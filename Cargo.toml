@@ -42,7 +42,7 @@ zeroize    = { version = "1", features = ["derive"] }
 ort     = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
 ndarray = "0.16"
 
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
 
 # --- native deps (enable as you build each crate) -----------------------------
 # nokhwa    = { version = "0.10", features = ["input-native"] }   # V4L2 capture

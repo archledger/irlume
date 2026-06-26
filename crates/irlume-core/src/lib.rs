@@ -22,3 +22,9 @@ pub mod tpm;
 /// glasses-off pairs score lower, so keep it conservative, don't chase 0.71.
 /// Do NOT assume buffalo_l's 0.60 — AuraFace scale differs.
 pub const PLACEHOLDER_MATCH_THRESHOLD: f32 = 0.50;
+
+/// IR-mode (dark) match threshold — HIGHER than RGB because AuraFace-on-IR is
+/// less discriminative. Benchmarked on the CBSR NIR dataset (real 850nm faces,
+/// 197 people): EER ≈0.9%; FAR ≤1e-4 (NIST-grade) is reached at 0.55 with ~2.5%
+/// FRR; impostor max 0.569. Live genuine IR (~0.65) clears 0.55 comfortably.
+pub const IR_MATCH_THRESHOLD: f32 = 0.55;

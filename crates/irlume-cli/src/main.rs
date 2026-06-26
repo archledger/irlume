@@ -21,6 +21,7 @@ fn main() -> std::process::ExitCode {
         (Some("selftest"), Some("align")) => selftest_align(&args),
         (Some("capture"), _) => capture(&args),
         (Some("eval"), _) => eval(&args),
+        (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("enroll"), _) => enroll(&args),
@@ -111,6 +112,110 @@ fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     } else {
         sum as f32 / n as f32
     }
+}
+
+/// `irlume irbench --dir <nir_images> --det .. --model ..` — the real IR
+/// recognition benchmark: embed real NIR faces (YuNet detect → align → AuraFace),
+/// group by person (filename prefix), and report genuine vs impostor cosine
+/// distributions + EER + FAR/FRR. Answers "does AuraFace-on-IR discriminate?".
+fn irbench(args: &[String]) -> std::process::ExitCode {
+    let (Some(dir), Some(det_path), Some(model)) =
+        (flag(args, "--dir"), flag(args, "--det"), flag(args, "--model"))
+    else {
+        eprintln!("usage: irlume irbench --dir <imgdir> --det <yunet.onnx> --model <glintr100.onnx> [--max-persons N]");
+        return std::process::ExitCode::from(2);
+    };
+    let max_persons: usize = flag(args, "--max-persons").and_then(|s| s.parse().ok()).unwrap_or(80);
+
+    // Collect *.bmp grouped by person (prefix before first '-').
+    let mut by_person: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = Default::default();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        eprintln!("cannot read dir {dir}");
+        return std::process::ExitCode::FAILURE;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("bmp")).unwrap_or(false) {
+            if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
+                let person = name.split('-').next().unwrap_or(name).to_string();
+                by_person.entry(person).or_default().push(p);
+            }
+        }
+    }
+    let persons: Vec<_> = by_person.into_iter().take(max_persons).collect();
+    println!("[irbench] {} persons, {} images; embedding (YuNet→align→AuraFace)…",
+        persons.len(), persons.iter().map(|(_, v)| v.len()).sum::<usize>());
+
+    let mut det = match irlume_vision::Detector::load_from_file(det_path) {
+        Ok(d) => d, Err(e) => { eprintln!("det load: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+    let mut emb = match irlume_vision::Embedder::load_from_file(model) {
+        Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+
+    // (person_index, embedding)
+    let mut embs: Vec<(usize, [f32; irlume_vision::EMBED_DIM])> = Vec::new();
+    let mut nodet = 0usize;
+    for (pi, (_person, files)) in persons.iter().enumerate() {
+        for f in files {
+            let Ok(img) = image::open(f) else { continue };
+            let rgb = img.to_rgb8();
+            let (w, h) = rgb.dimensions();
+            let data = rgb.into_raw();
+            let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
+            let Ok(faces) = det.detect(&view) else { continue };
+            let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { nodet += 1; continue };
+            if let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
+                if let Ok(e) = emb.embed(&chip) {
+                    embs.push((pi, e));
+                }
+            }
+        }
+    }
+    println!("[irbench] embedded {} faces ({} images had no detectable face)", embs.len(), nodet);
+
+    // Genuine = same person, impostor = different person.
+    let mut genuine = Vec::new();
+    let mut impostor = Vec::new();
+    for i in 0..embs.len() {
+        for j in (i + 1)..embs.len() {
+            let c = irlume_vision::align::cosine(&embs[i].1, &embs[j].1);
+            if embs[i].0 == embs[j].0 { genuine.push(c) } else { impostor.push(c) }
+        }
+    }
+    if genuine.is_empty() || impostor.is_empty() {
+        eprintln!("not enough data");
+        return std::process::ExitCode::FAILURE;
+    }
+    genuine.sort_by(f32::total_cmp);
+    impostor.sort_by(f32::total_cmp);
+    let pct = |v: &[f32], p: f32| v[((p * (v.len() - 1) as f32) as usize).min(v.len() - 1)];
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    println!("[genuine ] n={:6}  min {:.3}  mean {:.3}  median {:.3}", genuine.len(), genuine[0], mean(&genuine), pct(&genuine, 0.5));
+    println!("[impostor] n={:6}  mean {:.3}  p99 {:.3}  p99.9 {:.3}  max {:.3}", impostor.len(), mean(&impostor), pct(&impostor, 0.99), pct(&impostor, 0.999), impostor[impostor.len() - 1]);
+
+    // FAR/FRR sweep + EER + the threshold meeting FAR=1e-4.
+    let far = |t: f32| impostor.iter().filter(|&&c| c >= t).count() as f64 / impostor.len() as f64;
+    let frr = |t: f32| genuine.iter().filter(|&&c| c < t).count() as f64 / genuine.len() as f64;
+    for t in [0.40f32, 0.45, 0.50, 0.55, 0.60] {
+        println!("  thr {t:.2}: FAR {:.5}  FRR {:.4}", far(t), frr(t));
+    }
+    // EER: scan thresholds for |FAR-FRR| min.
+    let mut eer = (1.0f64, 0.0f32);
+    let mut t = 0.0;
+    while t < 1.0 {
+        let (a, r) = (far(t), frr(t));
+        if (a - r).abs() < eer.0 { eer = ((a - r).abs(), t); }
+        t += 0.005;
+    }
+    let et = eer.1;
+    println!("[EER] ~{:.3} at threshold {et:.3}", (far(et) + frr(et)) / 2.0);
+    // threshold achieving FAR<=1e-4, and its FRR
+    let mut t14 = 1.0f32;
+    let mut s = 0.30;
+    while s <= 0.95 { if far(s) <= 1e-4 { t14 = s; break; } s += 0.005; }
+    println!("[FAR≤1e-4] threshold {t14:.3} -> FRR {:.4} (reject rate for genuine at NIST-grade FAR)", frr(t14));
+    std::process::ExitCode::SUCCESS
 }
 
 /// Center-to-edge IR brightness ratio inside a face bbox (anti-flat depth cue):

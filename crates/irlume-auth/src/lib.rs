@@ -135,8 +135,9 @@ impl Engine {
             if verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
             }
+            // IR mode uses its own (higher) threshold — see IR_MATCH_THRESHOLD.
             let score = best(&probe, &profile.ir_templates);
-            let granted = score >= thr;
+            let granted = score >= irlume_core::IR_MATCH_THRESHOLD;
             return Ok(Outcome { granted, live: true, score, reason: if granted { "match (ir/dark)".into() } else { "below threshold (ir)".into() } });
         }
 

@@ -11,6 +11,8 @@
 //! to RGB8. FOOTGUN: enumerate V4L2 controls defensively — naive control queries
 //! panic on some drivers. Probe, don't assume.
 
+pub mod ir_emitter;
+
 use irlume_common::Error;
 use v4l::buffer::Type;
 use v4l::io::traits::CaptureStream;
@@ -161,7 +163,7 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
 
 const IR_W: u32 = 640;
 const IR_H: u32 = 400;
-const IR_WARMUP: usize = 8; // IR needs a few more frames than RGB (emitter/AE)
+const IR_BURST: usize = 24; // grab a burst; keep the brightest (lit strobe phase)
 
 /// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
 /// emitter must be illuminating for a usable image; on integrated Hello modules
@@ -183,12 +185,34 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
-    let mut last: Option<Vec<u8>> = None;
-    for _ in 0..IR_WARMUP {
+    // Fire the active-IR emitter on the open fd (Hello modules reset it per-open,
+    // so we must do it here, while streaming, not via an external one-shot).
+    let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
+    let lit = ir_emitter::enable(dev.handle().fd(), &card);
+    // The emitter may STROBE (pulse), so grab a burst and keep the brightest
+    // frame — the lit strobe phase (linhello lesson). Re-fire mid-burst in case
+    // the control self-clears.
+    let mut best: Option<Vec<u8>> = None;
+    let mut best_mean = -1.0f64;
+    let mut bmin = 255.0f64;
+    let mut bmax = 0.0f64;
+    for i in 0..IR_BURST {
+        if i == IR_BURST / 2 {
+            ir_emitter::enable(dev.handle().fd(), &card);
+        }
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        last = Some(buf.to_vec());
+        let mean = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
+        bmin = bmin.min(mean);
+        bmax = bmax.max(mean);
+        if mean > best_mean {
+            best_mean = mean;
+            best = Some(buf.to_vec());
+        }
     }
-    let grey = last.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
+    if std::env::var("IRLUME_DEBUG_IR").is_ok() {
+        eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
+    }
+    let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
     Ok(Frame { width: w, height: h, spectrum: Spectrum::Ir, data: grey })
 }
 

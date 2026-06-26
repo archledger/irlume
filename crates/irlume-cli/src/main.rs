@@ -309,11 +309,20 @@ fn eval(args: &[String]) -> std::process::ExitCode {
     let run = || -> irlume_common::Result<()> {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         let mut emb = irlume_vision::Embedder::load_from_file(model)?;
+        let grey = args.iter().any(|a| a == "--grey");
         let faces = det.detect(&view)?;
-        println!("[eval] {} faces; embedding each…", faces.len());
+        println!("[eval] {} faces; embedding each{}…", faces.len(), if grey { " (GREYSCALE / IR-proxy)" } else { "" });
         let mut embs = Vec::new();
         for f in &faces {
-            let chip = irlume_vision::align::align_to_arcface(&view, &f.landmarks)?;
+            let mut chip = irlume_vision::align::align_to_arcface(&view, &f.landmarks)?;
+            if grey {
+                // Simulate the IR modality: drop colour, keep luminance (BT.601),
+                // replicate to 3 channels. Isolates AuraFace's colour-removal loss.
+                for px in chip.chunks_exact_mut(3) {
+                    let y = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) as u8;
+                    px[0] = y; px[1] = y; px[2] = y;
+                }
+            }
             embs.push(emb.embed(&chip)?);
         }
         // All pairwise cosines = impostor scores (distinct people).

@@ -38,15 +38,111 @@ const RGB_W: u32 = 640;
 const RGB_H: u32 = 480;
 const AE_WARMUP: usize = 6; // discard frames while auto-exposure settles
 
+/// V4L2 privacy-control id (`V4L2_CID_PRIVACY`) — a hardware shutter/kill switch.
+pub const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
+
+/// Active-IR emitter table (UVC Extension-Unit `SET_CUR`), ported from linhello.
+/// archhost's **NexiGo HelloCam N930W** lives here: XU unit 4, selector 6,
+/// payload below fires the ~850nm illuminator (like `linux-enable-ir-emitter`).
+/// Override with `IRLUME_IR_EMITTER=unit:selector:b,b,...` or `off`.
+pub const IR_EMITTER_NEXIGO_N930W: (u8, u8, [u8; 9]) = (4, 6, [1, 3, 2, 0, 0, 0, 0, 0, 0]);
+
+/// Colour pixel formats imply an RGB sensor; greyscale-only implies the IR
+/// companion. linhello lesson: classify by advertised FourCC, never hardcode.
+const COLOUR_FOURCCS: [&[u8; 4]; 5] = [b"YUYV", b"MJPG", b"RGB3", b"BGR3", b"NV12"];
+const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
+
 fn hw<E: std::fmt::Display>(e: E) -> Error {
     Error::Hardware(e.to_string())
 }
 
+/// Map common io errors to actionable messages (linhello lesson: EBUSY/privacy
+/// are routine and need a clear cause, not a raw errno).
+fn map_io(device: &str, e: std::io::Error) -> Error {
+    use std::io::ErrorKind;
+    match e.raw_os_error() {
+        Some(16) => Error::Hardware(format!(
+            "{device}: camera busy (EBUSY) — another process holds it; close it or wait for resume"
+        )),
+        _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
+            "{device}: permission denied — add your user to the camera ACL/group"
+        )),
+        _ => Error::Hardware(format!("{device}: {e}")),
+    }
+}
+
+/// What a video node is, by its advertised formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Rgb,
+    Ir,
+    /// A capture node advertising neither (metadata node) or unreadable.
+    Other,
+}
+
+/// Classify a single `/dev/videoN` node by enumerating its pixel formats.
+/// Defensive: enumerate FORMATS (safe), never `query_controls` (panics on some
+/// UVC drivers — a hard-won linhello lesson).
+pub fn classify(device: &str) -> Role {
+    let Ok(dev) = Device::with_path(device) else {
+        return Role::Other;
+    };
+    let Ok(formats) = Capture::enum_formats(&dev) else {
+        return Role::Other;
+    };
+    let mut has_colour = false;
+    let mut has_grey = false;
+    for f in &formats {
+        let cc = &f.fourcc.repr;
+        if COLOUR_FOURCCS.iter().any(|c| *c == cc) {
+            has_colour = true;
+        }
+        if GREY_FOURCCS.iter().any(|c| *c == cc) {
+            has_grey = true;
+        }
+    }
+    match (has_colour, has_grey) {
+        (true, _) => Role::Rgb,
+        (false, true) => Role::Ir,
+        _ => Role::Other,
+    }
+}
+
+/// Scan `/dev/video0..9`, returning (path, role) for each readable capture node.
+pub fn discover_nodes() -> Vec<(String, Role)> {
+    (0..10)
+        .map(|n| format!("/dev/video{n}"))
+        .filter(|p| std::path::Path::new(p).exists())
+        .map(|p| {
+            let role = classify(&p);
+            (p, role)
+        })
+        .filter(|(_, r)| *r != Role::Other)
+        .collect()
+}
+
+/// Best-effort privacy-shutter check. Returns `Ok(true)` if the hardware privacy
+/// switch is engaged. Never panics: reads only the specific CID, not the whole
+/// control set.
+pub fn privacy_engaged(device: &str) -> bool {
+    let Ok(dev) = Device::with_path(device) else {
+        return false;
+    };
+    match dev.control(V4L2_CID_PRIVACY) {
+        Ok(ctrl) => matches!(ctrl.value, v4l::control::Value::Boolean(true))
+            || matches!(ctrl.value, v4l::control::Value::Integer(n) if n != 0),
+        Err(_) => false, // control absent on this camera
+    }
+}
+
 /// Capture one AE-warmed RGB frame from a V4L2 device (YUYV → RGB8).
 pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
-    let dev = Device::with_path(device).map_err(hw)?;
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
+    }
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let fmt = Format::new(RGB_W, RGB_H, FourCC::new(b"YUYV"));
-    let fmt = Capture::set_format(&dev, &fmt).map_err(hw)?;
+    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
     if &fmt.fourcc.repr != b"YUYV" {
         return Err(Error::Hardware(format!(
             "{device}: driver gave {:?}, expected YUYV",
@@ -54,12 +150,12 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream =
-        v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4).map_err(hw)?;
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| map_io(device, e))?;
 
     let mut last: Option<Vec<u8>> = None;
     for _ in 0..AE_WARMUP {
-        let (buf, _meta) = stream.next().map_err(hw)?;
+        let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
         last = Some(buf.to_vec());
     }
     let yuyv = last.ok_or_else(|| Error::Hardware("no frames captured".into()))?;
@@ -100,11 +196,28 @@ pub struct Cameras {
 }
 
 impl Cameras {
-    /// Open the configured RGB+IR devices.
+    /// Discover and classify the RGB + IR nodes (linhello lesson: don't hardcode).
+    /// Falls back to the default nodes if discovery finds nothing.
     pub fn open() -> irlume_common::Result<Self> {
         // TODO: device-trust binding (pin by topology/descriptor; reject virtual
-        // cams) — the CVE-2021-34466 defense. For now use the default nodes.
-        Ok(Self { rgb_device: DEFAULT_RGB_DEVICE.into(), ir_device: DEFAULT_IR_DEVICE.into() })
+        // cams) — the CVE-2021-34466 defense.
+        let nodes = discover_nodes();
+        let rgb = nodes
+            .iter()
+            .find(|(_, r)| *r == Role::Rgb)
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| DEFAULT_RGB_DEVICE.into());
+        let ir = nodes
+            .iter()
+            .find(|(_, r)| *r == Role::Ir)
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| DEFAULT_IR_DEVICE.into());
+        if privacy_engaged(&rgb) {
+            return Err(Error::Hardware(format!(
+                "{rgb}: hardware privacy switch is ON — disable it to authenticate"
+            )));
+        }
+        Ok(Self { rgb_device: rgb, ir_device: ir })
     }
 
     /// Capture an AE-warmed RGB frame.

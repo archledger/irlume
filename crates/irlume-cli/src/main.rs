@@ -20,6 +20,7 @@ fn main() -> std::process::ExitCode {
     match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
         (Some("selftest"), Some("align")) => selftest_align(&args),
         (Some("capture"), _) => capture(&args),
+        (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
             std::process::ExitCode::SUCCESS
@@ -29,6 +30,28 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
     }
+}
+
+/// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
+/// privacy switch, and confirm models + ONNX Runtime are present.
+fn doctor() -> std::process::ExitCode {
+    println!("[doctor] camera nodes (classified by pixel format):");
+    let nodes = irlume_camera::discover_nodes();
+    if nodes.is_empty() {
+        println!("  (none found under /dev/video0..9)");
+    }
+    for (path, role) in &nodes {
+        let priv_on = if irlume_camera::privacy_engaged(path) { "  ⚠ PRIVACY SWITCH ON" } else { "" };
+        println!("  {path}: {role:?}{priv_on}");
+    }
+    println!("[doctor] models:");
+    for m in ["models/glintr100.onnx", "models/face_detection_yunet_2023mar.onnx"] {
+        let ok = std::path::Path::new(m).exists();
+        println!("  {m}: {}", if ok { "present ✓" } else { "MISSING ✗" });
+    }
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
+    println!("[doctor] ORT_DYLIB_PATH: {}", if ort.is_empty() { "(unset)".into() } else { ort });
+    std::process::ExitCode::SUCCESS
 }
 
 /// Full live pipeline on one camera frame: capture RGB → YuNet detect → align

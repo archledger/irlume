@@ -138,8 +138,9 @@ impl RgbView<'_> {
         [self.data[i] as f32, self.data[i + 1] as f32, self.data[i + 2] as f32]
     }
 
+    /// Bilinear-sample the RGB image at fractional (x, y), edge-clamped.
     #[inline]
-    fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 3] {
+    pub fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 3] {
         let (x0, y0) = (x.floor() as i32, y.floor() as i32);
         let (dx, dy) = (x - x0 as f32, y - y0 as f32);
         let p00 = self.pixel(x0, y0);

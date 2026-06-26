@@ -11,6 +11,7 @@
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 
 pub mod align;
+pub mod detect;
 
 /// 5 facial landmarks (left eye, right eye, nose, left mouth, right mouth),
 /// in pixel coordinates of the source frame. Output by the detector.
@@ -29,7 +30,7 @@ pub type Embedding = [f32; EMBED_DIM];
 
 #[cfg(feature = "onnx")]
 mod onnx {
-    use super::{Embedding, EMBED_DIM};
+    use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
     use ort::session::{builder::GraphOptimizationLevel, Session};
     use ort::value::Tensor;
@@ -107,9 +108,86 @@ mod onnx {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
         }
-        // TODO: detect() — run YuNet, decode bbox + 5 landmarks across strides
-        // 8/16/32 with priors, score-threshold + NMS. Not needed for the Phase-1
-        // alignment-identity gate, which feeds an aligned chip directly.
+
+        /// Detect faces in an RGB frame. Letterboxes to YuNet's square input,
+        /// runs the net, groups outputs by tensor shape (cls/obj=1ch, bbox=4ch,
+        /// kps=10ch) per stride, decodes, NMS, and maps coords back to the frame.
+        pub fn detect(&mut self, frame: &align::RgbView) -> irlume_common::Result<Vec<Detection>> {
+            use crate::detect::{
+                decode_stride, letterbox_scale, nms, unletterbox, INPUT_SIZE, NMS_IOU,
+                SCORE_THRESHOLD, STRIDES,
+            };
+            let scale = letterbox_scale(frame.width, frame.height);
+            let input = letterbox_bgr(frame, scale, INPUT_SIZE);
+            let n = INPUT_SIZE as i64;
+            let tensor = Tensor::from_array(([1i64, 3, n, n], input)).map_err(err)?;
+            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+
+            // Group every output tensor by (channels, stride) using its shape.
+            let mut by: std::collections::HashMap<(usize, usize), Vec<Vec<f32>>> =
+                std::collections::HashMap::new();
+            for i in 0..outputs.len() {
+                let (shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
+                let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+                let ch = *dims.last().unwrap_or(&1);
+                let count = if ch == 0 { 0 } else { raw.len() / ch };
+                let stride = STRIDES.iter().copied().find(|&s| {
+                    let f = INPUT_SIZE / s;
+                    f * f == count
+                });
+                if let Some(stride) = stride {
+                    by.entry((ch, stride)).or_default().push(raw.to_vec());
+                }
+            }
+
+            let mut dets = Vec::new();
+            for &stride in &STRIDES {
+                let feat_w = INPUT_SIZE / stride;
+                let ones = by.get(&(1, stride));
+                let (Some(ones), Some(bbox), Some(kps)) =
+                    (ones, by.get(&(4, stride)), by.get(&(10, stride)))
+                else {
+                    continue;
+                };
+                if ones.len() < 2 {
+                    continue;
+                }
+                // score = sqrt(cls·obj); the two 1-channel tensors are symmetric.
+                dets.extend(decode_stride(
+                    &ones[0],
+                    &ones[1],
+                    &bbox[0],
+                    &kps[0],
+                    stride,
+                    feat_w,
+                    SCORE_THRESHOLD,
+                ));
+            }
+            let mut dets = nms(dets, NMS_IOU);
+            for d in &mut dets {
+                unletterbox(d, scale);
+            }
+            Ok(dets)
+        }
+    }
+
+    /// Resize+letterbox an RGB frame into a BGR, raw 0–255, NCHW input tensor for
+    /// YuNet (top-left aligned; remainder zero-padded).
+    fn letterbox_bgr(frame: &align::RgbView, scale: f32, size: usize) -> Vec<f32> {
+        let mut t = vec![0.0f32; 3 * size * size];
+        let plane = size * size;
+        let (sw, sh) =
+            ((frame.width as f32 * scale) as usize, (frame.height as f32 * scale) as usize);
+        for y in 0..sh.min(size) {
+            for x in 0..sw.min(size) {
+                let p = frame.sample_bilinear(x as f32 / scale, y as f32 / scale);
+                let o = y * size + x;
+                t[o] = p[2]; // B
+                t[plane + o] = p[1]; // G
+                t[2 * plane + o] = p[0]; // R
+            }
+        }
+        t
     }
 
     /// Phase-1 gate: embed the SAME aligned chip twice; cosine MUST be ~= 1.0.

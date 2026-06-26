@@ -18,6 +18,7 @@ pub mod detect;
 pub type Landmarks5 = [(f32, f32); 5];
 
 /// A detected face.
+#[derive(Clone)]
 pub struct Detection {
     pub bbox: [f32; 4], // x1, y1, x2, y2
     pub score: f32,

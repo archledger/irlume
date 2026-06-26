@@ -8,6 +8,7 @@ members = [
     "crates/irlume-vision",
     "crates/irlume-liveness",
     "crates/irlume-core",
+    "crates/irlume-auth",
     "crates/irlume-daemon",
     "crates/irlume-pam",
     "crates/irlume-cli",
@@ -29,6 +30,7 @@ irlume-camera   = { path = "crates/irlume-camera" }
 irlume-vision   = { path = "crates/irlume-vision" }
 irlume-liveness = { path = "crates/irlume-liveness" }
 irlume-core     = { path = "crates/irlume-core" }
+irlume-auth     = { path = "crates/irlume-auth" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,0 +1,16 @@
+[package]
+name = "irlume-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The shared authentication orchestration: capture RGB+IR -> detect -> align ->
+# embed + liveness gate -> match. Used by both the CLI and the irlumed daemon so
+# the security-critical pipeline lives in exactly one place.
+
+[dependencies]
+irlume-common.workspace = true
+irlume-camera.workspace = true
+irlume-vision.workspace = true
+irlume-liveness.workspace = true
+irlume-core.workspace = true

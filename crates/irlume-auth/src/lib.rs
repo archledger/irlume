@@ -1,0 +1,202 @@
+//! Shared authentication orchestration — the one place the security-critical
+//! pipeline lives. Both the CLI and the `irlumed` daemon drive this.
+//!
+//! Flow: capture RGB + IR (firing the IR emitter) → detect → align → embed (RGB)
+//! and run the liveness gate on the cross-spectrum signals → on Live, match the
+//! embedding against the user's enrolled templates at the fixed threshold.
+
+use irlume_liveness::{LivenessGate, Signals, Verdict};
+use irlume_vision::{align, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
+
+/// Loaded models + camera device selection. Build once, reuse per request.
+pub struct Engine {
+    det: Detector,
+    emb: Embedder,
+    gate: LivenessGate,
+    rgb_dev: String,
+    ir_dev: String,
+}
+
+/// What one capture+assessment produced.
+pub struct Assessment {
+    pub verdict: Verdict,
+    pub reason: String,
+    pub embedding: Option<[f32; EMBED_DIM]>,
+    pub ir_depth: f32,
+    pub ir_brightness: f32,
+}
+
+/// The authentication decision for a user.
+pub struct Outcome {
+    pub granted: bool,
+    pub live: bool,
+    pub score: f32,
+    pub reason: String,
+}
+
+impl Engine {
+    pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
+        Ok(Self {
+            det: Detector::load_from_file(det_path)?,
+            emb: Embedder::load_from_file(model_path)?,
+            gate: LivenessGate::new(),
+            rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
+            ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
+        })
+    }
+
+    pub fn with_devices(mut self, rgb: &str, ir: &str) -> Self {
+        self.rgb_dev = rgb.into();
+        self.ir_dev = ir.into();
+        self
+    }
+
+    /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
+    pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
+        let rgb = irlume_camera::capture_rgb(&self.rgb_dev)?;
+        let rgb_view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let rgb_faces = self.det.detect(&rgb_view)?;
+        let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
+
+        let ir = irlume_camera::capture_ir(&self.ir_dev)?;
+        let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
+        let ir_faces = {
+            let v = align::RgbView { data: &ir_grey_rgb, width: ir.width, height: ir.height };
+            self.det.detect(&v)?
+        };
+        let ir_top = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
+
+        let fbox = |f: &Detection, w: u32, h: u32| irlume_liveness::FaceBox {
+            cx: (f.bbox[0] + f.bbox[2]) / 2.0 / w as f32,
+            cy: (f.bbox[1] + f.bbox[3]) / 2.0 / h as f32,
+            score: f.score,
+        };
+        let ir_brightness = ir_top.as_ref().map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
+        let ir_depth = ir_top.as_ref().map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
+        let signals = Signals {
+            rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width, rgb.height)),
+            ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
+            ir_face_brightness: ir_brightness,
+            ir_center_edge_ratio: ir_depth,
+            ir_eye_glint: ir_top.as_ref().map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0),
+        };
+        let (verdict, _cues, reason) = self.gate.evaluate(&signals);
+
+        let embedding = match rgb_top {
+            Some(f) => {
+                let chip = align::align_to_arcface(&rgb_view, &f.landmarks)?;
+                Some(self.emb.embed(&chip)?)
+            }
+            None => None,
+        };
+        Ok(Assessment { verdict, reason, embedding, ir_depth, ir_brightness })
+    }
+
+    /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
+    /// then cosine match against enrolled templates at the fixed threshold.
+    pub fn authenticate(&mut self, user: &str) -> irlume_common::Result<Outcome> {
+        let Some(profile) = irlume_core::storage::load(user)? else {
+            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
+        };
+        let a = self.assess()?;
+        if a.verdict != Verdict::Live {
+            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
+        }
+        let Some(probe) = a.embedding else {
+            return Ok(Outcome { granted: false, live: true, score: 0.0, reason: "no face embedding".into() });
+        };
+        let score = profile
+            .templates
+            .iter()
+            .map(|t| align::cosine(&probe, t))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let granted = score >= irlume_core::PLACEHOLDER_MATCH_THRESHOLD;
+        Ok(Outcome { granted, live: true, score, reason: if granted { "match".into() } else { "below threshold".into() } })
+    }
+
+    /// Capture `want` LIVE samples and store them as `user`'s enrollment. Frames
+    /// failing the liveness gate are rejected (no enrolling from a photo).
+    pub fn enroll(&mut self, user: &str, want: usize) -> irlume_common::Result<usize> {
+        let mut templates = Vec::new();
+        let (mut depths, mut brights) = (Vec::new(), Vec::new());
+        for _ in 0..(want * 3) {
+            if templates.len() >= want {
+                break;
+            }
+            let a = self.assess()?;
+            if a.verdict == Verdict::Live {
+                if let Some(e) = a.embedding {
+                    templates.push(e.to_vec());
+                    depths.push(a.ir_depth);
+                    brights.push(a.ir_brightness);
+                }
+            }
+        }
+        if templates.len() < want {
+            return Err(irlume_common::Error::Protocol(format!(
+                "only {} live samples (need {want}) — check lighting and framing",
+                templates.len()
+            )));
+        }
+        let n = templates.len();
+        irlume_core::storage::save(&irlume_core::storage::Profile {
+            user: user.into(),
+            templates,
+            ir_depth_samples: depths,
+            ir_brightness_samples: brights,
+        })?;
+        Ok(n)
+    }
+}
+
+fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
+    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x2 = (bbox[2].max(0.0) as u32).min(w);
+    let y2 = (bbox[3].max(0.0) as u32).min(h);
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            sum += grey[(y * w + x) as usize] as u64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum as f32 / n as f32
+    }
+}
+
+fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+    let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+    if bw <= 4.0 || bh <= 4.0 {
+        return 0.0;
+    }
+    let inner = [bbox[0] + bw * 0.25, bbox[1] + bh * 0.25, bbox[2] - bw * 0.25, bbox[3] - bh * 0.25];
+    let center = mean_in_bbox(grey, w, h, &inner);
+    let whole = mean_in_bbox(grey, w, h, bbox);
+    let edge = (whole - center * 0.25) / 0.75;
+    if edge <= 1.0 {
+        0.0
+    } else {
+        center / edge
+    }
+}
+
+fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
+    let mut peak = 0u8;
+    for &(ex, ey) in &landmarks[0..2] {
+        let r = 8i32;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let x = ex as i32 + dx;
+                let y = ey as i32 + dy;
+                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                    peak = peak.max(grey[(y as u32 * w + x as u32) as usize]);
+                }
+            }
+        }
+    }
+    peak as f32
+}

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock
+# Bundled model weights are committed deliberately (see models/); but never
+# commit captured frames, templates, or any biometric data:
+*.onnx.tmp
+/var
+*.embedding
+*.template

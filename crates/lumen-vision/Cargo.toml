@@ -1,0 +1,14 @@
+[package]
+name = "lumen-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-common.workspace = true
+lumen-camera.workspace = true
+thiserror.workspace = true
+# Enable when wiring real inference:
+# ort     = { workspace = true }
+# ndarray = { workspace = true }
+# image   = { workspace = true }

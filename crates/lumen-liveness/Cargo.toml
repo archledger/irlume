@@ -1,0 +1,10 @@
+[package]
+name = "lumen-liveness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-common.workspace = true
+lumen-camera.workspace = true
+lumen-vision.workspace = true

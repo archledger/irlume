@@ -1,16 +1,16 @@
-# lumen — Linux face authentication (PAM), successor to linhello.
-# Placeholder name: `lumen`. Rename via find-replace `lumen` -> <yourname> across the tree.
+# irlume — Linux face authentication (PAM), successor to linhello.
+# irlume = IR (infrared) + lume (illumination).
 [workspace]
 resolver = "2"
 members = [
-    "crates/lumen-common",
-    "crates/lumen-camera",
-    "crates/lumen-vision",
-    "crates/lumen-liveness",
-    "crates/lumen-core",
-    "crates/lumen-daemon",
-    "crates/lumen-pam",
-    "crates/lumen-cli",
+    "crates/irlume-common",
+    "crates/irlume-camera",
+    "crates/irlume-vision",
+    "crates/irlume-liveness",
+    "crates/irlume-core",
+    "crates/irlume-daemon",
+    "crates/irlume-pam",
+    "crates/irlume-cli",
 ]
 
 [workspace.package]
@@ -18,17 +18,17 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/REPLACE_ME/lumen"
+repository = "https://github.com/REPLACE_ME/irlume"
 authors = ["REPLACE_ME"]
 
 # Shared dependency versions. Heavy/native deps are listed but commented so the
 # scaffold compiles offline as pure stubs — uncomment per crate as you implement.
 [workspace.dependencies]
-lumen-common   = { path = "crates/lumen-common" }
-lumen-camera   = { path = "crates/lumen-camera" }
-lumen-vision   = { path = "crates/lumen-vision" }
-lumen-liveness = { path = "crates/lumen-liveness" }
-lumen-core     = { path = "crates/lumen-core" }
+irlume-common   = { path = "crates/irlume-common" }
+irlume-camera   = { path = "crates/irlume-camera" }
+irlume-vision   = { path = "crates/irlume-vision" }
+irlume-liveness = { path = "crates/irlume-liveness" }
+irlume-core     = { path = "crates/irlume-core" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

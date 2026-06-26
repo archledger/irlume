@@ -1,6 +1,6 @@
-# Contributing to lumen
+# Contributing to irlume
 
-Thanks for your interest! lumen is **GPL-3.0-or-later** and intends to stay
+Thanks for your interest! irlume is **GPL-3.0-or-later** and intends to stay
 fully open source forever. There is **no CLA** and no commercial relicensing —
 your contributions remain under the same copyleft terms everyone else enjoys.
 
@@ -32,5 +32,5 @@ you certify the DCO. That's it — no forms, no rights assignment.
 ## Where to start
 
 Look for `todo!()` / `TODO` markers — each maps to a roadmap phase in the
-README. The Phase-1 alignment self-test (`lumen selftest align`) is the highest-
+README. The Phase-1 alignment self-test (`irlume selftest align`) is the highest-
 leverage first piece.

@@ -1,0 +1,15 @@
+[package]
+name = "irlume-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+irlume-common.workspace = true
+irlume-vision.workspace = true
+serde.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+# Enable when wiring TPM:
+# tss-esapi = { workspace = true }
+# secrecy   = { workspace = true }

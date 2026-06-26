@@ -1,11 +1,11 @@
-# lumen
+# irlume
 
-> **Placeholder name.** `lumen` (Latin: *light* — the IR illumination at its
-> core) is a working title. Rename across the tree with a single find-replace.
+> *irlume* = **IR** (infrared) + **lume** (illumination) — it recognizes you by
+> active infrared light, so it works in the dark and resists screen/photo spoofs.
 
 **Secure face authentication for Linux — engineered to meet or beat Windows Hello.**
 
-`lumen` is a PAM-based face-unlock system for Linux (login, sudo, lockscreen,
+`irlume` is a PAM-based face-unlock system for Linux (login, sudo, lockscreen,
 display managers). It is the from-scratch successor to
 [linhello](../linhello), rebuilt around a **commercially-clean, fully
 permissive model stack** under a copyleft umbrella, with **real IR liveness**
@@ -18,7 +18,7 @@ working authentication yet. **Not suitable for production use.**
 
 ## Why it's different
 
-| | Windows Hello | `visage` (closest FOSS) | **lumen** |
+| | Windows Hello | `visage` (closest FOSS) | **irlume** |
 |---|---|---|---|
 | Liveness / anti-spoof | IR only (bypassable, CVE-2021-34466) | none | **algorithmic IR PAD gate** |
 | Camera injection defense | ESS device-trust (newer HW) | none | **device-trust + cross-spectrum RGB↔IR** |
@@ -39,8 +39,8 @@ working authentication yet. **Not suitable for production use.**
 
 ## Architecture
 
-Privilege-separated. The thin **`pam_lumen.so`** module and **`lumen`** CLI are
-untrusted clients of the privileged **`lumend`** daemon, which alone owns the
+Privilege-separated. The thin **`pam_irlume.so`** module and **`irlume`** CLI are
+untrusted clients of the privileged **`irlumed`** daemon, which alone owns the
 camera, IR emitter, models, templates and TPM. They speak over a Unix socket;
 the daemon authenticates peers with `SO_PEERCRED`. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
@@ -48,14 +48,14 @@ the daemon authenticates peers with `SO_PEERCRED`. See
 
 ```
 crates/
-  lumen-common    IPC protocol, paths, errors
-  lumen-camera    V4L2 RGB+IR capture, UVC-XU IR emitter
-  lumen-vision    YuNet detect → align → AuraFace embed (ONNX via ort)
-  lumen-liveness  algorithmic IR PAD gate
-  lumen-core      matcher, template storage, TPM sealing
-  lumen-daemon    lumend — privileged hardware/model owner + IPC server
-  lumen-pam       pam_lumen.so — thin PAM client
-  lumen-cli       lumen — enroll/verify/selftest/doctor
+  irlume-common    IPC protocol, paths, errors
+  irlume-camera    V4L2 RGB+IR capture, UVC-XU IR emitter
+  irlume-vision    YuNet detect → align → AuraFace embed (ONNX via ort)
+  irlume-liveness  algorithmic IR PAD gate
+  irlume-core      matcher, template storage, TPM sealing
+  irlume-daemon    irlumed — privileged hardware/model owner + IPC server
+  irlume-pam       pam_irlume.so — thin PAM client
+  irlume-cli       irlume — enroll/verify/selftest/doctor
 ```
 
 ## Build
@@ -72,7 +72,7 @@ crate as you implement.
 ## Roadmap
 
 - **P1 — prove the pipeline:** YuNet → align → AuraFace → cosine match → unlock;
-  daemon/PAM split; `SO_PEERCRED`. **Gate: `lumen selftest align` (same crop →
+  daemon/PAM split; `SO_PEERCRED`. **Gate: `irlume selftest align` (same crop →
   cosine ≈ 1.0).**
 - **P2 — the security thesis:** IR liveness gate (NIR skin, bright-pupil,
   cross-spectrum overlap, device-trust) + ISO/IEC 30107-3 self-testing.

@@ -14,7 +14,7 @@ formal certification stays optional.
 
 ## Known Windows Hello bypass classes → our defenses
 
-| Bypass | Root cause | lumen defense |
+| Bypass | Root cause | irlume defense |
 |---|---|---|
 | **CVE-2021-34466** (CyberArk) — inject a spoofed IR frame from a fake USB camera | Hello trusts any USB device as camera root-of-trust; descriptors unauthenticated | **Device-trust binding**: pin the camera by topology/descriptor; reject unknown devices |
 | Same — real IR + arbitrary RGB ("SpongeBob") passes | Only IR validated, RGB ignored | **Cross-spectrum RGB↔IR spatial overlap**: face must align in both streams |

@@ -1,0 +1,10 @@
+[package]
+name = "irlume-liveness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+irlume-common.workspace = true
+irlume-camera.workspace = true
+irlume-vision.workspace = true

@@ -1,7 +1,7 @@
 # Models
 
-lumen bundles a **permissive, GPLv3-compatible** model stack. Once you add the
-weights here they are compiled into `lumend` via `include_bytes!` — no runtime
+irlume bundles a **permissive, GPLv3-compatible** model stack. Once you add the
+weights here they are compiled into `irlumed` via `include_bytes!` — no runtime
 download, no `fetch-models` step.
 
 | File | Stage | Source | License | Notes |

@@ -1,0 +1,17 @@
+[package]
+name = "irlume-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "irlumed"
+path = "src/main.rs"
+
+[dependencies]
+irlume-common.workspace = true
+irlume-camera.workspace = true
+irlume-vision.workspace = true
+irlume-liveness.workspace = true
+irlume-core.workspace = true
+serde_json.workspace = true

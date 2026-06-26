@@ -1,0 +1,17 @@
+[package]
+name = "irlume-pam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pam_irlume"
+# PAM modules are C-ABI shared objects loaded by libpam into the host
+# (login/sudo/sshd/display-manager). Produces pam_irlume.so.
+crate-type = ["cdylib"]
+
+[dependencies]
+irlume-common.workspace = true
+serde_json.workspace = true
+# Enable when implementing the module:
+# pamsm = { workspace = true }

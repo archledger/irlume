@@ -1,0 +1,11 @@
+[package]
+name = "irlume-camera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+irlume-common.workspace = true
+thiserror.workspace = true
+# Enable when implementing capture:
+# nokhwa = { workspace = true }

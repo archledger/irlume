@@ -24,7 +24,11 @@ pub mod tpm;
 pub const PLACEHOLDER_MATCH_THRESHOLD: f32 = 0.50;
 
 /// IR-mode (dark) match threshold — HIGHER than RGB because AuraFace-on-IR is
-/// less discriminative. Benchmarked on the CBSR NIR dataset (real 850nm faces,
-/// 197 people): EER ≈0.9%; FAR ≤1e-4 (NIST-grade) is reached at 0.55 with ~2.5%
-/// FRR; impostor max 0.569. Live genuine IR (~0.65) clears 0.55 comfortably.
+/// less discriminative. Benchmarked on the FULL CBSR NIR dataset (real 850nm,
+/// 197 people, 3940 faces, 7.72M impostor pairs): genuine mean 0.855, impostor
+/// MAX 0.900 (genuine/impostor OVERLAP), EER ≈0.8% @0.495. FAR/FRR: 0.55→
+/// 1.3e-3/1.7%, 0.60→2.7e-4/3.0%, NIST FAR≤1e-4 only @0.635 (FRR 4.6%).
+/// 0.55 is the CONVENIENCE balance (~1-in-750 FAR). DARK MODE IS CONVENIENCE-
+/// GRADE — high-assurance dark needs a dedicated IR-trained recognizer (proven,
+/// not speculation). Live genuine IR ~0.65 sits in the overlap zone.
 pub const IR_MATCH_THRESHOLD: f32 = 0.55;

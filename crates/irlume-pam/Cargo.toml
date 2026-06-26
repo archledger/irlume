@@ -13,5 +13,4 @@ crate-type = ["cdylib"]
 [dependencies]
 irlume-common.workspace = true
 serde_json.workspace = true
-# Enable when implementing the module:
-# pamsm = { workspace = true }
+pamsm = { version = "0.5", features = ["libpam"] }

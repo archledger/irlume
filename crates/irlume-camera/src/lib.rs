@@ -42,6 +42,9 @@ const AE_WARMUP: usize = 6; // discard frames while auto-exposure settles
 
 /// V4L2 privacy-control id (`V4L2_CID_PRIVACY`) — a hardware shutter/kill switch.
 pub const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
+/// `V4L2_CID_BACKLIGHT_COMPENSATION` — makes auto-exposure favor the (face)
+/// subject over a bright background, fixing the backlit-window case.
+pub const V4L2_CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
 
 /// Active-IR emitter table (UVC Extension-Unit `SET_CUR`), ported from linhello.
 /// archhost's **NexiGo HelloCam N930W** lives here: XU unit 4, selector 6,
@@ -139,6 +142,13 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
         return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    // Best-effort backlight/low-light correction: tell auto-exposure to expose
+    // for the face, not a bright window behind it. Harmless if unsupported
+    // (NexiGo N930W needs this; verified mean 49→124 + face detected).
+    let _ = dev.set_control(v4l::control::Control {
+        id: V4L2_CID_BACKLIGHT_COMPENSATION,
+        value: v4l::control::Value::Integer(2),
+    });
     let fmt = Format::new(RGB_W, RGB_H, FourCC::new(b"YUYV"));
     let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
     if &fmt.fourcc.repr != b"YUYV" {

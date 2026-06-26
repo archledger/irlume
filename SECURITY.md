@@ -48,7 +48,7 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
 **Do not open a public issue for security bugs.** Instead:
 
 - Use GitHub **Private Vulnerability Reporting** on this repository, or
-- Email **security@REPLACE_ME** (PGP key: _TBD_).
+- Email **archledger236@gmail.com** (PGP key: _TBD_).
 
 Please include affected version/commit, a description, and a reproduction if
 possible.

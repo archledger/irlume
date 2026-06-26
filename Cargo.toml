@@ -18,8 +18,8 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/REPLACE_ME/irlume"
-authors = ["REPLACE_ME"]
+repository = "https://github.com/archledger/irlume"
+authors = ["archledger <archledger236@gmail.com>"]
 
 # Shared dependency versions. Heavy/native deps are listed but commented so the
 # scaffold compiles offline as pure stubs — uncomment per crate as you implement.

@@ -104,6 +104,28 @@ mod onnx {
         }
     }
 
+    /// IR embedding adapter (512→256) — a small domain-adaptation MLP trained on
+    /// NIR faces that tightens IR genuine/impostor separation (CV: EER 0.82%→0.39%).
+    /// Applied to AuraFace IR embeddings in the dark path. Output is L2-normalized.
+    pub struct Adapter {
+        session: Session,
+    }
+
+    impl Adapter {
+        pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
+            let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            Ok(Self { session: build(&bytes)? })
+        }
+
+        /// Adapt one IR embedding -> adapted vector (already L2-normalized).
+        pub fn apply(&mut self, emb: &[f32]) -> irlume_common::Result<Vec<f32>> {
+            let tensor = Tensor::from_array(([1i64, emb.len() as i64], emb.to_vec())).map_err(err)?;
+            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+            Ok(raw.to_vec())
+        }
+    }
+
     fn l2_normalize(v: &mut [f32]) {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 1e-12 {
@@ -235,4 +257,4 @@ mod onnx {
 }
 
 #[cfg(feature = "onnx")]
-pub use onnx::{selftest_alignment_identity, Detector, Embedder};
+pub use onnx::{selftest_alignment_identity, Adapter, Detector, Embedder};

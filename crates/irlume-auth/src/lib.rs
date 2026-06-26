@@ -6,12 +6,14 @@
 //! embedding against the user's enrolled templates at the fixed threshold.
 
 use irlume_liveness::{LivenessGate, Signals, Verdict};
-use irlume_vision::{align, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
+use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
     det: Detector,
     emb: Embedder,
+    /// Optional IR domain-adaptation MLP (applied to IR embeddings in the dark).
+    ir_adapter: Option<Adapter>,
     gate: LivenessGate,
     rgb_dev: String,
     ir_dev: String,
@@ -23,8 +25,9 @@ pub struct Assessment {
     pub reason: String,
     /// RGB-face embedding (visible light) — the primary identity.
     pub embedding: Option<[f32; EMBED_DIM]>,
-    /// IR-face embedding (for dark operation), if a face was found in IR.
-    pub ir_embedding: Option<[f32; EMBED_DIM]>,
+    /// IR-face embedding (for dark operation), if a face was found in IR —
+    /// adapter-transformed (256-D) when the IR adapter is loaded, else raw 512-D.
+    pub ir_embedding: Option<Vec<f32>>,
     pub signals: Signals,
     pub ir_depth: f32,
     pub ir_brightness: f32,
@@ -43,6 +46,7 @@ impl Engine {
         Ok(Self {
             det: Detector::load_from_file(det_path)?,
             emb: Embedder::load_from_file(model_path)?,
+            ir_adapter: None,
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
@@ -53,6 +57,19 @@ impl Engine {
         self.rgb_dev = rgb.into();
         self.ir_dev = ir.into();
         self
+    }
+
+    /// Load the IR domain-adaptation adapter (improves dark recognition). If the
+    /// file is absent this is a no-op (raw IR embeddings are used).
+    pub fn with_ir_adapter(mut self, path: &str) -> irlume_common::Result<Self> {
+        if std::path::Path::new(path).exists() {
+            self.ir_adapter = Some(Adapter::load_from_file(path)?);
+        }
+        Ok(self)
+    }
+
+    pub fn has_ir_adapter(&self) -> bool {
+        self.ir_adapter.is_some()
     }
 
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
@@ -91,11 +108,16 @@ impl Engine {
             }
             None => None,
         };
-        // IR-face embedding (for dark operation): align + embed the IR image.
+        // IR-face embedding (for dark operation): align + embed the IR image,
+        // then apply the domain-adaptation adapter if loaded.
         let ir_embedding = match &ir_top {
             Some(f) => {
                 let chip = align::align_to_arcface(&ir_view, &f.landmarks)?;
-                Some(self.emb.embed(&chip)?)
+                let raw = self.emb.embed(&chip)?;
+                Some(match &mut self.ir_adapter {
+                    Some(a) => a.apply(&raw)?,
+                    None => raw.to_vec(),
+                })
             }
             None => None,
         };
@@ -135,9 +157,14 @@ impl Engine {
             if verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
             }
-            // IR mode uses its own (higher) threshold — see IR_MATCH_THRESHOLD.
+            // IR mode threshold — adapted space if the adapter is loaded.
+            let ir_thr = if self.ir_adapter.is_some() {
+                irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+            } else {
+                irlume_core::IR_MATCH_THRESHOLD
+            };
             let score = best(&probe, &profile.ir_templates);
-            let granted = score >= irlume_core::IR_MATCH_THRESHOLD;
+            let granted = score >= ir_thr;
             return Ok(Outcome { granted, live: true, score, reason: if granted { "match (ir/dark)".into() } else { "below threshold (ir)".into() } });
         }
 

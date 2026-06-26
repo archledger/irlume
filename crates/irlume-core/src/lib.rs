@@ -32,3 +32,9 @@ pub const PLACEHOLDER_MATCH_THRESHOLD: f32 = 0.50;
 /// GRADE — high-assurance dark needs a dedicated IR-trained recognizer (proven,
 /// not speculation). Live genuine IR ~0.65 sits in the overlap zone.
 pub const IR_MATCH_THRESHOLD: f32 = 0.55;
+
+/// Match threshold for ADAPTED IR embeddings (when the IR adapter is loaded).
+/// The adapter re-shapes the cosine space — 5-fold CV on CBSR NIR put FAR≤1e-4
+/// at 0.447 (FRR 1.35%, vs raw 0.613/3.49%). 0.45 is the interim NIST-grade
+/// point; MUST be re-validated on the live camera (CBSR→our-IR domain gap).
+pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.45;

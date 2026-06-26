@@ -84,13 +84,20 @@ fn user_arg(args: &[String]) -> String {
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()))
 }
 
-/// Build an Engine, honoring optional --rgb/--ir device overrides (e.g. NexiGo).
+/// Build an Engine: optional --rgb/--ir device overrides, and auto-load the IR
+/// adapter from models/ir_adapter.onnx (or --adapter PATH) if present.
 fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
-    Ok(match (flag(args, "--rgb"), flag(args, "--ir")) {
+    let e = match (flag(args, "--rgb"), flag(args, "--ir")) {
         (Some(r), Some(i)) => e.with_devices(r, i),
         _ => e,
-    })
+    };
+    let adapter = flag(args, "--adapter").unwrap_or("models/ir_adapter.onnx");
+    let e = e.with_ir_adapter(adapter)?;
+    if e.has_ir_adapter() {
+        eprintln!("[engine] IR adapter loaded ({adapter}) — dark mode uses adapted recognition");
+    }
+    Ok(e)
 }
 
 
@@ -173,6 +180,25 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
         }
     }
     println!("[irbench] embedded {} faces ({} images had no detectable face)", embs.len(), nodet);
+
+    // Optional: dump (person_index, 512-D embedding) per line for offline training.
+    if let Some(out) = flag(args, "--export") {
+        use std::io::Write;
+        match std::fs::File::create(out) {
+            Ok(mut f) => {
+                for (pi, e) in &embs {
+                    let mut line = pi.to_string();
+                    for v in e.iter() {
+                        line.push(' ');
+                        line.push_str(&format!("{v:.6}"));
+                    }
+                    let _ = writeln!(f, "{line}");
+                }
+                println!("[irbench] exported {} embeddings -> {out}", embs.len());
+            }
+            Err(e) => eprintln!("export failed: {e}"),
+        }
+    }
 
     // Genuine = same person, impostor = different person.
     let mut genuine = Vec::new();

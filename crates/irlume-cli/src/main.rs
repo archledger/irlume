@@ -55,6 +55,44 @@ fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
+/// Center-to-edge IR brightness ratio inside a face bbox (anti-flat depth cue):
+/// mean of the inner half vs. the surrounding border. >1 ⇒ 3D falloff.
+fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+    let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+    if bw <= 4.0 || bh <= 4.0 {
+        return 0.0;
+    }
+    // Inner box = central 50%.
+    let inner = [bbox[0] + bw * 0.25, bbox[1] + bh * 0.25, bbox[2] - bw * 0.25, bbox[3] - bh * 0.25];
+    let center = mean_in_bbox(grey, w, h, &inner);
+    let whole = mean_in_bbox(grey, w, h, bbox);
+    // Edge mean ≈ (whole*area - center*inner_area) / edge_area.
+    let edge = (whole * 1.0 - center * 0.25) / 0.75; // areas: inner=0.25, edge=0.75
+    if edge <= 1.0 {
+        0.0
+    } else {
+        center / edge
+    }
+}
+
+/// Peak IR brightness near the eye landmarks (corneal glint, supporting cue).
+fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &irlume_vision::Landmarks5) -> f32 {
+    let mut peak = 0u8;
+    for &(ex, ey) in &landmarks[0..2] {
+        let r = 8i32;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let x = ex as i32 + dx;
+                let y = ey as i32 + dy;
+                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                    peak = peak.max(grey[(y as u32 * w + x as u32) as usize]);
+                }
+            }
+        }
+    }
+    peak as f32
+}
+
 /// P2 probe: capture RGB + IR and report what the IR stream gives us — mean/min/
 /// max brightness (is the emitter illuminating?), and whether YuNet finds a face
 /// in each spectrum (the basis for the cross-spectrum liveness cue). Diagnostic,
@@ -98,15 +136,21 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_face_brightness = ir_top_face
             .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
+        let ir_center_edge_ratio =
+            ir_top_face.map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
+        let ir_eye_glint =
+            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0);
         let signals = irlume_liveness::Signals {
             rgb_face: rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).map(|f| to_fbox(f, rgb.width, rgb.height)),
             ir_face: ir_top_face.map(|f| to_fbox(f, ir.width, ir.height)),
             ir_face_brightness,
+            ir_center_edge_ratio,
+            ir_eye_glint,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-        println!("[gate] IR face-region brightness {ir_face_brightness:.0}");
-        println!("[gate] cues: rgb={} ir={} aligned={} ir_reflective={}",
-            cues.face_in_rgb, cues.face_in_ir, cues.cross_spectrum_aligned, cues.ir_reflectance_ok);
+        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");
+        println!("[gate] cues: rgb={} ir={} aligned={} ir_reflective={} depth={} glint={}",
+            cues.face_in_rgb, cues.face_in_ir, cues.cross_spectrum_aligned, cues.ir_reflectance_ok, cues.depth_ok, cues.glint_present);
         println!("[GATE] {verdict:?} — {reason}");
         Ok(())
     };

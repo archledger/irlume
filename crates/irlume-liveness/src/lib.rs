@@ -33,6 +33,13 @@ pub struct Signals {
     /// Mean brightness (0..255) inside the IR face region — skin reflects the
     /// active emitter strongly; a screen/print does not.
     pub ir_face_brightness: f32,
+    /// Center-to-edge IR brightness ratio in the face region. A real 3D face lit
+    /// by a near-coaxial emitter is brighter at the center/nose and falls off at
+    /// the edges (ratio > 1); a flat photo/screen is more uniform (~1). Anti-flat.
+    pub ir_center_edge_ratio: f32,
+    /// Peak IR brightness (0..255) at the eyes — the emitter's specular corneal
+    /// glint. Supporting cue only (glint alone is not decisive).
+    pub ir_eye_glint: f32,
 }
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
@@ -45,6 +52,10 @@ pub struct Cues {
     pub cross_spectrum_aligned: bool,
     /// IR face region is brightly lit by the emitter (skin reflectance).
     pub ir_reflectance_ok: bool,
+    /// 3D structure present (center brighter than edges) — anti-flat-spoof.
+    pub depth_ok: bool,
+    /// Corneal glint present (supporting; logged, not decisive).
+    pub glint_present: bool,
 }
 
 /// IR face region must be at least this bright (0..255). A lit live face ran ~83
@@ -55,6 +66,12 @@ pub const IR_FACE_MIN_BRIGHTNESS: f32 = 35.0;
 pub const CROSS_SPECTRUM_TOLERANCE: f32 = 0.30;
 /// Minimum detector score to trust a face.
 pub const MIN_FACE_SCORE: f32 = 0.6;
+/// Center/edge IR ratio above this indicates 3D structure (anti-flat). Calibrated
+/// 2026-06-26: a real lit face measured 1.36; a flat spoof is ~1.0. Kept lenient
+/// at 1.03 to avoid false-rejects across poses; tighten with flat-IR-spoof data.
+pub const DEPTH_MIN_RATIO: f32 = 1.03;
+/// Eye IR peak above this counts as a corneal glint (supporting cue).
+pub const GLINT_MIN: f32 = 180.0;
 
 /// The hard liveness gate. Stateless for now (per-user IR calibration is a P2
 /// follow-up).
@@ -104,7 +121,20 @@ impl LivenessGate {
             );
         }
 
-        (Verdict::Live, cues, "live: face in RGB+IR, co-located, IR-reflective".into())
+        // Anti-flat: a real 3D face shows center-vs-edge IR falloff.
+        cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
+        if !cues.depth_ok {
+            return (
+                Verdict::Spoof,
+                cues,
+                format!("IR too flat (center/edge {:.2}) — looks 2D, not a 3D face", s.ir_center_edge_ratio),
+            );
+        }
+
+        // Corneal glint — supporting only; logged, never decisive on its own.
+        cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
+
+        (Verdict::Live, cues, "live: face in RGB+IR, co-located, IR-reflective, 3D".into())
     }
 }
 
@@ -116,19 +146,31 @@ mod tests {
         FaceBox { cx, cy, score: 0.9 }
     }
 
-    #[test]
-    fn live_face_passes() {
-        let s = Signals {
+    fn live_signals() -> Signals {
+        Signals {
             rgb_face: Some(fb(0.5, 0.5)),
             ir_face: Some(fb(0.52, 0.49)),
             ir_face_brightness: 90.0,
-        };
-        assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Live);
+            ir_center_edge_ratio: 1.2,
+            ir_eye_glint: 220.0,
+        }
+    }
+
+    #[test]
+    fn live_face_passes() {
+        assert_eq!(LivenessGate::new().evaluate(&live_signals()).0, Verdict::Live);
+    }
+
+    #[test]
+    fn flat_ir_is_spoof() {
+        let mut s = live_signals();
+        s.ir_center_edge_ratio = 1.0; // uniform => flat
+        assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Spoof);
     }
 
     #[test]
     fn screen_with_no_ir_face_is_spoof() {
-        let s = Signals { rgb_face: Some(fb(0.5, 0.5)), ir_face: None, ir_face_brightness: 5.0 };
+        let s = Signals { rgb_face: Some(fb(0.5, 0.5)), ir_face: None, ir_face_brightness: 5.0, ..Default::default() };
         assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Spoof);
     }
 
@@ -138,6 +180,7 @@ mod tests {
             rgb_face: Some(fb(0.5, 0.5)),
             ir_face: Some(fb(0.5, 0.5)),
             ir_face_brightness: 12.0,
+            ..Default::default()
         };
         assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Spoof);
     }

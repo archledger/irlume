@@ -52,10 +52,6 @@ pub const IR_EMITTER_NEXIGO_N930W: (u8, u8, [u8; 9]) = (4, 6, [1, 3, 2, 0, 0, 0,
 const COLOUR_FOURCCS: [&[u8; 4]; 5] = [b"YUYV", b"MJPG", b"RGB3", b"BGR3", b"NV12"];
 const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
 
-fn hw<E: std::fmt::Display>(e: E) -> Error {
-    Error::Hardware(e.to_string())
-}
-
 /// Map common io errors to actionable messages (linhello lesson: EBUSY/privacy
 /// are routine and need a clear cause, not a raw errno).
 fn map_io(device: &str, e: std::io::Error) -> Error {

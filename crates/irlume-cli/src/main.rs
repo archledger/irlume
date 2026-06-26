@@ -20,6 +20,7 @@ fn main() -> std::process::ExitCode {
     match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
         (Some("selftest"), Some("align")) => selftest_align(&args),
         (Some("capture"), _) => capture(&args),
+        (Some("eval"), _) => eval(&args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -28,6 +29,69 @@ fn main() -> std::process::ExitCode {
         (None, _) => {
             println!("irlume <enroll|verify|profiles|delete|selftest|doctor>");
             std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Embed every detected face in an image and report the pairwise-cosine
+/// distribution. In a group photo every pair is a different person, so this is
+/// the IMPOSTOR distribution: it validates AuraFace discriminates (impostors
+/// should score low) and sets the threshold floor (must sit above impostor max).
+fn eval(args: &[String]) -> std::process::ExitCode {
+    let (Some(img), Some(det_path), Some(model)) =
+        (flag(args, "--image"), flag(args, "--det"), flag(args, "--model"))
+    else {
+        eprintln!("usage: irlume eval --image <group.jpg> --det <yunet.onnx> --model <glintr100.onnx>");
+        return std::process::ExitCode::from(2);
+    };
+    let rgb = match image::open(img) {
+        Ok(i) => i.to_rgb8(),
+        Err(e) => {
+            eprintln!("image load failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let (w, h) = rgb.dimensions();
+    let data = rgb.into_raw();
+    let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
+
+    let run = || -> irlume_common::Result<()> {
+        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
+        let mut emb = irlume_vision::Embedder::load_from_file(model)?;
+        let faces = det.detect(&view)?;
+        println!("[eval] {} faces; embedding each…", faces.len());
+        let mut embs = Vec::new();
+        for f in &faces {
+            let chip = irlume_vision::align::align_to_arcface(&view, &f.landmarks)?;
+            embs.push(emb.embed(&chip)?);
+        }
+        // All pairwise cosines = impostor scores (distinct people).
+        let mut scores = Vec::new();
+        for i in 0..embs.len() {
+            for j in (i + 1)..embs.len() {
+                scores.push(irlume_vision::align::cosine(&embs[i], &embs[j]));
+            }
+        }
+        if scores.is_empty() {
+            println!("[eval] need >=2 faces for pairwise stats.");
+            return Ok(());
+        }
+        scores.sort_by(f32::total_cmp);
+        let n = scores.len();
+        let mean = scores.iter().sum::<f32>() / n as f32;
+        let pct = |p: f32| scores[((p * (n - 1) as f32).round() as usize).min(n - 1)];
+        println!("[eval] impostor pairs: {n}");
+        println!("  min {:.3}  mean {:.3}  p95 {:.3}  p99 {:.3}  max {:.3}",
+            scores[0], mean, pct(0.95), pct(0.99), scores[n - 1]);
+        println!("  => threshold floor (above impostor max): {:.3}", scores[n - 1] + 0.02);
+        println!("  (genuine pairs — same person, 2 captures — set the ceiling; run two `capture` sessions to measure.)");
+        Ok(())
+    };
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("eval error: {e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }

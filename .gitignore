@@ -7,3 +7,7 @@ Cargo.lock
 /var
 *.embedding
 *.template
+
+# Model weights are fetched into models/ (see models/README.md), not committed
+# to git — glintr100.onnx is 261MB and GitHub blocks >100MB without LFS.
+models/*.onnx

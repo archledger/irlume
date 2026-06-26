@@ -35,6 +35,26 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Mean brightness (0..255) of an 8-bit greyscale frame inside a bbox region.
+fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
+    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x2 = (bbox[2].max(0.0) as u32).min(w);
+    let y2 = (bbox[3].max(0.0) as u32).min(h);
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            sum += grey[(y * w + x) as usize] as u64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum as f32 / n as f32
+    }
+}
+
 /// P2 probe: capture RGB + IR and report what the IR stream gives us — mean/min/
 /// max brightness (is the emitter illuminating?), and whether YuNet finds a face
 /// in each spectrum (the basis for the cross-spectrum liveness cue). Diagnostic,
@@ -66,14 +86,28 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_view =
             irlume_vision::align::RgbView { data: &ir_rgb, width: ir.width, height: ir.height };
         let ir_faces = det.detect(&ir_view)?;
-        let ir_top = ir_faces.iter().map(|f| f.score).fold(0.0f32, f32::max);
-        println!("[IR ] faces {}  top score {:.3}", ir_faces.len(), ir_top);
-        // First-cut cross-spectrum signal.
-        let live = !rgb_faces.is_empty() && !ir_faces.is_empty();
-        println!("[cue] face in RGB AND IR: {}  (real face illuminated by IR ⇒ both; a screen ⇒ usually RGB-only)", live);
-        if mean < 15.0 {
-            println!("[note] IR very dark (mean {mean:.1}) — emitter may not be firing; needs UVC-XU activation.");
-        }
+        let ir_top_face = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
+        println!("[IR ] faces {}  top score {:.3}", ir_faces.len(), ir_top_face.map_or(0.0, |f| f.score));
+
+        // Build signals for the gate.
+        let to_fbox = |f: &irlume_vision::Detection, w: u32, h: u32| irlume_liveness::FaceBox {
+            cx: (f.bbox[0] + f.bbox[2]) / 2.0 / w as f32,
+            cy: (f.bbox[1] + f.bbox[3]) / 2.0 / h as f32,
+            score: f.score,
+        };
+        let ir_face_brightness = ir_top_face
+            .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
+            .unwrap_or(0.0);
+        let signals = irlume_liveness::Signals {
+            rgb_face: rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).map(|f| to_fbox(f, rgb.width, rgb.height)),
+            ir_face: ir_top_face.map(|f| to_fbox(f, ir.width, ir.height)),
+            ir_face_brightness,
+        };
+        let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
+        println!("[gate] IR face-region brightness {ir_face_brightness:.0}");
+        println!("[gate] cues: rgb={} ir={} aligned={} ir_reflective={}",
+            cues.face_in_rgb, cues.face_in_ir, cues.cross_spectrum_aligned, cues.ir_reflectance_ok);
+        println!("[GATE] {verdict:?} — {reason}");
         Ok(())
     };
     match run() {

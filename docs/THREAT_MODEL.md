@@ -40,3 +40,16 @@ can't reach iBeta Level 2, train a model on **own IR-rig** data (license-clean).
 Seal a random release secret (or the login password) in the **TPM**, gated by
 **PCR policy**; release only on a successful live+match. Never store a
 recoverable face image. Embeddings zeroized after use.
+
+## Side channels
+
+- **Constant-time match decision.** The cosine/threshold comparison must not
+  branch or vary in timing on the similarity value, so an attacker cannot probe
+  response time to learn how close a presented face is to an enrolled template
+  (which would enable hill-climbing toward a match). Compare against the
+  threshold without early-out; keep the decision value-independent.
+- **No score leakage.** Auth responses to unprivileged callers expose only
+  grant/deny + a coarse reason — never the raw similarity score or per-template
+  distances.
+- **Memory hygiene.** Raw frames, chips, and embeddings are zeroized
+  (`zeroize`/`secrecy`) immediately after use; nothing biometric is logged.

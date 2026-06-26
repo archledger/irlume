@@ -40,9 +40,27 @@ mod onnx {
     }
 
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
-        Session::builder()
-            .map_err(err)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
+        #[allow(unused_mut)]
+        let mut b = Session::builder().map_err(err)?;
+        // Register a hardware execution provider if compiled in (cf. howrs).
+        // These fall back to CPU if the EP can't initialize at runtime.
+        #[cfg(feature = "cuda")]
+        {
+            b = b
+                .with_execution_providers([
+                    ort::execution_providers::CUDAExecutionProvider::default().build(),
+                ])
+                .map_err(err)?;
+        }
+        #[cfg(feature = "openvino")]
+        {
+            b = b
+                .with_execution_providers([
+                    ort::execution_providers::OpenVINOExecutionProvider::default().build(),
+                ])
+                .map_err(err)?;
+        }
+        b.with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(err)?
             .commit_from_memory(model)
             .map_err(err)

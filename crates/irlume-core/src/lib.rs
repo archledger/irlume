@@ -14,9 +14,11 @@ pub mod matcher;
 pub mod storage;
 pub mod tpm;
 
-/// Interim, evidence-based — REPLACE with an ROC-derived value for FMR<=1e-4.
-/// Measured impostor distribution (50-face eval, 1225 pairs): mean 0.105,
-/// p99 0.279, MAX 0.423. So the threshold must sit above ~0.42; this 0.45 is a
-/// safe floor pending genuine pairs (same person, multiple captures) to fix the
-/// final operating point. Do NOT assume buffalo_l's 0.60 — AuraFace scale differs.
-pub const PLACEHOLDER_MATCH_THRESHOLD: f32 = 0.45;
+/// Interim, evidence-based — refine with cross-session ROC for FMR<=1e-4.
+/// Measured: impostor (50-face eval, 1225 pairs) mean 0.105 / p99 0.279 / MAX
+/// 0.423; genuine (live, same person + glasses, 5 frames) min 0.712 / mean 0.849.
+/// Clean separation (0.42 vs 0.71) → 0.50 sits safely between with margin both
+/// ways. CAVEAT: genuine here is SAME-SESSION (optimistic); cross-session /
+/// glasses-off pairs score lower, so keep it conservative, don't chase 0.71.
+/// Do NOT assume buffalo_l's 0.60 — AuraFace scale differs.
+pub const PLACEHOLDER_MATCH_THRESHOLD: f32 = 0.50;

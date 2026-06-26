@@ -21,6 +21,7 @@ fn main() -> std::process::ExitCode {
         (Some("selftest"), Some("align")) => selftest_align(&args),
         (Some("capture"), _) => capture(&args),
         (Some("eval"), _) => eval(&args),
+        (Some("genuine"), _) => genuine(&args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -29,6 +30,69 @@ fn main() -> std::process::ExitCode {
         (None, _) => {
             println!("irlume <enroll|verify|profiles|delete|selftest|doctor>");
             std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Capture several frames of the (one) live person, embed each, and report the
+/// GENUINE cosine distribution. Compared to the impostor ceiling (~0.42 from
+/// `eval`), this shows the separation and lets us set the operating threshold.
+fn genuine(args: &[String]) -> std::process::ExitCode {
+    let device = flag(args, "--device").unwrap_or("/dev/video0");
+    let (Some(det_path), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
+        eprintln!("usage: irlume genuine --det <yunet.onnx> --model <glintr100.onnx>");
+        return std::process::ExitCode::from(2);
+    };
+    const FRAMES: usize = 5;
+    let run = || -> irlume_common::Result<()> {
+        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
+        let mut emb = irlume_vision::Embedder::load_from_file(model)?;
+        let mut embs = Vec::new();
+        println!("[genuine] stay in frame — capturing {FRAMES} frames…");
+        for k in 0..FRAMES {
+            let f = irlume_camera::capture_rgb(device)?;
+            let view = irlume_vision::align::RgbView { data: &f.data, width: f.width, height: f.height };
+            let faces = det.detect(&view)?;
+            match faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+                Some(top) => {
+                    let chip = irlume_vision::align::align_to_arcface(&view, &top.landmarks)?;
+                    embs.push(emb.embed(&chip)?);
+                    println!("  frame {}: face score {:.3}", k + 1, top.score);
+                }
+                None => println!("  frame {}: no face", k + 1),
+            }
+        }
+        if embs.len() < 2 {
+            println!("[genuine] need >=2 frames with a face — re-run staying in view.");
+            return Ok(());
+        }
+        let mut scores = Vec::new();
+        for i in 0..embs.len() {
+            for j in (i + 1)..embs.len() {
+                scores.push(irlume_vision::align::cosine(&embs[i], &embs[j]));
+            }
+        }
+        scores.sort_by(f32::total_cmp);
+        let mean = scores.iter().sum::<f32>() / scores.len() as f32;
+        println!("[genuine] {} pairs: min {:.3}  mean {:.3}  max {:.3}",
+            scores.len(), scores[0], mean, scores[scores.len() - 1]);
+        let impostor_max = 0.423;
+        println!("  impostor max (from eval): {impostor_max:.3}");
+        if scores[0] > impostor_max {
+            let mid = (scores[0] + impostor_max) / 2.0;
+            println!("  ✓ SEPARABLE — genuine min {:.3} > impostor max {:.3}; midpoint threshold ≈ {:.3}",
+                scores[0], impostor_max, mid);
+        } else {
+            println!("  ⚠ overlap — genuine min {:.3} ≤ impostor max; needs better alignment/lighting or per-profile (e.g. glasses) enrollment",
+                scores[0]);
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("genuine error: {e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }

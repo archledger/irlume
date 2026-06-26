@@ -4,11 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["onnx"]
+# ONNX inference (AuraFace embedder, YuNet detector). Off => align/cosine only.
+onnx = ["dep:ort", "dep:ndarray"]
+# Hardware-acceleration execution providers, selected at compile time (cf. howrs).
+# Default build = CPU. The heavy math runs inside ONNX Runtime, already SIMD +
+# multi-threaded; these pick the EP. Our own glue loops vectorize via target-cpu
+# (see .cargo/config.toml).
+cuda = ["ort/cuda"]
+openvino = ["ort/openvino"]
+coreml = ["ort/coreml"]
+tensorrt = ["ort/tensorrt"]
+
 [dependencies]
 irlume-common.workspace = true
 irlume-camera.workspace = true
 thiserror.workspace = true
-# Enable when wiring real inference:
-# ort     = { workspace = true }
-# ndarray = { workspace = true }
-# image   = { workspace = true }
+ort = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }

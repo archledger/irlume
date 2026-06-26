@@ -35,9 +35,12 @@ serde_json = "1"
 thiserror  = "2"
 zeroize    = { version = "1", features = ["derive"] }
 
+# ONNX inference. `load-dynamic` => libonnxruntime.so is dlopened at runtime, so
+# this builds without the native lib present (you supply it on the target).
+ort     = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
+ndarray = "0.16"
+
 # --- native deps (enable as you build each crate) -----------------------------
-# ort       = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray"] }
-# ndarray   = "0.16"
 # image     = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # nokhwa    = { version = "0.10", features = ["input-native"] }   # V4L2 capture
 # tss-esapi = "7"                                                 # TPM 2.0

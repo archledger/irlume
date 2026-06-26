@@ -1,0 +1,22 @@
+# Build tuning for irlume.
+#
+# Hardware acceleration has two layers:
+#
+#   1. ONNX Runtime execution provider — the big win (this is what howrs does).
+#      Pick at build time via cargo features on irlume-vision:
+#          cargo build -p irlume-daemon --features irlume-vision/cuda
+#          ... or openvino | coreml | tensorrt
+#      Default is CPU (ONNX Runtime's own SIMD + thread pool). Most of the
+#      compute lives here, not in our Rust code.
+#
+#   2. Our glue loops (alignment warp, cosine fold) — let LLVM vectorize them.
+#      Uncomment ONE block below for the machine you build for. Leave commented
+#      for portable / distro binaries (the default target is a safe floor).
+#
+# Portable AVX2 floor (Haswell+, ~2013 onward) — matches howrs's recommendation:
+# [build]
+# rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "target-feature=+avx2,+fma"]
+#
+# Native (fastest, NON-portable — only for binaries you build and run yourself):
+# [build]
+# rustflags = ["-C", "target-cpu=native"]

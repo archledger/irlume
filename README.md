@@ -80,6 +80,22 @@ crate as you implement.
   demographics; mandatory non-biometric fallback.
 - **P4 — (optional) certification:** iBeta ISO/IEC 30107-3 PAD; FIDO.
 
+## Performance & hardware acceleration
+
+Two layers (same model as [howrs](https://github.com/Eason0729/howrs)):
+
+1. **ONNX Runtime execution provider** — the big win, selected at build time via
+   `irlume-vision` cargo features: `cuda`, `openvino`, `coreml`, `tensorrt`.
+   Default is CPU (ONNX Runtime's own SIMD + thread pool). Most compute lives
+   here, not in our Rust.
+2. **Our glue loops** (alignment warp, cosine fold) auto-vectorize via LLVM.
+   Tune with `RUSTFLAGS` / `.cargo/config.toml` (`target-cpu=x86-64-v2 +avx2` for
+   a portable AVX2 floor, or `target-cpu=native` for self-built binaries).
+
+Hand-written SIMD intrinsics are intentionally avoided — for a once-per-unlock
+auth pipeline the compute is dominated by ONNX Runtime, and a 512-D cosine is
+negligible. Bundling **int8-quantized** models is the other free speedup.
+
 ## License
 
 **GPL-3.0-or-later.** Fully open source. Modifications stay free; nobody can lock

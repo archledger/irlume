@@ -22,6 +22,7 @@ fn main() -> std::process::ExitCode {
         (Some("capture"), _) => capture(&args),
         (Some("eval"), _) => eval(&args),
         (Some("genuine"), _) => genuine(&args),
+        (Some("liveness"), _) => liveness_probe(&args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -30,6 +31,56 @@ fn main() -> std::process::ExitCode {
         (None, _) => {
             println!("irlume <enroll|verify|profiles|delete|selftest|doctor>");
             std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+/// P2 probe: capture RGB + IR and report what the IR stream gives us — mean/min/
+/// max brightness (is the emitter illuminating?), and whether YuNet finds a face
+/// in each spectrum (the basis for the cross-spectrum liveness cue). Diagnostic,
+/// not yet a gate.
+fn liveness_probe(args: &[String]) -> std::process::ExitCode {
+    let rgb_dev = flag(args, "--rgb").unwrap_or(irlume_camera::DEFAULT_RGB_DEVICE);
+    let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
+    let Some(det_path) = flag(args, "--det") else {
+        eprintln!("usage: irlume liveness --det <yunet.onnx> [--rgb /dev/video0] [--ir /dev/video2]");
+        return std::process::ExitCode::from(2);
+    };
+    let run = || -> irlume_common::Result<()> {
+        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
+        // RGB
+        let rgb = irlume_camera::capture_rgb(rgb_dev)?;
+        let rgb_view =
+            irlume_vision::align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let rgb_faces = det.detect(&rgb_view)?;
+        let rgb_top = rgb_faces.iter().map(|f| f.score).fold(0.0f32, f32::max);
+        println!("[RGB] {}x{}  faces {}  top score {:.3}", rgb.width, rgb.height, rgb_faces.len(), rgb_top);
+        // IR
+        let ir = irlume_camera::capture_ir(ir_dev)?;
+        let (mn, mx, sum) = ir.data.iter().fold((255u8, 0u8, 0u64), |(mn, mx, s), &p| {
+            (mn.min(p), mx.max(p), s + p as u64)
+        });
+        let mean = sum as f64 / ir.data.len() as f64;
+        println!("[IR ] {}x{}  brightness mean {:.1} min {} max {}", ir.width, ir.height, mean, mn, mx);
+        let ir_rgb = irlume_camera::grey_to_rgb(&ir.data);
+        let ir_view =
+            irlume_vision::align::RgbView { data: &ir_rgb, width: ir.width, height: ir.height };
+        let ir_faces = det.detect(&ir_view)?;
+        let ir_top = ir_faces.iter().map(|f| f.score).fold(0.0f32, f32::max);
+        println!("[IR ] faces {}  top score {:.3}", ir_faces.len(), ir_top);
+        // First-cut cross-spectrum signal.
+        let live = !rgb_faces.is_empty() && !ir_faces.is_empty();
+        println!("[cue] face in RGB AND IR: {}  (real face illuminated by IR ⇒ both; a screen ⇒ usually RGB-only)", live);
+        if mean < 15.0 {
+            println!("[note] IR very dark (mean {mean:.1}) — emitter may not be firing; needs UVC-XU activation.");
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("liveness probe error: {e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }

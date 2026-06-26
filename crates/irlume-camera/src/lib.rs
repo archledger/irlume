@@ -159,6 +159,51 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
     Ok(Frame { width: w, height: h, spectrum: Spectrum::Rgb, data: rgb })
 }
 
+const IR_W: u32 = 640;
+const IR_H: u32 = 400;
+const IR_WARMUP: usize = 8; // IR needs a few more frames than RGB (emitter/AE)
+
+/// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
+/// emitter must be illuminating for a usable image; on integrated Hello modules
+/// it often fires when the stream opens, otherwise it needs a UVC-XU write (TODO,
+/// see `IR_EMITTER_NEXIGO_N930W`).
+pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
+    }
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
+    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
+    if &fmt.fourcc.repr != b"GREY" {
+        return Err(Error::Hardware(format!(
+            "{device}: driver gave {:?}, expected GREY",
+            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("????")
+        )));
+    }
+    let (w, h) = (fmt.width, fmt.height);
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| map_io(device, e))?;
+    let mut last: Option<Vec<u8>> = None;
+    for _ in 0..IR_WARMUP {
+        let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        last = Some(buf.to_vec());
+    }
+    let grey = last.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
+    Ok(Frame { width: w, height: h, spectrum: Spectrum::Ir, data: grey })
+}
+
+/// Replicate an 8-bit greyscale buffer into interleaved RGB8 (for feeding the
+/// RGB-trained detector on an IR frame).
+pub fn grey_to_rgb(grey: &[u8]) -> Vec<u8> {
+    let mut rgb = vec![0u8; grey.len() * 3];
+    for (i, &g) in grey.iter().enumerate() {
+        rgb[i * 3] = g;
+        rgb[i * 3 + 1] = g;
+        rgb[i * 3 + 2] = g;
+    }
+    rgb
+}
+
 /// Convert a YUYV (YUY2, 4:2:2) buffer to interleaved RGB8 (BT.601).
 pub fn yuyv_to_rgb(yuyv: &[u8], width: u32, height: u32) -> Vec<u8> {
     let (w, h) = (width as usize, height as usize);

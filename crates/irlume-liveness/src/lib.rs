@@ -136,6 +136,29 @@ impl LivenessGate {
 
         (Verdict::Live, cues, "live: face in RGB+IR, co-located, IR-reflective, 3D".into())
     }
+
+    /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no
+    /// visible-light face. Weaker than the full gate (no cross-spectrum anti-
+    /// injection) but keeps IR reflectance + 3D depth + glint — same basis
+    /// Windows Hello uses in the dark.
+    pub fn evaluate_ir_only(&self, s: &Signals) -> (Verdict, Cues, String) {
+        let mut cues = Cues::default();
+        let Some(ir) = s.ir_face.filter(|f| f.score >= MIN_FACE_SCORE) else {
+            return (Verdict::Uncertain, cues, "no face in IR".into());
+        };
+        cues.face_in_ir = true;
+        let _ = ir;
+        cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
+        if !cues.ir_reflectance_ok {
+            return (Verdict::Spoof, cues, format!("IR face too dark ({:.0})", s.ir_face_brightness));
+        }
+        cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
+        if !cues.depth_ok {
+            return (Verdict::Spoof, cues, format!("IR too flat (center/edge {:.2})", s.ir_center_edge_ratio));
+        }
+        cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
+        (Verdict::Live, cues, "live (dark/IR-only): IR-reflective, 3D".into())
+    }
 }
 
 #[cfg(test)]

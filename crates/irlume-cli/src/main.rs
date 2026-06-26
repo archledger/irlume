@@ -37,119 +37,20 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// One full capture: RGB+IR, liveness verdict, and (if a face) its embedding.
-struct Assessment {
-    verdict: irlume_liveness::Verdict,
-    reason: String,
-    embedding: Option<[f32; irlume_vision::EMBED_DIM]>,
-    ir_depth: f32,
-    ir_brightness: f32,
-}
-
-/// Capture RGB+IR, run detect → align → embed (RGB) and the liveness gate.
-fn assess(
-    det: &mut irlume_vision::Detector,
-    emb: &mut irlume_vision::Embedder,
-    rgb_dev: &str,
-    ir_dev: &str,
-) -> irlume_common::Result<Assessment> {
-    let rgb = irlume_camera::capture_rgb(rgb_dev)?;
-    let rgb_view = irlume_vision::align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
-    let rgb_faces = det.detect(&rgb_view)?;
-    let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
-
-    let ir = irlume_camera::capture_ir(ir_dev)?;
-    let ir_view = {
-        let g = irlume_camera::grey_to_rgb(&ir.data);
-        // detect on a replicated-grey RGB view (build owned buffer)
-        let faces = {
-            let v = irlume_vision::align::RgbView { data: &g, width: ir.width, height: ir.height };
-            det.detect(&v)?
-        };
-        (faces,)
-    };
-    let ir_faces = ir_view.0;
-    let ir_top = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
-
-    let fbox = |f: &irlume_vision::Detection, w: u32, h: u32| irlume_liveness::FaceBox {
-        cx: (f.bbox[0] + f.bbox[2]) / 2.0 / w as f32,
-        cy: (f.bbox[1] + f.bbox[3]) / 2.0 / h as f32,
-        score: f.score,
-    };
-    let ir_brightness = ir_top.map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
-    let ir_depth = ir_top.map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
-    let signals = irlume_liveness::Signals {
-        rgb_face: rgb_top.map(|f| fbox(f, rgb.width, rgb.height)),
-        ir_face: ir_top.map(|f| fbox(f, ir.width, ir.height)),
-        ir_face_brightness: ir_brightness,
-        ir_center_edge_ratio: ir_depth,
-        ir_eye_glint: ir_top.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0),
-    };
-    let (verdict, _cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-
-    let embedding = match rgb_top {
-        Some(f) => {
-            let chip = irlume_vision::align::align_to_arcface(&rgb_view, &f.landmarks)?;
-            Some(emb.embed(&chip)?)
-        }
-        None => None,
-    };
-    Ok(Assessment { verdict, reason, embedding, ir_depth, ir_brightness })
-}
-
-/// `irlume enroll --user U` — capture several LIVE frames and store templates.
-/// Frames that fail liveness are rejected (you can't enroll from a photo).
+/// `irlume enroll --user U` — capture LIVE samples (RGB + IR templates) via the
+/// shared auth engine. Frames failing the liveness gate are rejected.
 fn enroll(args: &[String]) -> std::process::ExitCode {
-    let user = flag(args, "--user").unwrap_or("").to_string();
-    let (Some(det_path), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
-        eprintln!("usage: irlume enroll --user U --det <yunet.onnx> --model <glintr100.onnx>");
+    let (Some(det), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
+        eprintln!("usage: irlume enroll --user U --det <yunet.onnx> --model <glintr100.onnx> [--rgb /dev/videoN] [--ir /dev/videoN]");
         return std::process::ExitCode::from(2);
     };
-    let user = if user.is_empty() {
-        std::env::var("USER").unwrap_or_else(|_| "user".into())
-    } else {
-        user
-    };
-    const WANT: usize = 5;
-    let run = || -> irlume_common::Result<()> {
-        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
-        let mut emb = irlume_vision::Embedder::load_from_file(model)?;
-        let mut templates = Vec::new();
-        let (mut depths, mut brights) = (Vec::new(), Vec::new());
-        println!("[enroll] '{user}' — stay in frame; capturing {WANT} live samples…");
-        for attempt in 0..(WANT * 3) {
-            if templates.len() >= WANT {
-                break;
-            }
-            let a = assess(&mut det, &mut emb, irlume_camera::DEFAULT_RGB_DEVICE, irlume_camera::DEFAULT_IR_DEVICE)?;
-            match (a.verdict, a.embedding) {
-                (irlume_liveness::Verdict::Live, Some(e)) => {
-                    templates.push(e.to_vec());
-                    depths.push(a.ir_depth);
-                    brights.push(a.ir_brightness);
-                    println!("  sample {}/{WANT} ok (live)", templates.len());
-                }
-                (v, _) => println!("  attempt {} skipped: {:?} — {}", attempt + 1, v, a.reason),
-            }
+    let user = user_arg(args);
+    println!("[enroll] '{user}' — stay in frame; capturing live samples (RGB + IR)…");
+    match engine(det, model, args).and_then(|mut e| e.enroll(&user, 5)) {
+        Ok(n) => {
+            println!("[enroll] saved {n} samples (RGB+IR templates) for '{user}' -> {}", irlume_core::storage::profile_path(&user).display());
+            std::process::ExitCode::SUCCESS
         }
-        if templates.len() < WANT {
-            return Err(irlume_common::Error::Protocol(format!(
-                "only {} live samples — enrollment needs {WANT}; ensure good lighting and face in view",
-                templates.len()
-            )));
-        }
-        let profile = irlume_core::storage::Profile {
-            user: user.clone(),
-            templates,
-            ir_depth_samples: depths,
-            ir_brightness_samples: brights,
-        };
-        irlume_core::storage::save(&profile)?;
-        println!("[enroll] saved {} templates for '{user}' -> {}", profile.templates.len(), irlume_core::storage::profile_path(&user).display());
-        Ok(())
-    };
-    match run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("enroll failed: {e}");
             std::process::ExitCode::FAILURE
@@ -157,50 +58,40 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume verify --user U` — the full auth decision: liveness gate THEN match.
+/// `irlume verify --user U` — full auth via the engine: liveness gate then match
+/// (RGB recognition in light, IR recognition in the dark).
 fn verify(args: &[String]) -> std::process::ExitCode {
-    let user = flag(args, "--user").map(str::to_string).unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
-    let (Some(det_path), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
-        eprintln!("usage: irlume verify --user U --det <yunet.onnx> --model <glintr100.onnx>");
+    let (Some(det), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
+        eprintln!("usage: irlume verify --user U --det <yunet.onnx> --model <glintr100.onnx> [--rgb ..] [--ir ..]");
         return std::process::ExitCode::from(2);
     };
-    let run = || -> irlume_common::Result<bool> {
-        let Some(profile) = irlume_core::storage::load(&user)? else {
-            eprintln!("no enrollment for '{user}' — run `irlume enroll --user {user} ...` first");
-            return Ok(false);
-        };
-        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
-        let mut emb = irlume_vision::Embedder::load_from_file(model)?;
-        let a = assess(&mut det, &mut emb, irlume_camera::DEFAULT_RGB_DEVICE, irlume_camera::DEFAULT_IR_DEVICE)?;
-        // 1) Liveness first — a spoof never reaches matching.
-        if a.verdict != irlume_liveness::Verdict::Live {
-            println!("[verify] DENY — liveness {:?}: {}", a.verdict, a.reason);
-            return Ok(false);
+    let user = user_arg(args);
+    match engine(det, model, args).and_then(|mut e| e.authenticate(&user)) {
+        Ok(o) => {
+            println!("[verify] live={} score {:.3} -> {} ({})", o.live, o.score, if o.granted { "GRANT \u{2705}" } else { "DENY \u{274c}" }, o.reason);
+            if o.granted { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
         }
-        // 2) Match against enrolled templates at the fixed threshold.
-        let Some(probe) = a.embedding else {
-            println!("[verify] DENY — no face embedding");
-            return Ok(false);
-        };
-        let best = profile
-            .templates
-            .iter()
-            .map(|t| irlume_vision::align::cosine(&probe, t))
-            .fold(f32::NEG_INFINITY, f32::max);
-        let thr = irlume_core::PLACEHOLDER_MATCH_THRESHOLD;
-        let granted = best >= thr;
-        println!("[verify] live ✓  best match {best:.3} vs threshold {thr:.2} -> {}", if granted { "GRANT ✅" } else { "DENY ❌" });
-        Ok(granted)
-    };
-    match run() {
-        Ok(true) => std::process::ExitCode::SUCCESS,
-        Ok(false) => std::process::ExitCode::FAILURE,
         Err(e) => {
             eprintln!("verify error: {e}");
             std::process::ExitCode::FAILURE
         }
     }
 }
+
+fn user_arg(args: &[String]) -> String {
+    flag(args, "--user").map(str::to_string).filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()))
+}
+
+/// Build an Engine, honoring optional --rgb/--ir device overrides (e.g. NexiGo).
+fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlume_auth::Engine> {
+    let e = irlume_auth::Engine::load(det, model)?;
+    Ok(match (flag(args, "--rgb"), flag(args, "--ir")) {
+        (Some(r), Some(i)) => e.with_devices(r, i),
+        _ => e,
+    })
+}
+
 
 /// Mean brightness (0..255) of an 8-bit greyscale frame inside a bbox region.
 fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {

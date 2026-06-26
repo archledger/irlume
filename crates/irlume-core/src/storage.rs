@@ -14,6 +14,10 @@ use std::path::PathBuf;
 pub struct Profile {
     pub user: String,
     pub templates: Vec<Vec<f32>>,
+    /// IR-face templates (AuraFace embeddings of the aligned IR image) for dark
+    /// operation — matched IR-vs-IR when there's no visible-light face.
+    #[serde(default)]
+    pub ir_templates: Vec<Vec<f32>>,
     /// Per-user IR liveness calibration: enrolled center/edge depth ratios and
     /// face-region brightness, for tightening the gate to this user (P2 follow-up).
     #[serde(default)]

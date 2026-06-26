@@ -21,7 +21,11 @@ pub struct Engine {
 pub struct Assessment {
     pub verdict: Verdict,
     pub reason: String,
+    /// RGB-face embedding (visible light) — the primary identity.
     pub embedding: Option<[f32; EMBED_DIM]>,
+    /// IR-face embedding (for dark operation), if a face was found in IR.
+    pub ir_embedding: Option<[f32; EMBED_DIM]>,
+    pub signals: Signals,
     pub ir_depth: f32,
     pub ir_brightness: f32,
 }
@@ -60,10 +64,8 @@ impl Engine {
 
         let ir = irlume_camera::capture_ir(&self.ir_dev)?;
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
-        let ir_faces = {
-            let v = align::RgbView { data: &ir_grey_rgb, width: ir.width, height: ir.height };
-            self.det.detect(&v)?
-        };
+        let ir_view = align::RgbView { data: &ir_grey_rgb, width: ir.width, height: ir.height };
+        let ir_faces = self.det.detect(&ir_view)?;
         let ir_top = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
 
         let fbox = |f: &Detection, w: u32, h: u32| irlume_liveness::FaceBox {
@@ -82,14 +84,22 @@ impl Engine {
         };
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);
 
-        let embedding = match rgb_top {
+        let embedding = match &rgb_top {
             Some(f) => {
                 let chip = align::align_to_arcface(&rgb_view, &f.landmarks)?;
                 Some(self.emb.embed(&chip)?)
             }
             None => None,
         };
-        Ok(Assessment { verdict, reason, embedding, ir_depth, ir_brightness })
+        // IR-face embedding (for dark operation): align + embed the IR image.
+        let ir_embedding = match &ir_top {
+            Some(f) => {
+                let chip = align::align_to_arcface(&ir_view, &f.landmarks)?;
+                Some(self.emb.embed(&chip)?)
+            }
+            None => None,
+        };
+        Ok(Assessment { verdict, reason, embedding, ir_embedding, signals, ir_depth, ir_brightness })
     }
 
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
@@ -99,36 +109,61 @@ impl Engine {
             return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
         };
         let a = self.assess()?;
-        if a.verdict != Verdict::Live {
-            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
-        }
-        let Some(probe) = a.embedding else {
-            return Ok(Outcome { granted: false, live: true, score: 0.0, reason: "no face embedding".into() });
+        let thr = irlume_core::PLACEHOLDER_MATCH_THRESHOLD;
+        let best = |probe: &[f32], templates: &[Vec<f32>]| {
+            templates.iter().map(|t| align::cosine(probe, t)).fold(f32::NEG_INFINITY, f32::max)
         };
-        let score = profile
-            .templates
-            .iter()
-            .map(|t| align::cosine(&probe, t))
-            .fold(f32::NEG_INFINITY, f32::max);
-        let granted = score >= irlume_core::PLACEHOLDER_MATCH_THRESHOLD;
-        Ok(Outcome { granted, live: true, score, reason: if granted { "match".into() } else { "below threshold".into() } })
+
+        // Primary path: a visible-light (RGB) face -> full cross-spectrum gate +
+        // RGB recognition.
+        if let Some(probe) = a.embedding {
+            if a.verdict != Verdict::Live {
+                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
+            }
+            let score = best(&probe, &profile.templates);
+            let granted = score >= thr;
+            return Ok(Outcome { granted, live: true, score, reason: if granted { "match (rgb)".into() } else { "below threshold".into() } });
+        }
+
+        // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
+        // recognition (Windows-Hello-style dark operation).
+        if let Some(probe) = a.ir_embedding {
+            if profile.ir_templates.is_empty() {
+                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "dark, but no IR enrollment — re-enroll to enable dark unlock".into() });
+            }
+            let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
+            if verdict != Verdict::Live {
+                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
+            }
+            let score = best(&probe, &profile.ir_templates);
+            let granted = score >= thr;
+            return Ok(Outcome { granted, live: true, score, reason: if granted { "match (ir/dark)".into() } else { "below threshold (ir)".into() } });
+        }
+
+        Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("no face: {}", a.reason) })
     }
 
     /// Capture `want` LIVE samples and store them as `user`'s enrollment. Frames
     /// failing the liveness gate are rejected (no enrolling from a photo).
     pub fn enroll(&mut self, user: &str, want: usize) -> irlume_common::Result<usize> {
         let mut templates = Vec::new();
+        let mut ir_templates = Vec::new();
         let (mut depths, mut brights) = (Vec::new(), Vec::new());
         for _ in 0..(want * 3) {
             if templates.len() >= want {
                 break;
             }
             let a = self.assess()?;
+            // Enroll on a Live (well-lit) capture so both RGB and IR templates
+            // are clean; capture the IR template alongside for dark operation.
             if a.verdict == Verdict::Live {
                 if let Some(e) = a.embedding {
                     templates.push(e.to_vec());
                     depths.push(a.ir_depth);
                     brights.push(a.ir_brightness);
+                    if let Some(ir) = a.ir_embedding {
+                        ir_templates.push(ir.to_vec());
+                    }
                 }
             }
         }
@@ -142,6 +177,7 @@ impl Engine {
         irlume_core::storage::save(&irlume_core::storage::Profile {
             user: user.into(),
             templates,
+            ir_templates,
             ir_depth_samples: depths,
             ir_brightness_samples: brights,
         })?;

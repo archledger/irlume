@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 irlume-common.workspace = true
 thiserror.workspace = true
-# Enable when implementing capture:
-# nokhwa = { workspace = true }
+# V4L2 capture. Chosen over nokhwa: it's the path linhello proved on this exact
+# Hello-class hardware, and builds from cache. nokhwa wraps this crate anyway.
+v4l = "0.14"

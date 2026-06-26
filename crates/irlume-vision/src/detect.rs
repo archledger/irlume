@@ -13,7 +13,7 @@
 use crate::{Detection, Landmarks5};
 
 pub const STRIDES: [usize; 3] = [8, 16, 32];
-pub const INPUT_SIZE: usize = 320; // square letterbox
+pub const INPUT_SIZE: usize = 640; // square letterbox; the 2023mar model's fixed input
 pub const SCORE_THRESHOLD: f32 = 0.6;
 pub const NMS_IOU: f32 = 0.3;
 
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn unletterbox_roundtrip() {
-        let scale = letterbox_scale(640, 480); // 320/640 = 0.5
+        let scale = letterbox_scale(1280, 960); // 640/1280 = 0.5
         assert!((scale - 0.5).abs() < 1e-6);
         let mut d = det([10.0, 20.0, 30.0, 40.0], 0.9);
         d.landmarks[0] = (15.0, 25.0);

@@ -36,6 +36,8 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror  = "2"
 zeroize    = { version = "1", features = ["derive"] }
+tss-esapi  = "7.5"      # TPM 2.0 seal/unseal of the keyring secret
+base64     = "0.22"     # envelope blob encoding
 
 # ONNX inference. `load-dynamic` => libonnxruntime.so is dlopened at runtime, so
 # this builds without the native lib present (you supply it on the target).

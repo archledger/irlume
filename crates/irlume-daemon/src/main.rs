@@ -14,11 +14,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
+    let adapter = env_or("IRLUME_IR_ADAPTER", "/etc/irlume/ir_adapter.onnx");
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
-    let mut engine = match irlume_auth::Engine::load(&det, &model) {
-        Ok(e) => e,
+    let mut engine = match irlume_auth::Engine::load(&det, &model).and_then(|e| e.with_ir_adapter(&adapter)) {
+        Ok(e) => {
+            eprintln!("irlumed: IR adapter {}", if e.has_ir_adapter() { "loaded" } else { "absent (raw IR)" });
+            e
+        }
         Err(e) => {
             eprintln!("irlumed: failed to load models: {e}");
             std::process::exit(1);
@@ -33,8 +37,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // SO_PEERCRED is the real trust boundary; mode 0660 group-gates casual access.
-    set_mode(&socket, 0o660);
+    // SO_PEERCRED is the real trust boundary; 0666 lets any local user *attempt*
+    // auth (login greeters / sudo run as different uids); privileged ops are
+    // still gated by the peer-credential check.
+    set_mode(&socket, 0o666);
     eprintln!("irlumed: listening on {socket}");
 
     for conn in listener.incoming() {
@@ -129,8 +135,91 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
+        // --- keyring unlock (TPM-sealed password) ---------------------------
+        Request::SealPassword { user, password } => {
+            // Arming the keyring: root or the user themselves. `password`
+            // zeroizes on drop, covering every return path.
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to seal password for '{user}'"));
+            }
+            match irlume_core::keyring::seal_password(&user, password.expose()) {
+                Ok(()) => {
+                    eprintln!("irlumed: SealPassword: armed keyring unlock for '{user}'");
+                    Response::PasswordSealed
+                }
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::UnsealPassword { user } => {
+            // The sealed LOGIN password is released ONLY to a root peer (the
+            // login/lockscreen PAM stack runs as root). A non-root caller never
+            // gets it, even with a matching face.
+            if peer.uid != 0 {
+                return Response::Error(format!("unseal_password requires root (peer uid {})", peer.uid));
+            }
+            do_unseal_password(&user, engine)
+        }
+        Request::HasSealedPassword { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to query '{user}'"));
+            }
+            Response::HasPassword(irlume_core::keyring::has_sealed_password(&user))
+        }
+        Request::ForgetPassword { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to forget password for '{user}'"));
+            }
+            match irlume_core::keyring::forget_password(&user) {
+                Ok(()) => Response::PasswordForgotten,
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::ListProfiles { .. } | Request::DeleteProfile { .. } | Request::SelfTest { .. } => {
             Response::Error("unimplemented".into())
+        }
+    }
+}
+
+/// Face-verify `user` and, on a live match, release the TPM-sealed password. The
+/// biometric check happens HERE (inside unseal), so a caller cannot get the
+/// password without a live face that matches the enrolled templates. We log the
+/// decision + cosine score, but never the password or its length.
+fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response {
+    eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
+    if !irlume_core::keyring::has_sealed_password(user) {
+        return Response::Error(format!("no sealed password for '{user}' — run `irlume keyring arm`"));
+    }
+    let outcome = match engine.authenticate(user) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}");
+            return Response::Error(e.to_string());
+        }
+    };
+    if !outcome.granted {
+        eprintln!(
+            "irlumed: UnsealPassword: denied for '{user}' (live={}, score {:.4}: {}) -> password",
+            outcome.live, outcome.score, outcome.reason
+        );
+        return Response::Error(format!("face not granted: {}", outcome.reason));
+    }
+    match irlume_core::keyring::unseal_password(user) {
+        Ok(secret) => {
+            eprintln!(
+                "irlumed: UnsealPassword: OK for '{user}' (score {:.4}), password unsealed",
+                outcome.score
+            );
+            Response::PasswordUnsealed { secret: irlume_common::SecretBytes::new(secret.to_vec()) }
+        }
+        // Face matched but the TPM could not release the secret (e.g. PCR drift
+        // after a Secure Boot config change). This is the line that explains a
+        // face login that nonetheless leaves the keyring locked.
+        Err(e) => {
+            eprintln!(
+                "irlumed: UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}",
+                outcome.score
+            );
+            Response::Error(e.to_string())
         }
     }
 }

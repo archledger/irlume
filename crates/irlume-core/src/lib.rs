@@ -10,6 +10,8 @@
 //! or a random release token) is SEALED IN THE TPM, gated by PCR policy, and
 //! released only on a successful live+match — not the template itself.
 
+pub mod envelope;
+pub mod keyring;
 pub mod matcher;
 pub mod storage;
 pub mod tpm;

@@ -26,6 +26,7 @@ fn main() -> std::process::ExitCode {
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("enroll"), _) => enroll(&args),
         (Some("verify"), _) => verify(&args),
+        (Some("keyring"), sub) => keyring(sub, &args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -77,6 +78,86 @@ fn verify(args: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// `irlume keyring <arm|status|forget>` — manage the TPM-sealed login password
+/// that lets a face login unlock the GNOME-keyring / KWallet. Talks to `irlumed`
+/// over the socket (the daemon owns the TPM + the root-only sealed store).
+fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
+    let user = user_arg(args);
+    match sub {
+        Some("arm") => {
+            println!(
+                "[keyring] Arming face-driven keyring unlock for '{user}'.\n\
+                 Enter this user's LOGIN password (it will be sealed in the TPM, never stored in plaintext)."
+            );
+            // No-echo prompt on a real terminal; fall back to a plain stdin line
+            // when piped (scripts / tests), where /dev/tty isn't available.
+            let pw = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                match rpassword::prompt_password("Login password: ") {
+                    Ok(p) => p,
+                    Err(e) => { eprintln!("[keyring] could not read password: {e}"); return std::process::ExitCode::FAILURE; }
+                }
+            } else {
+                use std::io::BufRead;
+                let mut line = String::new();
+                if std::io::stdin().lock().read_line(&mut line).is_err() {
+                    eprintln!("[keyring] could not read password from stdin"); return std::process::ExitCode::FAILURE;
+                }
+                line.trim_end_matches(['\n', '\r']).to_string()
+            };
+            if pw.is_empty() { eprintln!("[keyring] empty password — aborted"); return std::process::ExitCode::from(2); }
+            let req = irlume_common::Request::SealPassword {
+                user: user.clone(),
+                password: irlume_common::SecretBytes::new(pw.into_bytes()),
+            };
+            match daemon_request(&req) {
+                Ok(irlume_common::Response::PasswordSealed) => {
+                    println!("[keyring] \u{2705} armed. After a face login, your wallet will unlock automatically.");
+                    println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
+                Err(e) => { eprintln!("[keyring] arm failed: {e}"); std::process::ExitCode::FAILURE }
+            }
+        }
+        Some("status") => match daemon_request(&irlume_common::Request::HasSealedPassword { user: user.clone() }) {
+            Ok(irlume_common::Response::HasPassword(armed)) => {
+                println!("[keyring] '{user}': keyring unlock is {}", if armed { "ARMED \u{2705}" } else { "not armed" });
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
+            Err(e) => { eprintln!("[keyring] status failed: {e}"); std::process::ExitCode::FAILURE }
+        },
+        Some("forget") => match daemon_request(&irlume_common::Request::ForgetPassword { user: user.clone() }) {
+            Ok(irlume_common::Response::PasswordForgotten) => {
+                println!("[keyring] '{user}': sealed password erased — keyring unlock disarmed.");
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
+            Err(e) => { eprintln!("[keyring] forget failed: {e}"); std::process::ExitCode::FAILURE }
+        },
+        _ => {
+            eprintln!("usage: irlume keyring <arm|status|forget> [--user U]");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+/// Round-trip one request to `irlumed` over the Unix socket and return its reply.
+fn daemon_request(req: &irlume_common::Request) -> Result<irlume_common::Response, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let path = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| irlume_common::SOCKET_PATH.into());
+    let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e} (is irlumed running?)"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+    let mut line = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    (&stream).write_all(&line).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(&stream);
+    let mut resp = String::new();
+    reader.read_line(&mut resp).map_err(|e| e.to_string())?;
+    serde_json::from_str(resp.trim()).map_err(|e| e.to_string())
 }
 
 fn user_arg(args: &[String]) -> String {

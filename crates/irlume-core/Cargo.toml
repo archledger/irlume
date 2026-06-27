@@ -11,6 +11,5 @@ serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
-# Enable when wiring TPM:
-# tss-esapi = { workspace = true }
-# secrecy   = { workspace = true }
+tss-esapi.workspace = true
+base64.workspace = true

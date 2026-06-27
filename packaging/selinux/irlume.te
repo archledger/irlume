@@ -1,0 +1,45 @@
+policy_module(irlume, 1.0.0)
+
+########################################
+#
+# irlume — let confined login/display-manager domains reach the irlumed socket.
+#
+# irlumed runs as `unconfined_service_t` (a plain systemd service with no
+# custom domain) and binds /run/irlume.sock. The display manager / greeter
+# (plasmalogin, gdm, sddm) runs CONFINED as `xdm_t`, so on a real graphical
+# login SELinux denies it write/connect access to the socket and pam_irlume
+# silently falls through to the password — face login never engages.
+#
+#   avc: denied { write } ... comm="plasmalogin-hel" name="irlume.sock"
+#        scontext=...:xdm_t tcontext=...:var_run_t tclass=sock_file
+#
+# sudo and the KDE lock screen work without this module because both run in
+# the user's UNCONFINED domain, which is already allowed.
+#
+# We give the socket its own type via a name-based transition so the grant to
+# xdm_t is scoped to *our* socket rather than every var_run_t sock_file.
+#
+########################################
+
+require {
+	type xdm_t;
+	type unconfined_service_t;
+	type var_run_t;
+	class sock_file { create write unlink getattr setattr };
+	class unix_stream_socket connectto;
+}
+
+# Dedicated label for /run/irlume.sock.
+type irlume_runtime_t;
+files_pid_file(irlume_runtime_t)
+
+# When irlumed (unconfined_service_t) binds a sock_file named "irlume.sock"
+# under /run (var_run_t), label it irlume_runtime_t instead of var_run_t.
+type_transition unconfined_service_t var_run_t:sock_file irlume_runtime_t "irlume.sock";
+
+# irlumed manages its own socket.
+allow unconfined_service_t irlume_runtime_t:sock_file { create write unlink getattr setattr };
+
+# The display manager / greeter may connect to irlumed to do face auth at login.
+allow xdm_t irlume_runtime_t:sock_file write;
+allow xdm_t unconfined_service_t:unix_stream_socket connectto;

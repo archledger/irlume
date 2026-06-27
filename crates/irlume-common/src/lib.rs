@@ -8,9 +8,52 @@
 //! requests such as enrollment.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Unix domain socket the daemon listens on. Root-owned, mode 0660, group-gated.
 pub const SOCKET_PATH: &str = "/run/irlume.sock";
+
+/// A byte secret (e.g. the login password) that zeroizes on drop and whose
+/// `Debug` is redacted, so it never lingers on the daemon/PAM heap longer than
+/// needed nor leaks into a log line. `#[serde(transparent)]` so it ships as a
+/// plain byte array over the IPC channel.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        SecretBytes(bytes)
+    }
+    /// Borrow the raw bytes. Callers must not copy them into a non-zeroizing buffer.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Zeroize for SecretBytes {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretBytes([{} bytes redacted])", self.0.len())
+    }
+}
 
 /// Where models live at runtime (bundled via `include_bytes!` in `irlume-vision`,
 /// this path is only for optional overrides / operator-supplied weights).
@@ -36,6 +79,22 @@ pub enum Request {
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.
     Ping,
+
+    // --- keyring unlock (TPM-sealed password) -------------------------------
+    /// Seal `user`'s login password in the TPM so a later face login can release
+    /// it to unlock the GNOME-keyring / KWallet. PRIVILEGED: root or `user`.
+    SealPassword { user: String, password: SecretBytes },
+    /// Face-verify `user` and, on a live match, release the TPM-sealed password
+    /// so the caller can set it as `PAM_AUTHTOK` (login keyring unlock).
+    /// PRIVILEGED: root only — the sealed login password is never released to a
+    /// non-root peer.
+    UnsealPassword { user: String },
+    /// Whether `user` has a sealed password armed (for status / CLI / the
+    /// delete-erases-it warning). Unprivileged: root or `user`.
+    HasSealedPassword { user: String },
+    /// Erase `user`'s sealed password (disarms keyring unlock). PRIVILEGED:
+    /// root or `user`.
+    ForgetPassword { user: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +123,16 @@ pub enum Response {
     SelfTest { passed: bool, detail: String },
     Pong,
     Error(String),
+
+    // --- keyring unlock responses -------------------------------------------
+    /// The password was sealed (`SealPassword`).
+    PasswordSealed,
+    /// Face matched and the TPM released the password (`UnsealPassword`).
+    PasswordUnsealed { secret: SecretBytes },
+    /// Whether a sealed password exists (`HasSealedPassword`).
+    HasPassword(bool),
+    /// The sealed password was erased (`ForgetPassword`).
+    PasswordForgotten,
 }
 
 /// Crate-wide error type.
@@ -77,6 +146,10 @@ pub enum Error {
     NotAuthorized(String),
     #[error("hardware: {0}")]
     Hardware(String),
+    #[error("tpm: {0}")]
+    Tpm(String),
+    #[error("policy: {0}")]
+    Policy(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

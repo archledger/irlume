@@ -18,7 +18,14 @@ fn main() {
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
-    let mut engine = match irlume_auth::Engine::load(&det, &model).and_then(|e| e.with_ir_adapter(&adapter)) {
+    // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
+    // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
+    let (rgb_dev, ir_dev) = irlume_auth::select_pair();
+    eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev}");
+    let mut engine = match irlume_auth::Engine::load(&det, &model)
+        .map(|e| e.with_devices(&rgb_dev, &ir_dev))
+        .and_then(|e| e.with_ir_adapter(&adapter))
+    {
         Ok(e) => {
             eprintln!("irlumed: IR adapter {}", if e.has_ir_adapter() { "loaded" } else { "absent (raw IR)" });
             e

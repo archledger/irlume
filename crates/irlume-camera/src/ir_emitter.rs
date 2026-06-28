@@ -52,6 +52,13 @@ fn known_control(card: &str) -> Option<EmitterControl> {
     if card.contains("N930W") {
         return Some(EmitterControl { unit: 4, selector: 6, payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0] });
     }
+    // Other external Hello cameras (e.g. Logitech Brio 046d:085e/0919) are NOT
+    // hard-coded: their XU unit/selector/payload is firmware-specific with no
+    // on-hardware verification here, and some units fire the emitter automatically
+    // when the IR stream opens (no XU write needed). Configure such cameras with
+    // `linux-enable-ir-emitter` and set `IRLUME_IR_EMITTER=unit:sel:payload` — the
+    // env override above takes precedence over this table. A verified entry is
+    // welcome once confirmed on the device.
     None
 }
 

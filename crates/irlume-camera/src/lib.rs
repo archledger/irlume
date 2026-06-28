@@ -165,11 +165,13 @@ fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathB
 ///
 /// Always enforced: the device must resolve through sysfs to a physical bus
 /// (USB/PCI), never a virtual/platform node — the anti-injection gate, needs no
-/// per-host config. Additionally, when `IRLUME_CAMERA_PIN` (`"vid:pid"` lowercase
-/// hex, e.g. `3277:0059`) is set the USB descriptor must match; when
-/// `IRLUME_CAMERA_REQUIRE_FIXED=1` the `removable` attribute must read `fixed`
-/// (rejects a hot-plugged external camera — supplementary, since `removable` is
-/// frequently `unknown` even for legitimate devices).
+/// per-host config. Additionally, when `IRLUME_CAMERA_PIN` is set the USB
+/// descriptor must be in the allowlist — a comma-separated set of `"vid:pid"`
+/// lowercase hex (e.g. `3277:0059,046d:085e` to allow the built-in *and* an
+/// external Logitech Brio); when `IRLUME_CAMERA_REQUIRE_FIXED=1` the `removable`
+/// attribute must read `fixed` (rejects a hot-plugged external camera —
+/// supplementary, and intentionally *off* by default so external Hello cameras
+/// work; `removable` is also frequently `unknown` even for legitimate devices).
 pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");
@@ -185,23 +187,17 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
         )));
     }
     let dev_dir = find_attr_dir(&real, "idVendor");
-    if let Ok(pin) = std::env::var("IRLUME_CAMERA_PIN") {
-        let want = pin.trim().to_lowercase();
-        let got = dev_dir.as_ref().and_then(|d| {
-            let v = std::fs::read_to_string(d.join("idVendor")).ok()?;
-            let pr = std::fs::read_to_string(d.join("idProduct")).ok()?;
-            Some(format!("{}:{}", v.trim(), pr.trim()))
-        });
-        match got {
-            Some(g) if g == want => {}
+    if let Some(allow) = pin_allowlist() {
+        match dev_dir.as_ref().and_then(|d| read_vidpid(d)) {
+            Some(g) if allow.iter().any(|w| *w == g) => {}
             Some(g) => {
                 return Err(Error::Hardware(format!(
-                    "{device}: camera {g} != pinned {want} — refusing"
+                    "{device}: camera {g} not in pinned set {allow:?} — refusing"
                 )))
             }
             None => {
                 return Err(Error::Hardware(format!(
-                    "{device}: no USB descriptor to match pin {want} — refusing"
+                    "{device}: no USB descriptor to match pin {allow:?} — refusing"
                 )))
             }
         }
@@ -219,6 +215,90 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parse `IRLUME_CAMERA_PIN` into a lowercase `"vid:pid"` allowlist, or `None`
+/// when unset/empty. Comma-separated so multiple cameras (built-in + external)
+/// can be permitted. Pure (takes the raw value) so it is unit-testable.
+fn parse_pin_allowlist(raw: &str) -> Option<Vec<String>> {
+    let list: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+fn pin_allowlist() -> Option<Vec<String>> {
+    parse_pin_allowlist(&std::env::var("IRLUME_CAMERA_PIN").ok()?)
+}
+
+/// `"vid:pid"` (lowercase hex) for a USB device dir, if it carries descriptors.
+fn read_vidpid(dev_dir: &std::path::Path) -> Option<String> {
+    let v = std::fs::read_to_string(dev_dir.join("idVendor")).ok()?;
+    let p = std::fs::read_to_string(dev_dir.join("idProduct")).ok()?;
+    Some(format!("{}:{}", v.trim(), p.trim()))
+}
+
+/// The sysfs USB-device dir shared by all interfaces (RGB + IR) of one physical
+/// camera — two `/dev/videoN` nodes with the same id are the same camera.
+fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
+    let node = device.strip_prefix("/dev/").unwrap_or(device);
+    let real = std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device")).ok()?;
+    find_attr_dir(&real, "idVendor")
+}
+
+/// Select the RGB+IR camera pair to authenticate with. Supports the built-in
+/// Hello camera *and* external USB Hello webcams (Logitech Brio, NexiGo HelloCam)
+/// without hard-coded node numbers. Precedence:
+///   1. Explicit `IRLUME_RGB_DEVICE` + `IRLUME_IR_DEVICE`.
+///   2. Auto-discovery: a Hello camera is one physical device exposing *both* an
+///      RGB and an IR node. Ranked: a device matching `IRLUME_CAMERA_PIN` wins,
+///      else a built-in (`removable=fixed`) wins, else the first pair found.
+///   3. Compiled defaults (`video0`/`video2`).
+pub fn select_pair() -> (String, String) {
+    if let (Ok(r), Ok(i)) = (
+        std::env::var("IRLUME_RGB_DEVICE"),
+        std::env::var("IRLUME_IR_DEVICE"),
+    ) {
+        if !r.trim().is_empty() && !i.trim().is_empty() {
+            return (r, i);
+        }
+    }
+    // Group discovered nodes by physical camera → (rgb nodes, ir nodes).
+    let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
+        Default::default();
+    for (path, role) in discover_nodes() {
+        if let Some(id) = physical_device_id(&path) {
+            let e = groups.entry(id).or_default();
+            match role {
+                Role::Rgb => e.0.push(path),
+                Role::Ir => e.1.push(path),
+                _ => {}
+            }
+        }
+    }
+    let allow = pin_allowlist();
+    let (mut best, mut best_rank): (Option<(String, String)>, i32) = (None, -1);
+    for (id, (rgbs, irs)) in &groups {
+        if rgbs.is_empty() || irs.is_empty() {
+            continue; // not a Hello camera (needs both spectra)
+        }
+        let vidpid = read_vidpid(id);
+        let fixed = std::fs::read_to_string(id.join("removable"))
+            .map(|s| s.trim() == "fixed")
+            .unwrap_or(false);
+        let rank = match (&allow, &vidpid) {
+            (Some(a), Some(v)) if a.iter().any(|w| w == v) => 3,
+            _ if fixed => 2,
+            _ => 1,
+        };
+        if rank > best_rank {
+            best_rank = rank;
+            best = Some((rgbs[0].clone(), irs[0].clone()));
+        }
+    }
+    best.unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
 }
 
 /// Capture one AE-warmed RGB frame from a V4L2 device (YUYV → RGB8).
@@ -308,6 +388,16 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     }
     if std::env::var("IRLUME_DEBUG_IR").is_ok() {
         eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
+    }
+    // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
+    // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
+    // don't have a table entry for. Guide the user to configure it.
+    if !lit && best_mean >= 0.0 && best_mean < 35.0 {
+        eprintln!(
+            "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter — for an \
+             external Hello camera run `linux-enable-ir-emitter configure`, then set \
+             IRLUME_IR_EMITTER=unit:sel:b,b,... (or IRLUME_IR_EMITTER=off to silence)"
+        );
     }
     let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
     Ok(Frame { width: w, height: h, spectrum: Spectrum::Ir, data: grey })
@@ -426,5 +516,19 @@ mod tests {
         assert!(!is_physical_camera_path(
             "/sys/devices/virtual/video4linux/video0"
         ));
+    }
+
+    #[test]
+    fn pin_allowlist_parses_multi_camera_set() {
+        // Single camera.
+        assert_eq!(parse_pin_allowlist("3277:0059"), Some(vec!["3277:0059".into()]));
+        // Built-in + external Brio, with spacing/case normalized.
+        assert_eq!(
+            parse_pin_allowlist(" 3277:0059, 046D:085E "),
+            Some(vec!["3277:0059".into(), "046d:085e".into()])
+        );
+        // Empty / unset → no pin (physical-bus check still applies).
+        assert_eq!(parse_pin_allowlist(""), None);
+        assert_eq!(parse_pin_allowlist("  ,  "), None);
     }
 }

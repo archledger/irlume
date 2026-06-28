@@ -405,6 +405,21 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
         return std::process::ExitCode::FAILURE;
     }
 
+    // Optional: dump the raw 512-D embeddings (one per line) for offline analysis
+    // — e.g. apply a debiasing adapter and recompute FAR per demographic group.
+    if let Some(out) = flag(args, "--export") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(out) {
+            for e in &embs {
+                let line: Vec<String> = e.iter().map(|v| format!("{v:.6}")).collect();
+                let _ = writeln!(f, "{}", line.join(" "));
+            }
+            println!("[farbench] exported {} embeddings -> {out}", embs.len());
+        } else {
+            eprintln!("[farbench] export failed to create {out}");
+        }
+    }
+
     // All-pairs impostor cosines into a histogram over [-1, 1] (bin width 0.001).
     const BINS: usize = 2000;
     let mut hist = vec![0u64; BINS];

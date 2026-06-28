@@ -226,6 +226,13 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     };
     let max_persons: usize = flag(args, "--max-persons").and_then(|s| s.parse().ok()).unwrap_or(80);
 
+    // Impostor-only / FALSE-ACCEPT mode: a directory of distinct-identity images
+    // (e.g. SFHQ synthetic faces — every file is a different person), so every
+    // pair is an impostor pair. Measures FAR only (no genuine pairs / FRR).
+    if args.iter().any(|a| a == "--impostor-only") {
+        return farbench(dir, det_path, model, args);
+    }
+
     // Collect *.bmp grouped by person (prefix before first '-').
     let mut by_person: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = Default::default();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -334,6 +341,118 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     while s <= 0.95 { if far(s) <= 1e-4 { t14 = s; break; } s += 0.005; }
     println!("[FAR≤1e-4] threshold {t14:.3} -> FRR {:.4} (reject rate for genuine at NIST-grade FAR)", frr(t14));
     std::process::ExitCode::SUCCESS
+}
+
+/// Large-scale RGB FALSE-ACCEPT benchmark (the visible-light sibling of the IR
+/// `irbench`). Every image under `--dir` is treated as a distinct identity — true
+/// for SFHQ synthetic faces — so every pair is an impostor pair. Embeds each face
+/// through the real auth pipeline (YuNet → align → AuraFace) and reports the
+/// impostor cosine tail + FAR at the auth thresholds + the threshold achieving
+/// NIST-grade FAR ≤ 1e-4. Histogram-based, so it scales to millions of pairs
+/// without storing them. FAR only — genuine/FRR come from live captures, not here.
+fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::process::ExitCode {
+    let max_images: usize = flag(args, "--max-images").and_then(|s| s.parse().ok()).unwrap_or(20_000);
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    collect_images(std::path::Path::new(dir), &mut files);
+    files.sort(); // deterministic sample
+    files.truncate(max_images);
+    if files.len() < 2 {
+        eprintln!("[farbench] need >=2 images under {dir} (found {})", files.len());
+        return std::process::ExitCode::FAILURE;
+    }
+    println!("[farbench] {} images; embedding (YuNet→align→AuraFace)…", files.len());
+
+    let mut det = match irlume_vision::Detector::load_from_file(det_path) {
+        Ok(d) => d, Err(e) => { eprintln!("det load: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+    let mut emb = match irlume_vision::Embedder::load_from_file(model) {
+        Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+
+    let mut embs: Vec<[f32; irlume_vision::EMBED_DIM]> = Vec::with_capacity(files.len());
+    let mut nodet = 0usize;
+    for (i, f) in files.iter().enumerate() {
+        if i > 0 && i % 1000 == 0 {
+            println!("[farbench]   {}/{} embedded ({} no-face)…", embs.len(), i, nodet);
+        }
+        let Ok(img) = image::open(f) else { continue };
+        let rgb = img.to_rgb8();
+        let (w, h) = rgb.dimensions();
+        let data = rgb.into_raw();
+        let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
+        let Ok(faces) = det.detect(&view) else { continue };
+        let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { nodet += 1; continue };
+        if let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
+            if let Ok(e) = emb.embed(&chip) {
+                embs.push(e);
+            }
+        }
+    }
+    println!("[farbench] embedded {} faces ({} images had no detectable face)", embs.len(), nodet);
+    if embs.len() < 2 {
+        eprintln!("[farbench] too few embeddings for pairwise stats");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    // All-pairs impostor cosines into a histogram over [-1, 1] (bin width 0.001).
+    const BINS: usize = 2000;
+    let mut hist = vec![0u64; BINS];
+    let mut total: u64 = 0;
+    let mut sum_c: f64 = 0.0;
+    for i in 0..embs.len() {
+        for j in (i + 1)..embs.len() {
+            let c = irlume_vision::align::cosine(&embs[i], &embs[j]);
+            let b = (((c + 1.0) * 0.5 * BINS as f32) as usize).min(BINS - 1);
+            hist[b] += 1;
+            total += 1;
+            sum_c += c as f64;
+        }
+    }
+
+    // suffix[k] = #pairs in bins >= k, i.e. cos >= -1 + 2k/BINS → FAR numerator.
+    let mut suffix = vec![0u64; BINS + 1];
+    for k in (0..BINS).rev() { suffix[k] = suffix[k + 1] + hist[k]; }
+    let far_at = |t: f32| -> f64 {
+        let k = (((t + 1.0) * 0.5 * BINS as f32).ceil() as i64).clamp(0, BINS as i64) as usize;
+        suffix[k] as f64 / total as f64
+    };
+    let pct = |p: f64| -> f32 {
+        let target = (p * total as f64) as u64;
+        let mut cum = 0u64;
+        for k in 0..BINS { cum += hist[k]; if cum >= target { return -1.0 + 2.0 * k as f32 / BINS as f32; } }
+        1.0
+    };
+    let max_imp = (0..BINS).rev().find(|&k| hist[k] > 0)
+        .map(|k| -1.0 + 2.0 * (k as f32 + 1.0) / BINS as f32).unwrap_or(1.0);
+
+    println!("[impostor] pairs={total}  mean {:.3}  p99 {:.3}  p99.9 {:.3}  p99.99 {:.3}  max {:.3}",
+        sum_c / total as f64, pct(0.99), pct(0.999), pct(0.9999), max_imp);
+    println!("[FAR sweep]");
+    for t in [0.40f32, 0.45, 0.50, 0.55, 0.60] {
+        println!("  thr {t:.2}: FAR {:.6}  (1 in {:.0})", far_at(t),
+            if far_at(t) > 0.0 { 1.0 / far_at(t) } else { f64::INFINITY });
+    }
+    let mut t14 = 1.0f32; let mut s = 0.30f32;
+    while s <= 0.95 { if far_at(s) <= 1e-4 { t14 = s; break; } s += 0.005; }
+    println!("[FAR≤1e-4] threshold {t14:.3}  (RGB auth threshold 0.50 → FAR {:.6})", far_at(0.50));
+    std::process::ExitCode::SUCCESS
+}
+
+/// Recursively collect jpg/jpeg/png/bmp files under `dir`.
+fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_images(&p, out);
+        } else if p.extension().and_then(|x| x.to_str())
+            .map(|x| matches!(x.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "bmp"))
+            .unwrap_or(false)
+        {
+            out.push(p);
+        }
+    }
 }
 
 /// Center-to-edge IR brightness ratio inside a face bbox (anti-flat depth cue):

@@ -8,6 +8,10 @@ formal certification stays optional.
 - **FMR ≤ 1×10⁻⁴** across all demographic groups, at a single **fixed** threshold
   (per ISO/IEC 19795-1). AuraFace's score scale differs from buffalo_l — derive
   the threshold from a genuine/impostor ROC; do not port linhello's 0.60.
+  **Measured status:** AuraFace shows a ~10× per-group FAR spread; a single
+  threshold meeting FMR ≤ 1×10⁻⁴ for every group needs ≈0.69. The gap is bounded
+  by a conservative fixed threshold + mandatory fallback, never by relaxing FAR.
+  See [`FAIRNESS.md`](FAIRNESS.md) for the per-group table and policy.
 - **PAD mandatory**; target **IAPAR < 0.07** (ISO/IEC 30107-3 Clause 13).
 - **Biometric is one MFA factor only**, with a mandatory non-biometric fallback.
 - No network calls in the auth loop; templates/secrets local, root-owned 0600.

@@ -95,6 +95,13 @@ pub enum Request {
     /// Erase `user`'s sealed password (disarms keyring unlock). PRIVILEGED:
     /// root or `user`.
     ForgetPassword { user: String },
+    /// Re-seal `user`'s login password against the *current* PCR policy, but
+    /// ONLY if a sealed password is already armed (never auto-arms a fresh user)
+    /// and only if it actually changed (the PCRs moved, e.g. a dbx/Secure Boot
+    /// update, or the user changed their password). This is the auto-heal hook
+    /// fired from the login session phase with the freshly-typed/unsealed
+    /// `PAM_AUTHTOK`. PRIVILEGED: root or `user`.
+    ResealPassword { user: String, password: SecretBytes },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +140,11 @@ pub enum Response {
     HasPassword(bool),
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
+    /// Outcome of a `ResealPassword`. `changed` is true when the envelope was
+    /// (re-)written: either the old one no longer unsealed (PCRs moved) or the
+    /// password differed. `armed` is false when the user has no sealed password
+    /// at all, in which case nothing was done (we never auto-arm).
+    PasswordResealed { armed: bool, changed: bool },
 }
 
 /// Crate-wide error type.

@@ -53,6 +53,51 @@ pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     tpm::unseal(&env)
 }
 
+/// Outcome of [`reseal_password`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reseal {
+    /// No sealed password is armed for this user — nothing was done. We never
+    /// auto-arm from the login hook; arming stays an explicit `keyring arm`.
+    NotArmed,
+    /// The existing envelope already unseals to this exact password under the
+    /// current PCR policy — left untouched (the steady-state on every login).
+    Unchanged,
+    /// The envelope was re-sealed against the current PCR policy. Either it no
+    /// longer unsealed (PCRs moved — dbx/Secure Boot update) or the password
+    /// differed (the user changed it). This is the self-heal.
+    Resealed,
+}
+
+/// Self-heal hook: re-seal `user`'s login password against the *current* PCR
+/// policy, but only when it's both armed and actually stale.
+///
+/// Called from the login session phase with the freshly-typed (or just-unsealed)
+/// `PAM_AUTHTOK`. It deliberately writes nothing in the common case:
+///   * not armed            -> `NotArmed` (never auto-arm)
+///   * unseals to same `pw` -> `Unchanged` (PCRs still match, password same)
+///   * unseal fails OR diff  -> reseal, `Resealed`
+///
+/// The "unseal fails" branch is what fixes a dbx/Secure-Boot update: the old
+/// envelope's PCR7 policy no longer satisfies, so we rebind to today's PCRs
+/// using the password the user just proved they know.
+pub fn reseal_password(user: &str, password: &[u8]) -> Result<Reseal> {
+    if password.is_empty() {
+        return Err(Error::Protocol("refusing to reseal an empty password".into()));
+    }
+    if !has_sealed_password(user) {
+        return Ok(Reseal::NotArmed);
+    }
+    // If the current envelope still unseals to the same secret, there is nothing
+    // to do — don't churn the TPM on every single login.
+    if let Ok(current) = unseal_password(user) {
+        if current.as_slice() == password {
+            return Ok(Reseal::Unchanged);
+        }
+    }
+    seal_password(user, password)?;
+    Ok(Reseal::Resealed)
+}
+
 /// Whether `user` has a sealed password armed.
 pub fn has_sealed_password(user: &str) -> bool {
     envelope_path(user).exists()
@@ -96,6 +141,32 @@ mod tests {
         assert_eq!(&*got, pw);
         forget_password("tester").expect("forget");
         assert!(!has_sealed_password("tester"));
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    /// reseal: NotArmed when nothing sealed, Unchanged when same pw still
+    /// unseals, Resealed when the password differs. The PCR-moved -> Resealed
+    /// branch can't be exercised without changing PCRs, but the differ branch
+    /// hits the same reseal path.
+    #[test]
+    #[ignore = "requires real TPM (/dev/tpmrm0)"]
+    fn reseal_only_when_stale() {
+        let dir = "/tmp/irlume-kr-reseal";
+        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Not armed -> nothing happens.
+        assert_eq!(reseal_password("rt", b"whatever").unwrap(), Reseal::NotArmed);
+
+        seal_password("rt", b"first-password").expect("arm");
+        // Same password still unseals under current PCRs -> no rewrite.
+        assert_eq!(reseal_password("rt", b"first-password").unwrap(), Reseal::Unchanged);
+        // Different password (simulates a password change) -> reseal.
+        assert_eq!(reseal_password("rt", b"second-password").unwrap(), Reseal::Resealed);
+        // And it now unseals to the new one.
+        assert_eq!(&*unseal_password("rt").unwrap(), b"second-password");
+
+        forget_password("rt").expect("forget");
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 }

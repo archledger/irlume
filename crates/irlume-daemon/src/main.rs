@@ -174,6 +174,30 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
+        Request::ResealPassword { user, password } => {
+            // Auto-heal hook from the login session phase. Same authz as arming
+            // (root or the user), but it can only ever *re-seal an already armed*
+            // password against today's PCRs — it never arms a fresh user, so a
+            // self-peer cannot use it to plant a sealed password they didn't set.
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to reseal password for '{user}'"));
+            }
+            match irlume_core::keyring::reseal_password(&user, password.expose()) {
+                Ok(outcome) => {
+                    use irlume_core::keyring::Reseal;
+                    if outcome == Reseal::Resealed {
+                        eprintln!(
+                            "irlumed: ResealPassword: re-bound '{user}' to current PCRs (self-heal after PCR/password change)"
+                        );
+                    }
+                    Response::PasswordResealed {
+                        armed: outcome != Reseal::NotArmed,
+                        changed: outcome == Reseal::Resealed,
+                    }
+                }
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::ListProfiles { .. } | Request::DeleteProfile { .. } | Request::SelfTest { .. } => {
             Response::Error("unimplemented".into())
         }

@@ -24,6 +24,31 @@ use std::path::Path;
 /// Current envelope schema version for newly written envelopes.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// How the sealed object's `authPolicy` is satisfied at unseal time. Older
+/// envelopes have no `policy` field and default to [`PolicyKind::PcrLiteral`],
+/// so they keep loading unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum PolicyKind {
+    /// Tier 3 (universal): a literal `PolicyPCR` digest over `pcrs`. Breaks on
+    /// any bound-PCR drift; the auto-reseal-on-login hook heals it.
+    #[default]
+    PcrLiteral,
+    /// Tier 1 (UKI/systemd-boot): `PolicyAuthorize` over a signing public key.
+    /// Any PCR state for which a valid systemd-issued signature exists unseals,
+    /// so kernel updates don't require a reseal.
+    Authorized {
+        pubkey_pem: String,
+        #[serde(with = "b64", default, skip_serializing_if = "Vec::is_empty")]
+        policy_ref: Vec<u8>,
+    },
+    /// Tier 2 (GRUB2 + systemd-pcrlock): `PolicyAuthorizeNV` against a pcrlock
+    /// NV index that holds the currently-valid PCR policy. `make-policy`
+    /// re-predicts the index across Secure Boot / firmware updates, so PCR 7 /
+    /// dbx changes don't require a reseal.
+    PcrlockNv { nv_index: u32 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PcrValue {
     pub pcr: u32,
@@ -34,6 +59,10 @@ pub struct PcrValue {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SealedEnvelope {
     pub version: u32,
+    /// How the object's policy is satisfied. Absent in v1 literal envelopes →
+    /// defaults to [`PolicyKind::PcrLiteral`].
+    #[serde(default)]
+    pub policy: PolicyKind,
     /// PCRs replayed via `PolicyPCR` at unseal time.
     pub pcrs: Vec<u32>,
     #[serde(with = "b64")]
@@ -88,6 +117,7 @@ mod tests {
     fn envelope_roundtrips_through_json() {
         let env = SealedEnvelope {
             version: CURRENT_VERSION,
+            policy: PolicyKind::PcrLiteral,
             pcrs: vec![7],
             public: vec![1, 2, 3],
             private: vec![4, 5, 6],
@@ -96,8 +126,19 @@ mod tests {
         let s = serde_json::to_string(&env).unwrap();
         let back: SealedEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(back.pcrs, env.pcrs);
+        assert_eq!(back.policy, PolicyKind::PcrLiteral);
         assert_eq!(back.public, env.public);
         assert_eq!(back.private, env.private);
         assert_eq!(back.version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn legacy_envelope_without_policy_defaults_to_literal() {
+        // A v1 envelope written before the `policy` field existed must still
+        // load and be treated as a literal-PCR seal.
+        let json = r#"{"version":1,"pcrs":[7],"public":"AQID","private":"BAUG"}"#;
+        let env: SealedEnvelope = serde_json::from_str(json).unwrap();
+        assert_eq!(env.policy, PolicyKind::PcrLiteral);
+        assert_eq!(env.pcrs, vec![7]);
     }
 }

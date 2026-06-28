@@ -13,8 +13,10 @@
 pub mod envelope;
 pub mod keyring;
 pub mod matcher;
+pub mod pcrsig;
 pub mod storage;
 pub mod tpm;
+pub mod tpm_pcrlock;
 
 /// Interim, evidence-based — refine with cross-session ROC for FMR<=1e-4.
 /// Measured: impostor (50-face eval, 1225 pairs) mean 0.105 / p99 0.279 / MAX

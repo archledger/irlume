@@ -21,8 +21,9 @@
 //! expose only a handful of session/transient-object slots, so leaking them
 //! bricks the daemon after a few operations.
 
-use crate::envelope::{PcrValue, SealedEnvelope};
+use crate::envelope::{PcrValue, PolicyKind, SealedEnvelope};
 use irlume_common::{Error, Result};
+use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
 use std::str::FromStr;
 use zeroize::Zeroizing;
@@ -36,15 +37,20 @@ use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::resource_handles::{Hierarchy, Provision};
 use tss_esapi::interface_types::session_handles::{AuthSession, PolicySession};
 use tss_esapi::structures::{
-    Auth, Digest, KeyedHashScheme, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, Private,
-    Public, PublicBuilder, PublicKeyedHashParameters, PublicRsaParameters, RsaExponent, RsaScheme,
-    SensitiveData, SymmetricDefinition, SymmetricDefinitionObject,
+    Auth, Digest, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder, PcrSlot,
+    Private, Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters, PublicRsaParameters,
+    RsaExponent, RsaScheme, RsaSignature, SensitiveData, Signature, SymmetricDefinition,
+    SymmetricDefinitionObject,
 };
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::ESYS_TR;
 use tss_esapi::{Context, TctiNameConf};
 
 const TCTI_DEFAULT: &str = "device:/dev/tpmrm0";
+
+/// TPM2_PolicyAuthorize command code (big-endian), folded into the authorized
+/// policy digest per the TPM2 spec.
+const TPM_CC_POLICY_AUTHORIZE: [u8; 4] = [0x00, 0x00, 0x01, 0x6A];
 
 /// PCRs the secret is bound to by default: PCR 7 = UEFI Secure Boot policy.
 /// Stable across kernel updates; moves only on Secure Boot key / dbx changes.
@@ -343,9 +349,27 @@ fn with_srk<T>(
     result
 }
 
-/// Seal `secret` under a literal `PolicyPCR` over the configured PCRs
-/// ([`policy_pcrs`]).
+/// Seal `secret` under the best policy available on this machine:
+///   * Tier 1 — if systemd has published signed-PCR artifacts (UKI / systemd-boot),
+///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
+///     (typically PCR 11). Survives kernel updates with no reseal.
+///   * Tier 3 — otherwise a literal `PolicyPCR` over the configured PCRs
+///     ([`policy_pcrs`], default PCR 7). The login auto-reseal hook heals drift.
+///
+/// (Tier 2, pcrlock `PolicyAuthorizeNV`, is selected explicitly via
+/// [`seal_pcrlock`] when a pcrlock policy has been provisioned — it is not
+/// auto-chosen here because it requires admin setup.)
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
+    if crate::pcrsig::signed_policy_available() {
+        match seal_authorized(secret) {
+            Ok(env) => return Ok(env),
+            // Don't fail arming because the signed path had a problem — fall back
+            // to the universally-available literal seal.
+            Err(e) => eprintln!(
+                "irlume: signed-PCR seal unavailable ({e}); falling back to literal PCR seal"
+            ),
+        }
+    }
     seal_with_pcrs(secret, &policy_pcrs())
 }
 
@@ -374,6 +398,7 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
 
         Ok(SealedEnvelope {
             version: crate::envelope::CURRENT_VERSION,
+            policy: PolicyKind::PcrLiteral,
             pcrs: pcrs.clone(),
             public: created.out_public.marshall().map_err(tpm_err)?,
             private: created.out_private.to_vec(),
@@ -382,9 +407,23 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     })
 }
 
-/// Release the sealed secret iff the bound PCR policy is satisfied.
-#[allow(clippy::redundant_closure_call)]
+/// Release the sealed secret iff the bound policy is satisfied. Dispatches on the
+/// envelope's [`PolicyKind`].
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+    match &env.policy {
+        PolicyKind::PcrLiteral => unseal_literal(env),
+        PolicyKind::Authorized {
+            pubkey_pem,
+            policy_ref,
+        } => unseal_authorized(env, pubkey_pem, policy_ref),
+        PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
+    }
+}
+
+/// Unseal a literal-`PolicyPCR` envelope: replay the bound PCRs into a policy
+/// session and unseal.
+#[allow(clippy::redundant_closure_call)]
+fn unseal_literal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     let mut ctx = open_context()?;
 
     with_srk(&mut ctx, |ctx, srk| {
@@ -414,6 +453,258 @@ pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
         let _ = ctx.flush_context(sealed_handle.into());
         result
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: signed-PCR PolicyAuthorize (systemd UKI / systemd-boot).
+// ---------------------------------------------------------------------------
+
+/// Seal `secret` under a `PolicyAuthorize` over systemd's PCR-signing public
+/// key. The object's `authPolicy` commits only to that key's Name (not to any
+/// concrete PCR value), so any PCR state for which systemd has shipped a valid
+/// signature can unseal — the basis for surviving kernel/UKI updates without a
+/// reseal. Binds exactly the PCRs systemd signs (read from the signature file,
+/// typically PCR 11). Uses an empty `policyRef`, matching systemd's convention.
+fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
+    let pubkey_pem = crate::pcrsig::load_pubkey_pem()?;
+    let pcrs = crate::pcrsig::signed_pcrs(crate::pcrsig::DEFAULT_BANK)
+        .ok_or_else(|| Error::Policy("signed-PCR file has no usable signatures".into()))?;
+    let policy_ref: Vec<u8> = Vec::new();
+
+    let mut ctx = open_context()?;
+    let pcr_values = read_pcr_values(&mut ctx, &pcrs)?;
+
+    // The authorized policy depends only on the signing key's Name + policyRef.
+    let key_name = {
+        let key_handle = load_external_pubkey(&mut ctx, &pubkey_pem)?;
+        let name = ctx.tr_get_name(key_handle.into()).map_err(tpm_err);
+        let _ = ctx.flush_context(key_handle.into());
+        name?
+    };
+    let auth_policy = authorize_policy_digest(key_name.value(), &policy_ref)?;
+
+    with_srk(&mut ctx, |ctx, srk| {
+        let tmpl = sealed_template(auth_policy.clone())?;
+        let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
+        let created = ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.create(*srk, tmpl, None, Some(sensitive), None, None)
+            })
+            .map_err(tpm_err)?;
+
+        Ok(SealedEnvelope {
+            version: crate::envelope::CURRENT_VERSION,
+            policy: PolicyKind::Authorized {
+                pubkey_pem: pubkey_pem.clone(),
+                policy_ref: policy_ref.clone(),
+            },
+            pcrs: pcrs.clone(),
+            public: created.out_public.marshall().map_err(tpm_err)?,
+            private: created.out_private.to_vec(),
+            pcr_values: pcr_values.clone(),
+        })
+    })
+}
+
+/// Unseal a `PolicyAuthorize`-bound object: replay `PolicyPCR` over the current
+/// PCRs, find a signature whose authorized policy matches the resulting digest,
+/// verify it under the public key, and run `PolicyAuthorize` to satisfy the
+/// object's policy.
+#[allow(clippy::redundant_closure_call)]
+fn unseal_authorized(
+    env: &SealedEnvelope,
+    pubkey_pem: &str,
+    policy_ref: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut ctx = open_context()?;
+
+    with_srk(&mut ctx, |ctx, srk| {
+        let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
+        let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
+        let sealed_handle = ctx
+            .execute_with_nullauth_session(|ctx| ctx.load(*srk, private, public))
+            .map_err(tpm_err)?;
+
+        let result: Result<Zeroizing<Vec<u8>>> = (|| {
+            with_session(ctx, SessionType::Policy, |ctx, session| {
+                let policy_session = PolicySession::try_from(session).map_err(tpm_err)?;
+
+                // 1. Fold the current PCR state in and read the resulting policy
+                //    digest — the "approved policy" that must carry a signature.
+                let sel = pcr_selection(&env.pcrs)?;
+                ctx.policy_pcr(policy_session, Digest::default(), sel)
+                    .map_err(tpm_err)?;
+                let approved = ctx.policy_get_digest(policy_session).map_err(tpm_err)?;
+
+                // 2. Find a signature for exactly this PCR set + policy digest.
+                let sigs = crate::pcrsig::load_signatures(crate::pcrsig::DEFAULT_BANK)?;
+                let sig = crate::pcrsig::find_for_policy(&sigs, &env.pcrs, approved.value())
+                    .ok_or_else(|| {
+                        Error::Policy(
+                            "no signed PCR policy matches the current boot state \
+                             (kernel/UKI not yet enrolled — re-sign required)"
+                                .into(),
+                        )
+                    })?;
+
+                // 3. Verify the signature over aHash = H(approvedPolicy ‖ ref)
+                //    under the public key, yielding a verification ticket.
+                let key_handle = load_external_pubkey(ctx, pubkey_pem)?;
+                let verify_result: Result<Zeroizing<Vec<u8>>> = (|| {
+                    let key_name = ctx.tr_get_name(key_handle.into()).map_err(tpm_err)?;
+                    let a_hash = a_hash(approved.value(), policy_ref)?;
+                    let signature = Signature::RsaSsa(
+                        RsaSignature::create(
+                            HashingAlgorithm::Sha256,
+                            PublicKeyRsa::try_from(sig.sig.clone()).map_err(tpm_err)?,
+                        )
+                        .map_err(tpm_err)?,
+                    );
+                    let ticket = ctx
+                        .verify_signature(key_handle, a_hash, signature)
+                        .map_err(tpm_err)?;
+
+                    // 4. Authorize: rewrite the session policy to the key-bound
+                    //    value, which equals the object's authPolicy.
+                    let ref_nonce = Nonce::try_from(policy_ref.to_vec()).map_err(tpm_err)?;
+                    ctx.policy_authorize(
+                        policy_session,
+                        approved.clone(),
+                        ref_nonce,
+                        &key_name,
+                        ticket,
+                    )
+                    .map_err(tpm_err)?;
+
+                    // 5. Unseal under the now-satisfied policy session.
+                    let data = ctx
+                        .execute_with_session(Some(session), |ctx| {
+                            ctx.unseal(sealed_handle.into())
+                        })
+                        .map_err(|e| policy_aware_err(e, env))?;
+                    Ok(Zeroizing::new(data.to_vec()))
+                })();
+                let _ = ctx.flush_context(key_handle.into());
+                verify_result
+            })
+        })();
+
+        let _ = ctx.flush_context(sealed_handle.into());
+        result
+    })
+}
+
+/// Load an external RSA public key (SPKI PEM) into the TPM under the Null
+/// hierarchy so its Name can be taken and signatures verified against it.
+fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle> {
+    let public = rsa_pem_to_public(pubkey_pem)?;
+    ctx.load_external_public(public, Hierarchy::Null)
+        .map_err(tpm_err)
+}
+
+/// Build a tss-esapi `Public` for an external RSA verification key from a
+/// SubjectPublicKeyInfo PEM.
+fn rsa_pem_to_public(pubkey_pem: &str) -> Result<Public> {
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::traits::PublicKeyParts;
+
+    let key = rsa::RsaPublicKey::from_public_key_pem(pubkey_pem)
+        .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
+    let modulus = key.n().to_bytes_be();
+    let key_bits = match modulus.len() * 8 {
+        2048 => RsaKeyBits::Rsa2048,
+        3072 => RsaKeyBits::Rsa3072,
+        4096 => RsaKeyBits::Rsa4096,
+        other => return Err(Error::Policy(format!("unsupported PCR key size: {other} bits"))),
+    };
+    let exponent = {
+        let e = key.e().to_bytes_be();
+        if e.len() > 4 {
+            return Err(Error::Policy("PCR key exponent too large".into()));
+        }
+        let mut buf = [0u8; 4];
+        buf[4 - e.len()..].copy_from_slice(&e);
+        RsaExponent::create(u32::from_be_bytes(buf)).map_err(tpm_err)?
+    };
+
+    let attrs = ObjectAttributesBuilder::new()
+        .with_user_with_auth(true)
+        .with_sign_encrypt(true)
+        .with_decrypt(false)
+        .with_restricted(false)
+        .with_fixed_tpm(false)
+        .with_fixed_parent(false)
+        .with_sensitive_data_origin(false)
+        .build()
+        .map_err(tpm_err)?;
+
+    // Null scheme: the verification scheme (RSASSA/SHA-256) is supplied per
+    // operation in the `Signature` passed to `verify_signature`.
+    let params = PublicRsaParameters::new(
+        SymmetricDefinitionObject::Null,
+        RsaScheme::create(RsaSchemeAlgorithm::Null, None).map_err(tpm_err)?,
+        key_bits,
+        exponent,
+    );
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::Rsa)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(attrs)
+        .with_rsa_parameters(params)
+        .with_rsa_unique_identifier(PublicKeyRsa::try_from(modulus).map_err(tpm_err)?)
+        .build()
+        .map_err(tpm_err)
+}
+
+/// Compute the object `authPolicy` produced by `TPM2_PolicyAuthorize` from an
+/// empty starting policy: reset to a zero digest, fold in the command code + the
+/// signing key's Name, then the policyRef. Mirrors the TPM2 spec so we don't
+/// need a null verification ticket in a trial session.
+fn authorize_policy_digest(key_name: &[u8], policy_ref: &[u8]) -> Result<Digest> {
+    let mut h = Sha256::new();
+    h.update([0u8; 32]); // reset to Zero Digest (SHA-256 size)
+    h.update(TPM_CC_POLICY_AUTHORIZE);
+    h.update(key_name);
+    let d1 = h.finalize();
+
+    let mut h2 = Sha256::new();
+    h2.update(d1);
+    h2.update(policy_ref);
+    Digest::try_from(h2.finalize().to_vec()).map_err(tpm_err)
+}
+
+/// aHash = H(approvedPolicy ‖ policyRef), the message a PolicyAuthorize
+/// signature must cover.
+fn a_hash(approved_policy: &[u8], policy_ref: &[u8]) -> Result<Digest> {
+    let mut h = Sha256::new();
+    h.update(approved_policy);
+    h.update(policy_ref);
+    Digest::try_from(h.finalize().to_vec()).map_err(tpm_err)
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: systemd-pcrlock PolicyAuthorizeNV (GRUB2 + Secure Boot/dbx). Binds the
+// object to a pcrlock NV index that holds the currently-valid PCR policy; the
+// admin re-runs `systemd-pcrlock make-policy` to re-predict it across firmware
+// updates. Implemented with raw `Esys_PolicyAuthorizeNV` FFI (no tss-esapi safe
+// wrapper) in [`crate::tpm_pcrlock`].
+// ---------------------------------------------------------------------------
+
+/// Seal `secret` bound to the systemd-pcrlock NV index at `nv_index`.
+fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
+    crate::tpm_pcrlock::seal_pcrlock(secret, nv_index)
+}
+
+/// Unseal a `PolicyAuthorizeNV`-bound object against `nv_index`.
+fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u8>>> {
+    crate::tpm_pcrlock::unseal_pcrlock(env, nv_index)
+}
+
+/// Public entry point used by the CLI / daemon to arm a pcrlock-bound seal once
+/// a pcrlock policy has been provisioned at `nv_index`.
+pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
+    seal_pcrlock(secret, nv_index)
 }
 
 /// If the TSS error looks like a policy mismatch, enrich it with the list of
@@ -454,6 +745,31 @@ mod tests {
         assert!(is_irlume_srk(&srk_template().unwrap()).unwrap());
         let sealed = sealed_template(Digest::default()).unwrap();
         assert!(!is_irlume_srk(&sealed).unwrap());
+    }
+
+    #[test]
+    fn authorize_digest_deterministic_and_ref_sensitive() {
+        let name = [0x00, 0x0b]
+            .iter()
+            .chain([0xab; 32].iter())
+            .copied()
+            .collect::<Vec<u8>>();
+        let d1 = authorize_policy_digest(&name, &[]).unwrap();
+        let d2 = authorize_policy_digest(&name, &[]).unwrap();
+        assert_eq!(d1.value(), d2.value(), "must be deterministic");
+        assert_eq!(d1.value().len(), 32);
+        let d3 = authorize_policy_digest(&name, &[0x01]).unwrap();
+        assert_ne!(d1.value(), d3.value(), "policyRef must change the digest");
+        let d4 = authorize_policy_digest(&[0x00, 0x0b, 0x00], &[]).unwrap();
+        assert_ne!(d1.value(), d4.value(), "key Name must change the digest");
+    }
+
+    #[test]
+    fn a_hash_is_32_bytes_and_ref_sensitive() {
+        let a = a_hash(&[0xaa; 32], &[]).unwrap();
+        let b = a_hash(&[0xaa; 32], &[0x01]).unwrap();
+        assert_eq!(a.value().len(), 32);
+        assert_ne!(a.value(), b.value());
     }
 
     #[test]

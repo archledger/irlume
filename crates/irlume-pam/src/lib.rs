@@ -26,7 +26,7 @@
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
 //! log a failure — the password is always the floor).
 
-use irlume_common::{Request, Response, SOCKET_PATH};
+use irlume_common::{Request, Response, SecretBytes, SOCKET_PATH};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
@@ -49,6 +49,54 @@ impl PamServiceModule for IrlumePam {
         };
         let unseal = args.iter().any(|a| a == "unseal");
         let wait = args.iter().any(|a| a == "wait");
+        let reseal = args.iter().any(|a| a == "reseal");
+
+        // `reseal` mode (a login auth line placed AFTER password-auth): no camera,
+        // no verify — just capture the login password the user just authenticated
+        // with and ask the daemon to re-bind it to today's PCRs if it has gone
+        // stale (dbx/Secure Boot update, or a changed password). Self-heal hook.
+        // Always IGNORE so it never affects the auth outcome.
+        if reseal {
+            try_reseal(&pamh, &user);
+            return PamError::IGNORE;
+        }
+
+        // If the user has typed a password, defer to it — don't power up the
+        // camera at all. Scanning a face when they already chose to type would be
+        // a 2-3s annoyance for nothing, and we lose no capability by skipping:
+        // pam_kwallet5/pam_gnome_keyring open the wallet from the typed password
+        // exactly as they would from an unsealed one. Returning IGNORE keeps the
+        // password fallback intact.
+        //
+        // Learning whether they typed depends on the surface:
+        //
+        //  * Active probe (interactive login greeter — `unseal`, no `wait`): the
+        //    plasmalogin/SDDM greeter does NOT pre-set PAM_AUTHTOK; the typed
+        //    password only reaches PAM when a module asks for it. So we ask, once:
+        //    `pam_get_authtok` returns whatever the user already entered (an empty
+        //    string if they submitted a blank field to choose face) WITHOUT
+        //    re-prompting — the greeter answers it immediately from the password
+        //    it buffered on submit — and caches a non-empty answer as PAM_AUTHTOK
+        //    so the downstream pam_unix reuses it with no second prompt. Any
+        //    typed character ⇒ non-empty ⇒ we bail before the camera.
+        //
+        //  * Passive peek (everything else — sudo verify, lock screen `wait`): just
+        //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
+        //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
+        //    biometric device (kde-fingerprint) and cancels us natively the moment
+        //    a key is pressed, so an echo-off prompt from us would hijack the
+        //    password field; and a TTY `sudo` should keep "just look at the camera"
+        //    working without forcing the user to press Enter past a prompt first.
+        let typed = if unseal && !wait {
+            pamh.get_authtok(Some("Password: "))
+        } else {
+            pamh.get_cached_authtok()
+        };
+        if let Ok(Some(tok)) = typed {
+            if !tok.to_bytes().is_empty() {
+                return PamError::IGNORE;
+            }
+        }
 
         // In `wait` mode, retry until a match or the budget runs out; otherwise
         // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
@@ -103,6 +151,24 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
         }
         _ => PamError::IGNORE,
     }
+}
+
+/// Self-heal: capture the freshly-authenticated login password from
+/// `PAM_AUTHTOK` (set by `pam_unix` on the typed-password path, or by our own
+/// `unseal` line on the face path) and hand it to the daemon, which re-seals it
+/// against the current PCR policy ONLY if an envelope is already armed and has
+/// gone stale. Best-effort and silent: a login must never fail because of this.
+fn try_reseal(pamh: &Pam, user: &str) {
+    let tok = match pamh.get_cached_authtok() {
+        Ok(Some(t)) if !t.to_bytes().is_empty() => t.to_bytes().to_vec(),
+        // No password on the stack (e.g. a pure face login that did not unseal)
+        // — nothing to capture, nothing to heal.
+        _ => return,
+    };
+    let _ = request(&Request::ResealPassword {
+        user: user.to_string(),
+        password: SecretBytes::new(tok),
+    });
 }
 
 /// Round-trip one request to `irlumed` and return its reply.

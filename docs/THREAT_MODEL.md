@@ -56,6 +56,11 @@ this is the correct trust boundary; (b) a **malicious USB hardware device**
 descriptor, so topology/descriptor pinning cannot stop it. Closing that vector
 requires cryptographic camera attestation, which is **out of scope for V1.0**.
 
+**Implemented:** `irlume-camera::verify_pinned`, called at the head of every
+`capture_rgb`/`capture_ir`. The physical-bus check is always on (no config);
+`IRLUME_CAMERA_PIN="vid:pid"` and `IRLUME_CAMERA_REQUIRE_FIXED=1` add descriptor
+and removability pinning per host.
+
 ## Liveness (algorithmic, no trained weights)
 
 Physically-grounded cues, hard gate (any failure rejects):

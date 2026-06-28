@@ -136,8 +136,94 @@ pub fn privacy_engaged(device: &str) -> bool {
     }
 }
 
+/// True iff a sysfs `device` path traces to a real hardware bus (USB/PCI) and
+/// not a virtual/loopback origin. Pure so it can be unit-tested without sysfs.
+fn is_physical_camera_path(p: &str) -> bool {
+    (p.contains("/usb") || p.contains("/devices/pci"))
+        && !p.contains("/devices/virtual")
+        && !p.contains("v4l2loopback")
+}
+
+/// Walk up from `start` to the first ancestor dir holding `attr` (e.g. the USB
+/// device dir that carries `idVendor`/`removable`, above the interface node).
+fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathBuf> {
+    let mut p = start.to_path_buf();
+    loop {
+        if p.join(attr).exists() {
+            return Some(p);
+        }
+        p = p.parent()?.to_path_buf();
+        if !p.starts_with("/sys/devices") {
+            return None;
+        }
+    }
+}
+
+/// Camera device-pinning: verify `/dev/videoN` is a real, physically-attached
+/// camera before any frame is read, defeating unprivileged software frame
+/// injection (v4l2loopback / OBS virtual camera). See docs/THREAT_MODEL.md.
+///
+/// Always enforced: the device must resolve through sysfs to a physical bus
+/// (USB/PCI), never a virtual/platform node — the anti-injection gate, needs no
+/// per-host config. Additionally, when `IRLUME_CAMERA_PIN` (`"vid:pid"` lowercase
+/// hex, e.g. `3277:0059`) is set the USB descriptor must match; when
+/// `IRLUME_CAMERA_REQUIRE_FIXED=1` the `removable` attribute must read `fixed`
+/// (rejects a hot-plugged external camera — supplementary, since `removable` is
+/// frequently `unknown` even for legitimate devices).
+pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
+    let node = device.strip_prefix("/dev/").unwrap_or(device);
+    let link = format!("/sys/class/video4linux/{node}/device");
+    let real = std::fs::canonicalize(&link).map_err(|_| {
+        Error::Hardware(format!(
+            "{device}: no physical device in sysfs (virtual camera?) — refusing to authenticate"
+        ))
+    })?;
+    let p = real.to_string_lossy();
+    if !is_physical_camera_path(&p) {
+        return Err(Error::Hardware(format!(
+            "{device}: '{p}' is not a physical-bus camera — refusing (anti-injection)"
+        )));
+    }
+    let dev_dir = find_attr_dir(&real, "idVendor");
+    if let Ok(pin) = std::env::var("IRLUME_CAMERA_PIN") {
+        let want = pin.trim().to_lowercase();
+        let got = dev_dir.as_ref().and_then(|d| {
+            let v = std::fs::read_to_string(d.join("idVendor")).ok()?;
+            let pr = std::fs::read_to_string(d.join("idProduct")).ok()?;
+            Some(format!("{}:{}", v.trim(), pr.trim()))
+        });
+        match got {
+            Some(g) if g == want => {}
+            Some(g) => {
+                return Err(Error::Hardware(format!(
+                    "{device}: camera {g} != pinned {want} — refusing"
+                )))
+            }
+            None => {
+                return Err(Error::Hardware(format!(
+                    "{device}: no USB descriptor to match pin {want} — refusing"
+                )))
+            }
+        }
+    }
+    if std::env::var("IRLUME_CAMERA_REQUIRE_FIXED").map(|v| v == "1").unwrap_or(false) {
+        let removable = dev_dir
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join("removable")).ok())
+            .map(|s| s.trim().to_string());
+        if removable.as_deref() != Some("fixed") {
+            return Err(Error::Hardware(format!(
+                "{device}: removable='{}' (want fixed) — refusing hot-plugged camera",
+                removable.as_deref().unwrap_or("?")
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Capture one AE-warmed RGB frame from a V4L2 device (YUYV → RGB8).
 pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
+    verify_pinned(device)?;
     if privacy_engaged(device) {
         return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
     }
@@ -180,6 +266,7 @@ const IR_BURST: usize = 24; // grab a burst; keep the brightest (lit strobe phas
 /// it often fires when the stream opens, otherwise it needs a UVC-XU write (TODO,
 /// see `IR_EMITTER_NEXIGO_N930W`).
 pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
+    verify_pinned(device)?;
     if privacy_engaged(device) {
         return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
     }
@@ -320,5 +407,24 @@ mod tests {
         for c in rgb {
             assert!((c as i32 - 128).abs() <= 1);
         }
+    }
+
+    #[test]
+    fn physical_camera_path_accepts_real_rejects_virtual() {
+        // Real built-in USB camera (verified on the reference Zenbook).
+        assert!(is_physical_camera_path(
+            "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-5/3-5:1.0"
+        ));
+        // A discrete/MIPI camera under PCI is still physical.
+        assert!(is_physical_camera_path(
+            "/sys/devices/pci0000:00/0000:00:1f.6/cam0"
+        ));
+        // v4l2loopback / OBS virtual cameras — the injection vector — are rejected.
+        assert!(!is_physical_camera_path(
+            "/sys/devices/platform/v4l2loopback-000/video4linux/video0"
+        ));
+        assert!(!is_physical_camera_path(
+            "/sys/devices/virtual/video4linux/video0"
+        ));
     }
 }

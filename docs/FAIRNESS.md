@@ -56,13 +56,25 @@ embeddings reduces the disparity **~30%** on real faces:
 - result is scale-invariant (not an artifact of the adapter compressing the
   cosine range) — both absolute spread and CV drop by the same ~30%.
 
-This proves fairness can be engineered with **commercially-clean synthetic data**
-rather than tainted scraped datasets. It is a benchmark, not yet a shipped
-default in the primary path: DigiFace's license is non-commercial (so a shippable
-version needs a commercially-licensed synthetic generator), and the adapter's
-**FRR impact on real faces is not yet validated** (FairFace has no identity
-labels, so genuine pairs can't be measured there). Until both are cleared, the
-adapter is a documented lever, not a production change to the RGB auth path.
+This proves fairness *can* be moved with **commercially-clean synthetic data**
+rather than tainted scraped datasets. **It is a benchmark, not a shipped default**,
+and a deploy-safety test on real faces shows why. Measured on LFW (real,
+identity-labeled — the genuine pairs FairFace lacks), the same adapter **degrades
+overall recognition**:
+
+| | Raw AuraFace | DigiFace-adapted |
+|---|---|---|
+| EER | 4.17% | 5.12% (+23%) |
+| FRR @ matched FAR (1e-3) | 4.65% | **10.62%** (2.3×) |
+
+The adapter balances demographics but compresses genuine similarity on real faces
+(mean 0.584 → 0.447) — the synthetic→real **domain gap** (AuraFace embeds
+DigiFace's synthetic faces at EER 8.7%). Deploying it would more than double the
+false-reject rate, so it is **not** in the auth path. A deployable clean debiasing
+adapter needs either synthetic data with a smaller domain gap to real faces (a
+generator AuraFace embeds well) or real consented diverse data — plus a
+commercial license (DigiFace is non-commercial). The ~30% result stands as proof
+the lever exists; this particular adapter is not the one to ship.
 
 ## Policy: a single conservative threshold + uniform fallback
 

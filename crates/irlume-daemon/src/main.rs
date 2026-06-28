@@ -175,7 +175,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::ResealPassword { user, password } => {
-            // Auto-heal hook from the login session phase. Same authz as arming
+            // Self-heal hook from the login SESSION phase (runs only after auth
+            // succeeded, so `password` is verified-correct). Same authz as arming
             // (root or the user), but it can only ever *re-seal an already armed*
             // password against today's PCRs — it never arms a fresh user, so a
             // self-peer cannot use it to plant a sealed password they didn't set.

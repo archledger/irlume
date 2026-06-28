@@ -31,7 +31,7 @@ pub const CURRENT_VERSION: u32 = 1;
 #[serde(tag = "kind")]
 pub enum PolicyKind {
     /// Tier 3 (universal): a literal `PolicyPCR` digest over `pcrs`. Breaks on
-    /// any bound-PCR drift; the auto-reseal-on-login hook heals it.
+    /// any bound-PCR drift; the user re-runs `keyring arm` to rebind.
     #[default]
     PcrLiteral,
     /// Tier 1 (UKI/systemd-boot): `PolicyAuthorize` over a signing public key.

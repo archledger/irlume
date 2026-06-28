@@ -80,13 +80,13 @@ systemctl is-active irlumed.service >/dev/null && echo "    irlumed active" || {
 echo "    socket label: $(ls -Z /run/irlume.sock 2>/dev/null | awk '{print $1}')"
 
 echo "=== 4/5 wire plasmalogin greeter (face → KWallet unlock) ==="
-if [[ -f "$PAM_GREETER" ]] && grep -q "pam_irlume.so reseal" "$PAM_GREETER"; then
+if [[ -f "$PAM_GREETER" ]] && grep -q "pam_irlume.so unseal" "$PAM_GREETER"; then
     echo "    already wired — skipping"
 else
     {
         echo "$MARKER"
         awk '
-            /^auth[[:space:]]+substack[[:space:]]+password-auth/ && !done {
+            /^auth[[:space:]]+substack[[:space:]]+password-auth/ && !adone {
                 print "auth     [success=1 default=ignore]   pam_irlume.so unseal"
                 print                                              # the substack password-auth line
                 # Landing target for the success=1 jump. A numeric jump does NOT
@@ -97,15 +97,20 @@ else
                 # is safe: it cannot override a prior password FAILURE (which sets
                 # a negative impression first).
                 print "auth        optional      pam_permit.so"
-                # Self-heal line: runs AFTER password-auth in the same auth phase,
-                # so PAM_AUTHTOK is set (typed password, or the password the unseal
-                # line released on the face path). It re-binds the TPM-sealed
-                # password to the current PCRs when they have moved -- a dbx/Secure
-                # Boot update -- or the password changed, automatically on the next
-                # password login, with no manual keyring arm. optional + always
-                # IGNORE, so it can never affect the login outcome.
+                # STASH half of the self-heal: copies PAM_AUTHTOK into PAM data for
+                # the session line below. Pure read, no TPM write, no daemon call,
+                # so running it after a FAILED password attempt is harmless.
                 print "auth        optional      pam_irlume.so reseal"
-                done=1
+                adone=1
+                next
+            }
+            # RESEAL half of the self-heal: re-binds the sealed password to current
+            # PCRs only after auth SUCCEEDED (session phase runs only then), so it
+            # can never act on a typo. Placed after the session password-auth line.
+            /^session[[:space:]]+include[[:space:]]+password-auth/ && !sdone {
+                print
+                print "session     optional      pam_irlume.so reseal"
+                sdone=1
                 next
             }
             { print }

@@ -68,18 +68,26 @@ pub enum Reseal {
     Resealed,
 }
 
-/// Self-heal hook: re-seal `user`'s login password against the *current* PCR
-/// policy, but only when it's both armed and actually stale.
+/// Self-heal: re-seal `user`'s login password against the *current* PCR policy,
+/// but only when it's both armed and actually stale.
 ///
-/// Called from the login session phase with the freshly-typed (or just-unsealed)
-/// `PAM_AUTHTOK`. It deliberately writes nothing in the common case:
+/// SAFETY CONTRACT — the caller MUST pass only a password that has been
+/// VERIFIED correct (i.e. `pam_unix` accepted it). This function cannot tell a
+/// genuine new password from a typo on its own; that guarantee comes from
+/// WHERE it is called: the PAM **session** phase, which only runs after
+/// authentication has already succeeded. (An earlier version called it from an
+/// `optional` auth line that also ran after a FAILED password attempt, which let
+/// a typo overwrite the good seal — that path has been deleted. Never call this
+/// anywhere auth success is not already established.)
+///
+/// Given a verified password it writes nothing in the common case:
 ///   * not armed            -> `NotArmed` (never auto-arm)
 ///   * unseals to same `pw` -> `Unchanged` (PCRs still match, password same)
 ///   * unseal fails OR diff  -> reseal, `Resealed`
 ///
 /// The "unseal fails" branch is what fixes a dbx/Secure-Boot update: the old
 /// envelope's PCR7 policy no longer satisfies, so we rebind to today's PCRs
-/// using the password the user just proved they know.
+/// using the password the user just proved (via a successful login) they know.
 pub fn reseal_password(user: &str, password: &[u8]) -> Result<Reseal> {
     if password.is_empty() {
         return Err(Error::Protocol("refusing to reseal an empty password".into()));
@@ -147,7 +155,8 @@ mod tests {
     /// reseal: NotArmed when nothing sealed, Unchanged when same pw still
     /// unseals, Resealed when the password differs. The PCR-moved -> Resealed
     /// branch can't be exercised without changing PCRs, but the differ branch
-    /// hits the same reseal path.
+    /// hits the same reseal path. (Callers gate this on a verified password via
+    /// the PAM session phase — see the SAFETY CONTRACT on `reseal_password`.)
     #[test]
     #[ignore = "requires real TPM (/dev/tpmrm0)"]
     fn reseal_only_when_stale() {

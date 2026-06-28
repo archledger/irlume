@@ -39,6 +39,10 @@ const WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
 
+/// PAM-data key under which the `reseal` AUTH line stashes the typed password for
+/// the `reseal` SESSION line to pick up. Namespaced to this module.
+const RESEAL_STASH_KEY: &str = "pam_irlume_reseal_authtok";
+
 struct IrlumePam;
 
 impl PamServiceModule for IrlumePam {
@@ -51,13 +55,16 @@ impl PamServiceModule for IrlumePam {
         let wait = args.iter().any(|a| a == "wait");
         let reseal = args.iter().any(|a| a == "reseal");
 
-        // `reseal` mode (a login auth line placed AFTER password-auth): no camera,
-        // no verify — just capture the login password the user just authenticated
-        // with and ask the daemon to re-bind it to today's PCRs if it has gone
-        // stale (dbx/Secure Boot update, or a changed password). Self-heal hook.
-        // Always IGNORE so it never affects the auth outcome.
+        // `reseal` AUTH line (placed AFTER password-auth): STASH ONLY. We copy the
+        // current PAM_AUTHTOK into PAM transaction data so the matching `reseal`
+        // SESSION line can re-bind it later. We deliberately do NOT contact the
+        // daemon or touch the TPM here, because this auth line runs even after a
+        // FAILED password attempt — acting on the token here is exactly the bug
+        // that let a typo overwrite the good seal. The mutation happens in
+        // open_session, which PAM only runs once auth has SUCCEEDED, so the token
+        // it acts on is always one pam_unix accepted. Always IGNORE.
         if reseal {
-            try_reseal(&pamh, &user);
+            stash_authtok(&pamh);
             return PamError::IGNORE;
         }
 
@@ -121,6 +128,58 @@ impl PamServiceModule for IrlumePam {
     fn setcred(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
         PamError::SUCCESS
     }
+
+    /// `reseal` SESSION line: the actual self-heal. Reached ONLY after auth +
+    /// account succeeded, so the password the `reseal` AUTH line stashed is one
+    /// the system accepted. Hand it to the daemon, which re-binds the TPM-sealed
+    /// password to today's PCRs iff it is armed and has gone stale (PCR move or a
+    /// changed password). Best-effort and always IGNORE: a session must never
+    /// fail because of this, and other modes (unseal/verify/wait) wire no session
+    /// line so they fall straight through.
+    fn open_session(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
+        if args.iter().any(|a| a == "reseal") {
+            if let Ok(Some(u)) = pamh.get_user(None) {
+                try_reseal_session(&pamh, &u.to_string_lossy());
+            }
+        }
+        PamError::IGNORE
+    }
+
+    fn close_session(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
+        PamError::IGNORE
+    }
+}
+
+/// AUTH-phase half of `reseal`: copy the current PAM_AUTHTOK into PAM
+/// transaction data for the SESSION half to pick up. Pure read + stash — no
+/// daemon, no TPM. If auth ultimately fails the session never opens and PAM
+/// drops this data without it ever being acted on. We stash only a non-empty
+/// token (a blank submit on the face path has nothing to heal with).
+fn stash_authtok(pamh: &Pam) {
+    if let Ok(Some(tok)) = pamh.get_cached_authtok() {
+        let bytes = tok.to_bytes();
+        if !bytes.is_empty() {
+            // send_bytes copies into PAM-owned storage; the retrieved copy in the
+            // session phase is wrapped in zeroizing SecretBytes before use.
+            let _ = pamh.send_bytes(RESEAL_STASH_KEY, bytes.to_vec(), None);
+        }
+    }
+}
+
+/// SESSION-phase half of `reseal`: retrieve the stashed (already-verified)
+/// password and ask the daemon to re-seal it if the envelope is armed and stale.
+/// Best-effort and silent: a login session must never fail because of this.
+fn try_reseal_session(pamh: &Pam, user: &str) {
+    let pw = match pamh.retrieve_bytes(RESEAL_STASH_KEY) {
+        Ok(bytes) if !bytes.is_empty() => SecretBytes::new(bytes),
+        // No stash (e.g. a pure face login that submitted a blank field, or auth
+        // took a path that never set a token) — nothing to heal.
+        _ => return,
+    };
+    let _ = request(&Request::ResealPassword {
+        user: user.to_string(),
+        password: pw,
+    });
 }
 
 /// One verify attempt (sudo / in-session unlock): no password released.
@@ -151,24 +210,6 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
         }
         _ => PamError::IGNORE,
     }
-}
-
-/// Self-heal: capture the freshly-authenticated login password from
-/// `PAM_AUTHTOK` (set by `pam_unix` on the typed-password path, or by our own
-/// `unseal` line on the face path) and hand it to the daemon, which re-seals it
-/// against the current PCR policy ONLY if an envelope is already armed and has
-/// gone stale. Best-effort and silent: a login must never fail because of this.
-fn try_reseal(pamh: &Pam, user: &str) {
-    let tok = match pamh.get_cached_authtok() {
-        Ok(Some(t)) if !t.to_bytes().is_empty() => t.to_bytes().to_vec(),
-        // No password on the stack (e.g. a pure face login that did not unseal)
-        // — nothing to capture, nothing to heal.
-        _ => return,
-    };
-    let _ = request(&Request::ResealPassword {
-        user: user.to_string(),
-        password: SecretBytes::new(tok),
-    });
 }
 
 /// Round-trip one request to `irlumed` and return its reply.

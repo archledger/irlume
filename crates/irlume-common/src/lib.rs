@@ -98,9 +98,10 @@ pub enum Request {
     /// Re-seal `user`'s login password against the *current* PCR policy, but
     /// ONLY if a sealed password is already armed (never auto-arms a fresh user)
     /// and only if it actually changed (the PCRs moved, e.g. a dbx/Secure Boot
-    /// update, or the user changed their password). This is the auto-heal hook
-    /// fired from the login session phase with the freshly-typed/unsealed
-    /// `PAM_AUTHTOK`. PRIVILEGED: root or `user`.
+    /// update, or the user changed their password). Fired from the login
+    /// **session** phase — which runs only after authentication SUCCEEDED — so
+    /// `password` is always one `pam_unix` accepted (never a typo). PRIVILEGED:
+    /// root or `user`.
     ResealPassword { user: String, password: SecretBytes },
 }
 

@@ -354,7 +354,8 @@ fn with_srk<T>(
 ///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
 ///     (typically PCR 11). Survives kernel updates with no reseal.
 ///   * Tier 3 — otherwise a literal `PolicyPCR` over the configured PCRs
-///     ([`policy_pcrs`], default PCR 7). The login auto-reseal hook heals drift.
+///     ([`policy_pcrs`], default PCR 7). If those PCRs move (dbx/Secure Boot
+///     update) the envelope stops unsealing and the user re-runs `keyring arm`.
 ///
 /// (Tier 2, pcrlock `PolicyAuthorizeNV`, is selected explicitly via
 /// [`seal_pcrlock`] when a pcrlock policy has been provisioned — it is not

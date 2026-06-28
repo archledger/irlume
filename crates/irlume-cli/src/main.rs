@@ -94,10 +94,21 @@ fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             // No-echo prompt on a real terminal; fall back to a plain stdin line
             // when piped (scripts / tests), where /dev/tty isn't available.
             let pw = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                match rpassword::prompt_password("Login password: ") {
+                let first = match rpassword::prompt_password("Login password: ") {
                     Ok(p) => p,
                     Err(e) => { eprintln!("[keyring] could not read password: {e}"); return std::process::ExitCode::FAILURE; }
+                };
+                // Confirm to catch typos — a mistyped seal silently fails to
+                // unlock the wallet at the next face login (key mismatch).
+                let confirm = match rpassword::prompt_password("Confirm login password: ") {
+                    Ok(p) => p,
+                    Err(e) => { eprintln!("[keyring] could not read password: {e}"); return std::process::ExitCode::FAILURE; }
+                };
+                if first != confirm {
+                    eprintln!("[keyring] passwords do not match — aborted (nothing sealed).");
+                    return std::process::ExitCode::from(2);
                 }
+                first
             } else {
                 use std::io::BufRead;
                 let mut line = String::new();

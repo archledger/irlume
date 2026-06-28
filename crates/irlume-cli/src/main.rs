@@ -221,7 +221,7 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     let (Some(dir), Some(det_path), Some(model)) =
         (flag(args, "--dir"), flag(args, "--det"), flag(args, "--model"))
     else {
-        eprintln!("usage: irlume irbench --dir <imgdir> --det <yunet.onnx> --model <glintr100.onnx> [--max-persons N]");
+        eprintln!("usage: irlume irbench --dir <imgdir> --det <yunet.onnx> --model <glintr100.onnx> [--max-persons N] [--lfw] [--impostor-only [--max-images N]]");
         return std::process::ExitCode::from(2);
     };
     let max_persons: usize = flag(args, "--max-persons").and_then(|s| s.parse().ok()).unwrap_or(80);
@@ -233,20 +233,30 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
         return farbench(dir, det_path, model, args);
     }
 
-    // Collect *.bmp grouped by person (prefix before first '-').
-    let mut by_person: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = Default::default();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        eprintln!("cannot read dir {dir}");
+    // Collect images (recursive, jpg/png/bmp) grouped by person identity.
+    // Default key = prefix before first '-' (CBSR convention). With --lfw the key
+    // is the filename stem minus a trailing _<digits> image index, i.e. the LFW
+    // convention `AJ_Cook_0001.jpg` -> person `AJ_Cook`.
+    let lfw = args.iter().any(|a| a == "--lfw");
+    let mut all: Vec<std::path::PathBuf> = Vec::new();
+    collect_images(std::path::Path::new(dir), &mut all);
+    if all.is_empty() {
+        eprintln!("no jpg/png/bmp images under {dir}");
         return std::process::ExitCode::FAILURE;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("bmp")).unwrap_or(false) {
-            if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
-                let person = name.split('-').next().unwrap_or(name).to_string();
-                by_person.entry(person).or_default().push(p);
+    }
+    all.sort(); // deterministic
+    let mut by_person: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = Default::default();
+    for p in all {
+        let Some(name) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        let person = if lfw {
+            match name.rsplit_once('_') {
+                Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => head.to_string(),
+                _ => name.to_string(),
             }
-        }
+        } else {
+            name.split('-').next().unwrap_or(name).to_string()
+        };
+        by_person.entry(person).or_default().push(p);
     }
     let persons: Vec<_> = by_person.into_iter().take(max_persons).collect();
     println!("[irbench] {} persons, {} images; embedding (YuNet→align→AuraFace)…",

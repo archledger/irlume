@@ -565,12 +565,16 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             ir_top_face.map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
         let ir_eye_glint =
             ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0);
+        let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
+        let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
-            rgb_face: rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).map(|f| to_fbox(f, rgb.width, rgb.height)),
+            rgb_face: rgb_top.map(|f| to_fbox(f, rgb.width, rgb.height)),
             ir_face: ir_top_face.map(|f| to_fbox(f, ir.width, ir.height)),
             ir_face_brightness,
             ir_center_edge_ratio,
             ir_eye_glint,
+            head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
+            head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
         println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");

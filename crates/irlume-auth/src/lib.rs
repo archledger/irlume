@@ -97,12 +97,17 @@ impl Engine {
         };
         let ir_brightness = ir_top.as_ref().map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
         let ir_depth = ir_top.as_ref().map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
+        // Head orientation from the RGB face landmarks (Windows-Hello-style
+        // frontality gate). Defaults to frontal when there's no RGB face.
+        let pose = rgb_top.as_ref().map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = Signals {
             rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width, rgb.height)),
             ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
             ir_face_brightness: ir_brightness,
             ir_center_edge_ratio: ir_depth,
             ir_eye_glint: ir_top.as_ref().map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0),
+            head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
+            head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
         };
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);
 
@@ -136,7 +141,7 @@ impl Engine {
             return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
         };
         let a = self.assess()?;
-        let thr = irlume_core::PLACEHOLDER_MATCH_THRESHOLD;
+        let thr = irlume_core::RGB_MATCH_THRESHOLD;
         let best = |probe: &[f32], templates: &[Vec<f32>]| {
             templates.iter().map(|t| align::cosine(probe, t)).fold(f32::NEG_INFINITY, f32::max)
         };

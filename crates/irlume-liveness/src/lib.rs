@@ -23,7 +23,7 @@ pub struct FaceBox {
 }
 
 /// The physical signals the gate decides on (computed from RGB + IR captures).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Signals {
     /// Top face in the RGB frame, if any.
     pub rgb_face: Option<FaceBox>,
@@ -40,6 +40,26 @@ pub struct Signals {
     /// Peak IR brightness (0..255) at the eyes — the emitter's specular corneal
     /// glint. Supporting cue only (glint alone is not decisive).
     pub ir_eye_glint: f32,
+    /// Head-orientation yaw asymmetry from the RGB face landmarks (0 frontal,
+    /// →1 turned). Defaults to 0 (frontal) when not computed.
+    pub head_yaw_asym: f32,
+    /// Head-orientation pitch fraction (0.5 frontal; lower = chin down, higher =
+    /// chin up). Defaults to 0.5 (frontal) when not computed.
+    pub head_pitch_frac: f32,
+}
+
+impl Default for Signals {
+    fn default() -> Self {
+        Self {
+            rgb_face: None,
+            ir_face: None,
+            ir_face_brightness: 0.0,
+            ir_center_edge_ratio: 0.0,
+            ir_eye_glint: 0.0,
+            head_yaw_asym: 0.0,    // frontal
+            head_pitch_frac: 0.5,  // frontal
+        }
+    }
 }
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
@@ -56,6 +76,9 @@ pub struct Cues {
     pub depth_ok: bool,
     /// Corneal glint present (supporting; logged, not decisive).
     pub glint_present: bool,
+    /// Face is frontal enough (≈±15°) to make a decision — Windows-Hello-style
+    /// head-orientation gate.
+    pub frontal_ok: bool,
 }
 
 /// IR face region must be at least this bright (0..255). A lit live face ran ~83
@@ -72,6 +95,17 @@ pub const MIN_FACE_SCORE: f32 = 0.6;
 pub const DEPTH_MIN_RATIO: f32 = 1.03;
 /// Eye IR peak above this counts as a corneal glint (supporting cue).
 pub const GLINT_MIN: f32 = 180.0;
+/// Head-orientation gate (Windows-Hello-style ±15° frontality), approximated
+/// from 2D landmarks. Deliberately PERMISSIVE — rejects only clearly off-angle
+/// faces, to avoid false-rejects; a non-frontal face yields `Uncertain` ("face
+/// the camera"), never `Spoof`. Also gates enrollment, keeping templates frontal.
+/// PITCH is intentionally wide: a top-bezel camera sees the user pitched ~15-17°
+/// DOWN when they look at the screen, so a tight pitch gate would reject normal
+/// use. Tune per-camera with real pose data; calibrating to the user's enrolled
+/// pose is a follow-up.
+pub const YAW_ASYM_MAX: f32 = 0.40;
+pub const PITCH_FRAC_MIN: f32 = 0.20;
+pub const PITCH_FRAC_MAX: f32 = 0.80;
 
 /// The hard liveness gate. Stateless for now (per-user IR calibration is a P2
 /// follow-up).
@@ -111,6 +145,23 @@ impl LivenessGate {
             return (Verdict::Uncertain, cues, format!("RGB/IR face mismatch (dist {dist:.2}) — re-center"));
         }
 
+        // Head-orientation gate (Windows-Hello-style ±15° frontality): a face
+        // turned away or tilted yields a poor representation. Quality issue, not
+        // a spoof -> Uncertain ("face the camera"). Also rejects off-angle frames
+        // at enrollment, keeping templates frontal.
+        cues.frontal_ok = s.head_yaw_asym <= YAW_ASYM_MAX
+            && (PITCH_FRAC_MIN..=PITCH_FRAC_MAX).contains(&s.head_pitch_frac);
+        if !cues.frontal_ok {
+            return (
+                Verdict::Uncertain,
+                cues,
+                format!(
+                    "not facing the camera (yaw {:.2}, pitch {:.2}) — look directly at it",
+                    s.head_yaw_asym, s.head_pitch_frac
+                ),
+            );
+        }
+
         // IR skin reflectance: the face region must be brightly lit.
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
@@ -134,7 +185,7 @@ impl LivenessGate {
         // Corneal glint — supporting only; logged, never decisive on its own.
         cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
 
-        (Verdict::Live, cues, "live: face in RGB+IR, co-located, IR-reflective, 3D".into())
+        (Verdict::Live, cues, "live: face in RGB+IR, co-located, frontal, IR-reflective, 3D".into())
     }
 
     /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no
@@ -176,12 +227,25 @@ mod tests {
             ir_face_brightness: 90.0,
             ir_center_edge_ratio: 1.2,
             ir_eye_glint: 220.0,
+            ..Default::default() // frontal pose
         }
     }
 
     #[test]
     fn live_face_passes() {
         assert_eq!(LivenessGate::new().evaluate(&live_signals()).0, Verdict::Live);
+    }
+
+    #[test]
+    fn off_angle_face_is_uncertain() {
+        // A real, co-located, IR-lit 3D face that is turned away -> Uncertain
+        // (positioning), never Spoof or Live.
+        let mut yaw = live_signals();
+        yaw.head_yaw_asym = 0.5; // turned
+        assert_eq!(LivenessGate::new().evaluate(&yaw).0, Verdict::Uncertain);
+        let mut down = live_signals();
+        down.head_pitch_frac = 0.15; // chin down
+        assert_eq!(LivenessGate::new().evaluate(&down).0, Verdict::Uncertain);
     }
 
     #[test]

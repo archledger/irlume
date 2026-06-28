@@ -25,6 +25,60 @@ pub struct Detection {
     pub landmarks: Landmarks5,
 }
 
+/// Approximate head orientation from the 5 landmarks, with no 3D model — a 2D
+/// heuristic for a frontality gate (Windows Hello uses a ±15° head-orientation
+/// step). It rejects clearly off-angle presentations; it is *not* degree-
+/// calibrated. `yaw_asym` and `pitch_frac` are scale-invariant (ratios).
+#[derive(Debug, Clone, Copy)]
+pub struct HeadPose {
+    /// Horizontal nose asymmetry between the eyes: `|d(nose,left_eye) -
+    /// d(nose,right_eye)| / (sum)`. ~0 frontal, →1 turned left/right.
+    pub yaw_asym: f32,
+    /// Nose's vertical position between the eye line and mouth line. ~0.5
+    /// frontal; smaller looking down, larger looking up.
+    pub pitch_frac: f32,
+}
+
+/// Estimate [`HeadPose`] from landmarks `[left_eye, right_eye, nose, left_mouth,
+/// right_mouth]`. Defaults to frontal (0.0 / 0.5) on degenerate geometry.
+pub fn head_pose(lm: &Landmarks5) -> HeadPose {
+    let (le, re, nose, lmth, rmth) = (lm[0], lm[1], lm[2], lm[3], lm[4]);
+    let (dl, dr) = ((nose.0 - le.0).abs(), (re.0 - nose.0).abs());
+    let yaw_asym = if dl + dr > 1e-3 { (dl - dr).abs() / (dl + dr) } else { 0.0 };
+    let eye_y = (le.1 + re.1) / 2.0;
+    let span = (lmth.1 + rmth.1) / 2.0 - eye_y;
+    let pitch_frac = if span.abs() > 1e-3 { (nose.1 - eye_y) / span } else { 0.5 };
+    HeadPose { yaw_asym, pitch_frac }
+}
+
+#[cfg(test)]
+mod head_pose_tests {
+    use super::*;
+
+    #[test]
+    fn frontal_face_is_centered() {
+        // ARCFACE reference geometry: nose centered between eyes, mid eye-mouth.
+        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        let p = head_pose(&lm);
+        assert!(p.yaw_asym < 0.05, "yaw {}", p.yaw_asym);
+        assert!((p.pitch_frac - 0.5).abs() < 0.05, "pitch {}", p.pitch_frac);
+    }
+
+    #[test]
+    fn turned_head_raises_yaw_asym() {
+        // Nose shifted toward the left eye (head turned) -> high asymmetry.
+        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (25.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        assert!(head_pose(&lm).yaw_asym > 0.35, "{}", head_pose(&lm).yaw_asym);
+    }
+
+    #[test]
+    fn chin_down_lowers_pitch_frac() {
+        // Nose near the eye line (looking down) -> small pitch fraction.
+        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 28.0), (24.0, 48.0), (40.0, 48.0)];
+        assert!(head_pose(&lm).pitch_frac < 0.30, "{}", head_pose(&lm).pitch_frac);
+    }
+}
+
 /// L2-normalized face embedding. 512 dims for AuraFace.
 pub const EMBED_DIM: usize = 512;
 pub type Embedding = [f32; EMBED_DIM];

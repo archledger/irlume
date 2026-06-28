@@ -20,9 +20,41 @@ formal certification stays optional.
 
 | Bypass | Root cause | irlume defense |
 |---|---|---|
-| **CVE-2021-34466** (CyberArk) — inject a spoofed IR frame from a fake USB camera | Hello trusts any USB device as camera root-of-trust; descriptors unauthenticated | **Device-trust binding**: pin the camera by topology/descriptor; reject unknown devices |
+| **CVE-2021-34466** (CyberArk) — inject a spoofed IR frame from a fake USB camera | Hello trusts any USB device as camera root-of-trust; descriptors unauthenticated | **Device pinning** (topology + descriptor + `fixed`) — defeats *software* virtual-camera injection; a malicious *hardware* USB device needs crypto attestation (out of scope). See [Camera trust](#camera-trust--device-pinning). |
 | Same — real IR + arbitrary RGB ("SpongeBob") passes | Only IR validated, RGB ignored | **Cross-spectrum RGB↔IR spatial overlap**: face must align in both streams |
 | Weak frame-transition liveness | Trivial transition check | **Active IR-strobe response** + **bright-pupil retro-reflection** + **NIR skin** |
+
+## Camera trust — device pinning
+
+Before any frame is read, the daemon verifies the camera is the *expected
+physical device*, to defeat **unprivileged software frame injection**
+(`v4l2loopback`, OBS virtual camera, and similar userspace stream sources). The
+check is an **allowlist** (the device must match the pin), not a blocklist —
+this is robust regardless of how a virtual source is constructed.
+
+For each target `/dev/videoN`, resolve `/sys/class/video4linux/videoN/device`
+and require all of:
+
+1. **Physical bus origin** — the resolved path traces to a real bus
+   (`…/pci0000:00/…/usbX/…`), not a virtual/platform node. (Verified on the
+   reference Zenbook: RGB `…/usb3/3-5/3-5:1.0`, IR `…:1.2`.)
+2. **Pinned descriptor** — `idVendor`/`idProduct` match the enrolled values
+   (reference unit: `3277:0059`, Shinetech/ASUS FHD webcam). Stored per-host in
+   config, since these are device-specific.
+3. **Fixed removability** — the USB device's `removable` attribute reads `fixed`
+   (built-in), rejecting a camera hot-plugged into an external port. *Caveat:*
+   `removable` is derived from ACPI/hub data and is often `unknown` even for
+   legitimate devices, so it is a supplementary signal, not a sole gate — the
+   descriptor + topology pin is the primary check.
+
+**Threats mitigated:** userspace virtual-camera injection (the realistic remote/
+malware vector).
+**NOT mitigated:** (a) a **root** attacker — who can rewrite sysfs or load a
+kernel module, but also needs no spoof since they can bypass PAM directly, so
+this is the correct trust boundary; (b) a **malicious USB hardware device**
+(CVE-2021-34466 class) — it presents a real USB path and can forge any
+descriptor, so topology/descriptor pinning cannot stop it. Closing that vector
+requires cryptographic camera attestation, which is **out of scope for V1.0**.
 
 ## Liveness (algorithmic, no trained weights)
 
@@ -38,6 +70,9 @@ Physically-grounded cues, hard gate (any failure rejects):
 error rates (the best published NIR-PAD used a trained CNN). Treat the gate as a
 research milestone: self-test against ISO/IEC 30107-3 attack classes; if cues
 can't reach iBeta Level 2, train a model on **own IR-rig** data (license-clean).
+The decision to stay single-frame (no rPPG / no licensed PAD CNN) and the accepted
+3D-mask / active-IR-spoof residual risk are recorded in
+[`adr/0001-liveness-pad-strategy.md`](adr/0001-liveness-pad-strategy.md).
 
 ## Storage
 

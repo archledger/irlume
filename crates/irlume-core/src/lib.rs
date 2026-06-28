@@ -38,7 +38,11 @@ pub const PLACEHOLDER_MATCH_THRESHOLD: f32 = 0.50;
 pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 
 /// Match threshold for ADAPTED IR embeddings (when the IR adapter is loaded).
-/// The adapter re-shapes the cosine space — 5-fold CV on CBSR NIR put FAR≤1e-4
-/// at 0.447 (FRR 1.35%, vs raw 0.613/3.49%). 0.45 is the interim NIST-grade
-/// point; MUST be re-validated on the live camera (CBSR→our-IR domain gap).
-pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.45;
+/// The adapter (models/ir_adapter.onnx) is now trained on CBSR+Oulu COMBINED
+/// (multi-sensor) — 5-fold CV: CBSR-held-out EER 0.81%→0.46%, Oulu-held-out
+/// 1.20%→1.16% (no degradation, unlike the prior CBSR-only adapter which blew
+/// Oulu up to 1.95%). The combined adapter re-shapes the cosine space to a lower
+/// scale; CV puts FAR≈1e-3 at 0.363, so 0.40 is the deployment default (security
+/// margin over that). MUST be re-validated on the live camera at re-enroll
+/// (CBSR/Oulu → our-IR domain gap; re-enroll required when the adapter changes).
+pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.40;

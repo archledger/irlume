@@ -105,7 +105,10 @@ mod onnx {
     }
 
     /// IR embedding adapter (512→256) — a small domain-adaptation MLP trained on
-    /// NIR faces that tightens IR genuine/impostor separation (CV: EER 0.82%→0.39%).
+    /// NIR faces (CBSR+Oulu COMBINED, multi-sensor) that tightens IR genuine/
+    /// impostor separation and generalizes across NIR cameras (5-fold CV:
+    /// CBSR-held-out EER 0.81%→0.46%, Oulu-held-out 1.20%→1.16% = no degradation,
+    /// vs the prior CBSR-only adapter which degraded Oulu to 1.95%).
     /// Applied to AuraFace IR embeddings in the dark path. Output is L2-normalized.
     pub struct Adapter {
         session: Session,

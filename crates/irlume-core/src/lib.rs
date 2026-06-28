@@ -47,3 +47,51 @@ pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 /// margin over that). MUST be re-validated on the live camera at re-enroll
 /// (CBSR/Oulu → our-IR domain gap; re-enroll required when the adapter changes).
 pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.40;
+
+/// Threshold scaling per doubling of the template count. Matching takes the
+/// MAX cosine over a profile's N templates, which inflates the false-accept rate
+/// roughly linearly in N (union bound: P(any of N exceeds) ≈ N·p). Windows Hello
+/// raises its threshold as more *users* enroll for the same reason; irlume is
+/// 1:1 (PAM supplies the claimed user), so the equivalent compensation scales
+/// with the number of *templates compared against*. Calibration (LFW): ~+0.05
+/// cosine halves the impostor tail, so full compensation would be 0.05·log2(N) —
+/// but that approaches the genuine floor (~0.71) and would add false-rejects, so
+/// this PARTIAL step (0.015·log2(N)) gently raises the bar while preserving the
+/// accept margin. A heuristic — tune with a per-N impostor ROC.
+pub const TEMPLATE_SCALE_STEP: f32 = 0.015;
+/// Max upward adjustment (cosine), a safety cap kept well below the genuine
+/// floor so scaling can never lock out a legitimate user.
+pub const TEMPLATE_SCALE_MAX_BUMP: f32 = 0.10;
+
+/// Effective match threshold for a profile holding `n_templates`, raised from
+/// `base` to hold the false-accept rate roughly constant as templates accumulate
+/// (max-over-N inflates FAR ~linearly). Monotonic in `n_templates`, capped at
+/// `base + TEMPLATE_SCALE_MAX_BUMP`. `n_templates ≤ 1` returns `base` unchanged.
+pub fn scaled_threshold(base: f32, n_templates: usize) -> f32 {
+    if n_templates <= 1 {
+        return base;
+    }
+    let bump = (TEMPLATE_SCALE_STEP * (n_templates as f32).log2()).min(TEMPLATE_SCALE_MAX_BUMP);
+    base + bump
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn threshold_scales_monotonically_and_caps() {
+        // One template (or none): unchanged.
+        assert_eq!(scaled_threshold(0.55, 1), 0.55);
+        assert_eq!(scaled_threshold(0.55, 0), 0.55);
+        // Rises with template count.
+        let t2 = scaled_threshold(0.55, 2);
+        let t5 = scaled_threshold(0.55, 5);
+        let t10 = scaled_threshold(0.55, 10);
+        assert!(t2 > 0.55 && t5 > t2 && t10 > t5, "{t2} {t5} {t10}");
+        // Stays below the genuine floor (~0.71) for realistic counts.
+        assert!(t10 < 0.65, "10-template thr {t10} too high");
+        // Capped: even an absurd count can't exceed base + MAX_BUMP.
+        assert!(scaled_threshold(0.55, 100_000) <= 0.55 + TEMPLATE_SCALE_MAX_BUMP + 1e-6);
+    }
+}

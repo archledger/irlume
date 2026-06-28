@@ -141,17 +141,18 @@ impl Engine {
             return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
         };
         let a = self.assess()?;
-        let thr = irlume_core::RGB_MATCH_THRESHOLD;
         let best = |probe: &[f32], templates: &[Vec<f32>]| {
             templates.iter().map(|t| align::cosine(probe, t)).fold(f32::NEG_INFINITY, f32::max)
         };
 
         // Primary path: a visible-light (RGB) face -> full cross-spectrum gate +
-        // RGB recognition.
+        // RGB recognition. Threshold scales with the template count (max-over-N
+        // inflates FAR ~linearly), Windows-Hello-style.
         if let Some(probe) = a.embedding {
             if a.verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
             }
+            let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, profile.templates.len());
             let score = best(&probe, &profile.templates);
             let granted = score >= thr;
             return Ok(Outcome { granted, live: true, score, reason: if granted { "match (rgb)".into() } else { "below threshold".into() } });
@@ -167,12 +168,14 @@ impl Engine {
             if verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
             }
-            // IR mode threshold — adapted space if the adapter is loaded.
-            let ir_thr = if self.ir_adapter.is_some() {
+            // IR mode threshold — adapted space if the adapter is loaded — also
+            // scaled by the IR template count (same max-over-N FAR inflation).
+            let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
             } else {
                 irlume_core::IR_MATCH_THRESHOLD
             };
+            let ir_thr = irlume_core::scaled_threshold(ir_base, profile.ir_templates.len());
             let score = best(&probe, &profile.ir_templates);
             let granted = score >= ir_thr;
             return Ok(Outcome { granted, live: true, score, reason: if granted { "match (ir/dark)".into() } else { "below threshold (ir)".into() } });

@@ -240,6 +240,22 @@ fn read_vidpid(dev_dir: &std::path::Path) -> Option<String> {
     Some(format!("{}:{}", v.trim(), p.trim()))
 }
 
+/// A stable identity for the physical camera behind `/dev/videoN`, for
+/// per-enrollment device binding (anti-swap). Format: `"vid:pid"` plus
+/// `":serial"` when the descriptor carries a serial (`idVendor:idProduct[:serial]`,
+/// lowercase). `None` if the node has no USB descriptors (e.g. a virtual cam).
+pub fn device_identity(device: &str) -> Option<String> {
+    let node = device.strip_prefix("/dev/").unwrap_or(device);
+    let real = std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device")).ok()?;
+    let dev_dir = find_attr_dir(&real, "idVendor")?;
+    let vidpid = read_vidpid(&dev_dir)?;
+    let id = match std::fs::read_to_string(dev_dir.join("serial")) {
+        Ok(s) if !s.trim().is_empty() => format!("{vidpid}:{}", s.trim()),
+        _ => vidpid,
+    };
+    Some(id.to_lowercase())
+}
+
 /// The sysfs USB-device dir shared by all interfaces (RGB + IR) of one physical
 /// camera — two `/dev/videoN` nodes with the same id are the same camera.
 fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
@@ -301,8 +317,13 @@ pub fn select_pair() -> (String, String) {
     best.unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
 }
 
-/// Capture one AE-warmed RGB frame from a V4L2 device (YUYV → RGB8).
-pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
+/// Number of frames the auth path median-denoises over (~150ms @30fps): enough
+/// that one blurry / over-exposed / transiently corrupt frame is outvoted.
+const RGB_BURST: usize = 5;
+
+/// Open `device`, let auto-exposure settle, and capture `n` (≥1) RGB frames in a
+/// single streaming session (YUYV → RGB8). All frames share the same dimensions.
+pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
     verify_pinned(device)?;
     if privacy_engaged(device) {
         return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
@@ -327,14 +348,51 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
 
-    let mut last: Option<Vec<u8>> = None;
     for _ in 0..AE_WARMUP {
-        let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        last = Some(buf.to_vec());
+        stream.next().map_err(|e| map_io(device, e))?; // discard while AE settles
     }
-    let yuyv = last.ok_or_else(|| Error::Hardware("no frames captured".into()))?;
-    let rgb = yuyv_to_rgb(&yuyv, w, h);
-    Ok(Frame { width: w, height: h, spectrum: Spectrum::Rgb, data: rgb })
+    let mut frames = Vec::with_capacity(n.max(1));
+    for _ in 0..n.max(1) {
+        let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        frames.push(Frame { width: w, height: h, spectrum: Spectrum::Rgb, data: yuyv_to_rgb(buf, w, h) });
+    }
+    Ok(frames)
+}
+
+/// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
+pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
+    let mut frames = capture_rgb_burst(device, 1)?;
+    frames.pop().ok_or_else(|| Error::Hardware("no frames captured".into()))
+}
+
+/// Capture an RGB burst and return its per-pixel temporal median — the
+/// recognition path's denoise. A single motion-blurred, over-exposed, or
+/// transiently corrupt frame is rejected by the median, so it can't drop a
+/// genuine match below threshold (false reject). Used for auth/enroll; the
+/// framing guide stays single-shot for latency.
+pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<Frame> {
+    Ok(median_frame(capture_rgb_burst(device, RGB_BURST)?))
+}
+
+/// Per-pixel temporal median across same-sized frames (sorts each byte position
+/// across the burst, keeps the middle value). Returns the lone frame unchanged
+/// for a degenerate burst.
+pub fn median_frame(mut frames: Vec<Frame>) -> Frame {
+    if frames.len() <= 1 {
+        return frames.pop().expect("median_frame: empty burst");
+    }
+    let (w, h, spectrum) = (frames[0].width, frames[0].height, frames[0].spectrum);
+    let len = frames.iter().map(|f| f.data.len()).min().unwrap_or(0);
+    let mut out = vec![0u8; len];
+    let mut col = vec![0u8; frames.len()];
+    for (i, o) in out.iter_mut().enumerate() {
+        for (k, f) in frames.iter().enumerate() {
+            col[k] = f.data[i];
+        }
+        col.sort_unstable();
+        *o = col[col.len() / 2];
+    }
+    Frame { width: w, height: h, spectrum, data: out }
 }
 
 const IR_W: u32 = 640;
@@ -554,6 +612,31 @@ impl Cameras {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(data: &[u8]) -> Frame {
+        Frame { width: data.len() as u32, height: 1, spectrum: Spectrum::Rgb, data: data.to_vec() }
+    }
+
+    #[test]
+    fn median_frame_rejects_a_single_bad_frame() {
+        // Four "good" frames near 100 and one wildly over-exposed (255) frame:
+        // the per-pixel median ignores the outlier.
+        let frames = vec![
+            frame(&[100, 50, 200]),
+            frame(&[101, 49, 201]),
+            frame(&[255, 255, 255]), // the bad frame
+            frame(&[ 99, 51, 199]),
+            frame(&[100, 50, 200]),
+        ];
+        let m = median_frame(frames);
+        assert_eq!(m.data, vec![100, 50, 200]);
+    }
+
+    #[test]
+    fn median_frame_passes_lone_frame_through() {
+        let m = median_frame(vec![frame(&[1, 2, 3])]);
+        assert_eq!(m.data, vec![1, 2, 3]);
+    }
 
     #[test]
     fn yuyv_grey_converts_to_grey_rgb() {

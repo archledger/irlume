@@ -42,6 +42,17 @@ pub struct FaceProfile {
     pub scans: Vec<FaceScan>,
 }
 
+/// The physical camera(s) an enrollment was captured on, for anti-swap binding:
+/// at auth, the live camera identity must still match (a swapped/virtual camera
+/// is refused). Identities are `irlume_camera::device_identity` strings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CameraBinding {
+    #[serde(default)]
+    pub rgb: Option<String>,
+    #[serde(default)]
+    pub ir: Option<String>,
+}
+
 /// All face data for one OS user.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Enrollment {
@@ -50,11 +61,15 @@ pub struct Enrollment {
     /// Per-user opt-in: require both eyes open to unlock (default off).
     #[serde(default)]
     pub require_eyes_open: bool,
+    /// Camera identity captured at enroll, verified at auth (anti-swap). `None`
+    /// for pre-binding enrollments — enforcement only kicks in once bound.
+    #[serde(default)]
+    pub camera_binding: Option<CameraBinding>,
 }
 
 impl Enrollment {
     pub fn new(user: &str) -> Self {
-        Self { user: user.into(), profiles: Vec::new(), require_eyes_open: false }
+        Self { user: user.into(), profiles: Vec::new(), require_eyes_open: false, camera_binding: None }
     }
 
     /// Total scans across all profiles (drives threshold scaling).
@@ -78,6 +93,30 @@ impl Enrollment {
                 p.scans.iter().filter_map(move |s| s.ir.as_ref().map(|ir| (p.name.as_str(), s.name.as_str(), ir.as_slice())))
             })
             .collect()
+    }
+
+    /// Per-user IR-liveness floor `(depth_ratio, brightness)` derived from the
+    /// enrolled scans' own IR calibration — the live frame must clear it, so the
+    /// anti-screen / anti-photo threshold adapts to this user's camera/rig
+    /// instead of a one-size global constant. Returns `None` until there are at
+    /// least two IR-bearing scans (enough to be representative). The floor is the
+    /// weakest enrolled value with a 25% margin below it (live IR varies).
+    pub fn ir_calibration(&self) -> Option<(f32, f32)> {
+        let mut depths = Vec::new();
+        let mut brights = Vec::new();
+        for p in &self.profiles {
+            for s in &p.scans {
+                if s.ir.is_some() && s.ir_depth > 0.0 && s.ir_brightness > 0.0 {
+                    depths.push(s.ir_depth);
+                    brights.push(s.ir_brightness);
+                }
+            }
+        }
+        if depths.len() < 2 {
+            return None;
+        }
+        let min = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min);
+        Some((min(&depths) * 0.75, min(&brights) * 0.75))
     }
 
     /// Default name for the next profile ("Face Profile N", first free slot).
@@ -136,6 +175,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
         user: old.user,
         profiles: vec![FaceProfile { name: "Face Profile 1".into(), scans }],
         require_eyes_open: false,
+        camera_binding: None,
     }
 }
 
@@ -302,6 +342,7 @@ mod tests {
                 }],
             }],
             require_eyes_open: true,
+            camera_binding: None,
         }
     }
 
@@ -336,6 +377,38 @@ mod tests {
         let bytes = serialize_enrollment(&sample(), Some(&key)).unwrap();
         assert!(deserialize_enrollment(&bytes, None).is_err());
         assert!(deserialize_enrollment(&bytes, Some(&crypto::generate_key())).is_err());
+    }
+
+    fn scan_with_ir(depth: f32, bright: f32) -> FaceScan {
+        FaceScan { name: "s".into(), rgb: vec![0.1; 4], ir: Some(vec![0.2; 4]), ir_depth: depth, ir_brightness: bright }
+    }
+
+    #[test]
+    fn ir_calibration_needs_two_scans_then_floors_below_weakest() {
+        // One IR scan -> not enough to characterise the user's rig.
+        let mut e = Enrollment::new("u");
+        e.profiles.push(FaceProfile { name: "p".into(), scans: vec![scan_with_ir(1.5, 100.0)] });
+        assert!(e.ir_calibration().is_none());
+
+        // Two+ scans -> floor at 75% of the weakest enrolled value.
+        e.profiles[0].scans.push(scan_with_ir(1.2, 80.0));
+        let (depth_floor, bright_floor) = e.ir_calibration().unwrap();
+        assert!((depth_floor - 1.2 * 0.75).abs() < 1e-5);
+        assert!((bright_floor - 80.0 * 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ir_calibration_ignores_scans_without_ir() {
+        // RGB-only scans (no IR) must not count toward the floor.
+        let mut e = Enrollment::new("u");
+        e.profiles.push(FaceProfile {
+            name: "p".into(),
+            scans: vec![
+                FaceScan { name: "a".into(), rgb: vec![0.1; 4], ir: None, ir_depth: 0.0, ir_brightness: 0.0 },
+                scan_with_ir(1.5, 100.0),
+            ],
+        });
+        assert!(e.ir_calibration().is_none()); // only one IR-bearing scan
     }
 
     #[test]

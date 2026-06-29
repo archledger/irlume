@@ -90,7 +90,9 @@ impl Engine {
 
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
-        let rgb = irlume_camera::capture_rgb(&self.rgb_dev)?;
+        // Median-denoise the RGB frame so a single blurry/over-exposed frame
+        // can't false-reject a genuine user (IR is already brightest-of-burst).
+        let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
         let rgb_view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
         let rgb_faces = self.det.detect(&rgb_view)?;
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
@@ -167,6 +169,13 @@ impl Engine {
         if enr.profiles.iter().all(|p| p.scans.is_empty()) {
             return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' has no face scans enrolled") });
         }
+        // Anti-swap: refuse if the live camera no longer matches the one this
+        // user enrolled on (only enforced once an enrollment carries a binding).
+        if let Some(bind) = &enr.camera_binding {
+            if let Some(reason) = self.binding_mismatch(bind) {
+                return Ok(Outcome { granted: false, live: false, score: 0.0, reason });
+            }
+        }
         let a = self.assess()?;
 
         // Opt-in hard gate: never unlock unless both eyes read open.
@@ -187,6 +196,19 @@ impl Engine {
         if let Some(probe) = a.embedding {
             if a.verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
+            }
+            // Per-user IR-liveness floor (anti-screen/photo, calibrated to this
+            // user's enrolled IR): the live frame must clear the enrolled floor.
+            if let Some((depth_floor, bright_floor)) = enr.ir_calibration() {
+                if a.ir_depth < depth_floor || a.ir_brightness < bright_floor {
+                    return Ok(Outcome {
+                        granted: false, live: false, score: 0.0,
+                        reason: format!(
+                            "IR below your calibrated floor (depth {:.2}<{:.2} or brightness {:.0}<{:.0}) — likely a screen/photo",
+                            a.ir_depth, depth_floor, a.ir_brightness, bright_floor
+                        ),
+                    });
+                }
             }
             let scans = enr.rgb_scans();
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
@@ -279,8 +301,37 @@ impl Engine {
         }
         let n = prof.scans.len();
         enr.profiles.push(prof);
+        if enr.camera_binding.is_none() {
+            enr.camera_binding = Some(self.current_binding());
+        }
         storage::save(&enr)?;
         Ok((name, n))
+    }
+
+    /// Snapshot the identity of the cameras this engine is bound to, for
+    /// anti-swap verification at auth.
+    fn current_binding(&self) -> irlume_core::storage::CameraBinding {
+        irlume_core::storage::CameraBinding {
+            rgb: irlume_camera::device_identity(&self.rgb_dev),
+            ir: irlume_camera::device_identity(&self.ir_dev),
+        }
+    }
+
+    /// If the live cameras no longer match the enrolled binding, return a reason
+    /// to refuse (anti-swap). A bound device that now reads differently — or an
+    /// enrolled IR camera that's gone — fails; an unbound side is not checked.
+    fn binding_mismatch(&self, bind: &irlume_core::storage::CameraBinding) -> Option<String> {
+        if let Some(want) = &bind.rgb {
+            if irlume_camera::device_identity(&self.rgb_dev).as_ref() != Some(want) {
+                return Some("camera changed since enrollment (RGB device identity differs) — re-enroll on this camera".into());
+            }
+        }
+        if let Some(want) = &bind.ir {
+            if irlume_camera::device_identity(&self.ir_dev).as_ref() != Some(want) {
+                return Some("IR camera changed or absent since enrollment — re-enroll on this camera".into());
+            }
+        }
+        None
     }
 
     /// Add one scan to an existing profile ("improve recognition"). Errors if the
@@ -310,6 +361,9 @@ impl Engine {
         }
         let sname = enr.profiles[idx].next_scan_name();
         enr.profiles[idx].scans.push(FaceScan { name: sname.clone(), rgb, ir, ir_depth: d, ir_brightness: b });
+        if enr.camera_binding.is_none() {
+            enr.camera_binding = Some(self.current_binding());
+        }
         let total = enr.profiles[idx].scans.len();
         storage::save(&enr)?;
         Ok((sname, total))
@@ -511,6 +565,7 @@ mod tests {
         let enr = Enrollment {
             user: "u".into(),
             require_eyes_open: false,
+            camera_binding: None,
             profiles: vec![
                 FaceProfile { name: "Face Profile 1".into(), scans: vec![scan(face1.clone())] },
                 FaceProfile { name: "Face Profile 2".into(), scans: vec![scan(face2.clone())] },

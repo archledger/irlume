@@ -115,7 +115,13 @@ pub enum Request {
     /// so the caller can set it as `PAM_AUTHTOK` (login keyring unlock).
     /// PRIVILEGED: root only — the sealed login password is never released to a
     /// non-root peer.
-    UnsealPassword { user: String },
+    UnsealPassword {
+        user: String,
+        /// PAM service name (e.g. `plasmalogin`, `sudo`), for opt-in
+        /// biopolicy operation-class gating. `None` from older callers.
+        #[serde(default)]
+        service: Option<String>,
+    },
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.
     HasSealedPassword { user: String },

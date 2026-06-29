@@ -193,7 +193,11 @@ fn try_verify(user: &str) -> PamError {
 /// password and set it as `PAM_AUTHTOK` so the keyring/wallet module unlocks
 /// the wallet. `IGNORE` on decline/error so the password fallback runs.
 fn try_unseal(pamh: &Pam, user: &str) -> PamError {
-    match request(&Request::UnsealPassword { user: user.to_string() }) {
+    // Pass the PAM service name so the daemon can apply opt-in biopolicy
+    // operation-class gating (e.g. refuse credential release to a remote service).
+    let service = pamh.get_service().ok().flatten()
+        .and_then(|c| c.to_str().ok().map(str::to_string));
+    match request(&Request::UnsealPassword { user: user.to_string(), service }) {
         Ok(Response::PasswordUnsealed { secret }) => {
             // CString copies the bytes; PAM then copies them into its own store.
             // A login password cannot contain a NUL, so this only fails on a

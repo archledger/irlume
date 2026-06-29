@@ -81,6 +81,19 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
+/// Whether opt-in biopolicy operation-class gating is enabled. Off by default;
+/// turn on via `IRLUME_ENFORCE_BIOPOLICY=1` or `enforce_biopolicy=1` in
+/// `/etc/irlume/settings.conf`. When off, behaviour is unchanged.
+fn biopolicy_enforced() -> bool {
+    let truthy = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
+    if let Ok(v) = std::env::var("IRLUME_ENFORCE_BIOPOLICY") {
+        return truthy(&v);
+    }
+    irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
+        .map(|v| truthy(&v))
+        .unwrap_or(false)
+}
+
 /// Peer identity from SO_PEERCRED.
 struct Peer {
     uid: u32,
@@ -206,12 +219,27 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::UnsealPassword { user } => {
+        Request::UnsealPassword { user, service } => {
             // The sealed LOGIN password is released ONLY to a root peer (the
             // login/lockscreen PAM stack runs as root). A non-root caller never
             // gets it, even with a matching face.
             if peer.uid != 0 {
                 return Response::Error(format!("unseal_password requires root (peer uid {})", peer.uid));
+            }
+            // Opt-in biopolicy: when enforcement is enabled, gate credential
+            // release by the PAM service's operation class (e.g. refuse a remote
+            // / unknown service). Default off → unchanged behaviour.
+            if biopolicy_enforced() {
+                use irlume_core::biopolicy::{classify, decide, Action, Tier};
+                let svc = service.as_deref().unwrap_or("");
+                // UnsealPassword is the cold-login path (the lock screen uses
+                // verify-only `wait`), so warm=false. irlume's liveness already
+                // requires IR for any grant, so a granted match is Secure tier.
+                let action = decide(classify(svc, false), Tier::Secure);
+                if action != Action::Unseal {
+                    eprintln!("irlumed: biopolicy denies unseal for service '{svc}' ({action:?}) -> password");
+                    return Response::Error(format!("biopolicy: '{svc}' may not release the credential"));
+                }
             }
             do_unseal_password(&user, engine)
         }

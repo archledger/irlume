@@ -7,7 +7,11 @@
 //! with `SO_PEERCRED` (verify uid/gid of the peer) before honouring privileged
 //! requests such as enrollment.
 
+pub mod client;
+pub mod config;
+pub mod memlock;
 pub mod platform;
+pub mod secureboot;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -25,6 +29,9 @@ pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
     pub fn new(bytes: Vec<u8>) -> Self {
+        // Lock the secret's pages against swap / core dumps for its lifetime
+        // (defence-in-depth atop the zeroize-on-drop below).
+        memlock::lock_slice(&bytes);
         SecretBytes(bytes)
     }
     /// Borrow the raw bytes. Callers must not copy them into a non-zeroizing buffer.

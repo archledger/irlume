@@ -11,6 +11,8 @@ use irlume_common::{Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 
+mod users;
+
 fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
@@ -44,10 +46,23 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // SO_PEERCRED is the real trust boundary; 0666 lets any local user *attempt*
-    // auth (login greeters / sudo run as different uids); privileged ops are
-    // still gated by the peer-credential check.
-    set_mode(&socket, 0o666);
+    // SO_PEERCRED is the real trust boundary. Defence-in-depth: if the `irlume`
+    // group exists, restrict the socket to `0660 root:irlume` so only group
+    // members (greeters, the user) can even connect; otherwise fall back to
+    // 0666 so a box without the group set up still works (greeters run as
+    // varied uids). Privileged ops are gated by the peer-credential check either way.
+    match users::gid_for_group("irlume") {
+        Some(gid) => {
+            if let Err(e) = users::chown(std::path::Path::new(&socket), Some(0), Some(gid)) {
+                eprintln!("irlumed: could not chown socket to root:irlume ({e}); leaving 0666");
+                set_mode(&socket, 0o666);
+            } else {
+                set_mode(&socket, 0o660);
+                eprintln!("irlumed: socket restricted to root:irlume (0660)");
+            }
+        }
+        None => set_mode(&socket, 0o666),
+    }
     eprintln!("irlumed: listening on {socket}");
 
     for conn in listener.incoming() {
@@ -100,15 +115,10 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+/// Resolve a username to its uid via NSS (covers LDAP/SSSD/systemd-homed, not
+/// just `/etc/passwd`).
 fn uid_of(user: &str) -> Option<u32> {
-    let data = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in data.lines() {
-        let mut f = line.split(':');
-        if f.next() == Some(user) {
-            return f.nth(1).and_then(|u| u.parse().ok()); // field index 2 = uid
-        }
-    }
-    None
+    users::uid_for_name(user)
 }
 
 fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Result<()> {

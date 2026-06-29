@@ -23,6 +23,7 @@ const TAG_LEN: usize = 16;
 pub fn generate_key() -> Zeroizing<Vec<u8>> {
     let mut key = Zeroizing::new(vec![0u8; KEY_LEN]);
     rand::thread_rng().fill_bytes(&mut key);
+    irlume_common::memlock::lock_slice(&key);
     key
 }
 
@@ -73,6 +74,7 @@ pub fn decrypt(key: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let plain = cipher
         .decrypt(nonce, ct)
         .map_err(|_| Error::Policy("decryption failed (wrong key or tampered data)".into()))?;
+    irlume_common::memlock::lock_slice(&plain);
     Ok(Zeroizing::new(plain))
 }
 

@@ -411,14 +411,18 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
 /// Release the sealed secret iff the bound policy is satisfied. Dispatches on the
 /// envelope's [`PolicyKind`].
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
-    match &env.policy {
+    let out = match &env.policy {
         PolicyKind::PcrLiteral => unseal_literal(env),
         PolicyKind::Authorized {
             pubkey_pem,
             policy_ref,
         } => unseal_authorized(env, pubkey_pem, policy_ref),
         PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
-    }
+    }?;
+    // Lock the unsealed secret (login password / template key) against swap and
+    // core dumps for as long as it lives.
+    irlume_common::memlock::lock_slice(&out);
+    Ok(out)
 }
 
 /// Unseal a literal-`PolicyPCR` envelope: replay the bound PCRs into a policy

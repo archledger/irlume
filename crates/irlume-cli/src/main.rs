@@ -247,18 +247,10 @@ fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 
 /// Round-trip one request to `irlumed` over the Unix socket and return its reply.
 pub(crate) fn daemon_request(req: &irlume_common::Request) -> Result<irlume_common::Response, String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    let path = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| irlume_common::SOCKET_PATH.into());
-    let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e} (is irlumed running?)"))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(120))).ok();
-    let mut line = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-    line.push(b'\n');
-    (&stream).write_all(&line).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(&stream);
-    let mut resp = String::new();
-    reader.read_line(&mut resp).map_err(|e| e.to_string())?;
-    serde_json::from_str(resp.trim()).map_err(|e| e.to_string())
+    // Shared client: bounded connect timeout + zeroized wire buffers. The 120s
+    // read budget covers slow operations (guided enroll capture loops).
+    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120))
+        .map_err(|e| format!("{e} (is irlumed running?)"))
 }
 
 pub(crate) fn user_arg(args: &[String]) -> String {
@@ -824,45 +816,24 @@ fn tpm_device() -> Option<&'static str> {
     ["/dev/tpmrm0", "/dev/tpm0"].into_iter().find(|d| std::path::Path::new(d).exists())
 }
 
-/// Secure Boot state from the EFI variable: `Some(true/false)`, or `None` when
-/// not a UEFI boot / the variable is unreadable.
-fn secure_boot_state() -> Option<bool> {
-    let var = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
-    // Layout: 4-byte attribute header followed by the 1-byte value.
-    std::fs::read(var).ok().and_then(|b| b.get(4).map(|&v| v == 1))
-}
-
-/// Best-effort bootloader classification (informational): UKI vs GRUB.
-fn boot_mode() -> &'static str {
-    // A UKI exposes a systemd PCR-11 signature at runtime; the ESP also carries
-    // EFI/Linux/*.efi unified images.
-    if std::path::Path::new("/run/systemd/tpm2-pcr-signature.json").exists() {
-        return "UKI (signed PCR-11 eligible)";
-    }
-    for esp in ["/boot/efi/EFI/Linux", "/efi/EFI/Linux", "/boot/EFI/Linux"] {
-        if std::fs::read_dir(esp).map(|mut d| d.any(|e| e.is_ok())).unwrap_or(false) {
-            return "UKI (signed PCR-11 eligible)";
-        }
-    }
-    if std::path::Path::new("/boot/grub2").exists() || std::path::Path::new("/boot/grub").exists() {
-        return "GRUB (uses self-healing PCR-7 / recovery passphrase)";
-    }
-    "unknown bootloader"
-}
-
 fn doctor() -> std::process::ExitCode {
+    use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
     println!("[doctor] platform: {}", irlume_common::platform::distro_family().as_str());
     match tpm_device() {
         Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
         None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗ — required for sealing"),
     }
-    match secure_boot_state() {
-        Some(true) => println!("[doctor] Secure Boot: enabled ✓"),
-        Some(false) => println!("[doctor] Secure Boot: disabled ⚠ — TPM PCR-7 binding is weak; enable for trust"),
-        None => println!("[doctor] Secure Boot: unknown (not a UEFI boot?)"),
+    if !secureboot::secure_boot_present() {
+        println!("[doctor] Secure Boot: unknown (not a UEFI boot?)");
+    } else if secureboot::is_secure_boot_enabled() {
+        println!("[doctor] Secure Boot: enabled ✓");
+    } else if secureboot::is_setup_mode() {
+        println!("[doctor] Secure Boot: SETUP MODE ⚠ — keys not enrolled; PCR-7 binding is NOT enforcing");
+    } else {
+        println!("[doctor] Secure Boot: disabled ⚠ — TPM PCR-7 binding is weak; enable for trust");
     }
-    println!("[doctor] boot mode: {}", boot_mode());
+    println!("[doctor] boot mode: {}", secureboot::detect_boot_mode().as_str());
     println!(
         "[doctor] signed PCR policy: {}",
         if irlume_core::pcrsig::signed_policy_available() {

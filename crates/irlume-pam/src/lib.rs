@@ -26,11 +26,9 @@
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
 //! log a failure — the password is always the floor).
 
-use irlume_common::{Request, Response, SecretBytes, SOCKET_PATH};
+use irlume_common::{Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// How long `wait` keeps retrying before giving up to the password fallback.
@@ -212,24 +210,12 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
     }
 }
 
-/// Round-trip one request to `irlumed` and return its reply.
+/// Round-trip one request to `irlumed` and return its reply. Delegates to the
+/// shared client (bounded connect timeout so a stalled daemon never hangs the
+/// auth prompt; wire buffers zeroized). The 25s read budget covers a full
+/// camera capture + liveness + match before the TPM unseal.
 fn request(req: &Request) -> std::io::Result<Response> {
-    let path = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
-    let stream = UnixStream::connect(&path)?;
-    // Generous read timeout: an unseal does a full camera capture + liveness +
-    // match before the TPM unseal.
-    stream.set_read_timeout(Some(Duration::from_secs(25)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let mut line = serde_json::to_vec(req)?;
-    line.push(b'\n');
-    (&stream).write_all(&line)?;
-
-    let mut reader = BufReader::new(&stream);
-    let mut resp = String::new();
-    reader.read_line(&mut resp)?;
-    serde_json::from_str(resp.trim())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    irlume_common::client::request_with_timeout(req, Duration::from_secs(25))
 }
 
 pam_module!(IrlumePam);

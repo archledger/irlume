@@ -56,6 +56,7 @@ fn derive_key(passphrase: &[u8], salt: &[u8], m: u32, t: u32, p: u32) -> Result<
     let mut out = Zeroizing::new(vec![0u8; crypto::KEY_LEN]);
     a2.hash_password_into(passphrase, salt, &mut out)
         .map_err(|e| Error::Policy(format!("argon2 derive: {e}")))?;
+    irlume_common::memlock::lock_slice(&out);
     Ok(out)
 }
 

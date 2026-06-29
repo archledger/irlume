@@ -11,6 +11,8 @@
 //!   irlume selftest liveness                     run the IR PAD cues
 //!   irlume doctor                                check cameras/IR/TPM/models
 
+mod tui;
+
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
@@ -29,6 +31,10 @@ fn main() -> std::process::ExitCode {
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
+        (Some("tui"), _) => match tui::run() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => { eprintln!("tui: {e}"); std::process::ExitCode::FAILURE }
+        },
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -228,7 +234,7 @@ fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 }
 
 /// Round-trip one request to `irlumed` over the Unix socket and return its reply.
-fn daemon_request(req: &irlume_common::Request) -> Result<irlume_common::Response, String> {
+pub(crate) fn daemon_request(req: &irlume_common::Request) -> Result<irlume_common::Response, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     let path = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| irlume_common::SOCKET_PATH.into());

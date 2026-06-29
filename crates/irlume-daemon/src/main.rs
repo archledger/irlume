@@ -129,6 +129,10 @@ fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Resu
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     match req {
         Request::Ping => Response::Pong,
+        Request::PositionSample => match engine.position_sample() {
+            Ok(r) => Response::Position(r),
+            Err(e) => Response::Error(e.to_string()),
+        },
         Request::Authenticate { user } => match engine.authenticate(&user) {
             Ok(o) => Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason },
             Err(e) => Response::Error(e.to_string()),

@@ -95,6 +95,10 @@ pub enum Request {
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.
     Ping,
+    /// One framing-guide sample (no enrollment, no auth) — captures a frame and
+    /// returns a [`PositionReport`] of how the user is positioned, for the guided
+    /// enrollment cues. Safe to poll repeatedly.
+    PositionSample,
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
@@ -154,6 +158,30 @@ pub struct ProfileSummary {
     pub scans: Vec<String>,
 }
 
+/// Framing-guide sample for guided enrollment — no raw image, safe to poll. The
+/// gates that set `well_framed` mirror the enroll/auth path, so "well framed"
+/// implies a capture will succeed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PositionReport {
+    pub face: bool,
+    /// Face width / frame width (distance signal).
+    pub face_frac: f32,
+    pub centered: bool,
+    /// Head-orientation proxies (0 frontal yaw; ~0.5 frontal pitch).
+    pub yaw_asym: f32,
+    pub pitch_frac: f32,
+    /// Mean luma (0–255) of the RGB face region (lighting signal).
+    pub brightness: f32,
+    /// IR companion sees an emitter-lit face (dark-capable / liveness-ready).
+    pub ir_ok: bool,
+    /// Composite framing quality, 0–100.
+    pub quality: u8,
+    /// All gates pass — ready to capture.
+    pub well_framed: bool,
+    /// One plain-language cue for the user ("Move closer", "Hold still", …).
+    pub guidance: String,
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -174,6 +202,8 @@ pub enum Response {
     Ok(String),
     SelfTest { passed: bool, detail: String },
     Pong,
+    /// A framing-guide sample (`PositionSample`).
+    Position(PositionReport),
     Error(String),
 
     // --- keyring unlock responses -------------------------------------------

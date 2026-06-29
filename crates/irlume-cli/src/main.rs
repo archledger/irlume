@@ -14,10 +14,12 @@
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
 //!   irlume fingerprint <status|add|enable|disable> fprintd companion factor
 //!   irlume login <status|enable|disable>         wire face auth into PAM (dry-run)
+//!   irlume tui                                   interactive setup/management UI
 
 mod fingerprint;
 mod pamwire;
 mod recovery;
+mod tui;
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
@@ -41,12 +43,16 @@ fn main() -> std::process::ExitCode {
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("doctor"), _) => doctor(),
+        (Some("tui"), _) => match tui::run() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => { eprintln!("tui: {e}"); std::process::ExitCode::FAILURE }
+        },
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
             std::process::ExitCode::SUCCESS
         }
         (None, _) => {
-            println!("irlume <enroll|verify|profiles|delete|selftest|doctor|keyring|recovery|fingerprint|login>");
+            println!("irlume <enroll|verify|profiles|delete|selftest|doctor|keyring|recovery|fingerprint|login|tui>");
             std::process::ExitCode::SUCCESS
         }
     }

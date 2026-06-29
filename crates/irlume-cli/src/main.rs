@@ -11,8 +11,6 @@
 //!   irlume selftest liveness                     run the IR PAD cues
 //!   irlume doctor                                check cameras/IR/TPM/models
 
-mod tui;
-
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
@@ -31,10 +29,6 @@ fn main() -> std::process::ExitCode {
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
-        (Some("tui"), _) => match tui::run() {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(e) => { eprintln!("tui: {e}"); std::process::ExitCode::FAILURE }
-        },
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -54,8 +48,9 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let user = user_arg(args);
     let name = flag(args, "--name").map(String::from);
+    let scans = flag(args, "--scans").and_then(|s| s.parse::<usize>().ok());
     eprintln!("[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…");
-    match daemon_request(&Request::Enroll { user, profile: name, scans: None }) {
+    match daemon_request(&Request::Enroll { user, profile: name, scans }) {
         Ok(Response::Ok(msg)) => { println!("[enroll] {msg}"); std::process::ExitCode::SUCCESS }
         Ok(Response::Error(e)) => { eprintln!("enroll failed: {e}"); std::process::ExitCode::FAILURE }
         Ok(other) => { eprintln!("enroll: unexpected response {other:?}"); std::process::ExitCode::FAILURE }

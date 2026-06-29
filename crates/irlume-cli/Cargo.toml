@@ -18,4 +18,3 @@ irlume-auth.workspace = true
 serde_json.workspace = true
 image = { workspace = true }
 rpassword = "7"   # no-echo password prompt for `keyring arm`
-ratatui = "0.29"  # TUI (MIT) — bundles crossterm; powers `irlume tui`

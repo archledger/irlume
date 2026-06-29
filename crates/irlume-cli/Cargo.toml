@@ -15,6 +15,7 @@ irlume-camera.workspace = true
 irlume-liveness.workspace = true
 irlume-core.workspace = true
 irlume-auth.workspace = true
+irlume-fingerprint.workspace = true
 serde_json.workspace = true
 image = { workspace = true }
 rpassword = "7"   # no-echo password prompt for `keyring arm`

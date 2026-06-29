@@ -11,6 +11,8 @@
 //!   irlume selftest liveness                     run the IR PAD cues
 //!   irlume doctor                                check cameras/IR/TPM/models
 
+mod fingerprint;
+
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
@@ -28,6 +30,7 @@ fn main() -> std::process::ExitCode {
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
+        (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
@@ -244,7 +247,7 @@ pub(crate) fn daemon_request(req: &irlume_common::Request) -> Result<irlume_comm
     serde_json::from_str(resp.trim()).map_err(|e| e.to_string())
 }
 
-fn user_arg(args: &[String]) -> String {
+pub(crate) fn user_arg(args: &[String]) -> String {
     flag(args, "--user").map(str::to_string).filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()))
 }

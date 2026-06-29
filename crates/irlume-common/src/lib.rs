@@ -7,6 +7,8 @@
 //! with `SO_PEERCRED` (verify uid/gid of the peer) before honouring privileged
 //! requests such as enrollment.
 
+pub mod platform;
+
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 

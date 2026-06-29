@@ -156,6 +156,11 @@ impl Engine {
     /// then 1:N cosine match against every scan in every enrolled face profile
     /// (any enrolled face unlocks). Threshold scales with the total scan count.
     pub fn authenticate(&mut self, user: &str) -> irlume_common::Result<Outcome> {
+        // Fingerprint mode: face is disabled so pam_fprintd drives — never engage
+        // the camera, decline so the PAM stack cascades to fingerprint/password.
+        if irlume_core::policy::method().face_disabled() {
+            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "face disabled (fingerprint mode)".into() });
+        }
         let Some(enr) = irlume_core::storage::load(user)? else {
             return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
         };

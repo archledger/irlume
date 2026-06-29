@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod keyring;
 pub mod matcher;
 pub mod pcrsig;
+pub mod policy;
 pub mod storage;
 pub mod tpm;
 pub mod tpm_pcrlock;

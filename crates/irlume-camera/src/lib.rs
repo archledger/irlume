@@ -459,7 +459,11 @@ pub fn median_frame(mut frames: Vec<Frame>) -> Frame {
 
 const IR_W: u32 = 640;
 const IR_H: u32 = 400;
-const IR_BURST: usize = 24; // grab a burst; keep the brightest (lit strobe phase)
+// Grab a short burst and keep the brightest frame (the lit strobe phase). The
+// IR node caps at 15 fps, so each frame costs ~67ms — 10 frames (~0.67s) still
+// catches the emitter's strobe peak (it re-fires at mid-burst) while ~halving
+// the old 24-frame (~1.6s) cost. Bump back up if dark-mode genuine scores drop.
+const IR_BURST: usize = 10;
 
 /// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
 /// emitter must be illuminating for a usable image; on integrated Hello modules

@@ -12,6 +12,9 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 /// Re-exported so the daemon can pick devices without depending on the camera
 /// crate directly. See [`irlume_camera::select_pair`].
 pub use irlume_camera::select_pair;
+/// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
+/// the daemon. See [`irlume_camera::setup_ir_emitter`].
+pub use irlume_camera::{ensure_ir_emitter, list_ir_controls, setup_ir_emitter};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
@@ -65,6 +68,11 @@ impl Engine {
         self.rgb_dev = rgb.into();
         self.ir_dev = ir.into();
         self
+    }
+
+    /// The selected IR camera device path (for emitter auto-setup).
+    pub fn ir_device(&self) -> &str {
+        &self.ir_dev
     }
 
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the

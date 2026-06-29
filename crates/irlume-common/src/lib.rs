@@ -85,6 +85,10 @@ pub enum Request {
     RenameScan { user: String, profile: String, scan: String, new_name: String },
     /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
+    /// Auto-configure the IR emitter (integrated linux-enable-ir-emitter): find
+    /// and persist the UVC control that lights the 850nm illuminator, using IR
+    /// brightness to detect success. `dry_run` only enumerates XU controls.
+    SetupIrEmitter { dry_run: bool },
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.

@@ -137,9 +137,34 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to enroll '{user}'"));
             }
+            // Auto-fix a dark/disabled IR emitter so dark-mode scans enroll
+            // cleanly — only runs the brute-force if IR is actually dark.
+            match irlume_auth::ensure_ir_emitter(engine.ir_device()) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("irlumed: IR still dark after auto-setup — enrolling RGB (dark unlock unavailable)"),
+                Err(e) => eprintln!("irlumed: IR emitter auto-setup skipped: {e}"),
+            }
             match engine.enroll_profile(&user, profile, irlume_core::storage::DEFAULT_ENROLL_SCANS) {
                 Ok((name, n)) => Response::Ok(format!("enrolled '{name}' with {n} scans")),
                 Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::SetupIrEmitter { dry_run } => {
+            // Hardware fix on the shared camera; non-destructive on failure.
+            if dry_run {
+                match irlume_auth::list_ir_controls(engine.ir_device()) {
+                    Ok(c) if c.is_empty() => Response::Ok("no UVC extension-unit controls found".into()),
+                    Ok(c) => Response::Ok(format!(
+                        "XU controls: {}",
+                        c.iter().map(|(u, s, l)| format!("unit{u}/sel{s}/{l}B")).collect::<Vec<_>>().join(", ")
+                    )),
+                    Err(e) => Response::Error(e.to_string()),
+                }
+            } else {
+                match irlume_auth::setup_ir_emitter(engine.ir_device()) {
+                    Ok(msg) => { eprintln!("irlumed: {msg}"); Response::Ok(msg) }
+                    Err(e) => Response::Error(e.to_string()),
+                }
             }
         }
         Request::AddScan { user, profile } => {

@@ -28,6 +28,7 @@ fn main() -> std::process::ExitCode {
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
+        (Some("ir-setup"), _) => ir_setup(&args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {
             println!("irlume: '{cmd}' not yet implemented (scaffold)");
@@ -102,6 +103,22 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         Ok(Response::Error(e)) => { eprintln!("[profiles] {e}"); std::process::ExitCode::FAILURE }
         Ok(other) => { eprintln!("[profiles] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
         Err(e) => { eprintln!("[profiles] {e}"); std::process::ExitCode::FAILURE }
+    }
+}
+
+/// `irlume ir-setup [--dry-run]` — auto-enable the IR emitter via the daemon
+/// (integrated linux-enable-ir-emitter). `--dry-run` only lists XU controls.
+fn ir_setup(args: &[String]) -> std::process::ExitCode {
+    use irlume_common::{Request, Response};
+    let dry = args.iter().any(|a| a == "--dry-run");
+    if !dry {
+        eprintln!("[ir-setup] probing the IR camera and trying to enable the 850nm emitter (a few seconds)…");
+    }
+    match daemon_request(&Request::SetupIrEmitter { dry_run: dry }) {
+        Ok(Response::Ok(msg)) => { println!("[ir-setup] {msg}"); std::process::ExitCode::SUCCESS }
+        Ok(Response::Error(e)) => { eprintln!("[ir-setup] {e}"); std::process::ExitCode::FAILURE }
+        Ok(other) => { eprintln!("[ir-setup] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
+        Err(e) => { eprintln!("[ir-setup] {e}"); std::process::ExitCode::FAILURE }
     }
 }
 

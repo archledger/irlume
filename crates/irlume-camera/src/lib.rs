@@ -403,6 +403,73 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     Ok(Frame { width: w, height: h, spectrum: Spectrum::Ir, data: grey })
 }
 
+/// Auto-configure the IR emitter for `device` — irlume's integrated
+/// linux-enable-ir-emitter: enumerate the camera's UVC extension-unit controls,
+/// try candidate payloads, and keep the one that makes the IR image bright
+/// (success detected automatically from IR brightness — no phone-camera step).
+/// Persists the discovered control so every later capture uses it. Returns a
+/// human description, or errors if nothing worked. Non-destructive: controls
+/// that don't help are restored.
+pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
+    verify_pinned(device)?;
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
+    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
+    if &fmt.fourcc.repr != b"GREY" {
+        return Err(Error::Hardware(format!("{device}: not an IR (GREY) capture node")));
+    }
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| map_io(device, e))?;
+    let fd = dev.handle().fd();
+    for _ in 0..4 {
+        let _ = stream.next(); // let the sensor settle before baseline
+    }
+    // Mean IR brightness over a short burst (catches a strobed emitter's lit phase).
+    let measure = || -> f32 {
+        let mut best = 0.0f32;
+        for _ in 0..8 {
+            if let Ok((buf, _)) = stream.next() {
+                let m = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
+                best = best.max(m as f32);
+            }
+        }
+        best
+    };
+    match ir_emitter::autoconfigure(fd, measure) {
+        Some(ctrl) => {
+            ir_emitter::save_conf(&ctrl).map_err(|e| Error::Io(e.to_string()))?;
+            Ok(format!("IR emitter enabled — control {} (saved; future captures use it automatically)", ctrl.encode()))
+        }
+        None => Err(Error::Hardware(
+            "could not auto-enable the IR emitter: no extension-unit control brightened the IR image. \
+             The camera may have no software-controllable emitter, or need a vendor-specific config.".into(),
+        )),
+    }
+}
+
+/// Read-only list of the IR camera's UVC extension-unit controls (unit, selector,
+/// size) — for `ir-setup --dry-run` diagnostics. Touches no settings.
+pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<(u8, u8, usize)>> {
+    verify_pinned(device)?;
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    Ok(ir_emitter::list_controls(dev.handle().fd()))
+}
+
+/// Ensure the IR emitter is working: a normal IR capture first (fires the
+/// known/configured emitter); only if that's dark does it run auto-setup. So a
+/// camera that already works (table/conf/env) is never brute-forced. Returns
+/// whether IR is bright after. `Some(true/false)` distinguishes "auto-setup ran"
+/// in the bool; the caller logs accordingly. Best-effort.
+pub fn ensure_ir_emitter(device: &str) -> irlume_common::Result<bool> {
+    let mean_of = |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
+    if mean_of(&capture_ir(device)?) >= 40.0 {
+        return Ok(true); // already working — do not touch the camera
+    }
+    // Dark: attempt integrated auto-setup, then re-check.
+    setup_ir_emitter(device)?;
+    Ok(mean_of(&capture_ir(device)?) >= 40.0)
+}
+
 /// Replicate an 8-bit greyscale buffer into interleaved RGB8 (for feeding the
 /// RGB-trained detector on an IR frame).
 pub fn grey_to_rgb(grey: &[u8]) -> Vec<u8> {

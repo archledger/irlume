@@ -70,7 +70,7 @@ pub enum Request {
     Authenticate { user: String },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
-    Enroll { user: String, profile: Option<String> },
+    Enroll { user: String, profile: Option<String>, scans: Option<usize> },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
     /// List enrolled profiles + their scans for `user`.
@@ -85,6 +85,10 @@ pub enum Request {
     RenameScan { user: String, profile: String, scan: String, new_name: String },
     /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
+    /// One framing-guide sample (no enrollment, no auth) — captures a frame and
+    /// returns a [`PositionReport`] of how the user is positioned, for the guided
+    /// enrollment cues. Safe to poll repeatedly.
+    PositionSample,
     /// Auto-configure the IR emitter (integrated linux-enable-ir-emitter): find
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
@@ -136,6 +140,30 @@ pub struct ProfileSummary {
     pub scans: Vec<String>,
 }
 
+/// Framing-guide sample for guided enrollment — no raw image, safe to poll. The
+/// gates that set `well_framed` mirror the enroll/auth path, so "well framed"
+/// implies a capture will succeed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PositionReport {
+    pub face: bool,
+    /// Face width / frame width (distance signal).
+    pub face_frac: f32,
+    pub centered: bool,
+    /// Head-orientation proxies (0 frontal yaw; ~0.5 frontal pitch).
+    pub yaw_asym: f32,
+    pub pitch_frac: f32,
+    /// Mean luma (0–255) of the RGB face region (lighting signal).
+    pub brightness: f32,
+    /// IR companion sees an emitter-lit face (dark-capable / liveness-ready).
+    pub ir_ok: bool,
+    /// Composite framing quality, 0–100.
+    pub quality: u8,
+    /// All gates pass — ready to capture.
+    pub well_framed: bool,
+    /// One plain-language cue for the user ("Move closer", "Hold still", …).
+    pub guidance: String,
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -154,6 +182,8 @@ pub enum Response {
     Enrollment { profiles: Vec<ProfileSummary>, require_eyes_open: bool },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
+    /// A framing-guide sample (`PositionSample`).
+    Position(PositionReport),
     SelfTest { passed: bool, detail: String },
     Pong,
     Error(String),

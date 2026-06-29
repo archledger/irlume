@@ -55,7 +55,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     let user = user_arg(args);
     let name = flag(args, "--name").map(String::from);
     eprintln!("[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…");
-    match daemon_request(&Request::Enroll { user, profile: name }) {
+    match daemon_request(&Request::Enroll { user, profile: name, scans: None }) {
         Ok(Response::Ok(msg)) => { println!("[enroll] {msg}"); std::process::ExitCode::SUCCESS }
         Ok(Response::Error(e)) => { eprintln!("enroll failed: {e}"); std::process::ExitCode::FAILURE }
         Ok(other) => { eprintln!("enroll: unexpected response {other:?}"); std::process::ExitCode::FAILURE }

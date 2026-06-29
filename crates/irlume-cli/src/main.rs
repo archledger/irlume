@@ -184,7 +184,7 @@ fn verify(args: &[String]) -> std::process::ExitCode {
 /// `irlume keyring <arm|status|forget>` — manage the TPM-sealed login password
 /// that lets a face login unlock the GNOME-keyring / KWallet. Talks to `irlumed`
 /// over the socket (the daemon owns the TPM + the root-only sealed store).
-fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
+pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     let user = user_arg(args);
     match sub {
         Some("arm") => {

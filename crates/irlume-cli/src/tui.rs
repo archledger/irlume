@@ -25,15 +25,23 @@ const BLUE: Color = Color::Rgb(0x4a, 0x90, 0xd9);
 const OK: Color = Color::Rgb(0x73, 0xc9, 0x91);
 const ERR: Color = Color::Rgb(0xe8, 0x7a, 0x7a);
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SCREENS: [&str; 7] = ["Profiles", "Settings", "Fingerprint", "IR Camera", "Keyring", "Recovery", "Diagnostics"];
+const SCREENS: [&str; 12] = [
+    "Welcome", "Host check", "Cameras", "Profiles", "Calibrate", "Identify",
+    "Keyring", "Recovery", "Fingerprint", "Login wiring", "Settings", "Done",
+];
 // Screen indices (keep in sync with SCREENS).
-const SC_PROFILES: usize = 0;
-const SC_SETTINGS: usize = 1;
-const SC_FINGERPRINT: usize = 2;
-const SC_IRCAM: usize = 3;
-const SC_KEYRING: usize = 4;
-const SC_RECOVERY: usize = 5;
-const SC_DIAG: usize = 6;
+const SC_WELCOME: usize = 0;
+const SC_DOCTOR: usize = 1;
+const SC_CAMERAS: usize = 2;
+const SC_PROFILES: usize = 3;
+const SC_CALIBRATE: usize = 4;
+const SC_IDENTIFY: usize = 5;
+const SC_KEYRING: usize = 6;
+const SC_RECOVERY: usize = 7;
+const SC_FINGERPRINT: usize = 8;
+const SC_PAM: usize = 9;
+const SC_SETTINGS: usize = 10;
+const SC_DONE: usize = 11;
 const MAX_PROFILES: usize = 3;
 const ENROLL_SCANS: usize = 3;
 const GOOD_STREAK: u32 = 3;
@@ -58,6 +66,16 @@ enum Suspend {
     FingerprintAdd,
     RecoverySetup,
     RecoveryRestore,
+    KeyringArm,
+    LoginStatus,
+}
+
+/// Where an async op's result should land (besides the Activity log).
+#[derive(Clone, Copy, PartialEq)]
+enum OpTag {
+    Generic,
+    Identify,
+    Calibrate,
 }
 
 /// Fingerprint snapshot for the Fingerprint screen.
@@ -98,6 +116,7 @@ struct EnrollUi {
 
 struct Op {
     label: String,
+    tag: OpTag,
     rx: mpsc::Receiver<(bool, String)>,
 }
 
@@ -117,6 +136,10 @@ struct App {
     fp: FpInfo,
     recovery: Option<RecoveryInfo>,
     suspend: Option<Suspend>,
+    /// Last 1:N identify result, shown as a card on the Identify screen.
+    identify_result: Option<(bool, String)>,
+    /// Last IR liveness self-test result, shown on the Calibrate screen.
+    calibrate_result: Option<(bool, String)>,
     spin: usize,
     quit: bool,
 }
@@ -144,6 +167,7 @@ impl App {
             nodes: irlume_camera::discover_nodes(),
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
+            identify_result: None, calibrate_result: None,
             spin: 0, quit: false,
         }
     }
@@ -206,19 +230,23 @@ impl App {
     }
 
     fn start_op(&mut self, label: impl Into<String>, req: Request) {
+        self.start_async(label, OpTag::Generic, req, map_ok);
+    }
+
+    /// Run a daemon request on a worker thread, mapping its response to
+    /// (ok, message) with `map`. Result is logged + routed by `tag` in `poll`.
+    fn start_async(&mut self, label: impl Into<String>, tag: OpTag, req: Request, map: fn(Response) -> (bool, String)) {
         let label = label.into();
         self.log('→', format!("daemon: {label}"));
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let r = match crate::daemon_request(&req) {
-                Ok(Response::Ok(m)) => (true, m),
-                Ok(Response::Error(e)) => (false, e),
-                Ok(o) => (false, format!("unexpected: {o:?}")),
+                Ok(resp) => map(resp),
                 Err(e) => (false, e),
             };
             let _ = tx.send(r);
         });
-        self.op = Some(Op { label, rx });
+        self.op = Some(Op { label, tag, rx });
     }
 
     /// Start guided enrollment (new profile) or add-scan (`add` = existing name).
@@ -239,7 +267,13 @@ impl App {
     fn poll(&mut self) {
         if let Some(op) = &self.op {
             if let Ok((ok, msg)) = op.rx.try_recv() {
-                self.log(if ok { '✓' } else { '✗' }, msg);
+                let tag = op.tag;
+                self.log(if ok { '✓' } else { '✗' }, msg.clone());
+                match tag {
+                    OpTag::Identify => self.identify_result = Some((ok, msg)),
+                    OpTag::Calibrate => self.calibrate_result = Some((ok, msg)),
+                    OpTag::Generic => {}
+                }
                 self.op = None;
                 self.refresh();
             }
@@ -295,6 +329,8 @@ impl App {
             Suspend::FingerprintAdd => { crate::fingerprint::run(Some("add"), &none); }
             Suspend::RecoverySetup => { crate::recovery::run(Some("setup"), &none); }
             Suspend::RecoveryRestore => { crate::recovery::run(Some("restore"), &none); }
+            Suspend::KeyringArm => { crate::keyring(Some("arm"), &none); }
+            Suspend::LoginStatus => { crate::pamwire::run(Some("status"), &none); }
         }
         eprint!("\nPress Enter to return to the TUI… ");
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -349,6 +385,17 @@ impl App {
 
     fn on_action(&mut self, code: KeyCode) {
         match (self.screen, code) {
+            // Welcome / Done / Host check: refresh the whole snapshot.
+            (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) | (SC_DOCTOR, KeyCode::Char('r')) => {
+                self.log('·', "refreshing status…");
+                self.refresh();
+            }
+            // Cameras: IR emitter auto-setup / probe.
+            (SC_CAMERAS, KeyCode::Char('s')) => self.start_op("SetupIrEmitter (auto-enable emitter)", Request::SetupIrEmitter { dry_run: false }),
+            (SC_CAMERAS, KeyCode::Char('p')) => {
+                if let Some(Response::Ok(m)) = self.request(Request::SetupIrEmitter { dry_run: true }, "SetupIrEmitter(dry-run)") { self.log('✓', m); }
+            }
+            // Profiles.
             (SC_PROFILES, KeyCode::Char('e')) => {
                 if self.profiles.len() >= MAX_PROFILES {
                     self.log('✗', format!("at the max {MAX_PROFILES} profiles — delete one first"));
@@ -359,6 +406,32 @@ impl App {
             (SC_PROFILES, KeyCode::Char('a')) => { if let Some(p) = self.sel_profile() { self.start_enroll(Some(p)); } }
             (SC_PROFILES, KeyCode::Char('r')) => self.begin_rename(),
             (SC_PROFILES, KeyCode::Char('d')) => self.begin_delete(),
+            // Calibrate: run the algorithmic IR liveness/PAD self-test.
+            (SC_CALIBRATE, KeyCode::Char('c')) => self.start_async(
+                "SelfTest (IR liveness)", OpTag::Calibrate,
+                Request::SelfTest { kind: irlume_common::SelfTestKind::Liveness }, map_selftest),
+            // Identify: 1:N who-is-this.
+            (SC_IDENTIFY, KeyCode::Char('i')) => self.start_async(
+                "Identify (1:N)", OpTag::Identify, Request::Identify, map_identify),
+            // Keyring.
+            (SC_KEYRING, KeyCode::Char('a')) => self.suspend = Some(Suspend::KeyringArm),
+            (SC_KEYRING, KeyCode::Char('f')) => {
+                self.confirm = Some(("Erase the TPM-sealed login password?".into(), Request::ForgetPassword { user: self.user.clone() }));
+            }
+            // Recovery.
+            (SC_RECOVERY, KeyCode::Char('s')) => self.suspend = Some(Suspend::RecoverySetup),
+            (SC_RECOVERY, KeyCode::Char('t')) => self.suspend = Some(Suspend::RecoveryRestore),
+            (SC_RECOVERY, KeyCode::Char('f')) => {
+                self.confirm = Some(("Erase the recovery passphrase? (templates stay encrypted)".into(), Request::RecoveryForget { user: self.user.clone() }));
+            }
+            // Fingerprint.
+            (SC_FINGERPRINT, KeyCode::Char('a')) => {
+                if self.fp.available { self.suspend = Some(Suspend::FingerprintAdd); }
+                else { self.log('✗', "no fingerprint reader detected"); }
+            }
+            // Login wiring (PAM): show status outside the alt-screen.
+            (SC_PAM, KeyCode::Char('s')) => self.suspend = Some(Suspend::LoginStatus),
+            // Settings.
             (SC_SETTINGS, KeyCode::Enter) | (SC_SETTINGS, KeyCode::Char(' ')) => {
                 let on = !self.eyes_open;
                 if self.request(Request::SetRequireEyesOpen { user: self.user.clone(), on }, &format!("SetRequireEyesOpen({on})")).is_some() {
@@ -366,23 +439,6 @@ impl App {
                 }
                 self.refresh();
             }
-            (SC_FINGERPRINT, KeyCode::Char('a')) => {
-                if self.fp.available { self.suspend = Some(Suspend::FingerprintAdd); }
-                else { self.log('✗', "no fingerprint reader detected"); }
-            }
-            (SC_IRCAM, KeyCode::Char('s')) => self.start_op("SetupIrEmitter (auto-enable emitter)", Request::SetupIrEmitter { dry_run: false }),
-            (SC_IRCAM, KeyCode::Char('p')) => {
-                if let Some(Response::Ok(m)) = self.request(Request::SetupIrEmitter { dry_run: true }, "SetupIrEmitter(dry-run)") { self.log('✓', m); }
-            }
-            (SC_KEYRING, KeyCode::Char('f')) => {
-                self.confirm = Some(("Erase the TPM-sealed login password?".into(), Request::ForgetPassword { user: self.user.clone() }));
-            }
-            (SC_RECOVERY, KeyCode::Char('s')) => self.suspend = Some(Suspend::RecoverySetup),
-            (SC_RECOVERY, KeyCode::Char('t')) => self.suspend = Some(Suspend::RecoveryRestore),
-            (SC_RECOVERY, KeyCode::Char('f')) => {
-                self.confirm = Some(("Erase the recovery passphrase? (templates stay encrypted)".into(), Request::RecoveryForget { user: self.user.clone() }));
-            }
-            (SC_DIAG, KeyCode::Char('r')) => { if self.request(Request::Ping, "Ping").is_some() { self.log('✓', "daemon reachable (Pong)"); } }
             _ => {}
         }
     }
@@ -493,13 +549,18 @@ impl App {
         f.render_widget(blk, area);
         if self.enroll.is_some() { self.draw_enroll(f, inner); return; }
         match self.screen {
+            SC_WELCOME => self.draw_welcome(f, inner),
+            SC_DOCTOR => self.draw_doctor(f, inner),
+            SC_CAMERAS => self.draw_cameras(f, inner),
             SC_PROFILES => self.draw_profiles(f, inner),
-            SC_SETTINGS => self.draw_settings(f, inner),
-            SC_FINGERPRINT => self.draw_fingerprint(f, inner),
-            SC_IRCAM => self.draw_ircam(f, inner),
+            SC_CALIBRATE => self.draw_calibrate(f, inner),
+            SC_IDENTIFY => self.draw_identify(f, inner),
             SC_KEYRING => self.draw_keyring(f, inner),
             SC_RECOVERY => self.draw_recovery(f, inner),
-            _ => self.draw_diag(f, inner),
+            SC_FINGERPRINT => self.draw_fingerprint(f, inner),
+            SC_PAM => self.draw_pam(f, inner),
+            SC_SETTINGS => self.draw_settings(f, inner),
+            _ => self.draw_done(f, inner),
         }
     }
 
@@ -556,25 +617,57 @@ impl App {
     }
 
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
-        let dot = if self.eyes_open { Span::styled("● ON ", Style::new().fg(OK).add_modifier(Modifier::BOLD)) } else { Span::styled("○ off", Style::new().dim()) };
+        let bio = biopolicy_on();
         f.render_widget(Paragraph::new(vec![
+            section("Require eyes open"),
+            Line::from(vec![Span::raw("  state  "), onoff(self.eyes_open)]),
+            Line::from(Span::styled("  Never unlock unless both eyes read open (IR-glint heuristic).", Style::new().dim())),
+            Line::from(vec![Span::styled("  [enter]", Style::new().fg(ACCENT)), Span::styled(" toggle", Style::new().dim())]),
             Line::raw(""),
-            Line::from(vec![Span::styled("Require eyes open   ", Style::new().add_modifier(Modifier::BOLD)), dot]),
-            Line::from(Span::styled("  Never unlock unless both eyes read open (heuristic). [enter] toggles.", Style::new().dim())),
+            section("Biopolicy operation-class gate"),
+            Line::from(vec![Span::raw("  state  "),
+                if bio { Span::styled("● ENFORCING", Style::new().fg(OK).add_modifier(Modifier::BOLD)) } else { Span::styled("○ off (default)", Style::new().dim()) }]),
+            Line::from(Span::styled("  When on: only Login/Elevation may release the keyring; lock-screen", Style::new().dim())),
+            Line::from(Span::styled("  is verify-only; remote/unknown services are denied.", Style::new().dim())),
+            Line::from(Span::styled("  Toggle (root): set enforce_biopolicy=1 in /etc/irlume/settings.conf.", Style::new().dim())),
             Line::raw(""),
-            Line::from(Span::styled("Thresholds: RGB 0.55 · IR-adapted 0.40 · scaled by scan count (read-only)", Style::new().dim())),
+            section("Match thresholds (read-only)"),
+            Line::from(Span::styled("  RGB 0.55 · IR-adapted 0.40 · auto-scaled by enrolled scan count.", Style::new().dim())),
         ]).wrap(Wrap { trim: true }), area);
     }
 
-    fn draw_ircam(&self, f: &mut Frame, area: Rect) {
-        let mut lines = vec![Line::raw("")];
-        for (p, role) in &self.nodes {
-            lines.push(Line::from(vec![Span::raw(format!("  {p}  ")), Span::styled(format!("{role:?}"), Style::new().fg(ACCENT))]));
+    fn draw_cameras(&self, f: &mut Frame, area: Rect) {
+        let (rgb, ir) = irlume_camera::select_pair();
+        let mut lines = vec![
+            section("Active pair (auto-selected)"),
+            kv("  RGB", Span::styled(rgb.clone(), Style::new().fg(OK).add_modifier(Modifier::BOLD))),
+            kv("  IR ", Span::styled(ir.clone(), Style::new().fg(OK).add_modifier(Modifier::BOLD))),
+            Line::raw(""),
+            section("All video nodes"),
+        ];
+        if self.nodes.is_empty() {
+            lines.push(Line::from(Span::styled("  no camera nodes found under /dev/video*", Style::new().fg(ERR))));
         }
-        if self.nodes.is_empty() { lines.push(Line::from(Span::styled("  no camera nodes found", Style::new().fg(ERR)))); }
+        for (p, role) in &self.nodes {
+            let chosen = *p == rgb || *p == ir;
+            let mark = if chosen { Span::styled("  ▸ ", Style::new().fg(ACCENT)) } else { Span::raw("    ") };
+            let priv_on = if irlume_camera::privacy_engaged(p) { Span::styled("  ⚠ privacy switch ON", Style::new().fg(ERR)) } else { Span::raw("") };
+            lines.push(Line::from(vec![
+                mark,
+                Span::styled(format!("{p:<14}"), if chosen { Style::new().add_modifier(Modifier::BOLD) } else { Style::new().dim() }),
+                Span::styled(format!("{role:?}"), Style::new().fg(ACCENT)),
+                priv_on,
+            ]));
+        }
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("If the IR feed is dark, irlume can auto-enable the 850nm emitter:", Style::new().dim())));
-        lines.push(Line::from("  [s] auto-setup emitter     [p] probe XU controls (read-only)"));
+        lines.push(section("IR emitter (850nm)"));
+        lines.push(Line::from(Span::styled("  If the IR feed is dark, irlume can probe the UVC extension-unit", Style::new().dim())));
+        lines.push(Line::from(Span::styled("  controls and auto-enable the illuminator (no phone-camera step).", Style::new().dim())));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  [s]", Style::new().fg(ACCENT)), Span::raw(" auto-setup emitter    "),
+            Span::styled("[p]", Style::new().fg(ACCENT)), Span::raw(" probe XU controls (read-only)"),
+        ]));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     }
 
@@ -646,14 +739,137 @@ impl App {
         ]).wrap(Wrap { trim: true }), area);
     }
 
-    fn draw_diag(&self, f: &mut Frame, area: Rect) {
-        let socket = std::path::Path::new("/run/irlume.sock").exists();
-        f.render_widget(Paragraph::new(vec![
+    fn draw_welcome(&self, f: &mut Frame, area: Rect) {
+        let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
+        let rec = self.recovery.unwrap_or_default();
+        let lines = vec![
+            Line::from(Span::styled("  irlume — local face authentication", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("  IR + lume · clean-BOM · TPM-sealed · privacy by design", Style::new().dim())),
             Line::raw(""),
-            Line::from(vec![Span::raw("  daemon socket  "), if socket { Span::styled("● present", Style::new().fg(OK)) } else { Span::styled("✗ missing", Style::new().fg(ERR)) }]),
+            Line::from(Span::styled("  This is a guided panel. Tab / ⇧Tab walk the steps left-to-right;", Style::new().dim())),
+            Line::from(Span::styled("  each step shows live state and its own action keys in the footer.", Style::new().dim())),
             Line::raw(""),
-            Line::from("  [r] ping the daemon"),
-        ]).wrap(Wrap { trim: true }), area);
+            section("At a glance"),
+            Line::from(vec![Span::raw("  daemon       "), onoff(std::path::Path::new("/run/irlume.sock").exists())]),
+            Line::from(vec![Span::raw("  enrolled     "), count_badge(self.profiles.len(), scans)]),
+            Line::from(vec![Span::raw("  keyring      "), onoff(self.keyring_armed.unwrap_or(false))]),
+            Line::from(vec![Span::raw("  encrypted    "), onoff(rec.encrypted)]),
+            Line::from(vec![Span::raw("  biopolicy    "), onoff(biopolicy_on())]),
+            Line::raw(""),
+            Line::from(Span::styled("  New here? Step to Profiles and press [e] to enroll your face.", Style::new().dim())),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+    }
+
+    fn draw_doctor(&self, f: &mut Frame, area: Rect) {
+        use irlume_common::secureboot;
+        let model = |m: &str| std::path::Path::new(m).exists();
+        let sb = if secureboot::is_secure_boot_enabled() { ("enabled", OK) }
+                 else if secureboot::is_setup_mode() { ("SETUP MODE", ERR) }
+                 else if secureboot::secure_boot_present() { ("disabled", ERR) }
+                 else { ("not UEFI", ERR) };
+        let lines = vec![
+            section("Trust anchors"),
+            Line::from(vec![chk_span(crate::tpm_device().is_some()), Span::raw("TPM 2.0  "),
+                Span::styled(crate::tpm_device().unwrap_or("none").to_string(), Style::new().dim())]),
+            Line::from(vec![chk_span(sb.1 == OK), Span::raw("Secure Boot  "), Span::styled(sb.0.to_string(), Style::new().fg(sb.1))]),
+            Line::from(vec![Span::raw("    boot mode  "), Span::styled(secureboot::detect_boot_mode().as_str().to_string(), Style::new().dim())]),
+            Line::from(vec![chk_span(irlume_core::pcrsig::signed_policy_available()), Span::raw("signed PCR policy  "),
+                Span::styled(if irlume_core::pcrsig::signed_policy_available() { "PCR-11 signature" } else { "none (literal PCR-7)" }.to_string(), Style::new().dim())]),
+            Line::raw(""),
+            section("Models / runtime"),
+            Line::from(vec![chk_span(model("models/glintr100.onnx")), Span::raw("AuraFace glintr100.onnx")]),
+            Line::from(vec![chk_span(model("models/face_detection_yunet_2023mar.onnx")), Span::raw("YuNet detector")]),
+            Line::from(vec![chk_span(self.nodes.iter().any(|(_, r)| matches!(r, irlume_camera::Role::Rgb))
+                && self.nodes.iter().any(|(_, r)| matches!(r, irlume_camera::Role::Ir))), Span::raw("RGB + IR camera nodes")]),
+            Line::raw(""),
+            Line::from(Span::styled("  Full report: `irlume doctor` (CLI). [r] re-check.", Style::new().dim())),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+    }
+
+    fn draw_calibrate(&self, f: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            section("Per-user IR liveness"),
+            Line::from(Span::styled("  irlume's anti-spoof floor is calibrated automatically from your", Style::new().dim())),
+            Line::from(Span::styled("  enrolled IR scans (≈75% of your weakest enrolled IR reading), so", Style::new().dim())),
+            Line::from(Span::styled("  re-enrolling re-tunes it to your camera/rig — no manual step.", Style::new().dim())),
+            Line::raw(""),
+            section("Live check"),
+        ];
+        match &self.calibrate_result {
+            Some((ok, detail)) => lines.push(Line::from(vec![
+                if *ok { Span::styled("  ● ", Style::new().fg(OK)) } else { Span::styled("  ● ", Style::new().fg(ERR)) },
+                Span::styled(detail.clone(), if *ok { Style::new().fg(OK) } else { Style::new().fg(ERR) }),
+            ])),
+            None => lines.push(Line::from(Span::styled("  press [c] to run the IR PAD self-test against a live frame", Style::new().dim()))),
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled("  [c]", Style::new().fg(ACCENT)), Span::styled(" run IR liveness self-test (look at the camera)", Style::new().dim())]));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+    }
+
+    fn draw_identify(&self, f: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            section("1:N identify — \"who is this?\""),
+            Line::from(Span::styled("  Capture once and match against every enrolled user (no claimed", Style::new().dim())),
+            Line::from(Span::styled("  identity). Liveness-gated, RGB primary — a diagnostic, not unlock.", Style::new().dim())),
+            Line::raw(""),
+        ];
+        match &self.identify_result {
+            Some((true, who)) => {
+                lines.push(Line::from(Span::styled("  ┌─ result ───────────────────────────", Style::new().dim())));
+                lines.push(Line::from(vec![Span::styled("  │ ", Style::new().dim()), Span::styled(who.clone(), Style::new().fg(OK).add_modifier(Modifier::BOLD))]));
+                lines.push(Line::from(Span::styled("  └────────────────────────────────────", Style::new().dim())));
+            }
+            Some((false, why)) => lines.push(Line::from(vec![Span::styled("  ✗ ", Style::new().fg(ERR)), Span::styled(why.clone(), Style::new().fg(ERR))])),
+            None => lines.push(Line::from(Span::styled("  press [i] and look at the camera", Style::new().dim()))),
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled("  [i]", Style::new().fg(ACCENT)), Span::styled(" identify now", Style::new().dim())]));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+    }
+
+    fn draw_pam(&self, f: &mut Frame, area: Rect) {
+        let lines = vec![
+            section("PAM login wiring"),
+            Line::from(Span::styled("  Face auth plugs into your display-manager greeter and lock screen", Style::new().dim())),
+            Line::from(Span::styled("  via pam_irlume — always fail-safe to the password (no lockout).", Style::new().dim())),
+            Line::raw(""),
+            Line::from(vec![Span::raw("  greeter unlock  "), Span::styled("face → TPM-unseal password → wallet opens", Style::new().dim())]),
+            Line::from(vec![Span::raw("  lock screen     "), Span::styled("face verify-only (wallet already open)", Style::new().dim())]),
+            Line::from(vec![Span::raw("  sudo            "), Span::styled("face verify (optional)", Style::new().dim())]),
+            Line::raw(""),
+            section("Apply (root)"),
+            Line::from(Span::styled("  Preview:  irlume login enable            (dry-run, no changes)", Style::new().dim())),
+            Line::from(Span::styled("  Apply:    sudo irlume login enable --apply", Style::new().fg(ACCENT))),
+            Line::from(Span::styled("  Remove:   sudo irlume login disable --apply", Style::new().dim())),
+            Line::raw(""),
+            Line::from(vec![Span::styled("  [s]", Style::new().fg(ACCENT)), Span::styled(" show current wiring status (opens a console view)", Style::new().dim())]),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+    }
+
+    fn draw_done(&self, f: &mut Frame, area: Rect) {
+        let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
+        let rec = self.recovery.unwrap_or_default();
+        let lines = vec![
+            Line::from(Span::styled("  Setup dashboard", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))),
+            Line::raw(""),
+            Line::from(vec![Span::raw("  daemon            "), onoff(std::path::Path::new("/run/irlume.sock").exists())]),
+            Line::from(vec![Span::raw("  auth method       "), Span::styled(self.fp.method.clone(), Style::new().fg(ACCENT))]),
+            Line::from(vec![Span::raw("  enrollment        "), count_badge(self.profiles.len(), scans)]),
+            Line::from(vec![Span::raw("  eyes-open gate    "), onoff(self.eyes_open)]),
+            Line::from(vec![Span::raw("  keyring unlock    "), onoff(self.keyring_armed.unwrap_or(false))]),
+            Line::from(vec![Span::raw("  templates enc     "), onoff(rec.encrypted)]),
+            Line::from(vec![Span::raw("  recovery pass     "), onoff(rec.recovery_set)]),
+            Line::from(vec![Span::raw("  biopolicy         "), onoff(biopolicy_on())]),
+            Line::from(vec![Span::raw("  fingerprint       "), onoff(self.fp.available)]),
+            Line::raw(""),
+            Line::from(Span::styled("  All set. irlume keeps running as a daemon; this panel is safe to quit.", Style::new().dim())),
+            Line::from(vec![Span::styled("  [r]", Style::new().fg(ACCENT)), Span::styled(" refresh    [q] quit", Style::new().dim())]),
+        ];
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     }
 
     fn draw_activity(&self, f: &mut Frame, area: Rect) {
@@ -675,13 +891,18 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let actions: &[(&str, &str)] = match self.screen {
+            SC_WELCOME => &[("r", "refresh")],
+            SC_DOCTOR => &[("r", "re-check")],
+            SC_CAMERAS => &[("s", "setup emitter"), ("p", "probe")],
             SC_PROFILES => &[("e", "enroll"), ("a", "add scan"), ("r", "rename"), ("d", "delete")],
-            SC_SETTINGS => &[("enter", "toggle")],
-            SC_FINGERPRINT => &[("a", "enroll finger")],
-            SC_IRCAM => &[("s", "setup emitter"), ("p", "probe")],
-            SC_KEYRING => &[("f", "forget")],
+            SC_CALIBRATE => &[("c", "IR self-test")],
+            SC_IDENTIFY => &[("i", "identify")],
+            SC_KEYRING => &[("a", "arm"), ("f", "forget")],
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
-            _ => &[("r", "ping")],
+            SC_FINGERPRINT => &[("a", "enroll finger")],
+            SC_PAM => &[("s", "show status")],
+            SC_SETTINGS => &[("enter", "toggle eyes-open")],
+            _ => &[("r", "refresh")],
         };
         let key = |k: &str| Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT));
         let mut spans = vec![
@@ -710,6 +931,70 @@ impl App {
 fn quality_bar(q: u8) -> String {
     let filled = (q as usize * 10 / 100).min(10);
     format!("[{}{}] {q:>3}%", "█".repeat(filled), "░".repeat(10 - filled))
+}
+
+// ---- rich-render helpers --------------------------------------------------
+
+/// A bold accent section header line.
+fn section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(title.to_string(), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
+}
+
+/// `label  value` line.
+fn kv(label: &str, value: Span<'static>) -> Line<'static> {
+    Line::from(vec![Span::styled(format!("{label}  "), Style::new()), value])
+}
+
+/// Green ● ON / dim ○ off badge.
+fn onoff(on: bool) -> Span<'static> {
+    if on { Span::styled("● yes", Style::new().fg(OK).add_modifier(Modifier::BOLD)) }
+    else { Span::styled("○ no", Style::new().dim()) }
+}
+
+/// Leading ✓ / ✗ checklist marker.
+fn chk_span(ok: bool) -> Span<'static> {
+    if ok { Span::styled("  ✓ ", Style::new().fg(OK)) } else { Span::styled("  ✗ ", Style::new().fg(ERR)) }
+}
+
+/// "N profile(s), M scan(s)" or a dim "none".
+fn count_badge(profiles: usize, scans: usize) -> Span<'static> {
+    if profiles == 0 { Span::styled("○ none", Style::new().dim()) }
+    else { Span::styled(format!("● {profiles} profile(s), {scans} scan(s)"), Style::new().fg(OK).add_modifier(Modifier::BOLD)) }
+}
+
+/// Is opt-in biopolicy enforcement enabled (settings.conf)?
+fn biopolicy_on() -> bool {
+    irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+// ---- async response mappers (Response -> (ok, message)) -------------------
+
+fn map_ok(resp: Response) -> (bool, String) {
+    match resp {
+        Response::Ok(m) => (true, m),
+        Response::Error(e) => (false, e),
+        o => (false, format!("unexpected: {o:?}")),
+    }
+}
+
+fn map_identify(resp: Response) -> (bool, String) {
+    match resp {
+        Response::Identified { user: Some(u), profile, score, .. } =>
+            (true, format!("{u} · {} · score {score:.3}", profile.unwrap_or_default())),
+        Response::Identified { user: None, live, reason, .. } =>
+            (false, if live { format!("live face, no enrolled match ({reason})") } else { format!("no live face ({reason})") }),
+        Response::Error(e) => (false, e),
+        o => (false, format!("unexpected: {o:?}")),
+    }
+}
+
+fn map_selftest(resp: Response) -> (bool, String) {
+    match resp {
+        Response::SelfTest { passed, detail } => (passed, detail),
+        Response::Error(e) => (false, e),
+        o => (false, format!("unexpected: {o:?}")),
+    }
 }
 
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,

@@ -15,6 +15,17 @@ pub enum DistroFamily {
     Other,
 }
 
+impl DistroFamily {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DistroFamily::Debian => "Debian-family",
+            DistroFamily::Fedora => "Fedora-family",
+            DistroFamily::Arch => "Arch-family",
+            DistroFamily::Other => "other/unknown",
+        }
+    }
+}
+
 /// Detect the distro family from `/etc/os-release` (`ID` + `ID_LIKE`).
 pub fn distro_family() -> DistroFamily {
     let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();

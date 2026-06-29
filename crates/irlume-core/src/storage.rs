@@ -4,9 +4,12 @@
 //! else `/var/lib/irlume`), mode 0600. We store L2-normalized embeddings, never
 //! raw images. The old single-profile format is migrated transparently on load.
 
+use crate::{crypto, template_key};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 /// Max face profiles per account (e.g. self / self-with-glasses / a trusted
 /// person). A 4th requires deleting one.
@@ -150,44 +153,107 @@ pub fn profile_path(user: &str) -> PathBuf {
     state_dir().join(format!("{user}.json"))
 }
 
+/// On-disk wrapper for an encrypted enrollment (version 2). The plaintext under
+/// `enc` is the same JSON an unencrypted `Enrollment` serializes to.
+#[derive(Serialize, Deserialize)]
+struct EncEnvelope {
+    version: u32,
+    /// base64 of `crypto`'s `nonce ‖ ciphertext+tag`.
+    enc: String,
+}
+
+/// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
+/// host) or emitting pretty plaintext when not (dev / no-TPM). Pure — tested
+/// without a TPM.
+fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Result<Vec<u8>> {
+    match key {
+        Some(k) => {
+            let json = serde_json::to_vec(e).map_err(|er| irlume_common::Error::Protocol(er.to_string()))?;
+            let blob = crypto::encrypt(k, &json)?;
+            let env = EncEnvelope { version: 2, enc: STANDARD.encode(blob) };
+            serde_json::to_vec_pretty(&env).map_err(|er| irlume_common::Error::Protocol(er.to_string()))
+        }
+        None => serde_json::to_vec_pretty(e).map_err(|er| irlume_common::Error::Protocol(er.to_string())),
+    }
+}
+
+/// Parse on-disk bytes into an `Enrollment`, handling all three formats:
+/// encrypted (v2, needs `key`), plaintext multi-profile, and the legacy
+/// single-profile layout (migrated). Pure — tested without a TPM.
+fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Result<Enrollment> {
+    let v: serde_json::Value =
+        serde_json::from_slice(data).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
+    if v.get("enc").is_some() {
+        let env: EncEnvelope =
+            serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
+        let key = key.ok_or_else(|| {
+            irlume_common::Error::Policy("enrollment is encrypted but no template key is available".into())
+        })?;
+        let blob = STANDARD
+            .decode(env.enc.as_bytes())
+            .map_err(|e| irlume_common::Error::Protocol(format!("bad enc blob: {e}")))?;
+        let plain = crypto::decrypt(key, &blob)?;
+        serde_json::from_slice(&plain).map_err(|e| irlume_common::Error::Protocol(e.to_string()))
+    } else if v.get("profiles").is_some() {
+        serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))
+    } else {
+        let old: LegacyProfile =
+            serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
+        Ok(migrate(old))
+    }
+}
+
+/// Resolve the key to encrypt `user`'s templates with: the TPM-sealed template
+/// key on a TPM host (generated on first save), or `None` on a no-TPM host
+/// (plaintext fallback so dev boxes still work).
+fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
+    if template_key::tpm_available() {
+        Ok(Some(template_key::ensure_key(user)?))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
-    let json = serde_json::to_vec_pretty(e).map_err(|er| irlume_common::Error::Protocol(er.to_string()))?;
-    fs::write(&path, json).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
+    let key = save_key(&e.user)?;
+    let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
+    fs::write(&path, bytes).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     set_0600(&path);
     Ok(())
 }
 
-/// Load an enrollment, transparently migrating the legacy single-profile format.
+/// Load an enrollment, transparently decrypting (v2) and migrating the legacy
+/// single-profile format. A plaintext file loads without touching the TPM; an
+/// encrypted file unseals the template key (and fails cleanly — face auth then
+/// falls back to the password — if the seal can no longer be satisfied).
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     let path = profile_path(user);
     if !path.exists() {
         return Ok(None);
     }
     let data = fs::read(&path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-    // New format has a "profiles" array; legacy has "templates".
-    let v: serde_json::Value =
-        serde_json::from_slice(&data).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
-    if v.get("profiles").is_some() {
-        let e = serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
-        Ok(Some(e))
-    } else {
-        let old: LegacyProfile =
-            serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
-        Ok(Some(migrate(old)))
-    }
+    // Only unseal the key when the file is actually encrypted.
+    let is_enc = serde_json::from_slice::<serde_json::Value>(&data)
+        .map(|v| v.get("enc").is_some())
+        .unwrap_or(false);
+    let key = if is_enc { Some(template_key::load_key(user)?) } else { None };
+    deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
 }
 
 pub fn delete(user: &str) -> irlume_common::Result<bool> {
     let path = profile_path(user);
-    if path.exists() {
+    let existed = path.exists();
+    if existed {
         fs::remove_file(&path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-        Ok(true)
-    } else {
-        Ok(false)
     }
+    // Deleting all face data also retires the now-orphaned template key and its
+    // recovery envelope (a fresh enrollment mints a new key).
+    let _ = template_key::forget_key(user);
+    let _ = template_key::forget_recovery(user);
+    Ok(existed)
 }
 
 #[cfg(unix)]
@@ -220,6 +286,56 @@ mod tests {
         assert!(e.profiles[0].scans[1].ir.is_none()); // only one ir template
         assert_eq!(e.total_scans(), 2);
         assert!(!e.require_eyes_open);
+    }
+
+    fn sample() -> Enrollment {
+        Enrollment {
+            user: "u".into(),
+            profiles: vec![FaceProfile {
+                name: "Face Profile 1".into(),
+                scans: vec![FaceScan {
+                    name: "Face Scan 1".into(),
+                    rgb: vec![0.1, 0.2, 0.3, 0.4],
+                    ir: Some(vec![0.5, 0.6]),
+                    ir_depth: 1.4,
+                    ir_brightness: 90.0,
+                }],
+            }],
+            require_eyes_open: true,
+        }
+    }
+
+    #[test]
+    fn encrypted_round_trip_with_key() {
+        let key = crypto::generate_key();
+        let e = sample();
+        let bytes = serialize_enrollment(&e, Some(&key)).unwrap();
+        // The ciphertext must not leak the embeddings or the user in cleartext.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\"enc\""));
+        assert!(!text.contains("Face Profile 1"));
+        let back = deserialize_enrollment(&bytes, Some(&key)).unwrap();
+        assert_eq!(back.user, "u");
+        assert_eq!(back.total_scans(), 1);
+        assert!(back.require_eyes_open);
+        assert_eq!(back.profiles[0].scans[0].rgb, vec![0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn plaintext_round_trip_without_key() {
+        let e = sample();
+        let bytes = serialize_enrollment(&e, None).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("Face Profile 1"));
+        let back = deserialize_enrollment(&bytes, None).unwrap();
+        assert_eq!(back.total_scans(), 1);
+    }
+
+    #[test]
+    fn encrypted_file_needs_a_key_to_load() {
+        let key = crypto::generate_key();
+        let bytes = serialize_enrollment(&sample(), Some(&key)).unwrap();
+        assert!(deserialize_enrollment(&bytes, None).is_err());
+        assert!(deserialize_enrollment(&bytes, Some(&crypto::generate_key())).is_err());
     }
 
     #[test]

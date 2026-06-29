@@ -10,9 +10,14 @@
 //!   irlume selftest align --model <PATH>         Phase-1 gate: same crop -> ~1.0
 //!   irlume selftest liveness                     run the IR PAD cues
 //!   irlume doctor                                check cameras/IR/TPM/models
+//!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
+//!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
+//!   irlume fingerprint <status|add|enable|disable> fprintd companion factor
+//!   irlume login <status|enable|disable>         wire face auth into PAM (dry-run)
 
 mod fingerprint;
 mod pamwire;
+mod recovery;
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
@@ -31,6 +36,7 @@ fn main() -> std::process::ExitCode {
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
+        (Some("recovery"), sub) => recovery::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
@@ -40,7 +46,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         (None, _) => {
-            println!("irlume <enroll|verify|profiles|delete|selftest|doctor>");
+            println!("irlume <enroll|verify|profiles|delete|selftest|doctor|keyring|recovery|fingerprint|login>");
             std::process::ExitCode::SUCCESS
         }
     }
@@ -807,7 +813,60 @@ fn eval(args: &[String]) -> std::process::ExitCode {
 
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
 /// privacy switch, and confirm models + ONNX Runtime are present.
+/// TPM character device the kernel exposes, if any (resource-managed preferred).
+fn tpm_device() -> Option<&'static str> {
+    ["/dev/tpmrm0", "/dev/tpm0"].into_iter().find(|d| std::path::Path::new(d).exists())
+}
+
+/// Secure Boot state from the EFI variable: `Some(true/false)`, or `None` when
+/// not a UEFI boot / the variable is unreadable.
+fn secure_boot_state() -> Option<bool> {
+    let var = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+    // Layout: 4-byte attribute header followed by the 1-byte value.
+    std::fs::read(var).ok().and_then(|b| b.get(4).map(|&v| v == 1))
+}
+
+/// Best-effort bootloader classification (informational): UKI vs GRUB.
+fn boot_mode() -> &'static str {
+    // A UKI exposes a systemd PCR-11 signature at runtime; the ESP also carries
+    // EFI/Linux/*.efi unified images.
+    if std::path::Path::new("/run/systemd/tpm2-pcr-signature.json").exists() {
+        return "UKI (signed PCR-11 eligible)";
+    }
+    for esp in ["/boot/efi/EFI/Linux", "/efi/EFI/Linux", "/boot/EFI/Linux"] {
+        if std::fs::read_dir(esp).map(|mut d| d.any(|e| e.is_ok())).unwrap_or(false) {
+            return "UKI (signed PCR-11 eligible)";
+        }
+    }
+    if std::path::Path::new("/boot/grub2").exists() || std::path::Path::new("/boot/grub").exists() {
+        return "GRUB (uses self-healing PCR-7 / recovery passphrase)";
+    }
+    "unknown bootloader"
+}
+
 fn doctor() -> std::process::ExitCode {
+    // --- platform / trust anchors ------------------------------------------
+    println!("[doctor] platform: {}", irlume_common::platform::distro_family().as_str());
+    match tpm_device() {
+        Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
+        None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗ — required for sealing"),
+    }
+    match secure_boot_state() {
+        Some(true) => println!("[doctor] Secure Boot: enabled ✓"),
+        Some(false) => println!("[doctor] Secure Boot: disabled ⚠ — TPM PCR-7 binding is weak; enable for trust"),
+        None => println!("[doctor] Secure Boot: unknown (not a UEFI boot?)"),
+    }
+    println!("[doctor] boot mode: {}", boot_mode());
+    println!(
+        "[doctor] signed PCR policy: {}",
+        if irlume_core::pcrsig::signed_policy_available() {
+            "systemd PCR-11 signature present ✓ — kernel updates won't need re-seal"
+        } else {
+            "none — relies on PCR-7 literal seal + recovery passphrase (re-arm/restore after firmware updates)"
+        }
+    );
+
+    // --- cameras -----------------------------------------------------------
     println!("[doctor] camera nodes (classified by pixel format):");
     let nodes = irlume_camera::discover_nodes();
     if nodes.is_empty() {
@@ -817,6 +876,8 @@ fn doctor() -> std::process::ExitCode {
         let priv_on = if irlume_camera::privacy_engaged(path) { "  ⚠ PRIVACY SWITCH ON" } else { "" };
         println!("  {path}: {role:?}{priv_on}");
     }
+
+    // --- models / runtime --------------------------------------------------
     println!("[doctor] models:");
     for m in ["models/glintr100.onnx", "models/face_detection_yunet_2023mar.onnx"] {
         let ok = std::path::Path::new(m).exists();
@@ -824,6 +885,28 @@ fn doctor() -> std::process::ExitCode {
     }
     let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
     println!("[doctor] ORT_DYLIB_PATH: {}", if ort.is_empty() { "(unset)".into() } else { ort });
+
+    // --- companion factors / data-at-rest ----------------------------------
+    let fp = match irlume_fingerprint::device_name() {
+        Some(n) => format!("{n} ✓ (manage with `irlume fingerprint`)"),
+        None if irlume_fingerprint::available() => "present ✓".into(),
+        None => "none".into(),
+    };
+    println!("[doctor] fingerprint reader: {fp}");
+
+    // Template encryption + recovery come from the daemon (root-only store).
+    let user = user_arg(&[]);
+    match daemon_request(&irlume_common::Request::RecoveryStatus { user: user.clone() }) {
+        Ok(irlume_common::Response::RecoveryStatus { encrypted, recovery_set, .. }) => {
+            println!(
+                "[doctor] templates ({user}): {} · recovery passphrase {}",
+                if encrypted { "ENCRYPTED ✓" } else { "plaintext at rest" },
+                if recovery_set { "SET ✓" } else { "not set (run `irlume recovery setup`)" },
+            );
+        }
+        _ => println!("[doctor] templates ({user}): unknown (daemon not reachable — run `irlume recovery status`)"),
+    }
+
     std::process::ExitCode::SUCCESS
 }
 

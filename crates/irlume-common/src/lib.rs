@@ -119,6 +119,22 @@ pub enum Request {
     /// `password` is always one `pam_unix` accepted (never a typo). PRIVILEGED:
     /// root or `user`.
     ResealPassword { user: String, password: SecretBytes },
+
+    // --- template-key recovery passphrase -----------------------------------
+    /// Wrap `user`'s template key under a recovery `passphrase` (the manual
+    /// backstop for TPM-clear / dbx / disk-move). Requires an enrolled template
+    /// key to exist. PRIVILEGED: root or `user`.
+    RecoverySetup { user: String, passphrase: SecretBytes },
+    /// Restore `user`'s template key from the recovery envelope using
+    /// `passphrase`, re-sealing it to the current TPM PCRs. PRIVILEGED: root or
+    /// `user`.
+    RecoveryRestore { user: String, passphrase: SecretBytes },
+    /// Report whether `user` has a sealed template key and/or a recovery
+    /// envelope. Unprivileged: root or `user`.
+    RecoveryStatus { user: String },
+    /// Erase `user`'s recovery envelope (keeps the template key). PRIVILEGED:
+    /// root or `user`.
+    RecoveryForget { user: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +190,12 @@ pub enum Response {
     /// password differed. `armed` is false when the user has no sealed password
     /// at all, in which case nothing was done (we never auto-arm).
     PasswordResealed { armed: bool, changed: bool },
+
+    // --- recovery responses -------------------------------------------------
+    /// Status of `user`'s template-key encryption and recovery passphrase
+    /// (`RecoveryStatus`): whether templates are encrypted (a sealed key exists)
+    /// and whether a recovery passphrase is set.
+    RecoveryStatus { encrypted: bool, recovery_set: bool, tpm_present: bool },
 }
 
 /// Crate-wide error type.

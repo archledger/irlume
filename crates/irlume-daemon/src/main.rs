@@ -241,6 +241,62 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
+        // --- template-key recovery passphrase -------------------------------
+        Request::RecoverySetup { user, passphrase } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to set recovery for '{user}'"));
+            }
+            // If templates are still plaintext (pre-encryption enrollment), mint
+            // and seal a template key now by re-saving — encryption takes effect
+            // and there's a key for the recovery passphrase to wrap. A no-op when
+            // already encrypted or when the user isn't enrolled.
+            if !irlume_core::template_key::has_key(&user) {
+                if let Ok(Some(enr)) = irlume_core::storage::load(&user) {
+                    if let Err(e) = irlume_core::storage::save(&enr) {
+                        return Response::Error(format!("could not encrypt existing templates: {e}"));
+                    }
+                    eprintln!("irlumed: RecoverySetup: encrypted existing templates for '{user}'");
+                }
+            }
+            match irlume_core::template_key::setup_recovery(&user, passphrase.expose()) {
+                Ok(()) => {
+                    eprintln!("irlumed: RecoverySetup: recovery passphrase set for '{user}'");
+                    Response::Ok(format!("recovery passphrase set for '{user}'"))
+                }
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::RecoveryRestore { user, passphrase } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to restore recovery for '{user}'"));
+            }
+            match irlume_core::template_key::restore_from_recovery(&user, passphrase.expose()) {
+                Ok(()) => {
+                    eprintln!("irlumed: RecoveryRestore: re-sealed '{user}' template key to current PCRs");
+                    Response::Ok(format!("template key restored and re-sealed for '{user}'"))
+                }
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::RecoveryStatus { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to query '{user}'"));
+            }
+            Response::RecoveryStatus {
+                encrypted: irlume_core::template_key::has_key(&user),
+                recovery_set: irlume_core::template_key::has_recovery(&user),
+                tpm_present: irlume_core::template_key::tpm_available(),
+            }
+        }
+        Request::RecoveryForget { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to forget recovery for '{user}'"));
+            }
+            match irlume_core::template_key::forget_recovery(&user) {
+                Ok(()) => Response::Ok(format!("recovery passphrase erased for '{user}'")),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::ListProfiles { user } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to list '{user}'"));

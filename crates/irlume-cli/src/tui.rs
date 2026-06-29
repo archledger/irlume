@@ -232,11 +232,10 @@ impl App {
         }
     }
 
-    /// Pull the whole live snapshot from the daemon + host, SILENTLY (no Activity
-    /// log spam) so it can run on a periodic timer and the TUI stays live — any
-    /// change made to irlume (CLI enroll, daemon restart, camera plugged in,
-    /// keyring armed) shows up on the next tick without the user doing anything.
-    fn refresh(&mut self) {
+    /// CHEAP live poll (runs on the fast ~2.5s timer): daemon state + camera
+    /// nodes only — all sub-millisecond, no subprocess spawns. Keeps the panel
+    /// live without periodic UI hitches. SILENT (no Activity spam).
+    fn refresh_light(&mut self) {
         if let Ok(Response::Enrollment { profiles, require_eyes_open }) =
             crate::daemon_request(&Request::ListProfiles { user: self.user.clone() })
         {
@@ -250,17 +249,25 @@ impl App {
         if let Ok(Response::RecoveryStatus { encrypted, recovery_set, tpm_present }) =
             crate::daemon_request(&Request::RecoveryStatus { user: self.user.clone() })
         { self.recovery = Some(RecoveryInfo { encrypted, recovery_set, tpm_present }); }
+        self.nodes = irlume_camera::discover_nodes();
+        let max = self.rows().len().max(1);
+        if self.sel >= max { self.sel = max - 1; }
+        let pairs = irlume_camera::list_pairs().len().max(1);
+        if self.cam_sel >= pairs { self.cam_sel = pairs - 1; }
+    }
+
+    /// FULL refresh = cheap poll + the heavier probes (fingerprint via fprintd,
+    /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
+    /// on demand ([r]), after an op, and when opening Repair/Fingerprint — but
+    /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
+    fn refresh(&mut self) {
+        self.refresh_light();
         self.fp = FpInfo {
             available: irlume_fingerprint::available(),
             device: irlume_fingerprint::device_name(),
             enrolled: irlume_fingerprint::enrolled_fingers(&self.user),
             method: irlume_core::policy::method().as_str().to_string(),
         };
-        self.nodes = irlume_camera::discover_nodes();
-        let max = self.rows().len().max(1);
-        if self.sel >= max { self.sel = max - 1; }
-        let pairs = irlume_camera::list_pairs().len().max(1);
-        if self.cam_sel >= pairs { self.cam_sel = pairs - 1; }
         self.run_checks();
     }
 
@@ -433,7 +440,8 @@ impl App {
 
     fn main_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         use ratatui::crossterm::event::MouseEventKind;
-        let mut last_refresh = std::time::Instant::now();
+        let mut last_light = std::time::Instant::now();
+        let mut last_heavy = std::time::Instant::now();
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
@@ -450,13 +458,17 @@ impl App {
             }
             self.spin = (self.spin + 1) % SPIN.len();
             self.poll();
-            // Live auto-refresh: re-pull the snapshot every ~2.5s so external
-            // changes appear on their own. Skip while the user is mid-flow.
-            if last_refresh.elapsed() >= Duration::from_millis(2500)
-                && self.op.is_none() && self.enroll.is_none() && self.input.is_none() && self.confirm.is_none()
-            {
-                self.refresh();
-                last_refresh = std::time::Instant::now();
+            // Live auto-refresh, tiered so external changes appear on their own
+            // without periodic subprocess hitches. Skip while the user is mid-flow.
+            if self.op.is_none() && self.enroll.is_none() && self.input.is_none() && self.confirm.is_none() {
+                if last_heavy.elapsed() >= Duration::from_millis(10_000) {
+                    self.refresh(); // cheap + fingerprint + diagnostics
+                    last_heavy = std::time::Instant::now();
+                    last_light = std::time::Instant::now();
+                } else if last_light.elapsed() >= Duration::from_millis(2500) {
+                    self.refresh_light(); // daemon state + cameras only
+                    last_light = std::time::Instant::now();
+                }
             }
             // Interactive flows that need a cooked terminal: tear down, run, re-enter.
             if let Some(s) = self.suspend.take() {
@@ -530,8 +542,8 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::Right => { self.screen = (self.screen + 1) % SCREENS.len(); self.sel = 0; }
-            KeyCode::BackTab | KeyCode::Left => { self.screen = (self.screen + SCREENS.len() - 1) % SCREENS.len(); self.sel = 0; }
+            KeyCode::Tab | KeyCode::Right => self.goto((self.screen + 1) % SCREENS.len()),
+            KeyCode::BackTab | KeyCode::Left => self.goto((self.screen + SCREENS.len() - 1) % SCREENS.len()),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             // Activity panel history scroll (auto-follows newest when at bottom).
@@ -545,6 +557,16 @@ impl App {
 
     fn act_max(&self) -> usize {
         self.activity.len().saturating_sub(ACT_H)
+    }
+
+    /// Switch tabs. Repair/Fingerprint pull their heavier probes immediately so
+    /// the tab is fresh on open (the slow timer only refreshes them every ~10s).
+    fn goto(&mut self, new: usize) {
+        self.screen = new;
+        self.sel = 0;
+        if new == SC_REPAIR || new == SC_FINGERPRINT {
+            self.refresh();
+        }
     }
 
     fn move_sel(&mut self, d: i32) {

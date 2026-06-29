@@ -160,9 +160,20 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Ok(o) => Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason },
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::Enroll { user, profile, scans } => {
+        Request::Identify => match engine.identify() {
+            Ok(o) => Response::Identified { user: o.user, profile: o.profile, score: o.score, live: o.live, reason: o.reason },
+            Err(e) => Response::Error(e.to_string()),
+        },
+        Request::Enroll { user, profile, scans, reset } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to enroll '{user}'"));
+            }
+            if reset {
+                // Clean slate: drop the old enrollment (and its stale camera
+                // binding) before enrolling fresh.
+                if let Err(e) = irlume_core::storage::delete(&user) {
+                    return Response::Error(format!("reset failed: {e}"));
+                }
             }
             let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
             // Auto-fix a dark/disabled IR emitter so dark-mode scans enroll

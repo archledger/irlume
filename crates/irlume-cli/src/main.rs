@@ -16,12 +16,13 @@
 //!   irlume login <status|enable|disable>         wire face auth into PAM (dry-run)
 //!   irlume tui                                   interactive setup/management UI
 
+mod commands;
 mod fingerprint;
 mod pamwire;
 mod recovery;
 mod tui;
 
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
@@ -43,18 +44,24 @@ fn main() -> std::process::ExitCode {
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("doctor"), _) => doctor(),
+        (Some("status"), _) => commands::status(&args),
+        (Some("detect"), _) => commands::detect(&args),
+        (Some("identify"), _) => commands::identify(&args),
+        (Some("diag"), _) => commands::diag(&args),
+        (Some("deps"), _) => commands::deps(&args),
+        (Some("reseal"), _) => commands::reseal(&args),
+        (Some("selinux"), sub) => commands::selinux(sub, &args),
+        (Some("setup"), _) => commands::setup(&args),
+        (Some("help" | "--help" | "-h"), _) => commands::help(),
         (Some("tui"), _) => match tui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => { eprintln!("tui: {e}"); std::process::ExitCode::FAILURE }
         },
         (Some(cmd), _) => {
-            println!("irlume: '{cmd}' not yet implemented (scaffold)");
-            std::process::ExitCode::SUCCESS
+            eprintln!("irlume: unknown command '{cmd}' — run `irlume help`");
+            std::process::ExitCode::from(2)
         }
-        (None, _) => {
-            println!("irlume <enroll|verify|profiles|delete|selftest|doctor|keyring|recovery|fingerprint|login|tui>");
-            std::process::ExitCode::SUCCESS
-        }
+        (None, _) => commands::help(),
     }
 }
 
@@ -66,8 +73,12 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     let user = user_arg(args);
     let name = flag(args, "--name").map(String::from);
     let scans = flag(args, "--scans").and_then(|s| s.parse::<usize>().ok());
+    let reset = args.iter().any(|a| a == "--reset");
+    if reset {
+        eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
+    }
     eprintln!("[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…");
-    match daemon_request(&Request::Enroll { user, profile: name, scans }) {
+    match daemon_request(&Request::Enroll { user, profile: name, scans, reset }) {
         Ok(Response::Ok(msg)) => { println!("[enroll] {msg}"); std::process::ExitCode::SUCCESS }
         Ok(Response::Error(e)) => { eprintln!("enroll failed: {e}"); std::process::ExitCode::FAILURE }
         Ok(other) => { eprintln!("enroll: unexpected response {other:?}"); std::process::ExitCode::FAILURE }
@@ -812,7 +823,7 @@ fn eval(args: &[String]) -> std::process::ExitCode {
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
 /// privacy switch, and confirm models + ONNX Runtime are present.
 /// TPM character device the kernel exposes, if any (resource-managed preferred).
-fn tpm_device() -> Option<&'static str> {
+pub(crate) fn tpm_device() -> Option<&'static str> {
     ["/dev/tpmrm0", "/dev/tpm0"].into_iter().find(|d| std::path::Path::new(d).exists())
 }
 

@@ -79,7 +79,18 @@ pub enum Request {
     Authenticate { user: String },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
-    Enroll { user: String, profile: Option<String>, scans: Option<usize> },
+    /// `reset` (default false) wipes the user's existing enrollment first — a
+    /// clean re-enroll that also clears a stale camera binding.
+    Enroll {
+        user: String,
+        profile: Option<String>,
+        scans: Option<usize>,
+        #[serde(default)]
+        reset: bool,
+    },
+    /// 1:N identify ("who is this?"): one live capture matched against every
+    /// enrolled user, no claimed identity. Unprivileged (no credential release).
+    Identify,
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
     /// List enrolled profiles + their scans for `user`.
@@ -208,6 +219,9 @@ pub enum Response {
         reason: String,
     },
     Profiles(Vec<String>),
+    /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
+    /// face matched (check `live` to tell "no match" from "not a live face").
+    Identified { user: Option<String>, profile: Option<String>, score: f32, live: bool, reason: String },
     /// Structured enrollment listing: profiles (each with its scan names) plus
     /// the per-user require-eyes-open setting.
     Enrollment { profiles: Vec<ProfileSummary>, require_eyes_open: bool },

@@ -52,6 +52,16 @@ pub struct Outcome {
     pub reason: String,
 }
 
+/// The result of a 1:N identification ("who is this?"). `user`/`profile` are set
+/// only on a live, above-threshold match against some enrolled face.
+pub struct IdentifyOutcome {
+    pub user: Option<String>,
+    pub profile: Option<String>,
+    pub score: f32,
+    pub live: bool,
+    pub reason: String,
+}
+
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         Ok(Self {
@@ -240,6 +250,46 @@ impl Engine {
         }
 
         Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("no face: {}", a.reason) })
+    }
+
+    /// 1:N identify ("who is this?"): one live capture, matched against every
+    /// enrolled user's RGB profiles (no claimed identity). Liveness-gated like
+    /// auth; reports the best above-threshold (user, profile, score). RGB primary
+    /// path only — a diagnostic, not a dark-mode unlock.
+    pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
+        if irlume_core::policy::method().face_disabled() {
+            return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: "face disabled (fingerprint mode)".into() });
+        }
+        let a = self.assess()?;
+        let Some(probe) = a.embedding else {
+            return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: format!("no RGB face: {}", a.reason) });
+        };
+        if a.verdict != Verdict::Live {
+            return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
+        }
+        let mut best: Option<(f32, String, String)> = None; // (score, user, profile)
+        for user in irlume_core::storage::list_users() {
+            let Some(enr) = irlume_core::storage::load(&user)? else { continue };
+            let scans = enr.rgb_scans();
+            if scans.is_empty() {
+                continue;
+            }
+            let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
+            let (score, who) = scans
+                .iter()
+                .map(|(prof, _scan, t)| (align::cosine(&probe, t), prof.to_string()))
+                .fold((f32::NEG_INFINITY, String::new()), |acc, x| if x.0 > acc.0 { x } else { acc });
+            if score >= thr && best.as_ref().map_or(true, |b| score > b.0) {
+                best = Some((score, user.clone(), who));
+            }
+        }
+        match best {
+            Some((score, user, profile)) => Ok(IdentifyOutcome {
+                user: Some(user), profile: Some(profile), score, live: true,
+                reason: "match".into(),
+            }),
+            None => Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: true, reason: "live face, but no enrolled match".into() }),
+        }
     }
 
     /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).

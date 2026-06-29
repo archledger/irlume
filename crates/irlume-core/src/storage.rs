@@ -296,6 +296,25 @@ pub fn delete(user: &str) -> irlume_common::Result<bool> {
     Ok(existed)
 }
 
+/// Every OS user with an enrollment on this host (the `<user>.json` stems in the
+/// state dir), sorted. For 1:N identify and status reporting. Returns an empty
+/// list if the state dir doesn't exist yet.
+pub fn list_users() -> Vec<String> {
+    let mut users = Vec::new();
+    if let Ok(rd) = fs::read_dir(state_dir()) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    users.push(stem.to_string());
+                }
+            }
+        }
+    }
+    users.sort();
+    users
+}
+
 #[cfg(unix)]
 fn set_0600(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;

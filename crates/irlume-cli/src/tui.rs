@@ -742,7 +742,7 @@ fn enroll_worker(user: String, profile: String, add: Option<String>, target: usi
         }
         // Capture: first scan of a NEW profile creates it; the rest append.
         let req = if i == 0 && add.is_none() {
-            Request::Enroll { user: user.clone(), profile: Some(profile.clone()), scans: Some(1) }
+            Request::Enroll { user: user.clone(), profile: Some(profile.clone()), scans: Some(1), reset: false }
         } else {
             Request::AddScan { user: user.clone(), profile: profile.clone() }
         };

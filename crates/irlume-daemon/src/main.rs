@@ -425,7 +425,17 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Ok(format!("require-eyes-open {}", if on { "ENABLED" } else { "disabled" }))
             })
         }
-        Request::SelfTest { .. } => Response::Error("unimplemented".into()),
+        Request::SelfTest { kind } => {
+            use irlume_common::SelfTestKind;
+            let r = match kind {
+                SelfTestKind::Liveness => engine.liveness_selftest(),
+                SelfTestKind::AlignmentIdentity => engine.alignment_selftest(),
+            };
+            match r {
+                Ok((passed, detail)) => Response::SelfTest { passed, detail },
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
     }
 }
 

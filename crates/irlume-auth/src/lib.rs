@@ -292,6 +292,43 @@ impl Engine {
         }
     }
 
+    /// IR liveness self-test: capture and run the algorithmic PAD gate, reporting
+    /// the verdict plus the cues behind it. Backs the TUI Calibrate screen and
+    /// `Request::SelfTest { Liveness }`.
+    pub fn liveness_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
+        let a = self.assess()?;
+        let s = &a.signals;
+        let live = a.verdict == Verdict::Live;
+        let detail = if live {
+            format!(
+                "Live — RGB face {}, IR face {} · IR brightness {:.0}, depth {:.2}, glint {:.0}",
+                if s.rgb_face.is_some() { "✓" } else { "✗" },
+                if s.ir_face.is_some() { "✓" } else { "✗" },
+                a.ir_brightness, a.ir_depth, s.ir_eye_glint,
+            )
+        } else {
+            format!("{:?} — {}", a.verdict, a.reason)
+        };
+        Ok((live, detail))
+    }
+
+    /// Alignment-determinism self-test: embed the same aligned chip twice; the
+    /// cosine MUST be ~1.0. Catches the AuraFace alignment/normalization trap
+    /// (the "identical images score 0.6" failure). `Request::SelfTest { AlignmentIdentity }`.
+    pub fn alignment_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
+        let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+        let view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let faces = self.det.detect(&view)?;
+        let Some(f) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
+            return Ok((false, "no RGB face detected — face the camera and retry".into()));
+        };
+        let chip = align::align_to_arcface(&view, &f.landmarks)?;
+        let a = self.emb.embed(&chip)?;
+        let b = self.emb.embed(&chip)?;
+        let cos = align::cosine(&a, &b);
+        Ok((cos > 0.999, format!("alignment determinism cosine {cos:.6} (want ≈ 1.000000)")))
+    }
+
     /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).
     /// Each Live capture yields one (rgb, ir, depth, brightness). No enrolling
     /// from a photo — the liveness gate rejects spoofs.

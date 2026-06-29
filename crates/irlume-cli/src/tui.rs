@@ -529,8 +529,13 @@ impl App {
                 let _ = std::process::Command::new("sudo").args(["systemctl", "restart", "irlumed"]).status();
             }
             Suspend::SelinuxLoad => {
-                eprintln!("\nLoading the irlume SELinux module (sudo)…");
-                let _ = std::process::Command::new("sudo").args(["irlume", "selinux", "load"]).status();
+                // Load the policy AND restart the daemon so the socket relabels to
+                // irlume_runtime_t — otherwise the existing socket keeps its old
+                // label and the check would still fail.
+                eprintln!("\nLoading the irlume SELinux module + relabeling the socket (sudo)…");
+                let _ = std::process::Command::new("sudo")
+                    .args(["sh", "-c", "irlume selinux load && systemctl restart irlumed"])
+                    .status();
             }
         }
         eprint!("\nPress Enter to return to the TUI… ");

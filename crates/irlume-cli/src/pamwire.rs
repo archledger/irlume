@@ -63,6 +63,31 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     }
 }
 
+/// Structured wiring status for the TUI: `(label, present, wired)` per service
+/// plus a trailing SELinux row. Mirrors what `status()` prints.
+pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
+    let mut out = Vec::new();
+    for s in GREETERS.iter().chain(std::iter::once(&LOCKSCREEN)) {
+        match service_present(s) {
+            Some(p) => out.push((label_of(s.etc), true, file_has_module(&p))),
+            None => out.push((label_of(s.etc), false, false)),
+        }
+    }
+    let sudo = Path::new(SUDO);
+    out.push(("sudo".into(), sudo.exists(), sudo.exists() && file_has_module(sudo)));
+    out
+}
+
+/// Short label from an /etc/pam.d path (e.g. "/etc/pam.d/gdm-password" → "gdm-password").
+fn label_of(etc: &str) -> String {
+    etc.rsplit('/').next().unwrap_or(etc).to_string()
+}
+
+/// SELinux module load state for the TUI (None = can't tell without root).
+pub(crate) fn selinux_state() -> Option<bool> {
+    selinux_loaded()
+}
+
 fn status() -> ExitCode {
     println!("[login] wiring status (face auth in PAM):");
     let mut any = false;

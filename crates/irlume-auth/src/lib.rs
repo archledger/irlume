@@ -245,6 +245,20 @@ impl Engine {
                 "only {} live scans (need {want}) — check lighting and framing", captured.len()
             )));
         }
+        // Anti-mixing: a new profile must be a face not already enrolled elsewhere.
+        for (rgb, ..) in &captured {
+            if let Some((other, score)) = colliding_profile(&enr, rgb, None) {
+                let cnt = enr.profiles.iter().find(|p| p.name == other).map_or(0, |p| p.scans.len());
+                let hint = if cnt < MAX_SCANS_PER_PROFILE {
+                    format!("add scans to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE}) instead of a new profile")
+                } else {
+                    format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
+                };
+                return Err(irlume_common::Error::Protocol(format!(
+                    "this face is already enrolled as '{other}' (match {score:.2}) — {hint}"
+                )));
+            }
+        }
         let mut prof = FaceProfile { name: name.clone(), scans: Vec::new() };
         for (rgb, ir, d, b) in captured {
             let sname = prof.next_scan_name();
@@ -268,12 +282,49 @@ impl Engine {
         }
         let (rgb, ir, d, b) = self.capture_scans(1)?.into_iter().next()
             .ok_or_else(|| irlume_common::Error::Protocol("no live scan captured — check lighting and framing".into()))?;
+        // Anti-mixing: reject a scan whose face belongs to a different profile.
+        if let Some((other, score)) = colliding_profile(&enr, &rgb, Some(profile_name)) {
+            let cnt = enr.profiles.iter().find(|p| p.name == other).map_or(0, |p| p.scans.len());
+            let hint = if cnt < MAX_SCANS_PER_PROFILE {
+                format!("if you want this face, add the scan to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE})")
+            } else {
+                format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
+            };
+            return Err(irlume_common::Error::Protocol(format!(
+                "the scanned face belongs to '{other}' (match {score:.2}), not '{profile_name}' — {hint}. \
+                 Scans of different faces can't be mixed in one profile."
+            )));
+        }
         let sname = enr.profiles[idx].next_scan_name();
         enr.profiles[idx].scans.push(FaceScan { name: sname.clone(), rgb, ir, ir_depth: d, ir_brightness: b });
         let total = enr.profiles[idx].scans.len();
         storage::save(&enr)?;
         Ok((sname, total))
     }
+}
+
+/// Best-matching OTHER profile for `probe` (excluding `exclude`), if it reaches
+/// the identity threshold — i.e. this face already belongs to a different
+/// profile. Stops the same person's scans being split across profiles (which
+/// would corrupt recognition and the 1:N unlock model).
+fn colliding_profile(
+    enr: &irlume_core::storage::Enrollment,
+    probe: &[f32],
+    exclude: Option<&str>,
+) -> Option<(String, f32)> {
+    let mut best: Option<(String, f32)> = None;
+    for p in &enr.profiles {
+        if Some(p.name.as_str()) == exclude {
+            continue;
+        }
+        for s in &p.scans {
+            let c = align::cosine(probe, &s.rgb);
+            if c >= irlume_core::RGB_MATCH_THRESHOLD && best.as_ref().map_or(true, |b| c > b.1) {
+                best = Some((p.name.clone(), c));
+            }
+        }
+    }
+    best
 }
 
 /// Per-eye open check (IR corneal-glint heuristic): an open eye reflects the
@@ -353,4 +404,37 @@ fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
         }
     }
     peak as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
+
+    fn scan(v: Vec<f32>) -> FaceScan {
+        FaceScan { name: "s".into(), rgb: v, ir: None, ir_depth: 0.0, ir_brightness: 0.0 }
+    }
+
+    #[test]
+    fn collision_blocks_same_face_in_another_profile() {
+        let face1 = vec![1.0, 0.0, 0.0];
+        let face2 = vec![0.0, 1.0, 0.0];
+        let enr = Enrollment {
+            user: "u".into(),
+            require_eyes_open: false,
+            profiles: vec![
+                FaceProfile { name: "Face Profile 1".into(), scans: vec![scan(face1.clone())] },
+                FaceProfile { name: "Face Profile 2".into(), scans: vec![scan(face2.clone())] },
+            ],
+        };
+        // Adding face1 under Face Profile 2 -> flagged as belonging to Profile 1.
+        assert_eq!(
+            colliding_profile(&enr, &face1, Some("Face Profile 2")).map(|(n, _)| n),
+            Some("Face Profile 1".to_string())
+        );
+        // A novel face collides with nothing.
+        assert!(colliding_profile(&enr, &[0.0, 0.0, 1.0], None).is_none());
+        // Same face into its OWN profile (excluded) is fine — that's improving it.
+        assert!(colliding_profile(&enr, &face1, Some("Face Profile 1")).is_none());
+    }
 }

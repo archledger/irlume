@@ -12,6 +12,7 @@
 //!   irlume doctor                                check cameras/IR/TPM/models
 
 mod fingerprint;
+mod pamwire;
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
@@ -31,6 +32,7 @@ fn main() -> std::process::ExitCode {
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
+        (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("doctor"), _) => doctor(),
         (Some(cmd), _) => {

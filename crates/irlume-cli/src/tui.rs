@@ -57,17 +57,30 @@ enum Pending {
     EnrollName,
     RenameProfile(String),
     RenameScan(String, String),
+    // Masked password/passphrase entry, handled in-TUI (sent to the root daemon
+    // over the socket — no sudo, no screen teardown). The `Option<String>` holds
+    // the first entry while confirming (double-entry catches typos).
+    KeyringPw(Option<String>),
+    RecoveryPw(Option<String>),
+    RecoveryRestorePw,
+}
+
+impl Pending {
+    /// Password entries render masked.
+    fn masked(&self) -> bool {
+        matches!(self, Pending::KeyringPw(_) | Pending::RecoveryPw(_) | Pending::RecoveryRestorePw)
+    }
 }
 
 /// Interactive flow that needs a cooked terminal — the TUI tears down the
 /// alt-screen, runs it via the existing CLI handler (no-echo prompts), then
 /// re-enters. Mirrors linhello's suspend pattern.
+/// Flows that genuinely need the cooked terminal: an interactive root tool
+/// (sudo) or fprintd's own prompts. Daemon password ops are handled in-TUI
+/// instead (masked entry → socket), so they're not here.
 #[derive(Clone, Copy)]
 enum Suspend {
     FingerprintAdd,
-    RecoverySetup,
-    RecoveryRestore,
-    KeyringArm,
     LoginStatus,
     RestartDaemon,
     SelinuxLoad,
@@ -173,6 +186,12 @@ struct App {
     repair_sel: usize,
     /// Cameras-tab pair selection.
     cam_sel: usize,
+    /// A prominent, dismissible error banner (e.g. "camera busy") so failures
+    /// are never silently buried in the Activity log.
+    error: Option<String>,
+    /// Live daemon reachability (a real Ping, refreshed each tick) — not a
+    /// hardcoded socket-path check.
+    daemon_up: bool,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
     spin: usize,
@@ -205,7 +224,7 @@ impl App {
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
             identify_result: None, selftest_result: None,
-            repair: Vec::new(), repair_sel: 0, cam_sel: 0, act_scroll: 0,
+            repair: Vec::new(), repair_sel: 0, cam_sel: 0, error: None, daemon_up: false, act_scroll: 0,
             spin: 0, quit: false,
         }
     }
@@ -223,6 +242,14 @@ impl App {
         }
     }
 
+    /// Record a failure: log it AND raise the dismissible error banner so the
+    /// user sees WHY something failed (not just a scrolled-off Activity line).
+    fn set_error(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        self.log('✗', m.clone());
+        self.error = Some(m);
+    }
+
     fn request(&mut self, req: Request, action: &str) -> Option<Response> {
         self.log('→', format!("daemon: {action}"));
         match crate::daemon_request(&req) {
@@ -236,6 +263,7 @@ impl App {
     /// nodes only — all sub-millisecond, no subprocess spawns. Keeps the panel
     /// live without periodic UI hitches. SILENT (no Activity spam).
     fn refresh_light(&mut self) {
+        self.daemon_up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
         if let Ok(Response::Enrollment { profiles, require_eyes_open }) =
             crate::daemon_request(&Request::ListProfiles { user: self.user.clone() })
         {
@@ -408,7 +436,7 @@ impl App {
         if let Some(op) = &self.op {
             if let Ok((ok, msg)) = op.rx.try_recv() {
                 let tag = op.tag;
-                self.log(if ok { '✓' } else { '✗' }, msg.clone());
+                if ok { self.log('✓', msg.clone()); } else { self.set_error(msg.clone()); }
                 match tag {
                     OpTag::Identify => self.identify_result = Some((ok, msg)),
                     OpTag::Calibrate => self.selftest_result = Some((ok, msg)),
@@ -431,7 +459,11 @@ impl App {
                         self.log('✓', format!("captured scan {n}/{t}"));
                     }
                     WMsg::Done => { self.log('✓', "enrollment complete"); finished = true; }
-                    WMsg::Err(e) => { self.log('✗', e); finished = true; }
+                    WMsg::Err(e) => {
+                        let e = e.strip_prefix("hardware: ").unwrap_or(&e);
+                        self.set_error(format!("Enrollment failed — {e}"));
+                        finished = true;
+                    }
                 }
             }
             if finished { self.enroll = None; self.refresh(); }
@@ -491,9 +523,6 @@ impl App {
         let none: [String; 0] = [];
         match s {
             Suspend::FingerprintAdd => { crate::fingerprint::run(Some("add"), &none); }
-            Suspend::RecoverySetup => { crate::recovery::run(Some("setup"), &none); }
-            Suspend::RecoveryRestore => { crate::recovery::run(Some("restore"), &none); }
-            Suspend::KeyringArm => { crate::keyring(Some("arm"), &none); }
             Suspend::LoginStatus => { crate::pamwire::run(Some("status"), &none); }
             Suspend::RestartDaemon => {
                 eprintln!("\nRestarting irlumed (sudo)…");
@@ -520,6 +549,8 @@ impl App {
             }
             return;
         }
+        // A raised error banner swallows the next key (dismiss it).
+        if self.error.is_some() { self.error = None; return; }
         if self.op.is_some() { return; }
         if let Some((_, buf, _)) = self.input.as_mut() {
             match code {
@@ -624,14 +655,20 @@ impl App {
             // Identify: 1:N who-is-this.
             (SC_IDENTIFY, KeyCode::Char('i')) => self.start_async(
                 "Identify (1:N)", OpTag::Identify, Request::Identify, map_identify),
-            // Keyring.
-            (SC_KEYRING, KeyCode::Char('a')) => self.suspend = Some(Suspend::KeyringArm),
+            // Keyring — masked in-TUI entry (goes to the root daemon; no sudo).
+            (SC_KEYRING, KeyCode::Char('a')) => {
+                self.input = Some(("Login password to seal (••):".into(), String::new(), Pending::KeyringPw(None)));
+            }
             (SC_KEYRING, KeyCode::Char('f')) => {
                 self.confirm = Some(("Erase the TPM-sealed login password?".into(), Request::ForgetPassword { user: self.user.clone() }));
             }
-            // Recovery.
-            (SC_RECOVERY, KeyCode::Char('s')) => self.suspend = Some(Suspend::RecoverySetup),
-            (SC_RECOVERY, KeyCode::Char('t')) => self.suspend = Some(Suspend::RecoveryRestore),
+            // Recovery — masked in-TUI entry.
+            (SC_RECOVERY, KeyCode::Char('s')) => {
+                self.input = Some(("New recovery passphrase (••):".into(), String::new(), Pending::RecoveryPw(None)));
+            }
+            (SC_RECOVERY, KeyCode::Char('t')) => {
+                self.input = Some(("Recovery passphrase to restore (••):".into(), String::new(), Pending::RecoveryRestorePw));
+            }
             (SC_RECOVERY, KeyCode::Char('f')) => {
                 self.confirm = Some(("Erase the recovery passphrase? (templates stay encrypted)".into(), Request::RecoveryForget { user: self.user.clone() }));
             }
@@ -712,6 +749,45 @@ impl App {
             }
             Pending::RenameProfile(old) => self.rename(Request::RenameProfile { user: self.user.clone(), profile: old, new_name: v }),
             Pending::RenameScan(p, s) => self.rename(Request::RenameScan { user: self.user.clone(), profile: p, scan: s, new_name: v }),
+            // Passwords: use the RAW buffer (never trim). Double-entry to confirm.
+            Pending::KeyringPw(None) => {
+                if buf.is_empty() { self.set_error("empty password — aborted (nothing sealed)"); return; }
+                self.input = Some(("Confirm login password (••):".into(), String::new(), Pending::KeyringPw(Some(buf))));
+            }
+            Pending::KeyringPw(Some(first)) => {
+                if buf != first { self.set_error("passwords don't match — aborted (nothing sealed)"); return; }
+                let req = Request::SealPassword { user: self.user.clone(), password: irlume_common::SecretBytes::new(buf.into_bytes()) };
+                match self.request(req, "SealPassword") {
+                    Some(Response::PasswordSealed) => self.log('✓', "keyring armed — face login will open your wallet"),
+                    Some(other) => self.set_error(format!("arm failed: {other:?}")),
+                    None => {}
+                }
+                self.refresh();
+            }
+            Pending::RecoveryPw(None) => {
+                if buf.is_empty() { self.set_error("empty passphrase — aborted"); return; }
+                self.input = Some(("Confirm recovery passphrase (••):".into(), String::new(), Pending::RecoveryPw(Some(buf))));
+            }
+            Pending::RecoveryPw(Some(first)) => {
+                if buf != first { self.set_error("passphrases don't match — aborted"); return; }
+                let req = Request::RecoverySetup { user: self.user.clone(), passphrase: irlume_common::SecretBytes::new(buf.into_bytes()) };
+                match self.request(req, "RecoverySetup") {
+                    Some(Response::Ok(m)) => self.log('✓', m),
+                    Some(other) => self.set_error(format!("recovery setup failed: {other:?}")),
+                    None => {}
+                }
+                self.refresh();
+            }
+            Pending::RecoveryRestorePw => {
+                if buf.is_empty() { self.set_error("empty passphrase — aborted"); return; }
+                let req = Request::RecoveryRestore { user: self.user.clone(), passphrase: irlume_common::SecretBytes::new(buf.into_bytes()) };
+                match self.request(req, "RecoveryRestore") {
+                    Some(Response::Ok(m)) => self.log('✓', m),
+                    Some(other) => self.set_error(format!("recovery restore failed: {other:?}")),
+                    None => {}
+                }
+                self.refresh();
+            }
         }
     }
 
@@ -741,11 +817,33 @@ impl App {
         self.draw_content(f, body);
         self.draw_activity(f, activity);
         self.draw_footer(f, footer);
-        if let Some((prompt, buf, _)) = &self.input {
-            self.modal(f, prompt, &format!("{buf}▏"));
+        if let Some(err) = &self.error {
+            self.error_modal(f, err);
+        } else if let Some((prompt, buf, pending)) = &self.input {
+            let shown = if pending.masked() { "•".repeat(buf.chars().count()) } else { buf.clone() };
+            self.modal(f, prompt, &format!("{shown}▏"));
         } else if let Some((what, _)) = &self.confirm {
             self.modal(f, what, "[y] confirm    [any other key] cancel");
         }
+    }
+
+    /// A red, dismissible error banner centred on screen.
+    fn error_modal(&self, f: &mut Frame, msg: &str) {
+        let area = f.area();
+        let w = area.width.saturating_sub(8).min(78).max(30);
+        let h = 7u16;
+        let rect = Rect { x: area.width.saturating_sub(w) / 2, y: area.height.saturating_sub(h) / 2, width: w, height: h };
+        f.render_widget(Clear, rect);
+        let blk = Block::bordered().title(" ⚠ Problem ").border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(ERR).add_modifier(Modifier::BOLD))
+            .padding(ratatui::widgets::Padding::horizontal(1));
+        let body = vec![
+            Line::raw(""),
+            Line::from(Span::styled(msg.to_string(), Style::new().fg(ERR))),
+            Line::raw(""),
+            Line::from(Span::styled("[any key] dismiss", Style::new().dim())),
+        ];
+        f.render_widget(Paragraph::new(body).block(blk).wrap(Wrap { trim: true }), rect);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -1008,7 +1106,7 @@ impl App {
             Line::from(Span::styled("  each step shows live state and its own action keys in the footer.", Style::new().dim())),
             Line::raw(""),
             section("At a glance"),
-            Line::from(vec![Span::raw("  daemon       "), onoff(std::path::Path::new("/run/irlume.sock").exists())]),
+            Line::from(vec![Span::raw("  daemon       "), onoff(self.daemon_up)]),
             Line::from(vec![Span::raw("  enrolled     "), count_badge(self.profiles.len(), scans)]),
             Line::from(vec![Span::raw("  keyring      "), onoff(self.keyring_armed.unwrap_or(false))]),
             Line::from(vec![Span::raw("  encrypted    "), onoff(rec.encrypted)]),
@@ -1145,7 +1243,7 @@ impl App {
         let lines = vec![
             Line::from(Span::styled("  Setup dashboard", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))),
             Line::raw(""),
-            Line::from(vec![Span::raw("  daemon            "), onoff(std::path::Path::new("/run/irlume.sock").exists())]),
+            Line::from(vec![Span::raw("  daemon            "), onoff(self.daemon_up)]),
             Line::from(vec![Span::raw("  auth method       "), Span::styled(self.fp.method.clone(), Style::new().fg(ACCENT))]),
             Line::from(vec![Span::raw("  enrollment        "), count_badge(self.profiles.len(), scans)]),
             Line::from(vec![Span::raw("  eyes-open gate    "), onoff(self.eyes_open)]),

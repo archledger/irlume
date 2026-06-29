@@ -62,14 +62,43 @@ const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
 fn map_io(device: &str, e: std::io::Error) -> Error {
     use std::io::ErrorKind;
     match e.raw_os_error() {
-        Some(16) => Error::Hardware(format!(
-            "{device}: camera busy (EBUSY) — another process holds it; close it or wait for resume"
-        )),
+        Some(16) => {
+            let who = camera_holder(device)
+                .map(|h| format!(" — in use by {h}"))
+                .unwrap_or_else(|| " — another app is using it".into());
+            Error::Hardware(format!(
+                "{device}: camera busy{who}. Close that app (e.g. a camera/video/conferencing app) and retry."
+            ))
+        }
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
-            "{device}: permission denied — add your user to the camera ACL/group"
+            "{device}: permission denied — add your user to the 'video' group (camera) and re-login"
         )),
         _ => Error::Hardware(format!("{device}: {e}")),
     }
+}
+
+/// Best-effort: which process currently holds `device` open, for a clearer
+/// camera-busy message. Scans `/proc/<pid>/fd` for a symlink to the device;
+/// needs root to see other users' processes (the daemon runs as root). Returns
+/// e.g. "kamoso (pid 2567)", or `None` if it can't tell.
+fn camera_holder(device: &str) -> Option<String> {
+    let dev = std::fs::canonicalize(device).ok()?;
+    for ent in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = ent.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(ent.path().join("fd")) else { continue };
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path()).map(|t| t == dev).unwrap_or(false) {
+                let comm = std::fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
+                let comm = comm.trim();
+                return Some(if comm.is_empty() { format!("pid {pid}") } else { format!("{comm} (pid {pid})") });
+            }
+        }
+    }
+    None
 }
 
 /// What a video node is, by its advertised formats.

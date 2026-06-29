@@ -133,12 +133,21 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Ok(o) => Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason },
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::Enroll { user, .. } => {
+        Request::Enroll { user, profile } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to enroll '{user}'"));
             }
-            match engine.enroll(&user, 5) {
-                Ok(n) => Response::AuthResult { granted: true, score: 0.0, live: true, reason: format!("enrolled {n} samples") },
+            match engine.enroll_profile(&user, profile, irlume_core::storage::DEFAULT_ENROLL_SCANS) {
+                Ok((name, n)) => Response::Ok(format!("enrolled '{name}' with {n} scans")),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::AddScan { user, profile } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            match engine.add_scan(&user, &profile) {
+                Ok((scan, total)) => Response::Ok(format!("added '{scan}' to '{profile}' ({total} scans)")),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -206,9 +215,107 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::ListProfiles { .. } | Request::DeleteProfile { .. } | Request::SelfTest { .. } => {
-            Response::Error("unimplemented".into())
+        Request::ListProfiles { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to list '{user}'"));
+            }
+            match irlume_core::storage::load(&user) {
+                Ok(Some(enr)) => Response::Enrollment {
+                    profiles: enr.profiles.iter().map(|p| irlume_common::ProfileSummary {
+                        name: p.name.clone(),
+                        scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                    }).collect(),
+                    require_eyes_open: enr.require_eyes_open,
+                },
+                Ok(None) => Response::Enrollment { profiles: vec![], require_eyes_open: false },
+                Err(e) => Response::Error(e.to_string()),
+            }
         }
+        Request::DeleteProfile { user, profile } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                let before = enr.profiles.len();
+                enr.profiles.retain(|p| p.name != profile);
+                if enr.profiles.len() == before {
+                    Err(format!("no face profile '{profile}'"))
+                } else {
+                    Ok(format!("deleted profile '{profile}'"))
+                }
+            })
+        }
+        Request::DeleteScan { user, profile, scan } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                let p = enr.profiles.iter_mut().find(|p| p.name == profile).ok_or(format!("no face profile '{profile}'"))?;
+                let before = p.scans.len();
+                p.scans.retain(|s| s.name != scan);
+                if p.scans.len() == before { Err(format!("no scan '{scan}' in '{profile}'")) }
+                else if p.scans.is_empty() { Err("a profile must keep at least one scan — delete the profile instead".into()) }
+                else { Ok(format!("deleted scan '{scan}' from '{profile}'")) }
+            })
+        }
+        Request::RenameProfile { user, profile, new_name } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                if enr.profiles.iter().any(|p| p.name == new_name) { return Err(format!("'{new_name}' already exists")); }
+                let p = enr.profiles.iter_mut().find(|p| p.name == profile).ok_or(format!("no face profile '{profile}'"))?;
+                p.name = new_name.clone();
+                Ok(format!("renamed profile to '{new_name}'"))
+            })
+        }
+        Request::RenameScan { user, profile, scan, new_name } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                let p = enr.profiles.iter_mut().find(|p| p.name == profile).ok_or(format!("no face profile '{profile}'"))?;
+                if p.scans.iter().any(|s| s.name == new_name) { return Err(format!("'{new_name}' already exists in '{profile}'")); }
+                let s = p.scans.iter_mut().find(|s| s.name == scan).ok_or(format!("no scan '{scan}' in '{profile}'"))?;
+                s.name = new_name.clone();
+                Ok(format!("renamed scan to '{new_name}'"))
+            })
+        }
+        Request::SetRequireEyesOpen { user, on } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                enr.require_eyes_open = on;
+                Ok(format!("require-eyes-open {}", if on { "ENABLED" } else { "disabled" }))
+            })
+        }
+        Request::SelfTest { .. } => Response::Error("unimplemented".into()),
+    }
+}
+
+/// Load `user`'s enrollment, apply `f`, and save. `f` returns an Ok message or an
+/// error string. Used by the storage-only management operations.
+fn mutate_enrollment(user: &str, f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>) -> Response {
+    let mut enr = match irlume_core::storage::load(user) {
+        Ok(Some(e)) => e,
+        Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    match f(&mut enr) {
+        Ok(msg) => {
+            // If no profiles remain, remove the file entirely.
+            let save = if enr.profiles.is_empty() {
+                irlume_core::storage::delete(user).map(|_| ())
+            } else {
+                irlume_core::storage::save(&enr)
+            };
+            match save {
+                Ok(()) => Response::Ok(msg),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Err(e) => Response::Error(e),
     }
 }
 

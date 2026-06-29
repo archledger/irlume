@@ -25,6 +25,7 @@ fn main() -> std::process::ExitCode {
         (Some("genuine"), _) => genuine(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("enroll"), _) => enroll(&args),
+        (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
         (Some("doctor"), _) => doctor(),
@@ -39,25 +40,79 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `irlume enroll --user U` — capture LIVE samples (RGB + IR templates) via the
-/// shared auth engine. Frames failing the liveness gate are rejected.
+/// `irlume enroll --user U [--name "..."]` — enroll a NEW face profile (captures
+/// the default number of scans) via the daemon, which owns the camera. Default
+/// profile name is "Face Profile N".
 fn enroll(args: &[String]) -> std::process::ExitCode {
-    let (Some(det), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
-        eprintln!("usage: irlume enroll --user U --det <yunet.onnx> --model <glintr100.onnx> [--rgb /dev/videoN] [--ir /dev/videoN]");
-        return std::process::ExitCode::from(2);
-    };
+    use irlume_common::{Request, Response};
     let user = user_arg(args);
-    println!("[enroll] '{user}' — stay in frame; capturing live samples (RGB + IR)…");
-    match engine(det, model, args).and_then(|mut e| e.enroll(&user, 5)) {
-        Ok(n) => {
-            println!("[enroll] saved {n} samples (RGB+IR templates) for '{user}' -> {}", irlume_core::storage::profile_path(&user).display());
+    let name = flag(args, "--name").map(String::from);
+    eprintln!("[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…");
+    match daemon_request(&Request::Enroll { user, profile: name }) {
+        Ok(Response::Ok(msg)) => { println!("[enroll] {msg}"); std::process::ExitCode::SUCCESS }
+        Ok(Response::Error(e)) => { eprintln!("enroll failed: {e}"); std::process::ExitCode::FAILURE }
+        Ok(other) => { eprintln!("enroll: unexpected response {other:?}"); std::process::ExitCode::FAILURE }
+        Err(e) => { eprintln!("enroll: {e}"); std::process::ExitCode::FAILURE }
+    }
+}
+
+/// `irlume profiles [list|add-scan|rename|delete|eyes-open] ...` — manage the up-
+/// to-3 face profiles and their scans via the daemon.
+fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
+    use irlume_common::{Request, Response};
+    let user = user_arg(args);
+    let req = match sub {
+        None | Some("list") => Request::ListProfiles { user },
+        Some("add-scan") => match flag(args, "--profile") {
+            Some(p) => { eprintln!("[profiles] adding a scan to '{p}' — stay in frame…"); Request::AddScan { user, profile: p.into() } }
+            None => return usage_profiles(),
+        },
+        Some("delete") => match (flag(args, "--profile"), flag(args, "--scan")) {
+            (Some(p), Some(s)) => Request::DeleteScan { user, profile: p.into(), scan: s.into() },
+            (Some(p), None) => Request::DeleteProfile { user, profile: p.into() },
+            _ => return usage_profiles(),
+        },
+        Some("rename") => match (flag(args, "--profile"), flag(args, "--scan"), flag(args, "--name")) {
+            (Some(p), Some(s), Some(n)) => Request::RenameScan { user, profile: p.into(), scan: s.into(), new_name: n.into() },
+            (Some(p), None, Some(n)) => Request::RenameProfile { user, profile: p.into(), new_name: n.into() },
+            _ => return usage_profiles(),
+        },
+        Some("eyes-open") => {
+            let on = args.iter().any(|a| a == "on");
+            let off = args.iter().any(|a| a == "off");
+            if on == off { eprintln!("usage: irlume profiles eyes-open <on|off> [--user U]"); return std::process::ExitCode::from(2); }
+            Request::SetRequireEyesOpen { user, on }
+        }
+        _ => return usage_profiles(),
+    };
+    match daemon_request(&req) {
+        Ok(Response::Enrollment { profiles, require_eyes_open }) => {
+            if profiles.is_empty() {
+                println!("[profiles] none enrolled");
+            } else {
+                println!("[profiles] require-eyes-open: {}", if require_eyes_open { "ON" } else { "off" });
+                for p in &profiles {
+                    println!("  {} ({} scans)", p.name, p.scans.len());
+                    for s in &p.scans { println!("      - {s}"); }
+                }
+            }
             std::process::ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("enroll failed: {e}");
-            std::process::ExitCode::FAILURE
-        }
+        Ok(Response::Ok(msg)) => { println!("[profiles] {msg}"); std::process::ExitCode::SUCCESS }
+        Ok(Response::Error(e)) => { eprintln!("[profiles] {e}"); std::process::ExitCode::FAILURE }
+        Ok(other) => { eprintln!("[profiles] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
+        Err(e) => { eprintln!("[profiles] {e}"); std::process::ExitCode::FAILURE }
     }
+}
+
+fn usage_profiles() -> std::process::ExitCode {
+    eprintln!("usage: irlume profiles [--user U] <subcommand>\n  \
+        (no sub) | list                         list profiles + scans\n  \
+        add-scan --profile P                    add a scan to P (improve recognition)\n  \
+        rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
+        delete --profile P [--scan S]           delete a profile or a scan\n  \
+        eyes-open <on|off>                      require eyes open to unlock");
+    std::process::ExitCode::from(2)
 }
 
 /// `irlume verify --user U` — full auth via the engine: liveness gate then match
@@ -161,7 +216,7 @@ fn daemon_request(req: &irlume_common::Request) -> Result<irlume_common::Respons
     use std::os::unix::net::UnixStream;
     let path = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| irlume_common::SOCKET_PATH.into());
     let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e} (is irlumed running?)"))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(120))).ok();
     let mut line = serde_json::to_vec(req).map_err(|e| e.to_string())?;
     line.push(b'\n');
     (&stream).write_all(&line).map_err(|e| e.to_string())?;

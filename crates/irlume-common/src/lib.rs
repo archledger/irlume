@@ -71,10 +71,20 @@ pub enum Request {
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
     Enroll { user: String, profile: Option<String> },
-    /// List enrolled profiles for `user`.
+    /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
+    AddScan { user: String, profile: String },
+    /// List enrolled profiles + their scans for `user`.
     ListProfiles { user: String },
-    /// Delete a profile (privileged, same rule as Enroll).
+    /// Delete a whole profile (and its scans). PRIVILEGED, same rule as Enroll.
     DeleteProfile { user: String, profile: String },
+    /// Delete one scan from a profile. PRIVILEGED.
+    DeleteScan { user: String, profile: String, scan: String },
+    /// Rename a profile. PRIVILEGED.
+    RenameProfile { user: String, profile: String, new_name: String },
+    /// Rename a scan within a profile. PRIVILEGED.
+    RenameScan { user: String, profile: String, scan: String, new_name: String },
+    /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
+    SetRequireEyesOpen { user: String, on: bool },
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.
@@ -115,6 +125,13 @@ pub enum SelfTestKind {
     Liveness,
 }
 
+/// A profile and the names of its scans, for `ListProfiles`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub scans: Vec<String>,
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -128,6 +145,11 @@ pub enum Response {
         reason: String,
     },
     Profiles(Vec<String>),
+    /// Structured enrollment listing: profiles (each with its scan names) plus
+    /// the per-user require-eyes-open setting.
+    Enrollment { profiles: Vec<ProfileSummary>, require_eyes_open: bool },
+    /// Generic success ack for management operations, with a human message.
+    Ok(String),
     SelfTest { passed: bool, detail: String },
     Pong,
     Error(String),

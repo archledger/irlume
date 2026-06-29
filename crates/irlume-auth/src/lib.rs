@@ -36,6 +36,9 @@ pub struct Assessment {
     pub signals: Signals,
     pub ir_depth: f32,
     pub ir_brightness: f32,
+    /// Both eyes read open (IR corneal-glint heuristic). Used only when a profile
+    /// opts into the require-eyes-open gate. `false` if eyes couldn't be verified.
+    pub eyes_open: bool,
 }
 
 /// The authentication decision for a user.
@@ -131,99 +134,173 @@ impl Engine {
             }
             None => None,
         };
-        Ok(Assessment { verdict, reason, embedding, ir_embedding, signals, ir_depth, ir_brightness })
+        // Eyes-open (IR corneal-glint heuristic), for the opt-in require-eyes-open
+        // gate. Needs an IR face (the emitter lights the cornea); conservative:
+        // false when it can't be verified.
+        let eyes_open = ir_top
+            .as_ref()
+            .map(|f| both_eyes_open(&ir.data, ir.width, ir.height, &f.landmarks))
+            .unwrap_or(false);
+        Ok(Assessment { verdict, reason, embedding, ir_embedding, signals, ir_depth, ir_brightness, eyes_open })
     }
 
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
-    /// then cosine match against enrolled templates at the fixed threshold.
+    /// then 1:N cosine match against every scan in every enrolled face profile
+    /// (any enrolled face unlocks). Threshold scales with the total scan count.
     pub fn authenticate(&mut self, user: &str) -> irlume_common::Result<Outcome> {
-        let Some(profile) = irlume_core::storage::load(user)? else {
+        let Some(enr) = irlume_core::storage::load(user)? else {
             return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
         };
+        if enr.profiles.iter().all(|p| p.scans.is_empty()) {
+            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' has no face scans enrolled") });
+        }
         let a = self.assess()?;
-        let best = |probe: &[f32], templates: &[Vec<f32>]| {
-            templates.iter().map(|t| align::cosine(probe, t)).fold(f32::NEG_INFINITY, f32::max)
+
+        // Opt-in hard gate: never unlock unless both eyes read open.
+        if enr.require_eyes_open && !a.eyes_open {
+            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "eyes not detected open (require-eyes-open is on)".into() });
+        }
+
+        // best match over a labeled set of templates -> (score, profile name).
+        let best = |probe: &[f32], scans: &[(&str, &str, &[f32])]| -> (f32, String) {
+            scans
+                .iter()
+                .map(|(prof, _scan, t)| (align::cosine(probe, t), prof.to_string()))
+                .fold((f32::NEG_INFINITY, String::new()), |acc, x| if x.0 > acc.0 { x } else { acc })
         };
 
         // Primary path: a visible-light (RGB) face -> full cross-spectrum gate +
-        // RGB recognition. Threshold scales with the template count (max-over-N
-        // inflates FAR ~linearly), Windows-Hello-style.
+        // RGB recognition across all profiles' scans.
         if let Some(probe) = a.embedding {
             if a.verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
             }
-            let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, profile.templates.len());
-            let score = best(&probe, &profile.templates);
+            let scans = enr.rgb_scans();
+            let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
+            let (score, who) = best(&probe, &scans);
             let granted = score >= thr;
-            return Ok(Outcome { granted, live: true, score, reason: if granted { "match (rgb)".into() } else { "below threshold".into() } });
+            return Ok(Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (rgb)") } else { "below threshold".into() } });
         }
 
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
-        // recognition (Windows-Hello-style dark operation).
+        // recognition (Windows-Hello-style dark operation) across all profiles.
         if let Some(probe) = a.ir_embedding {
-            if profile.ir_templates.is_empty() {
-                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "dark, but no IR enrollment — re-enroll to enable dark unlock".into() });
+            let scans = enr.ir_scans();
+            if scans.is_empty() {
+                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "dark, but no IR scans enrolled — re-enroll to enable dark unlock".into() });
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
             if verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
             }
-            // IR mode threshold — adapted space if the adapter is loaded — also
-            // scaled by the IR template count (same max-over-N FAR inflation).
             let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
             } else {
                 irlume_core::IR_MATCH_THRESHOLD
             };
-            let ir_thr = irlume_core::scaled_threshold(ir_base, profile.ir_templates.len());
-            let score = best(&probe, &profile.ir_templates);
+            let ir_thr = irlume_core::scaled_threshold(ir_base, scans.len());
+            let (score, who) = best(&probe, &scans);
             let granted = score >= ir_thr;
-            return Ok(Outcome { granted, live: true, score, reason: if granted { "match (ir/dark)".into() } else { "below threshold (ir)".into() } });
+            return Ok(Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (ir/dark)") } else { "below threshold (ir)".into() } });
         }
 
         Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("no face: {}", a.reason) })
     }
 
-    /// Capture `want` LIVE samples and store them as `user`'s enrollment. Frames
-    /// failing the liveness gate are rejected (no enrolling from a photo).
-    pub fn enroll(&mut self, user: &str, want: usize) -> irlume_common::Result<usize> {
-        let mut templates = Vec::new();
-        let mut ir_templates = Vec::new();
-        let (mut depths, mut brights) = (Vec::new(), Vec::new());
-        for _ in 0..(want * 3) {
-            if templates.len() >= want {
+    /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).
+    /// Each Live capture yields one (rgb, ir, depth, brightness). No enrolling
+    /// from a photo — the liveness gate rejects spoofs.
+    fn capture_scans(&mut self, want: usize) -> irlume_common::Result<Vec<(Vec<f32>, Option<Vec<f32>>, f32, f32)>> {
+        let mut out = Vec::new();
+        for _ in 0..(want * 4) {
+            if out.len() >= want {
                 break;
             }
             let a = self.assess()?;
-            // Enroll on a Live (well-lit) capture so both RGB and IR templates
-            // are clean; capture the IR template alongside for dark operation.
             if a.verdict == Verdict::Live {
                 if let Some(e) = a.embedding {
-                    templates.push(e.to_vec());
-                    depths.push(a.ir_depth);
-                    brights.push(a.ir_brightness);
-                    if let Some(ir) = a.ir_embedding {
-                        ir_templates.push(ir.to_vec());
-                    }
+                    out.push((e.to_vec(), a.ir_embedding.clone(), a.ir_depth, a.ir_brightness));
                 }
             }
         }
-        if templates.len() < want {
+        Ok(out)
+    }
+
+    /// Enroll a NEW face profile with `want` scans (capped at MAX_SCANS_PER_PROFILE).
+    /// Errors if the account already has MAX_PROFILES. Returns (profile name, scans).
+    pub fn enroll_profile(&mut self, user: &str, profile_name: Option<String>, want: usize) -> irlume_common::Result<(String, usize)> {
+        use irlume_core::storage::{self, Enrollment, FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE};
+        let mut enr = storage::load(user)?.unwrap_or_else(|| Enrollment::new(user));
+        if enr.profiles.len() >= MAX_PROFILES {
+            return Err(irlume_common::Error::Protocol(format!("at the max of {MAX_PROFILES} face profiles — delete one first")));
+        }
+        let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
+        let name = profile_name.unwrap_or_else(|| enr.next_profile_name());
+        if enr.profiles.iter().any(|p| p.name == name) {
+            return Err(irlume_common::Error::Protocol(format!("a face profile named '{name}' already exists")));
+        }
+        let captured = self.capture_scans(want)?;
+        if captured.len() < want {
             return Err(irlume_common::Error::Protocol(format!(
-                "only {} live samples (need {want}) — check lighting and framing",
-                templates.len()
+                "only {} live scans (need {want}) — check lighting and framing", captured.len()
             )));
         }
-        let n = templates.len();
-        irlume_core::storage::save(&irlume_core::storage::Profile {
-            user: user.into(),
-            templates,
-            ir_templates,
-            ir_depth_samples: depths,
-            ir_brightness_samples: brights,
-        })?;
-        Ok(n)
+        let mut prof = FaceProfile { name: name.clone(), scans: Vec::new() };
+        for (rgb, ir, d, b) in captured {
+            let sname = prof.next_scan_name();
+            prof.scans.push(FaceScan { name: sname, rgb, ir, ir_depth: d, ir_brightness: b });
+        }
+        let n = prof.scans.len();
+        enr.profiles.push(prof);
+        storage::save(&enr)?;
+        Ok((name, n))
     }
+
+    /// Add one scan to an existing profile ("improve recognition"). Errors if the
+    /// profile is missing or already at MAX_SCANS_PER_PROFILE.
+    pub fn add_scan(&mut self, user: &str, profile_name: &str) -> irlume_common::Result<(String, usize)> {
+        use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
+        let mut enr = storage::load(user)?.ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
+        let idx = enr.profiles.iter().position(|p| p.name == profile_name)
+            .ok_or_else(|| irlume_common::Error::Protocol(format!("no face profile '{profile_name}'")))?;
+        if enr.profiles[idx].scans.len() >= MAX_SCANS_PER_PROFILE {
+            return Err(irlume_common::Error::Protocol(format!("'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans")));
+        }
+        let (rgb, ir, d, b) = self.capture_scans(1)?.into_iter().next()
+            .ok_or_else(|| irlume_common::Error::Protocol("no live scan captured — check lighting and framing".into()))?;
+        let sname = enr.profiles[idx].next_scan_name();
+        enr.profiles[idx].scans.push(FaceScan { name: sname.clone(), rgb, ir, ir_depth: d, ir_brightness: b });
+        let total = enr.profiles[idx].scans.len();
+        storage::save(&enr)?;
+        Ok((sname, total))
+    }
+}
+
+/// Per-eye open check (IR corneal-glint heuristic): an open eye reflects the
+/// 850nm emitter as a bright specular point near the eye landmark; a closed
+/// eyelid does not. Conservative — requires the glint, so an unverifiable eye
+/// reads closed (auth falls back to password). Heuristic; used only when a
+/// profile opts into the require-eyes-open gate.
+const EYE_OPEN_PEAK_MIN: f32 = 200.0;
+
+fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks5) -> bool {
+    let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
+    let r = (iod * 0.20).max(2.0) as i32;
+    eye_open_at(grey, w, h, lm[0], r) && eye_open_at(grey, w, h, lm[1], r)
+}
+
+fn eye_open_at(grey: &[u8], w: u32, h: u32, (ex, ey): (f32, f32), r: i32) -> bool {
+    let (cx, cy) = (ex as i32, ey as i32);
+    let mut peak = 0u8;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (x, y) = (cx + dx, cy + dy);
+            if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                peak = peak.max(grey[(y as u32 * w + x as u32) as usize]);
+            }
+        }
+    }
+    peak as f32 >= EYE_OPEN_PEAK_MIN
 }
 
 fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {

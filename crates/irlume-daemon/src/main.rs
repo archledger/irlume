@@ -164,6 +164,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Ok(o) => Response::Identified { user: o.user, profile: o.profile, score: o.score, live: o.live, reason: o.reason },
             Err(e) => Response::Error(e.to_string()),
         },
+        Request::SetCameras { rgb, ir } => {
+            // System-wide device setting (not credential-sensitive); the
+            // SO_PEERCRED local-peer boundary is sufficient.
+            engine.set_devices(&rgb, &ir);
+            let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
+            if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
+                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
+            {
+                msg = format!("{msg} (live only — could not persist: {e})");
+            }
+            eprintln!("irlumed: {msg}");
+            Response::Ok(msg)
+        }
         Request::Enroll { user, profile, scans, reset } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to enroll '{user}'"));

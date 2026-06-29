@@ -85,6 +85,18 @@ impl Engine {
         &self.ir_dev
     }
 
+    /// The selected RGB camera device path.
+    pub fn rgb_device(&self) -> &str {
+        &self.rgb_dev
+    }
+
+    /// Switch the active camera pair at runtime (TUI camera picker). The next
+    /// capture uses the new devices.
+    pub fn set_devices(&mut self, rgb: &str, ir: &str) {
+        self.rgb_dev = rgb.into();
+        self.ir_dev = ir.into();
+    }
+
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the
     /// file is absent this is a no-op (raw IR embeddings are used).
     pub fn with_ir_adapter(mut self, path: &str) -> irlume_common::Result<Self> {

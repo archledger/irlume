@@ -171,6 +171,8 @@ struct App {
     /// Repair-tab diagnostics + selection.
     repair: Vec<Check>,
     repair_sel: usize,
+    /// Cameras-tab pair selection.
+    cam_sel: usize,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
     spin: usize,
@@ -184,10 +186,12 @@ pub fn run() -> std::io::Result<()> {
         return Ok(());
     }
     let mut terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
     let mut app = App::new();
-    app.log('·', format!("irlume — managing '{}'", app.user));
+    app.log('·', format!("irlume — managing '{}' (live)", app.user));
     app.refresh();
     let res = app.main_loop(&mut terminal);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -201,7 +205,7 @@ impl App {
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
             identify_result: None, selftest_result: None,
-            repair: Vec::new(), repair_sel: 0, act_scroll: 0,
+            repair: Vec::new(), repair_sel: 0, cam_sel: 0, act_scroll: 0,
             spin: 0, quit: false,
         }
     }
@@ -228,20 +232,23 @@ impl App {
         }
     }
 
+    /// Pull the whole live snapshot from the daemon + host, SILENTLY (no Activity
+    /// log spam) so it can run on a periodic timer and the TUI stays live — any
+    /// change made to irlume (CLI enroll, daemon restart, camera plugged in,
+    /// keyring armed) shows up on the next tick without the user doing anything.
     fn refresh(&mut self) {
-        if let Some(Response::Enrollment { profiles, require_eyes_open }) =
-            self.request(Request::ListProfiles { user: self.user.clone() }, "ListProfiles")
+        if let Ok(Response::Enrollment { profiles, require_eyes_open }) =
+            crate::daemon_request(&Request::ListProfiles { user: self.user.clone() })
         {
-            let (np, ns) = (profiles.len(), profiles.iter().map(|p| p.scans.len()).sum::<usize>());
             self.profiles = profiles;
             self.eyes_open = require_eyes_open;
-            self.log('✓', format!("{np} profile(s), {ns} scan(s)"));
         }
-        if let Some(Response::HasPassword(b)) =
-            self.request(Request::HasSealedPassword { user: self.user.clone() }, "HasSealedPassword")
-        { self.keyring_armed = Some(b); }
-        if let Some(Response::RecoveryStatus { encrypted, recovery_set, tpm_present }) =
-            self.request(Request::RecoveryStatus { user: self.user.clone() }, "RecoveryStatus")
+        self.keyring_armed = match crate::daemon_request(&Request::HasSealedPassword { user: self.user.clone() }) {
+            Ok(Response::HasPassword(b)) => Some(b),
+            _ => self.keyring_armed,
+        };
+        if let Ok(Response::RecoveryStatus { encrypted, recovery_set, tpm_present }) =
+            crate::daemon_request(&Request::RecoveryStatus { user: self.user.clone() })
         { self.recovery = Some(RecoveryInfo { encrypted, recovery_set, tpm_present }); }
         self.fp = FpInfo {
             available: irlume_fingerprint::available(),
@@ -249,8 +256,11 @@ impl App {
             enrolled: irlume_fingerprint::enrolled_fingers(&self.user),
             method: irlume_core::policy::method().as_str().to_string(),
         };
+        self.nodes = irlume_camera::discover_nodes();
         let max = self.rows().len().max(1);
         if self.sel >= max { self.sel = max - 1; }
+        let pairs = irlume_camera::list_pairs().len().max(1);
+        if self.cam_sel >= pairs { self.cam_sel = pairs - 1; }
         self.run_checks();
     }
 
@@ -422,20 +432,39 @@ impl App {
     }
 
     fn main_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+        use ratatui::crossterm::event::MouseEventKind;
+        let mut last_refresh = std::time::Instant::now();
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press { self.on_key(k.code); }
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k.code),
+                    // Mouse wheel scrolls the Activity history.
+                    Event::Mouse(m) => match m.kind {
+                        MouseEventKind::ScrollUp => self.act_scroll = (self.act_scroll + 1).min(self.act_max()),
+                        MouseEventKind::ScrollDown => self.act_scroll = self.act_scroll.saturating_sub(1),
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
             self.spin = (self.spin + 1) % SPIN.len();
             self.poll();
+            // Live auto-refresh: re-pull the snapshot every ~2.5s so external
+            // changes appear on their own. Skip while the user is mid-flow.
+            if last_refresh.elapsed() >= Duration::from_millis(2500)
+                && self.op.is_none() && self.enroll.is_none() && self.input.is_none() && self.confirm.is_none()
+            {
+                self.refresh();
+                last_refresh = std::time::Instant::now();
+            }
             // Interactive flows that need a cooked terminal: tear down, run, re-enter.
             if let Some(s) = self.suspend.take() {
+                let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
                 ratatui::restore();
                 self.run_suspended(s);
                 *terminal = ratatui::init();
+                let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
                 terminal.clear()?;
                 self.refresh();
             }
@@ -519,9 +548,17 @@ impl App {
     }
 
     fn move_sel(&mut self, d: i32) {
-        let len = if self.screen == SC_REPAIR { self.repair.len() } else { self.rows().len() };
+        let len = match self.screen {
+            SC_REPAIR => self.repair.len(),
+            SC_CAMERAS => irlume_camera::list_pairs().len(),
+            _ => self.rows().len(),
+        };
         let n = len.max(1) as i32;
-        let cur = if self.screen == SC_REPAIR { &mut self.repair_sel } else { &mut self.sel };
+        let cur = match self.screen {
+            SC_REPAIR => &mut self.repair_sel,
+            SC_CAMERAS => &mut self.cam_sel,
+            _ => &mut self.sel,
+        };
         *cur = (((*cur as i32 + d) % n + n) % n) as usize;
     }
 
@@ -531,6 +568,20 @@ impl App {
             (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) => {
                 self.log('·', "refreshing status…");
                 self.refresh();
+            }
+            // Welcome quick-launch: jump to Profiles and start enrollment.
+            (SC_WELCOME, KeyCode::Char('e')) => { self.screen = SC_PROFILES; self.begin_enroll(); }
+            (SC_WELCOME, KeyCode::Char('i')) => { self.screen = SC_IDENTIFY; self.start_async("Identify (1:N)", OpTag::Identify, Request::Identify, map_identify); }
+            // Cameras: switch the active pair (persisted via the daemon).
+            (SC_CAMERAS, KeyCode::Enter) => {
+                let pairs = irlume_camera::list_pairs();
+                if let Some(p) = pairs.get(self.cam_sel) {
+                    let (rgb, ir) = (p.rgb.clone(), p.ir.clone());
+                    if self.request(Request::SetCameras { rgb: rgb.clone(), ir: ir.clone() }, "SetCameras").is_some() {
+                        self.log('✓', format!("active camera → {rgb} + {ir}"));
+                    }
+                    self.refresh();
+                }
             }
             // Repair: re-run checks, fix the selected issue, or run a live IR test.
             (SC_REPAIR, KeyCode::Char('r')) => { self.log('·', "re-running diagnostics…"); self.refresh(); }
@@ -544,13 +595,7 @@ impl App {
                 if let Some(Response::Ok(m)) = self.request(Request::SetupIrEmitter { dry_run: true }, "SetupIrEmitter(dry-run)") { self.log('✓', m); }
             }
             // Profiles.
-            (SC_PROFILES, KeyCode::Char('e')) => {
-                if self.profiles.len() >= MAX_PROFILES {
-                    self.log('✗', format!("at the max {MAX_PROFILES} profiles — delete one first"));
-                } else {
-                    self.input = Some(("New profile name (blank = default):".into(), String::new(), Pending::EnrollName));
-                }
-            }
+            (SC_PROFILES, KeyCode::Char('e')) => self.begin_enroll(),
             (SC_PROFILES, KeyCode::Char('a')) => { if let Some(p) = self.sel_profile() { self.start_enroll(Some(p)); } }
             (SC_PROFILES, KeyCode::Char('r')) => self.begin_rename(),
             (SC_PROFILES, KeyCode::Char('d')) => self.begin_delete(),
@@ -584,6 +629,15 @@ impl App {
                 self.refresh();
             }
             _ => {}
+        }
+    }
+
+    /// Start a new-profile enrollment (prompts for a name; blank = default).
+    fn begin_enroll(&mut self) {
+        if self.profiles.len() >= MAX_PROFILES {
+            self.log('✗', format!("at the max {MAX_PROFILES} profiles — delete one first"));
+        } else {
+            self.input = Some(("New profile name (blank = default):".into(), String::new(), Pending::EnrollName));
         }
     }
 
@@ -780,40 +834,60 @@ impl App {
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
-        let (rgb, ir) = irlume_camera::select_pair();
+        let [list_area, info_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).areas(area);
+        let (argb, air) = irlume_camera::select_pair(); // currently active pair
+        let pairs = irlume_camera::list_pairs();
+
+        // ---- selectable list of trusted (physical) Hello camera pairs ----
+        let items: Vec<ListItem> = if pairs.is_empty() {
+            vec![ListItem::new(Span::styled("no RGB+IR camera pair found", Style::new().fg(ERR)))]
+        } else {
+            pairs.iter().map(|p| {
+                let active = p.rgb == argb && p.ir == air;
+                let kind = if p.fixed { "built-in" } else { "external" };
+                let id = p.id.clone().unwrap_or_else(|| "?".into());
+                let priv_on = irlume_camera::privacy_engaged(&p.rgb) || irlume_camera::privacy_engaged(&p.ir);
+                ListItem::new(Line::from(vec![
+                    Span::styled(if active { " ● " } else { " ○ " }, Style::new().fg(if active { OK } else { Color::DarkGray })),
+                    Span::styled(format!("{:<16}", format!("{}+{}", p.rgb.trim_start_matches("/dev/"), p.ir.trim_start_matches("/dev/"))),
+                        if active { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() }),
+                    Span::styled(format!("{kind:<10}"), Style::new().fg(ACCENT)),
+                    Span::styled(format!("[{id}]"), Style::new().dim()),
+                    if priv_on { Span::styled("  ⚠ privacy ON", Style::new().fg(ERR)) } else { Span::raw("") },
+                ]))
+            }).collect()
+        };
+        let mut st = ListState::default().with_selected(Some(self.cam_sel.min(pairs.len().saturating_sub(1))));
+        let blk = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().dim())
+            .title(" cameras (● = active · ↑↓ select · enter = use) ");
+        let inner = blk.inner(list_area);
+        f.render_widget(blk, list_area);
+        f.render_stateful_widget(
+            List::new(items).highlight_style(Style::new().bg(Color::Rgb(0x20, 0x30, 0x40)).add_modifier(Modifier::BOLD)),
+            inner, &mut st);
+
+        // ---- info: active pair, selected pair nodes, emitter ----
         let mut lines = vec![
-            section("Active pair (auto-selected)"),
-            kv("  RGB", Span::styled(rgb.clone(), Style::new().fg(OK).add_modifier(Modifier::BOLD))),
-            kv("  IR ", Span::styled(ir.clone(), Style::new().fg(OK).add_modifier(Modifier::BOLD))),
-            Line::raw(""),
-            section("All video nodes"),
+            Line::from(vec![Span::styled("  active   ", Style::new().dim()),
+                Span::styled(format!("{argb} + {air}"), Style::new().fg(OK).add_modifier(Modifier::BOLD))]),
         ];
-        if self.nodes.is_empty() {
-            lines.push(Line::from(Span::styled("  no camera nodes found under /dev/video*", Style::new().fg(ERR))));
-        }
-        for (p, role) in &self.nodes {
-            let chosen = *p == rgb || *p == ir;
-            let mark = if chosen { Span::styled("  ▸ ", Style::new().fg(ACCENT)) } else { Span::raw("    ") };
-            let id = irlume_camera::device_identity(p).map(|s| format!("  [{s}]")).unwrap_or_default();
-            let priv_on = if irlume_camera::privacy_engaged(p) { Span::styled("  ⚠ privacy switch ON", Style::new().fg(ERR)) } else { Span::raw("") };
-            lines.push(Line::from(vec![
-                mark,
-                Span::styled(format!("{p:<12}"), if chosen { Style::new().add_modifier(Modifier::BOLD) } else { Style::new().dim() }),
-                Span::styled(format!("{role:<4?}"), Style::new().fg(ACCENT)),
-                Span::styled(id, Style::new().dim()),
-                priv_on,
-            ]));
+        if let Some(p) = pairs.get(self.cam_sel) {
+            if p.rgb != argb || p.ir != air {
+                lines.push(Line::from(vec![Span::styled("  selected ", Style::new().dim()),
+                    Span::styled(format!("{} + {}", p.rgb, p.ir), Style::new()),
+                    Span::styled("   [enter] to switch", Style::new().fg(ACCENT))]));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(section("IR emitter (850nm)"));
-        lines.push(Line::from(Span::styled("  If the IR feed is dark, irlume can probe the UVC extension-unit", Style::new().dim())));
-        lines.push(Line::from(Span::styled("  controls and auto-enable the illuminator (no phone-camera step).", Style::new().dim())));
-        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("  If the IR feed is dark irlume probes the UVC controls and enables", Style::new().dim())));
+        lines.push(Line::from(Span::styled("  the illuminator automatically (no phone-camera step).", Style::new().dim())));
         lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(ACCENT)), Span::raw(" auto-setup emitter    "),
-            Span::styled("[p]", Style::new().fg(ACCENT)), Span::raw(" probe XU controls (read-only)"),
+            Span::styled("  [s]", Style::new().fg(ACCENT)), Span::styled(" auto-setup emitter   ", Style::new().dim()),
+            Span::styled("[p]", Style::new().fg(ACCENT)), Span::styled(" probe XU controls", Style::new().dim()),
         ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        let iblk = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().dim());
+        f.render_widget(Paragraph::new(lines).block(iblk).wrap(Wrap { trim: true }), info_area);
     }
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {
@@ -918,7 +992,10 @@ impl App {
             Line::from(vec![Span::raw("  encrypted    "), onoff(rec.encrypted)]),
             Line::from(vec![Span::raw("  biopolicy    "), onoff(biopolicy_on())]),
             Line::raw(""),
-            Line::from(Span::styled("  New here? Step to Profiles and press [e] to enroll your face.", Style::new().dim())),
+            Line::from(vec![Span::styled("  [e]", Style::new().fg(ACCENT)), Span::styled(" enroll now   ", Style::new().dim()),
+                Span::styled("[i]", Style::new().fg(ACCENT)), Span::styled(" identify   ", Style::new().dim()),
+                Span::styled("Tab", Style::new().fg(ACCENT)), Span::styled(" walk the steps", Style::new().dim())]),
+            Line::from(Span::styled("  Live panel — changes to irlume appear here automatically.", Style::new().dim())),
         ];
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     }
@@ -1086,9 +1163,9 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let actions: &[(&str, &str)] = match self.screen {
-            SC_WELCOME => &[("r", "refresh")],
+            SC_WELCOME => &[("e", "enroll"), ("i", "identify"), ("r", "refresh")],
             SC_REPAIR => &[("f", "fix"), ("r", "re-check"), ("l", "IR test")],
-            SC_CAMERAS => &[("s", "setup emitter"), ("p", "probe")],
+            SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
             SC_PROFILES => &[("e", "enroll"), ("a", "add scan"), ("r", "rename"), ("d", "delete")],
             SC_IDENTIFY => &[("i", "identify")],
             SC_KEYRING => &[("a", "arm"), ("f", "forget")],
@@ -1133,11 +1210,6 @@ fn quality_bar(q: u8) -> String {
 /// A bold accent section header line.
 fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(title.to_string(), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
-}
-
-/// `label  value` line.
-fn kv(label: &str, value: Span<'static>) -> Line<'static> {
-    Line::from(vec![Span::styled(format!("{label}  "), Style::new()), value])
 }
 
 /// Green ● ON / dim ○ off badge.

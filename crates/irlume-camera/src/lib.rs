@@ -281,7 +281,49 @@ pub fn select_pair() -> (String, String) {
             return (r, i);
         }
     }
-    // Group discovered nodes by physical camera → (rgb nodes, ir nodes).
+    // A user-chosen pair persisted via the daemon (TUI Cameras tab) overrides
+    // auto-selection but not an explicit env override.
+    if let (Some(r), Some(i)) = (
+        irlume_common::config::read_kv("cameras.conf", "rgb"),
+        irlume_common::config::read_kv("cameras.conf", "ir"),
+    ) {
+        if !r.trim().is_empty() && !i.trim().is_empty() && device_exists(&r) && device_exists(&i) {
+            return (r, i);
+        }
+    }
+    let allow = pin_allowlist();
+    let (mut best, mut best_rank): (Option<(String, String)>, i32) = (None, -1);
+    for p in list_pairs() {
+        let rank = match (&allow, &p.id) {
+            (Some(a), Some(v)) if a.iter().any(|w| w == v) => 3,
+            _ if p.fixed => 2,
+            _ => 1,
+        };
+        if rank > best_rank {
+            best_rank = rank;
+            best = Some((p.rgb, p.ir));
+        }
+    }
+    best.unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
+}
+
+fn device_exists(dev: &str) -> bool {
+    std::path::Path::new(dev).exists()
+}
+
+/// A physical Hello camera exposing both an RGB and an IR node.
+pub struct CameraPair {
+    pub rgb: String,
+    pub ir: String,
+    /// `idVendor:idProduct`, if readable.
+    pub id: Option<String>,
+    /// Built-in (`removable=fixed`) vs an external USB camera.
+    pub fixed: bool,
+}
+
+/// Every physical camera that exposes both an RGB and an IR node (a Hello pair),
+/// sorted built-in first. Drives the TUI camera picker.
+pub fn list_pairs() -> Vec<CameraPair> {
     let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
         Default::default();
     for (path, role) in discover_nodes() {
@@ -294,27 +336,18 @@ pub fn select_pair() -> (String, String) {
             }
         }
     }
-    let allow = pin_allowlist();
-    let (mut best, mut best_rank): (Option<(String, String)>, i32) = (None, -1);
+    let mut out = Vec::new();
     for (id, (rgbs, irs)) in &groups {
         if rgbs.is_empty() || irs.is_empty() {
-            continue; // not a Hello camera (needs both spectra)
+            continue;
         }
-        let vidpid = read_vidpid(id);
         let fixed = std::fs::read_to_string(id.join("removable"))
             .map(|s| s.trim() == "fixed")
             .unwrap_or(false);
-        let rank = match (&allow, &vidpid) {
-            (Some(a), Some(v)) if a.iter().any(|w| w == v) => 3,
-            _ if fixed => 2,
-            _ => 1,
-        };
-        if rank > best_rank {
-            best_rank = rank;
-            best = Some((rgbs[0].clone(), irs[0].clone()));
-        }
+        out.push(CameraPair { rgb: rgbs[0].clone(), ir: irs[0].clone(), id: read_vidpid(id), fixed });
     }
-    best.unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
+    out.sort_by(|a, b| b.fixed.cmp(&a.fixed).then(a.rgb.cmp(&b.rgb)));
+    out
 }
 
 /// Number of frames the auth path median-denoises over (~150ms @30fps): enough

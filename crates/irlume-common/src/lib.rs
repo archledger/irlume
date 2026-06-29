@@ -91,6 +91,9 @@ pub enum Request {
     /// 1:N identify ("who is this?"): one live capture matched against every
     /// enrolled user, no claimed identity. Unprivileged (no credential release).
     Identify,
+    /// Switch the active RGB+IR camera pair, persisting it (cameras.conf) so it
+    /// survives a daemon restart. PRIVILEGED (root or self) — writes /etc/irlume.
+    SetCameras { rgb: String, ir: String },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
     /// List enrolled profiles + their scans for `user`.

@@ -46,6 +46,12 @@ pub struct Signals {
     /// Head-orientation pitch fraction (0.5 frontal; lower = chin down, higher =
     /// chin up). Defaults to 0.5 (frontal) when not computed.
     pub head_pitch_frac: f32,
+    /// Mean RGB-face luma (0–255) — RGB-only path: the face must be lit enough to
+    /// recognize. Unused on the IR path.
+    pub rgb_face_brightness: f32,
+    /// Fraction (0–1) of near-white pixels in the RGB face region — RGB-only
+    /// screen/glare deterrent cue. Unused on the IR path.
+    pub rgb_specular_frac: f32,
 }
 
 impl Default for Signals {
@@ -58,9 +64,19 @@ impl Default for Signals {
             ir_eye_glint: 0.0,
             head_yaw_asym: 0.0,    // frontal
             head_pitch_frac: 0.5,  // frontal
+            rgb_face_brightness: 0.0,
+            rgb_specular_frac: 0.0,
         }
     }
 }
+
+/// RGB-only convenience path: the face must be at least this bright to recognize.
+pub const RGB_FACE_MIN_BRIGHTNESS: f32 = 60.0;
+/// And not blown out (sunlight/overexposure makes recognition unreliable too).
+pub const RGB_FACE_MAX_BRIGHTNESS: f32 = 245.0;
+/// Above this near-white fraction in the face region, treat it as a screen/glare
+/// spoof (deterrent-grade — emissive displays & glossy prints blow out).
+pub const RGB_SPECULAR_MAX: f32 = 0.18;
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
 #[derive(Debug, Default, Clone)]
@@ -186,6 +202,37 @@ impl LivenessGate {
         cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
 
         (Verdict::Live, cues, "live: face in RGB+IR, co-located, frontal, IR-reflective, 3D".into())
+    }
+
+    /// RGB-only convenience gate (no IR hardware). DETERRENT-grade anti-spoof:
+    /// requires a present, frontal, well-lit face and rejects obvious screen/glare
+    /// (blown-out highlights). It CANNOT match IR's defeat of photo/screen replay,
+    /// which is exactly why this tier is limited to lock-screen unlock and never
+    /// releases credentials / logs in / elevates. The user must have light on
+    /// their face for the RGB camera to see them.
+    pub fn evaluate_rgb_only(&self, s: &Signals) -> (Verdict, Cues, String) {
+        let mut cues = Cues::default();
+        let Some(_rgb) = s.rgb_face.filter(|f| f.score >= MIN_FACE_SCORE) else {
+            return (Verdict::Uncertain, cues, "no face — present your face to the camera".into());
+        };
+        cues.face_in_rgb = true;
+        cues.frontal_ok = s.head_yaw_asym <= YAW_ASYM_MAX
+            && (PITCH_FRAC_MIN..=PITCH_FRAC_MAX).contains(&s.head_pitch_frac);
+        if !cues.frontal_ok {
+            return (Verdict::Uncertain, cues, "not facing the camera — look directly at it".into());
+        }
+        if s.rgb_face_brightness < RGB_FACE_MIN_BRIGHTNESS {
+            return (Verdict::Uncertain, cues,
+                "too dark — add light on your face (RGB-only mode needs a lit face)".into());
+        }
+        if s.rgb_face_brightness > RGB_FACE_MAX_BRIGHTNESS {
+            return (Verdict::Uncertain, cues, "overexposed — reduce the light/backlight".into());
+        }
+        if s.rgb_specular_frac > RGB_SPECULAR_MAX {
+            return (Verdict::Spoof, cues,
+                "screen/glare detected (blown-out highlights) — RGB-only anti-spoof".into());
+        }
+        (Verdict::Live, cues, "live (rgb convenience)".into())
     }
 
     /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no

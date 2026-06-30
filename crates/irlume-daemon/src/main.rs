@@ -156,10 +156,32 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Ok(r) => Response::Position(r),
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::Authenticate { user } => match engine.authenticate(&user) {
-            Ok(o) => Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason },
-            Err(e) => Response::Error(e.to_string()),
-        },
+        Request::Authenticate { user, service } => {
+            // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
+            // match may ONLY satisfy a screen unlock — never login, elevation, or
+            // a remote/unknown service (those keep the password). Always-on for
+            // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
+            if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
+                use irlume_core::biopolicy::{classify, OperationClass};
+                let class = classify(service.as_deref().unwrap_or(""), false);
+                if class != OperationClass::ScreenUnlock {
+                    eprintln!("irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password", service.as_deref().unwrap_or("?"));
+                    return Response::AuthResult { granted: false, score: 0.0, live: false,
+                        reason: format!("RGB-only convenience: face limited to screen unlock (not {class:?})") };
+                }
+            }
+            let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
+            match engine.authenticate(&user) {
+                Ok(o) => {
+                    if convenience {
+                        eprintln!("irlumed: convenience face auth '{user}': granted={} live={} score={:.3} ({})",
+                            o.granted, o.live, o.score, o.reason);
+                    }
+                    Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason }
+                }
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::Identify => match engine.identify() {
             Ok(o) => Response::Identified { user: o.user, profile: o.profile, score: o.score, live: o.live, reason: o.reason },
             Err(e) => Response::Error(e.to_string()),
@@ -249,6 +271,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // gets it, even with a matching face.
             if peer.uid != 0 {
                 return Response::Error(format!("unseal_password requires root (peer uid {})", peer.uid));
+            }
+            // Smart-Auto: an RGB-only (convenience) device NEVER releases the
+            // sealed credential — no cold-login / keyring unlock by RGB-only face.
+            if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
+                eprintln!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
+                return Response::Error("RGB-only convenience: face cannot release the login credential".into());
             }
             // Opt-in biopolicy: when enforcement is enabled, gate credential
             // release by the PAM service's operation class (e.g. refuse a remote

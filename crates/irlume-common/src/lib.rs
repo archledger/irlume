@@ -75,8 +75,15 @@ pub const STATE_DIR: &str = "/var/lib/irlume";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     /// Attempt to authenticate `user` from a live capture. The default,
-    /// unprivileged operation.
-    Authenticate { user: String },
+    /// unprivileged operation. `service` is the PAM service name (e.g. `sudo`,
+    /// `kde-fingerprint`) for tier×operation-class gating — on an RGB-only
+    /// (convenience) device only a screen-unlock service is honoured. `None`
+    /// from older callers (treated as unrestricted on IR hardware).
+    Authenticate {
+        user: String,
+        #[serde(default)]
+        service: Option<String>,
+    },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
     /// `reset` (default false) wipes the user's existing enrollment first — a

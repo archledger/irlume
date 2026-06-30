@@ -340,6 +340,24 @@ fn device_exists(dev: &str) -> bool {
     std::path::Path::new(dev).exists()
 }
 
+/// Hardware capability summary, for "smart Auto": what biometric face hardware
+/// is actually present. `IRLUME_FORCE_NO_IR=1` forces `ir_pair=false` (test the
+/// RGB-only convenience path on an IR box, or pin a box to convenience mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    /// A physical camera exposing BOTH an RGB and an IR node (full Hello cam).
+    pub ir_pair: bool,
+    /// Any usable RGB camera node exists.
+    pub rgb: bool,
+}
+
+pub fn capabilities() -> Caps {
+    let force_no_ir = std::env::var("IRLUME_FORCE_NO_IR").map(|v| v == "1").unwrap_or(false);
+    let ir_pair = !force_no_ir && !list_pairs().is_empty();
+    let rgb = ir_pair || discover_nodes().iter().any(|(_, r)| matches!(r, Role::Rgb));
+    Caps { ir_pair, rgb }
+}
+
 /// A physical Hello camera exposing both an RGB and an IR node.
 pub struct CameraPair {
     pub rgb: String,

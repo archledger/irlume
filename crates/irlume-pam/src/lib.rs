@@ -111,7 +111,7 @@ impl PamServiceModule for IrlumePam {
             let attempt = if unseal {
                 try_unseal(&pamh, &user)
             } else {
-                try_verify(&user)
+                try_verify(&pamh, &user)
             };
             if attempt == PamError::SUCCESS {
                 return PamError::SUCCESS;
@@ -181,9 +181,13 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
 }
 
 /// One verify attempt (sudo / in-session unlock): no password released.
-/// Returns `SUCCESS` on a live match, `IGNORE` on anything else.
-fn try_verify(user: &str) -> PamError {
-    match request(&Request::Authenticate { user: user.to_string() }) {
+/// Returns `SUCCESS` on a live match, `IGNORE` on anything else. Passes the PAM
+/// service so the daemon can apply tier×operation-class gating (an RGB-only
+/// convenience device honours only a screen-unlock service).
+fn try_verify(pamh: &Pam, user: &str) -> PamError {
+    let service = pamh.get_service().ok().flatten()
+        .map(|s| s.to_string_lossy().into_owned());
+    match request(&Request::Authenticate { user: user.to_string(), service }) {
         Ok(Response::AuthResult { granted: true, live: true, .. }) => PamError::SUCCESS,
         _ => PamError::IGNORE,
     }

@@ -668,6 +668,8 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             ir_eye_glint,
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
+            rgb_face_brightness: 0.0,
+            rgb_specular_frac: 0.0,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
         println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");

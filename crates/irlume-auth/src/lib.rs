@@ -25,7 +25,14 @@ pub struct Engine {
     gate: LivenessGate,
     rgb_dev: String,
     ir_dev: String,
+    /// Smart-Auto: true when a real RGB+IR Hello camera is present. False = an
+    /// RGB-only device → face runs in CONVENIENCE tier (lock-screen unlock only,
+    /// RGB-only liveness, never releases credentials / logs in / elevates).
+    ir_available: bool,
 }
+
+/// Assurance tier of this engine, derived from the available camera hardware.
+pub use irlume_core::biopolicy::Tier;
 
 /// What one capture+assessment produced.
 pub struct Assessment {
@@ -71,7 +78,19 @@ impl Engine {
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
+            ir_available: irlume_camera::capabilities().ir_pair,
         })
+    }
+
+    /// Assurance tier from the hardware: `Secure` with a real RGB+IR camera,
+    /// `Convenience` on an RGB-only device.
+    pub fn tier(&self) -> Tier {
+        if self.ir_available { Tier::Secure } else { Tier::Convenience }
+    }
+
+    /// Whether a real IR+RGB Hello camera is present (full face auth available).
+    pub fn ir_available(&self) -> bool {
+        self.ir_available
     }
 
     pub fn with_devices(mut self, rgb: &str, ir: &str) -> Self {
@@ -111,7 +130,50 @@ impl Engine {
     }
 
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
+    /// Capture + assess, choosing the path from the hardware: full cross-spectrum
+    /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
+        if self.ir_available { self.assess_full() } else { self.assess_rgb_only() }
+    }
+
+    /// RGB-only capture + algorithmic (no-IR) liveness — the convenience-tier
+    /// path for devices without an IR camera. Anti-spoof here is DETERRENT-grade
+    /// (well-lit + frontal + screen/glare heuristic), which is why this tier is
+    /// limited to lock-screen unlock and never releases credentials.
+    fn assess_rgb_only(&mut self) -> irlume_common::Result<Assessment> {
+        let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+        let rgb_view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let rgb_faces = self.det.detect(&rgb_view)?;
+        let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
+        let (rgb_brightness, rgb_specular) = rgb_top
+            .as_ref()
+            .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox))
+            .unwrap_or((0.0, 0.0));
+        let pose = rgb_top.as_ref().map(|f| irlume_vision::head_pose(&f.landmarks));
+        let signals = Signals {
+            rgb_face: rgb_top.as_ref().map(|f| irlume_liveness::FaceBox {
+                cx: (f.bbox[0] + f.bbox[2]) / 2.0 / rgb.width as f32,
+                cy: (f.bbox[1] + f.bbox[3]) / 2.0 / rgb.height as f32,
+                score: f.score,
+            }),
+            ir_face: None,
+            ir_face_brightness: 0.0,
+            ir_center_edge_ratio: 0.0,
+            ir_eye_glint: 0.0,
+            head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
+            head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
+            rgb_face_brightness: rgb_brightness,
+            rgb_specular_frac: rgb_specular,
+        };
+        let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
+        let embedding = match &rgb_top {
+            Some(f) => Some(self.emb.embed(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?),
+            None => None,
+        };
+        Ok(Assessment { verdict, reason, embedding, ir_embedding: None, signals, ir_depth: 0.0, ir_brightness: 0.0, eyes_open: false })
+    }
+
+    fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
         let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
@@ -143,6 +205,8 @@ impl Engine {
             ir_eye_glint: ir_top.as_ref().map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0),
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
+            rgb_face_brightness: 0.0, // IR path doesn't use the RGB-PAD cues
+            rgb_specular_frac: 0.0,
         };
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);
 
@@ -221,7 +285,8 @@ impl Engine {
             }
             // Per-user IR-liveness floor (anti-screen/photo, calibrated to this
             // user's enrolled IR): the live frame must clear the enrolled floor.
-            if let Some((depth_floor, bright_floor)) = enr.ir_calibration() {
+            // Only meaningful when IR was actually captured (skip on RGB-only).
+            if let Some((depth_floor, bright_floor)) = enr.ir_calibration().filter(|_| self.ir_available) {
                 if a.ir_depth < depth_floor || a.ir_brightness < bright_floor {
                     return Ok(Outcome {
                         granted: false, live: false, score: 0.0,
@@ -594,6 +659,30 @@ fn eye_open_at(grey: &[u8], w: u32, h: u32, (ex, ey): (f32, f32), r: i32) -> boo
         }
     }
     peak as f32 >= EYE_OPEN_PEAK_MIN
+}
+
+/// Mean luma (0–255) and the fraction of near-white ("hot") pixels inside `bbox`
+/// of an RGB image. The hot fraction is a basic RGB-PAD cue: emissive screens
+/// and glossy prints blow out highlights, so an unusually high fraction is a
+/// (deterrent-grade) screen/glare signal.
+fn rgb_luma_stats(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> (f32, f32) {
+    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
+    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x2 = (bbox[2].max(0.0) as u32).min(w);
+    let y2 = (bbox[3].max(0.0) as u32).min(h);
+    let (mut sum, mut n, mut hot) = (0u64, 0u64, 0u64);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            let i = ((y * w + x) * 3) as usize;
+            if i + 2 < rgb.len() {
+                let luma = (rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000;
+                sum += luma as u64;
+                if luma >= 250 { hot += 1; }
+                n += 1;
+            }
+        }
+    }
+    if n == 0 { (0.0, 0.0) } else { (sum as f32 / n as f32, hot as f32 / n as f32) }
 }
 
 fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {

@@ -44,6 +44,7 @@ fn main() -> std::process::ExitCode {
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("doctor"), _) => doctor(),
+        (Some("normprobe"), _) => normprobe(&args),
         (Some("status"), _) => commands::status(&args),
         (Some("detect"), _) => commands::detect(&args),
         (Some("identify"), _) => commands::identify(&args),
@@ -362,6 +363,9 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
         Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
     };
 
+    // Experiment knob: --tta = test-time augmentation (embed chip + its mirror,
+    // average, renormalize). Standard ArcFace inference trick; no retraining.
+    let tta = args.iter().any(|a| a == "--tta");
     // (person_index, embedding)
     let mut embs: Vec<(usize, [f32; irlume_vision::EMBED_DIM])> = Vec::new();
     let mut nodet = 0usize;
@@ -375,13 +379,22 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
             let Ok(faces) = det.detect(&view) else { continue };
             let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { nodet += 1; continue };
             if let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
-                if let Ok(e) = emb.embed(&chip) {
+                if tta {
+                    if let (Ok(a), Ok(b)) = (emb.embed(&chip), emb.embed(&irlume_vision::align::flip_h(&chip))) {
+                        let mut v = [0f32; irlume_vision::EMBED_DIM];
+                        let mut norm = 0f32;
+                        for k in 0..irlume_vision::EMBED_DIM { v[k] = a[k] + b[k]; norm += v[k] * v[k]; }
+                        let norm = norm.sqrt().max(1e-12);
+                        for k in 0..irlume_vision::EMBED_DIM { v[k] /= norm; }
+                        embs.push((pi, v));
+                    }
+                } else if let Ok(e) = emb.embed(&chip) {
                     embs.push((pi, e));
                 }
             }
         }
     }
-    println!("[irbench] embedded {} faces ({} images had no detectable face)", embs.len(), nodet);
+    println!("[irbench] embedded {} faces ({} images had no detectable face){}", embs.len(), nodet, if tta { " [TTA flip-avg]" } else { "" });
 
     // Optional: dump (person_index, 512-D embedding) per line for offline training.
     if let Some(out) = flag(args, "--export") {
@@ -558,6 +571,90 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
 }
 
 /// Recursively collect jpg/jpeg/png/bmp files under `dir`.
+/// Darken a 112x112x3 RGB chip (simulate low light): pixel *= factor.
+fn darken_chip(chip: &[u8], factor: f32) -> Vec<u8> {
+    chip.iter().map(|&p| (p as f32 * factor).round().clamp(0.0, 255.0) as u8).collect()
+}
+
+/// 3x3 box-blur a 112x112x3 RGB chip (simulate motion/focus blur).
+fn blur_chip(chip: &[u8]) -> Vec<u8> {
+    let n = 112i32;
+    let mut out = chip.to_vec();
+    for y in 0..n {
+        for x in 0..n {
+            for c in 0..3 {
+                let (mut sum, mut cnt) = (0u32, 0u32);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (yy, xx) = (y + dy, x + dx);
+                        if yy >= 0 && yy < n && xx >= 0 && xx < n {
+                            sum += chip[((yy * n + xx) * 3 + c) as usize] as u32;
+                            cnt += 1;
+                        }
+                    }
+                }
+                out[((y * n + x) * 3 + c) as usize] = (sum / cnt) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// `irlume normprobe --dir <imgs> --det <yunet> --model <glintr100> [--max N]`
+/// Experiment: validate the AdaFace/MagFace feature-norm-as-quality signal on
+/// AuraFace. For each face, embed the full chip and degraded (darkened, blurred)
+/// versions, comparing the PRE-normalization feature norm. If degraded < full
+/// consistently, the norm is a usable quality signal for irlume's fusion.
+fn normprobe(args: &[String]) -> std::process::ExitCode {
+    let dir = flag(args, "--dir").unwrap_or("");
+    let det_path = flag(args, "--det").unwrap_or("models/face_detection_yunet_2023mar.onnx");
+    let model = flag(args, "--model").unwrap_or("models/glintr100.onnx");
+    let max = flag(args, "--max").and_then(|s| s.parse::<usize>().ok()).unwrap_or(40);
+    if dir.is_empty() { eprintln!("usage: irlume normprobe --dir <imgs> [--det Y] [--model G] [--max N]"); return std::process::ExitCode::from(2); }
+    let mut det = match irlume_vision::Detector::load_from_file(det_path) {
+        Ok(d) => d, Err(e) => { eprintln!("det load: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+    let mut emb = match irlume_vision::Embedder::load_from_file(model) {
+        Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+    let mut files = Vec::new();
+    collect_images(std::path::Path::new(dir), &mut files);
+    files.truncate(max);
+    let (mut sf, mut sd, mut sb, mut n) = (0f64, 0f64, 0f64, 0u32);
+    let (mut dark_lower, mut blur_lower) = (0u32, 0u32);
+    for f in &files {
+        let Ok(img) = image::open(f) else { continue };
+        let rgb = img.to_rgb8();
+        let (w, h) = rgb.dimensions();
+        let data = rgb.into_raw();
+        let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
+        let Ok(faces) = det.detect(&view) else { continue };
+        let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
+        let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) else { continue };
+        let (Ok((_, nf)), Ok((_, nd)), Ok((_, nb))) = (
+            emb.embed_with_norm(&chip),
+            emb.embed_with_norm(&darken_chip(&chip, 0.35)),
+            emb.embed_with_norm(&blur_chip(&chip)),
+        ) else { continue };
+        sf += nf as f64; sd += nd as f64; sb += nb as f64; n += 1;
+        if nd < nf { dark_lower += 1; }
+        if nb < nf { blur_lower += 1; }
+    }
+    if n == 0 { eprintln!("[normprobe] no faces"); return std::process::ExitCode::FAILURE; }
+    let (nf, nd, nb) = (sf / n as f64, sd / n as f64, sb / n as f64);
+    println!("[normprobe] {n} faces — mean feature norm:");
+    println!("  full   {nf:.2}");
+    println!("  dark   {nd:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)", (nd - nf) / nf * 100.0, dark_lower, dark_lower as f32 / n as f32 * 100.0);
+    println!("  blur   {nb:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)", (nb - nf) / nf * 100.0, blur_lower, blur_lower as f32 / n as f32 * 100.0);
+    let verdict = if nd < nf * 0.97 && nb < nf * 0.97 && dark_lower as f32 / n as f32 > 0.8 {
+        "✓ feature norm TRACKS quality on AuraFace — usable as a quality signal"
+    } else {
+        "✗ weak/no correlation — feature norm NOT a reliable quality signal here"
+    };
+    println!("[normprobe] {verdict}");
+    std::process::ExitCode::SUCCESS
+}
+
 fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {

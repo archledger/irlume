@@ -143,6 +143,16 @@ mod onnx {
         /// collapse (the "identical images score 0.6" trap): channel order per
         /// [`align::INPUT_IS_RGB`], (px-127.5)/128.0, NCHW; output L2-normalized.
         pub fn embed(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
+            Ok(self.embed_with_norm(chip_rgb)?.0)
+        }
+
+        /// Embed AND return the PRE-normalization L2 norm of the raw feature — an
+        /// AdaFace/MagFace-style quality proxy (clearer faces tend to produce
+        /// larger feature norms; degraded/low-light faces smaller). The returned
+        /// embedding is still L2-normalized; the norm is the quality signal for
+        /// fusion weighting / low-quality gating. (AuraFace is ArcFace-trained, not
+        /// AdaFace, so the norm↔quality correlation must be validated empirically.)
+        pub fn embed_with_norm(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<(Embedding, f32)> {
             let data = align::preprocess_arcface(chip_rgb);
             let n = align::OUT_SIZE as i64;
             let tensor = Tensor::from_array(([1i64, 3, n, n], data)).map_err(err)?;
@@ -154,8 +164,9 @@ mod onnx {
             }
             let mut out = [0.0f32; EMBED_DIM];
             out.copy_from_slice(raw);
+            let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
             l2_normalize(&mut out);
-            Ok(out)
+            Ok((out, norm))
         }
     }
 

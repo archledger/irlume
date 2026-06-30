@@ -12,6 +12,7 @@
 
 pub mod align;
 pub mod detect;
+pub mod light;
 pub mod moire;
 
 /// 5 facial landmarks (left eye, right eye, nose, left mouth, right mouth),

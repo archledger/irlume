@@ -366,6 +366,11 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     // Experiment knob: --tta = test-time augmentation (embed chip + its mirror,
     // average, renormalize). Standard ArcFace inference trick; no retraining.
     let tta = args.iter().any(|a| a == "--tta");
+    // Low-light experiment knobs (applied to the aligned chip BEFORE embedding):
+    //   --darken F        simulate a dim capture (scale pixels by F<1)
+    //   --lightnorm MODE  illumination normalization: gamma|he|clahe (recover dim probe)
+    let darken: Option<f32> = flag(args, "--darken").and_then(|s| s.parse().ok());
+    let lightnorm: Option<String> = flag(args, "--lightnorm").map(|s| s.to_string());
     // (person_index, embedding)
     let mut embs: Vec<(usize, [f32; irlume_vision::EMBED_DIM])> = Vec::new();
     let mut nodet = 0usize;
@@ -378,7 +383,14 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
             let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
             let Ok(faces) = det.detect(&view) else { continue };
             let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { nodet += 1; continue };
-            if let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
+            if let Ok(mut chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
+                if let Some(f) = darken { irlume_vision::light::darken(&mut chip, f); }
+                match lightnorm.as_deref() {
+                    Some("gamma") => irlume_vision::light::gamma(&mut chip, 2.2),
+                    Some("he") => irlume_vision::light::equalize(&mut chip),
+                    Some("clahe") => irlume_vision::light::clahe(&mut chip, irlume_vision::align::OUT_SIZE as usize, 8, 3.0),
+                    _ => {}
+                }
                 if tta {
                     if let (Ok(a), Ok(b)) = (emb.embed(&chip), emb.embed(&irlume_vision::align::flip_h(&chip))) {
                         let mut v = [0f32; irlume_vision::EMBED_DIM];

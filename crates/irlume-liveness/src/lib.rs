@@ -52,6 +52,9 @@ pub struct Signals {
     /// Fraction (0–1) of near-white pixels in the RGB face region — RGB-only
     /// screen/glare deterrent cue. Unused on the IR path.
     pub rgb_specular_frac: f32,
+    /// High-frequency spectral peakiness of the RGB face region (2D-FFT moiré /
+    /// pixel-grid cue) — RGB-only screen-replay deterrent. Unused on the IR path.
+    pub rgb_moire_score: f32,
 }
 
 impl Default for Signals {
@@ -66,6 +69,7 @@ impl Default for Signals {
             head_pitch_frac: 0.5,  // frontal
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
+            rgb_moire_score: 0.0,
         }
     }
 }
@@ -77,6 +81,16 @@ pub const RGB_FACE_MAX_BRIGHTNESS: f32 = 245.0;
 /// Above this near-white fraction in the face region, treat it as a screen/glare
 /// spoof (deterrent-grade — emissive displays & glossy prints blow out).
 pub const RGB_SPECULAR_MAX: f32 = 0.18;
+/// Above this high-frequency spectral peakiness, treat the face region as a
+/// display (periodic pixel-grid / moiré). DETERRENT-grade and hardware-specific.
+/// Calibrated on the Shinetech RGB cam: a real lit face read ~9–13; a high-PPI
+/// phone held VERY CLOSE (the best case for moiré) read only ~15–38 — and moiré
+/// weakens with distance, so at arm's length a replay would overlap real faces
+/// entirely. 18 never false-rejects an observed real face (max 13) and catches
+/// close-range replays (~23–38); marginal/distant screens slip. This is NOT a
+/// robust PAD — the real mitigation for RGB-only is the convenience-tier policy
+/// (lock-screen unlock only, never credential release). Re-tune per camera.
+pub const RGB_MOIRE_MAX: f32 = 18.0;
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
 #[derive(Debug, Default, Clone)]
@@ -232,7 +246,13 @@ impl LivenessGate {
             return (Verdict::Spoof, cues,
                 "screen/glare detected (blown-out highlights) — RGB-only anti-spoof".into());
         }
-        (Verdict::Live, cues, "live (rgb convenience)".into())
+        if s.rgb_moire_score > RGB_MOIRE_MAX {
+            return (Verdict::Spoof, cues,
+                format!("screen pixel-grid/moiré pattern detected (peakiness {:.0}) — RGB-only anti-spoof", s.rgb_moire_score));
+        }
+        (Verdict::Live, cues,
+            format!("live (rgb convenience; bright {:.0} specular {:.2} moire {:.0})",
+                s.rgb_face_brightness, s.rgb_specular_frac, s.rgb_moire_score))
     }
 
     /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no

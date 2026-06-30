@@ -46,6 +46,7 @@ aes-gcm    = "0.10"     # AES-256-GCM for template-at-rest encryption
 argon2     = "0.5"      # Argon2id KDF for the recovery passphrase
 rand       = "0.8"      # CSPRNG for template keys, nonces, recovery salts
 libc       = "0.2"      # mlock/madvise (memlock), NSS getpwnam_r, SO_PEERCRED
+rustfft    = "6"        # 2D FFT for the RGB-only moiré/screen-replay PAD cue
 
 # ONNX inference. `load-dynamic` => libonnxruntime.so is dlopened at runtime, so
 # this builds without the native lib present (you supply it on the target).

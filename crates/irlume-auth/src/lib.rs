@@ -149,6 +149,12 @@ impl Engine {
             .as_ref()
             .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox))
             .unwrap_or((0.0, 0.0));
+        // 2D-FFT moiré / pixel-grid cue (screen-replay deterrent).
+        let rgb_moire = rgb_top
+            .as_ref()
+            .map(|f| irlume_vision::moire::moire_score(
+                &irlume_vision::moire::face_gray_n(&rgb.data, rgb.width, rgb.height, &f.bbox)))
+            .unwrap_or(0.0);
         let pose = rgb_top.as_ref().map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = Signals {
             rgb_face: rgb_top.as_ref().map(|f| irlume_liveness::FaceBox {
@@ -164,8 +170,13 @@ impl Engine {
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
+            rgb_moire_score: rgb_moire,
         };
         let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
+        if std::env::var("IRLUME_DEBUG_RGB").is_ok() {
+            eprintln!("irlumed: rgb-only cues: bright {:.0} specular {:.2} moire {:.0} -> {:?}",
+                signals.rgb_face_brightness, signals.rgb_specular_frac, signals.rgb_moire_score, verdict);
+        }
         let embedding = match &rgb_top {
             Some(f) => Some(self.emb.embed(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?),
             None => None,
@@ -206,6 +217,7 @@ impl Engine {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             rgb_face_brightness: 0.0, // IR path doesn't use the RGB-PAD cues
+            rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
         };
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);

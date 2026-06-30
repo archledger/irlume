@@ -194,6 +194,13 @@ struct App {
     daemon_up: bool,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
+    /// Hardware-adaptive: the subset of screen indices to show (Tab walks these).
+    /// e.g. a fingerprint-only desktop hides the camera/face screens entirely.
+    visible: Vec<usize>,
+    /// Detected face-hardware capabilities (drives `visible` + the recommendation).
+    caps: irlume_camera::Caps,
+    /// A fingerprint reader is present.
+    fp_present: bool,
     spin: usize,
     quit: bool,
 }
@@ -218,14 +225,41 @@ pub fn run() -> std::io::Result<()> {
 impl App {
     fn new() -> Self {
         let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "user".into());
+        // Hardware-adaptive screens: only show what the device can actually do, so
+        // a fingerprint-only box never offers face/camera setup steps.
+        let caps = irlume_camera::capabilities();
+        let fp_present = irlume_fingerprint::available();
+        let visible: Vec<usize> = (0..SCREENS.len()).filter(|&i| match i {
+            // Face/camera screens require a camera.
+            SC_CAMERAS | SC_PROFILES | SC_IDENTIFY | SC_RECOVERY => caps.rgb,
+            // Keyring unlock (face releases the login password) is Secure-only.
+            SC_KEYRING => caps.ir_pair,
+            // Fingerprint screen only if a reader exists.
+            SC_FINGERPRINT => fp_present,
+            // Welcome / Repair / Login-wiring / Settings / Done: always.
+            _ => true,
+        }).collect();
+        let screen = visible.first().copied().unwrap_or(0);
         Self {
-            user, screen: 0, sel: 0, profiles: Vec::new(), eyes_open: false, keyring_armed: None,
+            user, screen, sel: 0, profiles: Vec::new(), eyes_open: false, keyring_armed: None,
             nodes: irlume_camera::discover_nodes(),
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
             identify_result: None, selftest_result: None,
             repair: Vec::new(), repair_sel: 0, cam_sel: 0, error: None, daemon_up: false, act_scroll: 0,
+            visible, caps, fp_present,
             spin: 0, quit: false,
+        }
+    }
+
+    /// Capability-aware recommended unlock method (item: "suggest the best one").
+    fn recommended(&self) -> &'static str {
+        match (self.caps.ir_pair, self.caps.rgb, self.fp_present) {
+            (true, _, _) => "Face (IR) — secure: login, sudo, lock screen, dark mode",
+            (false, true, true) => "Fingerprint (secure) — or Face (RGB) for lock-screen only",
+            (false, true, false) => "Face (RGB) — convenience: lock-screen unlock only",
+            (false, false, true) => "Fingerprint",
+            (false, false, false) => "Password only — no supported biometric hardware",
         }
     }
 
@@ -578,8 +612,8 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Tab | KeyCode::Right => self.goto((self.screen + 1) % SCREENS.len()),
-            KeyCode::BackTab | KeyCode::Left => self.goto((self.screen + SCREENS.len() - 1) % SCREENS.len()),
+            KeyCode::Tab | KeyCode::Right => self.step(1),
+            KeyCode::BackTab | KeyCode::Left => self.step(-1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             // Activity panel history scroll (auto-follows newest when at bottom).
@@ -595,12 +629,17 @@ impl App {
         self.activity.len().saturating_sub(ACT_H)
     }
 
-    /// Switch tabs. Repair/Fingerprint pull their heavier probes immediately so
-    /// the tab is fresh on open (the slow timer only refreshes them every ~10s).
-    fn goto(&mut self, new: usize) {
-        self.screen = new;
+    /// Step `d` tabs through the VISIBLE (hardware-applicable) screens, wrapping.
+    /// Repair/Fingerprint pull their heavier probes immediately so the tab is
+    /// fresh on open (the slow timer only refreshes them every ~10s).
+    fn step(&mut self, d: i32) {
+        if self.visible.is_empty() { return; }
+        let n = self.visible.len() as i32;
+        let pos = self.visible.iter().position(|&s| s == self.screen).unwrap_or(0) as i32;
+        let new_pos = (((pos + d) % n + n) % n) as usize;
+        self.screen = self.visible[new_pos];
         self.sel = 0;
-        if new == SC_REPAIR || new == SC_FINGERPRINT {
+        if self.screen == SC_REPAIR || self.screen == SC_FINGERPRINT {
             self.refresh();
         }
     }
@@ -856,7 +895,9 @@ impl App {
         let left = Line::from(vec![
             Span::styled(" irlume ", Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(format!("step {}/{}: ", self.screen + 1, SCREENS.len()), Style::new().dim()),
+            Span::styled(
+                format!("step {}/{}: ", self.visible.iter().position(|&s| s == self.screen).map_or(1, |p| p + 1), self.visible.len()),
+                Style::new().dim()),
             Span::styled(SCREENS[self.screen], Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         ]);
         let right = Line::from(Span::styled(format!("{} ", self.user), Style::new().dim())).right_aligned();
@@ -1116,6 +1157,10 @@ impl App {
             Line::from(vec![Span::raw("  keyring      "), onoff(self.keyring_armed.unwrap_or(false))]),
             Line::from(vec![Span::raw("  encrypted    "), onoff(rec.encrypted)]),
             Line::from(vec![Span::raw("  biopolicy    "), onoff(biopolicy_on())]),
+            Line::raw(""),
+            Line::from(vec![Span::styled("  Recommended  ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::styled(self.recommended(), Style::new().fg(OK))]),
+            Line::from(Span::styled("  (you can change the method any time — Fingerprint/Settings tabs)", Style::new().dim())),
             Line::raw(""),
             Line::from(vec![Span::styled("  [e]", Style::new().fg(ACCENT)), Span::styled(" enroll now   ", Style::new().dim()),
                 Span::styled("[i]", Style::new().fg(ACCENT)), Span::styled(" identify   ", Style::new().dim()),

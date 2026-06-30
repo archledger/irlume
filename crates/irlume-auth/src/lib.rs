@@ -312,8 +312,32 @@ impl Engine {
             let scans = enr.rgb_scans();
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = best(&probe, &scans);
-            let granted = score >= thr;
-            return Ok(Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (rgb)") } else { "below threshold".into() } });
+            if score >= thr {
+                return Ok(Outcome { granted: true, live: true, score, reason: format!("match: {who} (rgb)") });
+            }
+            // Dim-light cross-spectral fallback (lighting-adaptive fusion, stage 1):
+            // RGB was too weak to recognize (poor ambient light), but the IR-emitter
+            // -lit face may still match. Liveness already passed (full cross-spectrum
+            // gate + per-user IR floor above), so try IR recognition — at a STRICTER
+            // threshold (+IR_FALLBACK_MARGIN) to offset the extra false-accept risk of
+            // a second modality. This is the bright→RGB / dark→IR / dim→fuse story.
+            if let Some(ir_probe) = &a.ir_embedding {
+                let ir_scans = enr.ir_scans();
+                if !ir_scans.is_empty() {
+                    let ir_base = if self.ir_adapter.is_some() {
+                        irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+                    } else {
+                        irlume_core::IR_MATCH_THRESHOLD
+                    };
+                    let ir_thr = irlume_core::scaled_threshold(ir_base, ir_scans.len()) + irlume_core::IR_FALLBACK_MARGIN;
+                    let (ir_score, ir_who) = best(ir_probe, &ir_scans);
+                    if ir_score >= ir_thr {
+                        return Ok(Outcome { granted: true, live: true, score: ir_score,
+                            reason: format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})") });
+                    }
+                }
+            }
+            return Ok(Outcome { granted: false, live: true, score, reason: format!("below threshold (rgb {score:.2}, ir-fallback miss)") });
         }
 
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR

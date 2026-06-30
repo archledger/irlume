@@ -53,6 +53,14 @@ pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 /// (CBSR/Oulu → our-IR domain gap; re-enroll required when the adapter changes).
 pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.40;
 
+/// Extra margin added to the IR threshold when IR is used as a DIM-LIGHT FALLBACK
+/// after the RGB match already missed (Secure tier). The fallback grants a second
+/// chance via the IR-emitter-lit face when ambient light is too low for RGB
+/// recognition — but a second modality adds false-accept risk, so demand a
+/// clearer IR match than the pure-dark path. Cross-spectral adaptive-fusion knob;
+/// re-tune against live genuine IR-fallback margins.
+pub const IR_FALLBACK_MARGIN: f32 = 0.05;
+
 /// Threshold scaling per doubling of the template count. Matching takes the
 /// MAX cosine over a profile's N templates, which inflates the false-accept rate
 /// roughly linearly in N (union bound: P(any of N exceeds) ≈ N·p). Windows Hello

@@ -173,8 +173,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             match engine.authenticate(&user) {
                 Ok(o) => {
-                    if convenience {
-                        eprintln!("irlumed: convenience face auth '{user}': granted={} live={} score={:.3} ({})",
+                    if convenience || std::env::var("IRLUME_DEBUG").is_ok() {
+                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={:.3} ({})",
                             o.granted, o.live, o.score, o.reason);
                     }
                     Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason }

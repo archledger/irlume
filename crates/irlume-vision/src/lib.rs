@@ -146,6 +146,22 @@ mod onnx {
             Ok(self.embed_with_norm(chip_rgb)?.0)
         }
 
+        /// Test-time augmentation: embed the chip + its horizontal mirror, average,
+        /// renormalize. Benchmarked on LFW to cut RGB false-rejects (~27% relative
+        /// at thr 0.50; FRR@0.55 13.6%→9.5%) with FAR unchanged (≤1e-4). RGB PATH
+        /// ONLY — on NIR it over-smooths the low-texture embedding (no EER gain,
+        /// slightly worse at low FAR), so the IR path keeps plain `embed`.
+        pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
+            let a = self.embed(chip_rgb)?;
+            let b = self.embed(&crate::align::flip_h(chip_rgb))?;
+            let mut out = [0.0f32; EMBED_DIM];
+            for k in 0..EMBED_DIM {
+                out[k] = a[k] + b[k];
+            }
+            l2_normalize(&mut out);
+            Ok(out)
+        }
+
         /// Embed AND return the PRE-normalization L2 norm of the raw feature — an
         /// AdaFace/MagFace-style quality proxy (clearer faces tend to produce
         /// larger feature norms; degraded/low-light faces smaller). The returned

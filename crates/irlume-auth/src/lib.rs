@@ -178,7 +178,7 @@ impl Engine {
                 signals.rgb_face_brightness, signals.rgb_specular_frac, signals.rgb_moire_score, verdict);
         }
         let embedding = match &rgb_top {
-            Some(f) => Some(self.emb.embed(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?),
+            Some(f) => Some(self.emb.embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?),
             None => None,
         };
         Ok(Assessment { verdict, reason, embedding, ir_embedding: None, signals, ir_depth: 0.0, ir_brightness: 0.0, eyes_open: false })
@@ -225,7 +225,7 @@ impl Engine {
         let embedding = match &rgb_top {
             Some(f) => {
                 let chip = align::align_to_arcface(&rgb_view, &f.landmarks)?;
-                Some(self.emb.embed(&chip)?)
+                Some(self.emb.embed_tta(&chip)?) // TTA flip-average (RGB only; cuts FRR)
             }
             None => None,
         };

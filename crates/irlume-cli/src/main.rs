@@ -34,6 +34,7 @@ fn main() -> std::process::ExitCode {
         (Some("eval"), _) => eval(&args),
         (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
+        (Some("calcapture"), _) => calcapture(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("enroll"), _) => enroll(&args),
         (Some("profiles"), sub) => profiles(sub, &args),
@@ -858,6 +859,148 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// `irlume calcapture --user U --det <yunet> --model <glintr100> [--adapter <ir>]
+///   [--rgb /dev/video0] [--ir /dev/video2] [--n 40] [--tag bright] --out cal.jsonl`
+///
+/// REAL-ASUS calibration/validation capture: direct camera access (run with the
+/// daemon stopped to avoid EBUSY). Grabs N live RGB+IR samples of the enrolled
+/// user and, per sample, records the genuine cosine vs the user's own templates
+/// (RGB TTA-512 space; IR in the deployed v1-adapter space) plus face brightness
+/// and the RAW 512-D RGB and IR embeddings. The dump feeds two offline jobs:
+///   #3 Platt recalibration — real genuine RGB/IR cosine+brightness distribution
+///      (the academic-fit consts in fusion.rs are a prior; this is ground truth);
+///   #4 adapter-v3 validation — raw IR embeddings re-scored through v1 vs the
+///      banked residZero+ASnorm adapter, with academic impostors, before deploy.
+/// Capture across lighting with `--tag bright` now and `--tag dim` at sunset.
+fn calcapture(args: &[String]) -> std::process::ExitCode {
+    let user = user_arg(args);
+    let (Some(det_path), Some(model), Some(out)) =
+        (flag(args, "--det"), flag(args, "--model"), flag(args, "--out"))
+    else {
+        eprintln!("usage: irlume calcapture --user U --det <yunet.onnx> --model <glintr100.onnx> --out <cal.jsonl> [--adapter <ir.onnx>] [--rgb /dev/video0] [--ir /dev/video2] [--n 40] [--tag bright]");
+        return std::process::ExitCode::from(2);
+    };
+    let rgb_dev = flag(args, "--rgb").unwrap_or("/dev/video0");
+    let ir_dev = flag(args, "--ir").unwrap_or("/dev/video2");
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(40);
+    let tag = flag(args, "--tag").unwrap_or("untagged").to_string();
+
+    // mean luma (RGB, BT.601) / mean grey (IR) inside a detector bbox, clamped.
+    let mean_bbox = |data: &[u8], w: u32, h: u32, ch: usize, bbox: &[f32; 4]| -> f32 {
+        let (x1, y1) = (bbox[0].max(0.0) as u32, bbox[1].max(0.0) as u32);
+        let (x2, y2) = ((bbox[2] as u32).min(w), (bbox[3] as u32).min(h));
+        if x2 <= x1 || y2 <= y1 { return 0.0; }
+        let (mut sum, mut cnt) = (0.0f64, 0u64);
+        for y in y1..y2 {
+            for x in x1..x2 {
+                let i = ((y * w + x) as usize) * ch;
+                let v = if ch == 3 {
+                    0.299 * data[i] as f32 + 0.587 * data[i + 1] as f32 + 0.114 * data[i + 2] as f32
+                } else { data[i] as f32 };
+                sum += v as f64; cnt += 1;
+            }
+        }
+        if cnt == 0 { 0.0 } else { (sum / cnt as f64) as f32 }
+    };
+
+    let run = || -> irlume_common::Result<usize> {
+        // Enrolled templates are encrypted at rest (TPM-sealed key, root-only), so a
+        // user-space run can't decrypt them. That's fine: we always dump the raw
+        // embeddings and derive genuine cosines pairwise among the captures offline.
+        // When templates ARE available (run as root, daemon stopped) we additionally
+        // record the true probe-vs-enrolled cosine.
+        let enr = match irlume_core::storage::load(&user) {
+            Ok(Some(e)) => Some(e),
+            Ok(None) => { eprintln!("[calcapture] note: '{user}' not enrolled — cosines from pairwise only"); None }
+            Err(e) => { eprintln!("[calcapture] note: templates unavailable ({e}) — cosines from pairwise only"); None }
+        };
+        let rgb_scans = enr.as_ref().map(|e| e.rgb_scans()).unwrap_or_default();
+        let ir_scans = enr.as_ref().map(|e| e.ir_scans()).unwrap_or_default();
+        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
+        let mut emb = irlume_vision::Embedder::load_from_file(model)?;
+        let mut adapter = match flag(args, "--adapter") {
+            Some(p) => Some(irlume_vision::Adapter::load_from_file(p)?),
+            None => None,
+        };
+        let best = |probe: &[f32], scans: &[(&str, &str, &[f32])]| -> f32 {
+            scans.iter().map(|(_, _, t)| irlume_vision::align::cosine(probe, t))
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let mut f = std::fs::File::create(out).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+        use std::io::Write;
+        println!("[calcapture] user={user} tag={tag} n={n} -> {out}");
+        println!("[calcapture] rgb_templates={} ir_templates={} adapter={}",
+            rgb_scans.len(), ir_scans.len(), if adapter.is_some() { "yes" } else { "no" });
+        println!("[calcapture] sit naturally in frame; vary pose slightly between samples.");
+        let mut written = 0usize;
+        for idx in 0..n {
+            // RGB (median-denoised, matches the auth path) + IR (brightest-of-burst).
+            let rgbf = irlume_camera::capture_rgb_denoised(rgb_dev)?;
+            let rv = irlume_vision::align::RgbView { data: &rgbf.data, width: rgbf.width, height: rgbf.height };
+            let rgb_top = det.detect(&rv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+
+            let irf = irlume_camera::capture_ir(ir_dev)?;
+            let ir_rgb = irlume_camera::grey_to_rgb(&irf.data);
+            let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: irf.width, height: irf.height };
+            let ir_top = det.detect(&iv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+
+            let mut rec = serde_json::Map::new();
+            rec.insert("idx".into(), idx.into());
+            rec.insert("tag".into(), tag.clone().into());
+
+            let (mut rgb_cos, mut rgb_bri) = (f32::NAN, 0.0f32);
+            if let Some(t) = &rgb_top {
+                let chip = irlume_vision::align::align_to_arcface(&rv, &t.landmarks)?;
+                let e = emb.embed_tta(&chip)?; // RGB path = TTA flip-average
+                rgb_bri = mean_bbox(&rgbf.data, rgbf.width, rgbf.height, 3, &t.bbox);
+                if !rgb_scans.is_empty() { rgb_cos = best(&e, &rgb_scans); }
+                rec.insert("rgb_face_score".into(), json_f32(t.score));
+                rec.insert("rgb_cos".into(), json_f32(rgb_cos));
+                rec.insert("rgb_brightness".into(), json_f32(rgb_bri));
+                rec.insert("rgb_emb".into(), serde_json::to_value(e.to_vec()).unwrap());
+            }
+            rec.insert("rgb_present".into(), rgb_top.is_some().into());
+
+            let (mut ir_cos, mut ir_bri) = (f32::NAN, 0.0f32);
+            if let Some(t) = &ir_top {
+                let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
+                let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
+                ir_bri = mean_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox);
+                if let Some(a) = adapter.as_mut() {
+                    let adapted = a.apply(&raw)?;
+                    if !ir_scans.is_empty() { ir_cos = best(&adapted, &ir_scans); }
+                }
+                rec.insert("ir_face_score".into(), json_f32(t.score));
+                rec.insert("ir_cos_v1".into(), json_f32(ir_cos));
+                rec.insert("ir_brightness".into(), json_f32(ir_bri));
+                rec.insert("ir_emb_raw".into(), serde_json::to_value(raw.to_vec()).unwrap());
+            }
+            rec.insert("ir_present".into(), ir_top.is_some().into());
+
+            writeln!(f, "{}", serde_json::Value::Object(rec)).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            written += 1;
+            println!("  [{:>2}/{n}] rgb {} cos {:>6} bri {:>5.1} | ir {} cos {:>6} bri {:>5.1}",
+                idx + 1,
+                if rgb_top.is_some() { "✓" } else { "·" }, fmt_cos(rgb_cos), rgb_bri,
+                if ir_top.is_some() { "✓" } else { "·" }, fmt_cos(ir_cos), ir_bri);
+        }
+        Ok(written)
+    };
+    match run() {
+        Ok(w) => { println!("[calcapture] wrote {w} samples to {out}"); std::process::ExitCode::SUCCESS }
+        Err(e) => { eprintln!("calcapture error: {e}"); std::process::ExitCode::FAILURE }
+    }
+}
+
+/// JSON number from an f32, mapping non-finite to JSON null (so `NaN` for an
+/// absent cosine round-trips cleanly instead of breaking the encoder).
+fn json_f32(x: f32) -> serde_json::Value {
+    serde_json::Number::from_f64(x as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+}
+fn fmt_cos(x: f32) -> String {
+    if x.is_finite() { format!("{x:.3}") } else { "  -  ".into() }
 }
 
 /// Embed every detected face in an image and report the pairwise-cosine

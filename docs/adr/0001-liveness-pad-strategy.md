@@ -61,3 +61,30 @@ spoofs are documented, accepted gaps for a future release.
   in `THREAT_MODEL.md`), **or**
 - the deployment moves to a higher-assurance posture requiring iBeta L2, at which
   point biometric-as-sole-factor should be reconsidered.
+
+## Validation update (2026-06-30) — residual risk demonstrated
+
+The ISO/IEC 30107-3 self-test ([`../PAD_SELFTEST.md`](../PAD_SELFTEST.md)) was run
+against this gate (results:
+[`../pad-results/2026-06-30-ir-liveness-selftest.md`](../pad-results/2026-06-30-ir-liveness-selftest.md)).
+Phone/laptop screen replays and a **matte paper** print were all rejected 0% APCER
+(caught at `face_in_ir`). A **life-size glossy vinyl print** (a graduation banner)
+**breached the gate at 98.6% APCER** (69/70 accepted as live).
+
+Two consequences for this ADR:
+
+1. **The residual risk is now demonstrated, not theoretical** — and the instrument
+   is a cheap large-format **glossy print**, not an exotic 3D mask. Vinyl reflects
+   850 nm (defeating `face_in_ir`), and on a **2D-IR camera** the brightness-ratio
+   "depth" cue is mimicked by a large flat surface's illumination falloff (banner
+   depth ranged 1.02–1.58, *overlapping and exceeding* the genuine 1.37–1.40 range —
+   so **no depth threshold separates them**; threshold tuning is not a fix).
+2. **The reasoning's premise that "the IR depth gradient subsumes 2D attacks" is
+   falsified** for IR-reflective large-format prints.
+
+**Direction (for a follow-up ADR):** the robust mitigation is **challenge-response /
+temporal liveness** — a static print cannot blink or turn on command, so lightweight
+motion/blink verification defeats this class without rPPG. The `require-eyes-open` +
+IR-glint eyes scaffolding is the starting point. Reason (1) of this ADR (the rPPG
+latency paradox) still stands; reason (2) does not, so temporal liveness should be
+reconsidered — not for heart-rate rPPG, but for **static-artifact motion challenge**.

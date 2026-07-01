@@ -80,6 +80,16 @@ The decision to stay single-frame (no rPPG / no licensed PAD CNN) and the accept
 3D-mask / active-IR-spoof residual risk are recorded in
 [`adr/0001-liveness-pad-strategy.md`](adr/0001-liveness-pad-strategy.md).
 
+**CONFIRMED BREACH (2026-06-30):** the self-test found that a **life-size glossy
+vinyl print** (graduation banner) defeats the gate at **98.6% APCER** — vinyl
+reflects 850 nm (defeating `face_in_ir`) and a large flat print mimics the
+brightness-ratio depth cue (banner depth 1.02–1.58 *overlaps and exceeds* genuine
+1.37–1.40, so no threshold separates them). Screen replays and matte-paper prints
+were still fully rejected. This is a demonstrated instance of the accepted
+IR-approximating-spoof residual risk, and the robust mitigation is
+**challenge-response / temporal liveness** (a static print cannot blink or move).
+Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/2026-06-30-ir-liveness-selftest.md).
+
 ## Storage
 
 Seal a random release secret (or the login password) in the **TPM**, gated by

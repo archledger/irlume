@@ -115,6 +115,9 @@ pub enum Request {
     RenameScan { user: String, profile: String, scan: String, new_name: String },
     /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
+    /// Toggle the per-user "require blink challenge to unlock" gate (temporal
+    /// liveness vs static prints, ADR-0002). PRIVILEGED.
+    SetRequireChallenge { user: String, on: bool },
     /// Auto-configure the IR emitter (integrated linux-enable-ir-emitter): find
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
@@ -233,8 +236,8 @@ pub enum Response {
     /// face matched (check `live` to tell "no match" from "not a live face").
     Identified { user: Option<String>, profile: Option<String>, score: f32, live: bool, reason: String },
     /// Structured enrollment listing: profiles (each with its scan names) plus
-    /// the per-user require-eyes-open setting.
-    Enrollment { profiles: Vec<ProfileSummary>, require_eyes_open: bool },
+    /// the per-user require-eyes-open and require-challenge settings.
+    Enrollment { profiles: Vec<ProfileSummary>, require_eyes_open: bool, require_challenge: bool },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
     SelfTest { passed: bool, detail: String },

@@ -39,6 +39,7 @@ fn main() -> std::process::ExitCode {
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("liveness"), _) => liveness_probe(&args),
+        (Some("blinkprobe"), _) => blinkprobe(&args),
         (Some("enroll"), _) => enroll(&args),
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
@@ -118,14 +119,22 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             if on == off { eprintln!("usage: irlume profiles eyes-open <on|off> [--user U]"); return std::process::ExitCode::from(2); }
             Request::SetRequireEyesOpen { user, on }
         }
+        Some("challenge") => {
+            let on = args.iter().any(|a| a == "on");
+            let off = args.iter().any(|a| a == "off");
+            if on == off { eprintln!("usage: irlume profiles challenge <on|off> [--user U]"); return std::process::ExitCode::from(2); }
+            Request::SetRequireChallenge { user, on }
+        }
         _ => return usage_profiles(),
     };
     match daemon_request(&req) {
-        Ok(Response::Enrollment { profiles, require_eyes_open }) => {
+        Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) => {
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
             } else {
-                println!("[profiles] require-eyes-open: {}", if require_eyes_open { "ON" } else { "off" });
+                println!("[profiles] require-eyes-open: {}  ·  require-challenge (blink): {}",
+                    if require_eyes_open { "ON" } else { "off" },
+                    if require_challenge { "ON" } else { "off" });
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
                     for s in &p.scans { println!("      - {s}"); }
@@ -796,6 +805,64 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("liveness probe error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `irlume blinkprobe --det <yunet.onnx> [--ir /dev/video2] [--n 30] [--burst 1]`
+/// Diagnostic for the ADR-0002 blink challenge: capture a short IR sequence, plot
+/// the per-frame corneal-glint trace, and report the `detect_blink` verdict. Use it
+/// to SEE genuine-blink vs static-print glint traces and tune the detector before
+/// wiring the challenge into auth. Blink deliberately ~1s into the capture.
+fn blinkprobe(args: &[String]) -> std::process::ExitCode {
+    let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
+    let Some(det_path) = flag(args, "--det") else {
+        eprintln!("usage: irlume blinkprobe --det <yunet.onnx> [--ir /dev/video2] [--n 30] [--burst 1]");
+        return std::process::ExitCode::from(2);
+    };
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let run = || -> irlume_common::Result<()> {
+        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
+        println!("[blinkprobe] capturing {n} IR samples (burst {burst}) — BLINK once during capture…");
+        let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
+        // Per-frame eye specular-contrast (the challenge metric) at the detected
+        // IR-face eyes; skip frames with no face (a missed detection must not
+        // masquerade as an eyes-closed dip).
+        let mut contrasts: Vec<f32> = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let rgb = irlume_camera::grey_to_rgb(&f.data);
+            let view = irlume_vision::align::RgbView { data: &rgb, width: f.width, height: f.height };
+            let top = det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+            match top {
+                Some(t) => {
+                    let c = irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                    contrasts.push(c);
+                    let bar = "█".repeat((c / 128.0 * 32.0).min(32.0) as usize);
+                    println!("  [{i:>2}] contrast {c:>3.0} |{bar}");
+                }
+                None => println!("  [{i:>2}] (no face — skipped)"),
+            }
+        }
+        let peak = contrasts.iter().copied().fold(0.0f32, f32::max);
+        let low = contrasts.iter().copied().fold(255.0f32, f32::min);
+        let verdict = irlume_liveness::detect_blink(&contrasts);
+        println!(
+            "[blinkprobe] samples={} contrast peak={peak:.0} low={low:.0}  open-floor {:.0}  close≤{:.0} reopen≥{:.0} run≥{}  => {:?}",
+            contrasts.len(),
+            irlume_liveness::BLINK_MIN_OPEN_CONTRAST,
+            irlume_liveness::BLINK_CLOSE_RATIO * peak,
+            irlume_liveness::BLINK_REOPEN_RATIO * peak,
+            irlume_liveness::BLINK_MIN_CLOSED_RUN,
+            verdict,
+        );
+        Ok(())
+    };
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("blinkprobe error: {e}");
             std::process::ExitCode::FAILURE
         }
     }

@@ -167,6 +167,7 @@ struct App {
     sel: usize,
     profiles: Vec<ProfileSummary>,
     eyes_open: bool,
+    challenge: bool,
     keyring_armed: Option<bool>,
     nodes: Vec<(String, irlume_camera::Role)>,
     activity: Vec<(char, String)>,
@@ -241,7 +242,7 @@ impl App {
         }).collect();
         let screen = visible.first().copied().unwrap_or(0);
         Self {
-            user, screen, sel: 0, profiles: Vec::new(), eyes_open: false, keyring_armed: None,
+            user, screen, sel: 0, profiles: Vec::new(), eyes_open: false, challenge: false, keyring_armed: None,
             nodes: irlume_camera::discover_nodes(),
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
@@ -298,11 +299,12 @@ impl App {
     /// live without periodic UI hitches. SILENT (no Activity spam).
     fn refresh_light(&mut self) {
         self.daemon_up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
-        if let Ok(Response::Enrollment { profiles, require_eyes_open }) =
+        if let Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) =
             crate::daemon_request(&Request::ListProfiles { user: self.user.clone() })
         {
             self.profiles = profiles;
             self.eyes_open = require_eyes_open;
+            self.challenge = require_challenge;
         }
         self.keyring_armed = match crate::daemon_request(&Request::HasSealedPassword { user: self.user.clone() }) {
             Ok(Response::HasPassword(b)) => Some(b),
@@ -1297,6 +1299,7 @@ impl App {
             Line::from(vec![Span::raw("  auth method       "), Span::styled(self.fp.method.clone(), Style::new().fg(ACCENT))]),
             Line::from(vec![Span::raw("  enrollment        "), count_badge(self.profiles.len(), scans)]),
             Line::from(vec![Span::raw("  eyes-open gate    "), onoff(self.eyes_open)]),
+            Line::from(vec![Span::raw("  blink challenge   "), onoff(self.challenge)]),
             Line::from(vec![Span::raw("  keyring unlock    "), onoff(self.keyring_armed.unwrap_or(false))]),
             Line::from(vec![Span::raw("  templates enc     "), onoff(rec.encrypted)]),
             Line::from(vec![Span::raw("  recovery pass     "), onoff(rec.recovery_set)]),

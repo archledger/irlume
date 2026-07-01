@@ -402,8 +402,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         scans: p.scans.iter().map(|s| s.name.clone()).collect(),
                     }).collect(),
                     require_eyes_open: enr.require_eyes_open,
+                    require_challenge: enr.require_challenge,
                 },
-                Ok(None) => Response::Enrollment { profiles: vec![], require_eyes_open: false },
+                Ok(None) => Response::Enrollment { profiles: vec![], require_eyes_open: false, require_challenge: false },
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -464,6 +465,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             mutate_enrollment(&user, |enr| {
                 enr.require_eyes_open = on;
                 Ok(format!("require-eyes-open {}", if on { "ENABLED" } else { "disabled" }))
+            })
+        }
+        Request::SetRequireChallenge { user, on } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                enr.require_challenge = on;
+                Ok(format!("require-challenge {}", if on { "ENABLED" } else { "disabled" }))
             })
         }
         Request::SelfTest { kind } => {

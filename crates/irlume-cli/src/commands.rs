@@ -31,10 +31,12 @@ pub fn status(args: &[String]) -> ExitCode {
 
     // Enrollment.
     match daemon_request(&Request::ListProfiles { user: user.clone() }) {
-        Ok(Response::Enrollment { profiles, require_eyes_open }) if !profiles.is_empty() => {
+        Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
-            println!("  enrollment    : {} profile(s), {scans} scan(s) {OK}{}",
-                profiles.len(), if require_eyes_open { " · eyes-open required" } else { "" });
+            println!("  enrollment    : {} profile(s), {scans} scan(s) {OK}{}{}",
+                profiles.len(),
+                if require_eyes_open { " · eyes-open required" } else { "" },
+                if require_challenge { " · blink-challenge required" } else { "" });
             for p in &profiles {
                 println!("                  - {} ({} scan(s))", p.name, p.scans.len());
             }
@@ -424,7 +426,7 @@ SYSTEM INTEGRATION
   ir-setup [--dry-run]            auto-configure the IR emitter
 
 CAMERA / DEV
-  capture | liveness | tui        capture/liveness probes; the terminal UI
+  capture | liveness | blinkprobe | tui   capture/liveness/blink probes; the UI
   irbench | genuine | eval | selftest align   benchmarks & self-tests
   padcapture --species N --kind attack|bonafide --out LOG   ISO 30107-3 PAD capture
   padreport --in LOG [--md OUT]   PAD self-test report (APCER/BPCER; docs/PAD_SELFTEST.md)

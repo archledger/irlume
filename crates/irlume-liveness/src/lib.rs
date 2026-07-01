@@ -279,6 +279,89 @@ impl LivenessGate {
     }
 }
 
+// --- Blink challenge (opt-in temporal liveness, ADR-0002) -------------------
+//
+// Defeats the demonstrated static IR-reflective print attack (a life-size glossy
+// vinyl banner passed the single-frame gate at 98.6% APCER, 2026-06-30): a static
+// print cannot blink. Given a sequence of per-frame eye SPECULAR-CONTRAST samples
+// (`irlume_auth::eye_glint_contrast`, in capture order), we look for an eyes
+// open→closed→open transition with a SUSTAINED closure.
+//
+// Why specular contrast, not raw glint: live-validated 2026-06-30, a closed lid
+// still reflects 850nm, so peak glint barely drops on a blink and is lost in noise;
+// but the corneal specular SPIKE (peak-above-surround) collapses on closure. A
+// static/printed eye is diffuse — its contrast is low (banner ≈70) and never
+// reaches a real open eye's (≈120), and being static it can never produce the
+// transition. Two independent guards therefore reject a print: it fails the
+// absolute open-eye floor, AND it can't sustain a closed dip. Requiring the closure
+// to persist for several consecutive samples rejects single-frame noise.
+
+/// A sample is "closed" when its contrast falls to/below this fraction of the peak.
+pub const BLINK_CLOSE_RATIO: f32 = 0.70;
+/// A sample is "open" when its contrast is at/above this fraction of the peak.
+pub const BLINK_REOPEN_RATIO: f32 = 0.82;
+/// Peak eye contrast must reach at least this to trust a real corneal specular was
+/// seen — a static/printed eye stays diffuse and low (banner ≈70) and fails here.
+/// Set below the genuine open-eye level (≈120) with margin. Tune from real traces.
+pub const BLINK_MIN_OPEN_CONTRAST: f32 = 90.0;
+/// The closure must persist for at least this many consecutive samples (a
+/// deliberate held blink), so single-sample noise dips don't count. At the ~15 fps
+/// IR rate (de-strobed ≈133 ms/sample) this is ≈0.4 s.
+pub const BLINK_MIN_CLOSED_RUN: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlinkResult {
+    /// A sustained eyes open→closed→open transition was observed (live).
+    Blinked,
+    /// A confident open eye was seen but no sustained blink (a static artefact — or
+    /// the user didn't blink in the window; caller re-prompts / falls back).
+    NoBlink,
+    /// No confident open eye anywhere in the window (a diffuse/printed eye, or a
+    /// poor capture): peak contrast never reached the open-eye floor.
+    NoEyes,
+}
+
+/// Detect a sustained blink (eyes open→closed→open) in a per-frame eye-contrast
+/// sequence. See the module comment for the rationale and why it defeats static
+/// prints (absolute open-eye floor + a closure a static image cannot produce).
+pub fn detect_blink(contrasts: &[f32]) -> BlinkResult {
+    let peak = contrasts.iter().copied().fold(0.0f32, f32::max);
+    if peak < BLINK_MIN_OPEN_CONTRAST {
+        return BlinkResult::NoEyes;
+    }
+    let open_th = BLINK_REOPEN_RATIO * peak;
+    let close_th = BLINK_CLOSE_RATIO * peak;
+    // 0 = need first open · 1 = counting a consecutive closed run · 2 = need reopen.
+    let mut phase = 0u8;
+    let mut run = 0usize;
+    for &c in contrasts {
+        match phase {
+            0 => {
+                if c >= open_th {
+                    phase = 1;
+                }
+            }
+            1 => {
+                if c <= close_th {
+                    run += 1;
+                    if run >= BLINK_MIN_CLOSED_RUN {
+                        phase = 2;
+                    }
+                } else {
+                    run = 0; // any non-closed sample breaks the consecutive run
+                }
+            }
+            2 => {
+                if c >= open_th {
+                    return BlinkResult::Blinked;
+                }
+            }
+            _ => {}
+        }
+    }
+    BlinkResult::NoBlink
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +426,43 @@ mod tests {
     fn no_subject_is_uncertain() {
         let s = Signals::default();
         assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Uncertain);
+    }
+
+    #[test]
+    fn genuine_held_blink_is_detected() {
+        // Contrast scale (real trace): open ≈120 → sustained closed ≈75 (≥3
+        // samples) → reopen ≈110.
+        let seq = [120.0, 124.0, 75.0, 73.0, 74.0, 76.0, 110.0, 112.0];
+        assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
+    }
+
+    #[test]
+    fn static_banner_reads_no_eyes() {
+        // A static/printed eye is diffuse: contrast flat and low (real banner
+        // trace ≈55–70), never reaching the open-eye floor.
+        assert_eq!(detect_blink(&[63.0, 63.0, 61.0, 57.0, 64.0, 70.0, 58.0]), BlinkResult::NoEyes);
+    }
+
+    #[test]
+    fn steady_open_eye_is_not_a_blink() {
+        // A real open eye held steady (no closure) — high contrast, no dip.
+        assert_eq!(detect_blink(&[120.0, 124.0, 122.0, 121.0, 123.0]), BlinkResult::NoBlink);
+    }
+
+    #[test]
+    fn single_sample_dip_is_noise_not_a_blink() {
+        // One isolated low sample (< the sustained run) must not count as a blink.
+        assert_eq!(detect_blink(&[120.0, 124.0, 70.0, 122.0, 124.0]), BlinkResult::NoBlink);
+    }
+
+    #[test]
+    fn close_without_reopen_is_not_a_blink() {
+        // Sustained closure but the window ends before the eyes reopen.
+        assert_eq!(detect_blink(&[120.0, 124.0, 75.0, 73.0, 74.0, 76.0]), BlinkResult::NoBlink);
+    }
+
+    #[test]
+    fn empty_reads_no_eyes() {
+        assert_eq!(detect_blink(&[]), BlinkResult::NoEyes);
     }
 }

@@ -545,6 +545,56 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     Ok(Frame { width: w, height: h, spectrum: Spectrum::Ir, data: grey })
 }
 
+/// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for
+/// temporal liveness (the blink challenge). Unlike [`capture_ir`], the eyes-closed
+/// dip of a blink must survive, so this returns every sample rather than only the
+/// brightest. Each of `samples` frames is the brightest of a `burst`-frame
+/// mini-burst — `burst=1` yields raw frames (to reveal whether the emitter
+/// strobes); `burst>=2` de-strobes locally while keeping enough temporal
+/// resolution for a blink (the IR node is ~15 fps, so a mini-burst of 2 ≈ 133 ms).
+pub fn capture_ir_sequence(device: &str, samples: usize, burst: usize) -> irlume_common::Result<Vec<Frame>> {
+    verify_pinned(device)?;
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
+    }
+    let burst = burst.max(1);
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
+    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
+    if &fmt.fourcc.repr != b"GREY" {
+        return Err(Error::Hardware(format!(
+            "{device}: driver gave {:?}, expected GREY",
+            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("????")
+        )));
+    }
+    let (w, h) = (fmt.width, fmt.height);
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| map_io(device, e))?;
+    let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
+    ir_emitter::enable(dev.handle().fd(), &card);
+    let mut frames = Vec::with_capacity(samples);
+    for s in 0..samples {
+        // Keep the emitter lit across the whole window (some controls self-clear).
+        if s % 8 == 0 {
+            ir_emitter::enable(dev.handle().fd(), &card);
+        }
+        let mut best: Option<Vec<u8>> = None;
+        let mut best_mean = -1.0f64;
+        for _ in 0..burst {
+            let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            let mean = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
+            if mean > best_mean {
+                best_mean = mean;
+                best = Some(buf.to_vec());
+            }
+        }
+        if let Some(data) = best {
+            frames.push(Frame { width: w, height: h, spectrum: Spectrum::Ir, data });
+        }
+    }
+    Ok(frames)
+}
+
 /// Auto-configure the IR emitter for `device` — irlume's integrated
 /// linux-enable-ir-emitter: enumerate the camera's UVC extension-unit controls,
 /// try candidate payloads, and keep the one that makes the IR image bright

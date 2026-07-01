@@ -252,6 +252,55 @@ impl Engine {
         Ok(Assessment { verdict, reason, embedding, ir_embedding, signals, ir_depth, ir_brightness, eyes_open })
     }
 
+    /// Blink challenge (opt-in temporal liveness, ADR-0002): capture a short IR
+    /// sequence and require an eyes open→closed→open transition — a static print
+    /// can't blink. Uses de-strobed samples + per-frame eye specular-contrast; only
+    /// meaningful with the IR emitter. Live-validated 2026-06-30: a genuine held
+    /// blink → Blinked; a static vinyl banner, even hand-modulated → NoEyes.
+    fn run_blink_challenge(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
+        const SAMPLES: usize = 30; // ~4s window (de-strobed, ~15fps / burst 2)
+        const BURST: usize = 2; // de-strobe the pulsing emitter
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, SAMPLES, BURST)?;
+        // Per-frame eye specular-contrast; skip frames with no detected face (a
+        // missed detection must not masquerade as an eyes-closed dip).
+        let mut contrasts = Vec::with_capacity(frames.len());
+        for f in &frames {
+            let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
+            let view = align::RgbView { data: &grey_rgb, width: f.width, height: f.height };
+            if let Some(t) = self.det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+                contrasts.push(eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks));
+            }
+        }
+        Ok(irlume_liveness::detect_blink(&contrasts))
+    }
+
+    /// If the user opted into the blink challenge and we're about to grant, require
+    /// a blink before releasing anything. Failure downgrades to a non-grant with an
+    /// Uncertain-style reason (PAM cascades to the password fallback — never a
+    /// lockout). No-op unless the outcome is a grant, the flag is on, and IR is
+    /// available (the glint challenge needs the emitter).
+    fn challenge_if_required(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        outcome: Outcome,
+    ) -> irlume_common::Result<Outcome> {
+        if !outcome.granted || !enr.require_challenge || !self.ir_available {
+            return Ok(outcome);
+        }
+        use irlume_liveness::BlinkResult;
+        Ok(match self.run_blink_challenge()? {
+            BlinkResult::Blinked => outcome,
+            BlinkResult::NoBlink => Outcome {
+                granted: false, live: true, score: outcome.score,
+                reason: "blink challenge: no blink seen — blink to confirm (require-challenge is on)".into(),
+            },
+            BlinkResult::NoEyes => Outcome {
+                granted: false, live: false, score: outcome.score,
+                reason: "blink challenge: no live eyes (looks like a print) — require-challenge is on".into(),
+            },
+        })
+    }
+
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
     /// then 1:N cosine match against every scan in every enrolled face profile
     /// (any enrolled face unlocks). Threshold scales with the total scan count.
@@ -318,7 +367,7 @@ impl Engine {
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = best(&probe, &scans);
             if score >= thr {
-                return Ok(Outcome { granted: true, live: true, score, reason: format!("match: {who} (rgb)") });
+                return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score, reason: format!("match: {who} (rgb)") });
             }
             // Stage-2 lighting-adaptive fusion: RGB recognition missed (poor ambient
             // light or a marginal angle). If we also captured an IR face and the user
@@ -340,7 +389,7 @@ impl Engine {
                     );
                     if f.grant {
                         let who = if ir_score >= score { ir_who } else { who };
-                        return Ok(Outcome { granted: true, live: true, score: f.prob,
+                        return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: f.prob,
                             reason: format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob) });
                     }
                     // (b) pure IR fallback — still valid when IR alone is clearly strong
@@ -353,7 +402,7 @@ impl Engine {
                     };
                     let ir_thr = irlume_core::scaled_threshold(ir_base, ir_scans.len()) + irlume_core::IR_FALLBACK_MARGIN;
                     if ir_score >= ir_thr {
-                        return Ok(Outcome { granted: true, live: true, score: ir_score,
+                        return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: ir_score,
                             reason: format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})") });
                     }
                 }
@@ -380,7 +429,7 @@ impl Engine {
             let ir_thr = irlume_core::scaled_threshold(ir_base, scans.len());
             let (score, who) = best(&probe, &scans);
             let granted = score >= ir_thr;
-            return Ok(Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (ir/dark)") } else { "below threshold (ir)".into() } });
+            return self.challenge_if_required(&enr, Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (ir/dark)") } else { "below threshold (ir)".into() } });
         }
 
         Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("no face: {}", a.reason) })
@@ -794,6 +843,35 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     peak as f32
 }
 
+/// Specular contrast at the eyes = peak − local-mean brightness, max over both
+/// eyes. A live OPEN eye makes a sharp corneal specular spike (high contrast); a
+/// CLOSED lid — or a printed/vinyl "eye" — is diffuse (low). This is the basis of
+/// the ADR-0002 blink challenge and has far better SNR than raw peak glint: a
+/// closed lid still reflects 850nm, so peak alone barely drops, but the specular
+/// spike (hence contrast) collapses. Live-validated 2026-06-30: genuine open-eye
+/// contrast ≈120, a static vinyl banner ≈70 (flat).
+pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
+    let iod = ((landmarks[1].0 - landmarks[0].0).powi(2) + (landmarks[1].1 - landmarks[0].1).powi(2)).sqrt();
+    let r = (iod * 0.20).max(2.0) as i32;
+    let at = |(ex, ey): (f32, f32)| -> f32 {
+        let (cx, cy) = (ex as i32, ey as i32);
+        let (mut peak, mut sum, mut cnt) = (0u8, 0u64, 0u64);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (cx + dx, cy + dy);
+                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                    let v = grey[(y as u32 * w + x as u32) as usize];
+                    peak = peak.max(v);
+                    sum += v as u64;
+                    cnt += 1;
+                }
+            }
+        }
+        if cnt == 0 { 0.0 } else { peak as f32 - sum as f32 / cnt as f32 }
+    };
+    at(landmarks[0]).max(at(landmarks[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +888,7 @@ mod tests {
         let enr = Enrollment {
             user: "u".into(),
             require_eyes_open: false,
+            require_challenge: false,
             camera_binding: None,
             profiles: vec![
                 FaceProfile { name: "Face Profile 1".into(), scans: vec![scan(face1.clone())] },

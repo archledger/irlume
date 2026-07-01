@@ -1,8 +1,9 @@
 # ADR-0002: Challenge-response temporal liveness for IR-reflective print attacks
 
-**Status:** Proposed (design) — revises the reasoning of
-[ADR-0001](0001-liveness-pad-strategy.md), does not supersede its rPPG rejection
-**Date:** 2026-06-30
+**Status:** Accepted — implemented & live-validated 2026-07-01 (opt-in). Revises the
+reasoning of [ADR-0001](0001-liveness-pad-strategy.md); does not supersede its rPPG
+rejection.
+**Date:** 2026-06-30 (implemented 2026-07-01)
 
 ## Context
 
@@ -101,6 +102,48 @@ The primary mechanism reuses signals irlume already computes:
   roadmap.
 - **The trained-PAD track stays blocked** (no clean weights). Challenge-response +
   IR physics is the "better-than-Hello" bar without a trained model.
+
+## Implementation & validation (2026-07-01)
+
+Built and live-validated on the Zenbook S14. Two findings changed the design during
+bring-up (both via a new `irlume blinkprobe` diagnostic that plots the per-frame
+signal):
+
+1. **Metric: specular *contrast*, not raw glint peak.** Raw eye-glint barely drops
+   on a blink — a closed lid still reflects 850 nm, so peak stays ~140–190 and the
+   blink is lost in noise. **Specular contrast** (peak − local-mean at the eye)
+   collapses on closure (a real cornea makes a sharp spike; a lid/print is diffuse)
+   and separates cleanly. Implemented as `irlume_auth::eye_glint_contrast`; the
+   detector (`irlume_liveness::detect_blink`) requires an open-eye contrast floor
+   **and** a *sustained* closure (≥3 consecutive closed samples) to reject noise.
+2. **De-strobing.** The IR emitter strobes (~15 fps node), so raw frames alternate
+   lit/dark. `irlume_camera::capture_ir_sequence(device, samples, burst=2)` keeps
+   the brightest of each mini-burst → a clean per-sample trace.
+
+**Live results** (contrast peak; challenge verdict):
+
+| presentation | contrast peak | verdict |
+|---|---|---|
+| genuine held blink | ~129 | **Blinked** (accept) |
+| static vinyl banner | ~46 | **NoEyes** (reject) |
+| live face, no blink | ~143 | **NoBlink** (re-prompt) |
+| banner + hand cover/uncover (adversarial) | ~45 | **NoEyes** (reject) |
+
+**End-to-end** through `authenticate` with `require_challenge` on: a genuine held
+blink **granted** (recognition 0.861 + Blinked); the banner — *recognized* as the
+user (0.650) so it would otherwise grant — was **denied** by the challenge
+("no live eyes (looks like a print)"). The 98.6%-APCER banner breach is closed.
+
+Shipped **opt-in** (`irlume profiles challenge on|off`, per-user `require_challenge`
+in storage; daemon `SetRequireChallenge`). The open-eye contrast floor (banner ≤46
+vs genuine ≥120) is itself a strong guard: a diffuse print can't reach it, so hand
+cover/uncover can't fake a blink. Residual: gluing specular dots on a print's eyes
+to fake the corneal spike + coordinated cover — defeated by deferred randomized
+prompts.
+
+**Known follow-up:** no greeter/lock-screen "blink to confirm" prompt is wired yet,
+so the challenge relies on the user knowing to blink during the ~4 s window — hence
+opt-in only for now. A UI prompt is the prerequisite for considering default-on.
 
 ## Revisit / follow-ups
 

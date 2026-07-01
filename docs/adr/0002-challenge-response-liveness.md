@@ -145,6 +145,43 @@ prompts.
 so the challenge relies on the user knowing to blink during the ~4 s window — hence
 opt-in only for now. A UI prompt is the prerequisite for considering default-on.
 
+## UX finding & revised direction (2026-07-01)
+
+Live greeter/sudo testing exposed a UX problem that makes the *prompted deliberate
+blink* unsuitable as a default gate, and redirects the work:
+
+- **A deliberate, timed blink is poor ergonomics.** People blink naturally every
+  few seconds; a natural blink (~150 ms) is too fast for the 15 fps IR sensor to
+  catch, so the gate requires an *unnatural held blink*. Worse, the flow is two
+  captures — match (scan 1) then challenge (scan 2) — and the user must keep eyes
+  open on scan 1 (blinking there weakens the match so it never reaches the
+  challenge) and blink only on scan 2. Without a precisely-timed "blink now" cue
+  that is impossible to guess.
+- **The prompt can't be delivered well.** A single `PAM_TEXT_INFO` before the
+  blocking daemon call is mistimed (it fires before scan 2) and did **not surface in
+  sudo** at all; correct timing needs a two-phase daemon protocol, and the KDE
+  greeter may not surface a parallel biometric's PAM messages regardless.
+
+**Key realization for the better path:** the discriminator is not the blink *motion*
+but the **corneal specular contrast** itself. Live eye contrast measured 120–129; the
+vinyl banner measured 46–70 even at specular angles and when hand-modulated — a
+diffuse print physically cannot make a real cornea's sharp specular. So the durable
+answer is **passive**, no user action:
+
+- **Chosen direction: MediaPipe FaceMesh (Apache-2.0, clean) for eye-aspect-ratio
+  (EAR).** Dense eye-contour landmarks give an unambiguous EAR that collapses to ~0
+  on closure (unlike the noisy brightness metric), so a **natural** blink can be
+  detected **passively** over the ~2 s the user is already in front of the camera —
+  no prompt, no timing, no deliberate action. This is the real "better than Hello"
+  liveness, deferred to its own session (source/verify the ONNX model, run it on IR,
+  compute EAR, and validate FRR across glasses/angles/dark + banner FAR across
+  specular angles — the same rigor as the PAD self-test).
+
+**Disposition:** the prompted blink challenge stays **opt-in and OFF by default**
+(committed, works for anyone who accepts the deliberate-blink UX). The `PAM_TEXT_INFO`
+prompt hint was reverted (dead end; the passive path needs no prompt). Default-on
+liveness waits on the passive EAR work above.
+
 ## Revisit / follow-ups
 
 - Implement the blink-via-glint-transition stage behind `require-challenge`;

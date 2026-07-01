@@ -48,6 +48,43 @@ being static it never dips at all.
 4. **Ships opt-in / OFF** (`require_challenge` flag, `irlume profiles challenge on`);
    default-on waits on the broader-condition validation above.
 
+## GLASSES — a real limitation found (2026-07-01)
+
+Ran the genuine FRR test again **with glasses on** (10 presentations, same gate):
+
+| condition | Live | non-response | hard-reject (BPCER) |
+|---|---:|---:|---:|
+| no glasses | 9/10 | 10% | 0 |
+| **glasses** | **2/10** | **80%** | 0 |
+
+**Safe but not usable.** Every glasses miss was `Uncertain` → password fallback — no
+false accept, no hard reject; security is intact. But an 80% non-response rate makes
+the gate unusable for glasses-wearers as shipped.
+
+**Root cause — the separation collapses.** Glasses lower the open-EAR baseline and
+make blink dips shallower *relative* to it: glasses blinks reached only **0.70–0.85×**
+the median, which **overlaps the banner's jitter range (0.75–0.90×)**. So no single
+relative-dip ratio passes glasses-genuine *and* rejects the banner — loosening 0.72→
+0.78 to catch glasses blinks would also admit the banner's 0.75× jitter (a breach).
+The single-metric relative-dip detector is insufficient with glasses.
+
+**Options (none a quick tweak; a future session):**
+1. **Temporal shape** — detect a blink as a fast V (drop-then-recover *velocity*), not
+   just depth. A real blink is a sharp transient; glasses/banner jitter is not. May
+   recover the separation where a static depth threshold can't.
+2. **Two-cue OR** — pass on (EAR blink) OR (corneal-specular contrast floor), so a
+   glasses-wearer whose blink is shallow still passes on the specular cue while the
+   diffuse banner fails both. Needs testing whether glasses pass the contrast floor
+   and the banner still fails it.
+3. **Refined eye/iris landmarks** — the `face_landmark_with_attention` model has
+   better eye/iris points but doesn't ONNX-convert (custom op); would need a different
+   conversion route.
+4. **Accept with a caveat** — ship opt-in, documented "works best without glasses";
+   glasses-wearers fall to password (safe, poor UX for a large population).
+
+Until one of these is validated, passive liveness stays **opt-in/OFF** and is NOT
+suitable for default-on where glasses-wearers are common.
+
 ## Reproduce
 
 ```sh

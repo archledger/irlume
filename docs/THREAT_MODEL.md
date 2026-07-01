@@ -73,8 +73,9 @@ Physically-grounded cues, hard gate (any failure rejects):
 
 **Honest caveat:** a pure hand-crafted gate is unproven at certification-grade
 error rates (the best published NIR-PAD used a trained CNN). Treat the gate as a
-research milestone: self-test against ISO/IEC 30107-3 attack classes; if cues
-can't reach iBeta Level 2, train a model on **own IR-rig** data (license-clean).
+research milestone: self-test against ISO/IEC 30107-3 attack classes (methodology
++ `irlume padcapture`/`padreport` tooling in [`PAD_SELFTEST.md`](PAD_SELFTEST.md));
+if cues can't reach iBeta Level 2, train a model on **own IR-rig** data (license-clean).
 The decision to stay single-frame (no rPPG / no licensed PAD CNN) and the accepted
 3D-mask / active-IR-spoof residual risk are recorded in
 [`adr/0001-liveness-pad-strategy.md`](adr/0001-liveness-pad-strategy.md).

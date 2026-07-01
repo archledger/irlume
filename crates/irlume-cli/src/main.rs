@@ -18,6 +18,7 @@
 
 mod commands;
 mod fingerprint;
+mod pad;
 mod pamwire;
 mod recovery;
 mod tui;
@@ -35,6 +36,8 @@ fn main() -> std::process::ExitCode {
         (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
         (Some("calcapture"), _) => calcapture(&args),
+        (Some("padcapture"), _) => pad::padcapture(&args),
+        (Some("padreport"), _) => pad::padreport(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("enroll"), _) => enroll(&args),
         (Some("profiles"), sub) => profiles(sub, &args),

@@ -26,7 +26,9 @@ you certify the DCO. That's it — no forms, no rights assignment.
   layers (code, weights, training data). No InsightFace buffalo_l/antelopev2 or
   other non-commercial weights — they conflict with GPL.
 - **Liveness/PAD changes** should come with a self-test against the relevant
-  ISO/IEC 30107-3 attack class.
+  ISO/IEC 30107-3 attack class — run `irlume padcapture` / `irlume padreport` and
+  include the per-species APCER/BPCER numbers. See
+  [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR.
 
 ## Where to start

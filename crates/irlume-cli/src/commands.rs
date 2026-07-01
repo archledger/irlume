@@ -426,6 +426,8 @@ SYSTEM INTEGRATION
 CAMERA / DEV
   capture | liveness | tui        capture/liveness probes; the terminal UI
   irbench | genuine | eval | selftest align   benchmarks & self-tests
+  padcapture --species N --kind attack|bonafide --out LOG   ISO 30107-3 PAD capture
+  padreport --in LOG [--md OUT]   PAD self-test report (APCER/BPCER; docs/PAD_SELFTEST.md)
 ");
     ExitCode::SUCCESS
 }

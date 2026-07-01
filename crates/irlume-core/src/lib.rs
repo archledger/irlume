@@ -16,6 +16,7 @@ pub mod envelope;
 pub mod fusion;
 pub mod keyring;
 pub mod matcher;
+pub mod pad;
 pub mod pcrsig;
 pub mod policy;
 pub mod recovery;

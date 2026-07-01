@@ -16,6 +16,14 @@ download, no `fetch-models` step.
   weights. Take only `glintr100.onnx` from that repo; use YuNet for detection.
 - **InsightFace buffalo_l / antelopev2** (`w600k_r50`, `det_10g`) — non-commercial
   weights, **incompatible with GPL** (which guarantees downstream commercial use).
+- **Silent-Face / MiniFASNet anti-spoofing weights** (minivision-ai, incl. HF ONNX
+  re-exports) — the *code* is Apache-2.0 but the **weights carry no explicit license
+  and no documented training data** (verified 2026-06-30; the re-export disclaims
+  training and gives no warranty). Weights ≠ code: an Apache `LICENSE` on the source
+  does not license weights whose provenance is unwarrantable. **Fails the clean-BOM
+  bar**; do not bundle. Anti-spoofing stays algorithmic (IR physics + challenge-
+  response, [`../docs/adr/0002-challenge-response-liveness.md`](../docs/adr/0002-challenge-response-liveness.md))
+  until a clean-licensed PAD model or own-IR-rig data exists.
 
 ## Verification
 

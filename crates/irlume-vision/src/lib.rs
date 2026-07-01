@@ -221,6 +221,101 @@ mod onnx {
         }
     }
 
+    /// MediaPipe FaceMesh (`face_landmark.onnx`, Apache-2.0) — 468 dense facial
+    /// landmarks. irlume uses it ONLY for passive blink liveness (eye-aspect-ratio,
+    /// ADR-0002), never recognition. Input is NHWC `[1,192,192,3]` (unlike the
+    /// NCHW recognizer); output `conv2d_21` is 468×3 landmarks in the 192×192 input
+    /// space, plus a face-probability flag. RGB-trained; IR-grey performance is
+    /// validated empirically (that's the open question the diagnostic answers).
+    pub struct FaceMesh {
+        session: Session,
+    }
+
+    /// FaceMesh square input side.
+    pub const MESH_INPUT: u32 = 192;
+    /// Number of dense landmarks.
+    pub const MESH_N: usize = 468;
+
+    impl FaceMesh {
+        pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            Ok(Self { session: build(model)? })
+        }
+        pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
+            let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            Self::load_from_memory(&bytes)
+        }
+
+        /// Run FaceMesh on the face at `bbox` (frame pixel coords) with `margin`
+        /// (fraction of the box size added on each side; MediaPipe uses ~0.25).
+        /// Returns the 468 landmarks as `(x, y)` in ORIGINAL FRAME pixel coords.
+        /// The crop is square and centered so aspect ratio is preserved.
+        pub fn landmarks(
+            &mut self,
+            frame: &align::RgbView,
+            bbox: &[f32; 4],
+            margin: f32,
+        ) -> irlume_common::Result<Vec<(f32, f32)>> {
+            // Square crop centered on the box, expanded by `margin` on each side.
+            let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
+            let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * margin);
+            let (x0, y0) = (cx - half, cy - half);
+            let side = 2.0 * half;
+            let n = MESH_INPUT as usize;
+            // NHWC, normalized to [0,1] (MediaPipe face_landmark expects [0,1]; flip
+            // to (px/127.5−1) if landmarks come out garbage — the first thing to try).
+            let mut data = vec![0.0f32; n * n * 3];
+            for oy in 0..n {
+                for ox in 0..n {
+                    let sx = x0 + (ox as f32 + 0.5) / n as f32 * side;
+                    let sy = y0 + (oy as f32 + 0.5) / n as f32 * side;
+                    let p = frame.sample_bilinear(sx, sy);
+                    let i = (oy * n + ox) * 3;
+                    data[i] = p[0] / 255.0;
+                    data[i + 1] = p[1] / 255.0;
+                    data[i + 2] = p[2] / 255.0;
+                }
+            }
+            let s = MESH_INPUT as i64;
+            let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
+            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            // Find the 468×3 landmark tensor by length (order-agnostic).
+            let mut lm_raw: Option<Vec<f32>> = None;
+            for i in 0..outputs.len() {
+                let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
+                if raw.len() == MESH_N * 3 {
+                    lm_raw = Some(raw.to_vec());
+                }
+            }
+            let raw = lm_raw.ok_or_else(|| err(format!("no {}-landmark output", MESH_N)))?;
+            // Map input-space (0..192) coords back to the frame crop.
+            let mut out = Vec::with_capacity(MESH_N);
+            for k in 0..MESH_N {
+                let lx = raw[3 * k] / MESH_INPUT as f32 * side + x0;
+                let ly = raw[3 * k + 1] / MESH_INPUT as f32 * side + y0;
+                out.push((lx, ly));
+            }
+            Ok(out)
+        }
+    }
+
+    /// 6-point eye-aspect-ratio landmark indices (MediaPipe 468 topology): the two
+    /// horizontal corners + two upper + two lower lid points, per eye.
+    pub const EAR_LEFT: [usize; 6] = [33, 160, 158, 133, 153, 144];
+    pub const EAR_RIGHT: [usize; 6] = [362, 385, 387, 263, 373, 380];
+
+    /// Eye-aspect-ratio for one eye from its 6 landmarks: `(|p2−p6| + |p3−p5|) /
+    /// (2·|p1−p4|)`. Scale-invariant (a ratio): ~0.3 open, →0 closed. This is the
+    /// clean blink signal — collapses on closure, unlike the noisy IR-glint metric.
+    pub fn eye_ear(lm: &[(f32, f32)], idx: &[usize; 6]) -> f32 {
+        let d = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+        let p = |k: usize| lm[idx[k]];
+        let horiz = d(p(0), p(3));
+        if horiz < 1e-6 {
+            return 0.0;
+        }
+        (d(p(1), p(5)) + d(p(2), p(4))) / (2.0 * horiz)
+    }
+
     /// YuNet detector (ONNX). Loaded once in the daemon.
     pub struct Detector {
         #[allow(dead_code)]
@@ -343,4 +438,43 @@ mod onnx {
 }
 
 #[cfg(feature = "onnx")]
-pub use onnx::{selftest_alignment_identity, Adapter, Detector, Embedder};
+pub use onnx::{
+    eye_ear, selftest_alignment_identity, Adapter, Detector, Embedder, FaceMesh, EAR_LEFT,
+    EAR_RIGHT, MESH_INPUT, MESH_N,
+};
+
+#[cfg(all(test, feature = "onnx"))]
+mod ear_tests {
+    use super::{eye_ear, EAR_LEFT};
+
+    /// EAR = (|p2−p6| + |p3−p5|) / (2·|p1−p4|). Build a 468-point array with only
+    /// the left-eye indices set to a known shape and check the ratio.
+    fn lm_with(idx: &[usize; 6], pts: [(f32, f32); 6]) -> Vec<(f32, f32)> {
+        let mut lm = vec![(0.0, 0.0); 468];
+        for (k, &i) in idx.iter().enumerate() {
+            lm[i] = pts[k];
+        }
+        lm
+    }
+
+    #[test]
+    fn open_eye_has_normal_ear() {
+        // corners 10 apart; lids ±2 => EAR = (4+4)/(2*10) = 0.4.
+        let lm = lm_with(&EAR_LEFT, [(0.0, 0.0), (3.0, -2.0), (7.0, -2.0), (10.0, 0.0), (7.0, 2.0), (3.0, 2.0)]);
+        assert!((eye_ear(&lm, &EAR_LEFT) - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn closed_eye_ear_near_zero() {
+        // lids collapse onto the horizontal line => vertical distances 0 => EAR 0.
+        let lm = lm_with(&EAR_LEFT, [(0.0, 0.0), (3.0, 0.0), (7.0, 0.0), (10.0, 0.0), (7.0, 0.0), (3.0, 0.0)]);
+        assert!(eye_ear(&lm, &EAR_LEFT) < 1e-5);
+    }
+
+    #[test]
+    fn degenerate_horizontal_is_safe() {
+        // Coincident corners (no width) must not divide by zero.
+        let lm = lm_with(&EAR_LEFT, [(5.0, 0.0); 6]);
+        assert_eq!(eye_ear(&lm, &EAR_LEFT), 0.0);
+    }
+}

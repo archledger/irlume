@@ -40,6 +40,7 @@ fn main() -> std::process::ExitCode {
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("blinkprobe"), _) => blinkprobe(&args),
+        (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
@@ -865,6 +866,71 @@ fn blinkprobe(args: &[String]) -> std::process::ExitCode {
             eprintln!("blinkprobe error: {e}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// `irlume meshprobe --det <yunet> --mesh <face_landmark.onnx> [--rgb ..] [--ir ..] [--n 30] [--burst 2]`
+/// Diagnostic for the ADR-0002 passive-EAR liveness (MediaPipe FaceMesh). First a
+/// single RGB frame as a sanity check (does the mesh give a sane open-eye EAR ~0.3
+/// at all?), then an IR sequence to see whether EAR survives the RGB→IR domain gap
+/// and whether a natural blink shows. Blink naturally a couple times during the IR
+/// capture.
+fn meshprobe(args: &[String]) -> std::process::ExitCode {
+    let rgb_dev = flag(args, "--rgb").unwrap_or(irlume_camera::DEFAULT_RGB_DEVICE);
+    let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
+    let (Some(det_path), Some(mesh_path)) = (flag(args, "--det"), flag(args, "--mesh")) else {
+        eprintln!("usage: irlume meshprobe --det <yunet.onnx> --mesh <face_landmark.onnx> [--rgb ..] [--ir ..] [--n 30] [--burst 2]");
+        return std::process::ExitCode::from(2);
+    };
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(2);
+    // min-EAR over both eyes = the blink signal (both eyes close together).
+    let ear_of = |det: &mut irlume_vision::Detector, mesh: &mut irlume_vision::FaceMesh, view: &irlume_vision::align::RgbView|
+     -> irlume_common::Result<Option<(f32, f32, f32)>> {
+        let Some(top) = det.detect(view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
+            return Ok(None);
+        };
+        let lm = mesh.landmarks(view, &top.bbox, 0.25)?;
+        let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
+        let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
+        Ok(Some((l, r, l.min(r))))
+    };
+    let run = || -> irlume_common::Result<()> {
+        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
+        let mut mesh = irlume_vision::FaceMesh::load_from_file(mesh_path)?;
+        // 1) RGB sanity: a real open eye should give EAR ~0.25–0.35.
+        let rgb = irlume_camera::capture_rgb(rgb_dev)?;
+        let rv = irlume_vision::align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        match ear_of(&mut det, &mut mesh, &rv)? {
+            Some((l, r, _)) => println!("[meshprobe] RGB sanity: EAR left {l:.3} right {r:.3}  (open eye ≈0.25–0.35 → mesh works on RGB)"),
+            None => println!("[meshprobe] RGB sanity: no face detected"),
+        }
+        // 2) IR sequence: does EAR survive on IR grey, and does a blink show?
+        println!("[meshprobe] capturing {n} IR samples (burst {burst}) — blink naturally a couple times…");
+        let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
+        let mut ears: Vec<f32> = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
+            let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: f.width, height: f.height };
+            match ear_of(&mut det, &mut mesh, &iv)? {
+                Some((l, r, m)) => {
+                    ears.push(m);
+                    let bar = "█".repeat((m / 0.4 * 32.0).min(32.0) as usize);
+                    println!("  [{i:>2}] EAR L{l:.3} R{r:.3} min {m:.3} |{bar}");
+                }
+                None => println!("  [{i:>2}] (no face — skipped)"),
+            }
+        }
+        if !ears.is_empty() {
+            let (mut mn, mut mx) = (1.0f32, 0.0f32);
+            for &e in &ears { mn = mn.min(e); mx = mx.max(e); }
+            println!("[meshprobe] IR EAR: n={} open(max)={mx:.3} closed(min)={mn:.3} spread={:.3}", ears.len(), mx - mn);
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => { eprintln!("meshprobe error: {e}"); std::process::ExitCode::FAILURE }
     }
 }
 

@@ -426,7 +426,7 @@ SYSTEM INTEGRATION
   ir-setup [--dry-run]            auto-configure the IR emitter
 
 CAMERA / DEV
-  capture | liveness | blinkprobe | tui   capture/liveness/blink probes; the UI
+  capture | liveness | blinkprobe | meshprobe | tui   capture/liveness/EAR probes; UI
   irbench | genuine | eval | selftest align   benchmarks & self-tests
   padcapture --species N --kind attack|bonafide --out LOG   ISO 30107-3 PAD capture
   padreport --in LOG [--md OUT]   PAD self-test report (APCER/BPCER; docs/PAD_SELFTEST.md)

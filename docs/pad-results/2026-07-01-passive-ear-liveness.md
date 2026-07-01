@@ -94,6 +94,35 @@ insufficient with glasses, at any distance.**
 Until one of these is validated, passive liveness stays **opt-in/OFF** and is NOT
 suitable for default-on where glasses-wearers are common.
 
+### Two-cue OR — tested and REFUTED (2026-07-01)
+
+Measured the corneal-specular **contrast** cue (peak over the window) for glasses-
+genuine vs the banner, to test the two-cue "EAR blink OR contrast floor" idea:
+
+| group | contrast_max | EAR verdict |
+|---|---|---|
+| glasses-genuine (10) | **143–181** | all Uncertain (EAR fails, as before) |
+| banner (10) | 38–72 for 9/10, **125** for 1/10 | **1/10 false-EAR-blinked (breach)** |
+
+Glasses eyes *do* clear a contrast floor (143+ ≫ ~90). But the idea fails on security:
+
+1. **OR increases FAR.** One banner presentation both false-EAR-blinked *and* spiked
+   contrast to 125 (a glossy specular hotspot). OR accepts if *either* cue fires, so
+   it breaches — OR-combining cues makes the gate *more* permissive, the wrong way.
+2. **Contrast can't separate cleanly.** The banner's specular tail (**125**) *exceeds*
+   no-glasses genuine (~120), so no single contrast floor passes both genuine types
+   (no-glasses ~120, glasses 143+) *and* rejects the banner's 125.
+3. **The banner beats EAR too, occasionally.** 1/10 here + 0/10 earlier ≈ **APCER ~5%
+   (1/20)** for EAR-alone — a determined glossy print false-blinks at some angle.
+
+**Conclusion.** On this 2D-IR camera, no combination of EAR + specular contrast
+robustly separates *all* genuine conditions (esp. glasses) from a determined
+life-size glossy print. This is the fundamental passive-cue ceiling ADR-0001 named:
+the durable fix is a **trained PAD model** (Track B, license-blocked) or **true depth
+hardware**. Passive EAR remains a useful *deterrent* (closes casual/typical print
+attacks, works well without glasses) but is **not a guarantee** against a determined
+glossy print and **does not cover glasses-wearers** — ship opt-in with those limits.
+
 ## Reproduce
 
 ```sh

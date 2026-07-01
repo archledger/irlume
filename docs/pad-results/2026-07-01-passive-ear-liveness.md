@@ -61,12 +61,21 @@ Ran the genuine FRR test again **with glasses on** (10 presentations, same gate)
 false accept, no hard reject; security is intact. But an 80% non-response rate makes
 the gate unusable for glasses-wearers as shipped.
 
-**Root cause — the separation collapses.** Glasses lower the open-EAR baseline and
-make blink dips shallower *relative* to it: glasses blinks reached only **0.70–0.85×**
-the median, which **overlaps the banner's jitter range (0.75–0.90×)**. So no single
-relative-dip ratio passes glasses-genuine *and* rejects the banner — loosening 0.72→
-0.78 to catch glasses blinks would also admit the banner's 0.75× jitter (a breach).
-The single-metric relative-dip detector is insufficient with glasses.
+**Confirmed across distances (not a distance/tuning issue):**
+
+| glasses condition | Live | non-response | blink dip |
+|---|---:|---:|---|
+| arm's length (run 1) | 2/10 | 80% | 0.11–0.20 |
+| close to camera | 1/10 | 90% | 0.11–0.17 |
+| arm's length (run 2) | 0/10 | 100% | 0.166–0.186 (barely dips) |
+
+**Root cause — the separation collapses.** On IR grey the RGB-trained mesh can't
+resolve the eyelid closing through the glasses (lens IR-reflections / frame confuse
+the eye-contour landmarks), so EAR barely dips: glasses blinks reached only
+**0.70–0.90×** the baseline, which **overlaps the banner's jitter (0.75–0.90×)**. No
+single relative-dip ratio passes glasses-genuine *and* rejects the banner — loosening
+0.72→0.78 would admit the banner's 0.75× jitter (a breach). **EAR alone is
+insufficient with glasses, at any distance.**
 
 **Options (none a quick tweak; a future session):**
 1. **Temporal shape** — detect a blink as a fast V (drop-then-recover *velocity*), not

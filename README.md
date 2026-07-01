@@ -20,7 +20,7 @@ working authentication yet. **Not suitable for production use.**
 
 | | Windows Hello | `visage` (closest FOSS) | **irlume** |
 |---|---|---|---|
-| Liveness / anti-spoof | IR only (bypassable, CVE-2021-34466) | none | **algorithmic IR PAD gate** |
+| Liveness / anti-spoof | IR only (bypassable, CVE-2021-34466) | none | **algorithmic IR gate + opt-in passive blink (EAR)**; self-tested per ISO/IEC 30107-3 |
 | Camera injection defense | ESS device-trust (newer HW) | none | **device-trust + cross-spectrum RGB↔IR** |
 | Template protection | TPM-bound | raw f32 in SQLite | **TPM-sealed release secret** |
 | Model licensing | proprietary | non-commercial weights | **permissive, bundleable** |
@@ -31,7 +31,8 @@ working authentication yet. **Not suitable for production use.**
 |---|---|---|
 | Detection | **YuNet** `face_detection_yunet_2023mar.onnx` | MIT |
 | Recognition | **AuraFace** `glintr100.onnx` (512-D ArcFace) | Apache-2.0 |
-| Liveness | self-built algorithmic IR gate (no weights) | — |
+| Liveness (IR gate) | self-built algorithmic IR gate (no weights) | — |
+| Liveness (passive blink) | **MediaPipe FaceMesh** `face_landmark.onnx` → EAR (opt-in) | Apache-2.0 |
 
 > Do **not** substitute InsightFace buffalo_l/antelopev2 or YuNet's bundled
 > SCRFD: their non-commercial weights conflict with GPL's downstream-commercial
@@ -71,11 +72,20 @@ crate as you implement.
 
 ## Roadmap
 
-- **P1 — prove the pipeline:** YuNet → align → AuraFace → cosine match → unlock;
-  daemon/PAM split; `SO_PEERCRED`. **Gate: `irlume selftest align` (same crop →
-  cosine ≈ 1.0).**
-- **P2 — the security thesis:** IR liveness gate (NIR skin, bright-pupil,
-  cross-spectrum overlap, device-trust) + ISO/IEC 30107-3 self-testing.
+- **P1 — prove the pipeline** ✅: YuNet → align → AuraFace → cosine match → unlock;
+  daemon/PAM split; `SO_PEERCRED`. (`irlume selftest align`: same crop → cosine ≈ 1.0.)
+- **P2 — the security thesis** (in progress): the single-frame IR gate (IR-face
+  presence, cross-spectrum RGB↔IR, IR depth, NIR reflectance) plus an **ISO/IEC
+  30107-3 self-test** (`irlume padcapture` / `padreport`, [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md)).
+  The self-test did its job — it found that a **life-size glossy print** defeats the
+  single-frame gate (results in [`docs/pad-results/`](docs/pad-results/)).
+  **Passive blink liveness** (MediaPipe FaceMesh → eye-aspect-ratio; opt-in,
+  no prompt) now closes casual/typical print attacks, but is honestly a **deterrent,
+  not a guarantee**: a determined glossy print still slips ~5%, and it does **not**
+  cover glasses-wearers (EAR can't see the lid through IR lens reflections). Every
+  miss falls safely to the password. Robustly beating a determined glossy print is
+  the passive-cue ceiling — it needs a trained PAD model or true depth hardware. See
+  [ADR-0002](docs/adr/0002-challenge-response-liveness.md).
 - **P3 — hardening:** TPM sealing; fixed threshold tuned for FMR ≤ 1e-4 across
   demographics; mandatory non-biometric fallback.
 - **P4 — (optional) certification:** iBeta ISO/IEC 30107-3 PAD; FIDO.

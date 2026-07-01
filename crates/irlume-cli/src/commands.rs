@@ -36,7 +36,7 @@ pub fn status(args: &[String]) -> ExitCode {
             println!("  enrollment    : {} profile(s), {scans} scan(s) {OK}{}{}",
                 profiles.len(),
                 if require_eyes_open { " · eyes-open required" } else { "" },
-                if require_challenge { " · blink-challenge required" } else { "" });
+                if require_challenge { " · passive blink liveness" } else { "" });
             for p in &profiles {
                 println!("                  - {} ({} scan(s))", p.name, p.scans.len());
             }
@@ -426,7 +426,7 @@ SYSTEM INTEGRATION
   ir-setup [--dry-run]            auto-configure the IR emitter
 
 CAMERA / DEV
-  capture | liveness | blinkprobe | meshprobe | tui   capture/liveness/EAR probes; UI
+  capture | liveness | meshprobe | tui   capture/liveness/EAR probes; the UI
   irbench | genuine | eval | selftest align   benchmarks & self-tests
   padcapture --species N --kind attack|bonafide --out LOG   ISO 30107-3 PAD capture
   padreport --in LOG [--md OUT]   PAD self-test report (APCER/BPCER; docs/PAD_SELFTEST.md)

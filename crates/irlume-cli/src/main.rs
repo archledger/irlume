@@ -39,7 +39,6 @@ fn main() -> std::process::ExitCode {
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("liveness"), _) => liveness_probe(&args),
-        (Some("blinkprobe"), _) => blinkprobe(&args),
         (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
         (Some("profiles"), sub) => profiles(sub, &args),
@@ -296,6 +295,11 @@ fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlu
     let e = e.with_ir_adapter(adapter)?;
     if e.has_ir_adapter() {
         eprintln!("[engine] IR adapter loaded ({adapter}) — dark mode uses adapted recognition");
+    }
+    let mesh = flag(args, "--mesh").unwrap_or("models/face_landmark.onnx");
+    let e = e.with_mesh(mesh)?;
+    if e.has_mesh() {
+        eprintln!("[engine] FaceMesh loaded ({mesh}) — passive EAR liveness available");
     }
     Ok(e)
 }
@@ -811,64 +815,6 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume blinkprobe --det <yunet.onnx> [--ir /dev/video2] [--n 30] [--burst 1]`
-/// Diagnostic for the ADR-0002 blink challenge: capture a short IR sequence, plot
-/// the per-frame corneal-glint trace, and report the `detect_blink` verdict. Use it
-/// to SEE genuine-blink vs static-print glint traces and tune the detector before
-/// wiring the challenge into auth. Blink deliberately ~1s into the capture.
-fn blinkprobe(args: &[String]) -> std::process::ExitCode {
-    let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
-    let Some(det_path) = flag(args, "--det") else {
-        eprintln!("usage: irlume blinkprobe --det <yunet.onnx> [--ir /dev/video2] [--n 30] [--burst 1]");
-        return std::process::ExitCode::from(2);
-    };
-    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(30);
-    let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let run = || -> irlume_common::Result<()> {
-        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
-        println!("[blinkprobe] capturing {n} IR samples (burst {burst}) — BLINK once during capture…");
-        let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
-        // Per-frame eye specular-contrast (the challenge metric) at the detected
-        // IR-face eyes; skip frames with no face (a missed detection must not
-        // masquerade as an eyes-closed dip).
-        let mut contrasts: Vec<f32> = Vec::new();
-        for (i, f) in frames.iter().enumerate() {
-            let rgb = irlume_camera::grey_to_rgb(&f.data);
-            let view = irlume_vision::align::RgbView { data: &rgb, width: f.width, height: f.height };
-            let top = det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
-            match top {
-                Some(t) => {
-                    let c = irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
-                    contrasts.push(c);
-                    let bar = "█".repeat((c / 128.0 * 32.0).min(32.0) as usize);
-                    println!("  [{i:>2}] contrast {c:>3.0} |{bar}");
-                }
-                None => println!("  [{i:>2}] (no face — skipped)"),
-            }
-        }
-        let peak = contrasts.iter().copied().fold(0.0f32, f32::max);
-        let low = contrasts.iter().copied().fold(255.0f32, f32::min);
-        let verdict = irlume_liveness::detect_blink(&contrasts);
-        println!(
-            "[blinkprobe] samples={} contrast peak={peak:.0} low={low:.0}  open-floor {:.0}  close≤{:.0} reopen≥{:.0} run≥{}  => {:?}",
-            contrasts.len(),
-            irlume_liveness::BLINK_MIN_OPEN_CONTRAST,
-            irlume_liveness::BLINK_CLOSE_RATIO * peak,
-            irlume_liveness::BLINK_REOPEN_RATIO * peak,
-            irlume_liveness::BLINK_MIN_CLOSED_RUN,
-            verdict,
-        );
-        Ok(())
-    };
-    match run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("blinkprobe error: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
 /// `irlume meshprobe --det <yunet> --mesh <face_landmark.onnx> [--rgb ..] [--ir ..] [--n 30] [--burst 2]`
 /// Diagnostic for the ADR-0002 passive-EAR liveness (MediaPipe FaceMesh). First a
 /// single RGB frame as a sanity check (does the mesh give a sane open-eye EAR ~0.3
@@ -876,60 +822,84 @@ fn blinkprobe(args: &[String]) -> std::process::ExitCode {
 /// and whether a natural blink shows. Blink naturally a couple times during the IR
 /// capture.
 fn meshprobe(args: &[String]) -> std::process::ExitCode {
-    let rgb_dev = flag(args, "--rgb").unwrap_or(irlume_camera::DEFAULT_RGB_DEVICE);
     let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
     let (Some(det_path), Some(mesh_path)) = (flag(args, "--det"), flag(args, "--mesh")) else {
-        eprintln!("usage: irlume meshprobe --det <yunet.onnx> --mesh <face_landmark.onnx> [--rgb ..] [--ir ..] [--n 30] [--burst 2]");
+        eprintln!("usage: irlume meshprobe --det <yunet.onnx> --mesh <face_landmark.onnx> [--ir ..] [--n 40] [--burst 2] [--reps 1]");
+        eprintln!("  to record a PAD-style validation run: --species NAME --kind bonafide|attack --out ear.jsonl");
         return std::process::ExitCode::from(2);
     };
-    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(30);
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(40);
     let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let reps: usize = flag(args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(1);
+    // Optional recording (reuses the padreport JSONL format: Blinked→Live,
+    // NoBlink→Uncertain/non-response, NoEyes→Spoof).
+    let record = match (flag(args, "--species"), flag(args, "--kind"), flag(args, "--out")) {
+        (Some(s), Some(k), Some(o)) => Some((s.to_string(), k.to_string(), o.to_string())),
+        _ => None,
+    };
     // min-EAR over both eyes = the blink signal (both eyes close together).
     let ear_of = |det: &mut irlume_vision::Detector, mesh: &mut irlume_vision::FaceMesh, view: &irlume_vision::align::RgbView|
-     -> irlume_common::Result<Option<(f32, f32, f32)>> {
+     -> irlume_common::Result<Option<f32>> {
         let Some(top) = det.detect(view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
             return Ok(None);
         };
         let lm = mesh.landmarks(view, &top.bbox, 0.25)?;
         let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
         let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-        Ok(Some((l, r, l.min(r))))
+        Ok(Some(l.min(r)))
     };
-    let run = || -> irlume_common::Result<()> {
+    let run = || -> irlume_common::Result<usize> {
+        use std::io::Write;
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         let mut mesh = irlume_vision::FaceMesh::load_from_file(mesh_path)?;
-        // 1) RGB sanity: a real open eye should give EAR ~0.25–0.35.
-        let rgb = irlume_camera::capture_rgb(rgb_dev)?;
-        let rv = irlume_vision::align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
-        match ear_of(&mut det, &mut mesh, &rv)? {
-            Some((l, r, _)) => println!("[meshprobe] RGB sanity: EAR left {l:.3} right {r:.3}  (open eye ≈0.25–0.35 → mesh works on RGB)"),
-            None => println!("[meshprobe] RGB sanity: no face detected"),
-        }
-        // 2) IR sequence: does EAR survive on IR grey, and does a blink show?
-        println!("[meshprobe] capturing {n} IR samples (burst {burst}) — blink naturally a couple times…");
-        let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
-        let mut ears: Vec<f32> = Vec::new();
-        for (i, f) in frames.iter().enumerate() {
-            let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
-            let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: f.width, height: f.height };
-            match ear_of(&mut det, &mut mesh, &iv)? {
-                Some((l, r, m)) => {
+        let mut out_file = match &record {
+            Some((_, _, o)) => Some(std::fs::OpenOptions::new().create(true).append(true).open(o)
+                .map_err(|e| irlume_common::Error::Io(e.to_string()))?),
+            None => None,
+        };
+        let mut written = 0usize;
+        for rep in 0..reps {
+            let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
+            let mut ears: Vec<f32> = Vec::new();
+            for f in &frames {
+                let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
+                let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: f.width, height: f.height };
+                if let Some(m) = ear_of(&mut det, &mut mesh, &iv)? {
                     ears.push(m);
-                    let bar = "█".repeat((m / 0.4 * 32.0).min(32.0) as usize);
-                    println!("  [{i:>2}] EAR L{l:.3} R{r:.3} min {m:.3} |{bar}");
                 }
-                None => println!("  [{i:>2}] (no face — skipped)"),
             }
-        }
-        if !ears.is_empty() {
+            let verdict = irlume_liveness::detect_blink(&ears);
+            let (vs, live) = match verdict {
+                irlume_liveness::BlinkResult::Blinked => ("Live", true),
+                irlume_liveness::BlinkResult::NoBlink => ("Uncertain", false),
+                irlume_liveness::BlinkResult::NoEyes => ("Spoof", false),
+            };
             let (mut mn, mut mx) = (1.0f32, 0.0f32);
             for &e in &ears { mn = mn.min(e); mx = mx.max(e); }
-            println!("[meshprobe] IR EAR: n={} open(max)={mx:.3} closed(min)={mn:.3} spread={:.3}", ears.len(), mx - mn);
+            let flag_note = match (&record, live) {
+                (Some((_, k, _)), true) if k == "attack" => " ‼ ACCEPTED (breach!)",
+                (Some((_, k, _)), false) if k == "bonafide" => " ✗ live user not confirmed",
+                _ => "",
+            };
+            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3} (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
+            if let (Some(f), Some((sp, kind, _))) = (out_file.as_mut(), &record) {
+                let rec = serde_json::json!({
+                    "species": sp, "kind": kind, "path": "ear", "idx": rep,
+                    "verdict": vs, "reason": format!("passive EAR ({verdict:?})"),
+                    "ear_open": json_f32(mx), "ear_min": json_f32(mn), "ear_samples": ears.len(),
+                    "caught": Vec::<String>::new(),
+                });
+                writeln!(f, "{rec}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+                written += 1;
+            }
         }
-        Ok(())
+        Ok(written)
     };
     match run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(w) => {
+            if let Some((_, _, o)) = &record { println!("[meshprobe] appended {w} presentations to {o} — run `irlume padreport --in {o}`"); }
+            std::process::ExitCode::SUCCESS
+        }
         Err(e) => { eprintln!("meshprobe error: {e}"); std::process::ExitCode::FAILURE }
     }
 }

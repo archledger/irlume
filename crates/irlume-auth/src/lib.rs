@@ -22,6 +22,10 @@ pub struct Engine {
     emb: Embedder,
     /// Optional IR domain-adaptation MLP (applied to IR embeddings in the dark).
     ir_adapter: Option<Adapter>,
+    /// Optional MediaPipe FaceMesh — dense landmarks for the passive EAR blink
+    /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
+    /// the opt-in passive-liveness gate (it can't run without landmarks).
+    mesh: Option<irlume_vision::FaceMesh>,
     gate: LivenessGate,
     rgb_dev: String,
     ir_dev: String,
@@ -75,6 +79,7 @@ impl Engine {
             det: Detector::load_from_file(det_path)?,
             emb: Embedder::load_from_file(model_path)?,
             ir_adapter: None,
+            mesh: None,
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
@@ -127,6 +132,20 @@ impl Engine {
 
     pub fn has_ir_adapter(&self) -> bool {
         self.ir_adapter.is_some()
+    }
+
+    /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
+    /// the file is absent this is a no-op — the opt-in passive gate then can't run
+    /// and is skipped (logged), so face auth keeps working.
+    pub fn with_mesh(mut self, path: &str) -> irlume_common::Result<Self> {
+        if std::path::Path::new(path).exists() {
+            self.mesh = Some(irlume_vision::FaceMesh::load_from_file(path)?);
+        }
+        Ok(self)
+    }
+
+    pub fn has_mesh(&self) -> bool {
+        self.mesh.is_some()
     }
 
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
@@ -252,33 +271,43 @@ impl Engine {
         Ok(Assessment { verdict, reason, embedding, ir_embedding, signals, ir_depth, ir_brightness, eyes_open })
     }
 
-    /// Blink challenge (opt-in temporal liveness, ADR-0002): capture a short IR
-    /// sequence and require an eyes open→closed→open transition — a static print
-    /// can't blink. Uses de-strobed samples + per-frame eye specular-contrast; only
-    /// meaningful with the IR emitter. Live-validated 2026-06-30: a genuine held
-    /// blink → Blinked; a static vinyl banner, even hand-modulated → NoEyes.
-    fn run_blink_challenge(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
-        const SAMPLES: usize = 30; // ~4s window (de-strobed, ~15fps / burst 2)
+    /// Passive blink liveness (opt-in, ADR-0002): capture a short IR sequence and
+    /// look for a NATURAL blink via EAR — no prompt, no deliberate action. Per frame
+    /// we run FaceMesh (from the detected face crop) and take the smaller eye's EAR;
+    /// [`irlume_liveness::detect_blink`] then finds a dip below the open baseline. A
+    /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
+    /// natural blink → Blinked, static vinyl banner → NoBlink.
+    fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
+        const SAMPLES: usize = 40; // ~5s window (de-strobed) — raises natural-blink capture
         const BURST: usize = 2; // de-strobe the pulsing emitter
+        let Some(mesh) = self.mesh.as_mut() else {
+            // No landmark model: can't run the passive gate. Signal NoEyes so the
+            // caller can decide (challenge_if_required skips when mesh is absent).
+            return Ok(irlume_liveness::BlinkResult::NoEyes);
+        };
         let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, SAMPLES, BURST)?;
-        // Per-frame eye specular-contrast; skip frames with no detected face (a
-        // missed detection must not masquerade as an eyes-closed dip).
-        let mut contrasts = Vec::with_capacity(frames.len());
+        // Per-frame EAR (smaller eye); skip frames with no detected face (a missed
+        // detection must not masquerade as a blink).
+        let mut ears = Vec::with_capacity(frames.len());
         for f in &frames {
             let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
             let view = align::RgbView { data: &grey_rgb, width: f.width, height: f.height };
             if let Some(t) = self.det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
-                contrasts.push(eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks));
+                let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
+                let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
+                let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
+                ears.push(l.min(r));
             }
         }
-        Ok(irlume_liveness::detect_blink(&contrasts))
+        Ok(irlume_liveness::detect_blink(&ears))
     }
 
-    /// If the user opted into the blink challenge and we're about to grant, require
-    /// a blink before releasing anything. Failure downgrades to a non-grant with an
-    /// Uncertain-style reason (PAM cascades to the password fallback — never a
-    /// lockout). No-op unless the outcome is a grant, the flag is on, and IR is
-    /// available (the glint challenge needs the emitter).
+    /// If the user opted into passive liveness and we're about to grant, require a
+    /// natural blink before releasing anything. Failure downgrades to a non-grant
+    /// with an Uncertain-style reason (PAM cascades to the password fallback — never
+    /// a lockout). No-op unless the outcome is a grant, the flag is on, IR is
+    /// available, and the FaceMesh model is loaded (else the gate can't run — we log
+    /// and skip rather than lock the user out of an undeployed model).
     fn challenge_if_required(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
@@ -287,16 +316,20 @@ impl Engine {
         if !outcome.granted || !enr.require_challenge || !self.ir_available {
             return Ok(outcome);
         }
+        if self.mesh.is_none() {
+            eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded — skipping (set IRLUME_MESH_MODEL)");
+            return Ok(outcome);
+        }
         use irlume_liveness::BlinkResult;
-        Ok(match self.run_blink_challenge()? {
+        Ok(match self.run_passive_liveness()? {
             BlinkResult::Blinked => outcome,
             BlinkResult::NoBlink => Outcome {
                 granted: false, live: true, score: outcome.score,
-                reason: "blink challenge: no blink seen — blink to confirm (require-challenge is on)".into(),
+                reason: "passive liveness: no natural blink in the window — look at the camera a moment longer".into(),
             },
             BlinkResult::NoEyes => Outcome {
                 granted: false, live: false, score: outcome.score,
-                reason: "blink challenge: no live eyes (looks like a print) — require-challenge is on".into(),
+                reason: "passive liveness: no live eyes (looks like a print/no face)".into(),
             },
         })
     }

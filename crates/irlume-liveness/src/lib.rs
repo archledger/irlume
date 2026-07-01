@@ -279,87 +279,62 @@ impl LivenessGate {
     }
 }
 
-// --- Blink challenge (opt-in temporal liveness, ADR-0002) -------------------
+// --- Passive blink liveness (opt-in, ADR-0002) ------------------------------
 //
 // Defeats the demonstrated static IR-reflective print attack (a life-size glossy
 // vinyl banner passed the single-frame gate at 98.6% APCER, 2026-06-30): a static
-// print cannot blink. Given a sequence of per-frame eye SPECULAR-CONTRAST samples
-// (`irlume_auth::eye_glint_contrast`, in capture order), we look for an eyes
-// open→closed→open transition with a SUSTAINED closure.
+// print cannot blink. Given a per-frame eye-aspect-ratio (EAR) sequence
+// (`irlume_vision::eye_ear` over MediaPipe FaceMesh landmarks, in capture order),
+// we PASSIVELY look for a natural blink — an EAR dip well below the user's open
+// baseline. No prompt, no deliberate action: the user just looks at the camera and
+// blinks naturally within the window; the print holds EAR flat and never dips.
 //
-// Why specular contrast, not raw glint: live-validated 2026-06-30, a closed lid
-// still reflects 850nm, so peak glint barely drops on a blink and is lost in noise;
-// but the corneal specular SPIKE (peak-above-surround) collapses on closure. A
-// static/printed eye is diffuse — its contrast is low (banner ≈70) and never
-// reaches a real open eye's (≈120), and being static it can never produce the
-// transition. Two independent guards therefore reject a print: it fails the
-// absolute open-eye floor, AND it can't sustain a closed dip. Requiring the closure
-// to persist for several consecutive samples rejects single-frame noise.
+// Why EAR (and not the earlier IR-glint metric): live-validated 2026-07-01, EAR is
+// the clean signal — open eye ≈0.24 (rock-stable), a natural blink dips to ≈0.15,
+// while a static vinyl banner sits flat 0.21–0.24 (min ≈0.206, spread ≈0.034, no
+// dips). The deliberate-blink glint challenge that preceded this was replaced for
+// bad UX (natural blinks too fast for the glint metric; a timed held blink is not
+// ergonomic). EAR is scale-invariant (a ratio), so the threshold is relative to the
+// user's own open baseline and needs no per-user calibration.
 
-/// A sample is "closed" when its contrast falls to/below this fraction of the peak.
-pub const BLINK_CLOSE_RATIO: f32 = 0.70;
-/// A sample is "open" when its contrast is at/above this fraction of the peak.
-pub const BLINK_REOPEN_RATIO: f32 = 0.82;
-/// Peak eye contrast must reach at least this to trust a real corneal specular was
-/// seen — a static/printed eye stays diffuse and low (banner ≈70) and fails here.
-/// Set below the genuine open-eye level (≈120) with margin. Tune from real traces.
-pub const BLINK_MIN_OPEN_CONTRAST: f32 = 90.0;
-/// The closure must persist for at least this many consecutive samples (a
-/// deliberate held blink), so single-sample noise dips don't count. At the ~15 fps
-/// IR rate (de-strobed ≈133 ms/sample) this is ≈0.4 s.
-pub const BLINK_MIN_CLOSED_RUN: usize = 3;
+/// A blink is an EAR dip to at/below this fraction of the open baseline. Live blinks
+/// hit ≈0.64× baseline; a static banner's jitter stays ≈0.90× — 0.72 sits between.
+pub const BLINK_EAR_DIP_RATIO: f32 = 0.72;
+/// The open baseline (median EAR over the window) must be at least this to trust a
+/// plausibly-open eye was seen — guards against the mesh failing / a squint spoof.
+pub const BLINK_MIN_OPEN_EAR: f32 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlinkResult {
-    /// A sustained eyes open→closed→open transition was observed (live).
+    /// A natural blink was observed (a clear EAR dip below the open baseline) → live.
     Blinked,
-    /// A confident open eye was seen but no sustained blink (a static artefact — or
-    /// the user didn't blink in the window; caller re-prompts / falls back).
+    /// A plausibly-open eye was seen but no blink in the window (a static artefact —
+    /// or the user simply didn't blink; caller re-captures / falls back to password).
     NoBlink,
-    /// No confident open eye anywhere in the window (a diffuse/printed eye, or a
-    /// poor capture): peak contrast never reached the open-eye floor.
+    /// No plausibly-open eye anywhere in the window (mesh failed, or a non-eye/print):
+    /// the median EAR never reached the open floor.
     NoEyes,
 }
 
-/// Detect a sustained blink (eyes open→closed→open) in a per-frame eye-contrast
-/// sequence. See the module comment for the rationale and why it defeats static
-/// prints (absolute open-eye floor + a closure a static image cannot produce).
-pub fn detect_blink(contrasts: &[f32]) -> BlinkResult {
-    let peak = contrasts.iter().copied().fold(0.0f32, f32::max);
-    if peak < BLINK_MIN_OPEN_CONTRAST {
+/// Detect a natural blink PASSIVELY from a per-frame EAR sequence. The open baseline
+/// is the median EAR (robust: most frames are open, a blink is brief). A live user
+/// dips well below it at least once; a static print holds EAR flat and never does.
+pub fn detect_blink(ears: &[f32]) -> BlinkResult {
+    let mut sorted: Vec<f32> = ears.iter().copied().filter(|e| e.is_finite()).collect();
+    if sorted.is_empty() {
         return BlinkResult::NoEyes;
     }
-    let open_th = BLINK_REOPEN_RATIO * peak;
-    let close_th = BLINK_CLOSE_RATIO * peak;
-    // 0 = need first open · 1 = counting a consecutive closed run · 2 = need reopen.
-    let mut phase = 0u8;
-    let mut run = 0usize;
-    for &c in contrasts {
-        match phase {
-            0 => {
-                if c >= open_th {
-                    phase = 1;
-                }
-            }
-            1 => {
-                if c <= close_th {
-                    run += 1;
-                    if run >= BLINK_MIN_CLOSED_RUN {
-                        phase = 2;
-                    }
-                } else {
-                    run = 0; // any non-closed sample breaks the consecutive run
-                }
-            }
-            2 => {
-                if c >= open_th {
-                    return BlinkResult::Blinked;
-                }
-            }
-            _ => {}
-        }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let open_ref = sorted[sorted.len() / 2]; // median = the open-eye baseline
+    if open_ref < BLINK_MIN_OPEN_EAR {
+        return BlinkResult::NoEyes;
     }
-    BlinkResult::NoBlink
+    let dip_th = BLINK_EAR_DIP_RATIO * open_ref;
+    if ears.iter().any(|&e| e.is_finite() && e <= dip_th) {
+        BlinkResult::Blinked
+    } else {
+        BlinkResult::NoBlink
+    }
 }
 
 #[cfg(test)]
@@ -429,40 +404,33 @@ mod tests {
     }
 
     #[test]
-    fn genuine_held_blink_is_detected() {
-        // Contrast scale (real trace): open ≈120 → sustained closed ≈75 (≥3
-        // samples) → reopen ≈110.
-        let seq = [120.0, 124.0, 75.0, 73.0, 74.0, 76.0, 110.0, 112.0];
+    fn natural_blink_is_detected() {
+        // Real IR trace: open EAR ≈0.24 (median), one natural blink dips to ≈0.15
+        // (0.15 / 0.24 = 0.63 < 0.72 → blink).
+        let seq = [0.24, 0.24, 0.23, 0.15, 0.16, 0.24, 0.24, 0.23, 0.24];
         assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
     }
 
     #[test]
-    fn static_banner_reads_no_eyes() {
-        // A static/printed eye is diffuse: contrast flat and low (real banner
-        // trace ≈55–70), never reaching the open-eye floor.
-        assert_eq!(detect_blink(&[63.0, 63.0, 61.0, 57.0, 64.0, 70.0, 58.0]), BlinkResult::NoEyes);
+    fn static_banner_flat_ear_is_not_a_blink() {
+        // Real banner trace: flat 0.21–0.24, min 0.206 (≈0.90× median) — never dips
+        // to 0.72× baseline.
+        let banner = [0.221, 0.236, 0.227, 0.229, 0.206, 0.232, 0.226, 0.224, 0.223];
+        assert_eq!(detect_blink(&banner), BlinkResult::NoBlink);
     }
 
     #[test]
-    fn steady_open_eye_is_not_a_blink() {
-        // A real open eye held steady (no closure) — high contrast, no dip.
-        assert_eq!(detect_blink(&[120.0, 124.0, 122.0, 121.0, 123.0]), BlinkResult::NoBlink);
+    fn dip_is_relative_to_the_users_open_baseline() {
+        // A user with narrower eyes (lower open EAR ≈0.18) still triggers on a
+        // proportional dip — the ratio is scale-invariant, no per-user calibration.
+        let seq = [0.18, 0.18, 0.12, 0.18, 0.18];
+        assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
     }
 
     #[test]
-    fn single_sample_dip_is_noise_not_a_blink() {
-        // One isolated low sample (< the sustained run) must not count as a blink.
-        assert_eq!(detect_blink(&[120.0, 124.0, 70.0, 122.0, 124.0]), BlinkResult::NoBlink);
-    }
-
-    #[test]
-    fn close_without_reopen_is_not_a_blink() {
-        // Sustained closure but the window ends before the eyes reopen.
-        assert_eq!(detect_blink(&[120.0, 124.0, 75.0, 73.0, 74.0, 76.0]), BlinkResult::NoBlink);
-    }
-
-    #[test]
-    fn empty_reads_no_eyes() {
+    fn no_plausible_open_eye_reads_no_eyes() {
+        // Median below the open floor (mesh failing / non-eye) → NoEyes, not a blink.
+        assert_eq!(detect_blink(&[0.05, 0.06, 0.04, 0.05]), BlinkResult::NoEyes);
         assert_eq!(detect_blink(&[]), BlinkResult::NoEyes);
     }
 }

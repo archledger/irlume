@@ -17,6 +17,7 @@ fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
     let adapter = env_or("IRLUME_IR_ADAPTER", "/etc/irlume/ir_adapter.onnx");
+    let mesh = env_or("IRLUME_MESH_MODEL", "/etc/irlume/face_landmark.onnx");
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
@@ -27,9 +28,11 @@ fn main() {
     let mut engine = match irlume_auth::Engine::load(&det, &model)
         .map(|e| e.with_devices(&rgb_dev, &ir_dev))
         .and_then(|e| e.with_ir_adapter(&adapter))
+        .and_then(|e| e.with_mesh(&mesh))
     {
         Ok(e) => {
             eprintln!("irlumed: IR adapter {}", if e.has_ir_adapter() { "loaded" } else { "absent (raw IR)" });
+            eprintln!("irlumed: FaceMesh (passive liveness) {}", if e.has_mesh() { "loaded" } else { "absent" });
             e
         }
         Err(e) => {

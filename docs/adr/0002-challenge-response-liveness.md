@@ -1,9 +1,11 @@
 # ADR-0002: Challenge-response temporal liveness for IR-reflective print attacks
 
-**Status:** Accepted — implemented & live-validated 2026-07-01 (opt-in). Revises the
-reasoning of [ADR-0001](0001-liveness-pad-strategy.md); does not supersede its rPPG
-rejection.
-**Date:** 2026-06-30 (implemented 2026-07-01)
+**Status:** Accepted — the shipped design is **passive EAR** liveness (MediaPipe
+FaceMesh), opt-in/off, implemented & validated 2026-07-01 (APCER 0% / BPCER 0% on
+the banner attack; see below). The earlier *prompted deliberate-blink* variant was
+built then withdrawn for bad UX. Revises the reasoning of
+[ADR-0001](0001-liveness-pad-strategy.md); does not supersede its rPPG rejection.
+**Date:** 2026-06-30 (passive EAR implemented 2026-07-01)
 
 ## Context
 
@@ -181,6 +183,24 @@ answer is **passive**, no user action:
 (committed, works for anyone who accepts the deliberate-blink UX). The `PAM_TEXT_INFO`
 prompt hint was reverted (dead end; the passive path needs no prompt). Default-on
 liveness waits on the passive EAR work above.
+
+## Passive EAR — implemented & validated (2026-07-01)
+
+Built and validated (commit `a8d839d`). `detect_blink` now takes a per-frame EAR
+sequence and finds a natural blink as a dip below **0.72× the median-EAR baseline**
+(relative → scale-invariant, no per-user calibration). `Engine::run_passive_liveness`
+captures a ~5 s IR window, runs FaceMesh per frame (smaller eye's EAR), and gates the
+grant; it **skips gracefully** (logs) if `face_landmark.onnx` isn't loaded, and
+`NoBlink`/`NoEyes` fall through to the password (never a lockout). No prompt, no
+deliberate action — the user just looks at the camera.
+
+**Validation** ([`../pad-results/2026-07-01-passive-ear-liveness.md`](../pad-results/2026-07-01-passive-ear-liveness.md),
+`meshprobe` → `padreport`): the vinyl-banner breach is **closed — APCER 0% (0/10),
+BPCER 0% (0/10), non-response 10%**. Live blinks dip to 0.55–0.65× baseline; the
+banner's jitter only to 0.75–0.90×, so the relative detector separates them. **Still
+opt-in/OFF** — default-on awaits broader-condition validation (glasses / dark /
+distance / extreme angle for FRR; a moving banner across more specular angles for
+FAR), per the results doc's limitations.
 
 ## Revisit / follow-ups
 

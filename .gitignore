@@ -14,3 +14,4 @@ models/*.onnx
 
 # but DO keep our own tiny trained adapter
 !models/ir_adapter.onnx
+models/ir_adapter.onnx.v1-256

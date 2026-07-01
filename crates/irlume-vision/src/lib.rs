@@ -187,11 +187,11 @@ mod onnx {
         }
     }
 
-    /// IR embedding adapter (512→256) — a small domain-adaptation MLP trained on
-    /// NIR faces (CBSR+Oulu COMBINED, multi-sensor) that tightens IR genuine/
-    /// impostor separation and generalizes across NIR cameras (5-fold CV:
-    /// CBSR-held-out EER 0.81%→0.46%, Oulu-held-out 1.20%→1.16% = no degradation,
-    /// vs the prior CBSR-only adapter which degraded Oulu to 1.95%).
+    /// IR embedding adapter (512→512) — the v3 residZero CLIP-adapter (out = x +
+    /// 0.6·A(x), A zero-init) trained on NIR faces (CBSR+Oulu COMBINED, multi-sensor)
+    /// that tightens IR genuine/impostor separation and generalizes across NIR
+    /// cameras. Real-ASUS-validated vs the prior v1 (512→256) adapter: no regression
+    /// and better on hard conditions (backlight/dark/motion), FRR@FAR1e-3 halved.
     /// Applied to AuraFace IR embeddings in the dark path. Output is L2-normalized.
     pub struct Adapter {
         session: Session,

@@ -8,15 +8,15 @@
 //! top of the existing single-modality thresholds; it never relaxes them.
 //!
 //! Constants fit offline (scripts/calibrate.py): RGB Platt on LFW genuine/impostor
-//! cosines; IR Platt on CBSR+Oulu NIR run through the DEPLOYED v1 adapter. Re-fit
-//! when the recognizer or IR adapter changes, and ideally refine on real captures.
+//! cosines; IR Platt on CBSR+Oulu NIR run through the DEPLOYED v3 residZero adapter.
+//! Re-fit when the recognizer or IR adapter changes, and ideally refine on real captures.
 
 /// RGB Platt: `p = sigmoid(a*cos + b)`. Fit on LFW (genuine cos μ0.565 / impostor μ0.062).
 pub const RGB_PLATT_A: f32 = 24.4708;
 pub const RGB_PLATT_B: f32 = -8.1873;
-/// IR Platt (adapted-IR space). Fit on CBSR+Oulu via v1 adapter (genuine μ0.821 / impostor μ-0.002).
-pub const IR_PLATT_A: f32 = 23.3195;
-pub const IR_PLATT_B: f32 = -9.9335;
+/// IR Platt (adapted-IR space). Fit on CBSR+Oulu via v3 residZero adapter (genuine μ0.783 / impostor μ0.033).
+pub const IR_PLATT_A: f32 = 40.0120;
+pub const IR_PLATT_B: f32 = -16.2221;
 
 /// Fused genuine-probability required to grant via fusion. CONSERVATIVE: the
 /// equal-weight independence model puts fused FAR≤1e-4 at ~0.31; 0.50 adds margin

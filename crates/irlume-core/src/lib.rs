@@ -45,13 +45,14 @@ pub const RGB_MATCH_THRESHOLD: f32 = 0.55;
 pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 
 /// Match threshold for ADAPTED IR embeddings (when the IR adapter is loaded).
-/// The adapter (models/ir_adapter.onnx) is now trained on CBSR+Oulu COMBINED
-/// (multi-sensor) — 5-fold CV: CBSR-held-out EER 0.81%→0.46%, Oulu-held-out
-/// 1.20%→1.16% (no degradation, unlike the prior CBSR-only adapter which blew
-/// Oulu up to 1.95%). The combined adapter re-shapes the cosine space to a lower
-/// scale; CV puts FAR≈1e-3 at 0.363, so 0.40 is the deployment default (security
-/// margin over that). MUST be re-validated on the live camera at re-enroll
-/// (CBSR/Oulu → our-IR domain gap; re-enroll required when the adapter changes).
+/// The adapter (models/ir_adapter.onnx) is the v3 residZero CLIP-adapter (512→512,
+/// out = x + 0.6·A(x)) trained on CBSR+Oulu COMBINED. Validated on the real ASUS
+/// sensor (irlume-caldata) against v1: no regression (EER 0.36%=0.36%, FAR@.40=0,
+/// FRR@.40 1.09%) and strictly better on the hard conditions (backlight/dark/motion)
+/// plus FRR@FAR1e-3 halved. Academic CBSR+Oulu puts FAR≈1e-3 at 0.354 and FAR≈1e-4
+/// at 0.410, so 0.40 remains the deployment default (FAR ~1e-4). MUST be re-validated
+/// on the live camera at re-enroll (re-enroll required when the adapter changes —
+/// v3 is a different, 512-D cosine space from v1's 256-D).
 pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.40;
 
 /// Extra margin added to the IR threshold when IR is used as a DIM-LIGHT FALLBACK

@@ -101,22 +101,29 @@ impl Enrollment {
     /// instead of a one-size global constant. Returns `None` until there are at
     /// least two IR-bearing scans (enough to be representative). The floor is the
     /// weakest enrolled value with a 25% margin below it (live IR varies).
-    pub fn ir_calibration(&self) -> Option<(f32, f32)> {
+    /// Per-user IR **depth** floor (center/edge ratio, a 3D-structure cue) for the
+    /// anti-screen/photo gate: 75% of the weakest enrolled IR depth. Needs ≥2 IR
+    /// scans. DEPTH ONLY — the former per-user IR *brightness* floor was removed:
+    /// IR face brightness is strongly ambient-dependent (emitter-only ~40 in the
+    /// dark vs ~140 in a lit room, measured on the ASUS Hello cam), so a brightness
+    /// floor derived from lit enrollment false-rejects a genuine dim/night login as
+    /// a "screen/photo". The global liveness gate (`evaluate`) already enforces an
+    /// ambient-robust IR brightness floor (`IR_FACE_MIN_BRIGHTNESS`) and depth floor
+    /// (`DEPTH_MIN_RATIO`); this adds a personalized depth tightening on top.
+    pub fn ir_calibration(&self) -> Option<f32> {
         let mut depths = Vec::new();
-        let mut brights = Vec::new();
         for p in &self.profiles {
             for s in &p.scans {
-                if s.ir.is_some() && s.ir_depth > 0.0 && s.ir_brightness > 0.0 {
+                if s.ir.is_some() && s.ir_depth > 0.0 {
                     depths.push(s.ir_depth);
-                    brights.push(s.ir_brightness);
                 }
             }
         }
         if depths.len() < 2 {
             return None;
         }
-        let min = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min);
-        Some((min(&depths) * 0.75, min(&brights) * 0.75))
+        let min = depths.iter().copied().fold(f32::INFINITY, f32::min);
+        Some(min * 0.75)
     }
 
     /// Default name for the next profile ("Face Profile N", first free slot).
@@ -409,11 +416,11 @@ mod tests {
         e.profiles.push(FaceProfile { name: "p".into(), scans: vec![scan_with_ir(1.5, 100.0)] });
         assert!(e.ir_calibration().is_none());
 
-        // Two+ scans -> floor at 75% of the weakest enrolled value.
+        // Two+ scans -> depth floor at 75% of the weakest enrolled depth.
+        // (brightness is intentionally NOT floored per-user — ambient-dependent.)
         e.profiles[0].scans.push(scan_with_ir(1.2, 80.0));
-        let (depth_floor, bright_floor) = e.ir_calibration().unwrap();
+        let depth_floor = e.ir_calibration().unwrap();
         assert!((depth_floor - 1.2 * 0.75).abs() < 1e-5);
-        assert!((bright_floor - 80.0 * 0.75).abs() < 1e-5);
     }
 
     #[test]

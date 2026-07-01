@@ -295,16 +295,21 @@ impl Engine {
             if a.verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
             }
-            // Per-user IR-liveness floor (anti-screen/photo, calibrated to this
-            // user's enrolled IR): the live frame must clear the enrolled floor.
+            // Per-user IR-liveness DEPTH floor (anti-screen/photo, calibrated to
+            // this user's enrolled 3D face structure): the live frame must clear the
+            // enrolled depth floor. Depth only — a per-user IR *brightness* floor was
+            // removed because IR face brightness is ambient-dependent (emitter-only
+            // ~40 in the dark vs ~140 lit) and a lit-enrollment floor false-rejected
+            // genuine dim/night logins as "screen/photo". The global gate above
+            // (`evaluate`) already enforces an ambient-robust IR brightness floor.
             // Only meaningful when IR was actually captured (skip on RGB-only).
-            if let Some((depth_floor, bright_floor)) = enr.ir_calibration().filter(|_| self.ir_available) {
-                if a.ir_depth < depth_floor || a.ir_brightness < bright_floor {
+            if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+                if a.ir_depth < depth_floor {
                     return Ok(Outcome {
                         granted: false, live: false, score: 0.0,
                         reason: format!(
-                            "IR below your calibrated floor (depth {:.2}<{:.2} or brightness {:.0}<{:.0}) — likely a screen/photo",
-                            a.ir_depth, depth_floor, a.ir_brightness, bright_floor
+                            "IR depth {:.2} below your calibrated floor {:.2} — looks 2D (screen/photo)",
+                            a.ir_depth, depth_floor
                         ),
                     });
                 }
@@ -737,7 +742,7 @@ fn rgb_luma_stats(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> (f32, f32) {
     if n == 0 { (0.0, 0.0) } else { (sum as f32 / n as f32, hot as f32 / n as f32) }
 }
 
-fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
     let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
     let x2 = (bbox[2].max(0.0) as u32).min(w);
@@ -756,7 +761,7 @@ fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
-fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
     if bw <= 4.0 || bh <= 4.0 {
         return 0.0;
@@ -772,7 +777,7 @@ fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
-fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
+pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     let mut peak = 0u8;
     for &(ex, ey) in &landmarks[0..2] {
         let r = 8i32;

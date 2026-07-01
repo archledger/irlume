@@ -963,11 +963,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
 
-            let (mut ir_cos, mut ir_bri) = (f32::NAN, 0.0f32);
+            let (mut ir_cos, mut ir_bri, mut ir_depth, mut ir_glint) = (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
                 ir_bri = mean_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox);
+                // Ambient-INDEPENDENT liveness cues (the depth-primary-floor candidates):
+                // center/edge IR ratio (3D face structure) and corneal glint peak.
+                ir_depth = irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
+                ir_glint = irlume_auth::eye_glint(&irf.data, irf.width, irf.height, &t.landmarks);
                 if let Some(a) = adapter.as_mut() {
                     let adapted = a.apply(&raw)?;
                     if !ir_scans.is_empty() { ir_cos = best(&adapted, &ir_scans); }
@@ -975,16 +979,18 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 rec.insert("ir_face_score".into(), json_f32(t.score));
                 rec.insert("ir_cos_v1".into(), json_f32(ir_cos));
                 rec.insert("ir_brightness".into(), json_f32(ir_bri));
+                rec.insert("ir_depth".into(), json_f32(ir_depth));
+                rec.insert("ir_glint".into(), json_f32(ir_glint));
                 rec.insert("ir_emb_raw".into(), serde_json::to_value(raw.to_vec()).unwrap());
             }
             rec.insert("ir_present".into(), ir_top.is_some().into());
 
             writeln!(f, "{}", serde_json::Value::Object(rec)).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             written += 1;
-            println!("  [{:>2}/{n}] rgb {} cos {:>6} bri {:>5.1} | ir {} cos {:>6} bri {:>5.1}",
+            println!("  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} depth {:>5.2} glint {:>3.0}",
                 idx + 1,
-                if rgb_top.is_some() { "✓" } else { "·" }, fmt_cos(rgb_cos), rgb_bri,
-                if ir_top.is_some() { "✓" } else { "·" }, fmt_cos(ir_cos), ir_bri);
+                if rgb_top.is_some() { "✓" } else { "·" }, rgb_bri,
+                if ir_top.is_some() { "✓" } else { "·" }, ir_bri, ir_depth, ir_glint);
         }
         Ok(written)
     };
@@ -998,9 +1004,6 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
 /// absent cosine round-trips cleanly instead of breaking the encoder).
 fn json_f32(x: f32) -> serde_json::Value {
     serde_json::Number::from_f64(x as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-}
-fn fmt_cos(x: f32) -> String {
-    if x.is_finite() { format!("{x:.3}") } else { "  -  ".into() }
 }
 
 /// Embed every detected face in an image and report the pairwise-cosine

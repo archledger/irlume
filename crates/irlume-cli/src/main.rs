@@ -837,17 +837,6 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
         (Some(s), Some(k), Some(o)) => Some((s.to_string(), k.to_string(), o.to_string())),
         _ => None,
     };
-    // min-EAR over both eyes = the blink signal (both eyes close together).
-    let ear_of = |det: &mut irlume_vision::Detector, mesh: &mut irlume_vision::FaceMesh, view: &irlume_vision::align::RgbView|
-     -> irlume_common::Result<Option<f32>> {
-        let Some(top) = det.detect(view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-            return Ok(None);
-        };
-        let lm = mesh.landmarks(view, &top.bbox, 0.25)?;
-        let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
-        let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-        Ok(Some(l.min(r)))
-    };
     let run = || -> irlume_common::Result<usize> {
         use std::io::Write;
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
@@ -861,11 +850,19 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
         for rep in 0..reps {
             let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
             let mut ears: Vec<f32> = Vec::new();
+            // Per-frame corneal-specular CONTRAST (the candidate 2nd cue): peak eye
+            // contrast over the window. Banner ≤70, no-glasses live ~120 — the open
+            // question is where glasses-genuine lands (does it clear the floor?).
+            let mut contrast_max = 0.0f32;
             for f in &frames {
                 let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
                 let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: f.width, height: f.height };
-                if let Some(m) = ear_of(&mut det, &mut mesh, &iv)? {
-                    ears.push(m);
+                if let Some(t) = det.detect(&iv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+                    let lm = mesh.landmarks(&iv, &t.bbox, 0.25)?;
+                    let ear = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT)
+                        .min(irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT));
+                    ears.push(ear);
+                    contrast_max = contrast_max.max(irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks));
                 }
             }
             let verdict = irlume_liveness::detect_blink(&ears);
@@ -881,12 +878,13 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
                 (Some((_, k, _)), false) if k == "bonafide" => " ✗ live user not confirmed",
                 _ => "",
             };
-            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3} (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
+            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3}  contrast_max {contrast_max:>5.0}  (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
             if let (Some(f), Some((sp, kind, _))) = (out_file.as_mut(), &record) {
                 let rec = serde_json::json!({
                     "species": sp, "kind": kind, "path": "ear", "idx": rep,
                     "verdict": vs, "reason": format!("passive EAR ({verdict:?})"),
                     "ear_open": json_f32(mx), "ear_min": json_f32(mn), "ear_samples": ears.len(),
+                    "contrast_max": json_f32(contrast_max),
                     "caught": Vec::<String>::new(),
                 });
                 writeln!(f, "{rec}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;

@@ -8,7 +8,7 @@ download, no `fetch-models` step.
 |---|---|---|---|---|
 | `face_detection_yunet_2023mar.onnx` | detection | [OpenCV Zoo](https://github.com/opencv/opencv_zoo) | **MIT** | bbox + 5 landmarks; int8 variant also fine |
 | `glintr100.onnx` | recognition | [fal/AuraFace-v1](https://huggingface.co/fal/AuraFace-v1) | **Apache-2.0** | 512-D ArcFace; use ONLY this file from the repo |
-| `face_mesh.onnx` (planned) | liveness (EAR) | Google MediaPipe FaceMesh V2 | **Apache-2.0** | 478 + 10 iris landmarks; eye-contour EAR for passive blink liveness. See note below. |
+| `face_landmark.onnx` | liveness (EAR) | Google MediaPipe FaceMesh (`face_landmark.tflite`) | **Apache-2.0** | 468 landmarks; input `[1,192,192,3]` RGB → `1404` + face flag. Eye-contour EAR for passive blink liveness. See note below. |
 
 ### MediaPipe FaceMesh — license-verified (unlike Silent-Face)
 
@@ -17,8 +17,14 @@ Cleared the clean-BOM gate 2026-07-01 against Google's **official model card**
 model card **itself states "LICENSED UNDER Apache License, Version 2.0"** (weights,
 not just code; authored by Google) and documents **first-party training data**
 (Google-collected smartphone/AR images — no MS-Celeb-1M / CelebA-Spoof taint). →
-warrantable, GPLv3-compatible. Use the canonical Google Apache-2.0 `.tflite`
-converted to ONNX (preserve the NOTICE), not an unprovenanced re-upload. Honest,
+warrantable, GPLv3-compatible. **Sourced 2026-07-01** by converting Google's
+canonical Apache-2.0 `face_landmark.tflite`
+(`storage.googleapis.com/mediapipe-assets/`) with `tf2onnx --opset 13` on archhost
+(TF needs Python ≤3.12 via a `uv` venv; neither box ships one by default). The
+`face_landmark_with_attention.tflite` (478 + iris) does **not** convert to a runnable
+ONNX — tf2onnx leaves a MediaPipe custom op (`TFL_Landmarks2TransformMatrix`) that
+onnxruntime rejects — so we use the basic 468-landmark model, whose eye-contour
+points suffice for EAR. Honest,
 non-license caveats to document at use: the card's out-of-scope notes ("not for
 facial recognition/identification", "not for life-critical decisions") are
 **advisory** — irlume uses it for LIVENESS only (EAR/blink, not recognition) with a

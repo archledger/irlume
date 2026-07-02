@@ -191,6 +191,17 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Err(e) => Response::Error(e.to_string()),
         },
         Request::Authenticate { user, service } => {
+            // Honor the configured unlock method: if the admin chose fingerprint,
+            // face must actually stand down (pam_fprintd drives; password is the
+            // fallback) — not just be claimed disabled by the CLI message.
+            if irlume_core::policy::method().face_disabled() {
+                return Response::AuthResult {
+                    granted: false,
+                    score: 0.0,
+                    live: false,
+                    reason: "face auth disabled — the configured method is fingerprint".into(),
+                };
+            }
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
             // match may ONLY satisfy a screen unlock — never login, elevation, or
             // a remote/unknown service (those keep the password). Always-on for
@@ -314,6 +325,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // gets it, even with a matching face.
             if peer.uid != 0 {
                 return Response::Error(format!("unseal_password requires root (peer uid {})", peer.uid));
+            }
+            // Same method gate as Authenticate: fingerprint-configured means no
+            // face-driven credential release either.
+            if irlume_core::policy::method().face_disabled() {
+                return Response::Error("face auth disabled — the configured method is fingerprint".into());
             }
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
             // sealed credential — no cold-login / keyring unlock by RGB-only face.

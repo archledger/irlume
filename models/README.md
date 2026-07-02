@@ -1,8 +1,10 @@
 # Models
 
-irlume bundles a **permissive, GPLv3-compatible** model stack. Once you add the
-weights here they are compiled into `irlumed` via `include_bytes!` — no runtime
-download, no `fetch-models` step.
+irlume bundles a **permissive, GPLv3-compatible** model stack. All weights are
+committed to this repo via **Git LFS** (see `../.gitattributes`) and loaded from
+`/usr/share/irlume/models/` (packages) or this dir (dev) — a clone or package is
+fully self-contained, no runtime download or fetch step. After cloning, run
+`git lfs pull` if your client didn't fetch LFS objects automatically.
 
 | File | Stage | Source | License | Notes |
 |---|---|---|---|---|

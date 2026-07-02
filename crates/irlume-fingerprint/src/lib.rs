@@ -78,6 +78,23 @@ pub fn enrolled_fingers(user: &str) -> Vec<String> {
     parse_enrolled_lines(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// True when the reader is CLAIMED by a stale fprintd session (a crashed or
+/// aborted enrollment holds the device open; `pam_fprintd` then fails silently
+/// and the finger prompt never appears — observed live 2026-07-01). Detection:
+/// `fprintd-list` must claim the device, and a stuck claim surfaces as
+/// "already open" / "failed to claim" in its output. The cure is restarting
+/// fprintd, which releases the claim.
+pub fn reader_stuck(user: &str) -> bool {
+    let Some(list) = tool("fprintd-list") else { return false };
+    let Ok(out) = Command::new(list).arg(user).output() else { return false };
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    all.contains("already open") || all.contains("failed to claim")
+}
+
 /// Parse the ` - #N: <finger>` enrolled lines from `fprintd-list`, de-duplicated
 /// (fprintd may list the same reader under Device/0 and Device/1).
 fn parse_enrolled_lines(text: &str) -> Vec<String> {

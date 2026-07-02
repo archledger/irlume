@@ -184,6 +184,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 ir_dev,
                 mesh: engine.has_mesh(),
                 adapter: engine.has_ir_adapter(),
+                version: env!("CARGO_PKG_VERSION").into(),
             }
         }
         Request::PositionSample => match engine.position_sample() {

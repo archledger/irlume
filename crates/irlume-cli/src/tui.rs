@@ -83,6 +83,7 @@ enum Suspend {
     FingerprintAdd,
     LoginStatus,
     RestartDaemon,
+    RestartFprintd,
     SelinuxLoad,
 }
 
@@ -136,6 +137,7 @@ struct HealthInfo {
     ir_dev: Option<String>,
     mesh: bool,
     adapter: bool,
+    version: String,
 }
 
 /// Template-encryption + recovery status (`RecoveryStatus`).
@@ -314,8 +316,8 @@ impl App {
     fn refresh_light(&mut self) {
         self.daemon_up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
         self.health = match crate::daemon_request(&Request::Health) {
-            Ok(Response::Health { tier, rgb_dev, ir_dev, mesh, adapter }) => {
-                Some(HealthInfo { tier, rgb_dev, ir_dev, mesh, adapter })
+            Ok(Response::Health { tier, rgb_dev, ir_dev, mesh, adapter, version }) => {
+                Some(HealthInfo { tier, rgb_dev, ir_dev, mesh, adapter, version })
             }
             _ => None, // older daemon / daemon down → Repair falls back to local probes
         };
@@ -443,6 +445,92 @@ impl App {
             if enrolled { format!("{} profile(s) enrolled", self.profiles.len()) } else { "no face enrolled yet".into() },
             if enrolled { Fix::None } else { Fix::Manual("Profiles tab → [e] enroll".into()) }));
 
+        // ---- Checks distilled from live cross-distro debugging (2026-07-01):
+        // every failure mode below cost a human diagnosis session once — Repair
+        // detects and resolves them now.
+
+        // Stale daemon build: the installed daemon predates this CLI (bit us on
+        // Fedora — an old daemon silently missing new behavior).
+        if let Some(h) = &self.health {
+            if !h.version.is_empty() && h.version != env!("CARGO_PKG_VERSION") {
+                v.push(mk("Daemon build", Sev::Warn,
+                    format!("daemon v{} ≠ CLI v{} — reinstall/restart the daemon", h.version, env!("CARGO_PKG_VERSION")),
+                    Fix::Root("restart-daemon")));
+            }
+        }
+        // Blink challenge configured but the FaceMesh model isn't loaded: the
+        // challenge silently skips — surface it instead.
+        if self.challenge && self.health.as_ref().is_some_and(|h| !h.mesh) {
+            v.push(mk("Blink challenge", Sev::Fail,
+                "require-challenge is ON but FaceMesh isn't loaded — the challenge is skipped".into(),
+                Fix::Manual("set IRLUME_MESH_MODEL=<models/face_landmark.onnx> in the irlumed unit".into())));
+        }
+        // Fingerprint reader health: a crashed/aborted enrollment leaves the
+        // device CLAIMED and pam_fprintd fails silently (no finger prompt).
+        if self.fp.available {
+            if irlume_fingerprint::reader_stuck(&self.user) {
+                v.push(mk("Fingerprint reader", Sev::Fail,
+                    "reader is claimed by a stale session — finger prompts fail silently".into(),
+                    Fix::Root("restart-fprintd")));
+            } else {
+                v.push(mk("Fingerprint reader", Sev::Ok,
+                    format!("{} finger(s) enrolled", self.fp.enrolled.len()), Fix::None));
+            }
+        }
+        // Method ↔ PAM-wiring coherence: competing biometric stacks intercept
+        // each other's prompts; a chosen method that isn't wired does nothing.
+        let pam_has = |needle: &str| {
+            ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"].iter().any(|p|
+                std::fs::read_to_string(p).map(|s| s.contains(needle)).unwrap_or(false))
+        };
+        let fprintd_wired = pam_has("pam_fprintd");
+        match self.fp.method.as_str() {
+            "fingerprint" => {
+                if !fprintd_wired {
+                    v.push(mk("Method wiring", Sev::Fail,
+                        "method is fingerprint but pam_fprintd is not wired".into(),
+                        Fix::Manual("sudo irlume fingerprint enable --user <you>".into())));
+                } else if self.fp.enrolled.is_empty() {
+                    v.push(mk("Method wiring", Sev::Fail,
+                        "method is fingerprint but no finger is enrolled".into(),
+                        Fix::Root("fingerprint-add")));
+                } else {
+                    v.push(mk("Method wiring", Sev::Ok, "fingerprint drives; face stands down".into(), Fix::None));
+                }
+            }
+            _ if fprintd_wired && enrolled => {
+                v.push(mk("Method wiring", Sev::Warn,
+                    "fingerprint (pam_fprintd) AND face are both wired — prompts compete/intercept".into(),
+                    Fix::Manual("pick one: `sudo irlume fingerprint enable` or `... disable`".into())));
+            }
+            _ => {}
+        }
+        // Foreign face-auth modules left over from another tool hijack the same
+        // PAM slots (a leftover module intercepted the greeter in live testing).
+        for foreign in ["howdy", "linhello"] {
+            if pam_has(foreign) {
+                v.push(mk("Other face auth", Sev::Warn,
+                    format!("another face-auth module ({foreign}) is wired — it will conflict with irlume"),
+                    Fix::Manual(format!("remove the {foreign} lines from /etc/pam.d (or uninstall it)"))));
+            }
+        }
+        // RGB-only anti-spoof tuning: the moiré cue varies per camera (glasses
+        // reflecting the screen can spike it on a live face).
+        if self.health.as_ref().is_some_and(|h| h.tier == "convenience") {
+            v.push(mk("RGB anti-spoof", Sev::Ok,
+                "moiré screen-detector active — if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
+                Fix::None));
+        }
+        // AppArmor (Debian-family) parity with the SELinux check.
+        if std::path::Path::new("/sys/kernel/security/apparmor").exists() {
+            let profiled = std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
+            v.push(mk("AppArmor", if profiled { Sev::Ok } else { Sev::Warn },
+                if profiled { "irlume profile installed".into() }
+                else { "daemon unconfined — optional hardening profile available".into() },
+                if profiled { Fix::None }
+                else { Fix::Manual("install packaging/apparmor/usr.local.bin.irlumed (see repo)".into()) }));
+        }
+
         if let Some(r) = self.recovery {
             if r.encrypted && !r.recovery_set {
                 v.push(mk("Recovery backstop", Sev::Warn,
@@ -471,6 +559,8 @@ impl App {
             Fix::Daemon("ir-emitter") => self.start_op("SetupIrEmitter (auto-enable emitter)", Request::SetupIrEmitter { dry_run: false }),
             Fix::Daemon(_) => {}
             Fix::Root("restart-daemon") => { self.log('→', "sudo systemctl restart irlumed (you'll be asked for your password)"); self.suspend = Some(Suspend::RestartDaemon); }
+            Fix::Root("restart-fprintd") => { self.log('→', "sudo systemctl restart fprintd — releases a stale reader claim"); self.suspend = Some(Suspend::RestartFprintd); }
+            Fix::Root("fingerprint-add") => { self.log('→', "enrolling a finger (interactive)"); self.suspend = Some(Suspend::FingerprintAdd); }
             Fix::Root("selinux-load") => { self.log('→', "sudo irlume selinux load (you'll be asked for your password)"); self.suspend = Some(Suspend::SelinuxLoad); }
             Fix::Root(_) => {}
         }
@@ -623,6 +713,14 @@ impl App {
             Suspend::RestartDaemon => {
                 eprintln!("\nRestarting irlumed (sudo)…");
                 let _ = std::process::Command::new("sudo").args(["systemctl", "restart", "irlumed"]).status();
+            }
+            Suspend::RestartFprintd => {
+                // A stale device claim (crashed/aborted enrollment) makes
+                // pam_fprintd fail silently; restarting fprintd releases it.
+                eprintln!("\nRestarting fprintd (sudo) — releases a stale fingerprint-reader claim…");
+                let _ = std::process::Command::new("sudo")
+                    .args(["sh", "-c", "systemctl restart fprintd 2>/dev/null || pkill fprintd"])
+                    .status();
             }
             Suspend::SelinuxLoad => {
                 // Load the policy AND restart the daemon so the socket relabels to

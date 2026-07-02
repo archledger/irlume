@@ -257,6 +257,10 @@ pub enum Response {
         mesh: bool,
         /// IR domain adapter loaded.
         adapter: bool,
+        /// The daemon's crate version — lets the TUI flag a stale installed
+        /// build (daemon predating the CLI it's talking to).
+        #[serde(default)]
+        version: String,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),

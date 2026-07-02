@@ -86,11 +86,23 @@ pub const RGB_SPECULAR_MAX: f32 = 0.18;
 /// Calibrated on the Shinetech RGB cam: a real lit face read ~9–13; a high-PPI
 /// phone held VERY CLOSE (the best case for moiré) read only ~15–38 — and moiré
 /// weakens with distance, so at arm's length a replay would overlap real faces
-/// entirely. 18 never false-rejects an observed real face (max 13) and catches
-/// close-range replays (~23–38); marginal/distant screens slip. This is NOT a
-/// robust PAD — the real mitigation for RGB-only is the convenience-tier policy
-/// (lock-screen unlock only, never credential release). Re-tune per camera.
-pub const RGB_MOIRE_MAX: f32 = 18.0;
+/// entirely. This is NOT a robust PAD — the real mitigation for RGB-only is the
+/// convenience-tier policy (lock-screen unlock only, never credential release).
+///
+/// PER-CAMERA SPREAD IS REAL (cross-distro survey 2026-07-01): a live face reads
+/// 9–13 on the Zenbook's Shinetech but 18–27 on a ThinkPad Chicony — the old 18
+/// hard-rejected a real user on the latter, and the two cameras' live/replay
+/// ranges overlap so no universal threshold exists. 28 clears every observed
+/// live face and still catches the top of the close-replay band (~30–38);
+/// override per camera with IRLUME_RGB_MOIRE_MAX until enrollment-time
+/// per-camera baselining lands.
+pub const RGB_MOIRE_MAX: f32 = 28.0;
+
+/// The effective moiré ceiling: `IRLUME_RGB_MOIRE_MAX` env override (per-camera
+/// tuning, set on the daemon unit) or the built-in default.
+pub fn rgb_moire_max() -> f32 {
+    std::env::var("IRLUME_RGB_MOIRE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(RGB_MOIRE_MAX)
+}
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
 #[derive(Debug, Default, Clone)]
@@ -246,7 +258,7 @@ impl LivenessGate {
             return (Verdict::Spoof, cues,
                 "screen/glare detected (blown-out highlights) — RGB-only anti-spoof".into());
         }
-        if s.rgb_moire_score > RGB_MOIRE_MAX {
+        if s.rgb_moire_score > rgb_moire_max() {
             return (Verdict::Spoof, cues,
                 format!("screen pixel-grid/moiré pattern detected (peakiness {:.0}) — RGB-only anti-spoof", s.rgb_moire_score));
         }

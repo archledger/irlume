@@ -197,7 +197,16 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
                 use irlume_core::biopolicy::{classify, OperationClass};
-                let class = classify(service.as_deref().unwrap_or(""), false);
+                // "Warm" = the user already has a running session (their systemd
+                // runtime dir exists) — then an ambiguous greeter service (GDM
+                // drives cold login AND the lock screen through gdm-password) is
+                // a screen unlock, not a login. Caveat: lingering user services
+                // also create /run/user/<uid>; acceptable for the convenience
+                // tier where the worst case is unlocking a lock screen.
+                let warm = users::uid_for_name(&user)
+                    .map(|uid| std::path::Path::new(&format!("/run/user/{uid}")).exists())
+                    .unwrap_or(false);
+                let class = classify(service.as_deref().unwrap_or(""), warm);
                 if class != OperationClass::ScreenUnlock {
                     eprintln!("irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password", service.as_deref().unwrap_or("?"));
                     return Response::AuthResult { granted: false, score: 0.0, live: false,

@@ -24,6 +24,11 @@ const CREATED_PREFIX: &str = "# irlume: created from ";
 
 // Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
 const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
+/// Debian-family greeters (Ubuntu gdm-password): the stack is `@include`-based —
+/// a `success=N` jump cannot skip an include expansion — and GDM's conversation
+/// blocks on an active password probe, so wire a face-first `sufficient` line
+/// directly before the password include instead.
+const GREETER_UNSEAL_DEBIAN: &str = "auth       sufficient                   pam_irlume.so unseal facefirst";
 const PERMIT_LANDING: &str = "auth       optional                     pam_permit.so";
 const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so reseal";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
@@ -248,6 +253,29 @@ fn is_auth_directive(line: &str) -> bool {
 fn wire_greeter(content: &str) -> (String, bool) {
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
+    // Debian/Ubuntu layout: place a face-first `sufficient` line right before
+    // `@include common-auth` (password path). nologin/succeed_if above us still
+    // run; on face success the stack is satisfied; otherwise the password flows
+    // exactly as stock. Reseal stash goes after the include (post-password).
+    if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
+        let mut out = Vec::with_capacity(lines.len() + 3);
+        for (i, l) in lines.iter().enumerate() {
+            if i == inc_at {
+                out.push(GREETER_UNSEAL_DEBIAN.to_string());
+                out.push((*l).to_string());
+                out.push(RESEAL_AUTH.to_string());
+            } else if l.trim_start().starts_with("@include common-session") {
+                out.push((*l).to_string());
+                out.push(RESEAL_SESSION.to_string());
+            } else {
+                out.push((*l).to_string());
+            }
+        }
+        if !out.iter().any(|l| l == RESEAL_SESSION) {
+            out.push(RESEAL_SESSION.to_string());
+        }
+        return (format!("{}\n", out.join("\n")), true);
+    }
     let auth_at = lines.iter().position(|l| is_passwd_substack(l, "auth"))
         .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
     let sess_at = lines.iter().position(|l| is_passwd_substack(l, "session"));

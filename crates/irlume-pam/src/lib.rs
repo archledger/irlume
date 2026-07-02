@@ -52,6 +52,11 @@ impl PamServiceModule for IrlumePam {
         let unseal = args.iter().any(|a| a == "unseal");
         let wait = args.iter().any(|a| a == "wait");
         let reseal = args.iter().any(|a| a == "reseal");
+        // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
+        // active password probe until the user types (unlike plasmalogin/SDDM,
+        // which answer instantly from the buffered field) — so skip the probe and
+        // scan right away; a typed password still wins via the modules after us.
+        let facefirst = args.iter().any(|a| a == "facefirst");
 
         // `reseal` AUTH line (placed AFTER password-auth): STASH ONLY. We copy the
         // current PAM_AUTHTOK into PAM transaction data so the matching `reseal`
@@ -92,7 +97,7 @@ impl PamServiceModule for IrlumePam {
         //    a key is pressed, so an echo-off prompt from us would hijack the
         //    password field; and a TTY `sudo` should keep "just look at the camera"
         //    working without forcing the user to press Enter past a prompt first.
-        let typed = if unseal && !wait {
+        let typed = if unseal && !wait && !facefirst {
             pamh.get_authtok(Some("Password: "))
         } else {
             pamh.get_cached_authtok()
@@ -108,11 +113,18 @@ impl PamServiceModule for IrlumePam {
         // stack always cascades to the password (NIST: a fallback must exist).
         let deadline = Instant::now() + WAIT_BUDGET;
         loop {
-            let attempt = if unseal {
+            let mut attempt = if unseal {
                 try_unseal(&pamh, &user)
             } else {
                 try_verify(&pamh, &user)
             };
+            // GDM drives BOTH the cold greeter and the live lock screen through
+            // one service. Unsealing is refused on the convenience tier (and on
+            // an un-armed keyring) — a warm screen unlock only needs identity,
+            // so fall back to a plain verify before giving up to the password.
+            if facefirst && unseal && attempt != PamError::SUCCESS {
+                attempt = try_verify(&pamh, &user);
+            }
             if attempt == PamError::SUCCESS {
                 return PamError::SUCCESS;
             }

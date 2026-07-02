@@ -83,6 +83,45 @@ Positive: adaptive screen sets correct on both (5 vs 10), recommendation
 lines accurate, fingerprint integration worked untouched on Ubuntu,
 `/usr/lib/pam.d` materialization already encoded, wrap-around nav clean.
 
+## Part 2 — Ubuntu live e2e (same night): GDM, tier policy, fingerprint
+
+All F1–F14 fixed (commit `46a88c1`) and re-verified on all three hosts. Then
+the full Ubuntu end-to-end with the user at the ThinkPad surfaced four more,
+all fixed and live-validated (`7ba956a`, `1eefa98`):
+
+15. **GDM blocks the active password probe** (plasmalogin/SDDM answer it
+    instantly from the buffered field) — face never ran. Fix: `facefirst`
+    module flag (skip probe, scan immediately; typed password still wins) +
+    unseal→verify fallback for tier/keyring refusals.
+16. **Debian `@include` stacks can't be jump-wired** (`success=N` cannot skip
+    an include expansion) — `wire_greeter` gained a Debian branch: face-first
+    `sufficient` line directly before `@include common-auth`.
+17. **Daemon classified with hardcoded cold sessions** — gdm-password would
+    deny warm screen-unlocks on the convenience tier. Fix: warm =
+    `/run/user/<uid>` exists.
+18. **Configured method wasn't enforced** — `fingerprint enable` claimed face
+    was disabled but the daemon kept granting it. Authenticate/UnsealPassword
+    now refuse instantly when the method disables face.
+
+Also: the moiré cue's per-camera spread is fatal for a universal threshold
+(live face 9–13 on Shinetech vs 18–27 on the ThinkPad Chicony, spiking to 70
+with glasses reflecting the screen). Default raised 18→28 +
+`IRLUME_RGB_MOIRE_MAX` override (disabled on the ThinkPad unit); durable fix
+is enrollment-time per-camera baselining.
+
+**Validated live on Ubuntu 26.04/GDM:** RGB enrollment via TUI; identify
+0.61–0.96 with and without glasses (enrolled without); `Super+L` face unlock
+through the real PAM path; cold login/sudo correctly kept the password
+(convenience tier); AppArmor profile flipped to **enforce** after a
+zero-denial complain audit of the full unlock path; `irlume fingerprint
+enable` wired pam_fprintd via pam-auth-update — sudo and lock screen then
+prompt for and accept the finger, with face standing down instantly.
+Ops note: a failed fprintd enrollment leaves the reader claimed — restart
+fprintd before diagnosing pam_fprintd silence. Roadmap: TPM-unseal on
+fingerprint match (would give fingerprint the keyring-unlock power face has
+on Secure-tier boxes); `fingerprint enable` should default `--user` to
+SUDO_USER.
+
 ## Distribution strategy (draft — verify specifics at implementation)
 
 - **Fedora**: RPM in Copr built from GitHub via Packit on signed tags —

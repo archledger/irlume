@@ -278,28 +278,35 @@ impl Engine {
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
     /// natural blink → Blinked, static vinyl banner → NoBlink.
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
-        const SAMPLES: usize = 40; // ~5s window (de-strobed) — raises natural-blink capture
-        const BURST: usize = 2; // de-strobe the pulsing emitter
+        // Raw frame rate (~15 fps, no de-strobe burst): the detector separates
+        // emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
+        // spans only 2–3 raw frames — halving the rate loses it (measured 2026-07-01).
+        const SAMPLES: usize = 75; // ~5s window
+        const BURST: usize = 1;
         let Some(mesh) = self.mesh.as_mut() else {
             // No landmark model: can't run the passive gate. Signal NoEyes so the
             // caller can decide (challenge_if_required skips when mesh is absent).
             return Ok(irlume_liveness::BlinkResult::NoEyes);
         };
         let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, SAMPLES, BURST)?;
-        // Per-frame EAR (smaller eye); skip frames with no detected face (a missed
-        // detection must not masquerade as a blink).
-        let mut ears = Vec::with_capacity(frames.len());
-        for f in &frames {
+        // Per-frame EAR (smaller eye). Frames with no detected face carry ear=None
+        // (a missed detection must not masquerade as a blink) but keep their
+        // brightness so the detector can classify the emitter strobe.
+        let mut samples = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
             let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
             let view = align::RgbView { data: &grey_rgb, width: f.width, height: f.height };
+            let mut ear = None;
             if let Some(t) = self.det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                 let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
                 let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
                 let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-                ears.push(l.min(r));
+                ear = Some(l.min(r));
             }
+            samples.push(irlume_liveness::EarSample { idx: i, ear, bri });
         }
-        Ok(irlume_liveness::detect_blink(&ears))
+        Ok(irlume_liveness::detect_blink(&samples))
     }
 
     /// If the user opted into passive liveness and we're about to grant, require a

@@ -828,9 +828,10 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
         eprintln!("  to record a PAD-style validation run: --species NAME --kind bonafide|attack --out ear.jsonl");
         return std::process::ExitCode::from(2);
     };
-    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(40);
-    let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(75);
+    let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(1);
     let reps: usize = flag(args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let trace_on = args.iter().any(|a| a == "--trace");
     // Optional recording (reuses the padreport JSONL format: Blinked→Live,
     // NoBlink→Uncertain/non-response, NoEyes→Spoof).
     let record = match (flag(args, "--species"), flag(args, "--kind"), flag(args, "--out")) {
@@ -854,18 +855,33 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
             // contrast over the window. Banner ≤70, no-glasses live ~120 — the open
             // question is where glasses-genuine lands (does it clear the floor?).
             let mut contrast_max = 0.0f32;
-            for f in &frames {
+            // Full EarSample stream (index + EAR-if-face + frame brightness): the
+            // brightness column doubles as an emitter duty-cycle probe in dark rooms.
+            let mut samples: Vec<irlume_liveness::EarSample> = Vec::new();
+            for (i, f) in frames.iter().enumerate() {
+                let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
                 let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
                 let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: f.width, height: f.height };
+                let mut ear_i = None;
                 if let Some(t) = det.detect(&iv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                     let lm = mesh.landmarks(&iv, &t.bbox, 0.25)?;
                     let ear = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT)
                         .min(irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT));
                     ears.push(ear);
+                    ear_i = Some(ear);
                     contrast_max = contrast_max.max(irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks));
                 }
+                samples.push(irlume_liveness::EarSample { idx: i, ear: ear_i, bri });
             }
-            let verdict = irlume_liveness::detect_blink(&ears);
+            if trace_on {
+                for s in &samples {
+                    match s.ear {
+                        Some(e) => println!("    trace {:>3}  ear {e:.3}  bri {:>5.1}", s.idx, s.bri),
+                        None => println!("    trace {:>3}  ear   -    bri {:>5.1}  (no face)", s.idx, s.bri),
+                    }
+                }
+            }
+            let verdict = irlume_liveness::detect_blink(&samples);
             let (vs, live) = match verdict {
                 irlume_liveness::BlinkResult::Blinked => ("Live", true),
                 irlume_liveness::BlinkResult::NoBlink => ("Uncertain", false),

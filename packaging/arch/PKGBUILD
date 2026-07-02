@@ -1,0 +1,41 @@
+# Maintainer: archledger <archledger236@gmail.com>
+pkgname=irlume
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local IR face authentication for Linux (clean-BOM, TPM-sealed)"
+arch=('x86_64')
+url="https://github.com/archledger/irlume"
+license=('GPL-3.0-or-later')
+# Arch's system onnxruntime is current (>=1.24) — a plain runtime dep.
+depends=('onnxruntime' 'tpm2-tss' 'pam')
+optdepends=('fprintd: fingerprint companion factor')
+makedepends=('rust' 'cargo' 'gcc' 'git-lfs')
+# Models ride in the tag via Git LFS; the tag tarball from GitHub includes the
+# LFS objects, so build from the git tag to get real weights (not pointers).
+source=("git+https://github.com/archledger/irlume.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+install=irlume.install
+
+prepare() {
+    cd "$srcdir/$pkgname"
+    git lfs install --local
+    git lfs pull
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+    install -Dm0755 target/release/irlumed "$pkgdir/usr/bin/irlumed"
+    install -Dm0755 target/release/irlume  "$pkgdir/usr/bin/irlume"
+    install -Dm0644 target/release/libpam_irlume.so "$pkgdir/usr/lib/security/pam_irlume.so"
+    for m in glintr100 face_detection_yunet_2023mar face_landmark ir_adapter; do
+        install -Dm0644 "models/$m.onnx" "$pkgdir/usr/share/irlume/models/$m.onnx"
+    done
+    install -Dm0644 packaging/systemd/irlumed.service "$pkgdir/usr/lib/systemd/system/irlumed.service"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

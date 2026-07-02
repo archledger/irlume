@@ -1,0 +1,21 @@
+post_install() {
+    systemctl daemon-reload
+    systemctl enable --now irlumed.service 2>/dev/null || true
+    cat <<'EOF'
+irlume installed. Next steps:
+  irlume ir-setup                 # enable the 850nm IR emitter (once)
+  irlume tui                      # enroll your face + configure
+  sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
+Arch has no SELinux/AppArmor by default; the SO_PEERCRED + socket-group
+boundary is the daemon's protection. Password is always the fallback.
+EOF
+}
+
+post_upgrade() {
+    systemctl daemon-reload
+    systemctl try-restart irlumed.service 2>/dev/null || true
+}
+
+pre_remove() {
+    systemctl disable --now irlumed.service 2>/dev/null || true
+}

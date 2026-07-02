@@ -1,0 +1,62 @@
+# nfpm manifest for the Debian/Ubuntu .deb (distributed via GitHub Releases).
+# Build with:  bash packaging/debian/build-deb.sh   (stages files, then nfpm pkg)
+#
+# Bundles onnxruntime because the Ubuntu/Debian archive ships 1.22 but irlume
+# needs >=1.24 (the api-24 pin). Everything else is a normal dependency.
+name: irlume
+arch: amd64
+platform: linux
+version: v0.1.0
+section: admin
+priority: optional
+maintainer: archledger <archledger236@gmail.com>
+description: |
+  Local IR face authentication for Linux (clean-BOM, TPM-sealed).
+  Thin PAM module + privileged daemon owning the IR (Windows Hello) camera;
+  YuNet + AuraFace with algorithmic IR liveness; TPM-sealed keyring unlock.
+  Password is always the fallback.
+vendor: irlume
+homepage: https://github.com/archledger/irlume
+license: GPL-3.0-or-later
+
+depends:
+  - libpam0g
+  - libtss2-esys-3.0.2-0 | libtss2-esys-3.0.2-0t64
+recommends:
+  - fprintd
+
+contents:
+  - src: ../../target/release/irlumed
+    dst: /usr/bin/irlumed
+  - src: ../../target/release/irlume
+    dst: /usr/bin/irlume
+  - src: ../../target/release/libpam_irlume.so
+    dst: /usr/lib/x86_64-linux-gnu/security/pam_irlume.so
+  # Bundled models (Git LFS pulled before build)
+  - src: ../../models/glintr100.onnx
+    dst: /usr/share/irlume/models/glintr100.onnx
+  - src: ../../models/face_detection_yunet_2023mar.onnx
+    dst: /usr/share/irlume/models/face_detection_yunet_2023mar.onnx
+  - src: ../../models/face_landmark.onnx
+    dst: /usr/share/irlume/models/face_landmark.onnx
+  - src: ../../models/ir_adapter.onnx
+    dst: /usr/share/irlume/models/ir_adapter.onnx
+  # Bundled onnxruntime (>=1.24) staged by build-deb.sh
+  - src: ../../.deb-staging/onnxruntime/lib/
+    dst: /opt/irlume/onnxruntime/lib/
+  # systemd unit + an override pointing ORT at the bundled lib
+  - src: ../systemd/irlumed.service
+    dst: /usr/lib/systemd/system/irlumed.service
+  - src: ../../.deb-staging/10-ort.conf
+    dst: /usr/lib/systemd/system/irlumed.service.d/10-ort.conf
+  # AppArmor profile (ships in complain mode; see the profile header)
+  - src: ../apparmor/usr.bin.irlumed
+    dst: /etc/apparmor.d/usr.bin.irlumed
+  - src: ../../LICENSE
+    dst: /usr/share/doc/irlume/LICENSE
+  - src: ../../README.md
+    dst: /usr/share/doc/irlume/README.md
+
+scripts:
+  postinstall: ./postinstall.sh
+  preremove: ./preremove.sh

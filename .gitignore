@@ -12,3 +12,5 @@ Cargo.lock
 # models/README.md) so a clone/package is self-contained. The one exception:
 # the superseded v1 adapter backup, kept locally for revert, never shipped.
 models/ir_adapter.onnx.v1-256
+.deb-staging
+irlume_*.deb

@@ -1,0 +1,32 @@
+# Packit: build irlume RPMs in Copr from signed GitHub tags (the linhello
+# pipeline). Models are Git LFS — Copr's srpm build must pull them.
+specfile_path: packaging/fedora/irlume.spec
+upstream_package_name: irlume
+downstream_package_name: irlume
+
+srpm_build_deps:
+  - git-lfs
+
+actions:
+  post-upstream-clone:
+    - git lfs install
+    - git lfs pull
+
+jobs:
+  - job: copr_build
+    trigger: release
+    owner: archledger
+    project: irlume
+    targets:
+      - fedora-stable
+      - fedora-rawhide
+    # irlume's own onnxruntime Copr provides the >=1.24 dependency.
+    additional_repos:
+      - "copr://archledger/linhello"
+
+  - job: copr_build
+    trigger: pull_request
+    owner: archledger
+    project: irlume
+    targets:
+      - fedora-stable

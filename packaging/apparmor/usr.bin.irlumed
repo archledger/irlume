@@ -1,0 +1,67 @@
+# AppArmor profile for the irlume face-authentication daemon (Debian/Ubuntu
+# parity with the Fedora SELinux module in packaging/selinux/).
+#
+# Ship-in-COMPLAIN first: install, exercise every auth path (enroll, verify,
+# lock screen, TUI), check `journalctl -k | grep -i apparmor` for would-be
+# denials, then flip to enforce. Authentication must never break on a policy
+# gap — the profile is defense-in-depth, not the security boundary.
+#
+# Install:  cp usr.local.bin.irlumed /etc/apparmor.d/ && apparmor_parser -r -C /etc/apparmor.d/usr.local.bin.irlumed
+# Enforce:  aa-enforce /etc/apparmor.d/usr.local.bin.irlumed
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile irlumed /usr/bin/irlumed flags=(complain) {
+  include <abstractions/base>
+  # uid→name lookups for SO_PEERCRED authz (/etc/nsswitch.conf, passwd, group).
+  include <abstractions/nameservice>
+
+  /usr/bin/irlumed mr,
+
+  # Device-class enumeration (camera discovery walks /sys/class).
+  /sys/class/ r,
+  /sys/class/*/ r,
+
+  # ONNX Runtime (mmap-exec): system lib dirs or a versioned /opt install.
+  /usr/lib{,64}/libonnxruntime*.so* mr,
+  /usr/local/lib/libonnxruntime*.so* mr,
+  /opt/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
+  /opt/onnxruntime-*/lib/libonnxruntime*.so* mr,
+
+  # Models: packaged location or a hand-installed repo checkout.
+  /usr/share/irlume/models/*.onnx r,
+  /home/*/irlume/models/*.onnx r,
+
+  # Cameras: capture nodes + the sysfs identity walk of the anti-injection
+  # camera pinning (canonicalized device path, USB ids, privacy switch).
+  /dev/video[0-9]* rw,
+  /sys/class/video4linux/ r,
+  /sys/class/video4linux/** r,
+  /sys/devices/** r,
+
+  # IPC socket (thin PAM module and CLI connect here; SO_PEERCRED authz).
+  /run/irlume.sock rw,
+
+  # TPM (template-key sealing, keyring unlock).
+  /dev/tpmrm[0-9] rw,
+  /dev/tpm[0-9] rw,
+
+  # Config + state: enrollments (per-user), template keys, recovery blobs.
+  /etc/irlume/ r,
+  /etc/irlume/** rw,
+  /home/*/.local/share/irlume/ rw,
+  /home/*/.local/share/irlume/** rw,
+  /var/lib/irlume/ rw,
+  /var/lib/irlume/** rw,
+
+  # Camera-busy diagnostics name the process holding the device.
+  /proc/ r,
+  /proc/[0-9]*/fd/ r,
+  /proc/[0-9]*/comm r,
+  /proc/[0-9]*/cmdline r,
+
+  # Reading another user's state dir as the root daemon.
+  capability dac_override,
+  capability dac_read_search,
+}

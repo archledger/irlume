@@ -8,6 +8,100 @@ use crate::{daemon_request, tpm_device, user_arg};
 use irlume_common::{Request, Response};
 use std::process::ExitCode;
 
+/// `irlume update` — check for a newer release and give family-appropriate
+/// instructions. Family-aware by design (see docs/cross-distro): each distro
+/// owns updates its own way, so irlume never fights the package manager — it
+/// checks the latest GitHub release and prints the right command per family
+/// (or performs it where that's idiomatic). No network library is bundled; we
+/// shell out to curl for the version check and skip gracefully if it's absent.
+pub fn update(_args: &[String]) -> ExitCode {
+    use irlume_common::platform::{distro_family, DistroFamily};
+    let current = env!("CARGO_PKG_VERSION");
+    println!("[update] installed: v{current}");
+
+    let latest = latest_release_tag();
+    match &latest {
+        Some(tag) => {
+            let newer = version_gt(tag.trim_start_matches('v'), current);
+            if newer {
+                println!("[update] available: {tag}  →  a newer release is out.");
+            } else {
+                println!("[update] up to date (latest release is {tag}).");
+                return ExitCode::SUCCESS;
+            }
+        }
+        None => println!("[update] couldn't reach the release feed (offline?) — showing the update method for this system:"),
+    }
+
+    match distro_family() {
+        DistroFamily::Fedora => {
+            println!("  Fedora: sudo dnf upgrade irlume");
+            println!("          (from the Copr; `dnf copr enable archledger/irlume` once, if not already)");
+        }
+        DistroFamily::Arch => {
+            println!("  Arch: update via your AUR helper — e.g.  yay -S irlume   (or paru -S irlume)");
+            println!("        (irlume doesn't self-update on Arch; the AUR helper owns package updates)");
+        }
+        DistroFamily::Debian => {
+            println!("  Debian/Ubuntu: sudo apt update && sudo apt install --only-upgrade irlume");
+            println!("          (if installed from a .deb: download the new .deb from the release page and `sudo apt install ./irlume_*.deb`)");
+        }
+        DistroFamily::Other => {
+            println!("  This distro isn't packaged yet — build from source at the tag:");
+            println!("    git -C <clone> fetch --tags && git checkout {}", latest.as_deref().unwrap_or("<latest>"));
+            println!("    git lfs pull && cargo build --release && sudo bash scripts/install-host.sh --ort <libonnxruntime.so>");
+        }
+    }
+    println!("  Release notes: https://github.com/archledger/irlume/releases");
+    ExitCode::SUCCESS
+}
+
+/// Best-effort latest release tag from the GitHub API via curl. None if curl is
+/// missing, offline, or the response can't be parsed — the caller degrades to
+/// just printing the update method.
+fn latest_release_tag() -> Option<String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "8",
+            "https://api.github.com/repos/archledger/irlume/releases/latest",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    // Tiny scan for "tag_name": "vX.Y.Z" — avoids a JSON dependency for one field.
+    let key = "\"tag_name\"";
+    let i = body.find(key)?;
+    let after = &body[i + key.len()..];
+    let colon = after.find(':')?;
+    let q1 = after[colon..].find('"')? + colon + 1;
+    let q2 = after[q1..].find('"')? + q1;
+    Some(after[q1..q2].to_string())
+}
+
+/// True if dotted version `a` is strictly greater than `b` (numeric per field,
+/// missing fields = 0). Pre-release suffixes are ignored (compared as the base).
+fn version_gt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split(|c: char| c == '.' || c == '-')
+            .take_while(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
+    };
+    let (va, vb) = (parse(a), parse(b));
+    for i in 0..va.len().max(vb.len()) {
+        let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
 const OK: &str = "\u{2705}";
 const WARN: &str = "\u{26a0}";
 const NO: &str = "\u{2717}";
@@ -424,6 +518,7 @@ SYSTEM INTEGRATION
   fingerprint <status|add|enable|disable>   fprintd companion factor
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter
+  update                          check for a newer release (family-aware)
 
 CAMERA / DEV
   capture | liveness | meshprobe | tui   capture/liveness/EAR probes; the UI

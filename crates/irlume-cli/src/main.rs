@@ -48,6 +48,7 @@ fn main() -> std::process::ExitCode {
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
+        (Some("update"), _) => commands::update(&args),
         (Some("doctor"), _) => doctor(),
         (Some("normprobe"), _) => normprobe(&args),
         (Some("status"), _) => commands::status(&args),

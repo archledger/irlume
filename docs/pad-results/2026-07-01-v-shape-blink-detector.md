@@ -54,8 +54,16 @@ password. Same test was 0/11 in the morning.
 
 ## Remaining follow-ups
 
-- Camera: stream-death (constant-144 frames) recovery + dark-start AE blowout
-  handling — until then dark rooms often non-respond (→ password, safe).
+- Camera stream-death recovery + saturation skip SHIPPED same day (see
+  `capture_ir_sequence`): bit-identical mid-grey frames → stream re-arm (≤4,
+  after 2 consecutive), blown frames (≥245) skipped, attempt budget 2×+30.
+  Validated: the infinite constant-144 lock is gone (recoveries observed,
+  one dark meshprobe rep went n=0 → n=11/Live). **Residual dark-room gap:**
+  in near-total darkness auto-exposure pumps blown↔grey-fault and each re-arm
+  resets the settle; real daemon path (exposure pre-warmed by the match scan)
+  granted 3/8 sudo attempts in a dark room (was 0). The full fix is a
+  warm-stream refactor — hold ONE IR stream across match scan + passive window
+  so exposure never resets mid-auth (also shaves the reopen latency).
 - Glasses UX: half the reps read NoEyes because the glasses baseline (~0.13–0.14)
   sits under `BLINK_MIN_OPEN_EAR` (0.15). Lowering toward 0.12 would likely
   raise the glasses catch rate — needs a spoof-side check first.

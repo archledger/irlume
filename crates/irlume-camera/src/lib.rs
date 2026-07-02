@@ -568,29 +568,78 @@ pub fn capture_ir_sequence(device: &str, samples: usize, burst: usize) -> irlume
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
-        .map_err(|e| map_io(device, e))?;
+    let mut stream = Some(
+        v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+            .map_err(|e| map_io(device, e))?,
+    );
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     ir_emitter::enable(dev.handle().fd(), &card);
+    // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
+    // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
+    // constant mid-grey for the rest of the window) — real sensor noise never
+    // repeats exactly. Saturated and near-black frames are excluded from the
+    // check: those are optical states (exposure blow-out / emitter-off phase),
+    // not a stall, and restarting mid-settle only prolongs the settle.
+    let sig_of = |data: &[u8]| -> Vec<u8> {
+        let stride = (data.len() / 64).max(1);
+        data.iter().step_by(stride).take(64).copied().collect()
+    };
     let mut frames = Vec::with_capacity(samples);
-    for s in 0..samples {
+    // Attempt budget: enough spare frames to ride out the ~1 s dark-start
+    // exposure settle and a stream restart without starving the window, while
+    // bounding worst-case wall time (~2x window) when the camera stays sick.
+    let max_attempts = samples * 2 + 30;
+    let (mut dead_run, mut restarts) = (0usize, 0usize);
+    let mut last_sig: Option<Vec<u8>> = None;
+    for attempt in 0..max_attempts {
+        if frames.len() >= samples {
+            break;
+        }
         // Keep the emitter lit across the whole window (some controls self-clear).
-        if s % 8 == 0 {
+        if attempt % 8 == 0 {
             ir_emitter::enable(dev.handle().fd(), &card);
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
         for _ in 0..burst {
-            let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            let (buf, _meta) = stream
+                .as_mut()
+                .expect("IR stream present")
+                .next()
+                .map_err(|e| map_io(device, e))?;
             let mean = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
             if mean > best_mean {
                 best_mean = mean;
                 best = Some(buf.to_vec());
             }
         }
-        if let Some(data) = best {
-            frames.push(Frame { width: w, height: h, spectrum: Spectrum::Ir, data });
+        let Some(data) = best else { continue };
+        let sig = sig_of(&data);
+        let frozen = (10.0..245.0).contains(&best_mean)
+            && last_sig.as_deref() == Some(sig.as_slice());
+        last_sig = Some(sig);
+        if frozen {
+            dead_run += 1;
+            if dead_run >= 2 && restarts < 4 {
+                restarts += 1;
+                dead_run = 0;
+                last_sig = None;
+                stream = None; // stop + release buffers before re-arming
+                stream = Some(
+                    v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+                        .map_err(|e| map_io(device, e))?,
+                );
+                ir_emitter::enable(dev.handle().fd(), &card);
+            }
+            continue;
         }
+        dead_run = 0;
+        if best_mean >= 245.0 {
+            // Exposure blow-out: no face is detectable in a saturated frame —
+            // skip it rather than spend a window slot on it.
+            continue;
+        }
+        frames.push(Frame { width: w, height: h, spectrum: Spectrum::Ir, data });
     }
     Ok(frames)
 }

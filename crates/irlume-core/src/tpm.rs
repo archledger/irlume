@@ -363,9 +363,24 @@ fn with_srk<T>(
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
         match seal_authorized(secret) {
-            Ok(env) => return Ok(env),
-            // Don't fail arming because the signed path had a problem — fall back
-            // to the universally-available literal seal.
+            // A signed seal can SUCCEED yet be un-unsealable on this boot: the
+            // artifacts under /run/systemd are systemd's, signed for a PCR-11
+            // value that only matches a UKI/measured-boot chain. On a GRUB box
+            // (or any host where those don't correspond to the live PCRs) the
+            // envelope seals fine but PolicyAuthorize fails at unseal (TPM
+            // 0x4c4) — the "sealed but unusable" trap that broke enrollment.
+            // So round-trip it: only trust the authorized envelope if it
+            // actually unseals right now; otherwise fall back to the literal
+            // PCR seal, which is bound to values we read from this TPM.
+            Ok(env) => match unseal(&env) {
+                Ok(rt) if rt.as_slice() == secret => return Ok(env),
+                Ok(_) => eprintln!(
+                    "irlume: signed-PCR seal round-trip mismatch; falling back to literal PCR seal"
+                ),
+                Err(e) => eprintln!(
+                    "irlume: signed-PCR seal doesn't unseal on this boot ({e}); falling back to literal PCR seal"
+                ),
+            },
             Err(e) => eprintln!(
                 "irlume: signed-PCR seal unavailable ({e}); falling back to literal PCR seal"
             ),

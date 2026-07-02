@@ -661,7 +661,17 @@ impl App {
         if let Some(op) = &self.op {
             if let Ok((ok, msg)) = op.rx.try_recv() {
                 let tag = op.tag;
-                if ok { self.log('✓', msg.clone()); } else { self.set_error(msg.clone()); }
+                // The IR self-test shows its own result line on the Repair screen;
+                // a normal "no face / uncertain" outcome shouldn't also raise the
+                // alarming error modal (that's for genuine failures like a busy
+                // camera). Identify/Generic keep the modal on failure.
+                if ok {
+                    self.log('✓', msg.clone());
+                } else if !matches!(tag, OpTag::Calibrate) {
+                    self.set_error(msg.clone());
+                } else {
+                    self.log('·', msg.clone());
+                }
                 match tag {
                     OpTag::Identify => self.identify_result = Some((ok, msg)),
                     OpTag::Calibrate => self.selftest_result = Some((ok, msg)),
@@ -1529,8 +1539,17 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(section("What each does"));
-        lines.push(Line::from(Span::styled("  greeter: face → TPM-unseal password → wallet opens at login", Style::new().dim())));
-        lines.push(Line::from(Span::styled("  lock screen: face verify-only (wallet already open)", Style::new().dim())));
+        // Tier-accurate: only the Secure (IR) tier releases the login credential
+        // at the greeter. On a convenience (RGB-only) box face is lock-screen
+        // only — describing keyring-unseal there would be a false promise.
+        let convenience = self.health.as_ref().is_some_and(|h| h.tier == "convenience");
+        if convenience {
+            lines.push(Line::from(Span::styled("  greeter (RGB-only): face is NOT accepted for login — password only", Style::new().dim())));
+            lines.push(Line::from(Span::styled("  lock screen: face unlocks the screen (no credential release)", Style::new().dim())));
+        } else {
+            lines.push(Line::from(Span::styled("  greeter: face → TPM-unseal password → wallet opens at login", Style::new().dim())));
+            lines.push(Line::from(Span::styled("  lock screen: face verify-only (wallet already open)", Style::new().dim())));
+        }
         lines.push(Line::from(Span::styled("  always fail-safe to the password — no lockout.", Style::new().dim())));
         lines.push(Line::raw(""));
         lines.push(section("Change (root)"));

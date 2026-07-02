@@ -564,6 +564,26 @@ impl App {
             }
         }
 
+        // TPM presence: without one, templates are root-only plaintext (not
+        // encrypted at rest) and keyring auto-unlock can't be armed at all.
+        // Face login + sudo still work — this only bounds at-rest hardening and
+        // the wallet-on-login convenience. Info, not a failure.
+        let tpm = self.recovery.map(|r| r.tpm_present).unwrap_or_else(|| crate::tpm_device().is_some());
+        if !tpm {
+            v.push(mk("TPM", Sev::Warn,
+                "no TPM — templates stored root-only plaintext; keyring auto-unlock unavailable (face login/sudo still work)".into(),
+                Fix::Manual("optional: enable the firmware TPM (fTPM/PTT) in BIOS, then re-enroll to encrypt at rest".into())));
+        } else {
+            // Secure Boot binds the TPM seal to the boot state (PCR-7). Off ⇒ the
+            // seal still works but isn't tamper-bound to a trusted boot chain.
+            use irlume_common::secureboot;
+            if secureboot::secure_boot_present() && !secureboot::is_secure_boot_enabled() {
+                v.push(mk("Secure Boot", Sev::Warn,
+                    "Secure Boot is OFF — TPM seals still work but aren't bound to a trusted boot chain (weaker tamper resistance)".into(),
+                    Fix::Manual("optional: enable Secure Boot in firmware for boot-state-bound sealing".into())));
+            }
+        }
+
         self.repair = v;
         if self.repair_sel >= self.repair.len().max(1) { self.repair_sel = self.repair.len().saturating_sub(1); }
     }

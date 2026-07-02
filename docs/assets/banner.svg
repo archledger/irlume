@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="240" viewBox="0 0 860 240" role="img" aria-label="irlume — infrared face authentication for Linux">
+  <defs>
+    <linearGradient id="ir" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c1d3f"/>
+      <stop offset="0.5" stop-color="#c0304f"/>
+      <stop offset="1" stop-color="#ff6a3d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff6a3d" stop-opacity="0.9"/>
+      <stop offset="0.6" stop-color="#c0304f" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#c0304f" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wordmark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f5f5f7"/>
+      <stop offset="1" stop-color="#c9ccd3"/>
+    </linearGradient>
+  </defs>
+
+  <!-- own dark panel so the light wordmark reads in BOTH GitHub themes -->
+  <rect x="0" y="0" width="860" height="240" rx="24" fill="#0d1117"/>
+  <rect x="1.5" y="1.5" width="857" height="237" rx="22.5" fill="none" stroke="#c0304f" stroke-opacity="0.25" stroke-width="1.5"/>
+
+  <!-- IR scanner iris mark -->
+  <g transform="translate(120,120)">
+    <circle r="86" fill="url(#glow)"/>
+    <circle r="62" fill="none" stroke="url(#ir)" stroke-width="6"/>
+    <circle r="30" fill="none" stroke="url(#ir)" stroke-width="10"/>
+    <circle r="8" fill="#ff6a3d"/>
+    <!-- scan sweep -->
+    <line x1="-62" y1="0" x2="62" y2="0" stroke="#ff6a3d" stroke-width="2.5" opacity="0.55"/>
+    <!-- corner brackets: "recognized" framing -->
+    <g stroke="url(#ir)" stroke-width="5" fill="none" stroke-linecap="round">
+      <path d="M -84 -58 l 0 -22 l 22 0"/>
+      <path d="M 84 -58 l 0 -22 l -22 0"/>
+      <path d="M -84 58 l 0 22 l 22 0"/>
+      <path d="M 84 58 l 0 22 l -22 0"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="238" y="118" font-family="'Segoe UI',Helvetica,Arial,sans-serif" font-size="82" font-weight="700" fill="url(#wordmark)" letter-spacing="-2">irlume</text>
+  <text x="240" y="160" font-family="'Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="500" fill="#9aa0aa">infrared face authentication for Linux</text>
+  <text x="240" y="192" font-family="'SF Mono','Consolas',monospace" font-size="15" fill="#7c8593">clean-BOM · TPM-sealed · privacy by design</text>
+</svg>

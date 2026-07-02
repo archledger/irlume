@@ -1,17 +1,14 @@
 /target
 **/*.rs.bk
 Cargo.lock
-# Bundled model weights are committed deliberately (see models/); but never
-# commit captured frames, templates, or any biometric data:
+
+# Never commit captured frames, templates, or any biometric data:
 *.onnx.tmp
 /var
 *.embedding
 *.template
 
-# Model weights are fetched into models/ (see models/README.md), not committed
-# to git — glintr100.onnx is 261MB and GitHub blocks >100MB without LFS.
-models/*.onnx
-
-# but DO keep our own tiny trained adapter
-!models/ir_adapter.onnx
+# Model weights are ALL bundled in-repo via Git LFS (see .gitattributes +
+# models/README.md) so a clone/package is self-contained. The one exception:
+# the superseded v1 adapter backup, kept locally for revert, never shipped.
 models/ir_adapter.onnx.v1-256

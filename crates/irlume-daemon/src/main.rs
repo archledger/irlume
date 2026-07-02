@@ -77,6 +77,22 @@ fn main() {
     }
     eprintln!("irlumed: listening on {socket}");
 
+    // Socket watchdog: if our socket file is deleted/replaced out from under us
+    // (a stale-runtime cleanup, a botched reinstall), the bound fd keeps working
+    // but no client can ever connect again — a silent outage. Detect it and exit
+    // so systemd (Restart=on-failure) re-binds a fresh socket. Self-heals what
+    // the Repair tab otherwise needs a manual restart for.
+    {
+        let socket = socket.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if !std::path::Path::new(&socket).exists() {
+                eprintln!("irlumed: socket {socket} vanished — exiting for a clean re-bind");
+                std::process::exit(1);
+            }
+        });
+    }
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {

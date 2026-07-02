@@ -205,6 +205,9 @@ struct App {
     /// Live daemon reachability (a real Ping, refreshed each tick) — not a
     /// hardcoded socket-path check.
     daemon_up: bool,
+    /// Last ListProfiles error (corrupt enrollment / missing template key) —
+    /// distinguishes "file broken" from "no profiles" on the Repair tab.
+    enroll_error: Option<String>,
     /// Daemon self-report (Request::Health): its camera tier and loaded models —
     /// ground truth for the Repair rows (static path probes lie when the daemon
     /// runs with its own env, e.g. a packaged install).
@@ -263,7 +266,7 @@ impl App {
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
             identify_result: None, selftest_result: None,
-            repair: Vec::new(), repair_sel: 0, cam_sel: 0, error: None, daemon_up: false, health: None, act_scroll: 0,
+            repair: Vec::new(), repair_sel: 0, cam_sel: 0, error: None, daemon_up: false, enroll_error: None, health: None, act_scroll: 0,
             visible, caps, fp_present,
             spin: 0, quit: false,
         }
@@ -321,12 +324,18 @@ impl App {
             }
             _ => None, // older daemon / daemon down → Repair falls back to local probes
         };
-        if let Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) =
-            crate::daemon_request(&Request::ListProfiles { user: self.user.clone() })
-        {
-            self.profiles = profiles;
-            self.eyes_open = require_eyes_open;
-            self.challenge = require_challenge;
+        match crate::daemon_request(&Request::ListProfiles { user: self.user.clone() }) {
+            Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) => {
+                self.profiles = profiles;
+                self.eyes_open = require_eyes_open;
+                self.challenge = require_challenge;
+                self.enroll_error = None;
+            }
+            // A corrupt/unreadable enrollment (or a missing template key for an
+            // encrypted file) surfaces as an Error, not empty — don't silently
+            // show "no face enrolled"; capture it so Repair can flag+fix it.
+            Ok(Response::Error(e)) => self.enroll_error = Some(e),
+            _ => {}
         }
         self.keyring_armed = match crate::daemon_request(&Request::HasSealedPassword { user: self.user.clone() }) {
             Ok(Response::HasPassword(b)) => Some(b),
@@ -441,9 +450,16 @@ impl App {
         }
 
         let enrolled = !self.profiles.is_empty();
-        v.push(mk("Enrollment", if enrolled { Sev::Ok } else { Sev::Warn },
-            if enrolled { format!("{} profile(s) enrolled", self.profiles.len()) } else { "no face enrolled yet".into() },
-            if enrolled { Fix::None } else { Fix::Manual("Profiles tab → [e] enroll".into()) }));
+        if let Some(err) = &self.enroll_error {
+            // File present but unreadable — never silently read as "not enrolled".
+            v.push(mk("Enrollment", Sev::Fail,
+                format!("enrollment unreadable: {err}"),
+                Fix::Manual("restore the backup, or re-enroll (Profiles → [e]); if encrypted, the template key may be missing".into())));
+        } else {
+            v.push(mk("Enrollment", if enrolled { Sev::Ok } else { Sev::Warn },
+                if enrolled { format!("{} profile(s) enrolled", self.profiles.len()) } else { "no face enrolled yet".into() },
+                if enrolled { Fix::None } else { Fix::Manual("Profiles tab → [e] enroll".into()) }));
+        }
 
         // ---- Checks distilled from live cross-distro debugging (2026-07-01):
         // every failure mode below cost a human diagnosis session once — Repair
@@ -479,9 +495,12 @@ impl App {
         }
         // Method ↔ PAM-wiring coherence: competing biometric stacks intercept
         // each other's prompts; a chosen method that isn't wired does nothing.
+        // Active (non-comment) PAM lines only — a commented-out module is not wired.
         let pam_has = |needle: &str| {
             ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"].iter().any(|p|
-                std::fs::read_to_string(p).map(|s| s.contains(needle)).unwrap_or(false))
+                std::fs::read_to_string(p).map(|s|
+                    s.lines().any(|l| !l.trim_start().starts_with('#') && l.contains(needle))
+                ).unwrap_or(false))
         };
         let fprintd_wired = pam_has("pam_fprintd");
         match self.fp.method.as_str() {

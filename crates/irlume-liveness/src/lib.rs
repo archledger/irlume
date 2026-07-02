@@ -302,7 +302,11 @@ impl LivenessGate {
 pub const BLINK_EAR_DIP_RATIO: f32 = 0.72;
 /// The open baseline (per-class median EAR) must be at least this to trust a
 /// plausibly-open eye was seen — guards against the mesh failing / a squint spoof.
-pub const BLINK_MIN_OPEN_EAR: f32 = 0.15;
+/// Lowered 0.15 → 0.12 (2026-07-01): glasses depress the open baseline to
+/// 0.13–0.14 on IR, which read NoEyes and cost half the glasses catch rate; the
+/// banner sits at 0.20–0.24 so this floor was never its rejector (re-validated
+/// against the banner after the change).
+pub const BLINK_MIN_OPEN_EAR: f32 = 0.12;
 // -- V-shape (velocity) rule, added 2026-07-01 after real-world traces showed
 // natural blinks at 15 fps dip only to 0.78–0.85× baseline (mid-closure sampled,
 // full closure missed) — above the depth cutoff but with a sharp drop-and-recover

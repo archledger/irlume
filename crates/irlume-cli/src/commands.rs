@@ -39,8 +39,14 @@ pub fn update(_args: &[String]) -> ExitCode {
             println!("          (from the Copr; `dnf copr enable archledger/irlume` once, if not already)");
         }
         DistroFamily::Arch => {
-            println!("  Arch: update via your AUR helper — e.g.  yay -S irlume   (or paru -S irlume)");
-            println!("        (irlume doesn't self-update on Arch; the AUR helper owns package updates)");
+            // AUR registration is currently disabled upstream, so the primary
+            // Arch channel is the prebuilt package on GitHub Releases (installed
+            // with pacman -U). The AUR PKGBUILD remains for source builds and
+            // will become the update path again once AUR sign-ups reopen.
+            println!("  Arch: grab the prebuilt package from the release page and install it:");
+            println!("    curl -fLO <release>/irlume-{}-x86_64.pkg.tar.zst", latest.as_deref().unwrap_or("VERSION").trim_start_matches('v'));
+            println!("    sudo pacman -U ./irlume-*.pkg.tar.zst");
+            println!("  (or build from source: makepkg -si  in packaging/arch/)");
         }
         DistroFamily::Debian => {
             println!("  Debian/Ubuntu: sudo apt update && sudo apt install --only-upgrade irlume");

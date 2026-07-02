@@ -24,10 +24,12 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
   GitHub tags (the linhello pipeline). Requires `onnxruntime`; PAM to
   `/usr/lib64/security`; SELinux subpackage. Update path: `dnf upgrade` / Copr,
   driven by `irlume update`.
-- **Arch** — `arch/PKGBUILD` for the AUR: builds from the release tag; depends on
-  `onnxruntime`, `tpm2-tss`, `pam`; PAM to `/usr/lib/security`. Updates are the
-  AUR helper's job; `irlume update` only checks + prints the command (never
-  fights pacman).
+- **Arch** — primary channel is a **prebuilt `.pkg.tar.zst` on GitHub Releases**
+  (`arch/build-pkg.sh` produces it from the local build), installed with
+  `sudo pacman -U`. AUR account registration is disabled upstream at the moment,
+  so `arch/PKGBUILD` (builds from the release tag) is kept for source builds and
+  will become the update path once AUR sign-ups reopen. Depends on `onnxruntime`
+  (system pkg is current), `tpm2-tss`, `pam`; PAM to `/usr/lib/security`.
 - **Debian/Ubuntu** — `debian/` via nfpm or dpkg-buildpackage: **bundles
   onnxruntime** (the archive ships 1.22; irlume needs ≥1.24) or depends on a
   companion `-ort` package; ships the AppArmor profile; PAM to the multiarch

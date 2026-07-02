@@ -14,3 +14,5 @@ Cargo.lock
 models/ir_adapter.onnx.v1-256
 .deb-staging
 irlume_*.deb
+.arch-build
+irlume-*.pkg.tar.zst

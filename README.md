@@ -68,9 +68,9 @@ sudo dnf install irlume
 <td>
 
 ```sh
-# AUR
-yay -S irlume
-# or: paru -S irlume
+# prebuilt from Releases
+sudo pacman -U \
+  ./irlume-*.pkg.tar.zst
 ```
 
 </td>

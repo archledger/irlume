@@ -202,6 +202,11 @@ fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathB
 /// supplementary, and intentionally *off* by default so external Hello cameras
 /// work; `removable` is also frequently `unknown` even for legitimate devices).
 pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
+    // Distinguish "no camera at all" from "a node that isn't physical" — the
+    // anti-injection message only makes sense when something answered to the path.
+    if !std::path::Path::new(device).exists() {
+        return Err(Error::Hardware(format!("{device}: no camera found")));
+    }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");
     let real = std::fs::canonicalize(&link).map_err(|_| {

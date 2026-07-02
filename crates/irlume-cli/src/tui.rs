@@ -128,6 +128,16 @@ struct FpInfo {
     method: String,
 }
 
+/// Daemon self-report (`Request::Health`): camera tier + loaded models.
+#[derive(Clone)]
+struct HealthInfo {
+    tier: String,
+    rgb_dev: Option<String>,
+    ir_dev: Option<String>,
+    mesh: bool,
+    adapter: bool,
+}
+
 /// Template-encryption + recovery status (`RecoveryStatus`).
 #[derive(Clone, Copy, Default)]
 struct RecoveryInfo {
@@ -193,6 +203,10 @@ struct App {
     /// Live daemon reachability (a real Ping, refreshed each tick) — not a
     /// hardcoded socket-path check.
     daemon_up: bool,
+    /// Daemon self-report (Request::Health): its camera tier and loaded models —
+    /// ground truth for the Repair rows (static path probes lie when the daemon
+    /// runs with its own env, e.g. a packaged install).
+    health: Option<HealthInfo>,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
     /// Hardware-adaptive: the subset of screen indices to show (Tab walks these).
@@ -247,7 +261,7 @@ impl App {
             activity: Vec::new(), input: None, confirm: None, op: None,
             enroll: None, fp: FpInfo::default(), recovery: None, suspend: None,
             identify_result: None, selftest_result: None,
-            repair: Vec::new(), repair_sel: 0, cam_sel: 0, error: None, daemon_up: false, act_scroll: 0,
+            repair: Vec::new(), repair_sel: 0, cam_sel: 0, error: None, daemon_up: false, health: None, act_scroll: 0,
             visible, caps, fp_present,
             spin: 0, quit: false,
         }
@@ -299,6 +313,12 @@ impl App {
     /// live without periodic UI hitches. SILENT (no Activity spam).
     fn refresh_light(&mut self) {
         self.daemon_up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
+        self.health = match crate::daemon_request(&Request::Health) {
+            Ok(Response::Health { tier, rgb_dev, ir_dev, mesh, adapter }) => {
+                Some(HealthInfo { tier, rgb_dev, ir_dev, mesh, adapter })
+            }
+            _ => None, // older daemon / daemon down → Repair falls back to local probes
+        };
         if let Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) =
             crate::daemon_request(&Request::ListProfiles { user: self.user.clone() })
         {
@@ -345,32 +365,70 @@ impl App {
             if up { "running, socket reachable".into() } else { "not reachable on /run/irlume.sock".into() },
             if up { Fix::None } else { Fix::Root("restart-daemon") }));
 
-        let ort = std::env::var("ORT_DYLIB_PATH").ok().filter(|p| std::path::Path::new(p).exists()).is_some()
-            || ["/usr/lib64/libonnxruntime.so", "/usr/lib/libonnxruntime.so"].iter().any(|p| std::path::Path::new(p).exists());
-        v.push(mk("ONNX Runtime", if ort { Sev::Ok } else { Sev::Fail },
-            if ort { "library found".into() } else { "libonnxruntime.so not found".into() },
-            if ort { Fix::None } else { Fix::Manual("install onnxruntime or set ORT_DYLIB_PATH".into()) }));
-
-        let m1 = std::path::Path::new("models/glintr100.onnx").exists();
-        let m2 = std::path::Path::new("models/face_detection_yunet_2023mar.onnx").exists();
-        v.push(mk("Models", if m1 && m2 { Sev::Ok } else { Sev::Fail },
-            if m1 && m2 { "YuNet + AuraFace present".into() } else { "missing model file(s) in models/".into() },
-            if m1 && m2 { Fix::None } else { Fix::Manual("place glintr100.onnx + face_detection_yunet_2023mar.onnx in models/".into()) }));
-
-        let rgb = self.nodes.iter().any(|(_, r)| matches!(r, irlume_camera::Role::Rgb));
-        let ir = self.nodes.iter().any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
-        let priv_on = self.nodes.iter().any(|(p, _)| irlume_camera::privacy_engaged(p));
-        let (csev, cdetail, cfix) = if !(rgb && ir) {
-            (Sev::Fail, "need both an RGB and an IR node".to_string(), Fix::Manual("connect the camera / confirm an IR (Hello) module".into()))
-        } else if priv_on {
-            (Sev::Warn, "RGB+IR present, but a privacy switch is ON".to_string(), Fix::Manual("turn off the camera privacy switch".into()))
+        // ONNX Runtime + Models: the daemon is the ground truth — if it answers
+        // Health it loaded both at startup (it exits otherwise). Static path
+        // probes are only a fallback while the daemon is down; they can't know
+        // the daemon's env (ORT_DYLIB_PATH / IRLUME_*_MODEL of a packaged unit).
+        if let Some(h) = self.health.clone() {
+            v.push(mk("ONNX Runtime", Sev::Ok, "loaded (reported by the daemon)".into(), Fix::None));
+            v.push(mk("Models", Sev::Ok,
+                format!("YuNet + AuraFace loaded{}{}",
+                    if h.adapter { " + IR adapter" } else { "" },
+                    if h.mesh { " + FaceMesh" } else { "" }),
+                Fix::None));
+            // Camera row from the daemon's validated tier (never the raw fallback).
+            let priv_on = self.nodes.iter().any(|(p, _)| irlume_camera::privacy_engaged(p));
+            let (csev, cdetail, cfix) = match h.tier.as_str() {
+                _ if priv_on => (Sev::Warn, "camera present, but a privacy switch is ON".to_string(),
+                    Fix::Manual("turn off the camera privacy switch".into())),
+                "secure" => (Sev::Ok,
+                    format!("RGB + IR ({} + {}) — secure tier",
+                        h.rgb_dev.as_deref().unwrap_or("?"), h.ir_dev.as_deref().unwrap_or("?")),
+                    Fix::None),
+                "convenience" => (Sev::Warn,
+                    format!("RGB-only ({}) — convenience tier: face unlocks the screen only, never sudo/login",
+                        h.rgb_dev.as_deref().unwrap_or("?")),
+                    Fix::None),
+                _ => (Sev::Warn, "no camera — face auth unavailable (password/fingerprint only)".to_string(),
+                    Fix::None),
+            };
+            v.push(mk("Cameras", csev, cdetail, cfix));
+            // Emitter fix only makes sense when an IR node exists.
+            if h.ir_dev.is_some() {
+                v.push(mk("IR emitter", Sev::Warn,
+                    "if the IR feed is dark, auto-enable the 850nm illuminator".into(), Fix::Daemon("ir-emitter")));
+            }
         } else {
-            (Sev::Ok, "RGB + IR nodes present".to_string(), Fix::None)
-        };
-        v.push(mk("Cameras", csev, cdetail, cfix));
+            let ort = std::env::var("ORT_DYLIB_PATH").ok().filter(|p| std::path::Path::new(p).exists()).is_some()
+                || ["/usr/lib64/libonnxruntime.so", "/usr/lib/libonnxruntime.so"].iter().any(|p| std::path::Path::new(p).exists());
+            v.push(mk("ONNX Runtime", if ort { Sev::Ok } else { Sev::Fail },
+                if ort { "library found".into() } else { "libonnxruntime.so not found (daemon down — local probe)".into() },
+                if ort { Fix::None } else { Fix::Manual("install onnxruntime or set ORT_DYLIB_PATH".into()) }));
 
-        v.push(mk("IR emitter", Sev::Warn,
-            "if the IR feed is dark, auto-enable the 850nm illuminator".into(), Fix::Daemon("ir-emitter")));
+            let m1 = std::path::Path::new("models/glintr100.onnx").exists();
+            let m2 = std::path::Path::new("models/face_detection_yunet_2023mar.onnx").exists();
+            v.push(mk("Models", if m1 && m2 { Sev::Ok } else { Sev::Fail },
+                if m1 && m2 { "YuNet + AuraFace present".into() } else { "not found near cwd (daemon down — local probe)".into() },
+                if m1 && m2 { Fix::None } else { Fix::Manual("place glintr100.onnx + face_detection_yunet_2023mar.onnx in models/".into()) }));
+
+            let rgb = self.nodes.iter().any(|(_, r)| matches!(r, irlume_camera::Role::Rgb));
+            let ir = self.nodes.iter().any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
+            let priv_on = self.nodes.iter().any(|(p, _)| irlume_camera::privacy_engaged(p));
+            let (csev, cdetail, cfix) = if !rgb && !ir {
+                (Sev::Warn, "no camera — face auth unavailable (password/fingerprint only)".to_string(), Fix::None)
+            } else if !ir {
+                (Sev::Warn, "RGB-only — convenience tier: face unlocks the screen only".to_string(), Fix::None)
+            } else if priv_on {
+                (Sev::Warn, "RGB+IR present, but a privacy switch is ON".to_string(), Fix::Manual("turn off the camera privacy switch".into()))
+            } else {
+                (Sev::Ok, "RGB + IR nodes present".to_string(), Fix::None)
+            };
+            v.push(mk("Cameras", csev, cdetail, cfix));
+            if ir {
+                v.push(mk("IR emitter", Sev::Warn,
+                    "if the IR feed is dark, auto-enable the 850nm illuminator".into(), Fix::Daemon("ir-emitter")));
+            }
+        }
 
         if std::fs::read_to_string("/sys/fs/selinux/enforce").map(|s| s.trim() == "1").unwrap_or(false) {
             let labeled = std::process::Command::new("ls").args(["-Z", "/run/irlume.sock"]).output()
@@ -392,7 +450,9 @@ impl App {
                     Fix::Manual("run `irlume recovery setup`".into())));
             } else {
                 v.push(mk("Recovery backstop", Sev::Ok,
-                    if r.encrypted { "encrypted + recovery set".into() } else { "plaintext (no TPM / not encrypted)".into() },
+                    if r.encrypted { "encrypted + recovery set".into() }
+                    else if r.tpm_present { "templates not encrypted yet (TPM available — encrypts at enroll)".into() }
+                    else { "templates not encrypted (no TPM on this device)".into() },
                     Fix::None));
             }
         }
@@ -669,8 +729,20 @@ impl App {
                 self.refresh();
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
-            (SC_WELCOME, KeyCode::Char('e')) => { self.screen = SC_PROFILES; self.begin_enroll(); }
-            (SC_WELCOME, KeyCode::Char('i')) => { self.screen = SC_IDENTIFY; self.start_async("Identify (1:N)", OpTag::Identify, Request::Identify, map_identify); }
+            // The quick launchers only make sense where their screens exist — on a
+            // camera-less box Profiles/Identify are hidden, so explain instead of
+            // jumping into an enrollment that cannot work.
+            (SC_WELCOME, KeyCode::Char('e')) if self.visible.contains(&SC_PROFILES) => {
+                self.screen = SC_PROFILES;
+                self.begin_enroll();
+            }
+            (SC_WELCOME, KeyCode::Char('i')) if self.visible.contains(&SC_IDENTIFY) => {
+                self.screen = SC_IDENTIFY;
+                self.start_async("Identify (1:N)", OpTag::Identify, Request::Identify, map_identify);
+            }
+            (SC_WELCOME, KeyCode::Char('e' | 'i')) => {
+                self.log('·', "no camera on this device — face enrollment/identify unavailable (see Fingerprint/Settings)");
+            }
             // Cameras: switch the active pair (persisted via the daemon).
             (SC_CAMERAS, KeyCode::Enter) => {
                 let pairs = irlume_camera::list_pairs();
@@ -1007,8 +1079,25 @@ impl App {
         let pairs = irlume_camera::list_pairs();
 
         // ---- selectable list of trusted (physical) Hello camera pairs ----
+        // No pair ≠ no camera: an RGB-only device still serves the convenience
+        // tier, so show what exists instead of only an error line.
         let items: Vec<ListItem> = if pairs.is_empty() {
-            vec![ListItem::new(Span::styled("no RGB+IR camera pair found", Style::new().fg(ERR)))]
+            let mut v = Vec::new();
+            for (path, role) in &self.nodes {
+                if matches!(role, irlume_camera::Role::Rgb) {
+                    v.push(ListItem::new(Line::from(vec![
+                        Span::styled(" ● ", Style::new().fg(OK)),
+                        Span::styled(format!("{:<16}", path.trim_start_matches("/dev/")), Style::new().add_modifier(Modifier::BOLD)),
+                        Span::styled("RGB-only — convenience tier (face unlocks the screen only)", Style::new().dim()),
+                    ])));
+                }
+            }
+            if v.is_empty() {
+                v.push(ListItem::new(Span::styled("no camera found — face auth unavailable on this device", Style::new().dim())));
+            } else {
+                v.push(ListItem::new(Span::styled("   no IR node — the Secure tier (sudo/login/keyring) needs an IR Hello camera", Style::new().dim())));
+            }
+            v
         } else {
             pairs.iter().map(|p| {
                 let active = p.rgb == argb && p.ir == air;
@@ -1035,9 +1124,17 @@ impl App {
             inner, &mut st);
 
         // ---- info: active pair, selected pair nodes, emitter ----
+        // Only claim a node as "active" if it exists — select_pair's fixed
+        // fallback names devices that may be absent on this hardware.
+        let ex = |d: &str| std::path::Path::new(d).exists();
+        let active = match (ex(&argb), ex(&air)) {
+            (true, true) => format!("{argb} + {air}"),
+            (true, false) => format!("{argb} (RGB only)"),
+            _ => "none (no camera hardware)".into(),
+        };
         let mut lines = vec![
             Line::from(vec![Span::styled("  active   ", Style::new().dim()),
-                Span::styled(format!("{argb} + {air}"), Style::new().fg(OK).add_modifier(Modifier::BOLD))]),
+                Span::styled(active, Style::new().fg(OK).add_modifier(Modifier::BOLD))]),
         ];
         if let Some(p) = pairs.get(self.cam_sel) {
             if p.rgb != argb || p.ir != air {
@@ -1211,6 +1308,9 @@ impl App {
         ])];
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
+                // "no action needed" next to a non-zero fail count reads as a
+                // contradiction — point at the failing rows instead.
+                Fix::None if fail > 0 => "this row is fine — ↑↓ select a failing row for its fix".to_string(),
                 Fix::None => "no action needed".to_string(),
                 Fix::Manual(cmd) => format!("manual: {cmd}"),
                 Fix::Daemon(_) => "press [f] — irlume fixes this via the daemon".to_string(),
@@ -1270,12 +1370,26 @@ impl App {
                       else { Span::styled("○ not wired", Style::new().dim()) };
             lines.push(Line::from(vec![Span::raw(format!("  {label:<16}")), val]));
         }
-        let sel = match crate::pamwire::selinux_state() {
-            Some(true) => Span::styled("● loaded", Style::new().fg(OK)),
-            Some(false) => Span::styled("✗ not loaded", Style::new().fg(ERR)),
-            None => Span::styled("unknown (needs root)", Style::new().dim()),
-        };
-        lines.push(Line::from(vec![Span::raw(format!("  {:<16}", "SELinux module")), sel]));
+        // LSM row is distro-aware: SELinux (Fedora-family), AppArmor
+        // (Debian/Ubuntu-family), or nothing (e.g. Arch default) — showing a
+        // SELinux row on a non-SELinux system reads as a fault that isn't one.
+        if std::path::Path::new("/sys/fs/selinux").exists() {
+            let sel = match crate::pamwire::selinux_state() {
+                Some(true) => Span::styled("● loaded", Style::new().fg(OK)),
+                Some(false) => Span::styled("✗ not loaded", Style::new().fg(ERR)),
+                None => Span::styled("unknown (needs root)", Style::new().dim()),
+            };
+            lines.push(Line::from(vec![Span::raw(format!("  {:<16}", "SELinux module")), sel]));
+        } else if std::path::Path::new("/sys/kernel/security/apparmor").exists() {
+            let profiled = std::fs::read_to_string("/proc/self/attr/apparmor/current")
+                .map(|s| s.contains("irlume")).unwrap_or(false)
+                || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {:<16}", "AppArmor")),
+                if profiled { Span::styled("● irlume profile installed", Style::new().fg(OK)) }
+                else { Span::styled("active — irlume unconfined (profile optional)", Style::new().dim()) },
+            ]));
+        }
         lines.push(Line::raw(""));
         lines.push(section("What each does"));
         lines.push(Line::from(Span::styled("  greeter: face → TPM-unseal password → wallet opens at login", Style::new().dim())));
@@ -1306,7 +1420,12 @@ impl App {
             Line::from(vec![Span::raw("  biopolicy         "), onoff(biopolicy_on())]),
             Line::from(vec![Span::raw("  fingerprint       "), onoff(self.fp.available)]),
             Line::raw(""),
-            Line::from(Span::styled("  All set. irlume keeps running as a daemon; this panel is safe to quit.", Style::new().dim())),
+            Line::from(Span::styled(
+                if !self.daemon_up { "  Daemon not running — see the Repair tab before quitting." }
+                else if self.profiles.is_empty() && self.caps.rgb { "  Not set up yet — enroll a face (Welcome [e]) to begin." }
+                else if self.profiles.is_empty() { "  No face hardware — fingerprint/password remain your methods." }
+                else { "  All set. irlume keeps running as a daemon; this panel is safe to quit." },
+                Style::new().dim())),
             Line::from(vec![Span::styled("  [r]", Style::new().fg(ACCENT)), Span::styled(" refresh    [q] quit", Style::new().dim())]),
         ];
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);

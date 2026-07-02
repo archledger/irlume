@@ -126,6 +126,10 @@ pub enum Request {
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.
     Ping,
+    /// Daemon self-report: what it actually has loaded and which camera tier it
+    /// operates in — ground truth for the Repair tab (a daemon that answers at
+    /// all has, by construction, working ONNX Runtime + recognition models).
+    Health,
     /// One framing-guide sample (no enrollment, no auth) — captures a frame and
     /// returns a [`PositionReport`] of how the user is positioned, for the guided
     /// enrollment cues. Safe to poll repeatedly.
@@ -242,6 +246,18 @@ pub enum Response {
     Ok(String),
     SelfTest { passed: bool, detail: String },
     Pong,
+    /// Reply to [`Request::Health`]. `rgb_dev`/`ir_dev` are the selected camera
+    /// nodes ONLY when they exist right now (never the unvalidated fallback).
+    Health {
+        /// "secure" (RGB+IR) | "convenience" (RGB-only) | "none" (no camera).
+        tier: String,
+        rgb_dev: Option<String>,
+        ir_dev: Option<String>,
+        /// FaceMesh (passive blink liveness) model loaded.
+        mesh: bool,
+        /// IR domain adapter loaded.
+        adapter: bool,
+    },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
     Error(String),

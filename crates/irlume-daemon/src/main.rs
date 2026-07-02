@@ -24,7 +24,16 @@ fn main() {
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
     // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
     let (rgb_dev, ir_dev) = irlume_auth::select_pair();
-    eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev}");
+    // Log what is actually usable, not the raw (possibly fallback) selection —
+    // on camera-less or RGB-only hardware the fixed default pair doesn't exist.
+    {
+        let ok = |d: &str| std::path::Path::new(d).exists();
+        match (ok(&rgb_dev), ok(&ir_dev)) {
+            (true, true) => eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)"),
+            (true, false) => eprintln!("irlumed: camera rgb={rgb_dev}, no IR node (convenience tier — screen unlock only)"),
+            (false, _) => eprintln!("irlumed: no camera found (face auth unavailable; password/fingerprint only)"),
+        }
+    }
     let mut engine = match irlume_auth::Engine::load(&det, &model)
         .map(|e| e.with_devices(&rgb_dev, &ir_dev))
         .and_then(|e| e.with_ir_adapter(&adapter))
@@ -155,6 +164,28 @@ fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Resu
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     match req {
         Request::Ping => Response::Pong,
+        Request::Health => {
+            // Live probe (cameras can appear/vanish); report selected nodes only
+            // when they actually exist — never the unvalidated fallback pair.
+            let caps = irlume_auth::capabilities();
+            let (rgb, ir) = irlume_auth::select_pair();
+            let rgb_dev = (caps.rgb && std::path::Path::new(&rgb).exists()).then_some(rgb);
+            let ir_dev = (caps.ir_pair && std::path::Path::new(&ir).exists()).then_some(ir);
+            let tier = if ir_dev.is_some() {
+                "secure"
+            } else if rgb_dev.is_some() {
+                "convenience"
+            } else {
+                "none"
+            };
+            Response::Health {
+                tier: tier.into(),
+                rgb_dev,
+                ir_dev,
+                mesh: engine.has_mesh(),
+                adapter: engine.has_ir_adapter(),
+            }
+        }
         Request::PositionSample => match engine.position_sample() {
             Ok(r) => Response::Position(r),
             Err(e) => Response::Error(e.to_string()),

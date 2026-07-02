@@ -121,6 +121,14 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN — showing what `--apply` would change (nothing is written):");
     }
+    if enable {
+        let caps = irlume_camera::capabilities();
+        if !caps.rgb && !caps.ir_pair {
+            println!("  ⚠ no camera detected on this device — face auth will fall through to the password until one is present");
+        } else if !caps.ir_pair {
+            println!("  ⚠ RGB-only camera — convenience tier: face satisfies the LOCK SCREEN only; login/sudo keep the password");
+        }
+    }
     let mut errs = 0;
     let mut do_svc = |s: &Svc, wire: fn(&str) -> (String, bool)| {
         match wire_service(s, enable, apply, wire) {

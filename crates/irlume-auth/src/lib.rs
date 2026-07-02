@@ -11,7 +11,7 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam).
 /// Re-exported so the daemon can pick devices without depending on the camera
 /// crate directly. See [`irlume_camera::select_pair`].
-pub use irlume_camera::select_pair;
+pub use irlume_camera::{capabilities, select_pair};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{ensure_ir_emitter, list_ir_controls, setup_ir_emitter};

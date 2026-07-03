@@ -64,6 +64,7 @@ fn main() -> std::process::ExitCode {
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
+        (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("doctor"), _) => doctor(),
         (Some("normprobe"), _) => normprobe(&args),
@@ -168,6 +169,23 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 
 /// `irlume ir-setup [--dry-run]` — auto-enable the IR emitter via the daemon
 /// (integrated linux-enable-ir-emitter). `--dry-run` only lists XU controls.
+/// `irlume set-cameras <rgb> <ir>` — persist the active RGB+IR pair. Root only
+/// (the daemon writes /etc/irlume/cameras.conf); the TUI camera picker runs this
+/// via sudo. Not shown in help — it's the picker's backing command.
+fn set_cameras(args: &[String]) -> std::process::ExitCode {
+    use irlume_common::{Request, Response};
+    let (Some(rgb), Some(ir)) = (args.get(1), args.get(2)) else {
+        eprintln!("usage: irlume set-cameras <rgb-node> <ir-node>   (root; e.g. /dev/video0 /dev/video2)");
+        return std::process::ExitCode::from(2);
+    };
+    match daemon_request(&Request::SetCameras { rgb: rgb.clone(), ir: ir.clone() }) {
+        Ok(Response::Ok(msg)) => { println!("[set-cameras] {msg}"); std::process::ExitCode::SUCCESS }
+        Ok(Response::Error(e)) => { eprintln!("[set-cameras] {e}"); std::process::ExitCode::FAILURE }
+        Ok(other) => { eprintln!("[set-cameras] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
+        Err(e) => { eprintln!("[set-cameras] {e}"); std::process::ExitCode::FAILURE }
+    }
+}
+
 fn ir_setup(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let dry = args.iter().any(|a| a == "--dry-run");

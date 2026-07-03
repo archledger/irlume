@@ -78,7 +78,7 @@ impl Pending {
 /// Flows that genuinely need the cooked terminal: an interactive root tool
 /// (sudo) or fprintd's own prompts. Daemon password ops are handled in-TUI
 /// instead (masked entry → socket), so they're not here.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Suspend {
     FingerprintAdd,
     LoginStatus,
@@ -86,6 +86,11 @@ enum Suspend {
     RestartDaemon,
     RestartFprintd,
     SelinuxLoad,
+    /// Switch the active camera pair — root op (writes /etc), so it suspends to
+    /// `sudo irlume set-cameras <rgb> <ir>`.
+    SetCameras(String, String),
+    /// Auto-configure the IR emitter — root op, suspends to `sudo irlume ir-setup`.
+    IrSetup,
 }
 
 /// Severity of a Repair-tab diagnostic.
@@ -620,7 +625,8 @@ impl App {
         match fix {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
-            Fix::Daemon("ir-emitter") => self.start_op("SetupIrEmitter (auto-enable emitter)", Request::SetupIrEmitter { dry_run: false }),
+            // Emitter setup writes the persisted UVC control — a root op now.
+            Fix::Daemon("ir-emitter") => { self.log('→', "sudo irlume ir-setup — enable the 850nm emitter (you'll be asked for your password)"); self.suspend = Some(Suspend::IrSetup); }
             Fix::Daemon(_) => {}
             Fix::Root("restart-daemon") => { self.log('→', "sudo systemctl restart irlumed (you'll be asked for your password)"); self.suspend = Some(Suspend::RestartDaemon); }
             Fix::Root("restart-fprintd") => { self.log('→', "sudo systemctl restart fprintd — releases a stale reader claim"); self.suspend = Some(Suspend::RestartFprintd); }
@@ -793,6 +799,16 @@ impl App {
                     .args(["irlume", "login", "enable", "--apply"])
                     .status();
             }
+            Suspend::SetCameras(rgb, ir) => {
+                eprintln!("\nSwitching the active camera pair (sudo irlume set-cameras {rgb} {ir})…");
+                let _ = std::process::Command::new("sudo")
+                    .args(["irlume", "set-cameras", &rgb, &ir])
+                    .status();
+            }
+            Suspend::IrSetup => {
+                eprintln!("\nEnabling the IR emitter (sudo irlume ir-setup)…");
+                let _ = std::process::Command::new("sudo").args(["irlume", "ir-setup"]).status();
+            }
             Suspend::RestartDaemon => {
                 eprintln!("\nRestarting irlumed (sudo)…");
                 let _ = std::process::Command::new("sudo").args(["systemctl", "restart", "irlumed"]).status();
@@ -924,15 +940,13 @@ impl App {
             (SC_WELCOME, KeyCode::Char('e' | 'i')) => {
                 self.log('·', "no camera on this device — face enrollment/identify unavailable (see Fingerprint/Settings)");
             }
-            // Cameras: switch the active pair (persisted via the daemon).
+            // Cameras: switch the active pair — persists to /etc, so it's a root
+            // op that suspends to `sudo irlume set-cameras`.
             (SC_CAMERAS, KeyCode::Enter) => {
                 let pairs = irlume_camera::list_pairs();
                 if let Some(p) = pairs.get(self.cam_sel) {
-                    let (rgb, ir) = (p.rgb.clone(), p.ir.clone());
-                    if self.request(Request::SetCameras { rgb: rgb.clone(), ir: ir.clone() }, "SetCameras").is_some() {
-                        self.log('✓', format!("active camera → {rgb} + {ir}"));
-                    }
-                    self.refresh();
+                    self.log('→', format!("sudo irlume set-cameras {} {} (you'll be asked for your password)", p.rgb, p.ir));
+                    self.suspend = Some(Suspend::SetCameras(p.rgb.clone(), p.ir.clone()));
                 }
             }
             // Repair: re-run checks, fix the selected issue, or run a live IR test.
@@ -941,8 +955,9 @@ impl App {
             (SC_REPAIR, KeyCode::Char('l')) => self.start_async(
                 "SelfTest (IR liveness)", OpTag::Calibrate,
                 Request::SelfTest { kind: irlume_common::SelfTestKind::Liveness }, map_selftest),
-            // Cameras: IR emitter auto-setup / probe.
-            (SC_CAMERAS, KeyCode::Char('s')) => self.start_op("SetupIrEmitter (auto-enable emitter)", Request::SetupIrEmitter { dry_run: false }),
+            // Cameras: IR emitter auto-setup (root — writes the persisted UVC
+            // control) suspends to sudo; the [p] probe below is read-only.
+            (SC_CAMERAS, KeyCode::Char('s')) => { self.log('→', "sudo irlume ir-setup — enable the 850nm emitter (you'll be asked for your password)"); self.suspend = Some(Suspend::IrSetup); }
             (SC_CAMERAS, KeyCode::Char('p')) => {
                 if let Some(Response::Ok(m)) = self.request(Request::SetupIrEmitter { dry_run: true }, "SetupIrEmitter(dry-run)") { self.log('✓', m); }
             }

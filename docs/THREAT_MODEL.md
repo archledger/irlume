@@ -96,6 +96,15 @@ Seal a random release secret (or the login password) in the **TPM**, gated by
 **PCR policy**; release only on a successful live+match. Never store a
 recoverable face image. Embeddings zeroized after use.
 
+**Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
+releases the sealed login password on *root peer + login-service-class*, without
+a daemon-verified biometric — the fingerprint (`pam_fprintd`) authenticated
+first. At-rest protection is preserved (a stolen disk can't unseal). Residual,
+accepted: a **live root attacker** in a login context can obtain the password —
+no new capability (root can already read the running keyring), and root is the
+trust boundary throughout. The face/IR path is strictly stronger here (it
+requires a daemon-verified live biometric even against root).
+
 ## Side channels
 
 - **Constant-time match decision.** The cosine/threshold comparison must not

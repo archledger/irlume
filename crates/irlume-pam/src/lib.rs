@@ -52,6 +52,33 @@ impl PamServiceModule for IrlumePam {
         let unseal = args.iter().any(|a| a == "unseal");
         let wait = args.iter().any(|a| a == "wait");
         let reseal = args.iter().any(|a| a == "reseal");
+        let keyring = args.iter().any(|a| a == "keyring");
+
+        // `keyring` mode: post-auth login-keyring unlock for the FINGERPRINT
+        // path. This line sits at the auth landing, after a trusted factor has
+        // already succeeded. If a password is present (the user typed one, or an
+        // earlier face `unseal` set it) the keyring unlocks from it — do nothing.
+        // If PAM_AUTHTOK is empty (a fingerprint login provides no password), ask
+        // the daemon to release the TPM-sealed password and set it, so a later
+        // pam_gnome_keyring/pam_kwallet opens the wallet. ALWAYS IGNORE: keyring
+        // unlock is best-effort and must never fail or block the login.
+        if keyring {
+            if let Ok(Some(tok)) = pamh.get_cached_authtok() {
+                if !tok.to_bytes().is_empty() {
+                    return PamError::IGNORE; // password present → keyring self-unlocks
+                }
+            }
+            let service = pamh.get_service().ok().flatten()
+                .and_then(|c| c.to_str().ok().map(str::to_string));
+            if let Ok(Response::PasswordUnsealed { secret }) =
+                request(&Request::UnsealKeyring { user: user.clone(), service })
+            {
+                if let Ok(tok) = CString::new(secret.expose()) {
+                    let _ = pamh.set_authtok(&tok);
+                }
+            }
+            return PamError::IGNORE;
+        }
         // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
         // active password probe until the user types (unlike plasmalogin/SDDM,
         // which answer instantly from the buffered field) — so skip the probe and

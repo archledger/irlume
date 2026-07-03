@@ -31,6 +31,11 @@ const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume
 const GREETER_UNSEAL_DEBIAN: &str = "auth       sufficient                   pam_irlume.so unseal facefirst";
 const PERMIT_LANDING: &str = "auth       optional                     pam_permit.so";
 const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so reseal";
+/// Post-auth login-keyring unlock for the FINGERPRINT path: runs after a trusted
+/// factor succeeded; if no password is present (fingerprint login) it unseals
+/// the TPM-sealed password and sets PAM_AUTHTOK so pam_gnome_keyring opens the
+/// wallet. No-op when the keyring isn't armed or a password is already set.
+const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
 const LOCK_WAIT: &str = "auth       sufficient                   pam_irlume.so wait";
 const SUDO_STANZA: &str = "auth       sufficient                   pam_irlume.so";
@@ -263,6 +268,7 @@ fn wire_greeter(content: &str) -> (String, bool) {
             if i == inc_at {
                 out.push(GREETER_UNSEAL_DEBIAN.to_string());
                 out.push((*l).to_string());
+                out.push(KEYRING_UNSEAL.to_string());
                 out.push(RESEAL_AUTH.to_string());
             } else if l.trim_start().starts_with("@include common-session") {
                 out.push((*l).to_string());
@@ -286,6 +292,7 @@ fn wire_greeter(content: &str) -> (String, bool) {
             out.push(GREETER_UNSEAL.to_string());
             out.push((*l).to_string());
             out.push(PERMIT_LANDING.to_string());
+            out.push(KEYRING_UNSEAL.to_string());
             out.push(RESEAL_AUTH.to_string());
         } else if Some(i) == sess_at {
             out.push((*l).to_string());

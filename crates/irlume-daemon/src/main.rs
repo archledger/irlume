@@ -371,6 +371,49 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             do_unseal_password(&user, engine)
         }
+        Request::UnsealKeyring { user, service } => {
+            // Fingerprint keyring unlock. pam_fprintd has ALREADY authenticated
+            // the user in this PAM transaction (pam_irlume `keyring` only runs at
+            // the post-auth landing). The daemon can't re-verify a fingerprint —
+            // fprintd owns the sensor — so the trust is: root peer + a login /
+            // unlock service class. Releases the sealed login password so
+            // pam_gnome_keyring can open the wallet, matching Windows Hello's
+            // functional model. SECURITY (ADR-0003 / THREAT_MODEL): preserves
+            // at-rest protection — a stolen disk still can't unseal (needs the
+            // live TPM) — but a live root attacker in a login context can obtain
+            // it; root stays the trust boundary. For daemon-verified biometric
+            // release resistant to live root, use the face/IR path.
+            if peer.uid != 0 {
+                return Response::Error(format!("unseal_keyring requires root (peer uid {})", peer.uid));
+            }
+            if !irlume_core::keyring::has_sealed_password(&user) {
+                return Response::Error(format!("no sealed password for '{user}' — run `irlume keyring arm`"));
+            }
+            // Only a login / greeter / lock-screen context — never sudo,
+            // elevation, remote, or unknown. Defence-in-depth: a direct caller
+            // can forge the service string (root can call us directly), so this
+            // does not stop a root attacker; it does stop the keyring line being
+            // (mis)wired into a non-login stack from releasing the credential.
+            {
+                use irlume_core::biopolicy::{classify, OperationClass};
+                let class = classify(service.as_deref().unwrap_or(""), true);
+                if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
+                    eprintln!("irlumed: UnsealKeyring refused for service '{}' ({class:?})",
+                        service.as_deref().unwrap_or("?"));
+                    return Response::Error(format!("keyring unseal not allowed for {class:?}"));
+                }
+            }
+            match irlume_core::keyring::unseal_password(&user) {
+                Ok(secret) => {
+                    eprintln!("irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), password unsealed");
+                    Response::PasswordUnsealed { secret: irlume_common::SecretBytes::new(secret.to_vec()) }
+                }
+                Err(e) => {
+                    eprintln!("irlumed: UnsealKeyring: TPM unseal FAILED for '{user}': {e}");
+                    Response::Error(e.to_string())
+                }
+            }
+        }
         Request::HasSealedPassword { user } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to query '{user}'"));

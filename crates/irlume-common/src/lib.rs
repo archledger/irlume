@@ -150,6 +150,19 @@ pub enum Request {
         #[serde(default)]
         service: Option<String>,
     },
+    /// Release the TPM-sealed password to unlock the login keyring WITHOUT a
+    /// face match — for the fingerprint path, where `pam_fprintd` has already
+    /// authenticated the user in this PAM transaction (this request only runs at
+    /// the post-auth landing). The daemon cannot re-verify a fingerprint
+    /// (fprintd owns the sensor), so the gate is: root peer + a login/unlock
+    /// service class. Preserves at-rest protection (a stolen disk still can't
+    /// unseal); a live root attacker in a login context can obtain it — see
+    /// ADR-0003 / THREAT_MODEL. PRIVILEGED: root only.
+    UnsealKeyring {
+        user: String,
+        #[serde(default)]
+        service: Option<String>,
+    },
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.
     HasSealedPassword { user: String },

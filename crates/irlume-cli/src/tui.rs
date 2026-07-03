@@ -252,8 +252,9 @@ impl App {
         let visible: Vec<usize> = (0..SCREENS.len()).filter(|&i| match i {
             // Face/camera screens require a camera.
             SC_CAMERAS | SC_PROFILES | SC_IDENTIFY | SC_RECOVERY => caps.rgb,
-            // Keyring unlock (face releases the login password) is Secure-only.
-            SC_KEYRING => caps.ir_pair,
+            // Keyring unlock: an IR camera (face releases the credential) OR a
+            // fingerprint reader (ADR-0003: a fingerprint login unseals it too).
+            SC_KEYRING => caps.ir_pair || fp_present,
             // Fingerprint screen only if a reader exists.
             SC_FINGERPRINT => fp_present,
             // Welcome / Repair / Login-wiring / Settings / Done: always.
@@ -515,6 +516,32 @@ impl App {
                         Fix::Root("fingerprint-add")));
                 } else {
                     v.push(mk("Method wiring", Sev::Ok, "fingerprint drives; face stands down".into(), Fix::None));
+                }
+                // Fingerprint keyring unlock (ADR-0003): on a fingerprint box a
+                // login leaves the wallet locked unless the keyring is armed
+                // (TPM-seal the password) AND the greeter carries the `keyring`
+                // line. Surface it so the user isn't left typing the keyring
+                // password after every fingerprint login.
+                if fprintd_wired && !self.fp.enrolled.is_empty() {
+                    let armed = self.keyring_armed.unwrap_or(false);
+                    let wired = ["/etc/pam.d/gdm-password", "/etc/pam.d/sddm", "/etc/pam.d/plasmalogin", "/etc/pam.d/login"]
+                        .iter().any(|p| std::fs::read_to_string(p).map(|s|
+                            s.lines().any(|l| !l.trim_start().starts_with('#') && l.contains("pam_irlume.so") && l.contains("keyring"))
+                        ).unwrap_or(false));
+                    if !crate::tpm_device().is_some() {
+                        // No TPM → can't seal; nothing to offer.
+                    } else if !armed {
+                        v.push(mk("FP keyring unlock", Sev::Warn,
+                            "wallet won't auto-unlock on fingerprint login — arm the keyring".into(),
+                            Fix::Manual("Keyring tab → [a] arm (seal your login password)".into())));
+                    } else if !wired {
+                        v.push(mk("FP keyring unlock", Sev::Warn,
+                            "keyring armed but the greeter lacks the unlock line".into(),
+                            Fix::Manual("sudo irlume login enable --apply".into())));
+                    } else {
+                        v.push(mk("FP keyring unlock", Sev::Ok,
+                            "a fingerprint login unseals the wallet (no keyring prompt)".into(), Fix::None));
+                    }
                 }
             }
             _ if fprintd_wired && enrolled => {
@@ -1369,15 +1396,22 @@ impl App {
             Line::from(vec![Span::raw("  TPM      "), if tpm { Span::styled("● present", Style::new().fg(OK)) } else { Span::styled("✗ none", Style::new().fg(ERR)) }]),
             Line::from(vec![Span::raw("  binding  "), Span::styled("PCR-7 (Secure Boot state)", Style::new().dim())]),
             Line::raw(""),
-            Line::from(Span::styled("  At a face login the daemon unseals your password and hands it to", Style::new().dim())),
-            Line::from(Span::styled("  pam_kwallet/gnome-keyring, so your wallet opens with no prompt.", Style::new().dim())),
-            Line::raw(""),
         ];
+        // The unlock trigger depends on this box's hardware.
+        if self.caps.ir_pair {
+            lines.push(Line::from(Span::styled("  At a face login the daemon unseals your password and hands it to", Style::new().dim())));
+            lines.push(Line::from(Span::styled("  pam_kwallet/gnome-keyring, so your wallet opens with no prompt.", Style::new().dim())));
+        } else if self.fp_present {
+            lines.push(Line::from(Span::styled("  At a fingerprint login the daemon unseals your password (ADR-0003)", Style::new().dim())));
+            lines.push(Line::from(Span::styled("  and hands it to gnome-keyring, so your wallet opens with no prompt.", Style::new().dim())));
+        }
+        lines.push(Line::raw(""));
         if armed {
             lines.push(Line::from(Span::styled("  ⚠ if a firmware/dbx update moves PCR-7, unseal fails → use the", Style::new().fg(WARN))));
             lines.push(Line::from(Span::styled("    Repair tab or `irlume reseal` to re-bind to current PCRs.", Style::new().dim())));
         } else {
-            lines.push(Line::from(Span::styled("  Not armed — face login won't open your wallet yet.", Style::new().dim())));
+            let how = if self.caps.ir_pair { "face" } else { "fingerprint" };
+            lines.push(Line::from(Span::styled(format!("  Not armed — {how} login won't open your wallet yet."), Style::new().dim())));
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![

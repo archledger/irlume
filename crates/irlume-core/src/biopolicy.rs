@@ -65,9 +65,10 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
         // Lock screens (live session).
         "kde" | "kde-fingerprint" | "kscreensaver" | "xscreensaver"
         | "gnome-screensaver" | "swaylock" | "i3lock" | "hyprlock" => OperationClass::ScreenUnlock,
-        // Display-manager greeters (cold login).
-        "sddm" | "plasmalogin" | "gdm-password" | "gdm" | "lightdm"
-        | "login" | "greetd" | "ly" => {
+        // Display-manager greeters (cold login), incl. GDM's separate
+        // fingerprint login service (`gdm-fingerprint`) — same login class.
+        "sddm" | "sddm-greeter" | "plasmalogin" | "gdm-password" | "gdm-fingerprint"
+        | "gdm" | "gdm3" | "lightdm" | "login" | "greetd" | "ly" => {
             if warm { OperationClass::ScreenUnlock } else { OperationClass::Login }
         }
         // Elevation.
@@ -112,6 +113,14 @@ mod tests {
     fn warm_greeter_is_a_screen_unlock() {
         assert_eq!(classify("plasmalogin", true), OperationClass::ScreenUnlock);
         assert_eq!(classify("plasmalogin", false), OperationClass::Login);
+    }
+
+    #[test]
+    fn gdm_fingerprint_is_a_login_service() {
+        // GDM's separate fingerprint login service must classify as a login /
+        // unlock class, else the keyring-unseal gate (ADR-0003) refuses it.
+        assert_eq!(classify("gdm-fingerprint", false), OperationClass::Login);
+        assert_eq!(classify("gdm-fingerprint", true), OperationClass::ScreenUnlock);
     }
 
     #[test]

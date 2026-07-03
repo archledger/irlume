@@ -54,6 +54,14 @@ const GREETERS: &[Svc] = &[
     Svc { etc: "/etc/pam.d/plasmalogin", vendor: Some("/usr/lib/pam.d/plasmalogin") }, // Plasma 6
 ];
 const LOCKSCREEN: Svc = Svc { etc: "/etc/pam.d/kde-fingerprint", vendor: Some("/usr/lib/pam.d/kde-fingerprint") };
+/// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
+/// distinct from `gdm-password` (password/face). It runs pam_fprintd then
+/// pam_gnome_keyring — which finds no password and leaves the wallet locked. We
+/// slot the `keyring` unseal line between them (ADR-0003) so a fingerprint login
+/// opens the wallet. Only present on GNOME/GDM systems; skipped elsewhere.
+const FP_GREETERS: &[Svc] = &[
+    Svc { etc: "/etc/pam.d/gdm-fingerprint", vendor: None },
+];
 const SUDO: &str = "/etc/pam.d/sudo";
 
 // ---- CLI entry ---------------------------------------------------------------
@@ -77,7 +85,7 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
 /// plus a trailing SELinux row. Mirrors what `status()` prints.
 pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
     let mut out = Vec::new();
-    for s in GREETERS.iter().chain(std::iter::once(&LOCKSCREEN)) {
+    for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
         match service_present(s) {
             Some(p) => out.push((label_of(s.etc), true, file_has_module(&p))),
             None => out.push((label_of(s.etc), false, false)),
@@ -93,6 +101,32 @@ fn label_of(etc: &str) -> String {
     etc.rsplit('/').next().unwrap_or(etc).to_string()
 }
 
+/// The active login manager, from the `display-manager.service` symlink
+/// (`gdm`, `gdm3`, `sddm`, `lightdm`, `greetd`, `ly`, …). None on a
+/// non-graphical / greeter-less host.
+fn active_display_manager() -> Option<String> {
+    std::fs::read_link("/etc/systemd/system/display-manager.service")
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+}
+
+/// The PAM services THIS login manager actually uses, so wiring targets what the
+/// DM will really consult (and, crucially, its separate FINGERPRINT service).
+/// Returns `(greeter_label, fingerprint_label_or_none)`.
+fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
+    match dm {
+        // GDM drives the password/face path and a SEPARATE fingerprint service.
+        "gdm" | "gdm3" => ("gdm-password", Some("gdm-fingerprint")),
+        // SDDM / Plasma: one greeter; KDE's fingerprint is the lock screen
+        // (kde-fingerprint), wired separately as the lock service.
+        "sddm" => ("sddm", None),
+        "lightdm" => ("lightdm", None),
+        "greetd" => ("greetd", None),
+        "ly" => ("ly", None),
+        _ => ("(unknown)", None),
+    }
+}
+
 /// SELinux module load state for the TUI (None = can't tell without root).
 pub(crate) fn selinux_state() -> Option<bool> {
     selinux_loaded()
@@ -100,8 +134,15 @@ pub(crate) fn selinux_state() -> Option<bool> {
 
 fn status() -> ExitCode {
     println!("[login] wiring status (face auth in PAM):");
+    if let Some(dm) = active_display_manager() {
+        let (greeter, fp) = dm_pam_services(&dm);
+        match fp {
+            Some(fp) => println!("  active login manager: {dm}  (uses {greeter} + {fp})"),
+            None => println!("  active login manager: {dm}  (uses {greeter})"),
+        }
+    }
     let mut any = false;
-    for s in GREETERS.iter().chain(std::iter::once(&LOCKSCREEN)) {
+    for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
         if let Some(present) = service_present(s) {
             let wired = file_has_module(&present);
             any |= wired;
@@ -132,6 +173,20 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         println!("[login] DRY RUN — showing what `--apply` would change (nothing is written):");
     }
     if enable {
+        // Login-manager-aware: report the detected DM and the exact services it
+        // consults, so the user can see the wiring matches their stack (and its
+        // fingerprint service is covered). We still wire every present known
+        // greeter below — harmless on inactive ones, and covers multi-DM boxes.
+        match active_display_manager() {
+            Some(dm) => {
+                let (greeter, fp) = dm_pam_services(&dm);
+                match fp {
+                    Some(fp) => println!("  detected login manager: {dm} → {greeter} (login) + {fp} (fingerprint keyring)"),
+                    None => println!("  detected login manager: {dm} → {greeter}"),
+                }
+            }
+            None => println!("  no active login manager detected (headless?) — wiring present greeters anyway"),
+        }
         let caps = irlume_camera::capabilities();
         if !caps.rgb && !caps.ir_pair {
             println!("  ⚠ no camera detected on this device — face auth will fall through to the password until one is present");
@@ -148,6 +203,9 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     };
     for s in GREETERS {
         do_svc(s, wire_greeter);
+    }
+    for s in FP_GREETERS {
+        do_svc(s, wire_fp_keyring);
     }
     do_svc(&LOCKSCREEN, wire_lock);
     if with_sudo {
@@ -323,6 +381,32 @@ fn wire_single(content: &str, stanza: &str) -> (String, bool) {
 }
 
 fn wire_lock(content: &str) -> (String, bool) { wire_single(content, LOCK_WAIT) }
+
+/// Wire the `keyring` unseal line into a fingerprint login service
+/// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
+/// the sealed password is set before pam_gnome_keyring's auth line runs.
+fn wire_fp_keyring(content: &str) -> (String, bool) {
+    if content.lines().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
+    }) {
+        return (content.to_string(), false); // already wired
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let fp_at = lines.iter().position(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.starts_with("auth") && t.contains("pam_fprintd.so")
+    });
+    let Some(fp_at) = fp_at else { return (content.to_string(), false); };
+    let mut out = Vec::with_capacity(lines.len() + 1);
+    for (i, l) in lines.iter().enumerate() {
+        out.push((*l).to_string());
+        if i == fp_at {
+            out.push(KEYRING_UNSEAL.to_string());
+        }
+    }
+    (format!("{}\n", out.join("\n")), true)
+}
 fn wire_sudo(content: &str) -> (String, bool) { wire_single(content, SUDO_STANZA) }
 
 /// Remove every irlume line AND the pam_permit landing we added (used only when

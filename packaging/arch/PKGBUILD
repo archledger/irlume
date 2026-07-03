@@ -6,7 +6,10 @@ pkgdesc="Local IR face authentication for Linux (clean-BOM, TPM-sealed)"
 arch=('x86_64')
 url="https://github.com/archledger/irlume"
 license=('GPL-3.0-or-later')
-# Arch's system onnxruntime is current (>=1.24) — a plain runtime dep.
+# Arch ships onnxruntime 1.24+ but SPLIT into onnxruntime-cpu / -cuda / -rocm,
+# each Provides=onnxruntime. Depend on the virtual 'onnxruntime' so any variant
+# the user has satisfies it (no conflict); a fresh install prompts to pick one —
+# choose onnxruntime-cpu unless you want GPU execution providers.
 depends=('onnxruntime' 'tpm2-tss' 'pam')
 optdepends=('fprintd: fingerprint companion factor')
 makedepends=('rust' 'cargo' 'gcc' 'git-lfs')

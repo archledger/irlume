@@ -30,6 +30,8 @@ Environment="ORT_DYLIB_PATH=/opt/irlume/onnxruntime/lib/libonnxruntime.so"
 EOF
 
 cd "$REPO/packaging/debian"
-nfpm package --packager deb --target "$REPO/irlume_${ORT_VER}.deb" || \
-  nfpm package --packager deb --target "$REPO/"
-echo "built .deb in $REPO"
+# Name the artifact after the irlume version (from nfpm.yaml), NOT the bundled
+# onnxruntime version — irlume_1.24.4.deb read like irlume itself was 1.24.4.
+PKG_VER="$(sed -n 's/^version:[[:space:]]*v\{0,1\}\([0-9][^[:space:]]*\).*/\1/p' nfpm.yaml)"
+nfpm package --packager deb --target "$REPO/irlume_${PKG_VER}_amd64.deb"
+echo "built irlume_${PKG_VER}_amd64.deb in $REPO"

@@ -1,3 +1,5 @@
+%global ort_ver 1.24.4
+
 Name:           irlume
 Version:        0.1.0
 Release:        1%{?dist}
@@ -7,6 +9,10 @@ License:        GPL-3.0-or-later
 URL:            https://github.com/archledger/irlume
 # Packit fills VCS source from the signed tag; models come via Git LFS.
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+# Bundled onnxruntime runtime (MIT). Fedora ships 1.22 but irlume needs the
+# api-24 ABI (>=1.24), so we vendor the upstream Linux build instead of
+# depending on an external Copr. Packit/Copr fetch remote sources (net-on).
+Source1:        https://github.com/microsoft/onnxruntime/releases/download/v%{ort_ver}/onnxruntime-linux-x64-%{ort_ver}.tgz
 
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -15,9 +21,8 @@ BuildRequires:  pam-devel
 BuildRequires:  tpm2-tss-devel
 BuildRequires:  systemd-rpm-macros
 
-# Runtime: onnxruntime >= 1.24 (api-24 pin) from the author's Copr; the PAM
-# stack + TPM + fprintd companion.
-Requires:       onnxruntime >= 1.24
+# Runtime: onnxruntime is bundled (see Source1); the PAM stack + TPM + fprintd
+# companion remain normal deps.
 Requires:       pam
 Requires:       tpm2-tss
 Recommends:     fprintd
@@ -41,6 +46,9 @@ daemon socket. Only needed on SELinux-enforcing systems (Fedora default).
 
 %prep
 %autosetup -n %{name}-%{version}
+# Unpack the bundled onnxruntime (Source1) next to the source tree; installed
+# below into %{_datadir}/%{name}/onnxruntime.
+tar -xzf %{SOURCE1}
 
 %build
 cargo build --release --locked
@@ -54,7 +62,11 @@ for m in glintr100 face_detection_yunet_2023mar face_landmark ir_adapter; do
     install -Dm0644 models/$m.onnx %{buildroot}%{_datadir}/%{name}/models/$m.onnx
 done
 install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlumed.service
-# onnxruntime is on the standard libdir here; no unit override needed.
+# Bundled onnxruntime runtime + a drop-in pointing ORT_DYLIB_PATH at it (cp -a
+# to preserve the .so version symlinks).
+install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
+cp -a onnxruntime-linux-x64-%{ort_ver}/lib/libonnxruntime.so* %{buildroot}%{_datadir}/%{name}/onnxruntime/lib/
+install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
 
 %post
@@ -80,11 +92,13 @@ semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
 %{_bindir}/irlume
 %{_libdir}/security/pam_irlume.so
 %{_datadir}/%{name}/models/*.onnx
+%{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service
+%{_unitdir}/irlumed.service.d/10-ort.conf
 
 %files selinux
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
-* Wed Jul 02 2026 archledger <archledger236@gmail.com> - 0.1.0-1
+* Thu Jul 02 2026 archledger <archledger236@gmail.com> - 0.1.0-1
 - Initial package: daemon + CLI + PAM module, bundled models, SELinux subpackage.

@@ -20,9 +20,7 @@ jobs:
     targets:
       - fedora-stable
       - fedora-rawhide
-    # irlume's own onnxruntime Copr provides the >=1.24 dependency.
-    additional_repos:
-      - "copr://archledger/linhello"
+    # onnxruntime is bundled in the RPM (Source1) — no external Copr needed.
 
   - job: copr_build
     trigger: pull_request

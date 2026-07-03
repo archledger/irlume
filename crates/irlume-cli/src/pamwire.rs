@@ -202,7 +202,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         }
     }
     let mut errs = 0;
-    let mut do_svc = |s: &Svc, wire: fn(&str) -> (String, bool), want: bool| {
+    let mut do_svc = |s: &Svc, wire: &dyn Fn(&str) -> (String, bool), want: bool| {
         // On enable, wire wanted factors and unwire unwanted ones; on disable,
         // unwire everything (want is ANDed with `enable`).
         match wire_service(s, enable && want, apply, wire) {
@@ -210,15 +210,20 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
             Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
         }
     };
+    // Greeters (gdm-password etc.) carry the FACE lines (only Secure-tier face
+    // login) AND the KEYRING line (fingerprint keyring unlock) — independent, so
+    // an RGB+fingerprint box gets keyring-only here, while GDM's session keyring
+    // unlock (which runs through gdm-password) still finds the password.
+    let greeter_wire = |c: &str| wire_greeter_impl(c, want_face_login, want_fp_keyring);
     for s in GREETERS {
-        do_svc(s, wire_greeter, want_face_login);
+        do_svc(s, &greeter_wire, want_face_login || want_fp_keyring);
     }
     for s in FP_GREETERS {
-        do_svc(s, wire_fp_keyring, want_fp_keyring);
+        do_svc(s, &wire_fp_keyring, want_fp_keyring);
     }
-    do_svc(&LOCKSCREEN, wire_lock, want_face_lock);
+    do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
     if with_sudo {
-        match wire_service(&Svc { etc: SUDO, vendor: None }, enable, apply, wire_sudo) {
+        match wire_service(&Svc { etc: SUDO, vendor: None }, enable, apply, &wire_sudo) {
             Ok(msg) => println!("  {msg}"),
             Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
         }
@@ -239,7 +244,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
 }
 
 /// Wire (or unwire) one service, choosing override-materialize vs edit-in-place.
-fn wire_service(s: &Svc, enable: bool, apply: bool, wire: fn(&str) -> (String, bool)) -> Result<String, String> {
+fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (String, bool)) -> Result<String, String> {
     let etc = Path::new(s.etc);
     // vendor-only service with no admin /etc copy → override strategy.
     let use_override = s.vendor.is_some() && (!etc.exists() || file_is_created_override(etc));
@@ -322,20 +327,25 @@ fn is_auth_directive(line: &str) -> bool {
 /// `pam_permit` landing + `reseal` after it, and a `session reseal` after the
 /// session substack. Idempotent; falls back to the first `auth` line if there's
 /// no password substack.
-fn wire_greeter(content: &str) -> (String, bool) {
+/// Wire a display-manager greeter. `face` adds the face-first login lines
+/// (Secure-tier credential release); `keyring` adds the post-auth keyring-unseal
+/// line (fingerprint keyring unlock — needed in gdm-password too, since GDM's
+/// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
+/// Reseal (self-heal of the sealed password) rides along whenever either is set.
+fn wire_greeter_impl(content: &str, face: bool, keyring: bool) -> (String, bool) {
+    if !face && !keyring { return (content.to_string(), false); }
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
-    // Debian/Ubuntu layout: place a face-first `sufficient` line right before
-    // `@include common-auth` (password path). nologin/succeed_if above us still
-    // run; on face success the stack is satisfied; otherwise the password flows
-    // exactly as stock. Reseal stash goes after the include (post-password).
+    // Debian/Ubuntu layout: face-first `sufficient` before `@include common-auth`
+    // (password path); keyring-unseal after it (runs on any auth success — incl.
+    // a fingerprint via common-auth's pam_fprintd).
     if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
-        let mut out = Vec::with_capacity(lines.len() + 3);
+        let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
-                out.push(GREETER_UNSEAL_DEBIAN.to_string());
+                if face { out.push(GREETER_UNSEAL_DEBIAN.to_string()); }
                 out.push((*l).to_string());
-                out.push(KEYRING_UNSEAL.to_string());
+                if keyring { out.push(KEYRING_UNSEAL.to_string()); }
                 out.push(RESEAL_AUTH.to_string());
             } else if l.trim_start().starts_with("@include common-session") {
                 out.push((*l).to_string());
@@ -353,13 +363,17 @@ fn wire_greeter(content: &str) -> (String, bool) {
         .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
     let sess_at = lines.iter().position(|l| is_passwd_substack(l, "session"));
     let Some(auth_at) = auth_at else { return (content.to_string(), false); };
-    let mut out = Vec::with_capacity(lines.len() + 4);
+    let mut out = Vec::with_capacity(lines.len() + 5);
     for (i, l) in lines.iter().enumerate() {
         if i == auth_at {
-            out.push(GREETER_UNSEAL.to_string());
-            out.push((*l).to_string());
-            out.push(PERMIT_LANDING.to_string());
-            out.push(KEYRING_UNSEAL.to_string());
+            if face {
+                out.push(GREETER_UNSEAL.to_string());
+                out.push((*l).to_string());
+                out.push(PERMIT_LANDING.to_string());
+            } else {
+                out.push((*l).to_string());
+            }
+            if keyring { out.push(KEYRING_UNSEAL.to_string()); }
             out.push(RESEAL_AUTH.to_string());
         } else if Some(i) == sess_at {
             out.push((*l).to_string());
@@ -508,7 +522,7 @@ mod tests {
 
     #[test]
     fn greeter_block_wraps_password_substack() {
-        let (w, changed) = wire_greeter(GDM);
+        let (w, changed) = wire_greeter_impl(GDM, true, true);
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let unseal = lines.iter().position(|l| l.contains("unseal")).unwrap();
@@ -523,8 +537,8 @@ mod tests {
 
     #[test]
     fn greeter_wiring_is_idempotent() {
-        let (w1, _) = wire_greeter(GDM);
-        let (w2, changed) = wire_greeter(&w1);
+        let (w1, _) = wire_greeter_impl(GDM, true, true);
+        let (w2, changed) = wire_greeter_impl(&w1, true, true);
         assert!(!changed);
         assert_eq!(w1, w2);
     }

@@ -172,42 +172,51 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN — showing what `--apply` would change (nothing is written):");
     }
+    // Method + tier aware plan: wire exactly what the chosen method needs on
+    // this hardware, and (on enable) UNWIRE what it doesn't — so switching method
+    // re-configures cleanly instead of leaving stale lines. `want_*` gate each
+    // factor; on disable everything is unwired.
+    let caps = irlume_camera::capabilities();
+    let method = irlume_core::policy::method();
+    let is_fp_method = method.face_disabled(); // Method::Fingerprint
+    let is_face_method = matches!(method, irlume_core::policy::Method::Face);
+    let fp_ready = irlume_fingerprint::available();
+    // Face releases the login credential only on the Secure (IR) tier; face
+    // verifies the lock screen on any camera; fingerprint drives the keyring
+    // unlock. `Auto` follows the hardware; an explicit method overrides.
+    let want_face_login = caps.ir_pair && !is_fp_method;
+    let want_face_lock = caps.rgb && !is_fp_method;
+    let want_fp_keyring = fp_ready && !is_face_method;
     if enable {
-        // Login-manager-aware: report the detected DM and the exact services it
-        // consults, so the user can see the wiring matches their stack (and its
-        // fingerprint service is covered). We still wire every present known
-        // greeter below — harmless on inactive ones, and covers multi-DM boxes.
         match active_display_manager() {
-            Some(dm) => {
-                let (greeter, fp) = dm_pam_services(&dm);
-                match fp {
-                    Some(fp) => println!("  detected login manager: {dm} → {greeter} (login) + {fp} (fingerprint keyring)"),
-                    None => println!("  detected login manager: {dm} → {greeter}"),
-                }
-            }
-            None => println!("  no active login manager detected (headless?) — wiring present greeters anyway"),
+            Some(dm) => println!("  login manager: {dm}   ·   method: {}   ·   {}",
+                method.as_str(),
+                if caps.ir_pair { "IR/Secure tier" } else if caps.rgb { "RGB/Convenience tier" } else { "no camera" }),
+            None => println!("  no active login manager (headless?)   ·   method: {}", method.as_str()),
         }
-        let caps = irlume_camera::capabilities();
-        if !caps.rgb && !caps.ir_pair {
-            println!("  ⚠ no camera detected on this device — face auth will fall through to the password until one is present");
-        } else if !caps.ir_pair {
-            println!("  ⚠ RGB-only camera — convenience tier: face satisfies the LOCK SCREEN only; login/sudo keep the password");
+        let onoff = |b: bool| if b { "on" } else { "—" };
+        println!("  plan → face login: {}   face lock: {}   fingerprint keyring: {}",
+            onoff(want_face_login), onoff(want_face_lock), onoff(want_fp_keyring));
+        if caps.rgb && !caps.ir_pair && !is_fp_method {
+            println!("  (RGB-only: face satisfies the LOCK SCREEN only; login/sudo keep the password)");
         }
     }
     let mut errs = 0;
-    let mut do_svc = |s: &Svc, wire: fn(&str) -> (String, bool)| {
-        match wire_service(s, enable, apply, wire) {
+    let mut do_svc = |s: &Svc, wire: fn(&str) -> (String, bool), want: bool| {
+        // On enable, wire wanted factors and unwire unwanted ones; on disable,
+        // unwire everything (want is ANDed with `enable`).
+        match wire_service(s, enable && want, apply, wire) {
             Ok(msg) => println!("  {msg}"),
             Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
         }
     };
     for s in GREETERS {
-        do_svc(s, wire_greeter);
+        do_svc(s, wire_greeter, want_face_login);
     }
     for s in FP_GREETERS {
-        do_svc(s, wire_fp_keyring);
+        do_svc(s, wire_fp_keyring, want_fp_keyring);
     }
-    do_svc(&LOCKSCREEN, wire_lock);
+    do_svc(&LOCKSCREEN, wire_lock, want_face_lock);
     if with_sudo {
         match wire_service(&Svc { etc: SUDO, vendor: None }, enable, apply, wire_sudo) {
             Ok(msg) => println!("  {msg}"),

@@ -122,6 +122,10 @@ fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
         // SDDM / Plasma: one greeter; KDE's fingerprint is the lock screen
         // (kde-fingerprint), wired separately as the lock service.
         "sddm" => ("sddm", None),
+        // Plasma 6 renamed the SDDM greeter service to `plasmalogin`; the
+        // display-manager.service symlink resolves to it. Same shape as SDDM:
+        // one greeter, KDE's fingerprint lives on the lock screen (kde-fingerprint).
+        "plasmalogin" => ("plasmalogin", None),
         "lightdm" => ("lightdm", None),
         "greetd" => ("greetd", None),
         "ly" => ("ly", None),

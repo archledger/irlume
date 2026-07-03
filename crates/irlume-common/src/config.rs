@@ -28,14 +28,24 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         // A present-but-unreadable config (classically a wrong SELinux label)
-        // must NOT be ignored silently: that sends the daemon to auto-detect and
-        // it can bind the wrong device. Make it loud (daemon stderr ⇒ journald).
+        // must NOT be ignored silently for the *daemon*: that sends it to
+        // auto-detect and it can bind the wrong device. Make it loud (daemon
+        // stderr ⇒ journald). But these files are deliberately root-only (0600),
+        // so an *unprivileged* CLI caller hitting Permission denied is expected,
+        // not a fault — the root daemon reads them fine. Warning there just
+        // alarms new users into needlessly loosening permissions. So: stay loud
+        // for root and for non-permission errors; stay quiet for the expected
+        // EACCES an ordinary user gets.
         Err(e) => {
-            eprintln!(
-                "irlume: WARNING: config {p} exists but is unreadable ({e}); key '{key}' \
-                 ignored — check permissions / SELinux label (try: restorecon -v {p})",
-                p = path.display(),
-            );
+            let unprivileged_eacces =
+                e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0;
+            if !unprivileged_eacces {
+                eprintln!(
+                    "irlume: WARNING: config {p} exists but is unreadable ({e}); key '{key}' \
+                     ignored — check permissions / SELinux label (try: restorecon -v {p})",
+                    p = path.display(),
+                );
+            }
             return None;
         }
     };

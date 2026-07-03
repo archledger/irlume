@@ -36,6 +36,11 @@ const DEV_CMDS: &[&str] = &[
 ];
 
 fn main() -> std::process::ExitCode {
+    // Rust ignores SIGPIPE by default, turning a closed stdout (`irlume … | head`,
+    // `| less` then quit, `| grep -q`) into a "failed printing to stdout: Broken
+    // pipe" panic + exit 101. Restore the Unix default so we exit quietly like any
+    // other CLI when a downstream reader goes away.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Gate the developer tools unless IRLUME_DEV is set.
     if let Some(cmd) = args.first().map(String::as_str) {
@@ -279,6 +284,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");
                     std::process::ExitCode::SUCCESS
                 }
+                Ok(irlume_common::Response::Error(e)) => { eprintln!("[keyring] arm failed: {e}"); std::process::ExitCode::FAILURE }
                 Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
                 Err(e) => { eprintln!("[keyring] arm failed: {e}"); std::process::ExitCode::FAILURE }
             }
@@ -288,6 +294,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 println!("[keyring] '{user}': keyring unlock is {}", if armed { "ARMED \u{2705}" } else { "not armed" });
                 std::process::ExitCode::SUCCESS
             }
+            Ok(irlume_common::Response::Error(e)) => { eprintln!("[keyring] status failed: {e}"); std::process::ExitCode::FAILURE }
             Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
             Err(e) => { eprintln!("[keyring] status failed: {e}"); std::process::ExitCode::FAILURE }
         },
@@ -296,6 +303,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 println!("[keyring] '{user}': sealed password erased — keyring unlock disarmed.");
                 std::process::ExitCode::SUCCESS
             }
+            Ok(irlume_common::Response::Error(e)) => { eprintln!("[keyring] forget failed: {e}"); std::process::ExitCode::FAILURE }
             Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
             Err(e) => { eprintln!("[keyring] forget failed: {e}"); std::process::ExitCode::FAILURE }
         },
@@ -1281,9 +1289,15 @@ fn doctor() -> std::process::ExitCode {
 
     // --- models / runtime --------------------------------------------------
     println!("[doctor] models:");
-    for m in ["models/glintr100.onnx", "models/face_detection_yunet_2023mar.onnx"] {
-        let ok = std::path::Path::new(m).exists();
-        println!("  {m}: {}", if ok { "present ✓" } else { "MISSING ✗" });
+    if commands::daemon_models_loaded() == Some(true) {
+        println!("  loaded by the daemon ✓");
+    } else {
+        for (f, env) in commands::REQUIRED_MODELS {
+            match commands::resolve_model(f, env) {
+                Some(p) => println!("  {f}: present ✓ ({})", p.display()),
+                None => println!("  {f}: not found — install the irlume package (or run from the repo)"),
+            }
+        }
     }
     let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
     println!("[doctor] ORT_DYLIB_PATH: {}", if ort.is_empty() { "(unset)".into() } else { ort });

@@ -331,18 +331,54 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
 }
 
 /// `irlume deps` — verify the runtime dependencies are present.
+/// Resolve a bundled model the way the daemon does: an explicit env path, the
+/// packaged /usr/share/irlume/models, then a repo-relative models/ (dev). This is
+/// why `doctor`/`deps` must NOT probe cwd-relative `models/` alone — a user runs
+/// them from their home dir, where that path never resolves.
+pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os(env_var) {
+        let p = std::path::PathBuf::from(p);
+        if p.exists() { return Some(p); }
+    }
+    for base in ["/usr/share/irlume/models", "/usr/lib/irlume/models", "models"] {
+        let p = std::path::Path::new(base).join(filename);
+        if p.exists() { return Some(p); }
+    }
+    None
+}
+
+/// `Some(true)` when the daemon reports models loaded (authoritative — it exits
+/// at startup if they can't load); `None` when the daemon is unreachable.
+pub(crate) fn daemon_models_loaded() -> Option<bool> {
+    matches!(daemon_request(&Request::Health), Ok(Response::Health { .. })).then_some(true)
+}
+
+/// The two required models as (filename, daemon-env-var) pairs.
+pub(crate) const REQUIRED_MODELS: [(&str, &str); 2] = [
+    ("glintr100.onnx", "IRLUME_MODEL"),
+    ("face_detection_yunet_2023mar.onnx", "IRLUME_DET_MODEL"),
+];
+
 pub fn deps(_args: &[String]) -> ExitCode {
     let mut ok = true;
     let mut check = |label: &str, present: bool, hint: &str| {
         println!("  {label:<14}: {}", if present { format!("{OK}") } else { ok = false; format!("{NO} {hint}") });
     };
-    // ONNX Runtime: explicit path, or a well-known system location.
+    // The daemon can't load models or run without ONNX Runtime, so a running
+    // daemon is proof onnxruntime is present — authoritative and cross-distro
+    // (avoids false "missing" on Debian/Ubuntu multiarch, where the lib lives at
+    // /usr/lib/x86_64-linux-gnu and the daemon's ORT_DYLIB_PATH env isn't in the
+    // user's shell). Fall back to an explicit path or a well-known location.
+    let loaded = daemon_models_loaded() == Some(true);
     let ort_env = std::env::var("ORT_DYLIB_PATH").ok().filter(|p| std::path::Path::new(p).exists());
-    let ort_sys = ["/usr/lib64/libonnxruntime.so", "/usr/lib/libonnxruntime.so"]
-        .iter().any(|p| std::path::Path::new(p).exists());
-    check("onnxruntime", ort_env.is_some() || ort_sys, "install onnxruntime or set ORT_DYLIB_PATH");
-    for m in ["models/glintr100.onnx", "models/face_detection_yunet_2023mar.onnx"] {
-        check(m.strip_prefix("models/").unwrap_or(m), std::path::Path::new(m).exists(), "fetch the model into models/");
+    let ort_sys = [
+        "/usr/lib64/libonnxruntime.so",
+        "/usr/lib/libonnxruntime.so",
+        "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+    ].iter().any(|p| std::path::Path::new(p).exists());
+    check("onnxruntime", loaded || ort_env.is_some() || ort_sys, "install onnxruntime or set ORT_DYLIB_PATH");
+    for (f, env) in REQUIRED_MODELS {
+        check(f, loaded || resolve_model(f, env).is_some(), "install the irlume package (or run from the repo)");
     }
     check("TPM", tpm_device().is_some(), "no /dev/tpmrm0 (sealing unavailable)");
     let have_video = (0..10).any(|n| std::path::Path::new(&format!("/dev/video{n}")).exists());

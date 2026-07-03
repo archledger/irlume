@@ -500,7 +500,8 @@ irlume — local face authentication
 USAGE: irlume <command> [options]   (default user = $USER; override with --user U)
 
 SETUP & STATUS
-  setup                 guided onboarding (enroll, keyring, recovery, wiring)
+  tui                   guided setup + live dashboard (enroll & configure here)
+  setup                 scripted onboarding (enroll, keyring, recovery, wiring)
   status                health dashboard (daemon, enrollment, keyring, cameras)
   detect                script probe; exit 0=ready / 10=partial / 20=absent
   doctor                platform / TPM / Secure Boot / camera / model checks
@@ -508,8 +509,7 @@ SETUP & STATUS
 
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
-  profiles [list|add-scan|rename|delete|eyes-open]   manage profiles/scans
-  verify                authenticate the current user (face)
+  profiles [list|add-scan|rename|delete|eyes-open|challenge <on|off>]   manage profiles
   identify              1:N \"who is this?\" across all enrolled users
 
 KEYRING / TPM
@@ -526,11 +526,7 @@ SYSTEM INTEGRATION
   ir-setup [--dry-run]            auto-configure the IR emitter
   update                          check for a newer release (family-aware)
 
-CAMERA / DEV
-  capture | liveness | meshprobe | tui   capture/liveness/EAR probes; the UI
-  irbench | genuine | eval | selftest align   benchmarks & self-tests
-  padcapture --species N --kind attack|bonafide --out LOG   ISO 30107-3 PAD capture
-  padreport --in LOG [--md OUT]   PAD self-test report (APCER/BPCER; docs/PAD_SELFTEST.md)
+  (developer/benchmark tools are hidden — set IRLUME_DEV=1 to enable them)
 ");
     ExitCode::SUCCESS
 }

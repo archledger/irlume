@@ -8,7 +8,8 @@
 //! requests are served one at a time.
 
 use irlume_common::{Request, Response, SOCKET_PATH};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use zeroize::Zeroize;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 mod users;
@@ -162,22 +163,68 @@ fn uid_of(user: &str) -> Option<u32> {
     users::uid_for_name(user)
 }
 
+/// One request line may not exceed this. A face embedding or sealed password is
+/// a few KB of base64; 64 KiB is generous and bounds a slow-loris / memory DoS
+/// from a peer that never sends a newline.
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
 fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // A read/write deadline stops one wedged peer from blocking the single-
+    // threaded daemon (and thus ALL logins) forever.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST_BYTES);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Ok(());
     }
     let req: Request = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
-        Err(e) => return respond(stream, &Response::Error(format!("bad request: {e}"))),
+        // Don't echo the peer's raw bytes / parser internals back to them.
+        Err(_) => {
+            line.zeroize();
+            return respond(stream, &Response::Error("bad request".into()));
+        }
     };
+    // The line may hold a plaintext secret (SealPassword/RecoverySetup) — wipe it
+    // now that it's parsed into the zeroizing SecretBytes.
+    line.zeroize();
     let resp = dispatch(req, &peer, engine);
     respond(stream, &resp)
 }
 
+/// A username is interpolated into `<user>.json` paths (enrollment, sealed key,
+/// keyring). Reject anything that could traverse or escape the state dir before
+/// any path is built — defence-in-depth on top of the NSS `authorized_for` check.
+fn valid_username(u: &str) -> bool {
+    !u.is_empty()
+        && u.len() <= 64
+        && !u.starts_with(['-', '.'])
+        && u.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
+}
+
+/// The `user` field of a request, if it carries one (for the traversal guard).
+fn request_user(req: &Request) -> Option<&str> {
+    use Request::*;
+    match req {
+        Authenticate { user, .. } | Enroll { user, .. } | ListProfiles { user }
+        | DeleteProfile { user, .. } | DeleteScan { user, .. } | RenameProfile { user, .. }
+        | RenameScan { user, .. } | AddScan { user, .. } | SetRequireEyesOpen { user, .. }
+        | SetRequireChallenge { user, .. } | SealPassword { user, .. } | UnsealPassword { user, .. }
+        | UnsealKeyring { user, .. } | HasSealedPassword { user } | ForgetPassword { user }
+        | ResealPassword { user, .. } | RecoveryStatus { user } | RecoverySetup { user, .. }
+        | RecoveryRestore { user, .. } | RecoveryForget { user } => Some(user.as_str()),
+        _ => None,
+    }
+}
+
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
+    if let Some(u) = request_user(&req) {
+        if !valid_username(u) {
+            return Response::Error("invalid username".into());
+        }
+    }
     match req {
         Request::Ping => Response::Pong,
         Request::Health => {
@@ -241,6 +288,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         reason: format!("RGB-only convenience: face limited to screen unlock (not {class:?})") };
                 }
             }
+            // Opt-in biopolicy also gates identity VERIFICATION on IR/Secure
+            // hardware (mirrors the credential-release gate) — else a face grant
+            // for a Remote/Unknown service would bypass the "face never satisfies
+            // remote" invariant. Off by default (behaviour unchanged).
+            if biopolicy_enforced() && engine.tier() != irlume_core::biopolicy::Tier::Convenience {
+                use irlume_core::biopolicy::{classify, decide, Action, Tier};
+                let svc = service.as_deref().unwrap_or("");
+                if decide(classify(svc, false), Tier::Secure) == Action::Deny {
+                    eprintln!("irlumed: biopolicy denies verify for service '{svc}' -> password");
+                    return Response::AuthResult { granted: false, score: 0.0, live: false,
+                        reason: format!("biopolicy: face may not satisfy '{svc}'") };
+                }
+            }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             match engine.authenticate(&user) {
                 Ok(o) => {
@@ -258,8 +318,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Err(e) => Response::Error(e.to_string()),
         },
         Request::SetCameras { rgb, ir } => {
-            // System-wide device setting (not credential-sensitive); the
-            // SO_PEERCRED local-peer boundary is sufficient.
+            // Persists to /etc and repoints the camera the daemon trusts — an
+            // attacker who could set this to a v4l2loopback node feeds recorded
+            // video into the match path (spoof) or bricks face auth (DoS). Root
+            // only (a system-wide /etc setting isn't an arbitrary peer's to make).
+            if peer.uid != 0 {
+                return Response::Error(format!("set_cameras requires root (peer uid {})", peer.uid));
+            }
             engine.set_devices(&rgb, &ir);
             let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
             if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
@@ -306,6 +371,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     Err(e) => Response::Error(e.to_string()),
                 }
             } else {
+                // The non-dry path brute-forces UVC control writes on the shared
+                // camera — a local peer could thrash the hardware. Root only.
+                if peer.uid != 0 {
+                    return Response::Error(format!("setup_ir_emitter requires root (peer uid {})", peer.uid));
+                }
                 match irlume_auth::setup_ir_emitter(engine.ir_device()) {
                     Ok(msg) => { eprintln!("irlumed: {msg}"); Response::Ok(msg) }
                     Err(e) => Response::Error(e.to_string()),

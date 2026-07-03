@@ -29,7 +29,9 @@ const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume
 /// blocks on an active password probe, so wire a face-first `sufficient` line
 /// directly before the password include instead.
 const GREETER_UNSEAL_DEBIAN: &str = "auth       sufficient                   pam_irlume.so unseal facefirst";
-const PERMIT_LANDING: &str = "auth       optional                     pam_permit.so";
+// Tagged so unwire strips OUR landing but never a foreign pam_permit.so the
+// stack legitimately carries (the trailing `#…` is a PAM comment, ignored).
+const PERMIT_LANDING: &str = "auth       optional                     pam_permit.so   # irlume-landing";
 const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so reseal";
 /// Post-auth login-keyring unlock for the FINGERPRINT path: runs after a trusted
 /// factor succeeded; if no password is present (fingerprint login) it unseals
@@ -130,6 +132,38 @@ fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
 /// SELinux module load state for the TUI (None = can't tell without root).
 pub(crate) fn selinux_state() -> Option<bool> {
     selinux_loaded()
+}
+
+/// True when the fingerprint keyring-unlock (`keyring`) line is present in EVERY
+/// login service the active login manager consults that exists — for GDM that is
+/// BOTH gdm-password AND gdm-fingerprint (the session opens via gdm-password even
+/// on a fingerprint login), for KDE/others the single greeter. Used by the TUI
+/// Repair tab to tell "fully wired" from "partially/not wired". Returns false if
+/// no relevant service exists (nothing to unlock).
+pub(crate) fn fp_keyring_wired() -> bool {
+    let has_keyring = |path: &str| -> Option<bool> {
+        std::fs::read_to_string(path).ok().map(|s| {
+            s.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
+            })
+        })
+    };
+    let mut services: Vec<String> = Vec::new();
+    if let Some(dm) = active_display_manager() {
+        let (greeter, fp) = dm_pam_services(&dm);
+        services.push(format!("/etc/pam.d/{greeter}"));
+        if let Some(fp) = fp {
+            services.push(format!("/etc/pam.d/{fp}"));
+        }
+    }
+    if services.is_empty() {
+        for g in ["gdm-password", "sddm", "plasmalogin", "lightdm"] {
+            services.push(format!("/etc/pam.d/{g}"));
+        }
+    }
+    let present: Vec<bool> = services.iter().filter_map(|p| has_keyring(p)).collect();
+    !present.is_empty() && present.iter().all(|&b| b)
 }
 
 fn status() -> ExitCode {
@@ -249,30 +283,39 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
     // vendor-only service with no admin /etc copy → override strategy.
     let use_override = s.vendor.is_some() && (!etc.exists() || file_is_created_override(etc));
     if enable {
+        // RECONCILE, don't skip-if-present: re-wire always rebuilds the desired
+        // line set from the ORIGINAL stack (the vendor copy / the backup) so a
+        // method switch — which changes which lines are wanted — actually takes
+        // effect instead of being a silent no-op when any pam_irlume line exists.
         if use_override {
             let vendor = s.vendor.unwrap();
             if !Path::new(vendor).exists() {
                 return Ok(format!("· {} — not installed (skipped)", s.etc));
             }
-            let vc = read(vendor)?;
-            if file_has_module(etc) {
-                return Ok(format!("· {} — already wired", s.etc));
-            }
-            let (wired, _) = wire(&vc);
+            let (base, _) = unwire_lines(&read(vendor)?);
+            let (wired, _) = wire(&base);
             let body = format!("{CREATED_PREFIX}{vendor} — delete this file to restore the vendor copy\n{wired}");
+            if etc.exists() && read(s.etc).ok().as_deref() == Some(body.as_str()) {
+                return Ok(format!("· {} — already correctly wired", s.etc));
+            }
             if apply { write_atomic(etc, &body)?; }
             Ok(format!("✓ {} — materialized override from {vendor}", s.etc))
         } else {
             if !etc.exists() {
                 return Ok(format!("· {} — not installed (skipped)", s.etc));
             }
-            let c = read(s.etc)?;
-            if file_has_module(etc) {
-                return Ok(format!("· {} — already wired", s.etc));
-            }
-            let (wired, changed) = wire(&c);
+            let current = read(s.etc)?;
+            // Rebuild from the pristine stock: the backup if we've wired before,
+            // else the current file — then strip any irlume lines and re-apply.
+            let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
+            let origin = if bak.exists() { read(&bak.to_string_lossy())? } else { current.clone() };
+            let (base, _) = unwire_lines(&origin);
+            let (wired, changed) = wire(&base);
             if !changed {
                 return Ok(format!("· {} — no anchor to wire (skipped)", s.etc));
+            }
+            if wired == current {
+                return Ok(format!("· {} — already correctly wired", s.etc));
             }
             if apply { backup(etc)?; write_atomic(etc, &wired)?; }
             Ok(format!("✓ {} — wired (backup {}{})", s.etc, s.etc, BACKUP))
@@ -435,10 +478,14 @@ fn wire_sudo(content: &str) -> (String, bool) { wire_single(content, SUDO_STANZA
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists — the backup-restore path is preferred).
 fn unwire_lines(content: &str) -> (String, bool) {
+    // Strip every pam_irlume line, plus ONLY the pam_permit landing WE tagged
+    // (`# irlume-landing`) — never a foreign pam_permit.so.
     let mut changed = false;
     let kept: Vec<&str> = content.lines().filter(|l| {
         let t = l.trim_start();
-        let drop = !t.starts_with('#') && (t.contains(MODULE) || t.contains("pam_permit.so"));
+        if t.starts_with('#') { return true; }
+        let drop = t.contains(MODULE)
+            || (t.contains("pam_permit.so") && l.contains("# irlume-landing"));
         if drop { changed = true; }
         !drop
     }).collect();
@@ -488,15 +535,33 @@ fn selinux_loaded() -> Option<bool> {
     }
     Some(String::from_utf8_lossy(&out.stdout).lines().any(|l| l.split_whitespace().next() == Some("irlume")))
 }
+/// Locate the compiled SELinux policy module. Packaged installs ship it under
+/// /usr/share/irlume/selinux; an env override and the in-repo build dir cover
+/// dev/source builds. (The old hardcoded developer home path never existed on a
+/// user's machine, so the module silently never loaded.)
+fn selinux_pp() -> Option<String> {
+    if let Some(p) = std::env::var_os("IRLUME_SELINUX_PP") {
+        let p = p.to_string_lossy().into_owned();
+        if Path::new(&p).exists() { return Some(p); }
+    }
+    for p in [
+        "/usr/share/irlume/selinux/irlume.pp",
+        "/usr/lib/irlume/selinux/irlume.pp",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/selinux/irlume.pp"),
+    ] {
+        if Path::new(p).exists() { return Some(p.to_string()); }
+    }
+    None
+}
+
 fn selinux(enable: bool, apply: bool) -> Result<String, String> {
-    let pp = "/home/wisbfime/irlume/packaging/selinux/irlume.pp";
     if enable {
         if selinux_loaded() == Some(true) { return Ok("· SELinux module already loaded".into()); }
-        if !Path::new(pp).exists() {
-            return Ok(format!("· SELinux: {pp} not built (run make in packaging/selinux) — skipped"));
-        }
+        let Some(pp) = selinux_pp() else {
+            return Ok("· SELinux: irlume.pp not found (install the selinux subpackage) — skipped".into());
+        };
         if apply {
-            let ok = Command::new("semodule").args(["-i", pp]).status().map(|s| s.success()).unwrap_or(false);
+            let ok = Command::new("semodule").args(["-i", pp.as_str()]).status().map(|s| s.success()).unwrap_or(false);
             if !ok { return Err("semodule -i irlume.pp failed".into()); }
         }
         Ok("✓ SELinux module loaded (greeter→daemon socket)".into())
@@ -541,6 +606,26 @@ mod tests {
         let (w2, changed) = wire_greeter_impl(&w1, true, true);
         assert!(!changed);
         assert_eq!(w1, w2);
+    }
+
+    #[test]
+    fn method_switch_reconciles_the_line_set() {
+        // face-only → (strip) → keyring-only must actually change the lines
+        // (the method-switch case the old skip-if-present logic silently no-op'd).
+        let (face_only, _) = wire_greeter_impl(GDM, true, false);
+        assert!(face_only.contains("pam_irlume.so unseal") && !face_only.contains("pam_irlume.so keyring"));
+        let (base, stripped) = unwire_lines(&face_only);
+        assert!(stripped && !base.contains(MODULE));
+        let (keyring_only, _) = wire_greeter_impl(&base, false, true);
+        assert!(keyring_only.contains("pam_irlume.so keyring") && !keyring_only.contains("pam_irlume.so unseal"));
+        assert_ne!(face_only, keyring_only);
+    }
+
+    #[test]
+    fn unwire_keeps_a_foreign_pam_permit() {
+        let stack = "auth optional pam_permit.so\nauth substack password-auth\n";
+        let (clean, _) = unwire_lines(stack);
+        assert!(clean.contains("pam_permit.so")); // foreign permit survives
     }
 
     #[test]

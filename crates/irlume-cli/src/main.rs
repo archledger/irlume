@@ -2,13 +2,12 @@
 //! protocol as the PAM module). Enrollment requests are authorized by the daemon
 //! via SO_PEERCRED, not by this binary.
 //!
-//! Subcommands (planned):
+//! Run `irlume help` for the user-facing subcommands, or `irlume tui` for the
+//! guided setup. Developer/benchmark tools are gated behind `IRLUME_DEV=1`.
+//! A selection of the main subcommands:
+//!   irlume tui                                   guided setup + live dashboard
 //!   irlume enroll [--user U] [--profile NAME]   register a face profile
-//!   irlume verify [--user U]                     one-shot auth test
-//!   irlume profiles [--user U]                   list profiles
-//!   irlume delete  --user U --profile NAME       remove a profile
-//!   irlume selftest align --model <PATH>         Phase-1 gate: same crop -> ~1.0
-//!   irlume selftest liveness                     run the IR PAD cues
+//!   irlume identify                              1:N "who is this?"
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
@@ -27,8 +26,25 @@ pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
+/// Developer / benchmark / research subcommands — hidden from `help` and gated
+/// behind `IRLUME_DEV=1`. They open the camera directly (bypassing the daemon,
+/// so they EBUSY-conflict on a running install) and some, like `calcapture`,
+/// write RAW face embeddings to a plaintext file — not for end users.
+const DEV_CMDS: &[&str] = &[
+    "capture", "eval", "irbench", "genuine", "calcapture", "normprobe",
+    "liveness", "meshprobe", "selftest", "padcapture", "padreport", "verify",
+];
+
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Gate the developer tools unless IRLUME_DEV is set.
+    if let Some(cmd) = args.first().map(String::as_str) {
+        if DEV_CMDS.contains(&cmd) && std::env::var_os("IRLUME_DEV").is_none() {
+            eprintln!("[irlume] '{cmd}' is a developer/benchmark tool (opens the camera directly, \
+                       not for normal use). Set IRLUME_DEV=1 to enable it.");
+            return std::process::ExitCode::from(2);
+        }
+    }
     match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
         (Some("selftest"), Some("align")) => selftest_align(&args),
         (Some("capture"), _) => capture(&args),
@@ -172,7 +188,8 @@ fn usage_profiles() -> std::process::ExitCode {
         add-scan --profile P                    add a scan to P (improve recognition)\n  \
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
-        eyes-open <on|off>                      require eyes open to unlock");
+        eyes-open <on|off>                      require eyes open to unlock\n  \
+        challenge <on|off>                      opt-in passive blink liveness");
     std::process::ExitCode::from(2)
 }
 

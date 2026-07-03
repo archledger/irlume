@@ -82,6 +82,7 @@ impl Pending {
 enum Suspend {
     FingerprintAdd,
     LoginStatus,
+    LoginEnable,
     RestartDaemon,
     RestartFprintd,
     SelinuxLoad,
@@ -522,22 +523,19 @@ impl App {
                 // (TPM-seal the password) AND the greeter carries the `keyring`
                 // line. Surface it so the user isn't left typing the keyring
                 // password after every fingerprint login.
-                if fprintd_wired && !self.fp.enrolled.is_empty() {
+                if fprintd_wired && !self.fp.enrolled.is_empty() && crate::tpm_device().is_some() {
                     let armed = self.keyring_armed.unwrap_or(false);
-                    let wired = ["/etc/pam.d/gdm-password", "/etc/pam.d/sddm", "/etc/pam.d/plasmalogin", "/etc/pam.d/login"]
-                        .iter().any(|p| std::fs::read_to_string(p).map(|s|
-                            s.lines().any(|l| !l.trim_start().starts_with('#') && l.contains("pam_irlume.so") && l.contains("keyring"))
-                        ).unwrap_or(false));
-                    if !crate::tpm_device().is_some() {
-                        // No TPM → can't seal; nothing to offer.
-                    } else if !armed {
+                    // DM-aware: the keyring line must be in EVERY login service
+                    // the active DM uses (GDM: gdm-password AND gdm-fingerprint).
+                    let wired = crate::pamwire::fp_keyring_wired();
+                    if !armed {
                         v.push(mk("FP keyring unlock", Sev::Warn,
                             "wallet won't auto-unlock on fingerprint login — arm the keyring".into(),
                             Fix::Manual("Keyring tab → [a] arm (seal your login password)".into())));
                     } else if !wired {
                         v.push(mk("FP keyring unlock", Sev::Warn,
-                            "keyring armed but the greeter lacks the unlock line".into(),
-                            Fix::Manual("sudo irlume login enable --apply".into())));
+                            "keyring armed but the login stack lacks the unlock line".into(),
+                            Fix::Root("login-enable")));
                     } else {
                         v.push(mk("FP keyring unlock", Sev::Ok,
                             "a fingerprint login unseals the wallet (no keyring prompt)".into(), Fix::None));
@@ -626,6 +624,7 @@ impl App {
             Fix::Daemon(_) => {}
             Fix::Root("restart-daemon") => { self.log('→', "sudo systemctl restart irlumed (you'll be asked for your password)"); self.suspend = Some(Suspend::RestartDaemon); }
             Fix::Root("restart-fprintd") => { self.log('→', "sudo systemctl restart fprintd — releases a stale reader claim"); self.suspend = Some(Suspend::RestartFprintd); }
+            Fix::Root("login-enable") => { self.log('→', "sudo irlume login enable --apply — wires the login stack for your method"); self.suspend = Some(Suspend::LoginEnable); }
             Fix::Root("fingerprint-add") => { self.log('→', "enrolling a finger (interactive)"); self.suspend = Some(Suspend::FingerprintAdd); }
             Fix::Root("selinux-load") => { self.log('→', "sudo irlume selinux load (you'll be asked for your password)"); self.suspend = Some(Suspend::SelinuxLoad); }
             Fix::Root(_) => {}
@@ -694,7 +693,7 @@ impl App {
                 // camera). Identify/Generic keep the modal on failure.
                 if ok {
                     self.log('✓', msg.clone());
-                } else if !matches!(tag, OpTag::Calibrate) {
+                } else if !matches!(tag, OpTag::Calibrate | OpTag::Identify) {
                     self.set_error(msg.clone());
                 } else {
                     self.log('·', msg.clone());
@@ -786,6 +785,14 @@ impl App {
         match s {
             Suspend::FingerprintAdd => { crate::fingerprint::run(Some("add"), &none); }
             Suspend::LoginStatus => { crate::pamwire::run(Some("status"), &none); }
+            Suspend::LoginEnable => {
+                // Wire the login stack for the current method+tier (adds the
+                // keyring line where the DM needs it). Idempotent; runs as root.
+                eprintln!("\nWiring the login stack (sudo irlume login enable --apply)…");
+                let _ = std::process::Command::new("sudo")
+                    .args(["irlume", "login", "enable", "--apply"])
+                    .status();
+            }
             Suspend::RestartDaemon => {
                 eprintln!("\nRestarting irlumed (sudo)…");
                 let _ = std::process::Command::new("sudo").args(["systemctl", "restart", "irlumed"]).status();
@@ -1243,7 +1250,7 @@ impl App {
             Line::from(Span::styled("  Toggle (root): set enforce_biopolicy=1 in /etc/irlume/settings.conf.", Style::new().dim())),
             Line::raw(""),
             section("Match thresholds (read-only)"),
-            Line::from(Span::styled("  RGB 0.55 · IR-adapted 0.40 · auto-scaled by enrolled scan count.", Style::new().dim())),
+            Line::from(Span::styled("  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.", Style::new().dim())),
         ]).wrap(Wrap { trim: true }), area);
     }
 
@@ -1576,13 +1583,17 @@ impl App {
         // Tier-accurate: only the Secure (IR) tier releases the login credential
         // at the greeter. On a convenience (RGB-only) box face is lock-screen
         // only — describing keyring-unseal there would be a false promise.
-        let convenience = self.health.as_ref().is_some_and(|h| h.tier == "convenience");
-        if convenience {
-            lines.push(Line::from(Span::styled("  greeter (RGB-only): face is NOT accepted for login — password only", Style::new().dim())));
-            lines.push(Line::from(Span::styled("  lock screen: face unlocks the screen (no credential release)", Style::new().dim())));
-        } else {
-            lines.push(Line::from(Span::styled("  greeter: face → TPM-unseal password → wallet opens at login", Style::new().dim())));
-            lines.push(Line::from(Span::styled("  lock screen: face verify-only (wallet already open)", Style::new().dim())));
+        match self.health.as_ref().map(|h| h.tier.as_str()) {
+            Some("convenience") => {
+                lines.push(Line::from(Span::styled("  greeter (RGB-only): face is NOT accepted for login — password only", Style::new().dim())));
+                lines.push(Line::from(Span::styled("  lock screen: face unlocks the screen (no credential release)", Style::new().dim())));
+            }
+            Some("secure") => {
+                lines.push(Line::from(Span::styled("  greeter: face → TPM-unseal password → wallet opens at login", Style::new().dim())));
+                lines.push(Line::from(Span::styled("  lock screen: face verify-only (wallet already open)", Style::new().dim())));
+            }
+            // Daemon unreachable/older, or no camera — don't promise credential release.
+            _ => lines.push(Line::from(Span::styled("  tier unknown (daemon unreachable) — password remains the fallback", Style::new().dim()))),
         }
         lines.push(Line::from(Span::styled("  always fail-safe to the password — no lockout.", Style::new().dim())));
         lines.push(Line::raw(""));
@@ -1675,7 +1686,7 @@ impl App {
     fn modal(&self, f: &mut Frame, title: &str, body: &str) {
         let area = f.area();
         let w = area.width.saturating_sub(8).min(72).max(24);
-        let rect = Rect { x: area.width.saturating_sub(w) / 2, y: area.height / 2 - 2, width: w, height: 5 };
+        let rect = Rect { x: area.width.saturating_sub(w) / 2, y: area.height.saturating_sub(5) / 2, width: w, height: 5.min(area.height) };
         f.render_widget(Clear, rect);
         let blk = Block::bordered().title(format!(" {title} ")).border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT)).padding(ratatui::widgets::Padding::horizontal(1));
         f.render_widget(Paragraph::new(Line::from(body.to_string())).block(blk).wrap(Wrap { trim: true }), rect);

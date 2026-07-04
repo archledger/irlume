@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Never commit captured frames, templates, or any biometric data:
 *.onnx.tmp

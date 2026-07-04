@@ -3,6 +3,8 @@
 specfile_path: packaging/fedora/irlume.spec
 upstream_package_name: irlume
 downstream_package_name: irlume
+# Tags are v-prefixed (v0.1.1); without this the RPM Version keeps the "v".
+upstream_tag_template: "v{version}"
 
 srpm_build_deps:
   - git-lfs

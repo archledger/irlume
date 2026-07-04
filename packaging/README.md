@@ -42,5 +42,3 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
 - Arch: system `onnxruntime` is current (≥1.24) — plain dependency.
 - Debian/Ubuntu: NOT in the archive at ≥1.24 → bundle under
   `/opt/irlume/onnxruntime` and point `ORT_DYLIB_PATH` via a unit override.
-
-<!-- packit pipeline probe 2026-07-03 (temporary PR; will be closed) -->

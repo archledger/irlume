@@ -3,7 +3,7 @@
 Name:           irlume
 Version:        0.1.1
 Release:        1%{?dist}
-Summary:        Local IR face authentication for Linux (clean-BOM, TPM-sealed)
+Summary:        Local face authentication for Linux (IR or RGB webcam; TPM-sealed, clean-BOM)
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/archledger/irlume
@@ -36,11 +36,13 @@ Recommends:     fprintd
 %{?systemd_requires}
 
 %description
-irlume authenticates you to Linux by your face using the infrared (Windows
-Hello) camera: a thin PAM module talks to a privileged daemon that owns the
-camera, runs a clean-license model stack (YuNet + AuraFace) with algorithmic IR
-liveness, and TPM-seals the login credential so a face match can unlock the
-keyring. Password is always the fallback — no lockout.
+irlume authenticates you to Linux by your face with whatever camera the
+machine has: an infrared (Windows Hello) camera enables the secure tier —
+login, sudo, and TPM-sealed keyring unlock with algorithmic IR liveness —
+while a regular RGB webcam enables convenient screen unlock, and a
+fingerprint reader can join as a companion factor. A thin PAM module talks
+to a privileged daemon that owns the camera and runs a clean-license model
+stack (YuNet + AuraFace). Password is always the fallback — no lockout.
 
 %package selinux
 Summary:        SELinux policy module for irlume

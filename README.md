@@ -1,11 +1,15 @@
 <div align="center">
 
-<img src="docs/assets/banner.svg" alt="irlume — infrared face authentication for Linux" width="640">
+<img src="docs/assets/banner.svg" alt="irlume — face authentication for Linux" width="640">
 
 <br>
 
 **Face-unlock for Linux — login, sudo, lock screen — that works in the dark,
 resists photo & screen spoofs, and never stores your face as an image.**
+
+Works with the camera you have: an **IR (Windows Hello) camera** unlocks the full
+secure tier, a **regular webcam** gives convenient screen unlock, and a
+**fingerprint reader** slots in as a companion factor.
 
 Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean stack.
 
@@ -15,7 +19,7 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 ![Platform](https://img.shields.io/badge/platform-Linux-1f2328)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 ![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu-2ea44f)
-![Version](https://img.shields.io/badge/version-0.1.0-c0304f)
+![Version](https://img.shields.io/badge/version-0.1.1-c0304f)
 
 [Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#️-honest-limitations) · [Docs](docs/)
 
@@ -49,7 +53,7 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 
 ## 📦 Install
 
-> **v0.1.0.** Works end-to-end on real hardware across all three families. Not
+> **v0.1.1.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass) — see [Honest limitations](#️-honest-limitations).
 
 <table>
@@ -161,7 +165,7 @@ Trust is built on candor, so — plainly:
 
 ## 🛠️ Status
 
-**v0.1.0 — working, validated end-to-end on real hardware across Fedora, Arch, and
+**v0.1.1 — working, validated end-to-end on real hardware across Fedora, Arch, and
 Debian/Ubuntu** (IR Secure tier, RGB Convenience tier, and fingerprint). Packaged
 for all three. Actively hardened; interfaces may still shift before 1.0.
 

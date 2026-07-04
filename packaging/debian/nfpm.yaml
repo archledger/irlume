@@ -11,10 +11,11 @@ section: admin
 priority: optional
 maintainer: archledger <archledger236@gmail.com>
 description: |
-  Local IR face authentication for Linux (clean-BOM, TPM-sealed).
-  Thin PAM module + privileged daemon owning the IR (Windows Hello) camera;
-  YuNet + AuraFace with algorithmic IR liveness; TPM-sealed keyring unlock.
-  Password is always the fallback.
+  Local face authentication for Linux (IR or RGB webcam; TPM-sealed, clean-BOM).
+  IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed
+  keyring unlock with algorithmic IR liveness. Regular RGB webcams get screen
+  unlock; a fingerprint reader can join as a companion factor. Thin PAM module
+  + privileged daemon; YuNet + AuraFace. Password is always the fallback.
 vendor: irlume
 homepage: https://github.com/archledger/irlume
 license: GPL-3.0-or-later

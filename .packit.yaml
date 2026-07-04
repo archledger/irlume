@@ -17,6 +17,9 @@ jobs:
     trigger: release
     owner: archledger
     project: irlume
+    # Packit submits builds with networking OFF regardless of the Copr
+    # project's own enable_net setting — cargo needs crates.io in %build.
+    enable_net: true
     targets:
       - fedora-stable
       - fedora-rawhide
@@ -26,5 +29,6 @@ jobs:
     trigger: pull_request
     owner: archledger
     project: irlume
+    enable_net: true
     targets:
       - fedora-stable

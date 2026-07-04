@@ -20,6 +20,13 @@ BuildRequires:  gcc
 BuildRequires:  pam-devel
 BuildRequires:  tpm2-tss-devel
 BuildRequires:  systemd-rpm-macros
+# v4l2-sys-mit generates bindings at build time: bindgen dlopens libclang
+# and parses the kernel's videodev2.h; tss-esapi locates tss2 via pkg-config.
+BuildRequires:  clang-devel
+BuildRequires:  kernel-headers
+BuildRequires:  pkgconf-pkg-config
+# Compiles packaging/selinux/irlume.te → irlume.pp in %%build.
+BuildRequires:  selinux-policy-devel
 
 # Runtime: onnxruntime is bundled (see Source1); the PAM stack + TPM + fprintd
 # companion remain normal deps.
@@ -52,6 +59,9 @@ tar -xzf %{SOURCE1}
 
 %build
 cargo build --release --locked
+# Compile the SELinux policy module from source (the .pp is a build artifact,
+# not committed to git).
+make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux irlume.pp
 
 %install
 install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
@@ -67,7 +77,7 @@ install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlume
 install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
 cp -a onnxruntime-linux-x64-%{ort_ver}/lib/libonnxruntime.so* %{buildroot}%{_datadir}/%{name}/onnxruntime/lib/
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
-install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
+install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
 
 %post
 %systemd_post irlumed.service

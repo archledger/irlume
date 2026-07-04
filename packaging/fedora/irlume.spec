@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Local IR face authentication for Linux (clean-BOM, TPM-sealed)
 
@@ -110,5 +110,9 @@ semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sat Jul 04 2026 archledger <archledger236@gmail.com> - 0.1.1-1
+- Copr pipeline fixes: enable_net for cargo, committed Cargo.lock,
+  bindgen/pkg-config BuildRequires, SELinux policy built from source.
+
 * Thu Jul 02 2026 archledger <archledger236@gmail.com> - 0.1.0-1
 - Initial package: daemon + CLI + PAM module, bundled models, SELinux subpackage.

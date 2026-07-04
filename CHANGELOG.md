@@ -3,6 +3,28 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-07-04
+
+Packaging-only patch release: makes the Fedora Copr pipeline work end-to-end.
+No functional changes to the daemon, CLI, or PAM module.
+
+### Fixed
+
+- **Fedora/Copr builds now succeed** (validated live in Copr): Packit jobs
+  request build-time networking (`enable_net`) so cargo can reach crates.io;
+  `Cargo.lock` is now committed so `cargo build --locked` works from release
+  tarballs; the spec gained the missing `clang-devel`, `kernel-headers`, and
+  `pkgconf-pkg-config` BuildRequires (bindgen for V4L2, pkg-config for
+  tss-esapi); and the SELinux policy module is compiled from its committed
+  `.te` source during the build instead of expecting a pregenerated `.pp`.
+- Fedora users can install from Copr: `dnf copr enable archledger/irlume &&
+  dnf install irlume`.
+
+### Notes
+
+- Arch (`.pkg.tar.zst`) and Debian/Ubuntu (`.deb`) binaries are unchanged from
+  v0.1.0 — use the v0.1.0 release assets.
+
 ## [0.1.0] — 2026-07-03
 
 First public release. Local infrared face authentication for Linux —

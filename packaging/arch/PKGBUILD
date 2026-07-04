@@ -1,6 +1,6 @@
 # Maintainer: archledger <archledger236@gmail.com>
 pkgname=irlume
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Local IR face authentication for Linux (clean-BOM, TPM-sealed)"
 arch=('x86_64')

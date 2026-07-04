@@ -20,6 +20,11 @@ BuildRequires:  gcc
 BuildRequires:  pam-devel
 BuildRequires:  tpm2-tss-devel
 BuildRequires:  systemd-rpm-macros
+# v4l2-sys-mit generates bindings at build time: bindgen dlopens libclang
+# and parses the kernel's videodev2.h; tss-esapi locates tss2 via pkg-config.
+BuildRequires:  clang-devel
+BuildRequires:  kernel-headers
+BuildRequires:  pkgconf-pkg-config
 
 # Runtime: onnxruntime is bundled (see Source1); the PAM stack + TPM + fprintd
 # companion remain normal deps.

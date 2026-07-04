@@ -21,7 +21,7 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 ![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu-2ea44f)
 ![Version](https://img.shields.io/badge/version-0.1.1-c0304f)
 
-[Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#️-honest-limitations) · [Docs](docs/)
+[Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#️-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
 
 </div>
 
@@ -42,14 +42,18 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 
 ## 🆚 Why it's different
 
-| | Windows Hello | `visage` *(closest FOSS)* | **irlume** |
-|---|:---:|:---:|:---:|
-| **Liveness / anti-spoof** | IR only *(bypassable — [CVE-2021-34466](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34466))* | ❌ none | ✅ algorithmic IR gate **+** opt-in passive blink; self-tested vs [ISO/IEC 30107-3](docs/PAD_SELFTEST.md) |
-| **Camera-injection defense** | device-trust *(newer HW)* | ❌ none | ✅ device pinning **+** cross-spectrum RGB↔IR |
-| **Template protection** | TPM-bound enclave | ⚠️ raw floats in SQLite | ✅ AES-256-GCM, **TPM-sealed key** |
-| **Stores your face as…** | template | embedding | **embedding only, never an image** |
-| **Model licensing** | proprietary | ⚠️ non-commercial weights | ✅ **permissive, bundleable** |
-| **Runs on** | Windows | Linux | **Linux — Fedora · Arch · Debian/Ubuntu** |
+How irlume compares to Windows Hello and the Linux face-unlock projects you've
+probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://github.com/sovren-software/visage)):
+
+| | Windows Hello | Howdy | `visage` | **irlume** |
+|---|:---:|:---:|:---:|:---:|
+| **Liveness / anti-spoof** | IR only *(bypassable — [CVE-2021-34466](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34466))* | ❌ none — its own README warns a *"well-printed photo of you could be enough"* | ❌ none | ✅ algorithmic IR gate **+** opt-in passive blink; self-tested vs [ISO/IEC 30107-3](docs/PAD_SELFTEST.md) |
+| **Camera-injection defense** | device-trust *(newer HW)* | ❌ none | ❌ none | ✅ device pinning **+** cross-spectrum RGB↔IR |
+| **Template protection** | TPM-bound enclave | ⚠️ unencrypted encodings on disk | ⚠️ raw floats in SQLite | ✅ AES-256-GCM, **TPM-sealed key** |
+| **Opens your keyring/wallet** | ✅ | ❌ *(keyring stays locked)* | ❌ | ✅ **TPM-unseals** it at login |
+| **Stores your face as…** | template | encoding | embedding | **embedding only, never an image** |
+| **Model licensing** | proprietary | MIT code · dlib weights | ⚠️ non-commercial weights | ✅ **permissive, bundleable** |
+| **Runs on** | Windows | Linux | Linux | **Linux — Fedora · Arch · Debian/Ubuntu** |
 
 ## 📦 Install
 
@@ -162,6 +166,49 @@ Trust is built on candor, so — plainly:
   never `sudo`, login, or the keyring (those keep the password). By design.
 - **Not lab-certified.** We self-test against ISO/IEC 30107-3; there's no paid iBeta
   pass. Demographic FMR tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
+
+## ❓ FAQ
+
+<details>
+<summary><b>Is this "Windows Hello for Linux"?</b></summary>
+
+Yes — that's the bar. irlume brings Windows Hello–style face login to Linux:
+face-unlock the login screen, lock screen, `sudo`, and your keyring/wallet,
+using the same IR (Windows Hello) camera your laptop already has. And it aims
+past Hello where Hello is weak: real anti-spoof liveness, encrypted
+TPM-sealed templates, and a fully open stack.
+</details>
+
+<details>
+<summary><b>How is irlume different from Howdy?</b></summary>
+
+[Howdy](https://github.com/boltgolt/howdy) is the best-known face unlock for
+Linux, and it's honest about being a *convenience*: its README says a
+well-printed photo could be enough to fool it. irlume is built as an
+*authenticator*: an IR liveness gate (self-tested against ISO/IEC 30107-3),
+AES-256-GCM-encrypted templates under a TPM-sealed key, camera pinning, and
+TPM keyring unlock at login — with tiers, so RGB-only face match is
+deliberately limited to screen unlock. See the [comparison](#-why-its-different).
+</details>
+
+<details>
+<summary><b>Do I need an IR camera?</b></summary>
+
+No. An IR (Windows Hello) camera gets the full **Secure** tier — greeter
+login, `sudo`, keyring unlock, works in the dark. A **regular RGB webcam**
+gets the Convenience tier: face unlock for the lock screen only. A
+**fingerprint reader** works as a companion factor on either. All
+auto-detected.
+</details>
+
+<details>
+<summary><b>Does it work on Ubuntu / Fedora / Arch, GNOME / KDE, Wayland?</b></summary>
+
+Yes — irlume authenticates through PAM, so the desktop stack doesn't matter.
+It's validated end-to-end on Fedora (KDE Plasma), Ubuntu (GNOME/GDM), and
+Arch, all on Wayland, including the greeter, lock screen, `sudo`, and
+fingerprint paths.
+</details>
 
 ## 🛠️ Status
 

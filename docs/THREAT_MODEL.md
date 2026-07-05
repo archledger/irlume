@@ -106,6 +106,15 @@ no new capability (root can already read the running keyring), and root is the
 trust boundary throughout. The face/IR path is strictly stronger here (it
 requires a daemon-verified live biometric even against root).
 
+**Fingerprint presentation attacks — honest scope.** The fingerprint path's
+anti-spoofing is whatever the sensor and `fprintd` provide, which for common
+match-on-host readers is **none**. irlume's IR liveness gates (emitter
+ratio/glint/depth cues, eyes-open, blink challenge) apply to the **face path
+only** and do not transfer. For reference, Windows Hello certification
+*requires* fingerprint anti-spoofing; irlume's fingerprint companion makes no
+equivalent claim — treat it as convenience-tier against a determined attacker
+with a fabricated print.
+
 ## Side channels
 
 - **Constant-time match decision.** The cosine/threshold comparison must not

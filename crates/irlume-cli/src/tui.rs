@@ -1357,6 +1357,16 @@ impl App {
             }
             Row::Scan(pi, si) => ListItem::new(Line::from(Span::raw(format!("     ↳ {}", self.profiles[*pi].scans[*si])))),
         }).collect();
+        // Windows-Hello-style enrollment guidance (selection never reaches
+        // these: `sel` is clamped to the real rows above).
+        let mut items = items;
+        items.push(ListItem::new(Line::raw("")));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  Tips: wear glasses sometimes? Enroll a second profile named 'glasses' ([e]).", Style::new().dim()))));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  Add a scan ([a]) after big appearance changes, or where strong sunlight", Style::new().dim()))));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  (high ambient IR) makes recognition unreliable.", Style::new().dim()))));
         let mut st = ListState::default().with_selected(Some(self.sel.min(rows.len().saturating_sub(1))));
         f.render_stateful_widget(List::new(items).highlight_style(Style::new().bg(Color::Rgb(0x20, 0x30, 0x40)).add_modifier(Modifier::BOLD)), area, &mut st);
     }

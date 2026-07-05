@@ -234,6 +234,18 @@ auto-detected.
 </details>
 
 <details>
+<summary><b>Glasses, beards, outdoors — when should I re-enroll?</b></summary>
+
+One enrollment usually lasts. Add to it when reality changes, the same way
+Windows Hello recommends: **wear glasses sometimes?** Enroll a second profile
+named `glasses` (TUI Profiles → `[e]`) so both looks match. **Major appearance
+change** (shaved beard, new heavy frames)? Add a scan (`[a]`) rather than
+starting over. **Recognition flaky in bright sunlight?** Strong ambient IR can
+wash out the emitter's illumination — add a scan captured in that environment.
+Profiles are per-user and deletable any time.
+</details>
+
+<details>
 <summary><b>Does it work on Ubuntu / Fedora / Arch, GNOME / KDE, Wayland?</b></summary>
 
 Yes — irlume authenticates through PAM, so the desktop stack doesn't matter.

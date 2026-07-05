@@ -802,7 +802,8 @@ SYSTEM INTEGRATION
   login <status|enable|disable> [--apply]   PAM wiring for greeters + lock screen
   fingerprint <status|add|enable|disable>   fprintd companion factor
   selinux <status|load>           SELinux module for the login greeter
-  ir-setup [--dry-run]            auto-configure the IR emitter
+  ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely
+                        needed — enroll auto-runs it when IR frames are dark)
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
 

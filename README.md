@@ -118,10 +118,15 @@ handles every case — it detects how irlume was installed and updates the same 
 Then, once:
 
 ```sh
-irlume ir-setup                    # IR cameras: enable the 850 nm emitter
 irlume tui                         # enroll your face + configure, guided
 sudo irlume login enable --apply   # opt-in: wire the greeter + lock screen
 ```
+
+No IR-emitter step needed: enrollment probes the IR camera and, if its frames
+come back black, auto-discovers and enables the 850 nm emitter itself. Only if
+IR stays dark after enrolling, run `sudo irlume ir-setup` manually — it applies
+to IR cameras only (on an RGB-only webcam it exits with "not an IR capture
+node" without touching anything).
 
 **Safe to try.** Installing the package wires **nothing** into your login —
 auth only changes when you run `login enable`, and without `--apply` it's a

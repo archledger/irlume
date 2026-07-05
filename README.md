@@ -19,7 +19,8 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 ![Platform](https://img.shields.io/badge/platform-Linux-1f2328)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 ![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu-2ea44f)
-![Version](https://img.shields.io/badge/version-0.1.1-c0304f)
+[![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
+[![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](#-faq)
 
 [Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#️-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
 
@@ -279,10 +280,13 @@ for all three. Actively hardened; interfaces may still shift before 1.0.
 lock this down. Contributions welcome under the [DCO](CONTRIBUTING.md) — **no CLA,
 no commercial relicensing**. Security reports: see [SECURITY.md](SECURITY.md).
 
-**AI disclosure.** irlume is built by a human maintainer working with an AI
-assistant (Anthropic's Claude) — disclosed on every commit via `Co-Authored-By`
-trailers in the public git history. Direction, review, hardware testing, and
-releases are human-driven, and the security claims rest on reproducible
-evaluations in this repo, not on who typed the code.
+> [!NOTE]
+> **AI disclosure — assisted, human-directed.** irlume is built by a human
+> maintainer working with an AI assistant (Anthropic's Claude), disclosed on
+> **every commit** via `Co-Authored-By` trailers — check the git history or the
+> [contributors](https://github.com/archledger/irlume/graphs/contributors) page.
+> Direction, review, and releases are human-driven; every release is validated
+> with clean-slate installs on real hardware, and the security claims rest on
+> reproducible evaluations in this repo, not on who typed the code.
 
 <div align="center"><sub>Built with Rust · <a href="LICENSE">GPL-3.0-or-later</a> · your face stays yours</sub></div>

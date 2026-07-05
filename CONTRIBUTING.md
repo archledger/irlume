@@ -26,13 +26,15 @@ you certify the DCO. That's it — no forms, no rights assignment.
   layers (code, weights, training data). No InsightFace buffalo_l/antelopev2 or
   other non-commercial weights — they conflict with GPL.
 - **Liveness/PAD changes** should come with a self-test against the relevant
-  ISO/IEC 30107-3 attack class — run `irlume padcapture` / `irlume padreport` and
+  ISO/IEC 30107-3 attack class — run `IRLUME_DEV=1 irlume padcapture` /
+  `padreport` and
   include the per-species APCER/BPCER numbers. See
   [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR.
 
 ## Where to start
 
-Look for `todo!()` / `TODO` markers — each maps to a roadmap phase in the
-README. The Phase-1 alignment self-test (`irlume selftest align`) is the highest-
-leverage first piece.
+Look for `todo!()` / `TODO` markers in the code. A good first smoke test of a
+working dev setup is the alignment self-test:
+`IRLUME_DEV=1 irlume selftest align` (dev/benchmark subcommands are gated
+behind `IRLUME_DEV=1`).

@@ -168,6 +168,7 @@ detector model. `irlumed` needs the camera, so **stop the daemon first** or poin
 `--rgb`/`--ir` at free device nodes.
 
 ```sh
+export IRLUME_DEV=1        # pad tools are dev-gated
 export ORT_DYLIB_PATH=/usr/lib64/libonnxruntime.so
 DET=models/face_detection_yunet_2023mar.onnx
 LOG=pad-$(git rev-parse --short HEAD).jsonl     # tie the log to the gate commit

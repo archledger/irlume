@@ -20,8 +20,9 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
 
 ## Per-family
 
-- **Fedora** — `fedora/irlume.spec` + `../.packit.yaml`: Copr builds from signed
-  GitHub tags (the linhello pipeline). Requires `onnxruntime`; PAM to
+- **Fedora** — `fedora/irlume.spec` + `../.packit.yaml`: Packit builds in Copr
+  from signed GitHub tags. Bundles onnxruntime 1.24.4 (Source1 →
+  `/usr/share/irlume/onnxruntime` + `ORT_DYLIB_PATH` drop-in); PAM to
   `/usr/lib64/security`; SELinux subpackage. Update path: `dnf upgrade` / Copr,
   driven by `irlume update`.
 - **Arch** — primary channel is a **prebuilt `.pkg.tar.zst` on GitHub Releases**
@@ -38,7 +39,8 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
 
 ## onnxruntime ≥ 1.24 (the api-24 pin)
 
-- Fedora: `onnxruntime` from the author's Copr (matches the pin).
+- Fedora: bundled in the RPM (Source1 tarball → `/usr/share/irlume/onnxruntime`,
+  `ORT_DYLIB_PATH` unit drop-in).
 - Arch: system `onnxruntime` is current (≥1.24) — plain dependency.
 - Debian/Ubuntu: NOT in the archive at ≥1.24 → bundle under
   `/opt/irlume/onnxruntime` and point `ORT_DYLIB_PATH` via a unit override.

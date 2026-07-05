@@ -40,15 +40,17 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
   template).
 - **Side channels** — the match comparison is value-independent in timing so a
   similarity score cannot be inferred from response time.
-- **Model integrity** — bundled model weights are checksum-verified
-  (`models/SHA256SUMS`) before use; only the permissive, audited BOM is shipped.
+- **Model integrity** — model weights are content-addressed in Git LFS
+  (SHA-256 object ids pinned in the repo) and ship inside the distro packages,
+  whose own integrity checking covers them; only the permissive, audited BOM is
+  shipped. Load-time checksum re-verification is planned, not yet implemented.
 
 ## Reporting a vulnerability
 
 **Do not open a public issue for security bugs.** Instead:
 
 - Use GitHub **Private Vulnerability Reporting** on this repository, or
-- Email **archledger236@gmail.com** (PGP key: _TBD_).
+- Email **archledger236@gmail.com**.
 
 Please include affected version/commit, a description, and a reproduction if
 possible.

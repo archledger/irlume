@@ -11,6 +11,7 @@ fully self-contained, no runtime download or fetch step. After cloning, run
 | `face_detection_yunet_2023mar.onnx` | detection | [OpenCV Zoo](https://github.com/opencv/opencv_zoo) | **MIT** | bbox + 5 landmarks; int8 variant also fine |
 | `glintr100.onnx` | recognition | [fal/AuraFace-v1](https://huggingface.co/fal/AuraFace-v1) | **Apache-2.0** | 512-D ArcFace; use ONLY this file from the repo |
 | `face_landmark.onnx` | liveness (EAR) | Google MediaPipe FaceMesh (`face_landmark.tflite`) | **Apache-2.0** | 468 landmarks; input `[1,192,192,3]` RGB → `1404` + face flag. Eye-contour EAR for passive blink liveness. See note below. |
+| `ir_adapter.onnx` | recognition (IR domain) | self-trained residual adapter (512→512), trained on the author's own IR captures | **GPL-3.0-or-later** (project) | boosts IR-frame match scores toward the RGB enrollment; no third-party training data |
 
 ### MediaPipe FaceMesh — license-verified (unlike Silent-Face)
 

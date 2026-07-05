@@ -29,6 +29,8 @@ The portability costs were environmental only: onnxruntime version sourcing
    `packaging/systemd/`; `scripts/install-host.sh` generates it today).
 3. Models: 265 MB — too big for most package payloads; needs a first-run
    `irlume models fetch` (checksummed) or a separate -data package.
+   *(Superseded: models ship bundled — Git LFS in-repo, included in every
+   package; no fetch step exists.)*
 4. onnxruntime ≥1.24: Fedora = own Copr pkg; Arch = system package already
    current; Ubuntu = **no usable archive version** → bundle, vendor a fetch
    step, or document the MS tarball (what this survey did).
@@ -125,14 +127,17 @@ SUDO_USER.
 ## Distribution strategy (draft — verify specifics at implementation)
 
 - **Fedora**: RPM in Copr built from GitHub via Packit on signed tags —
-  same proven pipeline as linhello. `irlume update` → dnf/Copr.
+  the proven Packit→Copr signed-tag pipeline. `irlume update` → dnf/Copr.
 - **Arch**: AUR `PKGBUILD` (build from the release tag; `-bin` variant
   optional later). Self-updating binaries fight pacman's model — let the
   AUR helper own updates; `irlume update` on Arch = "check + print the AUR
-  command".
+  command". *(Superseded: AUR sign-ups are disabled upstream — the shipped
+  channel is a prebuilt `.pkg.tar.zst` on GitHub Releases via `pacman -U`;
+  the PKGBUILD remains for source builds.)*
 - **Ubuntu/Debian**: no PPA needed initially — host a signed apt repo (e.g.
   GitHub Pages/Releases) or ship a .deb from GitHub Releases with
   `irlume update` handling check+download+apt-install. Must solve
   onnxruntime ≥1.24 (bundle in the .deb or a -ort companion package).
 - Models: distribute via `irlume models fetch` (checksummed download) in all
-  three, keeping packages small.
+  three, keeping packages small. *(Superseded: bundled in every package via
+  Git LFS instead — simpler, and installs work offline.)*

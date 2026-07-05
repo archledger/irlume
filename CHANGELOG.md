@@ -22,8 +22,8 @@ No functional changes to the daemon, CLI, or PAM module.
 
 ### Notes
 
-- Arch (`.pkg.tar.zst`) and Debian/Ubuntu (`.deb`) binaries are unchanged from
-  v0.1.0 — use the v0.1.0 release assets.
+- Arch (`.pkg.tar.zst`) and Debian/Ubuntu (`.deb`) packages are functionally
+  unchanged from v0.1.0; the v0.1.1 release ships freshly built assets.
 
 ## [0.1.0] — 2026-07-03
 
@@ -73,4 +73,5 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[0.1.1]: https://github.com/archledger/irlume/releases/tag/v0.1.1
 [0.1.0]: https://github.com/archledger/irlume/releases/tag/v0.1.0

@@ -116,7 +116,8 @@ let the fallback absorb the FRR, and never trade away the false-accept bound.
 
 ```
 # per-group FAR (one directory of distinct-identity faces per group)
-irlume irbench --dir <group_faces> --det <yunet> --model <glintr100> --impostor-only
+# (irbench is dev-gated: export IRLUME_DEV=1)
+IRLUME_DEV=1 irlume irbench --dir <group_faces> --det <yunet> --model <glintr100> --impostor-only
 # real-face FAR + FRR (identity in filename, LFW convention)
 irlume irbench --dir <lfw/images> --det <yunet> --model <glintr100> --lfw
 ```

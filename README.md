@@ -60,6 +60,11 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 > **v0.1.1.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass) — see [Honest limitations](#️-honest-limitations).
 
+**You need:** x86-64 Linux with systemd & PAM — the three families below are
+packaged and tested. A **TPM 2.0** is strongly recommended (encrypted templates,
+keyring unlock) but not required. Any camera is fine — it just sets your tier:
+**IR camera** → secure login · **RGB webcam** → screen unlock · **fingerprint** → companion.
+
 <table>
 <tr><th>Fedora</th><th>Arch</th><th>Debian / Ubuntu</th></tr>
 <tr valign="top">
@@ -97,10 +102,15 @@ sudo apt install \
 Then, once:
 
 ```sh
-irlume ir-setup                    # enable the 850 nm IR emitter (IR cameras)
+irlume ir-setup                    # IR cameras: enable the 850 nm emitter
 irlume tui                         # enroll your face + configure, guided
 sudo irlume login enable --apply   # opt-in: wire the greeter + lock screen
 ```
+
+**Safe to try.** Installing the package wires **nothing** into your login —
+auth only changes when you run `login enable`, and without `--apply` it's a
+dry run that prints every PAM edit it would make. Your password always keeps
+working, and one command undoes everything: `sudo irlume login disable --apply`.
 
 `irlume update` checks for a new release the way your distro expects. Prefer to
 build from source? See [`packaging/`](packaging/) and [`scripts/install-host.sh`](scripts/install-host.sh).
@@ -123,8 +133,8 @@ over a Unix socket authenticated with `SO_PEERCRED`.
                                                  ╚═══════════════════════════╝
 ```
 
-**Model bill-of-materials** — every weight permissive & GPLv3-compatible, so the
-whole thing is bundleable:
+**Model bill-of-materials** — every weight is permissive or first-party, all
+GPLv3-compatible, so the whole thing is bundleable:
 
 | Stage | Model | License |
 |---|---|:---:|
@@ -132,6 +142,7 @@ whole thing is bundleable:
 | Recognition | **AuraFace** *(512-D ArcFace)* | Apache-2.0 |
 | Liveness — IR gate | self-built, algorithmic *(no weights)* | — |
 | Liveness — passive blink | **MediaPipe FaceMesh** → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
+| IR domain adapter | self-trained *(author's own IR captures)* | GPL-3.0 |
 
 More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Cross-distro notes](docs/cross-distro/).
 

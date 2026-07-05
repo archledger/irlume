@@ -234,6 +234,19 @@ auto-detected.
 </details>
 
 <details>
+<summary><b>Is this AI-generated?</b></summary>
+
+AI-assisted, human-directed — and disclosed since the first commit: the git
+history carries `Co-Authored-By` trailers naming the AI assistant (Anthropic's
+Claude, also visible under this repo's contributors). A human maintainer sets
+direction, reviews the changes, and validates every release with clean-slate
+installs on real hardware (Fedora, Arch, Ubuntu — IR camera, TPM, fingerprint)
+before anything ships. Judge the project by its verifiable artifacts: the
+threat model, measured error rates, spoof-test results, and the code itself
+are all in the repo, reproducible regardless of what tools wrote them.
+</details>
+
+<details>
 <summary><b>Glasses, beards, outdoors — when should I re-enroll?</b></summary>
 
 One enrollment usually lasts. Add to it when reality changes, the same way
@@ -256,7 +269,7 @@ fingerprint paths.
 
 ## 🛠️ Status
 
-**v0.1.1 — working, validated end-to-end on real hardware across Fedora, Arch, and
+**v0.1.2 — working, validated end-to-end on real hardware across Fedora, Arch, and
 Debian/Ubuntu** (IR Secure tier, RGB Convenience tier, and fingerprint). Packaged
 for all three. Actively hardened; interfaces may still shift before 1.0.
 
@@ -265,5 +278,11 @@ for all three. Actively hardened; interfaces may still shift before 1.0.
 **GPL-3.0-or-later** — fully open, copyleft: modifications stay free, nobody can
 lock this down. Contributions welcome under the [DCO](CONTRIBUTING.md) — **no CLA,
 no commercial relicensing**. Security reports: see [SECURITY.md](SECURITY.md).
+
+**AI disclosure.** irlume is built by a human maintainer working with an AI
+assistant (Anthropic's Claude) — disclosed on every commit via `Co-Authored-By`
+trailers in the public git history. Direction, review, hardware testing, and
+releases are human-driven, and the security claims rest on reproducible
+evaluations in this repo, not on who typed the code.
 
 <div align="center"><sub>Built with Rust · <a href="LICENSE">GPL-3.0-or-later</a> · your face stays yours</sub></div>

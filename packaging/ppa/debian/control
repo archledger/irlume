@@ -1,0 +1,33 @@
+Source: irlume
+Section: admin
+Priority: optional
+Maintainer: archledger <archledger236@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.75),
+               clang,
+               libclang-dev,
+               pkg-config,
+               libpam0g-dev,
+               libtss2-dev,
+               linux-libc-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/archledger/irlume
+Vcs-Git: https://github.com/archledger/irlume.git
+Vcs-Browser: https://github.com/archledger/irlume
+Rules-Requires-Root: no
+
+Package: irlume
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g
+Recommends: fprintd
+Description: Windows Hello-style face login for Linux
+ IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed
+ keyring unlock with algorithmic IR liveness. Regular RGB webcams get screen
+ unlock; a fingerprint reader can join as a companion factor. Thin PAM module
+ plus privileged daemon; YuNet detection + AuraFace recognition. Password is
+ always the fallback - no lockout.
+ .
+ Bundles onnxruntime (>= 1.24) under /opt/irlume because irlume needs a newer
+ runtime than the Ubuntu archive ships. Model weights install to
+ /usr/share/irlume/models.

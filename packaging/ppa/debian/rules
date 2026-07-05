@@ -1,0 +1,49 @@
+#!/usr/bin/make -f
+# Launchpad builders have no network: the orig tarball carries vendor/ (all
+# crates, wired up by .cargo/config.toml) and ort-prebuilt/ (onnxruntime
+# release libs), both staged by scripts/build-ppa-source.sh.
+include /usr/share/dpkg/architecture.mk
+
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --frozen --offline
+
+override_dh_auto_test:
+	# Tests need camera/TPM hardware; not runnable on builders.
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo_home
+
+override_dh_auto_install:
+	install -D -m0755 target/release/irlumed debian/irlume/usr/bin/irlumed
+	install -D -m0755 target/release/irlume debian/irlume/usr/bin/irlume
+	install -D -m0644 target/release/libpam_irlume.so \
+		debian/irlume/usr/lib/$(DEB_HOST_MULTIARCH)/security/pam_irlume.so
+	install -D -m0644 models/glintr100.onnx \
+		debian/irlume/usr/share/irlume/models/glintr100.onnx
+	install -D -m0644 models/face_detection_yunet_2023mar.onnx \
+		debian/irlume/usr/share/irlume/models/face_detection_yunet_2023mar.onnx
+	install -D -m0644 models/face_landmark.onnx \
+		debian/irlume/usr/share/irlume/models/face_landmark.onnx
+	install -D -m0644 models/ir_adapter.onnx \
+		debian/irlume/usr/share/irlume/models/ir_adapter.onnx
+	mkdir -p debian/irlume/opt/irlume/onnxruntime
+	cp -a ort-prebuilt/lib debian/irlume/opt/irlume/onnxruntime/
+	install -D -m0644 packaging/systemd/irlumed.service \
+		debian/irlume/usr/lib/systemd/system/irlumed.service
+	install -D -m0644 debian/10-ort.conf \
+		debian/irlume/usr/lib/systemd/system/irlumed.service.d/10-ort.conf
+	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
+		debian/irlume/etc/apparmor.d/usr.bin.irlumed
+
+# Resolve intra-bundle links between the onnxruntime libs without turning
+# them into package dependencies.
+override_dh_shlibdeps:
+	dh_shlibdeps -l$(CURDIR)/debian/irlume/opt/irlume/onnxruntime/lib
+
+# dwz chokes on rust binaries and the prebuilt onnxruntime objects.
+override_dh_dwz:

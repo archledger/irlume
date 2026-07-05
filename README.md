@@ -283,6 +283,11 @@ CLI/daemon; camera-less testbed).** Packaged for all three. Actively hardened; i
 lock this down. Contributions welcome under the [DCO](CONTRIBUTING.md) — **no CLA,
 no commercial relicensing**. Security reports: see [SECURITY.md](SECURITY.md).
 
+**Questions, setup help, hardware reports** →
+[GitHub Discussions](https://github.com/archledger/irlume/discussions). Reports
+from laptops with IR cameras (working *or* not) are the most valuable
+contribution right now. Bugs → [Issues](https://github.com/archledger/irlume/issues).
+
 > [!NOTE]
 > **AI disclosure — assisted, human-directed.** irlume is built by a human
 > maintainer working with an AI assistant (Anthropic's Claude), disclosed

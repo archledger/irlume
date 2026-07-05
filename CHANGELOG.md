@@ -3,6 +3,44 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] — 2026-07-05
+
+First-run smoothness release, driven by a screen-recorded fresh-install test
+on Fedora: install → `irlume tui` → press `[e]` → enrolled → `[w]` → wired,
+with no terminal detours.
+
+### Fixed
+
+- **Fresh installs work immediately**: the Fedora package now enables and
+  starts `irlumed` at install (systemd preset + scriptlet), matching what the
+  Arch and Debian packages already did. Previously the daemon shipped disabled
+  and the first enrollment failed with a cryptic `os error 2`.
+- **SELinux**: `dnf install irlume` now pulls the policy subpackage in by
+  default (weak dependency), and both the subpackage scriptlet and
+  `irlume login enable` restart the daemon after loading the module — the
+  already-bound socket kept its pre-policy label, which silently blocked the
+  confined greeter until the next reboot.
+- `sudo irlume login disable --apply` now always unwires `/etc/pam.d/sudo`
+  (the "undoes everything" promise was false unless `--with-sudo` was passed).
+- Daemon-unreachable errors name the exact fix
+  (`sudo systemctl enable --now irlumed`) instead of `os error 2`; the
+  dry-run `login disable` no longer claims it removed the SELinux module.
+
+### Changed
+
+- **TUI essential view**: the wizard shows only the setup path — Welcome →
+  Enroll → Keyring → Recovery → Login wiring → Done. `[v]` reveals all tabs;
+  Repair appears automatically when something actually fails.
+- **Press `[e]` and it works**: enrolling with a stopped daemon now runs the
+  sudo enable+start fix and resumes enrollment automatically.
+- **`[w]` wires login from the TUI** (Done tab and Login-wiring tab); the Done
+  dashboard gained a "login wiring" row and says "one step left" instead of a
+  premature "All set".
+- Enrollment guidance (glasses profile, appearance changes, sunlight) on the
+  Profiles tab and in the README FAQ; THREAT_MODEL now states plainly that the
+  fingerprint companion has no presentation-attack detection of its own.
+- New `irlume version` subcommand.
+
 ## [0.1.1] — 2026-07-04
 
 Packaging-only patch release: makes the Fedora Copr pipeline work end-to-end.
@@ -73,5 +111,6 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[0.1.2]: https://github.com/archledger/irlume/releases/tag/v0.1.2
 [0.1.1]: https://github.com/archledger/irlume/releases/tag/v0.1.1
 [0.1.0]: https://github.com/archledger/irlume/releases/tag/v0.1.0

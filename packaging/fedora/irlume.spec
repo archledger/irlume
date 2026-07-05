@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -130,6 +130,14 @@ systemctl try-restart irlumed.service &>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sun Jul 05 2026 archledger <archledger236@gmail.com> - 0.1.2-1
+- First-run: daemon enabled+started at install (systemd preset + %%post);
+  irlume-selinux pulled in by default (Recommends) and the daemon restarts
+  after policy load so the greeter can reach the freshly labeled socket.
+- TUI: essential-view wizard, enroll auto-starts a stopped daemon and
+  resumes, [w] wires login from the Done tab, version subcommand.
+- login disable --apply now always unwires /etc/pam.d/sudo.
+
 * Sat Jul 04 2026 archledger <archledger236@gmail.com> - 0.1.1-1
 - Copr pipeline fixes: enable_net for cargo, committed Cargo.lock,
   bindgen/pkg-config BuildRequires, SELinux policy built from source.

@@ -1,0 +1,6 @@
+# /run/irlume.sock — the irlumed listener. Normally labeled at create time by
+# the named type_transition in irlume.te; this spec makes restorecon agree, so
+# the %post/`login enable` restorecon (and any full relabel) can fix a socket
+# created before the module was loaded (e.g. mid-transaction at package
+# install, where the policy commit can land after the daemon's first bind).
+/run/irlume\.sock	-s	gen_context(system_u:object_r:irlume_runtime_t,s0)

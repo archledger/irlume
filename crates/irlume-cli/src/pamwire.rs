@@ -599,8 +599,11 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             if !ok { return Err("semodule -i irlume.pp failed".into()); }
             // The already-bound socket keeps its pre-policy label — the greeter
             // stays blocked until the daemon rebinds. Restart it now so face
-            // login works at the very next lock/login, not the next reboot.
+            // login works at the very next lock/login, not the next reboot;
+            // restorecon (backed by the irlume.fc entry) settles the label even
+            // if the bind raced the policy commit.
             let _ = Command::new("systemctl").args(["try-restart", "irlumed.service"]).status();
+            let _ = Command::new("restorecon").arg("/run/irlume.sock").status();
             Ok("✓ SELinux module loaded (daemon restarted to relabel its socket)".into())
         } else {
             Ok("→ would load the SELinux module (greeter→daemon socket)".into())

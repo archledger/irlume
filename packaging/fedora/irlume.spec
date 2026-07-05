@@ -108,8 +108,12 @@ fi
 semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
 # The daemon (started by the main package's %%post, same transaction) bound its
 # socket before the policy existed — restart so the socket gets its label and
-# the confined greeter can actually connect.
+# the confined greeter can actually connect. The restorecon is the backstop:
+# with rpm's SELinux plugin the policy commit can land after the restarted
+# daemon's bind, leaving the socket var_run_t (observed live on fc44); the
+# irlume.fc entry lets restorecon settle it regardless of timing.
 systemctl try-restart irlumed.service &>/dev/null || :
+restorecon /run/irlume.sock 2>/dev/null || :
 
 %postun selinux
 [ $1 -eq 0 ] && semodule -r irlume 2>/dev/null || :

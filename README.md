@@ -90,14 +90,19 @@ sudo pacman -U \
 <td>
 
 ```sh
-# .deb from Releases
-sudo apt install \
-  ./irlume_*.deb
+# Ubuntu: PPA
+sudo add-apt-repository \
+  ppa:archledger/irlume
+sudo apt install irlume
 ```
 
 </td>
 </tr>
 </table>
+
+On Debian — or an Ubuntu series the [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
+doesn't build for yet — grab the `.deb` from
+[Releases](https://github.com/archledger/irlume/releases): `sudo apt install ./irlume_*.deb`.
 
 Then, once:
 

@@ -31,11 +31,15 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
   so `arch/PKGBUILD` (builds from the release tag) is kept for source builds and
   will become the update path once AUR sign-ups reopen. Depends on `onnxruntime`
   (system pkg is current), `tpm2-tss`, `pam`; PAM to `/usr/lib/security`.
-- **Debian/Ubuntu** — `debian/` via nfpm or dpkg-buildpackage: **bundles
-  onnxruntime** (the archive ships 1.22; irlume needs ≥1.24) or depends on a
-  companion `-ort` package; ships the AppArmor profile; PAM to the multiarch
-  dir. Update path: signed apt repo or a `.deb` from GitHub Releases via
-  `irlume update`.
+- **Ubuntu** — [`ppa:archledger/irlume`](https://launchpad.net/~archledger/+archive/ubuntu/irlume):
+  source package built on Launchpad from a self-contained orig tarball
+  (`ppa/debian/` + `scripts/build-ppa-source.sh` — vendored crates, bundled
+  onnxruntime, real model weights; LP builders have no network). Update path:
+  plain `apt upgrade`.
+- **Debian** (and Ubuntu series the PPA doesn't cover) — `debian/` via nfpm or
+  dpkg-buildpackage: **bundles onnxruntime** (the archive ships 1.22; irlume
+  needs ≥1.24); ships the AppArmor profile; PAM to the multiarch dir. Update
+  path: a `.deb` from GitHub Releases via `irlume update`.
 
 ## onnxruntime ≥ 1.24 (the api-24 pin)
 

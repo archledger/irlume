@@ -10,9 +10,10 @@ case "$1" in
         fi
         cat <<'MSG'
 irlume installed. Next steps:
-  irlume ir-setup                    # enable the 850nm IR emitter (once)
   irlume tui                         # enroll your face + configure
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
+(enrollment auto-enables the 850nm IR emitter when IR frames are black;
+ manual fallback for IR cameras: sudo irlume ir-setup)
 Password is always the fallback - no lockout.
 MSG
         ;;

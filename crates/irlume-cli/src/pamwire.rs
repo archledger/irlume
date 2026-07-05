@@ -98,6 +98,20 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
     out
 }
 
+/// True when any greeter or the lock screen carries the irlume wiring — the
+/// "is face login actually wired" probe for the TUI dashboard (sudo excluded:
+/// face-sudo alone doesn't make the login screen work).
+pub(crate) fn login_wired() -> bool {
+    for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
+        if let Some(p) = service_present(s) {
+            if file_has_module(&p) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Short label from an /etc/pam.d path (e.g. "/etc/pam.d/gdm-password" → "gdm-password").
 fn label_of(etc: &str) -> String {
     etc.rsplit('/').next().unwrap_or(etc).to_string()
@@ -260,7 +274,10 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         do_svc(s, &wire_fp_keyring, want_fp_keyring);
     }
     do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
-    if with_sudo {
+    // face-sudo is opt-in on enable (--with-sudo), but disable must ALWAYS
+    // unwire it — "disable --apply undoes everything" is a documented promise,
+    // and a stale sudo line would point at a module the user may remove next.
+    if with_sudo || !enable {
         match wire_service(&Svc { etc: SUDO, vendor: None }, enable, apply, &wire_sudo) {
             Ok(msg) => println!("  {msg}"),
             Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
@@ -567,12 +584,22 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
         if apply {
             let ok = Command::new("semodule").args(["-i", pp.as_str()]).status().map(|s| s.success()).unwrap_or(false);
             if !ok { return Err("semodule -i irlume.pp failed".into()); }
+            // The already-bound socket keeps its pre-policy label — the greeter
+            // stays blocked until the daemon rebinds. Restart it now so face
+            // login works at the very next lock/login, not the next reboot.
+            let _ = Command::new("systemctl").args(["try-restart", "irlumed.service"]).status();
+            Ok("✓ SELinux module loaded (daemon restarted to relabel its socket)".into())
+        } else {
+            Ok("→ would load the SELinux module (greeter→daemon socket)".into())
         }
-        Ok("✓ SELinux module loaded (greeter→daemon socket)".into())
     } else {
         if selinux_loaded() == Some(false) { return Ok("· SELinux module not loaded".into()); }
-        if apply { let _ = Command::new("semodule").args(["-r", "irlume"]).status(); }
-        Ok("✓ SELinux module removed".into())
+        if apply {
+            let _ = Command::new("semodule").args(["-r", "irlume"]).status();
+            Ok("✓ SELinux module removed".into())
+        } else {
+            Ok("→ would remove the SELinux module (if loaded)".into())
+        }
     }
 }
 

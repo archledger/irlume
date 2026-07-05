@@ -1,0 +1,4 @@
+# irlumed serves a local Unix socket only; authentication stays opt-in
+# (irlume login enable), so the daemon being up is safe and makes the
+# first-run TUI work immediately after install.
+enable irlumed.service

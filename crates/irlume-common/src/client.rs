@@ -37,7 +37,18 @@ pub fn request(req: &Request) -> io::Result<Response> {
 /// Send `req`, allowing `rw_timeout` for the reply (e.g. a longer budget for an
 /// unseal that does a full camera capture + liveness + match first).
 pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<Response> {
-    let stream = connect_with_timeout(&socket_path(), CONNECT_TIMEOUT)?;
+    let stream = connect_with_timeout(&socket_path(), CONNECT_TIMEOUT).map_err(|e| {
+        // A missing socket / nobody listening is the #1 first-run failure
+        // (fresh package install, unit disabled by distro preset policy) —
+        // name the daemon and the exact command instead of "os error 2".
+        match e.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => io::Error::new(
+                e.kind(),
+                "irlumed is not running — start it with: sudo systemctl enable --now irlumed",
+            ),
+            _ => e,
+        }
+    })?;
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 

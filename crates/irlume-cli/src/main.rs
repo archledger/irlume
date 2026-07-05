@@ -71,6 +71,10 @@ fn main() -> std::process::ExitCode {
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
+        (Some("version"), _) | (Some("--version"), _) | (Some("-V"), _) => {
+            println!("irlume {}", env!("CARGO_PKG_VERSION"));
+            std::process::ExitCode::SUCCESS
+        }
         (Some("doctor"), _) => doctor(),
         (Some("normprobe"), _) => normprobe(&args),
         (Some("status"), _) => commands::status(&args),
@@ -319,7 +323,12 @@ pub(crate) fn daemon_request(req: &irlume_common::Request) -> Result<irlume_comm
     // Shared client: bounded connect timeout + zeroized wire buffers. The 120s
     // read budget covers slow operations (guided enroll capture loops).
     irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120))
-        .map_err(|e| format!("{e} (is irlumed running?)"))
+        .map_err(|e| {
+            // The connect-failure message already names irlumed and the exact
+            // fix (client.rs); only append the hint where it adds information.
+            let m = e.to_string();
+            if m.contains("irlumed") { m } else { format!("{m} (is irlumed running?)") }
+        })
 }
 
 pub(crate) fn user_arg(args: &[String]) -> String {

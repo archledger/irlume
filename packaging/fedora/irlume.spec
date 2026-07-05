@@ -33,6 +33,10 @@ BuildRequires:  selinux-policy-devel
 Requires:       pam
 Requires:       tpm2-tss
 Recommends:     fprintd
+# Fedora enforces SELinux by default and the greeter can't reach the daemon
+# without the policy module — pull the subpackage in by default (weak dep, so
+# SELinux-disabled installs can still skip it).
+Recommends:     %{name}-selinux = %{version}-%{release}
 %{?systemd_requires}
 
 %description
@@ -80,9 +84,18 @@ install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
 cp -a onnxruntime-linux-x64-%{ort_ver}/lib/libonnxruntime.so* %{buildroot}%{_datadir}/%{name}/onnxruntime/lib/
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
+# Preset: the daemon is enabled on install (see %%post) — it only serves a local
+# socket and auth stays opt-in, so "installed" should mean "works".
+install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-irlume.preset
 
 %post
+# %%systemd_post honours our shipped preset → enables irlumed on first install.
 %systemd_post irlumed.service
+# Also start it now so `irlume tui` works immediately after `dnf install`
+# (no-op in chroots/containers where systemd isn't running).
+if [ $1 -eq 1 ]; then
+    systemctl start irlumed.service &>/dev/null || :
+fi
 # PAM wiring is opt-in (irlume login enable) — never auto-wire auth on install.
 
 %preun
@@ -93,6 +106,10 @@ install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/pack
 
 %post selinux
 semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
+# The daemon (started by the main package's %%post, same transaction) bound its
+# socket before the policy existed — restart so the socket gets its label and
+# the confined greeter can actually connect.
+systemctl try-restart irlumed.service &>/dev/null || :
 
 %postun selinux
 [ $1 -eq 0 ] && semodule -r irlume 2>/dev/null || :
@@ -107,6 +124,7 @@ semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
 %{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service
 %{_unitdir}/irlumed.service.d/10-ort.conf
+%{_presetdir}/90-irlume.preset
 
 %files selinux
 %{_datadir}/selinux/packages/irlume.pp

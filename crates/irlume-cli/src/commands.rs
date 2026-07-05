@@ -806,6 +806,7 @@ SYSTEM INTEGRATION
                         needed — enroll auto-runs it when IR frames are dark)
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
+  version                         print the installed irlume version
 
   (developer/benchmark tools are hidden — set IRLUME_DEV=1 to enable them)
 ");

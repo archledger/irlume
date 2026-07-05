@@ -9,8 +9,9 @@ if command -v apparmor_parser >/dev/null 2>&1; then
 fi
 cat <<'EOF'
 irlume installed. Next steps:
-  irlume ir-setup                    # enable the 850nm IR emitter (once)
   irlume tui                         # enroll your face + configure
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
+(enrollment auto-enables the 850nm IR emitter when IR frames are black;
+ manual fallback for IR cameras: sudo irlume ir-setup)
 Password is always the fallback — no lockout.
 EOF

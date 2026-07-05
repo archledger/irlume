@@ -873,11 +873,20 @@ impl App {
         eprintln!("\n{what} — running: sudo {}…", args.join(" "));
         match std::process::Command::new("sudo").args(args).status() {
             Ok(st) if st.success() => self.log('✓', format!("{what}: done")),
-            Ok(st) => match st.code() {
-                Some(c) => self.set_error(format!("{what}: sudo exited {c} — not applied (cancelled or failed)")),
-                None => self.set_error(format!("{what}: sudo terminated by a signal — not applied")),
-            },
-            Err(e) => self.set_error(format!("{what}: could not launch sudo: {e}")),
+            Ok(st) => {
+                // A failed/cancelled sudo can't have started the daemon — drop
+                // any parked enrollment so the resume path doesn't sit through
+                // its bounded daemon wait for nothing.
+                self.resume_enroll = None;
+                match st.code() {
+                    Some(c) => self.set_error(format!("{what}: sudo exited {c} — not applied (cancelled or failed)")),
+                    None => self.set_error(format!("{what}: sudo terminated by a signal — not applied")),
+                }
+            }
+            Err(e) => {
+                self.resume_enroll = None;
+                self.set_error(format!("{what}: could not launch sudo: {e}"));
+            }
         }
     }
 

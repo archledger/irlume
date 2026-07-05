@@ -349,8 +349,21 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
         } else if !use_override && etc.exists() {
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
             if bak.exists() {
-                if apply { std::fs::rename(&bak, etc).map_err(|e| format!("restore {}: {e}", s.etc))?; }
-                Ok(format!("✓ {} — restored from backup", s.etc))
+                // Restore the backup ONLY when it equals the current file minus
+                // our lines — i.e. nothing else changed since we wired. If an
+                // admin (or another package) edited the file after wiring,
+                // restoring the stale snapshot would silently revert their
+                // change (e.g. a faillock line added to sudo): strip in place
+                // instead and keep the backup for inspection.
+                let (stripped, _) = unwire_lines(&read(s.etc)?);
+                let bak_content = read(&bak.to_string_lossy())?;
+                if stripped == bak_content {
+                    if apply { std::fs::rename(&bak, etc).map_err(|e| format!("restore {}: {e}", s.etc))?; }
+                    Ok(format!("✓ {} — restored from backup", s.etc))
+                } else {
+                    if apply { write_atomic(etc, &stripped)?; }
+                    Ok(format!("✓ {} — stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
+                }
             } else if file_has_module(etc) {
                 let (clean, _) = unwire_lines(&read(s.etc)?);
                 if apply { write_atomic(etc, &clean)?; }

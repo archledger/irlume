@@ -274,9 +274,28 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
     let path = profile_path(&e.user);
     let key = save_key(&e.user)?;
     let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
-    fs::write(&path, bytes).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
-    set_0600(&path);
+    // Atomic + never world-readable: 0600 temp file in the same dir, then
+    // rename over the target — a crash mid-write can't leave a truncated
+    // profile, and there is no umask window on the real path.
+    let tmp = path.with_extension("json.tmp");
+    write_0600(&tmp, &bytes).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
+    fs::rename(&tmp, &path).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     Ok(())
+}
+
+/// Create/truncate `path` with mode 0600 and write `bytes` (unix).
+#[cfg(unix)]
+fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
 }
 
 /// Load an enrollment, transparently decrypting (v2) and migrating the legacy

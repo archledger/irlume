@@ -752,7 +752,11 @@ fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
     let mut json = serde_json::to_vec(resp)?;
     json.push(b'\n');
     stream.write_all(&json)?;
-    stream.flush()
+    let r = stream.flush();
+    // The response may carry an unsealed secret (PasswordUnsealed) — wipe the
+    // serialized line, same hygiene as the request path and the client side.
+    json.zeroize();
+    r
 }
 
 fn set_mode(path: &str, mode: u32) {

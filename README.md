@@ -60,21 +60,31 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 > **v0.1.1.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass) — see [Honest limitations](#️-honest-limitations).
 
-**You need:** x86-64 Linux with systemd & PAM — the three families below are
+**You need:** x86-64 Linux with systemd & PAM — the distros below are
 packaged and tested. A **TPM 2.0** is strongly recommended (encrypted templates,
 keyring unlock) but not required. Any camera is fine — it just sets your tier:
 **IR camera** → secure login · **RGB webcam** → screen unlock · **fingerprint** → companion.
 
 <table>
-<tr><th>Fedora</th><th>Arch</th><th>Debian / Ubuntu</th></tr>
+<tr><th>Fedora</th><th>Ubuntu</th><th>Arch</th><th>Debian</th></tr>
 <tr valign="top">
 <td>
 
 ```sh
-# Copr (signed tags)
+# Copr
 sudo dnf copr enable \
   archledger/irlume
 sudo dnf install irlume
+```
+
+</td>
+<td>
+
+```sh
+# PPA
+sudo add-apt-repository \
+  ppa:archledger/irlume
+sudo apt install irlume
 ```
 
 </td>
@@ -90,19 +100,20 @@ sudo pacman -U \
 <td>
 
 ```sh
-# Ubuntu: PPA
-sudo add-apt-repository \
-  ppa:archledger/irlume
-sudo apt install irlume
+# .deb from Releases
+sudo apt install \
+  ./irlume_*.deb
 ```
 
 </td>
 </tr>
 </table>
 
-On Debian — or an Ubuntu series the [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
-doesn't build for yet — grab the `.deb` from
-[Releases](https://github.com/archledger/irlume/releases): `sudo apt install ./irlume_*.deb`.
+Fedora and Ubuntu update with the system (`dnf upgrade` / `apt upgrade`); on an
+Ubuntu series the [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
+doesn't build for yet, use the Debian `.deb` from
+[Releases](https://github.com/archledger/irlume/releases). `irlume update`
+handles every case — it detects how irlume was installed and updates the same way.
 
 Then, once:
 

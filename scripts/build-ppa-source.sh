@@ -38,8 +38,10 @@ done
 echo "==> staging source tree $TREE (irlume $DEBVER)"
 mkdir -p "$BUILDROOT"
 rm -rf "$TREE"
-rsync -a --exclude .git --exclude target --exclude .deb-staging \
-      --exclude debian --exclude vendor "$REPO/" "$TREE/"
+# Leading / anchors each exclude to the tree root (a bare "debian" would
+# also strip packaging/ppa/debian and packaging/debian).
+rsync -a --exclude .git --exclude /target --exclude /.deb-staging \
+      --exclude /debian --exclude /vendor "$REPO/" "$TREE/"
 
 echo "==> bundling onnxruntime $ORT_VER"
 ORT_TGZ="$BUILDROOT/onnxruntime-linux-x64-${ORT_VER}.tgz"

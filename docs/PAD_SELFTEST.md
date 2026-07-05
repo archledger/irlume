@@ -57,9 +57,11 @@ Attack Instrument categories, ISO term). Constants are the current values in
 | `frontal_ok` | Windows-Hello-style ±15° pose gate (quality, not spoof → `Uncertain`) | off-angle / partial captures | yaw ≤ 0.40, pitch ∈ [0.20, 0.80] |
 | `glint_present` | corneal retro-reflection of the emitter | *supporting only* — never decisive (standalone-glint liveness is refuted) | eye peak ≥ `GLINT_MIN` (180) |
 
-The **per-user calibrated IR floor** (a depth-only floor stored at enrollment, in
-`irlume-auth`) tightens `depth_ok` for a specific user without depending on ambient
-brightness. When present it is exercised by the same self-test.
+The **per-user calibrated IR floor** (a depth-only floor stored at enrollment by
+`irlume-core`, enforced in `Engine::authenticate`) tightens the depth gate for a
+specific user without depending on ambient brightness. `padcapture` exercises
+the **global** gate only — the per-user floor applies at real authentication,
+not in this self-test.
 
 ---
 

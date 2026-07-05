@@ -255,6 +255,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Err(e) => Response::Error(e.to_string()),
         },
         Request::Authenticate { user, service } => {
+            // Root (PAM stacks) or the account owner only. Without this gate any
+            // local peer could probe Authenticate{other_user} and read the raw
+            // similarity score — a hill-climbing oracle toward a match (the
+            // threat model promises scores never leak to unprivileged peers).
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to authenticate '{user}'"));
+            }
             // Honor the configured unlock method: if the admin chose fingerprint,
             // face must actually stand down (pam_fprintd drives; password is the
             // fallback) — not just be claimed disabled by the CLI message.

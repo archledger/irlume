@@ -33,10 +33,10 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 |  |  |
 |---|---|
 | 🌑 **Works in the dark** | Active **infrared** recognition (Windows-Hello cameras) — no ambient light needed. |
-| 🔒 **Unlocks everything** | Login greeter, lock screen, `sudo`, polkit — with the password always as fallback (**no lockout, ever**). |
+| 🔒 **Unlocks everything** | Login greeter, lock screen, and `sudo` (opt-in via `login enable --with-sudo`) — with the password always as fallback (**no lockout, ever**). |
 | 🗝️ **Opens your keyring** | On IR hardware a face match **TPM-unseals your login password** so the wallet unlocks at login — like Hello. |
 | 👁️ **Real liveness** | Algorithmic IR anti-spoof gate + **opt-in passive blink** detection (no prompt, no action). |
-| 🧬 **Privacy by design** | Stores **512-D embeddings, never images**; **AES-256-GCM encrypted**, key **TPM-sealed** to your boot state. |
+| 🧬 **Privacy by design** | Stores **512-D embeddings, never images**; on TPM hardware they're **AES-256-GCM encrypted** under a **TPM-sealed** key (without a TPM: root-only files, and the TUI says so). |
 | 🎚️ **Adapts to your hardware** | IR camera → **Secure** tier · RGB-only → **Convenience** (screen-unlock) tier · fingerprint reader → companion factor. All auto-detected. |
 | 🩺 **Self-healing** | A live TUI (`irlume tui`) detects & one-key-fixes daemon/PAM/reader/config faults. |
 | 📦 **Self-contained** | One package per distro, all models bundled. `git clone` and go. |
@@ -58,7 +58,7 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 
 ## 📦 Install
 
-> **v0.1.1.** Works end-to-end on real hardware across all three families. Not
+> **v0.1.2.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass) — see [Honest limitations](#️-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM — the distros below are
@@ -131,7 +131,7 @@ node" without touching anything).
 
 **Safe to try.** Installing the package wires **nothing** into your login —
 auth only changes when you run `login enable`, and without `--apply` it's a
-dry run that prints every PAM edit it would make. Your password always keeps
+dry run that prints the full per-file wiring plan without writing anything. Your password always keeps
 working, and one command undoes everything: `sudo irlume login disable --apply`.
 
 `irlume update` checks for a new release the way your distro expects. Prefer to
@@ -263,16 +263,19 @@ Profiles are per-user and deletable any time.
 <summary><b>Does it work on Ubuntu / Fedora / Arch, GNOME / KDE, Wayland?</b></summary>
 
 Yes — irlume authenticates through PAM, so the desktop stack doesn't matter.
-It's validated end-to-end on Fedora (KDE Plasma), Ubuntu (GNOME/GDM), and
-Arch, all on Wayland, including the greeter, lock screen, `sudo`, and
-fingerprint paths.
+Validation so far, all on Wayland: **Fedora KDE** end-to-end on IR hardware
+(greeter, lock screen, `sudo`, TPM keyring unlock), **Ubuntu GNOME** on an
+RGB+fingerprint laptop (lock-screen face unlock, fingerprint, correct
+password-only refusals for login/sudo), and **Arch** for packaging, install,
+and the full CLI/daemon stack (the Arch testbed has no camera). Reports from
+other hardware are very welcome.
 </details>
 
 ## 🛠️ Status
 
-**v0.1.2 — working, validated end-to-end on real hardware across Fedora, Arch, and
-Debian/Ubuntu** (IR Secure tier, RGB Convenience tier, and fingerprint). Packaged
-for all three. Actively hardened; interfaces may still shift before 1.0.
+**v0.1.2 — working, validated on real hardware across Fedora (full IR Secure tier,
+end-to-end), Ubuntu (RGB Convenience tier + fingerprint), and Arch (packaging +
+CLI/daemon; camera-less testbed).** Packaged for all three. Actively hardened; interfaces may still shift before 1.0.
 
 ## 🤝 Contributing & license
 
@@ -282,8 +285,8 @@ no commercial relicensing**. Security reports: see [SECURITY.md](SECURITY.md).
 
 > [!NOTE]
 > **AI disclosure — assisted, human-directed.** irlume is built by a human
-> maintainer working with an AI assistant (Anthropic's Claude), disclosed on
-> **every commit** via `Co-Authored-By` trailers — check the git history or the
+> maintainer working with an AI assistant (Anthropic's Claude), disclosed
+> throughout the git history via `Co-Authored-By` trailers — see the log or the
 > [contributors](https://github.com/archledger/irlume/graphs/contributors) page.
 > Direction, review, and releases are human-driven; every release is validated
 > with clean-slate installs on real hardware, and the security claims rest on

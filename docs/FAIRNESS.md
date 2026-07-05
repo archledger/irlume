@@ -13,7 +13,8 @@ False Accept Rate is **demographic-differential**: impostors who share a
 demographic group are harder to separate, so within-group FAR is the honest
 operational number (a mixed-population FAR understates real risk). Measured on
 FairFace (validation split, ~1,100–1,900 faces/group, YuNet → AuraFace, all-pairs
-impostor; same pipeline as production):
+impostor; same pipeline as production; 0.50 is the measurement threshold used
+throughout this document):
 
 | Group | FAR @ threshold 0.50 |
 |---|---|
@@ -25,12 +26,14 @@ impostor; same pipeline as production):
 | Southeast Asian | 7.46×10⁻⁴ |
 | **East Asian** | **1.04×10⁻³** |
 
-**Spread ≈ 10×.** At the fixed production threshold of 0.50, only the
+**Spread ≈ 10×.** At the 0.50 measurement threshold, only the
 best-served group meets NIST FMR ≤ 1×10⁻⁴; the others exceed it within-group.
 A single fixed threshold that holds FAR ≤ 1×10⁻⁴ for **every** group requires
 ≈ **0.69** (bound by the worst groups). A cross-check on real faces (LFW,
 13,233 images, 87M impostor pairs) confirmed the mixed-population RGB FAR at
-0.50 is 3×10⁻⁵ — i.e. mixing demographics hides the within-group gap above.
+0.50 is 3×10⁻⁵ (the shipped RGB threshold is stricter still: 0.55, with
+template-count scaling up to +0.10; the IR path uses 0.55 native / 0.40
+adapted, and calibrated RGB+IR fusion grants at probability ≥ 0.50) — i.e. mixing demographics hides the within-group gap above.
 
 ## The recognizer trade-off (why we keep AuraFace)
 
@@ -81,8 +84,11 @@ the lever exists; this particular adapter is not the one to ship.
 irlume does **not** classify a user's demographic group at authentication time to
 pick a threshold. Runtime demographic classification is privacy-invasive,
 unreliable, and self-defeating for a fairness goal — and it is unnecessary. The
-same security guarantee comes from a **single fixed threshold set for the
-worst-performing group**, so FAR is bounded for everyone. Users in better-served
+right direction is a **single fixed threshold chosen conservatively against the
+worst-performing group's curve** — the shipped 0.55 (vs the 0.50 measurement
+point) moves that way, though fully bounding every group at 1×10⁻⁴ would need
+≈0.69 and a real FRR cost; the residual gap is bounded by the mandatory
+password fallback, never by relaxing FAR. Users in better-served
 groups pay a slightly higher False Reject Rate than strictly necessary; that cost
 is absorbed **uniformly** by the mandatory non-biometric fallback.
 

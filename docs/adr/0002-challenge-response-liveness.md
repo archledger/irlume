@@ -108,7 +108,7 @@ The primary mechanism reuses signals irlume already computes:
 ## Implementation & validation (2026-07-01)
 
 Built and live-validated on the Zenbook S14. Two findings changed the design during
-bring-up (both via a new `irlume blinkprobe` diagnostic that plots the per-frame
+bring-up (both via a new `irlume meshprobe` diagnostic that plots the per-frame
 signal):
 
 1. **Metric: specular *contrast*, not raw glint peak.** Raw eye-glint barely drops
@@ -211,3 +211,12 @@ FAR), per the results doc's limitations.
 - Randomized multi-prompt challenge if IR-video replay becomes a considered threat.
 - Own-IR-rig data collection for a clean-licensed passive PAD model remains the
   durable, still-deferred alternative.
+
+
+---
+
+*2026-07-05 update:* the deep-dip detector described above was reworked into a
+strobe-aware **V-shape** blink detector (baselining per strobe class, run-length
+cap, brightness-band check) after real-world non-response findings — see
+`docs/pad-results/` for the follow-up records. The probe tool is `irlume
+meshprobe` (formerly `blinkprobe`).

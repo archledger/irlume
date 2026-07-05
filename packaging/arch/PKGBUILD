@@ -13,8 +13,10 @@ license=('GPL-3.0-or-later')
 depends=('onnxruntime' 'tpm2-tss' 'pam')
 optdepends=('fprintd: fingerprint companion factor')
 makedepends=('rust' 'cargo' 'gcc' 'git-lfs')
-# Models ride in the tag via Git LFS; the tag tarball from GitHub includes the
-# LFS objects, so build from the git tag to get real weights (not pointers).
+# Models ride in the tag via Git LFS. GitHub's auto-generated tag tarballs do
+# NOT include LFS objects (they ship 131-byte pointer stubs) — that is exactly
+# why this PKGBUILD clones the git tag and runs `git lfs pull` instead of using
+# the tarball. Do not "simplify" to the archive URL.
 source=("git+https://github.com/archledger/irlume.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 install=irlume.install

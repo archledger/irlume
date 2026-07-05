@@ -36,7 +36,7 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
   algorithmic IR liveness gate, device-trust binding, and cross-spectrum RGB↔IR
   consistency.
 - **Biometric data leakage** — templates/embeddings are sensitive. They are
-  zeroized after use, never logged, and the unlock secret is TPM-sealed (not the
+  zeroized where the exposure is real (keys, secrets, IPC buffers); frames/embeddings are transient daemon memory, never logged, and the unlock secret is TPM-sealed (not the
   template).
 - **Side channels** — the match comparison is value-independent in timing so a
   similarity score cannot be inferred from response time.

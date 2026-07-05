@@ -13,7 +13,7 @@ own recipe. Everything the daemon does at *runtime* stays capability-detected.
 | `pam_irlume.so` | Fedora `/usr/lib64/security/` · Debian `/usr/lib/x86_64-linux-gnu/security/` · Arch `/usr/lib/security/` |
 | models (LFS, bundled) | `/usr/share/irlume/models/*.onnx` |
 | systemd unit | `/usr/lib/systemd/system/irlumed.service` (from `systemd/irlumed.service`) |
-| LSM policy | Fedora SELinux module · Debian `apparmor/usr.local.bin.irlumed` (path-adjusted) · Arch none |
+| LSM policy | Fedora SELinux module · Debian `apparmor/usr.bin.irlumed` (path-adjusted) · Arch none |
 
 Models are bundled (Git LFS) — no fetch step. Packages that build from a git
 checkout must `git lfs pull` first so the real weights (not pointers) are staged.

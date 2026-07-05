@@ -25,6 +25,11 @@ with no terminal detours.
 - Daemon-unreachable errors name the exact fix
   (`sudo systemctl enable --now irlumed`) instead of `os error 2`; the
   dry-run `login disable` no longer claims it removed the SELinux module.
+- Security-audit hardening: enrollment saves are atomic (0600 temp + rename,
+  no truncation on crash, no permissions window); the daemon zeroizes response
+  buffers that may carry an unsealed credential; a cancelled sudo during the
+  enroll fix no longer freezes the TUI; PAM-file restores keep admin edits
+  made after wiring (strip-in-place unless the file is otherwise unchanged).
 
 ### Changed
 
@@ -39,7 +44,9 @@ with no terminal detours.
 - Enrollment guidance (glasses profile, appearance changes, sunlight) on the
   Profiles tab and in the README FAQ; THREAT_MODEL now states plainly that the
   fingerprint companion has no presentation-attack detection of its own.
-- New `irlume version` subcommand.
+- New `irlume version` subcommand, and `irlume update` now detects how irlume
+  was installed (Copr, PPA, release asset, source) and updates through that
+  same channel.
 
 ## [0.1.1] — 2026-07-04
 
@@ -99,7 +106,7 @@ is always the fallback: no lockout, ever.
 
 - ISO/IEC 30107-3 PAD self-test tooling (`padcapture` / `padreport`) with
   per-species APCER / BPCER / ACER and exact-binomial confidence intervals.
-- SO_PEERCRED + operation-class biopolicy gate on credential release;
+- SO_PEERCRED + operation-class biopolicy gate on credential release (opt-in, off by default);
   bounded request size and read/write timeouts on the daemon socket.
 
 ### Known limitations

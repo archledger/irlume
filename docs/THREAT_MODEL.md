@@ -23,7 +23,7 @@ formal certification stays optional.
 |---|---|---|
 | **CVE-2021-34466** (CyberArk) — inject a spoofed IR frame from a fake USB camera | Hello trusts any USB device as camera root-of-trust; descriptors unauthenticated | **Device pinning** (topology + descriptor + `fixed`) — defeats *software* virtual-camera injection; a malicious *hardware* USB device needs crypto attestation (out of scope). See [Camera trust](#camera-trust--device-pinning). |
 | Same — real IR + arbitrary RGB ("SpongeBob") passes | Only IR validated, RGB ignored | **Cross-spectrum RGB↔IR spatial overlap**: face must align in both streams |
-| Weak frame-transition liveness | Trivial transition check | **Active IR-strobe response** + **bright-pupil retro-reflection** + **NIR skin** |
+| Weak frame-transition liveness | Trivial transition check | **IR reflectance floor** + **depth (center/edge) ratio** + **cross-spectrum overlap** |
 
 ## Camera trust — device pinning
 
@@ -40,8 +40,9 @@ and require all of:
    (`…/pci0000:00/…/usbX/…`), not a virtual/platform node. (Verified on the
    reference Zenbook: RGB `…/usb3/3-5/3-5:1.0`, IR `…:1.2`.)
 2. **Pinned descriptor** — `idVendor`/`idProduct` match the enrolled values
-   (reference unit: `3277:0059`, Shinetech/ASUS FHD webcam). Stored per-host in
-   config, since these are device-specific.
+   (reference unit: `3277:0059`, Shinetech/ASUS FHD webcam). Supplied per-host via the
+   `IRLUME_CAMERA_PIN` environment allowlist on the daemon unit, since these
+   are device-specific.
 3. **Fixed removability** — the USB device's `removable` attribute reads `fixed`
    (built-in), rejecting a camera hot-plugged into an external port. *Caveat:*
    `removable` is derived from ACPI/hub data and is often `unknown` even for
@@ -66,11 +67,17 @@ and removability pinning per host.
 
 Physically-grounded cues, hard gate (any failure rejects):
 
-- **NIR skin reflectance** (>1.2 µm melanin-independent → skin-tone fair).
-- **Bright-pupil retro-reflection** (~90% @850 nm, coaxial emitter).
+- **IR reflectance floor** — emitter-lit skin brightness (with a per-user
+  depth-calibrated floor for opt-in re-enrollments).
+- **Depth (center/edge) ratio** — a real face is closer to the emitter at the
+  nose than at the cheeks; flat media are not.
 - **Cross-spectrum RGB↔IR overlap** (anti-injection).
-- **Active IR-strobe response**.
+- **Frontality** (yaw/pitch bounds from landmarks).
 - **Corneal glint** — *supporting only* (standalone-glint liveness was refuted).
+
+*(Explored but not shipped as gates: bright-pupil retro-reflection and active
+IR-strobe response — the capture path picks the brightest strobe frame but no
+strobe-response check is enforced.)*
 
 **Honest caveat:** a pure hand-crafted gate is unproven at certification-grade
 error rates (the best published NIR-PAD used a trained CNN). Treat the gate as a
@@ -95,7 +102,7 @@ Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/20
 
 Seal a random release secret (or the login password) in the **TPM**, gated by
 **PCR policy**; release only on a successful live+match. Never store a
-recoverable face image. Embeddings zeroized after use.
+recoverable face image; decrypted template plaintext and keys are zeroized.
 
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
 releases the sealed login password on *root peer + login-service-class*, without
@@ -122,8 +129,14 @@ with a fabricated print.
   response time to learn how close a presented face is to an enrolled template
   (which would enable hill-climbing toward a match). Compare against the
   threshold without early-out; keep the decision value-independent.
-- **No score leakage.** Auth responses to unprivileged callers expose only
-  grant/deny + a coarse reason — never the raw similarity score or per-template
-  distances.
-- **Memory hygiene.** Raw frames, chips, and embeddings are zeroized
-  (`zeroize`/`secrecy`) immediately after use; nothing biometric is logged.
+- **Score exposure is authorization-gated.** `Authenticate` (which returns the
+  similarity score) is answered only for root peers (the PAM stacks) or the
+  account owner probing themselves; any other local peer is refused outright,
+  so there is no cross-user hill-climbing oracle. Scores are logged to the
+  root-only journal, never to unprivileged callers.
+- **Memory hygiene.** Secrets are zeroized where the exposure is real: sealed
+  keys, decrypted template plaintext, passwords, and the IPC wire buffers that
+  may carry them (`zeroize`). Camera frames and embeddings are transient
+  process memory, dropped after use but not explicitly wiped — inside the
+  same root daemon that holds the decrypted templates anyway. Nothing
+  biometric is logged.

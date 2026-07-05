@@ -348,14 +348,6 @@ pub fn list_users() -> Vec<String> {
     users
 }
 
-#[cfg(unix)]
-fn set_0600(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn set_0600(_path: &std::path::Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

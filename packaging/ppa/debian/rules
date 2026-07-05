@@ -18,6 +18,12 @@ override_dh_auto_test:
 override_dh_auto_clean:
 	rm -rf target debian/cargo_home
 
+# dh_clean's default cruft sweep deletes *.orig / *~ recursively, which
+# nukes vendored files (vendor/*/Cargo.toml.orig) that cargo's checksum
+# manifests require — cargo --frozen then fails on the builder.
+override_dh_clean:
+	dh_clean -Xvendor/
+
 override_dh_auto_install:
 	install -D -m0755 target/release/irlumed debian/irlume/usr/bin/irlumed
 	install -D -m0755 target/release/irlume debian/irlume/usr/bin/irlume

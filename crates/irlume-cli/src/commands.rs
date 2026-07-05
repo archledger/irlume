@@ -8,58 +8,301 @@ use crate::{daemon_request, tpm_device, user_arg};
 use irlume_common::{Request, Response};
 use std::process::ExitCode;
 
-/// `irlume update` — check for a newer release and give family-appropriate
-/// instructions. Family-aware by design (see docs/cross-distro): each distro
-/// owns updates its own way, so irlume never fights the package manager — it
-/// checks the latest GitHub release and prints the right command per family
-/// (or performs it where that's idiomatic). No network library is bundled; we
-/// shell out to curl for the version check and skip gracefully if it's absent.
-pub fn update(_args: &[String]) -> ExitCode {
-    use irlume_common::platform::{distro_family, DistroFamily};
+/// `irlume update` — origin-aware updater. Detects how this install got onto
+/// the system and updates through that same channel, never a different one:
+/// repo-backed installs (Fedora Copr, Launchpad PPA) are upgraded in place by
+/// running the package manager; release-asset and source installs get the
+/// matching manual steps, plus a pointer to the dedicated repo where one
+/// exists for the family. `--check` reports without running anything. No
+/// network library is bundled; we shell out to curl and degrade gracefully.
+pub fn update(args: &[String]) -> ExitCode {
+    let check_only = args.iter().any(|a| a == "--check" || a == "-n");
     let current = env!("CARGO_PKG_VERSION");
     println!("[update] installed: v{current}");
 
+    let origin = install_origin();
+    println!("[update] install method: {}", origin.describe());
+
     let latest = latest_release_tag();
-    match &latest {
+    let newer = match &latest {
         Some(tag) => {
-            let newer = version_gt(tag.trim_start_matches('v'), current);
-            if newer {
+            if version_gt(tag.trim_start_matches('v'), current) {
                 println!("[update] available: {tag}  →  a newer release is out.");
+                true
             } else {
                 println!("[update] up to date (latest release is {tag}).");
-                return ExitCode::SUCCESS;
+                false
             }
         }
-        None => println!("[update] couldn't reach the release feed (offline?) — showing the update method for this system:"),
+        None => {
+            println!("[update] couldn't reach the release feed (offline?) — not updating; the channel for this install:");
+            false
+        }
+    };
+
+    if !newer {
+        // Nothing to run, but a release-asset install still gets the
+        // switch-to-repo pointer so FUTURE updates are one command.
+        match &origin {
+            InstallOrigin::Copr => println!("  updates come from the Copr: sudo dnf upgrade --refresh irlume"),
+            InstallOrigin::Ppa => println!("  updates come with the system: sudo apt update && sudo apt upgrade"),
+            _ => {}
+        }
+        recommend_channel(&origin);
+        return ExitCode::SUCCESS;
     }
 
-    match distro_family() {
-        DistroFamily::Fedora => {
-            println!("  Fedora: sudo dnf upgrade irlume");
-            println!("          (from the Copr; `dnf copr enable archledger/irlume` once, if not already)");
+    match &origin {
+        InstallOrigin::Copr => {
+            if check_only {
+                println!("  would run: sudo dnf upgrade --refresh irlume");
+            } else {
+                println!("[update] updating from the Copr (the channel this was installed from):");
+                return run_pkg_steps(&[&["dnf", "upgrade", "--refresh", "irlume"]]);
+            }
         }
-        DistroFamily::Arch => {
-            // AUR registration is currently disabled upstream, so the primary
-            // Arch channel is the prebuilt package on GitHub Releases (installed
-            // with pacman -U). The AUR PKGBUILD remains for source builds and
-            // will become the update path again once AUR sign-ups reopen.
-            println!("  Arch: grab the prebuilt package from the release page and install it:");
-            println!("    curl -fLO <release>/irlume-{}-x86_64.pkg.tar.zst", latest.as_deref().unwrap_or("VERSION").trim_start_matches('v'));
-            println!("    sudo pacman -U ./irlume-*.pkg.tar.zst");
+        InstallOrigin::Ppa => {
+            if check_only {
+                println!("  would run: sudo apt update && sudo apt install --only-upgrade irlume");
+            } else {
+                println!("[update] updating from the PPA (the channel this was installed from):");
+                return run_pkg_steps(&[
+                    &["apt", "update"],
+                    &["apt", "install", "--only-upgrade", "irlume"],
+                ]);
+            }
+        }
+        InstallOrigin::LocalRpm(_) => {
+            // Fedora releases don't ship a standalone .rpm asset — the Copr is
+            // the only Fedora channel, so the recommendation IS the update path.
+            recommend_channel(&origin);
+        }
+        InstallOrigin::LocalDeb => {
+            let ver = latest.as_deref().unwrap_or("vVERSION").trim_start_matches('v');
+            println!("  Update the way it was installed — the new .deb from the release page:");
+            println!("    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/irlume_{ver}_amd64.deb");
+            println!("    sudo apt install ./irlume_{ver}_amd64.deb");
+            recommend_channel(&origin);
+        }
+        InstallOrigin::ArchPkg => {
+            // AUR registration is currently disabled upstream, so the Arch
+            // channel is the prebuilt package on GitHub Releases (pacman -U).
+            // The PKGBUILD remains for source builds and will become the
+            // update path again once AUR sign-ups reopen.
+            let ver = latest.as_deref().unwrap_or("vVERSION").trim_start_matches('v');
+            println!("  Update the way it was installed — the prebuilt package from the release page:");
+            println!("    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/irlume-{ver}-1-x86_64.pkg.tar.zst");
+            println!("    sudo pacman -U ./irlume-{ver}-1-x86_64.pkg.tar.zst");
             println!("  (or build from source: makepkg -si  in packaging/arch/)");
         }
-        DistroFamily::Debian => {
-            println!("  Debian/Ubuntu: sudo apt update && sudo apt install --only-upgrade irlume");
-            println!("          (if installed from a .deb: download the new .deb from the release page and `sudo apt install ./irlume_*.deb`)");
-        }
-        DistroFamily::Other => {
-            println!("  This distro isn't packaged yet — build from source at the tag:");
+        InstallOrigin::Source => {
+            println!("  Source install — update the checkout at the tag:");
             println!("    git -C <clone> fetch --tags && git checkout {}", latest.as_deref().unwrap_or("<latest>"));
             println!("    git lfs pull && cargo build --release && sudo bash scripts/install-host.sh --ort <libonnxruntime.so>");
         }
     }
     println!("  Release notes: https://github.com/archledger/irlume/releases");
     ExitCode::SUCCESS
+}
+
+/// How this irlume install got onto the system — decides the update channel.
+pub enum InstallOrigin {
+    /// Fedora Copr repo — the recommended Fedora channel.
+    Copr,
+    /// rpm-owned but not from the Copr (hand-built / local rpm). Carries
+    /// dnf's `from_repo` string for display (may be empty or a history hash).
+    LocalRpm(String),
+    /// Launchpad PPA — the recommended Ubuntu channel.
+    Ppa,
+    /// dpkg-owned with no PPA source behind it (release-asset .deb).
+    LocalDeb,
+    /// pacman-owned (release-asset package or makepkg).
+    ArchPkg,
+    /// Not owned by any package manager (source / dev install).
+    Source,
+}
+
+impl InstallOrigin {
+    pub fn describe(&self) -> String {
+        match self {
+            InstallOrigin::Copr => "Fedora Copr (archledger/irlume)".into(),
+            InstallOrigin::LocalRpm(repo) if repo.is_empty() || repo.len() == 32 => {
+                "local RPM (not from the Copr)".into()
+            }
+            InstallOrigin::LocalRpm(repo) => format!("RPM from repo `{repo}` (not the Copr)"),
+            InstallOrigin::Ppa => "Launchpad PPA (ppa:archledger/irlume)".into(),
+            InstallOrigin::LocalDeb => "local .deb (GitHub release asset)".into(),
+            InstallOrigin::ArchPkg => "pacman package (release asset / makepkg)".into(),
+            InstallOrigin::Source => "source / dev install (no package manager owns it)".into(),
+        }
+    }
+}
+
+/// Detect the install origin. Cheap local probes only: the owning package
+/// manager, and for owned packages the repo it came from (dnf's `from_repo`,
+/// apt's policy table).
+pub fn install_origin() -> InstallOrigin {
+    use irlume_common::platform::{distro_family, DistroFamily};
+    match distro_family() {
+        DistroFamily::Fedora => {
+            if !cmd_ok("rpm", &["-q", "irlume"]) {
+                return InstallOrigin::Source;
+            }
+            let repo = cmd_stdout("dnf", &["repoquery", "--installed", "--qf", "%{from_repo}\n", "irlume"])
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if is_copr_repo(&repo) {
+                InstallOrigin::Copr
+            } else {
+                InstallOrigin::LocalRpm(repo)
+            }
+        }
+        DistroFamily::Debian => {
+            let status = cmd_stdout("dpkg-query", &["-W", "-f", "${Status}", "irlume"]).unwrap_or_default();
+            if !status.contains("ok installed") {
+                return InstallOrigin::Source;
+            }
+            let policy = cmd_stdout("apt-cache", &["policy", "irlume"]).unwrap_or_default();
+            if policy.contains("ppa.launchpadcontent.net/archledger/irlume") {
+                InstallOrigin::Ppa
+            } else {
+                InstallOrigin::LocalDeb
+            }
+        }
+        DistroFamily::Arch => {
+            if cmd_ok("pacman", &["-Qq", "irlume"]) {
+                InstallOrigin::ArchPkg
+            } else {
+                InstallOrigin::Source
+            }
+        }
+        DistroFamily::Other => InstallOrigin::Source,
+    }
+}
+
+/// dnf5 `from_repo` for a Copr install looks like
+/// `copr:copr.fedorainfracloud.org:archledger:irlume`.
+fn is_copr_repo(repo: &str) -> bool {
+    repo.starts_with("copr:") && repo.ends_with(":archledger:irlume")
+}
+
+/// Point release-asset installs at the dedicated repo for their family (when
+/// one covers this system), so future updates arrive with the normal system
+/// upgrade instead of a manual download.
+fn recommend_channel(origin: &InstallOrigin) {
+    match origin {
+        InstallOrigin::LocalRpm(_) => {
+            println!("  Recommended: Fedora's release channel is the Copr — switch once and");
+            println!("  future updates arrive with plain `dnf upgrade`:");
+            println!("    sudo dnf copr enable archledger/irlume");
+            println!("    sudo dnf install irlume");
+        }
+        InstallOrigin::LocalDeb => {
+            let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+            let Some(codename) = ubuntu_codename(&os) else {
+                return; // Debian proper: the release .deb IS the channel.
+            };
+            match ppa_serves(&codename) {
+                Some(true) => {
+                    println!("  Recommended: Ubuntu's release channel is the PPA — switch once and");
+                    println!("  future updates arrive with plain `apt upgrade`:");
+                    println!("    sudo add-apt-repository ppa:archledger/irlume");
+                    println!("    sudo apt install irlume");
+                }
+                Some(false) => {
+                    println!("  (the PPA doesn't build for Ubuntu `{codename}` yet — the release .deb is the right channel)");
+                }
+                None => {
+                    println!("  If the PPA builds for your Ubuntu series, switching makes future updates automatic:");
+                    println!("    sudo add-apt-repository ppa:archledger/irlume && sudo apt install irlume");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `VERSION_CODENAME` if this is Ubuntu (or an Ubuntu derivative that can use
+/// PPAs), else None.
+fn ubuntu_codename(os_release: &str) -> Option<String> {
+    let field = |key: &str| -> String {
+        os_release
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().trim_matches('"').to_lowercase())
+            .unwrap_or_default()
+    };
+    let ubuntu = field("ID=") == "ubuntu" || field("ID_LIKE=").contains("ubuntu");
+    if !ubuntu {
+        return None;
+    }
+    let code = field("UBUNTU_CODENAME=");
+    let code = if code.is_empty() { field("VERSION_CODENAME=") } else { code };
+    (!code.is_empty()).then_some(code)
+}
+
+/// Does the PPA publish for this Ubuntu series? HTTP 200 on the series
+/// Release file means yes. None = couldn't check (offline / no curl).
+fn ppa_serves(codename: &str) -> Option<bool> {
+    let url = format!("https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/Release");
+    let status = std::process::Command::new("curl")
+        .args(["-fsI", "--max-time", "5", "-o", "/dev/null", &url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    Some(status.success())
+}
+
+/// Run each package-manager step with root: directly if we already are, else
+/// through interactive sudo so dnf/apt keep their own transaction prompt (the
+/// user still confirms the actual change). Stops at the first failure.
+fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
+    let root = unsafe { libc::geteuid() } == 0;
+    for step in steps {
+        let display = step.join(" ");
+        println!("  $ {}{display}", if root { "" } else { "sudo " });
+        let status = if root {
+            std::process::Command::new(step[0]).args(&step[1..]).status()
+        } else {
+            std::process::Command::new("sudo").args(*step).status()
+        };
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("[update] `{display}` exited with {s} — stopping.");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("[update] couldn't run `{display}`: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("[update] done.");
+    ExitCode::SUCCESS
+}
+
+fn cmd_ok(prog: &str, args: &[&str]) -> bool {
+    std::process::Command::new(prog)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn cmd_stdout(prog: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(prog)
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Best-effort latest release tag from the GitHub API via curl. None if curl is
@@ -560,9 +803,37 @@ SYSTEM INTEGRATION
   fingerprint <status|add|enable|disable>   fprintd companion factor
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter
-  update                          check for a newer release (family-aware)
+  update [--check]                update via the channel this was installed from
+                        (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
 
   (developer/benchmark tools are hidden — set IRLUME_DEV=1 to enable them)
 ");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::{is_copr_repo, ubuntu_codename};
+
+    #[test]
+    fn copr_from_repo_matches_only_our_project() {
+        assert!(is_copr_repo("copr:copr.fedorainfracloud.org:archledger:irlume"));
+        assert!(!is_copr_repo("copr:copr.fedorainfracloud.org:archledger:linhello"));
+        assert!(!is_copr_repo("fedora"));
+        assert!(!is_copr_repo("@commandline"));
+        assert!(!is_copr_repo("")); // no dnf history record
+        assert!(!is_copr_repo("6ecc2dfaa0dc41e5ad51e007707a786b")); // history hash
+    }
+
+    #[test]
+    fn ubuntu_codename_from_os_release() {
+        let ubuntu = "ID=ubuntu\nVERSION_CODENAME=resolute\nUBUNTU_CODENAME=resolute\n";
+        assert_eq!(ubuntu_codename(ubuntu).as_deref(), Some("resolute"));
+        // Derivative: ID_LIKE carries ubuntu, UBUNTU_CODENAME names the base series.
+        let mint = "ID=linuxmint\nID_LIKE=\"ubuntu debian\"\nVERSION_CODENAME=xia\nUBUNTU_CODENAME=noble\n";
+        assert_eq!(ubuntu_codename(mint).as_deref(), Some("noble"));
+        // Debian proper: PPAs don't apply.
+        let debian = "ID=debian\nVERSION_CODENAME=trixie\n";
+        assert_eq!(ubuntu_codename(debian), None);
+    }
 }

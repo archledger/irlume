@@ -1253,6 +1253,7 @@ fn doctor() -> std::process::ExitCode {
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
     println!("[doctor] platform: {}", irlume_common::platform::distro_family().as_str());
+    println!("[doctor] install origin: {}", commands::install_origin().describe());
     match tpm_device() {
         Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
         None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗ — required for sealing"),

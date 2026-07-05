@@ -3,7 +3,7 @@
 Name:           irlume
 Version:        0.1.1
 Release:        1%{?dist}
-Summary:        Local face authentication for Linux (IR or RGB webcam; TPM-sealed, clean-BOM)
+Summary:        Windows Hello-style face login for Linux
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/archledger/irlume

@@ -31,8 +31,8 @@ best-served group meets NIST FMR ≤ 1×10⁻⁴; the others exceed it within-gr
 A single fixed threshold that holds FAR ≤ 1×10⁻⁴ for **every** group requires
 ≈ **0.69** (bound by the worst groups). A cross-check on real faces (LFW,
 13,233 images, 87M impostor pairs, same YuNet→AuraFace pipeline) measured the
-all-pairs RGB FAR at 0.50 at **2.3×10⁻³** (reproduce it with the command in the
-Appendix). That is *higher* than the FairFace per-group figures above, not
+all-pairs RGB FAR at 0.50 at **2.3×10⁻³** (reproduce it with the command under
+[Reproducing these numbers](#reproducing-these-numbers)). That is *higher* than the FairFace per-group figures above, not
 lower: LFW is unconstrained web imagery — varied pose and lighting, with some
 near-duplicate identities — that aligns less cleanly than FairFace's curated
 crops, so real-world faces are the harder test. The shipped RGB threshold is

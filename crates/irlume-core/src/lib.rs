@@ -25,14 +25,16 @@ pub mod template_key;
 pub mod tpm;
 pub mod tpm_pcrlock;
 
-/// RGB (visible-light) match threshold. Evidence-based across two large FAR
-/// runs: real faces (LFW, 87M impostor pairs) give FAR 3e-5 @ 0.50 and 2e-5 @
-/// 0.55; synthetic (SFHQ, 112M pairs) 9.8e-5 @ 0.50. **Set to 0.55** to meet
-/// Windows Hello's stated bar (FAR < 1e-5) more closely AND for demographic
-/// headroom — FairFace per-group analysis showed 0.50 only clears FMR≤1e-4 for
-/// the best group; ~0.55+ tightens every group (see docs/FAIRNESS.md). Live
+/// RGB (visible-light) match threshold. Measured FAR: real faces (LFW, 13,233
+/// images, 87M impostor pairs, same pipeline as production) give FAR 2.3e-3 @
+/// 0.50 and 2.0e-3 @ 0.55; synthetic (SFHQ, 112M pairs) 9.8e-5 @ 0.50 (cleaner
+/// than unconstrained real photos). **Set to 0.55** for demographic headroom —
+/// FairFace per-group analysis showed 0.50 only clears FMR≤1e-4 for the best
+/// group; ~0.55+ tightens every group (see docs/FAIRNESS.md) — and because live
 /// genuine sits at min 0.71 / mean 0.85, so 0.55 keeps a wide accept margin (no
-/// added false-rejects). Do NOT assume buffalo_l's 0.60 — AuraFace scale differs.
+/// added false-rejects). Unconstrained real-world FAR stays well above Windows
+/// Hello's stated 1e-5 bar; the mandatory password fallback bounds the residual.
+/// Do NOT assume buffalo_l's 0.60 — AuraFace scale differs.
 pub const RGB_MATCH_THRESHOLD: f32 = 0.55;
 
 /// IR-mode (dark) match threshold — HIGHER than RGB because AuraFace-on-IR is

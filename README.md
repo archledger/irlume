@@ -254,9 +254,9 @@ auto-detected.
 <details>
 <summary><b>Is this AI-generated?</b></summary>
 
-AI-assisted, human-directed — and disclosed since the first commit: the git
-history carries `Co-Authored-By` trailers naming the AI assistant (Anthropic's
-Claude, also visible under this repo's contributors). A human maintainer sets
+AI-assisted, human-directed — and disclosed throughout the git history: the
+large majority of commits carry `Co-Authored-By` trailers naming the AI
+assistant (Anthropic's Claude, also visible under this repo's contributors). A human maintainer sets
 direction, reviews the changes, and validates every release with clean-slate
 installs on real hardware (Fedora, Arch, Ubuntu — IR camera, TPM, fingerprint)
 before anything ships. Judge the project by its verifiable artifacts: the

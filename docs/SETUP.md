@@ -67,7 +67,9 @@ irlume status for 'you'
   keyring unlock: not armed (run `irlume keyring arm`)
   templates     : plaintext ⚠ (run `irlume recovery setup`)
   recovery pass : not set ⚠
+  biopolicy     : off (default)
   cameras       : rgb=/dev/video0 ir=/dev/video2
+  fingerprint   : none
 ```
 
 `irlume doctor` gives the deeper platform/TPM/Secure-Boot/camera/model report;
@@ -129,8 +131,10 @@ every login, which is half the point.
 irlume keyring arm
 ```
 
-It prompts once for your **login password**, which it seals in the TPM (never
-stored in plaintext). Re-run it after you change your login password.
+It prompts for your **login password** (typed twice, to catch a typo), which it
+seals in the TPM — never stored in plaintext. Re-run it after you change your
+login password. On a fingerprint machine a fingerprint login unseals the wallet
+the same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
 ### 5. Recovery passphrase — recommended
 
@@ -194,12 +198,17 @@ irlume status
 A fully set-up secure-tier machine reads:
 
 ```
+irlume status for 'you'
   daemon        : running ✅
+  auth method   : Auto
   enrollment    : 1 profile(s), 3 scan(s) ✅
+                  - Face Profile 1 (3 scan(s))
   keyring unlock: armed ✅
   templates     : encrypted at rest ✅
   recovery pass : set ✅
+  biopolicy     : off (default)
   cameras       : rgb=/dev/video0 ir=/dev/video2
+  fingerprint   : none
 ```
 
 Then lock your screen (or open a fresh `sudo` if you wired it) and look at the

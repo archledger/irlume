@@ -24,6 +24,12 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 
 [Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#️-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
 
+<br>
+
+<img src="docs/assets/irlume-demo.gif" alt="irlume demo — dnf install, guided face enrollment, and wiring the login stack from the TUI" width="800">
+
+<sub>From <code>dnf install</code> to a wired face login: guided enrollment, TPM keyring unlock, recovery passphrase, and greeter/lock-screen wiring — all in the TUI.</sub>
+
 </div>
 
 ---

@@ -190,6 +190,9 @@ never sees; irlume's daemon is a root process holding decrypted embeddings in RA
 during a match — so **root on the live machine is the trust boundary** (as with
 most Linux secrets). Full write-up: [`docs/SECURITY_AT_REST.md`](docs/SECURITY_AT_REST.md).
 
+**Don't take our word for it** — every claim here maps to something you can run
+on your own machine: [`docs/VERIFY.md`](docs/VERIFY.md).
+
 ## ⚖️ Honest limitations
 
 Trust is built on candor, so — plainly:
@@ -251,6 +254,17 @@ installs on real hardware (Fedora, Arch, Ubuntu — IR camera, TPM, fingerprint)
 before anything ships. Judge the project by its verifiable artifacts: the
 threat model, measured error rates, spoof-test results, and the code itself
 are all in the repo, reproducible regardless of what tools wrote them.
+</details>
+
+<details>
+<summary><b>Can I verify these claims myself?</b></summary>
+
+Yes — that's the point. [`docs/VERIFY.md`](docs/VERIFY.md) maps each claim to a
+command you can run: see your own camera's anti-spoof score, confirm the stored
+template is encrypted ciphertext (not an image), run the presentation-attack
+self-test against your own spoofs, reproduce the real-face FAR on LFW, and build
+and run the test suite. Some checks take two minutes, some take real effort, but
+every one is runnable.
 </details>
 
 <details>

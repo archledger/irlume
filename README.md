@@ -134,6 +134,9 @@ Face-`sudo` is a separate opt-in — add it with
 `sudo irlume login enable --with-sudo --apply`, since granting root by face is a
 trade-off worth choosing deliberately (the password always still works).
 
+**Full step-by-step** (both the guided TUI and the individual CLI commands, with
+keyring unlock, recovery, and fingerprint): [`docs/SETUP.md`](docs/SETUP.md).
+
 No IR-emitter step needed: enrollment probes the IR camera and, if its frames
 come back black, auto-discovers and enables the 850 nm emitter itself. Only if
 IR stays dark after enrolling, run `sudo irlume ir-setup` manually — it applies

@@ -29,11 +29,13 @@ in the footer.
 2. **Profiles** — `[e]` enrolls a face. Look at the camera; it guides your
    framing and captures three scans automatically. Wear glasses sometimes?
    Enroll a second profile for that look.
-3. **Keyring** *(IR camera + TPM)* — arm TPM keyring unlock so a face login
-   opens your wallet with no prompt. You'll enter your login password once; it
-   is sealed in the TPM, never stored in plaintext.
-4. **Recovery** — set a recovery passphrase so you can restore your templates
-   after a TPM clear or firmware update without re-enrolling.
+3. **Keyring** *(recommended; IR camera + TPM)* — arm TPM keyring unlock so a
+   face login opens your wallet with no prompt. You'll enter your login password
+   once; it is sealed in the TPM, never stored in plaintext. Skip it and your
+   wallet just prompts separately after login.
+4. **Recovery** *(recommended)* — set a recovery passphrase. It restores your
+   templates after a TPM clear or firmware update without re-enrolling; without
+   it, such a change forces a full re-enroll.
 5. **Login wiring** — press `[w]` to wire the **greeter and lock screen**
    (runs `sudo irlume login enable --apply`). Face-`sudo` is opt-in and *not*
    included by `[w]` — see [face-sudo](#face-sudo-optional) below.
@@ -116,9 +118,12 @@ nothing.
 [login] done. Password remains the fallback everywhere.
 ```
 
-### 4. (Optional) Keyring unlock
+### 4. Keyring unlock — recommended (IR camera + TPM)
 
-So a face login opens GNOME Keyring / KWallet with no separate prompt:
+This is what makes a face login open your GNOME Keyring / KWallet with no
+separate prompt — the Windows-Hello-style experience. Skip it and face login
+still works, but your wallet stays locked and prompts you for its password after
+every login, which is half the point.
 
 ```sh
 irlume keyring arm
@@ -127,10 +132,12 @@ irlume keyring arm
 It prompts once for your **login password**, which it seals in the TPM (never
 stored in plaintext). Re-run it after you change your login password.
 
-### 5. (Optional) Recovery passphrase
+### 5. Recovery passphrase — recommended
 
-A backstop that restores your templates after a TPM clear, firmware/dbx update,
-or disk move — without re-enrolling:
+Set this. It's your backstop: without it, a TPM clear or a routine
+firmware/dbx/Secure-Boot update can invalidate the TPM-sealed key and force you
+to **re-enroll from scratch**. With it, you restore in seconds. That's why
+`irlume status` flags `recovery pass: not set ⚠` until you do.
 
 ```sh
 irlume recovery setup

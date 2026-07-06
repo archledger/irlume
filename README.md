@@ -129,6 +129,11 @@ irlume tui                         # enroll your face + configure, guided
 sudo irlume login enable --apply   # opt-in: wire the greeter + lock screen
 ```
 
+`login enable` (and the TUI's `[w]`) wires the **greeter and lock screen**.
+Face-`sudo` is a separate opt-in — add it with
+`sudo irlume login enable --with-sudo --apply`, since granting root by face is a
+trade-off worth choosing deliberately (the password always still works).
+
 No IR-emitter step needed: enrollment probes the IR camera and, if its frames
 come back black, auto-discovers and enables the 850 nm emitter itself. Only if
 IR stays dark after enrolling, run `sudo irlume ir-setup` manually — it applies

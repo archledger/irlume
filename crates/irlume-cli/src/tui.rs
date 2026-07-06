@@ -1102,7 +1102,8 @@ impl App {
             // sudo) from either the wiring tab or the Done dashboard — the last
             // setup mile must not require leaving the TUI for a manual command.
             (SC_PAM, KeyCode::Char('w')) | (SC_DONE, KeyCode::Char('w')) => {
-                self.log('→', "sudo irlume login enable --apply — wires the login stack for your method");
+                self.log('→', "sudo irlume login enable --apply — wires the greeter + lock screen for your method");
+                self.log('·', "face-sudo is opt-in — add it later with: sudo irlume login enable --with-sudo --apply");
                 self.suspend = Some(Suspend::LoginEnable);
             }
             // Login wiring (PAM): show status outside the alt-screen.
@@ -1751,6 +1752,7 @@ impl App {
         lines.push(Line::raw(""));
         lines.push(section("Change (root)"));
         lines.push(Line::from(vec![Span::styled("  [w]", Style::new().fg(ACCENT)), Span::styled(" wire the login stack now (runs sudo irlume login enable --apply)", Style::new())]));
+        lines.push(Line::from(vec![Span::styled("  face-sudo ", Style::new()), Span::styled("opt-in, not wired by [w]: sudo irlume login enable --with-sudo --apply", Style::new().dim())]));
         lines.push(Line::from(vec![Span::styled("  disable ", Style::new()), Span::styled("sudo irlume login disable --apply", Style::new().dim())]));
         lines.push(Line::from(vec![Span::styled("  [s]", Style::new().fg(ACCENT)), Span::styled(" open full status in a console view", Style::new().dim())]));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);

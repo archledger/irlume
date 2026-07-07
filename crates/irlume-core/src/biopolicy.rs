@@ -67,8 +67,11 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
         | "gnome-screensaver" | "swaylock" | "i3lock" | "hyprlock" => OperationClass::ScreenUnlock,
         // Display-manager greeters (cold login), incl. GDM's separate
         // fingerprint login service (`gdm-fingerprint`) — same login class.
+        // `cosmic-greeter` (COSMIC / Pop!_OS) uses one service for both the cold
+        // login and the live lock screen, so the warm/cold flag below is what
+        // separates its login from its screen-unlock.
         "sddm" | "sddm-greeter" | "plasmalogin" | "gdm-password" | "gdm-fingerprint"
-        | "gdm" | "gdm3" | "lightdm" | "login" | "greetd" | "ly" => {
+        | "gdm" | "gdm3" | "lightdm" | "login" | "greetd" | "ly" | "cosmic-greeter" => {
             if warm { OperationClass::ScreenUnlock } else { OperationClass::Login }
         }
         // Elevation.
@@ -113,6 +116,17 @@ mod tests {
     fn warm_greeter_is_a_screen_unlock() {
         assert_eq!(classify("plasmalogin", true), OperationClass::ScreenUnlock);
         assert_eq!(classify("plasmalogin", false), OperationClass::Login);
+    }
+
+    #[test]
+    fn cosmic_greeter_logs_in_cold_and_unlocks_warm() {
+        // COSMIC uses one `cosmic-greeter` service for both the cold login and
+        // the live lock screen; the warm flag must split them, and a cold login
+        // must reach Unseal on the Secure (IR) tier — else it classifies Unknown
+        // and the daemon denies the face match.
+        assert_eq!(classify("cosmic-greeter", false), OperationClass::Login);
+        assert_eq!(classify("cosmic-greeter", true), OperationClass::ScreenUnlock);
+        assert_eq!(decide(classify("cosmic-greeter", false), Tier::Secure), Action::Unseal);
     }
 
     #[test]

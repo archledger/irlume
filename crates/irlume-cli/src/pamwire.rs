@@ -29,6 +29,14 @@ const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume
 /// blocks on an active password probe, so wire a face-first `sufficient` line
 /// directly before the password include instead.
 const GREETER_UNSEAL_DEBIAN: &str = "auth       sufficient                   pam_irlume.so unseal facefirst";
+/// COSMIC greeter (cosmic-greeter): unlike GDM its conversation answers the
+/// active password probe from the buffered field, so it uses `ondemand` (face
+/// engages only on an empty-field Enter, never ambient) instead of GDM's
+/// `facefirst` scan-immediately — while keeping the same warm verify fallback,
+/// since cosmic-greeter also drives both the login and the lock screen.
+const GREETER_UNSEAL_COSMIC: &str = "auth       sufficient                   pam_irlume.so unseal ondemand";
+/// Jump-style variant of the above for a non-`@include` (e.g. Fedora) COSMIC stack.
+const GREETER_UNSEAL_COSMIC_JUMP: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand";
 // Tagged so unwire strips OUR landing but never a foreign pam_permit.so the
 // stack legitimately carries (the trailing `#…` is a PAM comment, ignored).
 const PERMIT_LANDING: &str = "auth       optional                     pam_permit.so   # irlume-landing";
@@ -54,6 +62,7 @@ const GREETERS: &[Svc] = &[
     Svc { etc: "/etc/pam.d/sddm", vendor: None },
     Svc { etc: "/etc/pam.d/lightdm", vendor: None },
     Svc { etc: "/etc/pam.d/plasmalogin", vendor: Some("/usr/lib/pam.d/plasmalogin") }, // Plasma 6
+    Svc { etc: "/etc/pam.d/cosmic-greeter", vendor: None }, // COSMIC (Pop!_OS / System76)
 ];
 const LOCKSCREEN: Svc = Svc { etc: "/etc/pam.d/kde-fingerprint", vendor: Some("/usr/lib/pam.d/kde-fingerprint") };
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
@@ -143,6 +152,11 @@ fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
         "lightdm" => ("lightdm", None),
         "greetd" => ("greetd", None),
         "ly" => ("ly", None),
+        // COSMIC (System76 / Pop!_OS): cosmic-greeter drives BOTH the cold login
+        // and the live lock screen through the SAME `cosmic-greeter` PAM service;
+        // the warm/cold flag in biopolicy::classify distinguishes them. No
+        // separate fingerprint service.
+        "cosmic-greeter" => ("cosmic-greeter", None),
         _ => ("(unknown)", None),
     }
 }
@@ -266,8 +280,12 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     // login) AND the KEYRING line (fingerprint keyring unlock) — independent, so
     // an RGB+fingerprint box gets keyring-only here, while GDM's session keyring
     // unlock (which runs through gdm-password) still finds the password.
-    let greeter_wire = |c: &str| wire_greeter_impl(c, want_face_login, want_fp_keyring);
     for s in GREETERS {
+        // cosmic-greeter answers the active probe on submit (so it takes the
+        // on-demand probe: face only on an empty-field Enter), unlike GDM whose
+        // conversation blocks and needs `facefirst`'s scan-immediately.
+        let ondemand = s.etc.ends_with("/cosmic-greeter");
+        let greeter_wire = |c: &str| wire_greeter_impl(c, want_face_login, want_fp_keyring, ondemand);
         do_svc(s, &greeter_wire, want_face_login || want_fp_keyring);
     }
     for s in FP_GREETERS {
@@ -409,7 +427,7 @@ fn is_auth_directive(line: &str) -> bool {
 /// line (fingerprint keyring unlock — needed in gdm-password too, since GDM's
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
-fn wire_greeter_impl(content: &str, face: bool, keyring: bool) -> (String, bool) {
+fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
     if !face && !keyring { return (content.to_string(), false); }
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
@@ -420,7 +438,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool) -> (String, bool)
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
-                if face { out.push(GREETER_UNSEAL_DEBIAN.to_string()); }
+                if face { out.push(if ondemand { GREETER_UNSEAL_COSMIC } else { GREETER_UNSEAL_DEBIAN }.to_string()); }
                 out.push((*l).to_string());
                 if keyring { out.push(KEYRING_UNSEAL.to_string()); }
                 out.push(RESEAL_AUTH.to_string());
@@ -444,7 +462,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool) -> (String, bool)
     for (i, l) in lines.iter().enumerate() {
         if i == auth_at {
             if face {
-                out.push(GREETER_UNSEAL.to_string());
+                out.push(if ondemand { GREETER_UNSEAL_COSMIC_JUMP } else { GREETER_UNSEAL }.to_string());
                 out.push((*l).to_string());
                 out.push(PERMIT_LANDING.to_string());
             } else {
@@ -634,7 +652,7 @@ mod tests {
 
     #[test]
     fn greeter_block_wraps_password_substack() {
-        let (w, changed) = wire_greeter_impl(GDM, true, true);
+        let (w, changed) = wire_greeter_impl(GDM, true, true, false);
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let unseal = lines.iter().position(|l| l.contains("unseal")).unwrap();
@@ -647,10 +665,31 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("session") && l.contains("reseal")));
     }
 
+    // Debian/Ubuntu cosmic-greeter layout (@include-based; one service drives
+    // both the login and the lock screen).
+    const COSMIC: &str = "#%PAM-1.0\nauth    requisite    pam_nologin.so\n@include common-auth\nauth    optional    pam_gnome_keyring.so\n@include common-account\n@include common-session\n@include common-password\n";
+
+    #[test]
+    fn cosmic_greeter_wires_ondemand_not_facefirst() {
+        // ondemand=true → on-demand probe line (face only on empty-Enter), placed
+        // before the password include so the password stays a fallback.
+        let (w, changed) = wire_greeter_impl(COSMIC, true, false, true);
+        assert!(changed);
+        assert!(w.contains("pam_irlume.so unseal ondemand"));
+        assert!(!w.contains("facefirst"));
+        let lines: Vec<&str> = w.lines().collect();
+        let unseal = lines.iter().position(|l| l.contains("unseal ondemand")).unwrap();
+        let inc = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")).unwrap();
+        assert!(unseal < inc);
+        // A non-cosmic Debian greeter (ondemand=false) still gets facefirst.
+        let (g, _) = wire_greeter_impl(COSMIC, true, false, false);
+        assert!(g.contains("facefirst") && !g.contains("ondemand"));
+    }
+
     #[test]
     fn greeter_wiring_is_idempotent() {
-        let (w1, _) = wire_greeter_impl(GDM, true, true);
-        let (w2, changed) = wire_greeter_impl(&w1, true, true);
+        let (w1, _) = wire_greeter_impl(GDM, true, true, false);
+        let (w2, changed) = wire_greeter_impl(&w1, true, true, false);
         assert!(!changed);
         assert_eq!(w1, w2);
     }
@@ -659,11 +698,11 @@ mod tests {
     fn method_switch_reconciles_the_line_set() {
         // face-only → (strip) → keyring-only must actually change the lines
         // (the method-switch case the old skip-if-present logic silently no-op'd).
-        let (face_only, _) = wire_greeter_impl(GDM, true, false);
+        let (face_only, _) = wire_greeter_impl(GDM, true, false, false);
         assert!(face_only.contains("pam_irlume.so unseal") && !face_only.contains("pam_irlume.so keyring"));
         let (base, stripped) = unwire_lines(&face_only);
         assert!(stripped && !base.contains(MODULE));
-        let (keyring_only, _) = wire_greeter_impl(&base, false, true);
+        let (keyring_only, _) = wire_greeter_impl(&base, false, true, false);
         assert!(keyring_only.contains("pam_irlume.so keyring") && !keyring_only.contains("pam_irlume.so unseal"));
         assert_ne!(face_only, keyring_only);
     }

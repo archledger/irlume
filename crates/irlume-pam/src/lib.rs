@@ -85,6 +85,17 @@ impl PamServiceModule for IrlumePam {
         // scan right away; a typed password still wins via the modules after us.
         let facefirst = args.iter().any(|a| a == "facefirst");
 
+        // `ondemand` (COSMIC / cosmic-greeter): a greeter that DOES answer the
+        // active probe from the buffered field (like plasmalogin) but drives BOTH
+        // the cold login and the live lock screen through ONE service (like GDM).
+        // So we want the on-demand ACTIVE probe (face engages only when the user
+        // submits an empty field — never ambient, never after a typed/rejected
+        // password) AND the warm `unseal→verify` fallback below (so the lock
+        // screen still unlocks). It is `facefirst`'s warm-fallback WITHOUT its
+        // scan-immediately probe. Uses the active-probe path (it never sets
+        // `facefirst`, so the `!facefirst` probe test below stays true).
+        let ondemand = args.iter().any(|a| a == "ondemand");
+
         // `reseal` AUTH line (placed AFTER password-auth): STASH ONLY. We copy the
         // current PAM_AUTHTOK into PAM transaction data so the matching `reseal`
         // SESSION line can re-bind it later. We deliberately do NOT contact the
@@ -145,11 +156,14 @@ impl PamServiceModule for IrlumePam {
             } else {
                 try_verify(&pamh, &user)
             };
-            // GDM drives BOTH the cold greeter and the live lock screen through
-            // one service. Unsealing is refused on the convenience tier (and on
-            // an un-armed keyring) — a warm screen unlock only needs identity,
-            // so fall back to a plain verify before giving up to the password.
-            if facefirst && unseal && attempt != PamError::SUCCESS {
+            // GDM and cosmic-greeter each drive BOTH the cold greeter and the
+            // live lock screen through one service. Unsealing is refused on the
+            // convenience tier (and on an un-armed keyring) — a warm screen unlock
+            // only needs identity, so fall back to a plain verify before giving up
+            // to the password. `try_verify` re-applies biopolicy in the daemon, so
+            // a cold login on a convenience tier still returns Deny here: the
+            // fallback only rescues the identity-only warm-unlock case.
+            if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
                 attempt = try_verify(&pamh, &user);
             }
             if attempt == PamError::SUCCESS {

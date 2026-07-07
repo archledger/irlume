@@ -791,12 +791,13 @@ impl Engine {
 /// A tighter band makes the up/down cue fire at a MODERATE, still-detectable
 /// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
 /// below-eye-level laptop camera looks UP at the face, biasing neutral toward
-/// the LOW (looking-up) end, so the floor isn't set aggressively high. Yaw keeps
-/// the liveness value — it already coached well before face loss. Tune from the
-/// `IRLUME_LOG=debug` "framing:" trace (median = a level face) if a camera reads off.
-const FRAME_YAW_ASYM_MAX: f32 = 0.40;
-const FRAME_PITCH_MIN: f32 = 0.33;
-const FRAME_PITCH_MAX: f32 = 0.70;
+/// the LOW (looking-up) end, so the floor isn't set aggressively high. These are
+/// tighter than the first pass (was yaw 0.40 / pitch 0.33–0.70) to coach a more
+/// squarely-frontal capture; still wide enough that a level face isn't nagged.
+/// Tune from the `IRLUME_LOG=debug` "framing:" trace (median = a level face).
+const FRAME_YAW_ASYM_MAX: f32 = 0.34;
+const FRAME_PITCH_MIN: f32 = 0.37;
+const FRAME_PITCH_MAX: f32 = 0.66;
 
 /// Turn a non-frontal head pose into a directional enrollment instruction, told
 /// in the USER's own frame. On irlume's non-mirrored capture, nose-toward-image-

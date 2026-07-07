@@ -190,12 +190,13 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
         // GDM (GNOME): modern gnome-shell submits the empty field (ondemand);
         // older gnome-shell blocked the probe → facefirst.
         "gdm-password" => DmProfile { ondemand: gdm_uses_ondemand(gnome) },
-        // LightDM: validated (Ubuntu 26.04, lightdm-gtk-greeter) — answers the
-        // active probe on submit and auto-logs-in on face success, so ondemand
-        // gives a clean empty-Enter→face with no spurious "incorrect password".
-        "lightdm" => DmProfile { ondemand: true },
-        // SDDM / plasmalogin / other submit-driven greeters — default to the
-        // safe facefirst until each is validated for the on-demand probe.
+        // LightDM (lightdm-gtk-greeter) and SDDM: both validated on Ubuntu 26.04
+        // — they answer the active probe on submit and auto-log-in on face
+        // success, so `ondemand` gives a clean empty-Enter→face with no spurious
+        // "incorrect password" that facefirst caused.
+        "lightdm" | "sddm" => DmProfile { ondemand: true },
+        // plasmalogin / other submit-driven greeters — default to the safe
+        // facefirst until each is validated for the on-demand probe.
         _ => DmProfile { ondemand: false },
     }
 }

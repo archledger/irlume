@@ -810,19 +810,19 @@ impl Engine {
 /// A tighter band makes the up/down cue fire at a MODERATE, still-detectable
 /// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
 /// below-eye-level laptop camera looks UP at the face, biasing neutral toward
-/// the LOW (looking-up) end, so the floor isn't set aggressively high. These are
-/// progressively tighter than the first pass (yaw 0.40 → 0.30 → 0.27; pitch
-/// 0.33–0.70 → 0.40–0.63 → 0.42–0.61) to coach a squarely-frontal capture;
-/// still wide enough that a level face isn't nagged. If a straight-on face
-/// starts getting corrected, loosen from the `IRLUME_LOG=debug` "framing:"
-/// trace (its median is where a level face sits on this camera).
-const FRAME_YAW_ASYM_MAX: f32 = 0.27;
-const FRAME_PITCH_MIN: f32 = 0.42;
-const FRAME_PITCH_MAX: f32 = 0.61;
-/// Half-width of the pitch acceptance window once the user's neutral is known —
-/// preserves the tuned tightness (the default band above is ±0.095) but centres
-/// it on their camera's actual level reading instead of the global constant.
-const PITCH_TOL: f32 = 0.095;
+/// the LOW (looking-up) end, so the floor isn't set aggressively high. After a
+/// round of aggressive tightening (down to yaw 0.27 / pitch 0.42–0.61) these
+/// are back to CONSERVATIVE, forgiving values — tight enough to coach a frontal
+/// capture, loose enough not to nag a naturally-held head (per-user calibration
+/// still recentres the pitch window on each camera). Loosen further from the
+/// `IRLUME_LOG=debug` "framing:" trace if a straight-on face still gets corrected.
+const FRAME_YAW_ASYM_MAX: f32 = 0.36;
+const FRAME_PITCH_MIN: f32 = 0.35;
+const FRAME_PITCH_MAX: f32 = 0.67;
+/// Half-width of the pitch acceptance window once the user's neutral is known.
+/// Matches the conservative default band's half-width (±0.16) but centres it on
+/// the camera's actual level reading instead of the global constant.
+const PITCH_TOL: f32 = 0.16;
 
 /// The pitch acceptance window: `neutral ± PITCH_TOL` once this user has a
 /// calibrated neutral (from prior enrollment scans), else the hand-tuned global
@@ -1066,10 +1066,10 @@ mod tests {
         assert!(!frontal_signals(&s(0.45, 0.50), None), "clearly turned is rejected");
         assert!(!frontal_signals(&s(0.0, 0.20), None), "looking up is rejected");
         assert!(!frontal_signals(&s(0.0, 0.75), None), "looking down is rejected");
-        // Calibrated to a high (laptop-biased) neutral 0.62 → band recentres, so
-        // a level face reading 0.62 passes and the global-default 0.50 does not.
+        // Calibrated to a high (laptop-biased) neutral 0.62 → band recentres to
+        // [0.46, 0.78], so a level face reading 0.62 passes and a clear tilt does not.
         assert!(frontal_signals(&s(0.0, 0.62), Some(0.62)), "at the calibrated neutral passes");
-        assert!(!frontal_signals(&s(0.0, 0.50), Some(0.62)), "well below the neutral is rejected");
+        assert!(!frontal_signals(&s(0.0, 0.40), Some(0.62)), "well below the neutral is rejected");
     }
 
     #[test]

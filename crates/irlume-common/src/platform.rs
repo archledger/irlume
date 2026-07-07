@@ -48,3 +48,32 @@ pub fn distro_family() -> DistroFamily {
         DistroFamily::Other
     }
 }
+
+/// Best-effort "does this user already have a live login session" — the same
+/// heuristic the daemon uses for its warm/cold classification: `/run/user/<uid>`
+/// exists. The PAM module uses it to distinguish a COLD login (unlock the login
+/// keyring: let the auth stack continue so pam_gnome_keyring runs) from a WARM
+/// lock-screen unlock (keyring already open: short-circuit). Lingering user
+/// services can also create `/run/user/<uid>`; treating that rare case as "warm"
+/// is acceptable (worst case: a cold login that skips the keyring-continue).
+pub fn user_has_live_session(user: &str) -> bool {
+    let Some(uid) = uid_for_name(user) else { return false };
+    std::path::Path::new(&format!("/run/user/{uid}")).exists()
+}
+
+/// Resolve a user name to its uid via NSS (`getpwnam_r`). `None` if absent.
+fn uid_for_name(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call; `buf` is sized and owned here;
+    // on success `result` points into `pwd`, from which we copy the uid out.
+    let rc = unsafe {
+        libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(pwd.pw_uid)
+}

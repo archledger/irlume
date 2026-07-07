@@ -24,23 +24,19 @@ const CREATED_PREFIX: &str = "# irlume: created from ";
 
 // Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
 const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
-/// The Debian/Ubuntu greeter face line, for the `@include common-auth` layout
-/// (a `success=N` jump can't skip an include expansion, so this can't be the
-/// jump form). `continue_ctrl` picks the control:
-///   * true → `[success=ok default=ignore]`: the face line UNSEALS (sets
-///     PAM_AUTHTOK) and the stack CONTINUES, so pam_unix authenticates with the
-///     released password AND pam_gnome_keyring unlocks the login keyring. Valid
-///     only when the tier unseals (Secure) AND the DM's locker tolerates a
-///     continue (per [`DmProfile`] — GDM yes, cosmic no). A bare `sufficient`
-///     short-circuits before the keyring module (Debian/GDM keyring gap; the
-///     Fedora success=1 layout continues past the jump, so its keyring unlocks).
-///   * false → `sufficient` (short-circuit): the Convenience tier (verify only,
-///     no token — else pam_unix would re-prompt), cosmic (locker needs the
-///     short-circuit), and separate lock services (keyring already open).
-/// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (empty-Enter).
-fn debian_greeter_line(continue_ctrl: bool, mode: &str) -> String {
-    let ctrl = if continue_ctrl { "[success=ok default=ignore]" } else { "sufficient" };
-    format!("auth       {ctrl}   pam_irlume.so unseal {mode}")
+/// The Debian/Ubuntu greeter face line, for the `@include common-auth` layout (a
+/// `success=N` jump can't skip an include expansion, so this can't be the jump
+/// form). Always `sufficient` — the same control works for EVERY DM's locker
+/// (GDM and cosmic alike short-circuit on a warm unlock). Cold-login keyring
+/// unlock is handled by the module's `kr` arg, NOT the control: on a cold login
+/// the module returns IGNORE (having set the token), so `sufficient` continues to
+/// pam_unix + pam_gnome_keyring; a warm lock returns SUCCESS and short-circuits.
+/// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (empty-Enter). `kr`
+/// adds the keyring-continue arg — true for greeters (cold login unlocks the
+/// keyring), false for a separate warm lock service (keyring already open).
+fn debian_greeter_line(mode: &str, kr: bool) -> String {
+    let kr_arg = if kr { " kr" } else { "" };
+    format!("auth       sufficient   pam_irlume.so unseal {mode}{kr_arg}")
 }
 /// Jump-style variant for a non-`@include` (e.g. Fedora) COSMIC stack.
 const GREETER_UNSEAL_COSMIC_JUMP: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand";
@@ -178,36 +174,24 @@ fn gdm_uses_ondemand(gnome_major: Option<u32>) -> bool {
 /// their lock screens differently, and those differences we've validated on
 /// hardware live here rather than scattered across the wiring code.
 struct DmProfile {
-    /// Login-manager family, for diagnostics.
-    dm: &'static str,
     /// Face engages on an empty-field Enter (`ondemand`) vs GDM's
     /// scan-immediately (`facefirst`). For GDM this is gated by GNOME version.
+    /// The cold-login-vs-warm-lock control tension (keyring unlock) is handled
+    /// uniformly by the module's `kr` arg, so it needs no per-DM field here.
     ondemand: bool,
-    /// Whether this DM's LOCKER tolerates a continue-style face line
-    /// (`[success=ok default=ignore]`, which lets the login keyring unlock after
-    /// a COLD face login). gnome-shell/GDM: yes (validated — keyring unlocks).
-    /// cosmic-greeter's locker: NO — it needs the face line to short-circuit, so
-    /// COSMIC uses a bare `sufficient` and its cold-login keyring stays a
-    /// follow-up (would need context-aware module return codes to resolve the
-    /// one-service-does-login-and-lock tension). Login-only greeters (KDE/SDDM,
-    /// whose lock is a SEPARATE service) also accept a continue on their cold line.
-    keyring_continue_ok: bool,
 }
 
 /// Resolve the [`DmProfile`] for a greeter PAM service path. `gnome` is the
 /// detected GNOME Shell major (for GDM's version gate).
 fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
     match greeter_etc.rsplit('/').next().unwrap_or("") {
-        // COSMIC (System76 / Pop!_OS): answers the probe on submit (ondemand),
-        // but its locker can't handle a continue → short-circuit.
-        "cosmic-greeter" => DmProfile { dm: "COSMIC", ondemand: true, keyring_continue_ok: false },
-        // GDM (GNOME): modern gnome-shell submits the empty field (ondemand) and
-        // its locker handles a continue (keyring unlocks on cold login); older
-        // gnome-shell blocked the probe → facefirst.
-        "gdm-password" => DmProfile { dm: "GDM", ondemand: gdm_uses_ondemand(gnome), keyring_continue_ok: true },
-        // SDDM / plasmalogin / lightdm / …: submit-driven login greeters whose
-        // lock is a SEPARATE service, so their cold-login line may continue.
-        _ => DmProfile { dm: "generic", ondemand: false, keyring_continue_ok: true },
+        // COSMIC (System76 / Pop!_OS): answers the probe on submit → ondemand.
+        "cosmic-greeter" => DmProfile { ondemand: true },
+        // GDM (GNOME): modern gnome-shell submits the empty field (ondemand);
+        // older gnome-shell blocked the probe → facefirst.
+        "gdm-password" => DmProfile { ondemand: gdm_uses_ondemand(gnome) },
+        // SDDM / plasmalogin / lightdm / …: submit-driven login greeters.
+        _ => DmProfile { ondemand: false },
     }
 }
 
@@ -367,22 +351,15 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         // the daemon's credential-release gate).
         let unified_login_lock = s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
         let face = want_face_login || (unified_login_lock && want_face_lock);
-        // Continue-control (so the login keyring unlocks on a cold face login)
-        // only when the tier UNSEALS (Secure — the face line sets a token) AND
-        // the DM's locker tolerates a continue (per profile: GDM yes, cosmic no).
-        let continue_ctrl = caps.ir_pair && prof.keyring_continue_ok;
-        let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, prof.ondemand, continue_ctrl);
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, prof.ondemand);
         do_svc(s, &greeter_wire, face || want_fp_keyring);
     }
     for s in FP_GREETERS {
         do_svc(s, &wire_fp_keyring, want_fp_keyring);
     }
-    // A separate lock service (KDE `kde`) is a WARM screen unlock — the login
-    // keyring is already open, so the face line should SHORT-CIRCUIT (no
-    // continue-control needed, and it avoids a cosmic-style locker mismatch on a
-    // Debian layout). The Fedora substack path uses the success=1 jump regardless.
-    let lock_wire = |c: &str| wire_lock(c, false);
-    do_svc(&LOCKSCREEN, &lock_wire, want_face_lock);
+    // A separate lock service (KDE `kde`) is a WARM screen unlock — the module
+    // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
+    do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
     // face-sudo is opt-in on enable (--with-sudo), but disable must ALWAYS
     // unwire it — "disable --apply undoes everything" is a documented promise,
     // and a stale sudo line would point at a module the user may remove next.
@@ -518,7 +495,7 @@ fn is_auth_directive(line: &str) -> bool {
 /// line (fingerprint keyring unlock — needed in gdm-password too, since GDM's
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
-fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool, continue_ctrl: bool) -> (String, bool) {
+fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
     if !face && !keyring { return (content.to_string(), false); }
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
@@ -529,7 +506,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool, c
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
-                if face { out.push(debian_greeter_line(continue_ctrl, if ondemand { "ondemand" } else { "facefirst" })); }
+                if face { out.push(debian_greeter_line(if ondemand { "ondemand" } else { "facefirst" }, true)); }
                 out.push((*l).to_string());
                 if keyring { out.push(KEYRING_UNSEAL.to_string()); }
                 out.push(RESEAL_AUTH.to_string());
@@ -595,14 +572,14 @@ fn wire_single(content: &str, stanza: &str) -> (String, bool) {
 /// cosmic-greeter, applied to KDE's submit-driven lock service. No reseal (a
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
-fn wire_lock(content: &str, continue_ctrl: bool) -> (String, bool) {
+fn wire_lock(content: &str) -> (String, bool) {
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
     // Debian `@include common-auth` layout → face-first `sufficient` before it.
     if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
         let mut out = Vec::with_capacity(lines.len() + 1);
         for (i, l) in lines.iter().enumerate() {
-            if i == inc_at { out.push(debian_greeter_line(continue_ctrl, "ondemand")); }
+            if i == inc_at { out.push(debian_greeter_line("ondemand", false)); }
             out.push((*l).to_string());
         }
         return (format!("{}\n", out.join("\n")), true);
@@ -776,7 +753,7 @@ mod tests {
 
     #[test]
     fn greeter_block_wraps_password_substack() {
-        let (w, changed) = wire_greeter_impl(GDM, true, true, false, true);
+        let (w, changed) = wire_greeter_impl(GDM, true, true, false);
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let unseal = lines.iter().position(|l| l.contains("unseal")).unwrap();
@@ -797,7 +774,7 @@ mod tests {
     fn cosmic_greeter_wires_ondemand_not_facefirst() {
         // ondemand=true → on-demand probe line (face only on empty-Enter), placed
         // before the password include so the password stays a fallback.
-        let (w, changed) = wire_greeter_impl(COSMIC, true, false, true, true);
+        let (w, changed) = wire_greeter_impl(COSMIC, true, false, true);
         assert!(changed);
         assert!(w.contains("pam_irlume.so unseal ondemand"));
         assert!(!w.contains("facefirst"));
@@ -806,40 +783,34 @@ mod tests {
         let inc = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")).unwrap();
         assert!(unseal < inc);
         // A non-cosmic Debian greeter (ondemand=false) still gets facefirst.
-        let (g, _) = wire_greeter_impl(COSMIC, true, false, false, true);
+        let (g, _) = wire_greeter_impl(COSMIC, true, false, false);
         assert!(g.contains("facefirst") && !g.contains("ondemand"));
     }
 
     #[test]
     fn dm_profile_tailors_per_login_manager() {
-        // COSMIC: ondemand, but its locker can't continue → no keyring-continue
-        // (short-circuit), which is what fixes the cosmic lock regression.
-        let cosmic = dm_profile("/etc/pam.d/cosmic-greeter", Some(50));
-        assert!(cosmic.ondemand && !cosmic.keyring_continue_ok);
-        // GDM: locker handles continue (keyring unlocks on cold login); ondemand
-        // is version-gated.
-        let gdm = dm_profile("/etc/pam.d/gdm-password", Some(50));
-        assert!(gdm.ondemand && gdm.keyring_continue_ok);
+        // COSMIC answers the probe on submit → ondemand.
+        assert!(dm_profile("/etc/pam.d/cosmic-greeter", Some(50)).ondemand);
+        // GDM: ondemand is version-gated (modern GNOME) → facefirst below.
+        assert!(dm_profile("/etc/pam.d/gdm-password", Some(50)).ondemand);
         assert!(!dm_profile("/etc/pam.d/gdm-password", Some(3)).ondemand); // old GNOME → facefirst
         assert!(!dm_profile("/etc/pam.d/gdm-password", None).ondemand);    // undetected → facefirst
-        // generic login-only greeters (separate lock): facefirst, continue OK.
-        let sddm = dm_profile("/etc/pam.d/sddm", None);
-        assert!(!sddm.ondemand && sddm.keyring_continue_ok);
+        // generic login-only greeters: facefirst.
+        assert!(!dm_profile("/etc/pam.d/sddm", None).ondemand);
     }
 
     #[test]
-    fn debian_greeter_control_is_tier_aware() {
-        // Secure (IR) tier: unseal sets the token, so CONTINUE past the include
-        // (`[success=ok default=ignore]`) — pam_unix + pam_gnome_keyring run, so
-        // the keyring unlocks after a face login. Convenience (RGB): verify only,
-        // so short-circuit (`sufficient`) or pam_unix would re-prompt.
-        let secure = debian_greeter_line(true, "ondemand");
-        assert!(secure.contains("[success=ok default=ignore]"));
-        assert!(!secure.contains("sufficient"));
-        assert!(secure.contains("pam_irlume.so unseal ondemand"));
-        let conv = debian_greeter_line(false, "facefirst");
-        assert!(conv.contains("sufficient"));
-        assert!(conv.contains("pam_irlume.so unseal facefirst"));
+    fn debian_greeter_line_is_sufficient_plus_kr() {
+        // Uniform `sufficient` for every DM; the module's `kr` arg (not the
+        // control) drives cold-login keyring-continue. Greeters carry `kr`.
+        let greeter = debian_greeter_line("ondemand", true);
+        assert!(greeter.contains("sufficient"));
+        assert!(greeter.contains("pam_irlume.so unseal ondemand kr"));
+        assert!(!greeter.contains("success=ok"));
+        // A separate warm lock service short-circuits without `kr`.
+        let lock = debian_greeter_line("ondemand", false);
+        assert!(lock.contains("sufficient") && lock.ends_with("unseal ondemand"));
+        assert!(!lock.contains(" kr"));
     }
 
     #[test]
@@ -855,8 +826,8 @@ mod tests {
 
     #[test]
     fn greeter_wiring_is_idempotent() {
-        let (w1, _) = wire_greeter_impl(GDM, true, true, false, true);
-        let (w2, changed) = wire_greeter_impl(&w1, true, true, false, true);
+        let (w1, _) = wire_greeter_impl(GDM, true, true, false);
+        let (w2, changed) = wire_greeter_impl(&w1, true, true, false);
         assert!(!changed);
         assert_eq!(w1, w2);
     }
@@ -865,11 +836,11 @@ mod tests {
     fn method_switch_reconciles_the_line_set() {
         // face-only → (strip) → keyring-only must actually change the lines
         // (the method-switch case the old skip-if-present logic silently no-op'd).
-        let (face_only, _) = wire_greeter_impl(GDM, true, false, false, true);
+        let (face_only, _) = wire_greeter_impl(GDM, true, false, false);
         assert!(face_only.contains("pam_irlume.so unseal") && !face_only.contains("pam_irlume.so keyring"));
         let (base, stripped) = unwire_lines(&face_only);
         assert!(stripped && !base.contains(MODULE));
-        let (keyring_only, _) = wire_greeter_impl(&base, false, true, false, true);
+        let (keyring_only, _) = wire_greeter_impl(&base, false, true, false);
         assert!(keyring_only.contains("pam_irlume.so keyring") && !keyring_only.contains("pam_irlume.so unseal"));
         assert_ne!(face_only, keyring_only);
     }
@@ -895,7 +866,7 @@ mod tests {
 
     #[test]
     fn kde_lock_is_ondemand_not_ambient_wait() {
-        let (w, changed) = wire_lock(KDE_LOCK, false);
+        let (w, changed) = wire_lock(KDE_LOCK);
         assert!(changed);
         // consent-driven on-demand, never the ambient `wait` mode, no reseal.
         assert!(w.contains("pam_irlume.so unseal ondemand"));

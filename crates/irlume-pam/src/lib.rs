@@ -53,6 +53,15 @@ impl PamServiceModule for IrlumePam {
         let wait = args.iter().any(|a| a == "wait");
         let reseal = args.iter().any(|a| a == "reseal");
         let keyring = args.iter().any(|a| a == "keyring");
+        // `kr` (keyring-continue): on a Debian `@include` greeter whose face line
+        // is `sufficient`, a plain SUCCESS short-circuits before pam_gnome_keyring,
+        // so a COLD face login leaves the login keyring locked. With `kr` we
+        // instead return IGNORE on a cold login that released the password —
+        // `sufficient` then CONTINUES, pam_unix authenticates with the token, and
+        // pam_gnome_keyring unlocks the keyring. A WARM lock still returns SUCCESS
+        // (short-circuit: keyring already open, and cosmic's locker needs it).
+        // Opt-in, so the Fedora success=1 layout (no `kr`) is unchanged.
+        let kr = args.iter().any(|a| a == "kr");
 
         // `keyring` mode: post-auth login-keyring unlock for the FINGERPRINT
         // path. This line sits at the auth landing, after a trusted factor has
@@ -156,6 +165,10 @@ impl PamServiceModule for IrlumePam {
             } else {
                 try_verify(&pamh, &user)
             };
+            // Did the SUCCESSFUL attempt release the sealed password into
+            // PAM_AUTHTOK? Only `try_unseal` does; the verify fallback below does
+            // not. This drives the `kr` cold-login keyring-continue decision.
+            let mut unsealed = unseal && attempt == PamError::SUCCESS;
             // GDM and cosmic-greeter each drive BOTH the cold greeter and the
             // live lock screen through one service. Unsealing is refused on the
             // convenience tier (and on an un-armed keyring) — a warm screen unlock
@@ -165,8 +178,16 @@ impl PamServiceModule for IrlumePam {
             // fallback only rescues the identity-only warm-unlock case.
             if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
                 attempt = try_verify(&pamh, &user);
+                unsealed = false; // the fallback verifies identity, releases no token
             }
             if attempt == PamError::SUCCESS {
+                // `kr` + a COLD login that released the password → IGNORE, so the
+                // `sufficient` control CONTINUES and pam_gnome_keyring unlocks the
+                // login keyring (pam_unix accepts the token we set). Every other
+                // success (warm lock, no token, or no `kr`) short-circuits.
+                if kr && unsealed && !irlume_common::platform::user_has_live_session(&user) {
+                    return PamError::IGNORE;
+                }
                 return PamError::SUCCESS;
             }
             if !wait || Instant::now() >= deadline {

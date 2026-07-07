@@ -800,6 +800,8 @@ KEYRING / TPM
 
 SYSTEM INTEGRATION
   login <status|enable|disable> [--with-sudo] [--apply]   PAM wiring for greeters + lock screen
+  logs [-f] [--since T]           the face-auth journal in one view (daemon, PAM, keyring)
+  logs debug <on|off>             per-stage pipeline tracing in the daemon (sudo)
   fingerprint <status|add|enable|disable>   fprintd companion factor
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely

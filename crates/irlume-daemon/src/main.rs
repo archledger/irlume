@@ -77,6 +77,9 @@ fn main() {
         None => set_mode(&socket, 0o666),
     }
     eprintln!("irlumed: listening on {socket}");
+    if irlume_common::dbglog::on() {
+        eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug) — per-stage pipeline lines follow; numbers only, never frames/embeddings");
+    }
 
     // Socket watchdog: if our socket file is deleted/replaced out from under us
     // (a stale-runtime cleanup, a botched reinstall), the bound fd keeps working
@@ -309,12 +312,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
+            let t = std::time::Instant::now();
             match engine.authenticate(&user) {
                 Ok(o) => {
-                    if convenience || std::env::var("IRLUME_DEBUG").is_ok() {
+                    if convenience || irlume_common::dbglog::on() {
                         eprintln!("irlumed: face auth '{user}': granted={} live={} score={:.3} ({})",
                             o.granted, o.live, o.score, o.reason);
                     }
+                    irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
                     Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason }
                 }
                 Err(e) => Response::Error(e.to_string()),
@@ -717,6 +722,7 @@ fn mutate_enrollment(user: &str, f: impl FnOnce(&mut irlume_core::storage::Enrol
 /// decision + cosine score, but never the password or its length.
 fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
+    let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
         return Response::Error(format!("no sealed password for '{user}' — run `irlume keyring arm`"));
     }
@@ -740,6 +746,7 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
                 "irlumed: UnsealPassword: OK for '{user}' (score {:.4}), password unsealed",
                 outcome.score
             );
+            irlume_common::dlog!("unseal '{user}' total {}ms (face + TPM)", t.elapsed().as_millis());
             Response::PasswordUnsealed { secret: irlume_common::SecretBytes::new(secret.to_vec()) }
         }
         // Face matched but the TPM could not release the secret (e.g. PCR drift

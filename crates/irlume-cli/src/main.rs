@@ -13,10 +13,12 @@
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
 //!   irlume fingerprint <status|add|enable|disable> fprintd companion factor
 //!   irlume login <status|enable|disable>         wire face auth into PAM (dry-run)
+//!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 //!   irlume tui                                   interactive setup/management UI
 
 mod commands;
 mod fingerprint;
+mod logs;
 mod pad;
 mod pamwire;
 mod recovery;
@@ -68,6 +70,7 @@ fn main() -> std::process::ExitCode {
         (Some("recovery"), sub) => recovery::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("login"), sub) => pamwire::run(sub, &args),
+        (Some("logs"), sub) => logs::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),

@@ -139,6 +139,11 @@ trade-off worth choosing deliberately (the password always still works).
 
 **Full step-by-step** (both the guided TUI and the individual CLI commands, with
 keyring unlock, recovery, and fingerprint): [`docs/SETUP.md`](docs/SETUP.md).
+**Something not working — or want to audit every decision?**
+[`docs/DEBUGGING.md`](docs/DEBUGGING.md): `irlume logs` puts the whole
+face-auth story in one journal view, and `sudo irlume logs debug on` traces
+every pipeline stage (scores, liveness cues, thresholds, timings — numbers
+only, never frames or embeddings).
 
 No IR-emitter step needed: enrollment probes the IR camera and, if its frames
 come back black, auto-discovers and enables the 850 nm emitter itself. Only if

@@ -9,6 +9,7 @@
 
 pub mod client;
 pub mod config;
+pub mod dbglog;
 pub mod memlock;
 pub mod platform;
 pub mod secureboot;

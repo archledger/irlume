@@ -38,33 +38,25 @@ not decrypt) is written up in [`SECURITY_AT_REST.md`](SECURITY_AT_REST.md).
 [`cross-distro/2026-07-01-arch-ubuntu-survey.md`](cross-distro/2026-07-01-arch-ubuntu-survey.md)
 (≈9–13 on one camera, ≈18–27 on another) are real readings from the code.
 
-Turn on the daemon's RGB debug log:
+Turn on the daemon's diagnostic tracing:
 
 ```sh
-sudo systemctl edit irlumed
+sudo irlume logs debug on
 ```
 
-Add these lines in the editor:
-
-```ini
-[Service]
-Environment=IRLUME_DEBUG_RGB=1
-```
-
-If your camera is an **IR (Windows Hello)** one, also add the line below so the
-daemon runs the RGB path the moiré cue lives on (it drops to the RGB /
-convenience tier for the test):
-
-```ini
-Environment=IRLUME_FORCE_NO_IR=1
-```
-
-Restart and run a check with a lit face:
+If your camera is an **IR (Windows Hello)** one, also force the RGB path the
+moiré cue lives on (it drops to the RGB / convenience tier for the test):
 
 ```sh
+sudo systemctl edit irlumed     # add:  [Service]  Environment=IRLUME_FORCE_NO_IR=1
 sudo systemctl restart irlumed
+```
+
+Run a check with a lit face:
+
+```sh
 irlume identify
-journalctl -u irlumed | grep moire
+irlume logs | grep moire
 ```
 
 You will see your own camera's score, e.g. `rgb-only cues: ... moire 10 ...`.

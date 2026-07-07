@@ -192,10 +192,8 @@ impl Engine {
             rgb_moire_score: rgb_moire,
         };
         let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
-        if std::env::var("IRLUME_DEBUG_RGB").is_ok() {
-            eprintln!("irlumed: rgb-only cues: bright {:.0} specular {:.2} moire {:.0} -> {:?}",
-                signals.rgb_face_brightness, signals.rgb_specular_frac, signals.rgb_moire_score, verdict);
-        }
+        irlume_common::dlog!("liveness(rgb-only): {verdict:?} ({reason}); bright={:.0} specular={:.2} moire={:.0}",
+            signals.rgb_face_brightness, signals.rgb_specular_frac, signals.rgb_moire_score);
         let embedding = match &rgb_top {
             Some(f) => Some(self.emb.embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?),
             None => None,
@@ -206,16 +204,24 @@ impl Engine {
     fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
+        let t = std::time::Instant::now();
         let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+        let rgb_ms = t.elapsed().as_millis();
         let rgb_view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
         let rgb_faces = self.det.detect(&rgb_view)?;
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
+        irlume_common::dlog!("assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
+            rgb.width, rgb.height, rgb_faces.len(), rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0));
 
+        let t = std::time::Instant::now();
         let ir = irlume_camera::capture_ir(&self.ir_dev)?;
+        let ir_ms = t.elapsed().as_millis();
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
         let ir_view = align::RgbView { data: &ir_grey_rgb, width: ir.width, height: ir.height };
         let ir_faces = self.det.detect(&ir_view)?;
         let ir_top = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
+        irlume_common::dlog!("assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
+            ir.width, ir.height, ir_faces.len(), ir_top.as_ref().map(|f| f.score).unwrap_or(0.0));
 
         let fbox = |f: &Detection, w: u32, h: u32| irlume_liveness::FaceBox {
             cx: (f.bbox[0] + f.bbox[2]) / 2.0 / w as f32,
@@ -240,6 +246,12 @@ impl Engine {
             rgb_specular_frac: 0.0,
         };
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);
+        // Log the cue values on PASS too — a near-miss on a genuine user is
+        // invisible in the outcome line but obvious here.
+        irlume_common::dlog!(
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} yaw_asym={:.2} pitch={:.2}",
+            signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
+            signals.head_yaw_asym, signals.head_pitch_frac);
 
         let embedding = match &rgb_top {
             Some(f) => {
@@ -393,6 +405,7 @@ impl Engine {
             // (`evaluate`) already enforces an ambient-robust IR brightness floor.
             // Only meaningful when IR was actually captured (skip on RGB-only).
             if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+                irlume_common::dlog!("gate(per-user depth floor): live {:.2} vs floor {:.2}", a.ir_depth, depth_floor);
                 if a.ir_depth < depth_floor {
                     return Ok(Outcome {
                         granted: false, live: false, score: 0.0,
@@ -406,6 +419,7 @@ impl Engine {
             let scans = enr.rgb_scans();
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = best(&probe, &scans);
+            irlume_common::dlog!("match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')", scans.len());
             if score >= thr {
                 return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score, reason: format!("match: {who} (rgb)") });
             }
@@ -427,6 +441,8 @@ impl Engine {
                         irlume_core::fusion::ir_genuine_prob(ir_score),
                         irlume_core::fusion::ir_quality_weight(true, a.ir_brightness),
                     );
+                    irlume_common::dlog!("match(fusion): p={:.3} grant={} (rgb {score:.3} bright {:.0} / ir {ir_score:.3} bright {:.0})",
+                        f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
                     if f.grant {
                         let who = if ir_score >= score { ir_who } else { who };
                         return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: f.prob,
@@ -441,6 +457,7 @@ impl Engine {
                         irlume_core::IR_MATCH_THRESHOLD
                     };
                     let ir_thr = irlume_core::scaled_threshold(ir_base, ir_scans.len()) + irlume_core::IR_FALLBACK_MARGIN;
+                    irlume_common::dlog!("match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})", self.ir_adapter.is_some());
                     if ir_score >= ir_thr {
                         return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: ir_score,
                             reason: format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})") });
@@ -458,6 +475,8 @@ impl Engine {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "dark, but no IR scans enrolled — re-enroll to enable dark unlock".into() });
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2}",
+                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint);
             if verdict != Verdict::Live {
                 return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
             }
@@ -468,6 +487,7 @@ impl Engine {
             };
             let ir_thr = irlume_core::scaled_threshold(ir_base, scans.len());
             let (score, who) = best(&probe, &scans);
+            irlume_common::dlog!("match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={})", scans.len(), self.ir_adapter.is_some());
             let granted = score >= ir_thr;
             return self.challenge_if_required(&enr, Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (ir/dark)") } else { "below threshold (ir)".into() } });
         }

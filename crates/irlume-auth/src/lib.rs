@@ -502,7 +502,22 @@ impl Engine {
     /// enrolled user's RGB profiles (no claimed identity). Liveness-gated like
     /// auth; reports the best above-threshold (user, profile, score). RGB primary
     /// path only — a diagnostic, not a dark-mode unlock.
+    /// 1:N identify across every enrolled user. Full cross-user search — an
+    /// admin/testing capability; the daemon restricts a non-root caller to
+    /// [`identify_within`] so the returned score can't become a hill-climbing
+    /// oracle against other users' templates.
     pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
+        self.identify_impl(None)
+    }
+
+    /// Identify scoped to a single enrolled user ("is this `user`?"). Same
+    /// liveness gate and RGB match as [`identify`], but the search set is just
+    /// this one account — what a non-root peer is allowed to ask about itself.
+    pub fn identify_within(&mut self, user: &str) -> irlume_common::Result<IdentifyOutcome> {
+        self.identify_impl(Some(user))
+    }
+
+    fn identify_impl(&mut self, restrict: Option<&str>) -> irlume_common::Result<IdentifyOutcome> {
         if irlume_core::policy::method().face_disabled() {
             return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: "face disabled (fingerprint mode)".into() });
         }
@@ -514,7 +529,11 @@ impl Engine {
             return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
         }
         let mut best: Option<(f32, String, String)> = None; // (score, user, profile)
-        for user in irlume_core::storage::list_users() {
+        let candidates: Vec<String> = match restrict {
+            Some(u) => vec![u.to_string()],
+            None => irlume_core::storage::list_users(),
+        };
+        for user in candidates {
             let Some(enr) = irlume_core::storage::load(&user)? else { continue };
             let scans = enr.rgb_scans();
             if scans.is_empty() {

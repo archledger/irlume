@@ -332,10 +332,28 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::Identify => match engine.identify() {
-            Ok(o) => Response::Identified { user: o.user, profile: o.profile, score: o.score, live: o.live, reason: o.reason },
-            Err(e) => Response::Error(e.to_string()),
-        },
+        Request::Identify => {
+            // 1:N identify returns an exact similarity score, so an ungated
+            // socket peer could hill-climb it to tune a spoof or enumerate who
+            // is enrolled. Root keeps the full cross-user search (admin/test);
+            // a non-root peer is scoped to its OWN account — the score then only
+            // concerns a face the caller already controls, not other users'.
+            let scoped = if peer.uid == 0 {
+                engine.identify()
+            } else {
+                match users::name_for_uid(peer.uid) {
+                    Some(name) => engine.identify_within(&name),
+                    None => Ok(irlume_auth::IdentifyOutcome {
+                        user: None, profile: None, score: 0.0, live: false,
+                        reason: "caller has no local account".into(),
+                    }),
+                }
+            };
+            match scoped {
+                Ok(o) => Response::Identified { user: o.user, profile: o.profile, score: o.score, live: o.live, reason: o.reason },
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::SetCameras { rgb, ir } => {
             // Persists to /etc and repoints the camera the daemon trusts — an
             // attacker who could set this to a v4l2loopback node feeds recorded

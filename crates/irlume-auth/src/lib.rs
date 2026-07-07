@@ -599,12 +599,19 @@ impl Engine {
     /// from a photo — the liveness gate rejects spoofs.
     fn capture_scans(&mut self, want: usize) -> irlume_common::Result<Vec<(Vec<f32>, Option<Vec<f32>>, f32, f32)>> {
         let mut out = Vec::new();
-        for _ in 0..(want * 4) {
+        // Budget bumped (was ×4) to absorb the added frontality gate — a frame
+        // grabbed the instant the user drifts off-angle is now rejected, not saved.
+        for _ in 0..(want * 6) {
             if out.len() >= want {
                 break;
             }
             let a = self.assess()?;
-            if a.verdict == Verdict::Live {
+            // Authoritative capture gate: LIVE *and* squarely frontal. The guided
+            // TUI only decides when to START the 3-2-1; this is what actually
+            // decides whether the frame is kept, so a turned/tilted (but live)
+            // face can't be saved as a bad template even if the user moved during
+            // the countdown. Same bounds the enrollment guide coaches to.
+            if a.verdict == Verdict::Live && frontal_signals(&a.signals) {
                 if let Some(e) = a.embedding {
                     out.push((e.to_vec(), a.ir_embedding.clone(), a.ir_depth, a.ir_brightness));
                 }
@@ -798,6 +805,14 @@ impl Engine {
 const FRAME_YAW_ASYM_MAX: f32 = 0.34;
 const FRAME_PITCH_MIN: f32 = 0.37;
 const FRAME_PITCH_MAX: f32 = 0.66;
+
+/// True when a head pose is squarely-frontal enough to enroll — the capture-time
+/// gate (in [`Engine::capture_scans`]) and the guide's `well_framed` share these
+/// bounds, so what the guide coaches to is exactly what gets saved.
+fn frontal_signals(s: &Signals) -> bool {
+    s.head_yaw_asym <= FRAME_YAW_ASYM_MAX
+        && (FRAME_PITCH_MIN..=FRAME_PITCH_MAX).contains(&s.head_pitch_frac)
+}
 
 /// Turn a non-frontal head pose into a directional enrollment instruction, told
 /// in the USER's own frame. On irlume's non-mirrored capture, nose-toward-image-
@@ -1010,6 +1025,16 @@ mod tests {
 
     fn scan(v: Vec<f32>) -> FaceScan {
         FaceScan { name: "s".into(), rgb: v, ir: None, ir_depth: 0.0, ir_brightness: 0.0 }
+    }
+
+    #[test]
+    fn frontal_signals_gates_capture() {
+        let s = |yaw: f32, pitch: f32| Signals { head_yaw_asym: yaw, head_pitch_frac: pitch, ..Default::default() };
+        assert!(frontal_signals(&s(0.0, 0.50)), "square-on should pass");
+        assert!(frontal_signals(&s(0.30, 0.55)), "small turn within bounds passes");
+        assert!(!frontal_signals(&s(0.45, 0.50)), "clearly turned is rejected");
+        assert!(!frontal_signals(&s(0.0, 0.20)), "looking up is rejected");
+        assert!(!frontal_signals(&s(0.0, 0.75)), "looking down is rejected");
     }
 
     #[test]

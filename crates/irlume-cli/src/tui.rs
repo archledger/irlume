@@ -2007,40 +2007,54 @@ fn map_settings(resp: Response) -> (bool, String) {
 fn enroll_worker(user: String, profile: String, add: Option<String>, target: usize, stop: Arc<AtomicBool>, tx: mpsc::Sender<WMsg>) {
     let send = |m: WMsg| tx.send(m).is_ok();
     for i in 0..target {
-        if stop.load(Ordering::Relaxed) { return; }
-        // Framing loop: wait for a well-framed streak.
-        let mut streak = 0u32;
-        loop {
+        // Retry this scan until it's captured while well-framed: a drift during
+        // the 3-2-1 aborts the countdown and re-frames instead of firing capture.
+        'scan: loop {
             if stop.load(Ordering::Relaxed) { return; }
-            match crate::daemon_request(&Request::PositionSample) {
-                Ok(Response::Position(r)) => {
-                    let good = r.well_framed;
-                    if !send(WMsg::Cue(r)) { return; }
-                    streak = if good { streak + 1 } else { 0 };
-                    if streak >= GOOD_STREAK { break; }
+            // Framing loop: wait for a well-framed streak.
+            let mut streak = 0u32;
+            loop {
+                if stop.load(Ordering::Relaxed) { return; }
+                match crate::daemon_request(&Request::PositionSample) {
+                    Ok(Response::Position(r)) => {
+                        let good = r.well_framed;
+                        if !send(WMsg::Cue(r)) { return; }
+                        streak = if good { streak + 1 } else { 0 };
+                        if streak >= GOOD_STREAK { break; }
+                    }
+                    Ok(Response::Error(e)) => { let _ = send(WMsg::Err(e)); return; }
+                    Ok(_) => {}
+                    Err(e) => { let _ = send(WMsg::Err(e)); return; }
                 }
+            }
+            // 3-2-1 countdown — re-verify framing at each beat (the poll lands
+            // just before the next beat / the capture). Drift off-angle aborts.
+            for c in (1..=3).rev() {
+                if stop.load(Ordering::Relaxed) { return; }
+                if !send(WMsg::Count(c)) { return; }
+                std::thread::sleep(Duration::from_millis(650));
+                match crate::daemon_request(&Request::PositionSample) {
+                    // Still framed: keep counting (don't send a Cue — that would
+                    // clear the on-screen count). Only surface a cue on abort.
+                    Ok(Response::Position(r)) if r.well_framed => {}
+                    Ok(Response::Position(r)) => { let _ = send(WMsg::Cue(r)); continue 'scan; }
+                    Ok(Response::Error(e)) => { let _ = send(WMsg::Err(e)); return; }
+                    Ok(_) => {}
+                    Err(e) => { let _ = send(WMsg::Err(e)); return; }
+                }
+            }
+            // Capture: first scan of a NEW profile creates it; the rest append.
+            let req = if i == 0 && add.is_none() {
+                Request::Enroll { user: user.clone(), profile: Some(profile.clone()), scans: Some(1), reset: false }
+            } else {
+                Request::AddScan { user: user.clone(), profile: profile.clone() }
+            };
+            match crate::daemon_request(&req) {
+                Ok(Response::Ok(_)) => { if !send(WMsg::Captured(i + 1, target)) { return; } break 'scan; }
                 Ok(Response::Error(e)) => { let _ = send(WMsg::Err(e)); return; }
-                Ok(_) => {}
+                Ok(o) => { let _ = send(WMsg::Err(format!("unexpected: {o:?}"))); return; }
                 Err(e) => { let _ = send(WMsg::Err(e)); return; }
             }
-        }
-        // 3-2-1 countdown.
-        for c in (1..=3).rev() {
-            if stop.load(Ordering::Relaxed) { return; }
-            if !send(WMsg::Count(c)) { return; }
-            std::thread::sleep(Duration::from_millis(650));
-        }
-        // Capture: first scan of a NEW profile creates it; the rest append.
-        let req = if i == 0 && add.is_none() {
-            Request::Enroll { user: user.clone(), profile: Some(profile.clone()), scans: Some(1), reset: false }
-        } else {
-            Request::AddScan { user: user.clone(), profile: profile.clone() }
-        };
-        match crate::daemon_request(&req) {
-            Ok(Response::Ok(_)) => { if !send(WMsg::Captured(i + 1, target)) { return; } }
-            Ok(Response::Error(e)) => { let _ = send(WMsg::Err(e)); return; }
-            Ok(o) => { let _ = send(WMsg::Err(format!("unexpected: {o:?}"))); return; }
-            Err(e) => { let _ = send(WMsg::Err(e)); return; }
         }
     }
     let _ = send(WMsg::Done);

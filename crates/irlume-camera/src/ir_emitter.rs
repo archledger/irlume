@@ -191,37 +191,42 @@ fn candidate_payloads(size: usize) -> Vec<Vec<u8>> {
 
 /// Auto-discover the emitter control: enumerate XU controls and try candidate
 /// payloads, using `measure` (mean IR brightness while streaming) to detect
-/// success — no human "is it flashing?" step. Restores every control it touches
-/// that didn't help, so a failed search leaves the camera unchanged. Returns the
-/// winning control (already left active) or None.
+/// success — no human "is it flashing?" step. Returns the control+payload that
+/// yields the BRIGHTEST IR (not merely the first one that clears the threshold),
+/// so a camera with several viable emitter controls gets the one with the most
+/// headroom above the liveness floor. Each control is tested in isolation
+/// (restored to its original before the next), so measurements aren't polluted;
+/// only the global winner is re-applied at the end. A failed search leaves the
+/// camera unchanged.
 pub fn autoconfigure(fd: c_int, mut measure: impl FnMut() -> f32) -> Option<EmitterControl> {
     let baseline = measure(); // emitter off
     let success = |b: f32| b >= baseline + 20.0 && b >= 40.0;
+    let mut best: Option<(EmitterControl, f32)> = None;
     for unit in 0u8..=31 {
         for selector in 0u8..=15 {
             let Some(len) = get_len(fd, unit, selector) else { continue };
             let orig = get_cur(fd, unit, selector, len);
-            let mut worked = None;
             for payload in candidate_payloads(len) {
                 if !set_cur(fd, unit, selector, &payload) {
                     continue;
                 }
-                if success(measure()) {
-                    worked = Some(payload);
-                    break;
+                let b = measure();
+                if success(b) && best.as_ref().map_or(true, |(_, bb)| b > *bb) {
+                    best = Some((EmitterControl { unit, selector, payload: payload.clone() }, b));
                 }
             }
-            match worked {
-                Some(payload) => return Some(EmitterControl { unit, selector, payload }),
-                None => {
-                    if let Some(o) = orig {
-                        let _ = set_cur(fd, unit, selector, &o); // restore (non-destructive)
-                    }
-                }
+            // Restore this control before testing the next — so each is measured
+            // against the emitter-off baseline, not a lingering set control.
+            if let Some(o) = orig {
+                let _ = set_cur(fd, unit, selector, &o);
             }
         }
     }
-    None
+    // Re-apply the brightest winner so the camera is left lit on it.
+    if let Some((ctrl, _)) = &best {
+        let _ = set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload);
+    }
+    best.map(|(ctrl, _)| ctrl)
 }
 
 /// Read-only enumeration of the camera's XU controls (unit, selector, size), for

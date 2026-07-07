@@ -218,6 +218,9 @@ fn request_user(req: &Request) -> Option<&str> {
         | UnsealKeyring { user, .. } | HasSealedPassword { user } | ForgetPassword { user }
         | ResealPassword { user, .. } | RecoveryStatus { user } | RecoverySetup { user, .. }
         | RecoveryRestore { user, .. } | RecoveryForget { user } => Some(user.as_str()),
+        // Framing guide: the (optional) user only tunes the pitch band, but it's
+        // still interpolated into a state path, so validate it like the rest.
+        PositionSample { user: Some(u) } => Some(u.as_str()),
         _ => None,
     }
 }
@@ -253,7 +256,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 version: env!("CARGO_PKG_VERSION").into(),
             }
         }
-        Request::PositionSample => match engine.position_sample() {
+        Request::PositionSample { user } => match engine.position_sample(user.as_deref()) {
             Ok(r) => Response::Position(r),
             Err(e) => Response::Error(e.to_string()),
         },

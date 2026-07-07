@@ -595,9 +595,11 @@ impl Engine {
     }
 
     /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).
-    /// Each Live capture yields one (rgb, ir, depth, brightness). No enrolling
-    /// from a photo — the liveness gate rejects spoofs.
-    fn capture_scans(&mut self, want: usize) -> irlume_common::Result<Vec<(Vec<f32>, Option<Vec<f32>>, f32, f32)>> {
+    /// Each Live capture yields one (rgb, ir, depth, brightness, pitch). No
+    /// enrolling from a photo — the liveness gate rejects spoofs. `pitch_neutral`
+    /// centres the frontal gate on this user's camera (None on first enroll).
+    fn capture_scans(&mut self, want: usize, pitch_neutral: Option<f32>)
+        -> irlume_common::Result<Vec<(Vec<f32>, Option<Vec<f32>>, f32, f32, f32)>> {
         let mut out = Vec::new();
         // Budget bumped (was ×4) to absorb the added frontality gate — a frame
         // grabbed the instant the user drifts off-angle is now rejected, not saved.
@@ -610,10 +612,10 @@ impl Engine {
             // TUI only decides when to START the 3-2-1; this is what actually
             // decides whether the frame is kept, so a turned/tilted (but live)
             // face can't be saved as a bad template even if the user moved during
-            // the countdown. Same bounds the enrollment guide coaches to.
-            if a.verdict == Verdict::Live && frontal_signals(&a.signals) {
+            // the countdown. Same bounds (and neutral) the enrollment guide uses.
+            if a.verdict == Verdict::Live && frontal_signals(&a.signals, pitch_neutral) {
                 if let Some(e) = a.embedding {
-                    out.push((e.to_vec(), a.ir_embedding.clone(), a.ir_depth, a.ir_brightness));
+                    out.push((e.to_vec(), a.ir_embedding.clone(), a.ir_depth, a.ir_brightness, a.signals.head_pitch_frac));
                 }
             }
         }
@@ -633,7 +635,9 @@ impl Engine {
         if enr.profiles.iter().any(|p| p.name == name) {
             return Err(irlume_common::Error::Protocol(format!("a face profile named '{name}' already exists")));
         }
-        let captured = self.capture_scans(want)?;
+        // First enroll: no neutral yet → capture_scans falls back to the global
+        // default band; the scans' pitches become this user's neutral for next time.
+        let captured = self.capture_scans(want, enr.pitch_neutral())?;
         if captured.len() < want {
             return Err(irlume_common::Error::Protocol(format!(
                 "only {} live scans (need {want}) — check lighting and framing", captured.len()
@@ -654,9 +658,9 @@ impl Engine {
             }
         }
         let mut prof = FaceProfile { name: name.clone(), scans: Vec::new() };
-        for (rgb, ir, d, b) in captured {
+        for (rgb, ir, d, b, pitch) in captured {
             let sname = prof.next_scan_name();
-            prof.scans.push(FaceScan { name: sname, rgb, ir, ir_depth: d, ir_brightness: b });
+            prof.scans.push(FaceScan { name: sname, rgb, ir, ir_depth: d, ir_brightness: b, pitch });
         }
         let n = prof.scans.len();
         enr.profiles.push(prof);
@@ -703,7 +707,7 @@ impl Engine {
         if enr.profiles[idx].scans.len() >= MAX_SCANS_PER_PROFILE {
             return Err(irlume_common::Error::Protocol(format!("'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans")));
         }
-        let (rgb, ir, d, b) = self.capture_scans(1)?.into_iter().next()
+        let (rgb, ir, d, b, pitch) = self.capture_scans(1, enr.pitch_neutral())?.into_iter().next()
             .ok_or_else(|| irlume_common::Error::Protocol("no live scan captured — check lighting and framing".into()))?;
         // Anti-mixing: reject a scan whose face belongs to a different profile.
         if let Some((other, score)) = colliding_profile(&enr, &rgb, Some(profile_name)) {
@@ -719,7 +723,7 @@ impl Engine {
             )));
         }
         let sname = enr.profiles[idx].next_scan_name();
-        enr.profiles[idx].scans.push(FaceScan { name: sname.clone(), rgb, ir, ir_depth: d, ir_brightness: b });
+        enr.profiles[idx].scans.push(FaceScan { name: sname.clone(), rgb, ir, ir_depth: d, ir_brightness: b, pitch });
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
         }
@@ -731,13 +735,20 @@ impl Engine {
     /// One framing-guide sample for guided enrollment: capture, detect, and
     /// report how the user is positioned (no enrollment, no auth). The gates
     /// mirror the enroll/auth path so `well_framed` implies a capture will take.
-    pub fn position_sample(&mut self) -> irlume_common::Result<irlume_common::PositionReport> {
+    /// `user` (the account being enrolled) tunes the pitch band to that user's
+    /// calibrated neutral when they already have scans — so the guide coaches to
+    /// the same window the capture gate will accept.
+    pub fn position_sample(&mut self, user: Option<&str>) -> irlume_common::Result<irlume_common::PositionReport> {
         use irlume_common::PositionReport;
         const MIN_FRAC: f32 = 0.12;
         const MAX_FRAC: f32 = 0.55;
         const CENTER_TOL: f32 = 0.18;
         const DIM: f32 = 55.0;
         const BRIGHT: f32 = 235.0;
+        // This user's calibrated pitch neutral, if any (read-only; absent = global default).
+        let pitch_neutral = user
+            .and_then(|u| irlume_core::storage::load(u).ok().flatten())
+            .and_then(|e| e.pitch_neutral());
 
         let rgb = irlume_camera::capture_rgb(&self.rgb_dev)?;
         let view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
@@ -764,12 +775,13 @@ impl Engine {
         let mut q = 100i32;
         let mut guidance = "Hold still — looking good".to_string();
         let mut well = true;
-        let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX
-            && (FRAME_PITCH_MIN..=FRAME_PITCH_MAX).contains(&pose.pitch_frac);
+        let (plo, phi) = pitch_band(pitch_neutral);
+        let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX && (plo..=phi).contains(&pose.pitch_frac);
         // Live pose numbers for calibrating the framing bounds to a given camera
-        // (`IRLUME_LOG=debug`): a below-eye-level laptop cam biases pitch high.
-        irlume_common::dlog!("framing: yaw_asym={:.2} yaw_signed={:.2} pitch={:.2} face_frac={:.2} bright={:.0}",
-            pose.yaw_asym, pose.yaw_signed, pose.pitch_frac, face_frac, brightness);
+        // (`IRLUME_LOG=debug`); `neutral` is this user's calibrated centre (or —).
+        irlume_common::dlog!("framing: yaw_asym={:.2} yaw_signed={:.2} pitch={:.2} band=[{:.2},{:.2}] neutral={} face_frac={:.2} bright={:.0}",
+            pose.yaw_asym, pose.yaw_signed, pose.pitch_frac, plo, phi,
+            pitch_neutral.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into()), face_frac, brightness);
         if face_frac < MIN_FRAC {
             guidance = "Move closer".into(); well = false; q -= 45;
         } else if face_frac > MAX_FRAC {
@@ -777,7 +789,7 @@ impl Engine {
         } else if !centered {
             guidance = "Center your face in the frame".into(); well = false; q -= 30;
         } else if !frontal {
-            guidance = frontality_hint(&pose); well = false; q -= 30;
+            guidance = frontality_hint(&pose, pitch_neutral); well = false; q -= 30;
         } else if brightness < DIM {
             guidance = "Too dark — add light or face a window".into(); well = false; q -= 30;
         } else if brightness > BRIGHT {
@@ -807,13 +819,28 @@ impl Engine {
 const FRAME_YAW_ASYM_MAX: f32 = 0.27;
 const FRAME_PITCH_MIN: f32 = 0.42;
 const FRAME_PITCH_MAX: f32 = 0.61;
+/// Half-width of the pitch acceptance window once the user's neutral is known —
+/// preserves the tuned tightness (the default band above is ±0.095) but centres
+/// it on their camera's actual level reading instead of the global constant.
+const PITCH_TOL: f32 = 0.095;
+
+/// The pitch acceptance window: `neutral ± PITCH_TOL` once this user has a
+/// calibrated neutral (from prior enrollment scans), else the hand-tuned global
+/// default. Shared by the guide and the capture gate so they never disagree.
+fn pitch_band(pitch_neutral: Option<f32>) -> (f32, f32) {
+    match pitch_neutral {
+        Some(n) => (n - PITCH_TOL, n + PITCH_TOL),
+        None => (FRAME_PITCH_MIN, FRAME_PITCH_MAX),
+    }
+}
 
 /// True when a head pose is squarely-frontal enough to enroll — the capture-time
 /// gate (in [`Engine::capture_scans`]) and the guide's `well_framed` share these
-/// bounds, so what the guide coaches to is exactly what gets saved.
-fn frontal_signals(s: &Signals) -> bool {
-    s.head_yaw_asym <= FRAME_YAW_ASYM_MAX
-        && (FRAME_PITCH_MIN..=FRAME_PITCH_MAX).contains(&s.head_pitch_frac)
+/// bounds (and the same `pitch_neutral`), so what the guide coaches to is exactly
+/// what gets saved.
+fn frontal_signals(s: &Signals, pitch_neutral: Option<f32>) -> bool {
+    let (lo, hi) = pitch_band(pitch_neutral);
+    s.head_yaw_asym <= FRAME_YAW_ASYM_MAX && (lo..=hi).contains(&s.head_pitch_frac)
 }
 
 /// Turn a non-frontal head pose into a directional enrollment instruction, told
@@ -824,21 +851,22 @@ fn frontal_signals(s: &Signals) -> bool {
 /// a HIGH `pitch_frac` means looking DOWN → ask them to lift the chin. When both
 /// axes are off the more-severe one wins, so the user is corrected on one thing
 /// at a time instead of being bounced around.
-fn frontality_hint(pose: &irlume_vision::HeadPose) -> String {
-    let mid = (FRAME_PITCH_MIN + FRAME_PITCH_MAX) / 2.0;
+fn frontality_hint(pose: &irlume_vision::HeadPose, pitch_neutral: Option<f32>) -> String {
+    let (lo, hi) = pitch_band(pitch_neutral);
+    let mid = (lo + hi) / 2.0;
     let yaw_off = pose.yaw_asym > FRAME_YAW_ASYM_MAX;
-    let pitch_off = pose.pitch_frac < FRAME_PITCH_MIN || pose.pitch_frac > FRAME_PITCH_MAX;
+    let pitch_off = pose.pitch_frac < lo || pose.pitch_frac > hi;
     let yaw_sev = pose.yaw_asym / FRAME_YAW_ASYM_MAX;
-    let pitch_sev = (pose.pitch_frac - mid).abs() / ((FRAME_PITCH_MAX - FRAME_PITCH_MIN) / 2.0);
+    let pitch_sev = (pose.pitch_frac - mid).abs() / ((hi - lo) / 2.0);
     if yaw_off && (!pitch_off || yaw_sev >= pitch_sev) {
         // Nose toward image-left → looking to their right → turn left, and vice versa.
         if pose.yaw_signed < 0.0 { "Turn your head left to face the camera".into() }
         else { "Turn your head right to face the camera".into() }
-    } else if pose.pitch_frac < FRAME_PITCH_MIN {
-        // Low pitch = nose toward eye line = looking up → bring the chin down.
+    } else if pose.pitch_frac < lo {
+        // Below neutral = nose toward eye line = looking up → bring the chin down.
         "Lower your chin — look down a little".into()
-    } else if pose.pitch_frac > FRAME_PITCH_MAX {
-        // High pitch = nose toward mouth = looking down → bring the chin up.
+    } else if pose.pitch_frac > hi {
+        // Above neutral = nose toward mouth = looking down → bring the chin up.
         "Lift your chin — look up a little".into()
     } else {
         "Look straight at the camera".into()
@@ -1026,17 +1054,22 @@ mod tests {
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
 
     fn scan(v: Vec<f32>) -> FaceScan {
-        FaceScan { name: "s".into(), rgb: v, ir: None, ir_depth: 0.0, ir_brightness: 0.0 }
+        FaceScan { name: "s".into(), rgb: v, ir: None, ir_depth: 0.0, ir_brightness: 0.0, pitch: 0.0 }
     }
 
     #[test]
     fn frontal_signals_gates_capture() {
         let s = |yaw: f32, pitch: f32| Signals { head_yaw_asym: yaw, head_pitch_frac: pitch, ..Default::default() };
-        assert!(frontal_signals(&s(0.0, 0.50)), "square-on should pass");
-        assert!(frontal_signals(&s(0.20, 0.55)), "small turn within bounds passes");
-        assert!(!frontal_signals(&s(0.45, 0.50)), "clearly turned is rejected");
-        assert!(!frontal_signals(&s(0.0, 0.20)), "looking up is rejected");
-        assert!(!frontal_signals(&s(0.0, 0.75)), "looking down is rejected");
+        // Uncalibrated (None) → global default band [0.42, 0.61].
+        assert!(frontal_signals(&s(0.0, 0.50), None), "square-on should pass");
+        assert!(frontal_signals(&s(0.20, 0.55), None), "small turn within bounds passes");
+        assert!(!frontal_signals(&s(0.45, 0.50), None), "clearly turned is rejected");
+        assert!(!frontal_signals(&s(0.0, 0.20), None), "looking up is rejected");
+        assert!(!frontal_signals(&s(0.0, 0.75), None), "looking down is rejected");
+        // Calibrated to a high (laptop-biased) neutral 0.62 → band recentres, so
+        // a level face reading 0.62 passes and the global-default 0.50 does not.
+        assert!(frontal_signals(&s(0.0, 0.62), Some(0.62)), "at the calibrated neutral passes");
+        assert!(!frontal_signals(&s(0.0, 0.50), Some(0.62)), "well below the neutral is rejected");
     }
 
     #[test]
@@ -1045,20 +1078,20 @@ mod tests {
         // Turned so the nose sits image-left (yaw_signed<0) → they're looking to
         // their right → we tell them to turn LEFT (non-mirrored capture).
         let p = HeadPose { yaw_asym: 0.6, yaw_signed: -0.6, pitch_frac: 0.5 };
-        assert_eq!(frontality_hint(&p), "Turn your head left to face the camera");
+        assert_eq!(frontality_hint(&p, None), "Turn your head left to face the camera");
         // Nose image-right → looking to their left → turn RIGHT.
         let p = HeadPose { yaw_asym: 0.6, yaw_signed: 0.6, pitch_frac: 0.5 };
-        assert_eq!(frontality_hint(&p), "Turn your head right to face the camera");
+        assert_eq!(frontality_hint(&p, None), "Turn your head right to face the camera");
         // Looking UP (low pitch = nose toward eye line) → lower chin.
         let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.10 };
-        assert!(frontality_hint(&p).starts_with("Lower your chin"));
+        assert!(frontality_hint(&p, None).starts_with("Lower your chin"));
         // Looking DOWN (high pitch = nose toward mouth) → lift chin.
         let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.90 };
-        assert!(frontality_hint(&p).starts_with("Lift your chin"));
+        assert!(frontality_hint(&p, None).starts_with("Lift your chin"));
         // Both off: the more-severe axis wins (yaw far past its limit) → yaw
         // guidance, not pitch — robust to small bound tweaks.
         let p = HeadPose { yaw_asym: 0.95, yaw_signed: 0.95, pitch_frac: 0.82 };
-        assert_eq!(frontality_hint(&p), "Turn your head right to face the camera");
+        assert_eq!(frontality_hint(&p, None), "Turn your head right to face the camera");
     }
 
     #[test]

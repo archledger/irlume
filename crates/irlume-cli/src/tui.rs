@@ -44,7 +44,7 @@ const SC_SETTINGS: usize = 9;
 const SC_DONE: usize = 10;
 const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
 const MAX_PROFILES: usize = 3;
-const ENROLL_SCANS: usize = 3;
+const ENROLL_SCANS: usize = 5;
 const GOOD_STREAK: u32 = 3;
 
 #[derive(Clone, Copy)]
@@ -2015,7 +2015,7 @@ fn enroll_worker(user: String, profile: String, add: Option<String>, target: usi
             let mut streak = 0u32;
             loop {
                 if stop.load(Ordering::Relaxed) { return; }
-                match crate::daemon_request(&Request::PositionSample) {
+                match crate::daemon_request(&Request::PositionSample { user: Some(user.clone()) }) {
                     Ok(Response::Position(r)) => {
                         let good = r.well_framed;
                         if !send(WMsg::Cue(r)) { return; }
@@ -2033,7 +2033,7 @@ fn enroll_worker(user: String, profile: String, add: Option<String>, target: usi
                 if stop.load(Ordering::Relaxed) { return; }
                 if !send(WMsg::Count(c)) { return; }
                 std::thread::sleep(Duration::from_millis(650));
-                match crate::daemon_request(&Request::PositionSample) {
+                match crate::daemon_request(&Request::PositionSample { user: Some(user.clone()) }) {
                     // Still framed: keep counting (don't send a Cue — that would
                     // clear the on-screen count). Only surface a cue on abort.
                     Ok(Response::Position(r)) if r.well_framed => {}

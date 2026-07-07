@@ -18,7 +18,7 @@ pub const MAX_PROFILES: usize = 3;
 /// the false-accept surface (mitigated by [`crate::scaled_threshold`]).
 pub const MAX_SCANS_PER_PROFILE: usize = 5;
 /// Scans captured by a fresh enrollment to bootstrap solid recognition.
-pub const DEFAULT_ENROLL_SCANS: usize = 3;
+pub const DEFAULT_ENROLL_SCANS: usize = 5;
 
 /// One quality-gated capture under a profile. `rgb` is a 512-D L2-normalized
 /// AuraFace embedding; `ir` is the IR-face embedding for dark operation.
@@ -33,6 +33,12 @@ pub struct FaceScan {
     pub ir_depth: f32,
     #[serde(default)]
     pub ir_brightness: f32,
+    /// Head `pitch_frac` at capture. The median across scans is this user's
+    /// frontal neutral, used to CENTRE the enrollment framing band on their
+    /// camera (a below-eye laptop cam reads pitch high even when level). 0.0 =
+    /// not recorded (pre-calibration scan); ignored by [`Enrollment::pitch_neutral`].
+    #[serde(default)]
+    pub pitch: f32,
 }
 
 /// A face profile: a named set of scans of one face.
@@ -132,6 +138,26 @@ impl Enrollment {
         Some(min * 0.75)
     }
 
+    /// This user's frontal pitch neutral — the median of the per-scan capture
+    /// pitches — or `None` until at least two calibrated scans exist. Lets the
+    /// framing guide + capture gate centre on where a LEVEL face actually reads
+    /// on this camera instead of a hand-tuned global constant. Scans with pitch
+    /// 0.0 (pre-calibration) are ignored, so it stays backward-compatible.
+    pub fn pitch_neutral(&self) -> Option<f32> {
+        let mut v: Vec<f32> = self
+            .profiles
+            .iter()
+            .flat_map(|p| p.scans.iter())
+            .map(|s| s.pitch)
+            .filter(|&p| p > 0.0)
+            .collect();
+        if v.len() < 2 {
+            return None;
+        }
+        v.sort_by(f32::total_cmp);
+        Some(v[v.len() / 2])
+    }
+
     /// Default name for the next profile ("Face Profile N", first free slot).
     pub fn next_profile_name(&self) -> String {
         for n in 1..=MAX_PROFILES {
@@ -182,6 +208,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
             ir: old.ir_templates.get(i).cloned(),
             ir_depth: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
             ir_brightness: old.ir_brightness_samples.get(i).copied().unwrap_or(0.0),
+            pitch: 0.0, // legacy scans predate pitch calibration
         })
         .collect();
     Enrollment {
@@ -383,6 +410,7 @@ mod tests {
                     ir: Some(vec![0.5, 0.6]),
                     ir_depth: 1.4,
                     ir_brightness: 90.0,
+                    pitch: 0.52,
                 }],
             }],
             require_eyes_open: true,
@@ -425,7 +453,26 @@ mod tests {
     }
 
     fn scan_with_ir(depth: f32, bright: f32) -> FaceScan {
-        FaceScan { name: "s".into(), rgb: vec![0.1; 4], ir: Some(vec![0.2; 4]), ir_depth: depth, ir_brightness: bright }
+        FaceScan { name: "s".into(), rgb: vec![0.1; 4], ir: Some(vec![0.2; 4]), ir_depth: depth, ir_brightness: bright, pitch: 0.0 }
+    }
+
+    fn scan_with_pitch(pitch: f32) -> FaceScan {
+        FaceScan { name: "s".into(), rgb: vec![0.1; 4], ir: None, ir_depth: 0.0, ir_brightness: 0.0, pitch }
+    }
+
+    #[test]
+    fn pitch_neutral_is_median_of_calibrated_scans() {
+        let mut e = Enrollment::new("u");
+        // One calibrated scan -> not enough.
+        e.profiles.push(FaceProfile { name: "p".into(), scans: vec![scan_with_pitch(0.60)] });
+        assert!(e.pitch_neutral().is_none());
+        // Add more -> median of {0.60, 0.58, 0.62} = 0.60.
+        e.profiles[0].scans.push(scan_with_pitch(0.58));
+        e.profiles[0].scans.push(scan_with_pitch(0.62));
+        assert!((e.pitch_neutral().unwrap() - 0.60).abs() < 1e-6);
+        // Pre-calibration scans (pitch 0.0) are ignored.
+        e.profiles[0].scans.push(scan_with_pitch(0.0));
+        assert!((e.pitch_neutral().unwrap() - 0.60).abs() < 1e-6);
     }
 
     #[test]
@@ -449,7 +496,7 @@ mod tests {
         e.profiles.push(FaceProfile {
             name: "p".into(),
             scans: vec![
-                FaceScan { name: "a".into(), rgb: vec![0.1; 4], ir: None, ir_depth: 0.0, ir_brightness: 0.0 },
+                FaceScan { name: "a".into(), rgb: vec![0.1; 4], ir: None, ir_depth: 0.0, ir_brightness: 0.0, pitch: 0.0 },
                 scan_with_ir(1.5, 100.0),
             ],
         });

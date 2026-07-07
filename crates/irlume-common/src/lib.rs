@@ -133,8 +133,10 @@ pub enum Request {
     Health,
     /// One framing-guide sample (no enrollment, no auth) — captures a frame and
     /// returns a [`PositionReport`] of how the user is positioned, for the guided
-    /// enrollment cues. Safe to poll repeatedly.
-    PositionSample,
+    /// enrollment cues. Safe to poll repeatedly. `user` is the account being
+    /// enrolled: it tunes the pitch band to that user's calibrated neutral (a
+    /// read-only lookup) so the guide matches the capture gate. `None` = default band.
+    PositionSample { user: Option<String> },
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release

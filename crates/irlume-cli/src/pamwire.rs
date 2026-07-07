@@ -47,7 +47,6 @@ const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so
 /// wallet. No-op when the keyring isn't armed or a password is already set.
 const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
-const LOCK_WAIT: &str = "auth       sufficient                   pam_irlume.so wait";
 const SUDO_STANZA: &str = "auth       sufficient                   pam_irlume.so";
 
 /// A PAM service to wire. `vendor=Some` → materialize an /etc override from the
@@ -64,7 +63,12 @@ const GREETERS: &[Svc] = &[
     Svc { etc: "/etc/pam.d/plasmalogin", vendor: Some("/usr/lib/pam.d/plasmalogin") }, // Plasma 6
     Svc { etc: "/etc/pam.d/cosmic-greeter", vendor: None }, // COSMIC (Pop!_OS / System76)
 ];
-const LOCKSCREEN: Svc = Svc { etc: "/etc/pam.d/kde-fingerprint", vendor: Some("/usr/lib/pam.d/kde-fingerprint") };
+// KDE lock: wire the submit-driven `kde` password service with the on-demand
+// face block, NOT KDE's ambient `kde-fingerprint` parallel-biometric slot — so
+// face engages only on an empty-field Enter (never continuously scanning). The
+// `kde` service classifies as ScreenUnlock, so `ondemand` verifies identity and
+// releases no credential.
+const LOCKSCREEN: Svc = Svc { etc: "/etc/pam.d/kde", vendor: None };
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
 /// distinct from `gdm-password` (password/face). It runs pam_fprintd then
 /// pam_gnome_keyring — which finds no password and leaves the wallet locked. We
@@ -498,7 +502,40 @@ fn wire_single(content: &str, stanza: &str) -> (String, bool) {
     (format!("{}\n", out.join("\n")), true)
 }
 
-fn wire_lock(content: &str) -> (String, bool) { wire_single(content, LOCK_WAIT) }
+/// Wire the KDE lock (`kde`) with the consent-driven on-demand face block: face
+/// engages only on an empty-field Enter, verifies identity for the unlock, and
+/// otherwise falls through to the password. Same `ondemand` mode as
+/// cosmic-greeter, applied to KDE's submit-driven lock service. No reseal (a
+/// screen unlock releases no credential). Handles both the Debian `@include`
+/// and the Fedora `substack` layouts.
+fn wire_lock(content: &str) -> (String, bool) {
+    if content_has_module(content) { return (content.to_string(), false); }
+    let lines: Vec<&str> = content.lines().collect();
+    // Debian `@include common-auth` layout → face-first `sufficient` before it.
+    if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
+        let mut out = Vec::with_capacity(lines.len() + 1);
+        for (i, l) in lines.iter().enumerate() {
+            if i == inc_at { out.push(GREETER_UNSEAL_COSMIC.to_string()); }
+            out.push((*l).to_string());
+        }
+        return (format!("{}\n", out.join("\n")), true);
+    }
+    // Fedora `substack password-auth` layout → jump stanza + permit landing.
+    let auth_at = lines.iter().position(|l| is_passwd_substack(l, "auth"))
+        .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
+    let Some(auth_at) = auth_at else { return (content.to_string(), false); };
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    for (i, l) in lines.iter().enumerate() {
+        if i == auth_at {
+            out.push(GREETER_UNSEAL_COSMIC_JUMP.to_string());
+            out.push((*l).to_string());
+            out.push(PERMIT_LANDING.to_string());
+        } else {
+            out.push((*l).to_string());
+        }
+    }
+    (format!("{}\n", out.join("\n")), true)
+}
 
 /// Wire the `keyring` unseal line into a fingerprint login service
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
@@ -717,10 +754,32 @@ mod tests {
     #[test]
     fn single_stanza_and_unwire_roundtrip() {
         let base = "#%PAM-1.0\nauth required pam_unix.so\nsession required pam_unix.so\n";
-        let (w, c) = wire_single(base, LOCK_WAIT);
+        let (w, c) = wire_single(base, SUDO_STANZA);
         assert!(c && content_has_module(&w));
         let (back, changed) = unwire_lines(&w);
         assert!(changed && !content_has_module(&back));
+    }
+
+    // Fedora KDE lock service `kde` (substack layout), the real file we validated.
+    const KDE_LOCK: &str = "auth        substack      password-auth\nauth        include       postlogin\naccount     required      pam_nologin.so\npassword    include       password-auth\nsession     required      pam_selinux.so close\n";
+
+    #[test]
+    fn kde_lock_is_ondemand_not_ambient_wait() {
+        let (w, changed) = wire_lock(KDE_LOCK);
+        assert!(changed);
+        // consent-driven on-demand, never the ambient `wait` mode, no reseal.
+        assert!(w.contains("pam_irlume.so unseal ondemand"));
+        assert!(!w.contains("pam_irlume.so wait"));
+        assert!(!w.contains("reseal"));
+        // face-first before the password substack, with the permit landing.
+        let lines: Vec<&str> = w.lines().collect();
+        let face = lines.iter().position(|l| l.contains("unseal ondemand")).unwrap();
+        let substack = lines.iter().position(|l| l.contains("substack      password-auth")).unwrap();
+        assert!(face < substack);
+        assert!(w.contains("pam_permit.so") && w.contains("irlume-landing"));
+        // fully reversible.
+        let (back, undone) = unwire_lines(&w);
+        assert!(undone && !content_has_module(&back));
     }
 
     #[test]

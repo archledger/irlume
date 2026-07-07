@@ -737,8 +737,10 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("\n[6/6] PAM login wiring");
     println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
     println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
+    println!("  once wired: at the greeter/lock, leave the password empty and press Enter");
+    println!("  to use your face (typing a password never starts the camera).");
 
-    println!("\n=== setup complete. Check `irlume status` any time. ===");
+    println!("\n=== setup complete. Check `irlume status` any time. Troubleshoot with `irlume logs`. ===");
     ExitCode::SUCCESS
 }
 
@@ -789,7 +791,7 @@ SETUP & STATUS
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
   profiles [list|add-scan|rename|delete|eyes-open|challenge <on|off>]   manage profiles
-  identify              1:N \"who is this?\" across all enrolled users
+  identify              1:N \"who is this?\" (all users as root; else scoped to you)
 
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed login password for wallet unlock

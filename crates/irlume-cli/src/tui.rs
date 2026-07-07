@@ -91,6 +91,9 @@ enum Suspend {
     SetCameras(String, String),
     /// Auto-configure the IR emitter — root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
+    /// View the face-auth journal (`sudo irlume logs`) — the daemon's lines live
+    /// in the system journal, so it runs under sudo to guarantee they show.
+    Logs,
 }
 
 /// Severity of a Repair-tab diagnostic.
@@ -905,6 +908,8 @@ impl App {
                 self.sudo_step("switch the active camera pair", &["irlume", "set-cameras", &rgb, &ir]),
             Suspend::IrSetup =>
                 self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
+            Suspend::Logs =>
+                self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // enable + restart: `enable` makes the unit survive reboots (fresh
             // installs ship disabled under distro preset policy) and `restart`
             // also revives an enabled-but-wedged daemon; either alone misses a case.
@@ -1060,6 +1065,13 @@ impl App {
             // Repair: re-run checks, fix the selected issue, or run a live IR test.
             (SC_REPAIR, KeyCode::Char('r')) => { self.log('·', "re-running diagnostics…"); self.refresh(); }
             (SC_REPAIR, KeyCode::Char('f')) | (SC_REPAIR, KeyCode::Enter) => self.apply_fix(self.repair_sel),
+            // View the face-auth journal to see WHY a check failed. `logs debug
+            // on` (a console step) adds per-stage tracing when a number is needed.
+            (SC_REPAIR, KeyCode::Char('v')) => {
+                self.log('→', "sudo irlume logs — the daemon/PAM/keyring journal in one view");
+                self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
+                self.suspend = Some(Suspend::Logs);
+            }
             (SC_REPAIR, KeyCode::Char('l')) => self.start_async(
                 "SelfTest (IR liveness)", OpTag::Calibrate,
                 Request::SelfTest { kind: irlume_common::SelfTestKind::Liveness }, map_selftest),
@@ -1103,6 +1115,7 @@ impl App {
             // setup mile must not require leaving the TUI for a manual command.
             (SC_PAM, KeyCode::Char('w')) | (SC_DONE, KeyCode::Char('w')) => {
                 self.log('→', "sudo irlume login enable --apply — wires the greeter + lock screen for your method");
+                self.log('·', "at the login/lock screen: leave the password empty and press Enter to use your face");
                 self.log('·', "face-sudo is opt-in — add it later with: sudo irlume login enable --with-sudo --apply");
                 self.suspend = Some(Suspend::LoginEnable);
             }
@@ -1645,7 +1658,7 @@ impl App {
             Span::styled(format!("  {ok} ok"), Style::new().fg(OK)),
             Span::styled(format!("   {warn} warn"), Style::new().fg(WARN)),
             Span::styled(format!("   {fail} fail"), Style::new().fg(ERR)),
-            Span::styled("      [f] fix selected   [r] re-check   [l] IR self-test", Style::new().dim()),
+            Span::styled("      [f] fix selected   [r] re-check   [l] IR self-test   [v] logs", Style::new().dim()),
         ])];
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
@@ -1684,8 +1697,8 @@ impl App {
     fn draw_identify(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![
             section("1:N identify — \"who is this?\""),
-            Line::from(Span::styled("  Capture once and match against every enrolled user (no claimed", Style::new().dim())),
-            Line::from(Span::styled("  identity). Liveness-gated, RGB primary — a diagnostic, not unlock.", Style::new().dim())),
+            Line::from(Span::styled("  Capture once and match against your enrollment (every user when", Style::new().dim())),
+            Line::from(Span::styled("  run as root). Liveness-gated, RGB primary — a diagnostic, not unlock.", Style::new().dim())),
             Line::raw(""),
         ];
         match &self.identify_result {
@@ -1828,7 +1841,7 @@ impl App {
         }
         let actions: &[(&str, &str)] = match self.screen {
             SC_WELCOME => &[("e", "enroll"), ("i", "identify"), ("r", "refresh")],
-            SC_REPAIR => &[("f", "fix"), ("r", "re-check"), ("l", "IR test")],
+            SC_REPAIR => &[("f", "fix"), ("r", "re-check"), ("l", "IR test"), ("v", "logs")],
             SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
             SC_PROFILES => &[("e", "enroll"), ("a", "add scan"), ("r", "rename"), ("d", "delete")],
             SC_IDENTIFY => &[("i", "identify")],

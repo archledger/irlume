@@ -36,6 +36,13 @@ pub struct HeadPose {
     /// Horizontal nose asymmetry between the eyes: `|d(nose,left_eye) -
     /// d(nose,right_eye)| / (sum)`. ~0 frontal, →1 turned left/right.
     pub yaw_asym: f32,
+    /// SIGNED horizontal turn, for directional enrollment guidance. Computed in
+    /// pure image space (nose x vs the eye-midpoint x, normalized by half the
+    /// inter-eye span), so it's independent of which landmark index is labelled
+    /// "left". Negative = the nose sits toward image-LEFT; positive = image-RIGHT.
+    /// On a non-mirrored camera frame (irlume never flips the capture), nose-
+    /// toward-image-left means the person is looking to THEIR OWN right. ~0 frontal.
+    pub yaw_signed: f32,
     /// Nose's vertical position between the eye line and mouth line. ~0.5
     /// frontal; smaller looking down, larger looking up.
     pub pitch_frac: f32,
@@ -47,10 +54,15 @@ pub fn head_pose(lm: &Landmarks5) -> HeadPose {
     let (le, re, nose, lmth, rmth) = (lm[0], lm[1], lm[2], lm[3], lm[4]);
     let (dl, dr) = ((nose.0 - le.0).abs(), (re.0 - nose.0).abs());
     let yaw_asym = if dl + dr > 1e-3 { (dl - dr).abs() / (dl + dr) } else { 0.0 };
+    // Signed yaw straight from image x — label-agnostic (uses the eye midpoint,
+    // not "which eye is left"). Half the inter-eye span makes it ~unit-scaled.
+    let eye_mid_x = (le.0 + re.0) / 2.0;
+    let half_span = ((re.0 - le.0).abs() / 2.0).max(1e-3);
+    let yaw_signed = (nose.0 - eye_mid_x) / half_span;
     let eye_y = (le.1 + re.1) / 2.0;
     let span = (lmth.1 + rmth.1) / 2.0 - eye_y;
     let pitch_frac = if span.abs() > 1e-3 { (nose.1 - eye_y) / span } else { 0.5 };
-    HeadPose { yaw_asym, pitch_frac }
+    HeadPose { yaw_asym, yaw_signed, pitch_frac }
 }
 
 #[cfg(test)]
@@ -71,6 +83,19 @@ mod head_pose_tests {
         // Nose shifted toward the left eye (head turned) -> high asymmetry.
         let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (25.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
         assert!(head_pose(&lm).yaw_asym > 0.35, "{}", head_pose(&lm).yaw_asym);
+    }
+
+    #[test]
+    fn yaw_signed_tracks_nose_side() {
+        // Eye midpoint x = 32. Nose toward image-LEFT (x=25 < 32) -> negative.
+        let left: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (25.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        assert!(head_pose(&left).yaw_signed < -0.3, "{}", head_pose(&left).yaw_signed);
+        // Nose toward image-RIGHT (x=39 > 32) -> positive.
+        let right: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (39.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        assert!(head_pose(&right).yaw_signed > 0.3, "{}", head_pose(&right).yaw_signed);
+        // Frontal (nose centered) -> ~0.
+        let mid: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        assert!(head_pose(&mid).yaw_signed.abs() < 0.05, "{}", head_pose(&mid).yaw_signed);
     }
 
     #[test]

@@ -766,7 +766,7 @@ impl Engine {
         } else if !centered {
             guidance = "Center your face in the frame".into(); well = false; q -= 30;
         } else if !frontal {
-            guidance = "Look straight at the camera".into(); well = false; q -= 30;
+            guidance = frontality_hint(&pose); well = false; q -= 30;
         } else if brightness < DIM {
             guidance = "Too dark — add light or face a window".into(); well = false; q -= 30;
         } else if brightness > BRIGHT {
@@ -776,6 +776,31 @@ impl Engine {
             face: true, face_frac, centered, yaw_asym: pose.yaw_asym, pitch_frac: pose.pitch_frac,
             brightness, ir_ok, quality: q.clamp(0, 100) as u8, well_framed: well, guidance,
         })
+    }
+}
+
+/// Turn a non-frontal head pose into a directional enrollment instruction, told
+/// in the USER's own frame. On irlume's non-mirrored capture, nose-toward-image-
+/// left (`yaw_signed < 0`) means the person is looking to THEIR right, so we ask
+/// them to turn left; `pitch_frac` below its floor is chin-down/looking-down, so
+/// we ask for a chin lift. When both axes are off the more-severe one wins, so
+/// the user is corrected on one thing at a time instead of being bounced around.
+fn frontality_hint(pose: &irlume_vision::HeadPose) -> String {
+    use irlume_liveness::{PITCH_FRAC_MAX, PITCH_FRAC_MIN, YAW_ASYM_MAX};
+    let yaw_off = pose.yaw_asym > YAW_ASYM_MAX;
+    let pitch_off = pose.pitch_frac < PITCH_FRAC_MIN || pose.pitch_frac > PITCH_FRAC_MAX;
+    let yaw_sev = pose.yaw_asym / YAW_ASYM_MAX;
+    let pitch_sev = (pose.pitch_frac - 0.5).abs() / ((PITCH_FRAC_MAX - PITCH_FRAC_MIN) / 2.0);
+    if yaw_off && (!pitch_off || yaw_sev >= pitch_sev) {
+        // Nose toward image-left → looking to their right → turn left, and vice versa.
+        if pose.yaw_signed < 0.0 { "Turn your head left to face the camera".into() }
+        else { "Turn your head right to face the camera".into() }
+    } else if pose.pitch_frac < PITCH_FRAC_MIN {
+        "Lift your chin — look up a little".into()
+    } else if pose.pitch_frac > PITCH_FRAC_MAX {
+        "Lower your chin — look down a little".into()
+    } else {
+        "Look straight at the camera".into()
     }
 }
 
@@ -961,6 +986,28 @@ mod tests {
 
     fn scan(v: Vec<f32>) -> FaceScan {
         FaceScan { name: "s".into(), rgb: v, ir: None, ir_depth: 0.0, ir_brightness: 0.0 }
+    }
+
+    #[test]
+    fn frontality_hint_is_directional() {
+        use irlume_vision::HeadPose;
+        // Turned so the nose sits image-left (yaw_signed<0) → they're looking to
+        // their right → we tell them to turn LEFT (non-mirrored capture).
+        let p = HeadPose { yaw_asym: 0.6, yaw_signed: -0.6, pitch_frac: 0.5 };
+        assert_eq!(frontality_hint(&p), "Turn your head left to face the camera");
+        // Nose image-right → looking to their left → turn RIGHT.
+        let p = HeadPose { yaw_asym: 0.6, yaw_signed: 0.6, pitch_frac: 0.5 };
+        assert_eq!(frontality_hint(&p), "Turn your head right to face the camera");
+        // Chin down / looking down (pitch below floor) → lift chin.
+        let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.10 };
+        assert!(frontality_hint(&p).starts_with("Lift your chin"));
+        // Looking up (pitch above ceiling) → lower chin.
+        let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.90 };
+        assert!(frontality_hint(&p).starts_with("Lower your chin"));
+        // Both off: the more-severe axis wins (here yaw is 2x its limit, pitch
+        // barely over) → yaw guidance, not pitch.
+        let p = HeadPose { yaw_asym: 0.80, yaw_signed: 0.80, pitch_frac: 0.82 };
+        assert_eq!(frontality_hint(&p), "Turn your head right to face the camera");
     }
 
     #[test]

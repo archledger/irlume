@@ -316,8 +316,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             match engine.authenticate(&user) {
                 Ok(o) => {
                     if convenience || irlume_common::dbglog::on() {
-                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={:.3} ({})",
-                            o.granted, o.live, o.score, o.reason);
+                        // Denied scores quantized unless tracing (anti-oracle).
+                        let score = if o.granted { format!("{:.3}", o.score) } else { deny_score(o.score) };
+                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({})",
+                            o.granted, o.live, o.reason);
                     }
                     irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
                     Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason }
@@ -720,6 +722,12 @@ fn mutate_enrollment(user: &str, f: impl FnOnce(&mut irlume_core::storage::Enrol
 /// biometric check happens HERE (inside unseal), so a caller cannot get the
 /// password without a live face that matches the enrolled templates. We log the
 /// decision + cosine score, but never the password or its length.
+/// Deny-line score display: exact under IRLUME_LOG=debug tracing, else
+/// quantized to one decimal (anti-oracle — see comment at the deny log).
+fn deny_score(s: f32) -> String {
+    if irlume_common::dbglog::on() { format!("{s:.4}") } else { format!("~{s:.1}") }
+}
+
 fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
@@ -734,9 +742,13 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
         }
     };
     if !outcome.granted {
+        // Denied-attempt scores are QUANTIZED to one decimal unless tracing is
+        // on: a 4-decimal score after every try is a gradient a journal-reading
+        // attacker could climb to tune a spoof. One decimal still separates
+        // "borderline" from "not even close" for false-reject diagnosis.
         eprintln!(
-            "irlumed: UnsealPassword: denied for '{user}' (live={}, score {:.4}: {}) -> password",
-            outcome.live, outcome.score, outcome.reason
+            "irlumed: UnsealPassword: denied for '{user}' (live={}, score {}: {}) -> password",
+            outcome.live, deny_score(outcome.score), outcome.reason
         );
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }

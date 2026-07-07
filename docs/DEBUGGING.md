@@ -63,16 +63,19 @@ The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
 
 **Security note — treat tracing as a diagnostic session, not a resident
-setting.** While tracing is on, *denied* attempts log their match score next to
-the threshold. To anyone who can read the system journal (root or the
+setting.** While tracing is on, *denied* attempts log their exact match score
+next to the threshold. To anyone who can read the system journal (root or the
 `systemd-journal` group) that is an oracle: present a spoof, read how close it
 got, adjust, repeat — most relevant if you enabled face-`sudo`, where a
 compromised user session would be the one reading the journal. Both halves are
 privileged (enabling tracing needs root; reading the system journal needs
 root/`systemd-journal`), so this does not weaken a default setup — but the
 habit that keeps it irrelevant is: turn tracing on, reproduce your problem,
-turn it off. Nothing else changes while tracing is on: gates, thresholds, and
-what the daemon will or won't release are identical.
+turn it off. With tracing **off** (the default), denied-attempt scores are
+deliberately quantized to one decimal (`score ~0.4`) — coarse enough to kill
+the gradient, still enough to tell "borderline" from "not even close".
+Nothing else changes while tracing is on: gates, thresholds, and what the
+daemon will or will not release are identical.
 
 ## Health & config at a glance
 

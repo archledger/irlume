@@ -65,6 +65,7 @@ const GREETERS: &[Svc] = &[
     Svc { etc: "/etc/pam.d/lightdm", vendor: None },
     Svc { etc: "/etc/pam.d/plasmalogin", vendor: Some("/usr/lib/pam.d/plasmalogin") }, // Plasma 6
     Svc { etc: "/etc/pam.d/cosmic-greeter", vendor: None }, // COSMIC (Pop!_OS / System76)
+    Svc { etc: "/etc/pam.d/greetd", vendor: None }, // greetd (sway / wayland / tuigreet)
 ];
 // KDE lock: wire the submit-driven `kde` password service with the on-demand
 // face block, NOT KDE's ambient `kde-fingerprint` parallel-biometric slot — so
@@ -195,6 +196,11 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
         // success, so `ondemand` gives a clean empty-Enter→face with no spurious
         // "incorrect password" that facefirst caused.
         "lightdm" | "sddm" => DmProfile { ondemand: true },
+        // greetd (agreety / tuigreet / sway sessions): a submit-driven greeter that
+        // reads a password line then hands it to PAM — same on-demand family as
+        // lightdm/sddm. (cosmic-greeter, itself an ondemand greetd greeter, is the
+        // System76 case handled above.)
+        "greetd" => DmProfile { ondemand: true },
         // plasmalogin / other submit-driven greeters — default to the safe
         // facefirst until each is validated for the on-demand probe.
         _ => DmProfile { ondemand: false },
@@ -505,10 +511,17 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
     if !face && !keyring { return (content.to_string(), false); }
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
-    // Debian/Ubuntu layout: face-first `sufficient` before `@include common-auth`
-    // (password path); keyring-unseal after it (runs on any auth success — incl.
-    // a fingerprint via common-auth's pam_fprintd).
-    if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
+    // Debian/Ubuntu layout: face-first `sufficient` before the password path;
+    // keyring-unseal after it (runs on any auth success — incl. a fingerprint via
+    // common-auth's pam_fprintd). Most greeters `@include common-auth` directly;
+    // greetd instead `@include login` (which itself pulls in common-auth) and adds
+    // its own keyring modules after — inserting the face line before that include
+    // works identically (face IGNORE on cold login → the include's pam_unix +
+    // greetd's pam_gnome_keyring run with the unsealed AUTHTOK → keyring unlocks).
+    if let Some(inc_at) = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.starts_with("@include common-auth") || t.starts_with("@include login")
+    }) {
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
@@ -793,6 +806,27 @@ mod tests {
         assert!(g.contains("facefirst") && !g.contains("ondemand"));
     }
 
+    // greetd layout: `@include login` (which itself pulls in common-auth) plus its
+    // own keyring modules after — NOT a direct `@include common-auth`.
+    const GREETD: &str = "#%PAM-1.0\n@include login\n-auth        optional        pam_gnome_keyring.so\n-auth        optional        pam_kwallet5.so\n-session     optional        pam_gnome_keyring.so auto_start\n-session     optional        pam_kwallet5.so auto_start\n";
+
+    #[test]
+    fn greetd_include_login_layout_wires_before_the_include() {
+        // The face line must land before `@include login` (so face runs ahead of
+        // the password stack), NOT before greetd's post-include keyring modules.
+        let (w, changed) = wire_greeter_impl(GREETD, true, true, true);
+        assert!(changed);
+        assert!(w.contains("pam_irlume.so unseal ondemand"));
+        let lines: Vec<&str> = w.lines().collect();
+        let unseal = lines.iter().position(|l| l.contains("unseal ondemand")).unwrap();
+        let inc = lines.iter().position(|l| l.trim_start().starts_with("@include login")).unwrap();
+        assert!(unseal < inc, "face line must precede @include login");
+        // keyring-unseal rides just after the include, ahead of greetd's own
+        // pam_gnome_keyring so the unsealed AUTHTOK is in place for it.
+        let kr = lines.iter().position(|l| l.contains("pam_irlume.so keyring")).unwrap();
+        assert!(kr > inc);
+    }
+
     #[test]
     fn dm_profile_tailors_per_login_manager() {
         // COSMIC answers the probe on submit → ondemand.
@@ -804,6 +838,8 @@ mod tests {
         // LightDM + SDDM: validated → on-demand.
         assert!(dm_profile("/etc/pam.d/lightdm", None).ondemand);
         assert!(dm_profile("/etc/pam.d/sddm", None).ondemand);
+        // greetd: submit-driven family → on-demand.
+        assert!(dm_profile("/etc/pam.d/greetd", None).ondemand);
         // an untested/unknown greeter defaults to the safe facefirst.
         assert!(!dm_profile("/etc/pam.d/xdm", None).ondemand);
     }

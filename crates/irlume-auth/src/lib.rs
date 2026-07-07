@@ -464,10 +464,10 @@ impl Engine {
                     }
                 }
             }
-            // Deny reasons quantize the match score unless tracing is on — an
-            // exact near-miss score in the journal is spoof-tuning feedback.
-            let shown = if irlume_common::dbglog::on() { format!("{score:.2}") } else { format!("~{score:.1}") };
-            return Ok(Outcome { granted: false, live: true, score, reason: format!("below threshold (rgb {shown}, fusion+ir-fallback miss)") });
+            // The reason keeps the exact score: it reaches only the session's
+            // own TUI/CLI (coaching a genuine false reject); the daemon redacts
+            // measurements before this line touches the journal (anti-oracle).
+            return Ok(Outcome { granted: false, live: true, score, reason: format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)") });
         }
 
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR

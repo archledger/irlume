@@ -316,10 +316,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             match engine.authenticate(&user) {
                 Ok(o) => {
                     if convenience || irlume_common::dbglog::on() {
-                        // Denied scores quantized unless tracing (anti-oracle).
-                        let score = if o.granted { format!("{:.3}", o.score) } else { deny_score(o.score) };
-                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({})",
-                            o.granted, o.live, o.reason);
+                        // Denied score + reason measurements quantized/redacted
+                        // unless tracing (anti-oracle); grants log exact.
+                        let (score, reason) = if o.granted {
+                            (format!("{:.3}", o.score), o.reason.clone())
+                        } else {
+                            (deny_score(o.score), deny_reason(&o.reason))
+                        };
+                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
+                            o.granted, o.live);
                     }
                     irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
                     Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason }
@@ -728,6 +733,41 @@ fn deny_score(s: f32) -> String {
     if irlume_common::dbglog::on() { format!("{s:.4}") } else { format!("~{s:.1}") }
 }
 
+/// Journal-side deny-reason display. Deny reasons embed measured values
+/// ("IR too flat (1.02)", "rgb 0.35") as coaching for a genuine false reject —
+/// but in the JOURNAL those same numbers are per-attempt feedback a spoofer
+/// could tune against. The exact reason still goes back over IPC to the
+/// session's own TUI/CLI; here we strip the numeric payloads unless tracing is
+/// on. Digit runs attached to letters ("2D", "3D", "850nm") are prose, kept.
+fn deny_reason(r: &str) -> String {
+    if irlume_common::dbglog::on() {
+        return r.to_string();
+    }
+    let cs: Vec<char> = r.chars().collect();
+    let mut out = String::with_capacity(r.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i].is_ascii_digit() {
+            let start = i;
+            while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') { i += 1; }
+            let mut end = i;
+            while end > start && cs[end - 1] == '.' { end -= 1; } // sentence period, not a decimal
+            let prev_alpha = start > 0 && cs[start - 1].is_ascii_alphabetic();
+            let next_alpha = end < cs.len() && cs[end].is_ascii_alphabetic();
+            if prev_alpha || next_alpha {
+                out.extend(&cs[start..end]);
+            } else {
+                out.push('…');
+            }
+            out.extend(&cs[end..i]);
+        } else {
+            out.push(cs[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
@@ -748,7 +788,7 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
         // "borderline" from "not even close" for false-reject diagnosis.
         eprintln!(
             "irlumed: UnsealPassword: denied for '{user}' (live={}, score {}: {}) -> password",
-            outcome.live, deny_score(outcome.score), outcome.reason
+            outcome.live, deny_score(outcome.score), deny_reason(&outcome.reason)
         );
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }
@@ -799,5 +839,21 @@ mod tests {
         let root = Peer { uid: 0, gid: 0, pid: 1 };
         // uid_of relies on /etc/passwd; just exercise the root path deterministically.
         assert!(authorized_for(&root, "nonexistent-user"));
+    }
+
+    #[test]
+    fn deny_reason_strips_measurements_keeps_prose() {
+        // (tracing is off in tests — IRLUME_LOG unset)
+        assert_eq!(deny_reason("IR too flat (center/edge 1.02) — looks 2D, not a 3D face"),
+                   "IR too flat (center/edge …) — looks 2D, not a 3D face");
+        assert_eq!(deny_reason("IR face too dark (42)"), "IR face too dark (…)");
+        assert_eq!(deny_reason("below threshold (rgb 0.35, fusion+ir-fallback miss)"),
+                   "below threshold (rgb …, fusion+ir-fallback miss)");
+        // digit runs attached to letters are prose/idents, not measurements
+        assert_eq!(deny_reason("a real face reflects 850nm"), "a real face reflects 850nm");
+        // trailing sentence period survives a float at end of sentence
+        assert_eq!(deny_reason("floor 1.12."), "floor ….");
+        // no numbers -> unchanged
+        assert_eq!(deny_reason("'ghost' is not enrolled"), "'ghost' is not enrolled");
     }
 }

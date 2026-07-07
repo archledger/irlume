@@ -71,11 +71,16 @@ compromised user session would be the one reading the journal. Both halves are
 privileged (enabling tracing needs root; reading the system journal needs
 root/`systemd-journal`), so this does not weaken a default setup — but the
 habit that keeps it irrelevant is: turn tracing on, reproduce your problem,
-turn it off. With tracing **off** (the default), denied-attempt scores are
-deliberately quantized to one decimal (`score ~0.4`) — coarse enough to kill
-the gradient, still enough to tell "borderline" from "not even close".
-Nothing else changes while tracing is on: gates, thresholds, and what the
-daemon will or will not release are identical.
+turn it off. With tracing **off** (the default), the journal's denied-attempt
+lines are deliberately coarsened: scores quantize to one decimal
+(`score ~0.4`) and measured cue values are redacted (`IR too flat
+(center/edge …)`) — the categorical reason (which gate fired) stays, the
+per-attempt gradient goes. The **exact** numbers still reach the one place a
+genuine user is being coached through a false reject: the TUI/CLI in their
+own session (the IPC reply), which a greeter-side attacker never sees — the
+PAM module ignores the reason text entirely. Nothing else changes while
+tracing is on: gates, thresholds, and what the daemon will or will not
+release are identical.
 
 ## Health & config at a glance
 

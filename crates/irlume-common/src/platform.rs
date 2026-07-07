@@ -57,8 +57,58 @@ pub fn distro_family() -> DistroFamily {
 /// services can also create `/run/user/<uid>`; treating that rare case as "warm"
 /// is acceptable (worst case: a cold login that skips the keyring-continue).
 pub fn user_has_live_session(user: &str) -> bool {
-    let Some(uid) = uid_for_name(user) else { return false };
-    std::path::Path::new(&format!("/run/user/{uid}")).exists()
+    // Prefer logind: an ACTIVE, `user`-class session. Unlike a bare
+    // `/run/user/<uid>` check, this is NOT fooled by a runtime dir that lingers
+    // after logout — which otherwise makes a logout→login look "warm" and skip
+    // the cold-login keyring unlock. Fall back to `/run/user/<uid>` if logind is
+    // unavailable.
+    if let Some(active) = active_graphical_session(user) {
+        return active;
+    }
+    uid_for_name(user)
+        .map(|uid| std::path::Path::new(&format!("/run/user/{uid}")).exists())
+        .unwrap_or(false)
+}
+
+/// `Some(active?)` from logind — does `user` own an active/online `user`-class
+/// session right now? `None` if `loginctl` is missing/unparsable (→ caller falls
+/// back to the runtime-dir heuristic).
+fn active_graphical_session(user: &str) -> Option<bool> {
+    let out = std::process::Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // columns: SESSION  UID  USER  SEAT  [TTY…]
+        let mut cols = line.split_whitespace();
+        let Some(session) = cols.next() else { continue };
+        let _uid = cols.next();
+        if cols.next() != Some(user) {
+            continue;
+        }
+        if session_is_active_user(session) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// A greeter session is `Class=greeter`; a real logged-in session is
+/// `Class=user`. A logout closes the user session (gone or `closing`), so only a
+/// live lock screen leaves an active/online user-class session.
+fn session_is_active_user(session: &str) -> bool {
+    let Ok(out) = std::process::Command::new("loginctl")
+        .args(["show-session", session, "-p", "Class", "-p", "State"])
+        .output()
+    else {
+        return false;
+    };
+    let t = String::from_utf8_lossy(&out.stdout);
+    let val = |k: &str| t.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").trim();
+    val("Class=") == "user" && matches!(val("State="), "active" | "online")
 }
 
 /// Resolve a user name to its uid via NSS (`getpwnam_r`). `None` if absent.

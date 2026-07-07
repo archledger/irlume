@@ -139,6 +139,31 @@ fn active_display_manager() -> Option<String> {
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
 }
 
+/// Minimum GNOME Shell major version that wires GDM with the consent-driven
+/// `ondemand` face mode instead of `facefirst`. Hardware-validated on GNOME 50
+/// (its gnome-shell greeter/lock submit an empty field to PAM); 46–49 are
+/// inferred (same gnome-shell architecture) and degrade gracefully if wrong
+/// (face just falls back to the password). Below this, GDM keeps `facefirst`
+/// (older gnome-shell blocked the active probe, so ambient scan is the only
+/// working face path). Lower as older versions are validated.
+const GDM_ONDEMAND_MIN_GNOME: u32 = 46;
+
+/// GNOME Shell major version via `gnome-shell --version` ("GNOME Shell 50.1" →
+/// 50). None when gnome-shell is absent/unparseable (→ conservative facefirst).
+fn gnome_shell_major() -> Option<u32> {
+    let out = std::process::Command::new("gnome-shell").arg("--version").output().ok()?;
+    if !out.status.success() { return None; }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find_map(|tok| tok.split('.').next().and_then(|n| n.parse::<u32>().ok()))
+}
+
+/// Whether GDM should wire the consent-driven `ondemand` mode for this GNOME
+/// version. `None` (undetected) → false, so an unknown GDM keeps facefirst.
+fn gdm_uses_ondemand(gnome_major: Option<u32>) -> bool {
+    gnome_major.is_some_and(|v| v >= GDM_ONDEMAND_MIN_GNOME)
+}
+
 /// The PAM services THIS login manager actually uses, so wiring targets what the
 /// DM will really consult (and, crucially, its separate FINGERPRINT service).
 /// Returns `(greeter_label, fingerprint_label_or_none)`.
@@ -284,13 +309,24 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     // login) AND the KEYRING line (fingerprint keyring unlock) — independent, so
     // an RGB+fingerprint box gets keyring-only here, while GDM's session keyring
     // unlock (which runs through gdm-password) still finds the password.
+    let gnome = gnome_shell_major();
     for s in GREETERS {
-        // cosmic-greeter answers the active probe on submit (so it takes the
-        // on-demand probe: face only on an empty-field Enter), unlike GDM whose
-        // conversation blocks and needs `facefirst`'s scan-immediately.
-        let ondemand = s.etc.ends_with("/cosmic-greeter");
-        let greeter_wire = |c: &str| wire_greeter_impl(c, want_face_login, want_fp_keyring, ondemand);
-        do_svc(s, &greeter_wire, want_face_login || want_fp_keyring);
+        // cosmic-greeter and gdm-password each drive BOTH the cold login and the
+        // live lock screen through ONE service (no separate lock service). So
+        // they carry the face line whenever face login OR face lock is wanted —
+        // an RGB (convenience) box still gets face LOCK there (a cold login on
+        // that tier stays denied by the daemon's credential-release gate).
+        let unified_login_lock = s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
+        let face = want_face_login || (unified_login_lock && want_face_lock);
+        // on-demand vs facefirst: cosmic always answers the active probe on
+        // submit; GDM does too on MODERN GNOME (validated on 50), so gate it by
+        // version. Older GDM blocked the probe, so it keeps `facefirst`'s
+        // scan-immediately — below the cutoff `ondemand` would only fall back to
+        // the password (graceful, no lockout) but face wouldn't fire.
+        let ondemand = s.etc.ends_with("/cosmic-greeter")
+            || (s.etc.ends_with("/gdm-password") && gdm_uses_ondemand(gnome));
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, ondemand);
+        do_svc(s, &greeter_wire, face || want_fp_keyring);
     }
     for s in FP_GREETERS {
         do_svc(s, &wire_fp_keyring, want_fp_keyring);
@@ -721,6 +757,17 @@ mod tests {
         // A non-cosmic Debian greeter (ondemand=false) still gets facefirst.
         let (g, _) = wire_greeter_impl(COSMIC, true, false, false);
         assert!(g.contains("facefirst") && !g.contains("ondemand"));
+    }
+
+    #[test]
+    fn gdm_ondemand_is_version_gated() {
+        // Modern GNOME (validated on 50) → on-demand; older → facefirst; unknown
+        // → facefirst (conservative). Boundary at the documented cutoff.
+        assert!(gdm_uses_ondemand(Some(50)));
+        assert!(gdm_uses_ondemand(Some(GDM_ONDEMAND_MIN_GNOME)));
+        assert!(!gdm_uses_ondemand(Some(GDM_ONDEMAND_MIN_GNOME - 1)));
+        assert!(!gdm_uses_ondemand(Some(3))); // GNOME 3.x-era
+        assert!(!gdm_uses_ondemand(None)); // undetected → facefirst
     }
 
     #[test]

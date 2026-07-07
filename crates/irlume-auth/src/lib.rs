@@ -799,12 +799,14 @@ impl Engine {
 /// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
 /// below-eye-level laptop camera looks UP at the face, biasing neutral toward
 /// the LOW (looking-up) end, so the floor isn't set aggressively high. These are
-/// tighter than the first pass (was yaw 0.40 / pitch 0.33–0.70) to coach a more
-/// squarely-frontal capture; still wide enough that a level face isn't nagged.
-/// Tune from the `IRLUME_LOG=debug` "framing:" trace (median = a level face).
-const FRAME_YAW_ASYM_MAX: f32 = 0.34;
-const FRAME_PITCH_MIN: f32 = 0.37;
-const FRAME_PITCH_MAX: f32 = 0.66;
+/// progressively tighter than the first pass (yaw 0.40 → 0.34 → 0.30; pitch
+/// 0.33–0.70 → 0.37–0.66 → 0.40–0.63) to coach a squarely-frontal capture;
+/// still wide enough that a level face isn't nagged. If a straight-on face
+/// starts getting corrected, loosen from the `IRLUME_LOG=debug` "framing:"
+/// trace (its median is where a level face sits on this camera).
+const FRAME_YAW_ASYM_MAX: f32 = 0.30;
+const FRAME_PITCH_MIN: f32 = 0.40;
+const FRAME_PITCH_MAX: f32 = 0.63;
 
 /// True when a head pose is squarely-frontal enough to enroll — the capture-time
 /// gate (in [`Engine::capture_scans`]) and the guide's `well_framed` share these
@@ -1031,7 +1033,7 @@ mod tests {
     fn frontal_signals_gates_capture() {
         let s = |yaw: f32, pitch: f32| Signals { head_yaw_asym: yaw, head_pitch_frac: pitch, ..Default::default() };
         assert!(frontal_signals(&s(0.0, 0.50)), "square-on should pass");
-        assert!(frontal_signals(&s(0.30, 0.55)), "small turn within bounds passes");
+        assert!(frontal_signals(&s(0.20, 0.55)), "small turn within bounds passes");
         assert!(!frontal_signals(&s(0.45, 0.50)), "clearly turned is rejected");
         assert!(!frontal_signals(&s(0.0, 0.20)), "looking up is rejected");
         assert!(!frontal_signals(&s(0.0, 0.75)), "looking down is rejected");
@@ -1053,9 +1055,9 @@ mod tests {
         // Looking DOWN (high pitch = nose toward mouth) → lift chin.
         let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.90 };
         assert!(frontality_hint(&p).starts_with("Lift your chin"));
-        // Both off: the more-severe axis wins (here yaw is 2x its limit, pitch
-        // barely over) → yaw guidance, not pitch.
-        let p = HeadPose { yaw_asym: 0.80, yaw_signed: 0.80, pitch_frac: 0.82 };
+        // Both off: the more-severe axis wins (yaw far past its limit) → yaw
+        // guidance, not pitch — robust to small bound tweaks.
+        let p = HeadPose { yaw_asym: 0.95, yaw_signed: 0.95, pitch_frac: 0.82 };
         assert_eq!(frontality_hint(&p), "Turn your head right to face the camera");
     }
 

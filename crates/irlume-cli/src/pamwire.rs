@@ -801,8 +801,11 @@ mod tests {
         assert!(dm_profile("/etc/pam.d/gdm-password", Some(50)).ondemand);
         assert!(!dm_profile("/etc/pam.d/gdm-password", Some(3)).ondemand); // old GNOME → facefirst
         assert!(!dm_profile("/etc/pam.d/gdm-password", None).ondemand);    // undetected → facefirst
-        // generic login-only greeters: facefirst.
-        assert!(!dm_profile("/etc/pam.d/sddm", None).ondemand);
+        // LightDM + SDDM: validated → on-demand.
+        assert!(dm_profile("/etc/pam.d/lightdm", None).ondemand);
+        assert!(dm_profile("/etc/pam.d/sddm", None).ondemand);
+        // an untested/unknown greeter defaults to the safe facefirst.
+        assert!(!dm_profile("/etc/pam.d/xdm", None).ondemand);
     }
 
     #[test]

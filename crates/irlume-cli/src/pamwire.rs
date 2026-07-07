@@ -24,18 +24,25 @@ const CREATED_PREFIX: &str = "# irlume: created from ";
 
 // Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
 const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
-/// Debian-family greeters (Ubuntu gdm-password): the stack is `@include`-based —
-/// a `success=N` jump cannot skip an include expansion — and GDM's conversation
-/// blocks on an active password probe, so wire a face-first `sufficient` line
-/// directly before the password include instead.
-const GREETER_UNSEAL_DEBIAN: &str = "auth       sufficient                   pam_irlume.so unseal facefirst";
-/// COSMIC greeter (cosmic-greeter): unlike GDM its conversation answers the
-/// active password probe from the buffered field, so it uses `ondemand` (face
-/// engages only on an empty-field Enter, never ambient) instead of GDM's
-/// `facefirst` scan-immediately — while keeping the same warm verify fallback,
-/// since cosmic-greeter also drives both the login and the lock screen.
-const GREETER_UNSEAL_COSMIC: &str = "auth       sufficient                   pam_irlume.so unseal ondemand";
-/// Jump-style variant of the above for a non-`@include` (e.g. Fedora) COSMIC stack.
+/// The Debian/Ubuntu greeter face line, for the `@include common-auth` layout
+/// (a `success=N` jump can't skip an include expansion, so this can't be the
+/// jump form). The CONTROL is tier-aware:
+///   * Secure (IR) tier — the face line UNSEALS, setting PAM_AUTHTOK, so
+///     `[success=ok default=ignore]` lets the stack CONTINUE: pam_unix then
+///     authenticates with the released password AND pam_gnome_keyring runs to
+///     unlock the login keyring. A bare `sufficient` short-circuits before the
+///     keyring module, so the wallet stays locked after a face login — this is
+///     the Debian/GDM-only gap (the Fedora success=1 layout continues past the
+///     jump, so its keyring already unlocks).
+///   * Convenience (RGB) tier — the face line only VERIFIES (releases no token),
+///     so it MUST short-circuit with `sufficient`; otherwise pam_unix would
+///     re-prompt for a password after the face already matched.
+/// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (empty-Enter).
+fn debian_greeter_line(secure: bool, mode: &str) -> String {
+    let ctrl = if secure { "[success=ok default=ignore]" } else { "sufficient" };
+    format!("auth       {ctrl}   pam_irlume.so unseal {mode}")
+}
+/// Jump-style variant for a non-`@include` (e.g. Fedora) COSMIC stack.
 const GREETER_UNSEAL_COSMIC_JUMP: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand";
 // Tagged so unwire strips OUR landing but never a foreign pam_permit.so the
 // stack legitimately carries (the trailing `#…` is a PAM comment, ignored).
@@ -325,13 +332,14 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         // the password (graceful, no lockout) but face wouldn't fire.
         let ondemand = s.etc.ends_with("/cosmic-greeter")
             || (s.etc.ends_with("/gdm-password") && gdm_uses_ondemand(gnome));
-        let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, ondemand);
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, ondemand, caps.ir_pair);
         do_svc(s, &greeter_wire, face || want_fp_keyring);
     }
     for s in FP_GREETERS {
         do_svc(s, &wire_fp_keyring, want_fp_keyring);
     }
-    do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
+    let lock_wire = |c: &str| wire_lock(c, caps.ir_pair);
+    do_svc(&LOCKSCREEN, &lock_wire, want_face_lock);
     // face-sudo is opt-in on enable (--with-sudo), but disable must ALWAYS
     // unwire it — "disable --apply undoes everything" is a documented promise,
     // and a stale sudo line would point at a module the user may remove next.
@@ -467,7 +475,7 @@ fn is_auth_directive(line: &str) -> bool {
 /// line (fingerprint keyring unlock — needed in gdm-password too, since GDM's
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
-fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
+fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool, secure: bool) -> (String, bool) {
     if !face && !keyring { return (content.to_string(), false); }
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
@@ -478,7 +486,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
-                if face { out.push(if ondemand { GREETER_UNSEAL_COSMIC } else { GREETER_UNSEAL_DEBIAN }.to_string()); }
+                if face { out.push(debian_greeter_line(secure, if ondemand { "ondemand" } else { "facefirst" })); }
                 out.push((*l).to_string());
                 if keyring { out.push(KEYRING_UNSEAL.to_string()); }
                 out.push(RESEAL_AUTH.to_string());
@@ -544,14 +552,14 @@ fn wire_single(content: &str, stanza: &str) -> (String, bool) {
 /// cosmic-greeter, applied to KDE's submit-driven lock service. No reseal (a
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
-fn wire_lock(content: &str) -> (String, bool) {
+fn wire_lock(content: &str, secure: bool) -> (String, bool) {
     if content_has_module(content) { return (content.to_string(), false); }
     let lines: Vec<&str> = content.lines().collect();
     // Debian `@include common-auth` layout → face-first `sufficient` before it.
     if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
         let mut out = Vec::with_capacity(lines.len() + 1);
         for (i, l) in lines.iter().enumerate() {
-            if i == inc_at { out.push(GREETER_UNSEAL_COSMIC.to_string()); }
+            if i == inc_at { out.push(debian_greeter_line(secure, "ondemand")); }
             out.push((*l).to_string());
         }
         return (format!("{}\n", out.join("\n")), true);
@@ -725,7 +733,7 @@ mod tests {
 
     #[test]
     fn greeter_block_wraps_password_substack() {
-        let (w, changed) = wire_greeter_impl(GDM, true, true, false);
+        let (w, changed) = wire_greeter_impl(GDM, true, true, false, true);
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let unseal = lines.iter().position(|l| l.contains("unseal")).unwrap();
@@ -746,7 +754,7 @@ mod tests {
     fn cosmic_greeter_wires_ondemand_not_facefirst() {
         // ondemand=true → on-demand probe line (face only on empty-Enter), placed
         // before the password include so the password stays a fallback.
-        let (w, changed) = wire_greeter_impl(COSMIC, true, false, true);
+        let (w, changed) = wire_greeter_impl(COSMIC, true, false, true, true);
         assert!(changed);
         assert!(w.contains("pam_irlume.so unseal ondemand"));
         assert!(!w.contains("facefirst"));
@@ -755,8 +763,23 @@ mod tests {
         let inc = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")).unwrap();
         assert!(unseal < inc);
         // A non-cosmic Debian greeter (ondemand=false) still gets facefirst.
-        let (g, _) = wire_greeter_impl(COSMIC, true, false, false);
+        let (g, _) = wire_greeter_impl(COSMIC, true, false, false, true);
         assert!(g.contains("facefirst") && !g.contains("ondemand"));
+    }
+
+    #[test]
+    fn debian_greeter_control_is_tier_aware() {
+        // Secure (IR) tier: unseal sets the token, so CONTINUE past the include
+        // (`[success=ok default=ignore]`) — pam_unix + pam_gnome_keyring run, so
+        // the keyring unlocks after a face login. Convenience (RGB): verify only,
+        // so short-circuit (`sufficient`) or pam_unix would re-prompt.
+        let secure = debian_greeter_line(true, "ondemand");
+        assert!(secure.contains("[success=ok default=ignore]"));
+        assert!(!secure.contains("sufficient"));
+        assert!(secure.contains("pam_irlume.so unseal ondemand"));
+        let conv = debian_greeter_line(false, "facefirst");
+        assert!(conv.contains("sufficient"));
+        assert!(conv.contains("pam_irlume.so unseal facefirst"));
     }
 
     #[test]
@@ -772,8 +795,8 @@ mod tests {
 
     #[test]
     fn greeter_wiring_is_idempotent() {
-        let (w1, _) = wire_greeter_impl(GDM, true, true, false);
-        let (w2, changed) = wire_greeter_impl(&w1, true, true, false);
+        let (w1, _) = wire_greeter_impl(GDM, true, true, false, true);
+        let (w2, changed) = wire_greeter_impl(&w1, true, true, false, true);
         assert!(!changed);
         assert_eq!(w1, w2);
     }
@@ -782,11 +805,11 @@ mod tests {
     fn method_switch_reconciles_the_line_set() {
         // face-only → (strip) → keyring-only must actually change the lines
         // (the method-switch case the old skip-if-present logic silently no-op'd).
-        let (face_only, _) = wire_greeter_impl(GDM, true, false, false);
+        let (face_only, _) = wire_greeter_impl(GDM, true, false, false, true);
         assert!(face_only.contains("pam_irlume.so unseal") && !face_only.contains("pam_irlume.so keyring"));
         let (base, stripped) = unwire_lines(&face_only);
         assert!(stripped && !base.contains(MODULE));
-        let (keyring_only, _) = wire_greeter_impl(&base, false, true, false);
+        let (keyring_only, _) = wire_greeter_impl(&base, false, true, false, true);
         assert!(keyring_only.contains("pam_irlume.so keyring") && !keyring_only.contains("pam_irlume.so unseal"));
         assert_ne!(face_only, keyring_only);
     }
@@ -812,7 +835,7 @@ mod tests {
 
     #[test]
     fn kde_lock_is_ondemand_not_ambient_wait() {
-        let (w, changed) = wire_lock(KDE_LOCK);
+        let (w, changed) = wire_lock(KDE_LOCK, false);
         assert!(changed);
         // consent-driven on-demand, never the ambient `wait` mode, no reseal.
         assert!(w.contains("pam_irlume.so unseal ondemand"));

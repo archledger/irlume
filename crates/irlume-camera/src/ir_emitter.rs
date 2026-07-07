@@ -81,18 +81,36 @@ fn conf_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/var/lib/irlume/ir_emitter.conf"))
 }
 
+/// Emitter control — the FIRST line of the conf.
 fn load_conf() -> Option<EmitterControl> {
     let raw = std::fs::read_to_string(conf_path()).ok()?;
-    parse_control(raw.trim())
+    parse_control(raw.lines().next()?.trim())
 }
 
-/// Persist a discovered control so future captures use it automatically.
+/// Optional companion BOOST control — the SECOND line of the conf, if present.
+fn load_boost() -> Option<EmitterControl> {
+    let raw = std::fs::read_to_string(conf_path()).ok()?;
+    parse_control(raw.lines().nth(1)?.trim())
+}
+
+/// Persist a discovered emitter control so future captures use it automatically.
 pub fn save_conf(ctrl: &EmitterControl) -> std::io::Result<()> {
+    save_conf_full(ctrl, None)
+}
+
+/// Persist the emitter and (optionally) a companion boost control. The boost is
+/// written as a second line and is applied ALONGSIDE the emitter by [`enable`].
+pub fn save_conf_full(emitter: &EmitterControl, boost: Option<&EmitterControl>) -> std::io::Result<()> {
     let path = conf_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, ctrl.encode())
+    let mut s = emitter.encode();
+    if let Some(b) = boost {
+        s.push('\n');
+        s.push_str(&b.encode());
+    }
+    std::fs::write(&path, s)
 }
 
 /// Parse `unit:selector:b,b,b,...` (decimal or `0x` hex bytes).
@@ -162,7 +180,13 @@ pub fn enable(fd: c_int, card: &str) -> bool {
     let Some(ctrl) = env_control().or_else(load_conf).or_else(|| known_control(card)) else {
         return false;
     };
-    set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload)
+    let ok = set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload);
+    // Apply a discovered companion brightness-boost control (conf-only) alongside
+    // the emitter — best-effort, never gates the emitter result.
+    if let Some(b) = load_boost() {
+        let _ = set_cur(fd, b.unit, b.selector, &b.payload);
+    }
+    ok
 }
 
 /// Candidate SET_CUR payloads to try for a control of `size` bytes — the common
@@ -198,7 +222,7 @@ fn candidate_payloads(size: usize) -> Vec<Vec<u8>> {
 /// (restored to its original before the next), so measurements aren't polluted;
 /// only the global winner is re-applied at the end. A failed search leaves the
 /// camera unchanged.
-pub fn autoconfigure(fd: c_int, mut measure: impl FnMut() -> f32) -> Option<EmitterControl> {
+pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<EmitterControl> {
     let baseline = measure(); // emitter off
     let success = |b: f32| b >= baseline + 20.0 && b >= 40.0;
     let mut best: Option<(EmitterControl, f32)> = None;
@@ -227,6 +251,70 @@ pub fn autoconfigure(fd: c_int, mut measure: impl FnMut() -> f32) -> Option<Emit
         let _ = set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload);
     }
     best.map(|(ctrl, _)| ctrl)
+}
+
+/// After the emitter is set, look for a COMPANION XU control that further
+/// brightens the IR — an exposure/gain-like vendor control (e.g. the NexiGo
+/// N930W's second control, unit4/sel9). With the emitter kept LIT, sweep each
+/// OTHER XU control's boost candidates and keep the one that lifts mean IR
+/// brightness the most above the emitter-alone level; restore the rest. Returns
+/// the boost control (left applied, alongside the emitter) or None if nothing
+/// helped. Non-destructive.
+pub fn discover_boost<F: FnMut() -> f32>(
+    fd: c_int,
+    emitter: &EmitterControl,
+    measure: &mut F,
+) -> Option<EmitterControl> {
+    let relight = |fd: c_int| { let _ = set_cur(fd, emitter.unit, emitter.selector, &emitter.payload); };
+    relight(fd);
+    let base = measure(); // emitter on, no boost
+    let mut best: Option<(EmitterControl, f32)> = None;
+    for unit in 0u8..=31 {
+        for selector in 0u8..=15 {
+            if unit == emitter.unit && selector == emitter.selector {
+                continue; // that's the emitter itself
+            }
+            let Some(len) = get_len(fd, unit, selector) else { continue };
+            let orig = get_cur(fd, unit, selector, len);
+            for payload in boost_candidates(len) {
+                relight(fd); // keep the emitter lit during the boost sweep
+                if !set_cur(fd, unit, selector, &payload) {
+                    continue;
+                }
+                let b = measure();
+                // Require a clear lift so we don't latch onto measurement noise.
+                if b >= base + 6.0 && best.as_ref().map_or(true, |(_, bb)| b > *bb) {
+                    best = Some((EmitterControl { unit, selector, payload: payload.clone() }, b));
+                }
+            }
+            if let Some(o) = orig {
+                let _ = set_cur(fd, unit, selector, &o); // restore before the next control
+            }
+        }
+    }
+    relight(fd);
+    if let Some((c, _)) = &best {
+        let _ = set_cur(fd, c.unit, c.selector, &c.payload);
+    }
+    best.map(|(c, _)| c)
+}
+
+/// Candidate payloads for a companion BOOST control (an unknown vendor control
+/// that may raise IR exposure/gain). We can't read its semantics, so sweep a few
+/// magnitudes low→high — a genuine brightness control gets brighter as the value
+/// rises, which `discover_boost` detects from the IR image.
+fn boost_candidates(len: usize) -> Vec<Vec<u8>> {
+    let full = |v: u8| vec![v; len];
+    let low_bytes = |n: usize| {
+        let mut p = vec![0u8; len];
+        for b in p.iter_mut().take(n) {
+            *b = 0xFF;
+        }
+        p
+    };
+    let mut v = vec![full(0xFF), full(0x80), full(0x40), low_bytes(1), low_bytes(2)];
+    v.dedup();
+    v
 }
 
 /// Read-only enumeration of the camera's XU controls (unit, selector, size), for

@@ -671,7 +671,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         let _ = stream.next(); // let the sensor settle before baseline
     }
     // Mean IR brightness over a short burst (catches a strobed emitter's lit phase).
-    let measure = || -> f32 {
+    let mut measure = || -> f32 {
         let mut best = 0.0f32;
         for _ in 0..8 {
             if let Ok((buf, _)) = stream.next() {
@@ -681,10 +681,23 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         }
         best
     };
-    match ir_emitter::autoconfigure(fd, measure) {
+    match ir_emitter::autoconfigure(fd, &mut measure) {
         Some(ctrl) => {
-            ir_emitter::save_conf(&ctrl).map_err(|e| Error::Io(e.to_string()))?;
-            Ok(format!("IR emitter enabled — control {} (saved; future captures use it automatically)", ctrl.encode()))
+            // With the emitter lit, look for a companion control that brightens
+            // the IR further (an exposure/gain-like vendor XU control) — persist
+            // it alongside the emitter so every capture applies both.
+            let boost = ir_emitter::discover_boost(fd, &ctrl, &mut measure);
+            ir_emitter::save_conf_full(&ctrl, boost.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
+            Ok(match &boost {
+                Some(b) => format!(
+                    "IR emitter enabled — control {} + brightness boost {} (saved; future captures use both)",
+                    ctrl.encode(), b.encode()
+                ),
+                None => format!(
+                    "IR emitter enabled — control {} (saved; no extra brightness control found)",
+                    ctrl.encode()
+                ),
+            })
         }
         None => Err(Error::Hardware(
             "could not auto-enable the IR emitter: no extension-unit control brightened the IR image. \

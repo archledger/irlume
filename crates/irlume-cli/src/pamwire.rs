@@ -201,8 +201,12 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
         // lightdm/sddm. (cosmic-greeter, itself an ondemand greetd greeter, is the
         // System76 case handled above.)
         "greetd" => DmProfile { ondemand: true },
-        // plasmalogin / other submit-driven greeters — default to the safe
-        // facefirst until each is validated for the on-demand probe.
+        // plasmalogin (KDE's Plasma Login Manager, an SDDM fork): submit-driven,
+        // answers the empty-field probe like sddm → ondemand. Validated live on
+        // Fedora 44 KDE (the [success=1] substack layout).
+        "plasmalogin" => DmProfile { ondemand: true },
+        // other/unknown submit-driven greeters — default to the safe facefirst
+        // until each is validated for the on-demand probe.
         _ => DmProfile { ondemand: false },
     }
 }
@@ -840,6 +844,8 @@ mod tests {
         assert!(dm_profile("/etc/pam.d/sddm", None).ondemand);
         // greetd: submit-driven family → on-demand.
         assert!(dm_profile("/etc/pam.d/greetd", None).ondemand);
+        // plasmalogin (SDDM fork): submit-driven → on-demand.
+        assert!(dm_profile("/etc/pam.d/plasmalogin", None).ondemand);
         // an untested/unknown greeter defaults to the safe facefirst.
         assert!(!dm_profile("/etc/pam.d/xdm", None).ondemand);
     }

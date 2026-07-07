@@ -799,7 +799,7 @@ KEYRING / TPM
   diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)
 
 SYSTEM INTEGRATION
-  login <status|enable|disable> [--apply]   PAM wiring for greeters + lock screen
+  login <status|enable|disable> [--with-sudo] [--apply]   PAM wiring for greeters + lock screen
   fingerprint <status|add|enable|disable>   fprintd companion factor
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely

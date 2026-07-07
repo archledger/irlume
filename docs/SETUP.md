@@ -109,16 +109,25 @@ sudo irlume login enable --apply
 ```
 
 This wires the **greeter and lock screen** for your login manager (GDM, SDDM,
-Plasma). Without `--apply` it's a dry run that prints the plan and writes
-nothing.
+Plasma, LightDM, greetd, COSMIC). Without `--apply` it's a dry run that prints
+the plan and writes nothing.
 
 ```
   login manager: plasmalogin   ·   method: auto   ·   IR/Secure tier
   plan → face login: on   face lock: on   fingerprint keyring: —
+  face trigger: on-demand — leave the password empty and press Enter to use your face
   ✓ /etc/pam.d/plasmalogin — materialized override from /usr/lib/pam.d/plasmalogin
   ✓ /etc/pam.d/kde-fingerprint — wired (backup /etc/pam.d/kde-fingerprint.pre-irlume)
 [login] done. Password remains the fallback everywhere.
 ```
+
+**How you log in:** face is **on-demand** — at the greeter (and lock screen),
+leave the password field **empty and press Enter**; the camera fires only then,
+never on its own. Typing a password never starts the camera, and the password
+always works. The one exception is older GNOME greeters (Shell < 46), whose
+greeter can't relay the empty-field probe — there the camera verifies as soon
+as your account is selected (face-first). `irlume login status` shows which
+mode each wired service uses.
 
 ### 4. Keyring unlock — recommended (IR camera + TPM)
 

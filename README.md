@@ -40,6 +40,7 @@ Engineered to meet or beat Windows Hello, on a fully-open, commercially-clean st
 |---|---|
 | 🌑 **Works in the dark** | Active **infrared** recognition (Windows-Hello cameras) — no ambient light needed. |
 | 🔒 **Unlocks everything** | Login greeter, lock screen, and `sudo` (opt-in via `login enable --with-sudo`) — with the password always as fallback (**no lockout, ever**). |
+| 🙋 **On-demand, by consent** | The camera fires only when you ask: leave the password field **empty and press Enter**. Typing a password never starts a scan. Wiring is tailored per login manager (GDM · SDDM · Plasma Login · LightDM · greetd · COSMIC). |
 | 🗝️ **Opens your keyring** | On IR hardware a face match **TPM-unseals your login password** so the wallet unlocks at login — like Hello. |
 | 👁️ **Real liveness** | Algorithmic IR anti-spoof gate + **opt-in passive blink** detection (no prompt, no action). |
 | 🧬 **Privacy by design** | Stores **512-D embeddings, never images**; on TPM hardware they're **AES-256-GCM encrypted** under a **TPM-sealed** key (without a TPM: root-only files, and the TUI says so). |
@@ -129,7 +130,9 @@ irlume tui                         # enroll your face + configure, guided
 sudo irlume login enable --apply   # opt-in: wire the greeter + lock screen
 ```
 
-`login enable` (and the TUI's `[w]`) wires the **greeter and lock screen**.
+`login enable` (and the TUI's `[w]`) wires the **greeter and lock screen** for
+your login manager. From then on face is **on-demand**: at the greeter or lock
+screen, leave the password empty and press Enter — the camera fires only then.
 Face-`sudo` is a separate opt-in — add it with
 `sudo irlume login enable --with-sudo --apply`, since granting root by face is a
 trade-off worth choosing deliberately (the password always still works).
@@ -290,13 +293,16 @@ Profiles are per-user and deletable any time.
 <details>
 <summary><b>Does it work on Ubuntu / Fedora / Arch, GNOME / KDE, Wayland?</b></summary>
 
-Yes — irlume authenticates through PAM, so the desktop stack doesn't matter.
-Validation so far, all on Wayland: **Fedora KDE** end-to-end on IR hardware
-(greeter, lock screen, `sudo`, TPM keyring unlock), **Ubuntu GNOME** on an
-RGB+fingerprint laptop (lock-screen face unlock, fingerprint, correct
-password-only refusals for login/sudo), and **Arch** for packaging, install,
-and the full CLI/daemon stack (the Arch testbed has no camera). Reports from
-other hardware are very welcome.
+Yes — irlume authenticates through PAM, and tailors the greeter wiring to the
+login manager it detects. Validated live on real machines: **Fedora KDE**
+end-to-end on IR hardware (Plasma Login Manager greeter, lock screen, `sudo`,
+TPM keyring unlock — Wayland), **Ubuntu GNOME** on an RGB+fingerprint laptop
+(lock-screen face unlock, fingerprint, correct password-only refusals for
+login/sudo), the full login-manager matrix — **GDM** (on-demand on GNOME ≥ 46;
+face-first before that), **SDDM**, **LightDM** (gtk and slick greeters, X11),
+**greetd** (tuigreet), and **COSMIC's greeter** — and **Arch** for packaging,
+install, and the full CLI/daemon stack (that testbed has no camera). Reports
+from other hardware are very welcome.
 </details>
 
 ## 🛠️ Status

@@ -284,16 +284,27 @@ fn status() -> ExitCode {
         }
     }
     let mut any = false;
+    let mut any_ondemand = false;
     for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
         if let Some(present) = service_present(s) {
-            let wired = file_has_module(&present);
+            let content = std::fs::read_to_string(&present).unwrap_or_default();
+            let wired = content_has_module(&content);
             any |= wired;
-            println!("  {:<34} {}", present.display(), if wired { "● wired" } else { "○ not wired" });
+            // Surface HOW face fires on this service — on-demand (the consent
+            // model) is invisible in the PAM file to a user, so name it here.
+            let label = if !wired { "○ not wired" }
+                else if !content.contains("unseal") { "● wired" } // keyring-only line
+                else if content.contains("ondemand") { any_ondemand = true; "● wired (face on-demand)" }
+                else { "● wired (face-first)" };
+            println!("  {:<34} {}", present.display(), label);
         }
     }
     if Path::new(SUDO).exists() {
         let wired = file_has_module(Path::new(SUDO));
         println!("  {:<34} {}", SUDO, if wired { "● wired (sudo)" } else { "○ not wired (sudo)" });
+    }
+    if any_ondemand {
+        println!("  on-demand: leave the password empty and press Enter to use your face");
     }
     println!("[login] SELinux module: {}", match selinux_loaded() {
         Some(true) => "loaded",
@@ -341,6 +352,18 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
             onoff(want_face_login), onoff(want_face_lock), onoff(want_fp_keyring));
         if caps.rgb && !caps.ir_pair && !is_fp_method {
             println!("  (RGB-only: face satisfies the LOCK SCREEN only; login/sudo keep the password)");
+        }
+        // Tell the user HOW face will fire at their greeter — on-demand (the
+        // consent model) is not discoverable from the greeter UI itself.
+        if want_face_login {
+            if let Some(dm) = active_display_manager() {
+                let (greeter, _) = dm_pam_services(&dm);
+                println!("  face trigger: {}", if dm_profile(&format!("/etc/pam.d/{greeter}"), gnome_shell_major()).ondemand {
+                    "on-demand — leave the password empty and press Enter to use your face"
+                } else {
+                    "face-first — the camera verifies as soon as your account is selected"
+                });
+            }
         }
     }
     let mut errs = 0;

@@ -1752,6 +1752,7 @@ impl App {
         lines.push(Line::raw(""));
         lines.push(section("Change (root)"));
         lines.push(Line::from(vec![Span::styled("  [w]", Style::new().fg(ACCENT)), Span::styled(" wire the login stack now (runs sudo irlume login enable --apply)", Style::new())]));
+        lines.push(Line::from(Span::styled("  at the greeter/lock: leave the password empty, press Enter — face fires only then", Style::new().dim())));
         lines.push(Line::from(vec![Span::styled("  face-sudo ", Style::new()), Span::styled("opt-in, not wired by [w]: sudo irlume login enable --with-sudo --apply", Style::new().dim())]));
         lines.push(Line::from(vec![Span::styled("  disable ", Style::new()), Span::styled("sudo irlume login disable --apply", Style::new().dim())]));
         lines.push(Line::from(vec![Span::styled("  [s]", Style::new().fg(ACCENT)), Span::styled(" open full status in a console view", Style::new().dim())]));

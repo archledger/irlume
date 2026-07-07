@@ -601,9 +601,10 @@ impl Engine {
     fn capture_scans(&mut self, want: usize, pitch_neutral: Option<f32>)
         -> irlume_common::Result<Vec<(Vec<f32>, Option<Vec<f32>>, f32, f32, f32)>> {
         let mut out = Vec::new();
-        // Budget bumped (was ×4) to absorb the added frontality gate — a frame
-        // grabbed the instant the user drifts off-angle is now rejected, not saved.
-        for _ in 0..(want * 6) {
+        // Budget (was ×4) absorbs the added frontality gate — a frame grabbed the
+        // instant the user drifts off-angle is rejected, not saved — with enough
+        // retries that a brief drift near the capture moment doesn't abort enroll.
+        for _ in 0..(want * 10) {
             if out.len() >= want {
                 break;
             }
@@ -810,19 +811,20 @@ impl Engine {
 /// A tighter band makes the up/down cue fire at a MODERATE, still-detectable
 /// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
 /// below-eye-level laptop camera looks UP at the face, biasing neutral toward
-/// the LOW (looking-up) end, so the floor isn't set aggressively high. After a
-/// round of aggressive tightening (down to yaw 0.27 / pitch 0.42–0.61) these
-/// are back to CONSERVATIVE, forgiving values — tight enough to coach a frontal
-/// capture, loose enough not to nag a naturally-held head (per-user calibration
-/// still recentres the pitch window on each camera). Loosen further from the
-/// `IRLUME_LOG=debug` "framing:" trace if a straight-on face still gets corrected.
+/// the LOW (looking-up) end. This is the UNCALIBRATED bootstrap band, used only
+/// until a user has ≥2 enrolled scans: it is deliberately WIDE so a FIRST
+/// enrollment succeeds on any camera geometry — a below-eye laptop cam can read
+/// a level face at ~0.72, an eye-level cam at ~0.45, so the window must span both
+/// or first enroll could loop with no escape. Once calibrated, [`pitch_band`]
+/// recentres a tighter `neutral ± PITCH_TOL` window on the user's own camera.
+/// Yaw is camera-independent (0 = frontal on any rig) so it stays moderately tight.
 const FRAME_YAW_ASYM_MAX: f32 = 0.36;
-const FRAME_PITCH_MIN: f32 = 0.35;
-const FRAME_PITCH_MAX: f32 = 0.67;
-/// Half-width of the pitch acceptance window once the user's neutral is known.
-/// Matches the conservative default band's half-width (±0.16) but centres it on
-/// the camera's actual level reading instead of the global constant.
-const PITCH_TOL: f32 = 0.16;
+const FRAME_PITCH_MIN: f32 = 0.28;
+const FRAME_PITCH_MAX: f32 = 0.75;
+/// Half-width of the pitch window once the user's neutral is known. Tighter than
+/// the wide bootstrap band because it's centred on the camera's actual level
+/// reading — coaches a squarely-frontal capture without nagging a level face.
+const PITCH_TOL: f32 = 0.13;
 
 /// The pitch acceptance window: `neutral ± PITCH_TOL` once this user has a
 /// calibrated neutral (from prior enrollment scans), else the hand-tuned global
@@ -1060,14 +1062,14 @@ mod tests {
     #[test]
     fn frontal_signals_gates_capture() {
         let s = |yaw: f32, pitch: f32| Signals { head_yaw_asym: yaw, head_pitch_frac: pitch, ..Default::default() };
-        // Uncalibrated (None) → global default band [0.42, 0.61].
+        // Uncalibrated (None) → wide bootstrap band [0.28, 0.75].
         assert!(frontal_signals(&s(0.0, 0.50), None), "square-on should pass");
-        assert!(frontal_signals(&s(0.20, 0.55), None), "small turn within bounds passes");
+        assert!(frontal_signals(&s(0.20, 0.72), None), "a low laptop-cam neutral still bootstraps");
         assert!(!frontal_signals(&s(0.45, 0.50), None), "clearly turned is rejected");
         assert!(!frontal_signals(&s(0.0, 0.20), None), "looking up is rejected");
-        assert!(!frontal_signals(&s(0.0, 0.75), None), "looking down is rejected");
+        assert!(!frontal_signals(&s(0.0, 0.82), None), "clearly looking down is rejected");
         // Calibrated to a high (laptop-biased) neutral 0.62 → band recentres to
-        // [0.46, 0.78], so a level face reading 0.62 passes and a clear tilt does not.
+        // 0.62 ± 0.13 = [0.49, 0.75], so a level face reading 0.62 passes and a clear tilt does not.
         assert!(frontal_signals(&s(0.0, 0.62), Some(0.62)), "at the calibrated neutral passes");
         assert!(!frontal_signals(&s(0.0, 0.40), Some(0.62)), "well below the neutral is rejected");
     }

@@ -256,7 +256,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 version: env!("CARGO_PKG_VERSION").into(),
             }
         }
-        Request::PositionSample { user } => match engine.position_sample(user.as_deref()) {
+        // Only tune the band to a user the peer may act for (root, or their own
+        // account) — else ignore it. Stops a non-root peer forcing a per-poll TPM
+        // unseal of another user's (e.g. root's) enrollment via the framing guide.
+        Request::PositionSample { user } => match engine.position_sample(
+            user.as_deref().filter(|u| authorized_for(peer, u)),
+        ) {
             Ok(r) => Response::Position(r),
             Err(e) => Response::Error(e.to_string()),
         },

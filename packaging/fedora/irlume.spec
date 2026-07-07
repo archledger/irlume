@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -134,6 +134,13 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Mon Jul 07 2026 archledger <archledger236@gmail.com> - 0.1.3-1
+- Every major login manager profiled for on-demand face auth (GDM/SDDM/LightDM/
+  greetd/COSMIC/Plasma Login); `irlume logs` + IRLUME_LOG=debug diagnostics.
+- Directional, per-user auto-calibrated enrollment guidance; 5 scans; frontal
+  framing enforced at capture. TUI hint bar.
+- Security: peer-authenticated 1:N identify; redacted journal deny lines.
+
 * Sun Jul 05 2026 archledger <archledger236@gmail.com> - 0.1.2-1
 - First-run: daemon enabled+started at install (systemd preset + %%post);
   irlume-selinux pulled in by default (Recommends) and the daemon restarts

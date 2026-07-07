@@ -3,6 +3,48 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] — 2026-07-07
+
+Display-manager coverage, a diagnostics story, security hardening, and a much
+friendlier guided enrollment.
+
+### Added
+
+- **Every major login manager is now profiled** for consent-driven face auth:
+  GDM (on-demand on GNOME ≥ 46, face-first below), SDDM, LightDM (gtk + slick),
+  greetd, COSMIC's greeter, and KDE's Plasma Login Manager — each wired to the
+  behaviour its greeter actually supports. Face is **on-demand** by default:
+  leave the password empty and press Enter; typing a password never starts the
+  camera.
+- **`irlume logs`** — the whole face-auth story (daemon, PAM grantors, keyring
+  modules) in one journal view, with `-f` / `--since`. **`irlume logs debug
+  on|off`** toggles per-stage pipeline tracing (`IRLUME_LOG=debug`) — capture
+  timings, liveness cues vs thresholds, match scores — for diagnosing a failed
+  or slow login. Numbers only; never frames, embeddings, or secrets.
+- **Directional enrollment guidance**: the framing guide now tells you which way
+  to turn ("Turn your head left") and tilt ("Lift your chin"), and **auto-
+  calibrates the frontal pitch neutral per user/camera** so the coaching centres
+  on wherever a level face reads on your hardware. Fresh enrollment now captures
+  **5 scans** (was 3).
+- A per-tab **hint bar** in the TUI so a first-time user always knows what a
+  screen is for and which key to press. `docs/DEBUGGING.md` scrutineer's guide.
+
+### Security
+
+- **1:N `identify` and identity verification are peer-authenticated**: a
+  non-root caller is scoped to its own account (root keeps the cross-user
+  search), closing a similarity-score oracle on a world-connectable socket.
+- **Journal deny lines are redacted** with tracing off: denied-attempt scores
+  quantize to one decimal and cue measurements are stripped, so the system
+  journal can't be used as a spoof-tuning oracle. Exact values still reach the
+  session's own TUI/CLI for false-reject coaching.
+
+### Fixed
+
+- **Enrollment enforces frontal framing at capture, not just before the
+  countdown** — drifting off-angle during the 3-2-1 re-frames instead of saving
+  a bad-angle template.
+
 ## [0.1.2] — 2026-07-05
 
 First-run smoothness release, driven by a screen-recorded fresh-install test

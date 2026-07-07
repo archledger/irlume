@@ -743,7 +743,7 @@ impl Engine {
         let Some(f) = top else {
             return Ok(PositionReport {
                 ir_ok,
-                guidance: "No face detected — center yourself in front of the camera".into(),
+                guidance: "No face detected — look straight at the camera and center yourself".into(),
                 ..Default::default()
             });
         };
@@ -757,8 +757,12 @@ impl Engine {
         let mut q = 100i32;
         let mut guidance = "Hold still — looking good".to_string();
         let mut well = true;
-        let frontal = pose.yaw_asym <= irlume_liveness::YAW_ASYM_MAX
-            && (irlume_liveness::PITCH_FRAC_MIN..=irlume_liveness::PITCH_FRAC_MAX).contains(&pose.pitch_frac);
+        let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX
+            && (FRAME_PITCH_MIN..=FRAME_PITCH_MAX).contains(&pose.pitch_frac);
+        // Live pose numbers for calibrating the framing bounds to a given camera
+        // (`IRLUME_LOG=debug`): a below-eye-level laptop cam biases pitch high.
+        irlume_common::dlog!("framing: yaw_asym={:.2} yaw_signed={:.2} pitch={:.2} face_frac={:.2} bright={:.0}",
+            pose.yaw_asym, pose.yaw_signed, pose.pitch_frac, face_frac, brightness);
         if face_frac < MIN_FRAC {
             guidance = "Move closer".into(); well = false; q -= 45;
         } else if face_frac > MAX_FRAC {
@@ -779,6 +783,20 @@ impl Engine {
     }
 }
 
+/// Framing-guide frontality bounds — deliberately STRICTER than the liveness
+/// anti-spoof gate (yaw 0.40 / pitch 0.20–0.80). The wide liveness pitch band
+/// meant a normal chin tilt never left "frontal", so "lift/lower your chin"
+/// almost never fired — and by the time a tilt was steep enough to trip the
+/// liveness band, the detector had already lost the face ("no face detected").
+/// A tighter band makes the up/down cue fire at a MODERATE, still-detectable
+/// tilt. Pitch is biased slightly high (centre ~0.53) because a below-eye-level
+/// laptop camera looks up at the face and reads pitch high even when level.
+/// Yaw keeps the liveness value — it already coached well before face loss.
+/// Tune with the `IRLUME_LOG=debug` "framing:" trace if a camera reads off.
+const FRAME_YAW_ASYM_MAX: f32 = 0.40;
+const FRAME_PITCH_MIN: f32 = 0.35;
+const FRAME_PITCH_MAX: f32 = 0.72;
+
 /// Turn a non-frontal head pose into a directional enrollment instruction, told
 /// in the USER's own frame. On irlume's non-mirrored capture, nose-toward-image-
 /// left (`yaw_signed < 0`) means the person is looking to THEIR right, so we ask
@@ -786,18 +804,18 @@ impl Engine {
 /// we ask for a chin lift. When both axes are off the more-severe one wins, so
 /// the user is corrected on one thing at a time instead of being bounced around.
 fn frontality_hint(pose: &irlume_vision::HeadPose) -> String {
-    use irlume_liveness::{PITCH_FRAC_MAX, PITCH_FRAC_MIN, YAW_ASYM_MAX};
-    let yaw_off = pose.yaw_asym > YAW_ASYM_MAX;
-    let pitch_off = pose.pitch_frac < PITCH_FRAC_MIN || pose.pitch_frac > PITCH_FRAC_MAX;
-    let yaw_sev = pose.yaw_asym / YAW_ASYM_MAX;
-    let pitch_sev = (pose.pitch_frac - 0.5).abs() / ((PITCH_FRAC_MAX - PITCH_FRAC_MIN) / 2.0);
+    let mid = (FRAME_PITCH_MIN + FRAME_PITCH_MAX) / 2.0;
+    let yaw_off = pose.yaw_asym > FRAME_YAW_ASYM_MAX;
+    let pitch_off = pose.pitch_frac < FRAME_PITCH_MIN || pose.pitch_frac > FRAME_PITCH_MAX;
+    let yaw_sev = pose.yaw_asym / FRAME_YAW_ASYM_MAX;
+    let pitch_sev = (pose.pitch_frac - mid).abs() / ((FRAME_PITCH_MAX - FRAME_PITCH_MIN) / 2.0);
     if yaw_off && (!pitch_off || yaw_sev >= pitch_sev) {
         // Nose toward image-left → looking to their right → turn left, and vice versa.
         if pose.yaw_signed < 0.0 { "Turn your head left to face the camera".into() }
         else { "Turn your head right to face the camera".into() }
-    } else if pose.pitch_frac < PITCH_FRAC_MIN {
+    } else if pose.pitch_frac < FRAME_PITCH_MIN {
         "Lift your chin — look up a little".into()
-    } else if pose.pitch_frac > PITCH_FRAC_MAX {
+    } else if pose.pitch_frac > FRAME_PITCH_MAX {
         "Lower your chin — look down a little".into()
     } else {
         "Look straight at the camera".into()

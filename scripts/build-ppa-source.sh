@@ -5,10 +5,17 @@
 # self-contained: vendored crates (cargo vendor), the bundled onnxruntime
 # release libs, and the real ONNX model weights (not LFS pointers).
 #
-# Run on an Ubuntu/Debian box from a repo checkout with real LFS models:
-#   bash scripts/build-ppa-source.sh
-# Then sign irlume_*_source.changes with the release key and:
-#   dput ppa:archledger/irlume irlume_*_source.changes
+# Run on an Ubuntu/Debian box from a repo checkout with real LFS models.
+#
+# A PPA is keyed on the Ubuntu SERIES codename, not the derivative name, so one
+# build per LTS base covers every derivative on it (noble -> Pop!_OS 24.04, Mint
+# 22, Zorin 18, elementary 8, Ubuntu 24.04; jammy -> the 22.04 generation).
+# Build + upload each series you want to support — at minimum the current LTS:
+#   for s in noble jammy resolute; do
+#     SERIES=$s bash scripts/build-ppa-source.sh
+#     debsign  "$HOME/ppa-build/irlume_"*"~${s}1_source.changes"   # release key
+#     dput ppa:archledger/irlume "$HOME/ppa-build/irlume_"*"~${s}1_source.changes"
+#   done
 #
 # Env knobs: SERIES (default resolute), PPAREV (0ppa1), ORT_VER (1.24.4),
 # BUILDROOT (~/ppa-build), SKIP_BUILD_CHECK=1 to skip the offline test build.

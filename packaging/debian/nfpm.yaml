@@ -23,6 +23,11 @@ license: GPL-3.0-or-later
 depends:
   - libpam0g
   - libtss2-esys-3.0.2-0 | libtss2-esys-3.0.2-0t64
+  # tctildr is the TCTI loader the binary links directly; it is NOT pulled in
+  # by libtss2-esys (esys drags in mu/sys/tcti-device, but not tctildr), so a
+  # clean install without it leaves irlumed crash-looping on a missing .so.
+  # (The PPA build computes this automatically via ${shlibs:Depends}.)
+  - libtss2-tctildr0 | libtss2-tctildr0t64
 recommends:
   - fprintd
 

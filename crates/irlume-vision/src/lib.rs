@@ -44,7 +44,9 @@ pub struct HeadPose {
     /// toward-image-left means the person is looking to THEIR OWN right. ~0 frontal.
     pub yaw_signed: f32,
     /// Nose's vertical position between the eye line and mouth line. ~0.5
-    /// frontal; smaller looking down, larger looking up.
+    /// frontal. Verified against a live camera: SMALLER when looking UP (the
+    /// nose tip swings up toward the eye line), LARGER when looking DOWN (the
+    /// nose tip drops toward the mouth) — the opposite of the naive reading.
     pub pitch_frac: f32,
 }
 
@@ -99,8 +101,10 @@ mod head_pose_tests {
     }
 
     #[test]
-    fn chin_down_lowers_pitch_frac() {
-        // Nose near the eye line (looking down) -> small pitch fraction.
+    fn nose_toward_eyeline_lowers_pitch_frac() {
+        // Nose risen toward the eye line = looking UP -> small pitch fraction.
+        // (Live-verified: looking DOWN instead drives the nose toward the mouth
+        // and raises pitch_frac; this geometry is the looking-UP case.)
         let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 28.0), (24.0, 48.0), (40.0, 48.0)];
         assert!(head_pose(&lm).pitch_frac < 0.30, "{}", head_pose(&lm).pitch_frac);
     }

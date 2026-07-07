@@ -789,20 +789,23 @@ impl Engine {
 /// almost never fired — and by the time a tilt was steep enough to trip the
 /// liveness band, the detector had already lost the face ("no face detected").
 /// A tighter band makes the up/down cue fire at a MODERATE, still-detectable
-/// tilt. Pitch is biased slightly high (centre ~0.53) because a below-eye-level
-/// laptop camera looks up at the face and reads pitch high even when level.
-/// Yaw keeps the liveness value — it already coached well before face loss.
-/// Tune with the `IRLUME_LOG=debug` "framing:" trace if a camera reads off.
+/// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
+/// below-eye-level laptop camera looks UP at the face, biasing neutral toward
+/// the LOW (looking-up) end, so the floor isn't set aggressively high. Yaw keeps
+/// the liveness value — it already coached well before face loss. Tune from the
+/// `IRLUME_LOG=debug` "framing:" trace (median = a level face) if a camera reads off.
 const FRAME_YAW_ASYM_MAX: f32 = 0.40;
-const FRAME_PITCH_MIN: f32 = 0.35;
-const FRAME_PITCH_MAX: f32 = 0.72;
+const FRAME_PITCH_MIN: f32 = 0.33;
+const FRAME_PITCH_MAX: f32 = 0.70;
 
 /// Turn a non-frontal head pose into a directional enrollment instruction, told
 /// in the USER's own frame. On irlume's non-mirrored capture, nose-toward-image-
 /// left (`yaw_signed < 0`) means the person is looking to THEIR right, so we ask
-/// them to turn left; `pitch_frac` below its floor is chin-down/looking-down, so
-/// we ask for a chin lift. When both axes are off the more-severe one wins, so
-/// the user is corrected on one thing at a time instead of being bounced around.
+/// them to turn left. For pitch (live-verified): a LOW `pitch_frac` means the
+/// nose has risen toward the eye line = looking UP → ask them to lower the chin;
+/// a HIGH `pitch_frac` means looking DOWN → ask them to lift the chin. When both
+/// axes are off the more-severe one wins, so the user is corrected on one thing
+/// at a time instead of being bounced around.
 fn frontality_hint(pose: &irlume_vision::HeadPose) -> String {
     let mid = (FRAME_PITCH_MIN + FRAME_PITCH_MAX) / 2.0;
     let yaw_off = pose.yaw_asym > FRAME_YAW_ASYM_MAX;
@@ -814,9 +817,11 @@ fn frontality_hint(pose: &irlume_vision::HeadPose) -> String {
         if pose.yaw_signed < 0.0 { "Turn your head left to face the camera".into() }
         else { "Turn your head right to face the camera".into() }
     } else if pose.pitch_frac < FRAME_PITCH_MIN {
-        "Lift your chin — look up a little".into()
-    } else if pose.pitch_frac > FRAME_PITCH_MAX {
+        // Low pitch = nose toward eye line = looking up → bring the chin down.
         "Lower your chin — look down a little".into()
+    } else if pose.pitch_frac > FRAME_PITCH_MAX {
+        // High pitch = nose toward mouth = looking down → bring the chin up.
+        "Lift your chin — look up a little".into()
     } else {
         "Look straight at the camera".into()
     }
@@ -1016,12 +1021,12 @@ mod tests {
         // Nose image-right → looking to their left → turn RIGHT.
         let p = HeadPose { yaw_asym: 0.6, yaw_signed: 0.6, pitch_frac: 0.5 };
         assert_eq!(frontality_hint(&p), "Turn your head right to face the camera");
-        // Chin down / looking down (pitch below floor) → lift chin.
+        // Looking UP (low pitch = nose toward eye line) → lower chin.
         let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.10 };
-        assert!(frontality_hint(&p).starts_with("Lift your chin"));
-        // Looking up (pitch above ceiling) → lower chin.
-        let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.90 };
         assert!(frontality_hint(&p).starts_with("Lower your chin"));
+        // Looking DOWN (high pitch = nose toward mouth) → lift chin.
+        let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.90 };
+        assert!(frontality_hint(&p).starts_with("Lift your chin"));
         // Both off: the more-severe axis wins (here yaw is 2x its limit, pitch
         // barely over) → yaw guidance, not pitch.
         let p = HeadPose { yaw_asym: 0.80, yaw_signed: 0.80, pitch_frac: 0.82 };

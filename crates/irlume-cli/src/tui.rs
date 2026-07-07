@@ -1067,7 +1067,8 @@ impl App {
             (SC_REPAIR, KeyCode::Char('f')) | (SC_REPAIR, KeyCode::Enter) => self.apply_fix(self.repair_sel),
             // View the face-auth journal to see WHY a check failed. `logs debug
             // on` (a console step) adds per-stage tracing when a number is needed.
-            (SC_REPAIR, KeyCode::Char('v')) => {
+            // Key is 'g' — 'v' is the global basic/all-tabs toggle (on_key).
+            (SC_REPAIR, KeyCode::Char('g')) => {
                 self.log('→', "sudo irlume logs — the daemon/PAM/keyring journal in one view");
                 self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
                 self.suspend = Some(Suspend::Logs);
@@ -1259,10 +1260,11 @@ impl App {
     // ---- rendering --------------------------------------------------------
 
     fn draw(&self, f: &mut Frame) {
-        let [header, body, activity, footer] = Layout::vertical([
-            Constraint::Length(3), Constraint::Min(6), Constraint::Length(7), Constraint::Length(3),
+        let [header, hint, body, activity, footer] = Layout::vertical([
+            Constraint::Length(3), Constraint::Length(1), Constraint::Min(6), Constraint::Length(7), Constraint::Length(3),
         ]).areas(f.area());
         self.draw_header(f, header);
+        self.draw_hint(f, hint);
         self.draw_content(f, body);
         self.draw_activity(f, activity);
         self.draw_footer(f, footer);
@@ -1308,6 +1310,38 @@ impl App {
         let right = Line::from(Span::styled(format!("{} ", self.user), Style::new().dim())).right_aligned();
         f.render_widget(Paragraph::new(left).block(blk.clone()), area);
         f.render_widget(Paragraph::new(right).block(blk), area);
+    }
+
+    /// A single plain-language line under the header: what THIS tab is for and
+    /// the one thing to do here. The whole point is that a first-time user never
+    /// lands on a screen not knowing why they're there — no jargon, names the key.
+    fn draw_hint(&self, f: &mut Frame, area: Rect) {
+        // During a capture the whole UI is about holding still — don't distract.
+        // Kept to ~70 chars so it never wraps off this single row on an 80-col
+        // terminal (the "  ℹ " prefix eats ~4). Each names the key to press.
+        let text = if self.enroll.is_some() {
+            "Look at the camera and hold still — the checklist turns green as you go."
+        } else {
+            match self.screen {
+                SC_WELCOME => "New here? Press [e] to scan your face — your password still works too.",
+                SC_REPAIR => "A red row is a problem: highlight it, press [f] to fix or [g] for logs.",
+                SC_CAMERAS => "Wrong camera picked? Highlight a pair and press [enter] to use it.",
+                SC_PROFILES => "Press [e] to add a face, or [a] to add scans so it knows you better.",
+                SC_IDENTIFY => "A 'does it recognize me?' test. Press [i] and look at the camera.",
+                SC_KEYRING => "Let your face open your password wallet: press [a], type your password.",
+                SC_RECOVERY => "Set a backup passphrase so you're never locked out — press [s].",
+                SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
+                SC_PAM => "Turn on face login for your screen: press [w] (asks for your password).",
+                SC_SETTINGS => "Optional stricter checks — highlight one and press [enter] to toggle.",
+                SC_DONE => "All set! Green = done; anything left shows its key. Press [q] to close.",
+                _ => "",
+            }
+        };
+        let line = Line::from(vec![
+            Span::styled("  ℹ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(text, Style::new().fg(ACCENT)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
     }
 
     fn draw_content(&self, f: &mut Frame, area: Rect) {
@@ -1658,7 +1692,7 @@ impl App {
             Span::styled(format!("  {ok} ok"), Style::new().fg(OK)),
             Span::styled(format!("   {warn} warn"), Style::new().fg(WARN)),
             Span::styled(format!("   {fail} fail"), Style::new().fg(ERR)),
-            Span::styled("      [f] fix selected   [r] re-check   [l] IR self-test   [v] logs", Style::new().dim()),
+            Span::styled("      [f] fix selected   [r] re-check   [l] IR self-test   [g] logs", Style::new().dim()),
         ])];
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
@@ -1841,7 +1875,7 @@ impl App {
         }
         let actions: &[(&str, &str)] = match self.screen {
             SC_WELCOME => &[("e", "enroll"), ("i", "identify"), ("r", "refresh")],
-            SC_REPAIR => &[("f", "fix"), ("r", "re-check"), ("l", "IR test"), ("v", "logs")],
+            SC_REPAIR => &[("f", "fix"), ("r", "re-check"), ("l", "IR test"), ("g", "logs")],
             SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
             SC_PROFILES => &[("e", "enroll"), ("a", "add scan"), ("r", "rename"), ("d", "delete")],
             SC_IDENTIFY => &[("i", "identify")],

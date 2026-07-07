@@ -799,14 +799,14 @@ impl Engine {
 /// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
 /// below-eye-level laptop camera looks UP at the face, biasing neutral toward
 /// the LOW (looking-up) end, so the floor isn't set aggressively high. These are
-/// progressively tighter than the first pass (yaw 0.40 → 0.34 → 0.30; pitch
-/// 0.33–0.70 → 0.37–0.66 → 0.40–0.63) to coach a squarely-frontal capture;
+/// progressively tighter than the first pass (yaw 0.40 → 0.30 → 0.27; pitch
+/// 0.33–0.70 → 0.40–0.63 → 0.42–0.61) to coach a squarely-frontal capture;
 /// still wide enough that a level face isn't nagged. If a straight-on face
 /// starts getting corrected, loosen from the `IRLUME_LOG=debug` "framing:"
 /// trace (its median is where a level face sits on this camera).
-const FRAME_YAW_ASYM_MAX: f32 = 0.30;
-const FRAME_PITCH_MIN: f32 = 0.40;
-const FRAME_PITCH_MAX: f32 = 0.63;
+const FRAME_YAW_ASYM_MAX: f32 = 0.27;
+const FRAME_PITCH_MIN: f32 = 0.42;
+const FRAME_PITCH_MAX: f32 = 0.61;
 
 /// True when a head pose is squarely-frontal enough to enroll — the capture-time
 /// gate (in [`Engine::capture_scans`]) and the guide's `well_framed` share these

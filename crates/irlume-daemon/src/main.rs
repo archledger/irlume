@@ -733,12 +733,19 @@ fn deny_score(s: f32) -> String {
     if irlume_common::dbglog::on() { format!("{s:.4}") } else { format!("~{s:.1}") }
 }
 
+/// Prose tokens that legitimately contain digits and must survive redaction —
+/// dimension labels and the emitter wavelength. FAIL-CLOSED: the redactor keeps
+/// ONLY these exact tokens; every other number (including a future unit-suffixed
+/// measurement like `12ms` or `3px`) is stripped by default, so adding a new
+/// numeric cue to a deny reason can't silently defeat the redaction.
+const REASON_PROSE_KEEP: &[&str] = &["2D", "3D", "850nm"];
+
 /// Journal-side deny-reason display. Deny reasons embed measured values
 /// ("IR too flat (1.02)", "rgb 0.35") as coaching for a genuine false reject —
 /// but in the JOURNAL those same numbers are per-attempt feedback a spoofer
 /// could tune against. The exact reason still goes back over IPC to the
-/// session's own TUI/CLI; here we strip the numeric payloads unless tracing is
-/// on. Digit runs attached to letters ("2D", "3D", "850nm") are prose, kept.
+/// session's own TUI/CLI; here we strip every numeric payload unless tracing is
+/// on, keeping only the [`REASON_PROSE_KEEP`] tokens.
 fn deny_reason(r: &str) -> String {
     if irlume_common::dbglog::on() {
         return r.to_string();
@@ -748,18 +755,25 @@ fn deny_reason(r: &str) -> String {
     let mut i = 0;
     while i < cs.len() {
         if cs[i].is_ascii_digit() {
+            // Grab the number, then any glued alpha suffix (a unit or a prose
+            // tail like the "D" in "2D") so we can test the whole token.
             let start = i;
             while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') { i += 1; }
-            let mut end = i;
-            while end > start && cs[end - 1] == '.' { end -= 1; } // sentence period, not a decimal
-            let prev_alpha = start > 0 && cs[start - 1].is_ascii_alphabetic();
-            let next_alpha = end < cs.len() && cs[end].is_ascii_alphabetic();
-            if prev_alpha || next_alpha {
-                out.extend(&cs[start..end]);
+            let mut num_end = i;
+            while num_end > start && cs[num_end - 1] == '.' { num_end -= 1; } // sentence period, not a decimal
+            let mut tok_end = num_end;
+            while tok_end < cs.len() && cs[tok_end].is_ascii_alphabetic() { tok_end += 1; }
+            let token: String = cs[start..tok_end].iter().collect();
+            // An identifier (digits glued AFTER letters, e.g. "PCR7") is a name,
+            // not a measurement — keep it. Otherwise keep only allowlisted prose.
+            let is_ident = start > 0 && cs[start - 1].is_ascii_alphabetic();
+            if is_ident || REASON_PROSE_KEEP.contains(&token.as_str()) {
+                out.extend(&cs[start..tok_end]);
+                i = tok_end;
             } else {
                 out.push('…');
+                out.extend(&cs[num_end..i]); // keep a trailing '.' that was a sentence period
             }
-            out.extend(&cs[end..i]);
         } else {
             out.push(cs[i]);
             i += 1;
@@ -849,8 +863,15 @@ mod tests {
         assert_eq!(deny_reason("IR face too dark (42)"), "IR face too dark (…)");
         assert_eq!(deny_reason("below threshold (rgb 0.35, fusion+ir-fallback miss)"),
                    "below threshold (rgb …, fusion+ir-fallback miss)");
-        // digit runs attached to letters are prose/idents, not measurements
+        // allowlisted prose (dimension labels, wavelength) survives
         assert_eq!(deny_reason("a real face reflects 850nm"), "a real face reflects 850nm");
+        assert_eq!(deny_reason("looks 2D not 3D"), "looks 2D not 3D");
+        // identifiers (digits glued after letters) survive as names
+        assert_eq!(deny_reason("PCR7 drift"), "PCR7 drift");
+        // FAIL-CLOSED: a future unit-suffixed measurement is still redacted
+        assert_eq!(deny_reason("gap 3px wide"), "gap …px wide");
+        assert_eq!(deny_reason("took 12ms"), "took …ms");
+        assert_eq!(deny_reason("margin 0.5x"), "margin …x");
         // trailing sentence period survives a float at end of sentence
         assert_eq!(deny_reason("floor 1.12."), "floor ….");
         // no numbers -> unchanged

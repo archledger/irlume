@@ -69,10 +69,20 @@ if [ "${SKIP_BUILD_CHECK:-0}" != "1" ]; then
     rm -rf "$TREE/.cargo-home-check" "$TREE/target"
 fi
 
-echo "==> creating orig tarball"
+echo "==> creating orig tarball (deterministic — same bytes for every series)"
 cd "$BUILDROOT"
 rm -f "irlume_${VERSION}.orig.tar.gz"
-tar --exclude="irlume-$VERSION/target" -czf "irlume_${VERSION}.orig.tar.gz" "irlume-$VERSION"
+# Multi-series PPAs upload the SAME upstream version to noble/jammy/resolute/…,
+# and Launchpad keeps one orig tarball per version — a second upload with a
+# different checksum is rejected ("already exists with different contents"). So
+# pack reproducibly: fixed mtime/owner, sorted names, gzip without a timestamp,
+# so every series build yields a byte-identical orig. mtime = the release tag's
+# commit date (override with SOURCE_DATE_EPOCH).
+SDE="${SOURCE_DATE_EPOCH:-$(git -C "$REPO" log -1 --format=%ct "v${VERSION}" 2>/dev/null || echo 1600000000)}"
+tar --exclude="irlume-$VERSION/target" \
+    --sort=name --mtime="@${SDE}" --owner=0 --group=0 --numeric-owner \
+    --pax-option='exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime' \
+    -cf - "irlume-$VERSION" | gzip -n > "irlume_${VERSION}.orig.tar.gz"
 
 echo "==> debianizing for $SERIES"
 cp -r "$TREE/packaging/ppa/debian" "$TREE/debian"

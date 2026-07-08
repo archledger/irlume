@@ -17,16 +17,18 @@ use std::process::ExitCode;
 /// network library is bundled; we shell out to curl and degrade gracefully.
 pub fn update(args: &[String]) -> ExitCode {
     let check_only = args.iter().any(|a| a == "--check" || a == "-n");
-    let current = env!("CARGO_PKG_VERSION");
-    println!("[update] installed: v{current}");
-
     let origin = install_origin();
+    // The version the package manager actually has installed — the source of
+    // truth for "is a newer one out?" — not just this binary's compiled version
+    // (which can differ from the package on a dev/overlaid box).
+    let current = installed_version(&origin);
+    println!("[update] installed: {current}");
     println!("[update] install method: {}", origin.describe());
 
     let latest = latest_release_tag();
     let newer = match &latest {
         Some(tag) => {
-            if version_gt(tag.trim_start_matches('v'), current) {
+            if version_gt(tag.trim_start_matches('v'), &current) {
                 println!("[update] available: {tag}  →  a newer release is out.");
                 true
             } else {
@@ -324,6 +326,30 @@ fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
     }
     println!("[update] done.");
     ExitCode::SUCCESS
+}
+
+/// The version actually installed, from the owning package manager — the source
+/// of truth for "is a newer one out?". Falls back to this binary's own compiled
+/// version for source/dev installs (no package owns them). Package versions
+/// carry distro suffixes (`…-1.fc44`, `…-0ppa1~resolute1`, `…-1`); `version_gt`
+/// compares the numeric upstream prefix, so they still compare against a tag.
+fn installed_version(origin: &InstallOrigin) -> String {
+    let pkg = match origin {
+        InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
+            cmd_stdout("rpm", &["-q", "--qf", "%{VERSION}", "irlume"])
+        }
+        InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
+            cmd_stdout("dpkg-query", &["-W", "-f", "${Version}", "irlume"])
+        }
+        InstallOrigin::ArchPkg => {
+            // `pacman -Q irlume` → "irlume 0.1.3-1"; take the version field.
+            cmd_stdout("pacman", &["-Q", "irlume"]).and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
+        }
+        InstallOrigin::Source => None,
+    };
+    pkg.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 fn cmd_ok(prog: &str, args: &[&str]) -> bool {

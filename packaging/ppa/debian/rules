@@ -10,7 +10,14 @@ export CARGO_HOME = $(CURDIR)/debian/cargo_home
 	dh $@
 
 override_dh_auto_build:
-	cargo build --release --frozen --offline
+	# The committed Cargo.lock is format v4 (needs cargo >= 1.78); Ubuntu 24.04
+	# (noble) ships cargo 1.75, which can't even parse it, so a --frozen build
+	# fails before compiling. Every crate is vendored (network-free), so drop
+	# the lock and let the BUILDER's own cargo regenerate one in its native
+	# format, then build offline. Toolchain-agnostic: works on noble (writes v3)
+	# and resolute (v4) alike, without pinning a lockfile version in the orig.
+	rm -f Cargo.lock
+	cargo build --release --offline
 
 override_dh_auto_test:
 	# Tests need camera/TPM hardware; not runnable on builders.

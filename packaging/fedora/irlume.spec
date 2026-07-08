@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -134,6 +134,12 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Jul 07 2026 archledger <archledger236@gmail.com> - 0.1.4-1
+- Distribution/maintenance release (face auth unchanged): `irlume update` now
+  adapts to distro, install channel, and CPU arch, and reports the real
+  installed package version; universal .deb for Ubuntu derivatives; Arch makepkg
+  git-lfs fix; deterministic PPA orig; declared MSRV raised to Rust 1.88.
+
 * Mon Jul 07 2026 archledger <archledger236@gmail.com> - 0.1.3-1
 - Every major login manager profiled for on-demand face auth (GDM/SDDM/LightDM/
   greetd/COSMIC/Plasma Login); `irlume logs` + IRLUME_LOG=debug diagnostics.

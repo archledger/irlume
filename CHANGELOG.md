@@ -3,6 +3,49 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] — 2026-07-07
+
+A distribution and self-update release — face authentication itself is
+unchanged; this makes installing and updating irlume smooth on every distro.
+
+### Changed
+
+- **`irlume update` is fully adaptive.** It reports the version your package
+  manager actually has installed, detects the exact channel it came from (Copr,
+  PPA, the GitHub `.deb`, the pacman package, or a source build), matches the
+  release asset for your CPU architecture, and only offers a download that
+  actually exists — no more dead links or steering an Ubuntu derivative to a PPA
+  that can't serve it.
+- **Two Ubuntu lanes.** The PPA carries the current Ubuntu LTS (native,
+  auto-updating); every derivative (Mint, Pop!_OS, Zorin, elementary) uses the
+  universal `.deb` below — one binary that installs on Ubuntu 24.04 and newer.
+- Declared minimum Rust is now 1.88 (the real floor, via the ONNX Runtime binding).
+
+### Fixed
+
+- Arch: `git lfs pull` fetches the model weights correctly under `makepkg`.
+- PPA source builds pack a deterministic orig tarball.
+
+### Downloads — which asset do I need?
+
+Prefer your distro's repo (`dnf` / the PPA / the AUR-style package) so updates
+arrive automatically; these assets are direct downloads for everyone else.
+
+- **`irlume_0.1.4_amd64.deb`** — Debian and Ubuntu derivatives. Built on the
+  oldest supported Ubuntu base, so this single file installs on Mint, Pop!_OS,
+  Zorin, elementary, and any newer Ubuntu (`sudo apt install ./…`).
+- **`irlume-0.1.4-1-x86_64.pkg.tar.zst`** — Arch Linux (`sudo pacman -U ./…`).
+- **`irlume-0.1.4-1.fc44.x86_64.rpm`** — Fedora, the main package
+  (`sudo dnf install ./…`). The [Copr](https://copr.fedorainfracloud.org/coprs/archledger/irlume)
+  is the auto-updating Fedora channel and pulls the SELinux policy in for you.
+- **`irlume-selinux-0.1.4-1.fc44.noarch.rpm`** — the SELinux policy companion for
+  the Fedora RPM. Fedora enforces SELinux by default and the login greeter can't
+  reach the daemon without this module. It's a *weak* dependency, so a local
+  `dnf install ./main.rpm` won't pull it automatically — install it alongside the
+  main RPM on an enforcing system. It's `noarch` because the policy is
+  architecture-independent (that's also why it's a separate package, not baked
+  into the `x86_64` RPM).
+
 ## [0.1.3] — 2026-07-07
 
 Display-manager coverage, a diagnostics story, security hardening, and a much

@@ -32,9 +32,18 @@ you certify the DCO. That's it — no forms, no rights assignment.
   [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR.
 
+## Setting up a dev environment
+
+See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full walkthrough. The
+quickest path is Nix — `nix develop` gives you the whole pinned toolchain
+(Rust, libclang, TPM/PAM libs, the ONNX runtime) on any distro with one
+command; the guide also lists the per-distro `dnf`/`apt`/`pacman` dependencies
+if you'd rather install them by hand. Note the models live in Git LFS
+(`git lfs pull`), and real face/camera/TPM/PAM testing needs a physical machine.
+
 ## Where to start
 
 Look for `todo!()` / `TODO` markers in the code. A good first smoke test of a
 working dev setup is the alignment self-test:
-`IRLUME_DEV=1 irlume selftest align` (dev/benchmark subcommands are gated
-behind `IRLUME_DEV=1`).
+`IRLUME_DEV=1 irlume selftest align --model models/glintr100.onnx`
+(dev/benchmark subcommands are gated behind `IRLUME_DEV=1`).

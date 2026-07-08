@@ -111,7 +111,11 @@ mod tests {
         let key = generate_key();
         let a = encrypt(&key, b"same plaintext").unwrap();
         let b = encrypt(&key, b"same plaintext").unwrap();
-        assert_ne!(a[..NONCE_LEN], b[..NONCE_LEN], "each encrypt must use a fresh nonce");
+        assert_ne!(
+            a[..NONCE_LEN],
+            b[..NONCE_LEN],
+            "each encrypt must use a fresh nonce"
+        );
         assert_ne!(a, b);
     }
 

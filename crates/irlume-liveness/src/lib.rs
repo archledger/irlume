@@ -65,8 +65,8 @@ impl Default for Signals {
             ir_face_brightness: 0.0,
             ir_center_edge_ratio: 0.0,
             ir_eye_glint: 0.0,
-            head_yaw_asym: 0.0,    // frontal
-            head_pitch_frac: 0.5,  // frontal
+            head_yaw_asym: 0.0,   // frontal
+            head_pitch_frac: 0.5, // frontal
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
@@ -101,7 +101,10 @@ pub const RGB_MOIRE_MAX: f32 = 28.0;
 /// The effective moiré ceiling: `IRLUME_RGB_MOIRE_MAX` env override (per-camera
 /// tuning, set on the daemon unit) or the built-in default.
 pub fn rgb_moire_max() -> f32 {
-    std::env::var("IRLUME_RGB_MOIRE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(RGB_MOIRE_MAX)
+    std::env::var("IRLUME_RGB_MOIRE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RGB_MOIRE_MAX)
 }
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
@@ -165,7 +168,11 @@ impl LivenessGate {
         let mut cues = Cues::default();
 
         let Some(rgb) = s.rgb_face.filter(|f| f.score >= MIN_FACE_SCORE) else {
-            return (Verdict::Uncertain, cues, "no face in RGB — present your face".into());
+            return (
+                Verdict::Uncertain,
+                cues,
+                "no face in RGB — present your face".into(),
+            );
         };
         cues.face_in_rgb = true;
 
@@ -184,7 +191,11 @@ impl LivenessGate {
         let dist = ((rgb.cx - ir.cx).powi(2) + (rgb.cy - ir.cy).powi(2)).sqrt();
         cues.cross_spectrum_aligned = dist <= CROSS_SPECTRUM_TOLERANCE;
         if !cues.cross_spectrum_aligned {
-            return (Verdict::Uncertain, cues, format!("RGB/IR face mismatch (dist {dist:.2}) — re-center"));
+            return (
+                Verdict::Uncertain,
+                cues,
+                format!("RGB/IR face mismatch (dist {dist:.2}) — re-center"),
+            );
         }
 
         // Head-orientation gate (Windows-Hello-style ±15° frontality): a face
@@ -210,7 +221,10 @@ impl LivenessGate {
             return (
                 Verdict::Spoof,
                 cues,
-                format!("IR face too dark ({:.0}) — not reflecting IR like skin", s.ir_face_brightness),
+                format!(
+                    "IR face too dark ({:.0}) — not reflecting IR like skin",
+                    s.ir_face_brightness
+                ),
             );
         }
 
@@ -220,14 +234,21 @@ impl LivenessGate {
             return (
                 Verdict::Spoof,
                 cues,
-                format!("IR too flat (center/edge {:.2}) — looks 2D, not a 3D face", s.ir_center_edge_ratio),
+                format!(
+                    "IR too flat (center/edge {:.2}) — looks 2D, not a 3D face",
+                    s.ir_center_edge_ratio
+                ),
             );
         }
 
         // Corneal glint — supporting only; logged, never decisive on its own.
         cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
 
-        (Verdict::Live, cues, "live: face in RGB+IR, co-located, frontal, IR-reflective, 3D".into())
+        (
+            Verdict::Live,
+            cues,
+            "live: face in RGB+IR, co-located, frontal, IR-reflective, 3D".into(),
+        )
     }
 
     /// RGB-only convenience gate (no IR hardware). DETERRENT-grade anti-spoof:
@@ -239,32 +260,55 @@ impl LivenessGate {
     pub fn evaluate_rgb_only(&self, s: &Signals) -> (Verdict, Cues, String) {
         let mut cues = Cues::default();
         let Some(_rgb) = s.rgb_face.filter(|f| f.score >= MIN_FACE_SCORE) else {
-            return (Verdict::Uncertain, cues, "no face — present your face to the camera".into());
+            return (
+                Verdict::Uncertain,
+                cues,
+                "no face — present your face to the camera".into(),
+            );
         };
         cues.face_in_rgb = true;
         cues.frontal_ok = s.head_yaw_asym <= YAW_ASYM_MAX
             && (PITCH_FRAC_MIN..=PITCH_FRAC_MAX).contains(&s.head_pitch_frac);
         if !cues.frontal_ok {
-            return (Verdict::Uncertain, cues, "not facing the camera — look directly at it".into());
+            return (
+                Verdict::Uncertain,
+                cues,
+                "not facing the camera — look directly at it".into(),
+            );
         }
         if s.rgb_face_brightness < RGB_FACE_MIN_BRIGHTNESS {
-            return (Verdict::Uncertain, cues,
-                "too dark — add light on your face (RGB-only mode needs a lit face)".into());
+            return (
+                Verdict::Uncertain,
+                cues,
+                "too dark — add light on your face (RGB-only mode needs a lit face)".into(),
+            );
         }
         if s.rgb_face_brightness > RGB_FACE_MAX_BRIGHTNESS {
-            return (Verdict::Uncertain, cues, "overexposed — reduce the light/backlight".into());
+            return (
+                Verdict::Uncertain,
+                cues,
+                "overexposed — reduce the light/backlight".into(),
+            );
         }
         if s.rgb_specular_frac > RGB_SPECULAR_MAX {
-            return (Verdict::Spoof, cues,
-                "screen/glare detected (blown-out highlights) — RGB-only anti-spoof".into());
+            return (
+                Verdict::Spoof,
+                cues,
+                "screen/glare detected (blown-out highlights) — RGB-only anti-spoof".into(),
+            );
         }
         if s.rgb_moire_score > rgb_moire_max() {
             return (Verdict::Spoof, cues,
                 format!("screen pixel-grid/moiré pattern detected (peakiness {:.0}) — RGB-only anti-spoof", s.rgb_moire_score));
         }
-        (Verdict::Live, cues,
-            format!("live (rgb convenience; bright {:.0} specular {:.2} moire {:.0})",
-                s.rgb_face_brightness, s.rgb_specular_frac, s.rgb_moire_score))
+        (
+            Verdict::Live,
+            cues,
+            format!(
+                "live (rgb convenience; bright {:.0} specular {:.2} moire {:.0})",
+                s.rgb_face_brightness, s.rgb_specular_frac, s.rgb_moire_score
+            ),
+        )
     }
 
     /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no
@@ -280,14 +324,26 @@ impl LivenessGate {
         let _ = ir;
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
-            return (Verdict::Spoof, cues, format!("IR face too dark ({:.0})", s.ir_face_brightness));
+            return (
+                Verdict::Spoof,
+                cues,
+                format!("IR face too dark ({:.0})", s.ir_face_brightness),
+            );
         }
         cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
         if !cues.depth_ok {
-            return (Verdict::Spoof, cues, format!("IR too flat (center/edge {:.2})", s.ir_center_edge_ratio));
+            return (
+                Verdict::Spoof,
+                cues,
+                format!("IR too flat (center/edge {:.2})", s.ir_center_edge_ratio),
+            );
         }
         cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
-        (Verdict::Live, cues, "live (dark/IR-only): IR-reflective, 3D".into())
+        (
+            Verdict::Live,
+            cues,
+            "live (dark/IR-only): IR-reflective, 3D".into(),
+        )
     }
 }
 
@@ -395,15 +451,26 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
     }
     // Strobe visible? Compare typical adjacent brightness jump to typical level.
     let mut bris: Vec<f32> = samples.iter().map(|s| s.bri).collect();
-    let mut deltas: Vec<f32> = samples.windows(2).map(|w| (w[0].bri - w[1].bri).abs()).collect();
+    let mut deltas: Vec<f32> = samples
+        .windows(2)
+        .map(|w| (w[0].bri - w[1].bri).abs())
+        .collect();
     let med_bri = median(&mut bris).unwrap_or(0.0).max(1.0);
     let strobing = median(&mut deltas).unwrap_or(0.0) > 0.30 * med_bri;
     let lit = |i: usize| -> bool {
         if !strobing {
             return true;
         }
-        let prev = if i > 0 { samples[i - 1].bri } else { samples[i + 1].bri };
-        let next = if i + 1 < samples.len() { samples[i + 1].bri } else { samples[i - 1].bri };
+        let prev = if i > 0 {
+            samples[i - 1].bri
+        } else {
+            samples[i + 1].bri
+        };
+        let next = if i + 1 < samples.len() {
+            samples[i + 1].bri
+        } else {
+            samples[i - 1].bri
+        };
         samples[i].bri > (prev + next) / 2.0
     };
     // Per-class open baseline; classes too small or never-open don't count as eyes.
@@ -432,7 +499,12 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         .filter_map(|(i, s)| {
             let base = baseline[if lit(i) { 0 } else { 1 }]?;
             let e = s.ear.filter(|e| e.is_finite())?;
-            Some(Obs { idx: s.idx, ratio: e / base, bri: s.bri, lit: lit(i) })
+            Some(Obs {
+                idx: s.idx,
+                ratio: e / base,
+                bri: s.bri,
+                lit: lit(i),
+            })
         })
         .collect();
     if ratios.is_empty() {
@@ -461,8 +533,12 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         let run = &ratios[start..=end];
         let len = run.len();
         let deepest = run.iter().map(|o| o.ratio).fold(f32::INFINITY, f32::min);
-        let deep_enough =
-            deepest <= if len == 1 { BLINK_V_MIN_SINGLE } else { BLINK_V_MIN_MULTI };
+        let deep_enough = deepest
+            <= if len == 1 {
+                BLINK_V_MIN_SINGLE
+            } else {
+                BLINK_V_MIN_MULTI
+            };
         if len <= BLINK_V_MAX_RUN && deep_enough {
             let (first_idx, last_idx) = (run[0].idx, run[len - 1].idx);
             let run_bri = run.iter().map(|o| o.bri).sum::<f32>() / len as f32;
@@ -470,10 +546,14 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
                 b >= (1.0 - BLINK_V_BRI_BAND) * run_bri && b <= (1.0 + BLINK_V_BRI_BAND) * run_bri
             };
             let pre = ratios[..start].iter().rev().any(|o| {
-                first_idx - o.idx <= BLINK_V_PRE_WIN && o.ratio >= BLINK_V_OPEN_RATIO && bri_ok(o.bri)
+                first_idx - o.idx <= BLINK_V_PRE_WIN
+                    && o.ratio >= BLINK_V_OPEN_RATIO
+                    && bri_ok(o.bri)
             });
             let post = ratios[end + 1..].iter().any(|o| {
-                o.idx - last_idx <= BLINK_V_POST_WIN && o.ratio >= BLINK_V_OPEN_RATIO && bri_ok(o.bri)
+                o.idx - last_idx <= BLINK_V_POST_WIN
+                    && o.ratio >= BLINK_V_OPEN_RATIO
+                    && bri_ok(o.bri)
             });
             if pre && post {
                 return BlinkResult::Blinked;
@@ -505,7 +585,10 @@ mod tests {
 
     #[test]
     fn live_face_passes() {
-        assert_eq!(LivenessGate::new().evaluate(&live_signals()).0, Verdict::Live);
+        assert_eq!(
+            LivenessGate::new().evaluate(&live_signals()).0,
+            Verdict::Live
+        );
     }
 
     #[test]
@@ -529,7 +612,12 @@ mod tests {
 
     #[test]
     fn screen_with_no_ir_face_is_spoof() {
-        let s = Signals { rgb_face: Some(fb(0.5, 0.5)), ir_face: None, ir_face_brightness: 5.0, ..Default::default() };
+        let s = Signals {
+            rgb_face: Some(fb(0.5, 0.5)),
+            ir_face: None,
+            ir_face_brightness: 5.0,
+            ..Default::default()
+        };
         assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Spoof);
     }
 
@@ -554,7 +642,11 @@ mod tests {
     fn flat(ears: &[f32]) -> Vec<EarSample> {
         ears.iter()
             .enumerate()
-            .map(|(i, &e)| EarSample { idx: i, ear: Some(e), bri: 60.0 })
+            .map(|(i, &e)| EarSample {
+                idx: i,
+                ear: Some(e),
+                bri: 60.0,
+            })
             .collect()
     }
 
@@ -564,10 +656,18 @@ mod tests {
         let mut out = Vec::new();
         for i in 0..lit.len().max(dark.len()) {
             if i < lit.len() {
-                out.push(EarSample { idx: 2 * i, ear: Some(lit[i]), bri: 60.0 });
+                out.push(EarSample {
+                    idx: 2 * i,
+                    ear: Some(lit[i]),
+                    bri: 60.0,
+                });
             }
             if i < dark.len() {
-                out.push(EarSample { idx: 2 * i + 1, ear: dark[i], bri: 9.0 });
+                out.push(EarSample {
+                    idx: 2 * i + 1,
+                    ear: dark[i],
+                    bri: 9.0,
+                });
             }
         }
         out
@@ -586,10 +686,15 @@ mod tests {
         // blink sampled mid-closure, one frame at 0.173 (0.82× the lit median 0.212),
         // sharp drop from 0.212 and recovery to 0.205. Ambient-class frames read
         // systematically lower (~0.185) and must not drag the baseline down.
-        let lit = [0.209, 0.224, 0.257, 0.240, 0.236, 0.204, 0.208, 0.212, 0.173, 0.205, 0.226, 0.206];
-        let dark: Vec<Option<f32>> =
-            [0.192, 0.191, 0.180, 0.184, 0.189, 0.193, 0.194, 0.189, 0.181, 0.175, 0.184, 0.185]
-                .iter().map(|&e| Some(e)).collect();
+        let lit = [
+            0.209, 0.224, 0.257, 0.240, 0.236, 0.204, 0.208, 0.212, 0.173, 0.205, 0.226, 0.206,
+        ];
+        let dark: Vec<Option<f32>> = [
+            0.192, 0.191, 0.180, 0.184, 0.189, 0.193, 0.194, 0.189, 0.181, 0.175, 0.184, 0.185,
+        ]
+        .iter()
+        .map(|&e| Some(e))
+        .collect();
         assert_eq!(detect_blink(&strobed(&lit, &dark)), BlinkResult::Blinked);
     }
 
@@ -598,7 +703,9 @@ mod tests {
         // Real dark-living-room trace 2026-07-01: ambient frames have NO face (only
         // the emitter lights you), blink = two lit samples 0.129/0.142 (0.73×/0.81×
         // of the 0.176 lit median) with clean pre/post open samples.
-        let lit = [0.176, 0.185, 0.176, 0.129, 0.142, 0.174, 0.174, 0.188, 0.180, 0.176];
+        let lit = [
+            0.176, 0.185, 0.176, 0.129, 0.142, 0.174, 0.174, 0.188, 0.180, 0.176,
+        ];
         let dark = vec![None; 10];
         assert_eq!(detect_blink(&strobed(&lit, &dark)), BlinkResult::Blinked);
     }
@@ -607,7 +714,9 @@ mod tests {
     fn static_banner_flat_ear_is_not_a_blink() {
         // Real banner trace: flat 0.21–0.24, min 0.206 (≈0.91× median) — too shallow
         // for a run sample, no V, no deep dip.
-        let banner = flat(&[0.221, 0.236, 0.227, 0.229, 0.206, 0.232, 0.226, 0.224, 0.223]);
+        let banner = flat(&[
+            0.221, 0.236, 0.227, 0.229, 0.206, 0.232, 0.226, 0.224, 0.223,
+        ]);
         assert_eq!(detect_blink(&banner), BlinkResult::NoBlink);
     }
 
@@ -617,8 +726,8 @@ mod tests {
         // sample only reaches 0.87× of median — a lone sample must reach the
         // single-frame depth (0.82×) to count, so no blink.
         let seq = flat(&[
-            0.240, 0.236, 0.230, 0.224, 0.216, 0.208, 0.200, 0.193, 0.187, 0.193,
-            0.200, 0.208, 0.216, 0.224, 0.230, 0.236,
+            0.240, 0.236, 0.230, 0.224, 0.216, 0.208, 0.200, 0.193, 0.187, 0.193, 0.200, 0.208,
+            0.216, 0.224, 0.230, 0.236,
         ]);
         assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
     }
@@ -629,8 +738,8 @@ mod tests {
         // consecutive samples while exposure stabilises — longer than any real
         // blink; the run-length cap rejects it even though it is deep.
         let lit = [
-            0.190, 0.168, 0.182, 0.159, 0.155, 0.159, 0.154, 0.158, 0.144, 0.137,
-            0.164, 0.185, 0.189, 0.201, 0.200, 0.201, 0.203, 0.205, 0.194, 0.195,
+            0.190, 0.168, 0.182, 0.159, 0.155, 0.159, 0.154, 0.158, 0.144, 0.137, 0.164, 0.185,
+            0.189, 0.201, 0.200, 0.201, 0.203, 0.205, 0.194, 0.195,
         ];
         let dark = vec![None; 20];
         assert_eq!(detect_blink(&strobed(&lit, &dark)), BlinkResult::NoBlink);
@@ -642,14 +751,25 @@ mod tests {
         // EAR dipped in sync with auto-exposure slewing (bri 182→57) — previously
         // scored Live. Too few samples to trust: NoEyes.
         let mut seq: Vec<EarSample> = [
-            (0usize, 0.236f32, 182.4f32), (2, 0.226, 202.8), (4, 0.177, 145.6),
-            (6, 0.181, 126.4), (8, 0.217, 57.0),
+            (0usize, 0.236f32, 182.4f32),
+            (2, 0.226, 202.8),
+            (4, 0.177, 145.6),
+            (6, 0.181, 126.4),
+            (8, 0.217, 57.0),
         ]
         .iter()
-        .map(|&(idx, e, b)| EarSample { idx, ear: Some(e), bri: b })
+        .map(|&(idx, e, b)| EarSample {
+            idx,
+            ear: Some(e),
+            bri: b,
+        })
         .collect();
         for i in 5..30 {
-            seq.push(EarSample { idx: 2 * i, ear: None, bri: 144.0 });
+            seq.push(EarSample {
+                idx: 2 * i,
+                ear: None,
+                bri: 144.0,
+            });
         }
         assert_eq!(detect_blink(&seq), BlinkResult::NoEyes);
     }
@@ -660,13 +780,25 @@ mod tests {
         // the dip's only near-open neighbours sit at a very different exposure, so
         // the brightness-band check refuses to treat it as a V.
         let seq: Vec<EarSample> = [
-            (0usize, 0.230f32, 210.0f32), (1, 0.231, 200.0), (2, 0.229, 185.0),
-            (3, 0.185, 150.0), (4, 0.188, 132.0), (5, 0.219, 96.0), (6, 0.221, 92.0),
-            (7, 0.222, 91.0), (8, 0.222, 90.0), (9, 0.221, 90.0), (10, 0.222, 90.0),
+            (0usize, 0.230f32, 210.0f32),
+            (1, 0.231, 200.0),
+            (2, 0.229, 185.0),
+            (3, 0.185, 150.0),
+            (4, 0.188, 132.0),
+            (5, 0.219, 96.0),
+            (6, 0.221, 92.0),
+            (7, 0.222, 91.0),
+            (8, 0.222, 90.0),
+            (9, 0.221, 90.0),
+            (10, 0.222, 90.0),
             (11, 0.221, 90.0),
         ]
         .iter()
-        .map(|&(idx, e, b)| EarSample { idx, ear: Some(e), bri: b })
+        .map(|&(idx, e, b)| EarSample {
+            idx,
+            ear: Some(e),
+            bri: b,
+        })
         .collect();
         assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
     }
@@ -674,7 +806,10 @@ mod tests {
     #[test]
     fn no_plausible_open_eye_reads_no_eyes() {
         // Median below the open floor (mesh failing / non-eye) → NoEyes, not a blink.
-        assert_eq!(detect_blink(&flat(&[0.05, 0.06, 0.04, 0.05, 0.05])), BlinkResult::NoEyes);
+        assert_eq!(
+            detect_blink(&flat(&[0.05, 0.06, 0.04, 0.05, 0.05])),
+            BlinkResult::NoEyes
+        );
         assert_eq!(detect_blink(&[]), BlinkResult::NoEyes);
         // Dark closet: frames captured but no face anywhere → NoEyes.
         let none = strobed(&[], &[None; 20]);

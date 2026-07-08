@@ -81,7 +81,13 @@ pub struct Enrollment {
 
 impl Enrollment {
     pub fn new(user: &str) -> Self {
-        Self { user: user.into(), profiles: Vec::new(), require_eyes_open: false, require_challenge: false, camera_binding: None }
+        Self {
+            user: user.into(),
+            profiles: Vec::new(),
+            require_eyes_open: false,
+            require_challenge: false,
+            camera_binding: None,
+        }
     }
 
     /// Total scans across all profiles (drives threshold scaling).
@@ -93,7 +99,11 @@ impl Enrollment {
     pub fn rgb_scans(&self) -> Vec<(&str, &str, &[f32])> {
         self.profiles
             .iter()
-            .flat_map(|p| p.scans.iter().map(move |s| (p.name.as_str(), s.name.as_str(), s.rgb.as_slice())))
+            .flat_map(|p| {
+                p.scans
+                    .iter()
+                    .map(move |s| (p.name.as_str(), s.name.as_str(), s.rgb.as_slice()))
+            })
             .collect()
     }
 
@@ -102,7 +112,10 @@ impl Enrollment {
         self.profiles
             .iter()
             .flat_map(|p| {
-                p.scans.iter().filter_map(move |s| s.ir.as_ref().map(|ir| (p.name.as_str(), s.name.as_str(), ir.as_slice())))
+                p.scans.iter().filter_map(move |s| {
+                    s.ir.as_ref()
+                        .map(|ir| (p.name.as_str(), s.name.as_str(), ir.as_slice()))
+                })
             })
             .collect()
     }
@@ -213,7 +226,10 @@ fn migrate(old: LegacyProfile) -> Enrollment {
         .collect();
     Enrollment {
         user: old.user,
-        profiles: vec![FaceProfile { name: "Face Profile 1".into(), scans }],
+        profiles: vec![FaceProfile {
+            name: "Face Profile 1".into(),
+            scans,
+        }],
         require_eyes_open: false,
         require_challenge: false,
         camera_binding: None,
@@ -249,12 +265,18 @@ struct EncEnvelope {
 fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Result<Vec<u8>> {
     match key {
         Some(k) => {
-            let json = serde_json::to_vec(e).map_err(|er| irlume_common::Error::Protocol(er.to_string()))?;
+            let json = serde_json::to_vec(e)
+                .map_err(|er| irlume_common::Error::Protocol(er.to_string()))?;
             let blob = crypto::encrypt(k, &json)?;
-            let env = EncEnvelope { version: 2, enc: STANDARD.encode(blob) };
-            serde_json::to_vec_pretty(&env).map_err(|er| irlume_common::Error::Protocol(er.to_string()))
+            let env = EncEnvelope {
+                version: 2,
+                enc: STANDARD.encode(blob),
+            };
+            serde_json::to_vec_pretty(&env)
+                .map_err(|er| irlume_common::Error::Protocol(er.to_string()))
         }
-        None => serde_json::to_vec_pretty(e).map_err(|er| irlume_common::Error::Protocol(er.to_string())),
+        None => serde_json::to_vec_pretty(e)
+            .map_err(|er| irlume_common::Error::Protocol(er.to_string())),
     }
 }
 
@@ -268,7 +290,9 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
         let env: EncEnvelope =
             serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
         let key = key.ok_or_else(|| {
-            irlume_common::Error::Policy("enrollment is encrypted but no template key is available".into())
+            irlume_common::Error::Policy(
+                "enrollment is encrypted but no template key is available".into(),
+            )
         })?;
         let blob = STANDARD
             .decode(env.enc.as_bytes())
@@ -315,7 +339,12 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
 fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()
 }
@@ -339,7 +368,11 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     let is_enc = serde_json::from_slice::<serde_json::Value>(&data)
         .map(|v| v.get("enc").is_some())
         .unwrap_or(false);
-    let key = if is_enc { Some(template_key::load_key(user)?) } else { None };
+    let key = if is_enc {
+        Some(template_key::load_key(user)?)
+    } else {
+        None
+    };
     deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
 }
 
@@ -453,18 +486,35 @@ mod tests {
     }
 
     fn scan_with_ir(depth: f32, bright: f32) -> FaceScan {
-        FaceScan { name: "s".into(), rgb: vec![0.1; 4], ir: Some(vec![0.2; 4]), ir_depth: depth, ir_brightness: bright, pitch: 0.0 }
+        FaceScan {
+            name: "s".into(),
+            rgb: vec![0.1; 4],
+            ir: Some(vec![0.2; 4]),
+            ir_depth: depth,
+            ir_brightness: bright,
+            pitch: 0.0,
+        }
     }
 
     fn scan_with_pitch(pitch: f32) -> FaceScan {
-        FaceScan { name: "s".into(), rgb: vec![0.1; 4], ir: None, ir_depth: 0.0, ir_brightness: 0.0, pitch }
+        FaceScan {
+            name: "s".into(),
+            rgb: vec![0.1; 4],
+            ir: None,
+            ir_depth: 0.0,
+            ir_brightness: 0.0,
+            pitch,
+        }
     }
 
     #[test]
     fn pitch_neutral_is_median_of_calibrated_scans() {
         let mut e = Enrollment::new("u");
         // One calibrated scan -> not enough.
-        e.profiles.push(FaceProfile { name: "p".into(), scans: vec![scan_with_pitch(0.60)] });
+        e.profiles.push(FaceProfile {
+            name: "p".into(),
+            scans: vec![scan_with_pitch(0.60)],
+        });
         assert!(e.pitch_neutral().is_none());
         // Add more -> median of {0.60, 0.58, 0.62} = 0.60.
         e.profiles[0].scans.push(scan_with_pitch(0.58));
@@ -479,7 +529,10 @@ mod tests {
     fn ir_calibration_needs_two_scans_then_floors_below_weakest() {
         // One IR scan -> not enough to characterise the user's rig.
         let mut e = Enrollment::new("u");
-        e.profiles.push(FaceProfile { name: "p".into(), scans: vec![scan_with_ir(1.5, 100.0)] });
+        e.profiles.push(FaceProfile {
+            name: "p".into(),
+            scans: vec![scan_with_ir(1.5, 100.0)],
+        });
         assert!(e.ir_calibration().is_none());
 
         // Two+ scans -> depth floor at 75% of the weakest enrolled depth.
@@ -496,7 +549,14 @@ mod tests {
         e.profiles.push(FaceProfile {
             name: "p".into(),
             scans: vec![
-                FaceScan { name: "a".into(), rgb: vec![0.1; 4], ir: None, ir_depth: 0.0, ir_brightness: 0.0, pitch: 0.0 },
+                FaceScan {
+                    name: "a".into(),
+                    rgb: vec![0.1; 4],
+                    ir: None,
+                    ir_depth: 0.0,
+                    ir_brightness: 0.0,
+                    pitch: 0.0,
+                },
                 scan_with_ir(1.5, 100.0),
             ],
         });
@@ -507,7 +567,10 @@ mod tests {
     fn default_names_fill_first_free_slot() {
         let mut e = Enrollment::new("u");
         assert_eq!(e.next_profile_name(), "Face Profile 1");
-        e.profiles.push(FaceProfile { name: "Face Profile 1".into(), scans: vec![] });
+        e.profiles.push(FaceProfile {
+            name: "Face Profile 1".into(),
+            scans: vec![],
+        });
         assert_eq!(e.next_profile_name(), "Face Profile 2");
         let p = &e.profiles[0];
         assert_eq!(p.next_scan_name(), "Face Scan 1");

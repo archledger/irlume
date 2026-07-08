@@ -90,7 +90,9 @@ pub enum Reseal {
 /// using the password the user just proved (via a successful login) they know.
 pub fn reseal_password(user: &str, password: &[u8]) -> Result<Reseal> {
     if password.is_empty() {
-        return Err(Error::Protocol("refusing to reseal an empty password".into()));
+        return Err(Error::Protocol(
+            "refusing to reseal an empty password".into(),
+        ));
     }
     if !has_sealed_password(user) {
         return Ok(Reseal::NotArmed);
@@ -165,13 +167,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
 
         // Not armed -> nothing happens.
-        assert_eq!(reseal_password("rt", b"whatever").unwrap(), Reseal::NotArmed);
+        assert_eq!(
+            reseal_password("rt", b"whatever").unwrap(),
+            Reseal::NotArmed
+        );
 
         seal_password("rt", b"first-password").expect("arm");
         // Same password still unseals under current PCRs -> no rewrite.
-        assert_eq!(reseal_password("rt", b"first-password").unwrap(), Reseal::Unchanged);
+        assert_eq!(
+            reseal_password("rt", b"first-password").unwrap(),
+            Reseal::Unchanged
+        );
         // Different password (simulates a password change) -> reseal.
-        assert_eq!(reseal_password("rt", b"second-password").unwrap(), Reseal::Resealed);
+        assert_eq!(
+            reseal_password("rt", b"second-password").unwrap(),
+            Reseal::Resealed
+        );
         // And it now unseals to the new one.
         assert_eq!(&*unseal_password("rt").unwrap(), b"second-password");
 

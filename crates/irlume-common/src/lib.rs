@@ -109,11 +109,24 @@ pub enum Request {
     /// Delete a whole profile (and its scans). PRIVILEGED, same rule as Enroll.
     DeleteProfile { user: String, profile: String },
     /// Delete one scan from a profile. PRIVILEGED.
-    DeleteScan { user: String, profile: String, scan: String },
+    DeleteScan {
+        user: String,
+        profile: String,
+        scan: String,
+    },
     /// Rename a profile. PRIVILEGED.
-    RenameProfile { user: String, profile: String, new_name: String },
+    RenameProfile {
+        user: String,
+        profile: String,
+        new_name: String,
+    },
     /// Rename a scan within a profile. PRIVILEGED.
-    RenameScan { user: String, profile: String, scan: String, new_name: String },
+    RenameScan {
+        user: String,
+        profile: String,
+        scan: String,
+        new_name: String,
+    },
     /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
     /// Toggle the per-user "require blink challenge to unlock" gate (temporal
@@ -185,11 +198,17 @@ pub enum Request {
     /// Wrap `user`'s template key under a recovery `passphrase` (the manual
     /// backstop for TPM-clear / dbx / disk-move). Requires an enrolled template
     /// key to exist. PRIVILEGED: root or `user`.
-    RecoverySetup { user: String, passphrase: SecretBytes },
+    RecoverySetup {
+        user: String,
+        passphrase: SecretBytes,
+    },
     /// Restore `user`'s template key from the recovery envelope using
     /// `passphrase`, re-sealing it to the current TPM PCRs. PRIVILEGED: root or
     /// `user`.
-    RecoveryRestore { user: String, passphrase: SecretBytes },
+    RecoveryRestore {
+        user: String,
+        passphrase: SecretBytes,
+    },
     /// Report whether `user` has a sealed template key and/or a recovery
     /// envelope. Unprivileged: root or `user`.
     RecoveryStatus { user: String },
@@ -254,13 +273,26 @@ pub enum Response {
     Profiles(Vec<String>),
     /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
     /// face matched (check `live` to tell "no match" from "not a live face").
-    Identified { user: Option<String>, profile: Option<String>, score: f32, live: bool, reason: String },
+    Identified {
+        user: Option<String>,
+        profile: Option<String>,
+        score: f32,
+        live: bool,
+        reason: String,
+    },
     /// Structured enrollment listing: profiles (each with its scan names) plus
     /// the per-user require-eyes-open and require-challenge settings.
-    Enrollment { profiles: Vec<ProfileSummary>, require_eyes_open: bool, require_challenge: bool },
+    Enrollment {
+        profiles: Vec<ProfileSummary>,
+        require_eyes_open: bool,
+        require_challenge: bool,
+    },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
-    SelfTest { passed: bool, detail: String },
+    SelfTest {
+        passed: bool,
+        detail: String,
+    },
     Pong,
     /// Reply to [`Request::Health`]. `rgb_dev`/`ir_dev` are the selected camera
     /// nodes ONLY when they exist right now (never the unvalidated fallback).
@@ -286,7 +318,9 @@ pub enum Response {
     /// The password was sealed (`SealPassword`).
     PasswordSealed,
     /// Face matched and the TPM released the password (`UnsealPassword`).
-    PasswordUnsealed { secret: SecretBytes },
+    PasswordUnsealed {
+        secret: SecretBytes,
+    },
     /// Whether a sealed password exists (`HasSealedPassword`).
     HasPassword(bool),
     /// The sealed password was erased (`ForgetPassword`).
@@ -295,13 +329,20 @@ pub enum Response {
     /// (re-)written: either the old one no longer unsealed (PCRs moved) or the
     /// password differed. `armed` is false when the user has no sealed password
     /// at all, in which case nothing was done (we never auto-arm).
-    PasswordResealed { armed: bool, changed: bool },
+    PasswordResealed {
+        armed: bool,
+        changed: bool,
+    },
 
     // --- recovery responses -------------------------------------------------
     /// Status of `user`'s template-key encryption and recovery passphrase
     /// (`RecoveryStatus`): whether templates are encrypted (a sealed key exists)
     /// and whether a recovery passphrase is set.
-    RecoveryStatus { encrypted: bool, recovery_set: bool, tpm_present: bool },
+    RecoveryStatus {
+        encrypted: bool,
+        recovery_set: bool,
+        tpm_present: bool,
+    },
 }
 
 /// Crate-wide error type.

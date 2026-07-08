@@ -89,12 +89,21 @@ fn camera_holder(device: &str) -> Option<String> {
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let Ok(fds) = std::fs::read_dir(ent.path().join("fd")) else { continue };
+        let Ok(fds) = std::fs::read_dir(ent.path().join("fd")) else {
+            continue;
+        };
         for fd in fds.flatten() {
-            if std::fs::read_link(fd.path()).map(|t| t == dev).unwrap_or(false) {
+            if std::fs::read_link(fd.path())
+                .map(|t| t == dev)
+                .unwrap_or(false)
+            {
                 let comm = std::fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
                 let comm = comm.trim();
-                return Some(if comm.is_empty() { format!("pid {pid}") } else { format!("{comm} (pid {pid})") });
+                return Some(if comm.is_empty() {
+                    format!("pid {pid}")
+                } else {
+                    format!("{comm} (pid {pid})")
+                });
             }
         }
     }
@@ -159,8 +168,10 @@ pub fn privacy_engaged(device: &str) -> bool {
         return false;
     };
     match dev.control(V4L2_CID_PRIVACY) {
-        Ok(ctrl) => matches!(ctrl.value, v4l::control::Value::Boolean(true))
-            || matches!(ctrl.value, v4l::control::Value::Integer(n) if n != 0),
+        Ok(ctrl) => {
+            matches!(ctrl.value, v4l::control::Value::Boolean(true))
+                || matches!(ctrl.value, v4l::control::Value::Integer(n) if n != 0)
+        }
         Err(_) => false, // control absent on this camera
     }
 }
@@ -236,7 +247,10 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
             }
         }
     }
-    if std::env::var("IRLUME_CAMERA_REQUIRE_FIXED").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("IRLUME_CAMERA_REQUIRE_FIXED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         let removable = dev_dir
             .as_ref()
             .and_then(|d| std::fs::read_to_string(d.join("removable")).ok())
@@ -357,7 +371,9 @@ pub struct Caps {
 }
 
 pub fn capabilities() -> Caps {
-    let force_no_ir = std::env::var("IRLUME_FORCE_NO_IR").map(|v| v == "1").unwrap_or(false);
+    let force_no_ir = std::env::var("IRLUME_FORCE_NO_IR")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let ir_pair = !force_no_ir && !list_pairs().is_empty();
     let rgb = ir_pair || discover_nodes().iter().any(|(_, r)| matches!(r, Role::Rgb));
     Caps { ir_pair, rgb }
@@ -396,7 +412,12 @@ pub fn list_pairs() -> Vec<CameraPair> {
         let fixed = std::fs::read_to_string(id.join("removable"))
             .map(|s| s.trim() == "fixed")
             .unwrap_or(false);
-        out.push(CameraPair { rgb: rgbs[0].clone(), ir: irs[0].clone(), id: read_vidpid(id), fixed });
+        out.push(CameraPair {
+            rgb: rgbs[0].clone(),
+            ir: irs[0].clone(),
+            id: read_vidpid(id),
+            fixed,
+        });
     }
     out.sort_by(|a, b| b.fixed.cmp(&a.fixed).then(a.rgb.cmp(&b.rgb)));
     out
@@ -411,7 +432,9 @@ const RGB_BURST: usize = 5;
 pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
     verify_pinned(device)?;
     if privacy_engaged(device) {
-        return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
+        return Err(Error::Hardware(format!(
+            "{device}: hardware privacy switch is ON"
+        )));
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     // Best-effort backlight/low-light correction: tell auto-exposure to expose
@@ -439,7 +462,12 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
     let mut frames = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        frames.push(Frame { width: w, height: h, spectrum: Spectrum::Rgb, data: yuyv_to_rgb(buf, w, h) });
+        frames.push(Frame {
+            width: w,
+            height: h,
+            spectrum: Spectrum::Rgb,
+            data: yuyv_to_rgb(buf, w, h),
+        });
     }
     Ok(frames)
 }
@@ -447,7 +475,9 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
 /// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
 pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
     let mut frames = capture_rgb_burst(device, 1)?;
-    frames.pop().ok_or_else(|| Error::Hardware("no frames captured".into()))
+    frames
+        .pop()
+        .ok_or_else(|| Error::Hardware("no frames captured".into()))
 }
 
 /// Capture an RGB burst and return its per-pixel temporal median — the
@@ -477,7 +507,12 @@ pub fn median_frame(mut frames: Vec<Frame>) -> Frame {
         col.sort_unstable();
         *o = col[col.len() / 2];
     }
-    Frame { width: w, height: h, spectrum, data: out }
+    Frame {
+        width: w,
+        height: h,
+        spectrum,
+        data: out,
+    }
 }
 
 const IR_W: u32 = 640;
@@ -495,7 +530,9 @@ const IR_BURST: usize = 10;
 pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     verify_pinned(device)?;
     if privacy_engaged(device) {
-        return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
+        return Err(Error::Hardware(format!(
+            "{device}: hardware privacy switch is ON"
+        )));
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
@@ -547,7 +584,12 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
         );
     }
     let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
-    Ok(Frame { width: w, height: h, spectrum: Spectrum::Ir, data: grey })
+    Ok(Frame {
+        width: w,
+        height: h,
+        spectrum: Spectrum::Ir,
+        data: grey,
+    })
 }
 
 /// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for
@@ -557,10 +599,16 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
 /// mini-burst — `burst=1` yields raw frames (to reveal whether the emitter
 /// strobes); `burst>=2` de-strobes locally while keeping enough temporal
 /// resolution for a blink (the IR node is ~15 fps, so a mini-burst of 2 ≈ 133 ms).
-pub fn capture_ir_sequence(device: &str, samples: usize, burst: usize) -> irlume_common::Result<Vec<Frame>> {
+pub fn capture_ir_sequence(
+    device: &str,
+    samples: usize,
+    burst: usize,
+) -> irlume_common::Result<Vec<Frame>> {
     verify_pinned(device)?;
     if privacy_engaged(device) {
-        return Err(Error::Hardware(format!("{device}: hardware privacy switch is ON")));
+        return Err(Error::Hardware(format!(
+            "{device}: hardware privacy switch is ON"
+        )));
     }
     let burst = burst.max(1);
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
@@ -620,8 +668,8 @@ pub fn capture_ir_sequence(device: &str, samples: usize, burst: usize) -> irlume
         }
         let Some(data) = best else { continue };
         let sig = sig_of(&data);
-        let frozen = (10.0..245.0).contains(&best_mean)
-            && last_sig.as_deref() == Some(sig.as_slice());
+        let frozen =
+            (10.0..245.0).contains(&best_mean) && last_sig.as_deref() == Some(sig.as_slice());
         last_sig = Some(sig);
         if frozen {
             dead_run += 1;
@@ -644,7 +692,12 @@ pub fn capture_ir_sequence(device: &str, samples: usize, burst: usize) -> irlume
             // skip it rather than spend a window slot on it.
             continue;
         }
-        frames.push(Frame { width: w, height: h, spectrum: Spectrum::Ir, data });
+        frames.push(Frame {
+            width: w,
+            height: h,
+            spectrum: Spectrum::Ir,
+            data,
+        });
     }
     Ok(frames)
 }
@@ -662,7 +715,9 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
     let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
     if &fmt.fourcc.repr != b"GREY" {
-        return Err(Error::Hardware(format!("{device}: not an IR (GREY) capture node")));
+        return Err(Error::Hardware(format!(
+            "{device}: not an IR (GREY) capture node"
+        )));
     }
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
@@ -720,7 +775,8 @@ pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<(u8, u8, usiz
 /// whether IR is bright after. `Some(true/false)` distinguishes "auto-setup ran"
 /// in the bool; the caller logs accordingly. Best-effort.
 pub fn ensure_ir_emitter(device: &str) -> irlume_common::Result<bool> {
-    let mean_of = |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
+    let mean_of =
+        |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
     if mean_of(&capture_ir(device)?) >= 40.0 {
         return Ok(true); // already working — do not touch the camera
     }
@@ -795,7 +851,10 @@ impl Cameras {
                 "{rgb}: hardware privacy switch is ON — disable it to authenticate"
             )));
         }
-        Ok(Self { rgb_device: rgb, ir_device: ir })
+        Ok(Self {
+            rgb_device: rgb,
+            ir_device: ir,
+        })
     }
 
     /// Capture an AE-warmed RGB frame.
@@ -815,7 +874,12 @@ mod tests {
     use super::*;
 
     fn frame(data: &[u8]) -> Frame {
-        Frame { width: data.len() as u32, height: 1, spectrum: Spectrum::Rgb, data: data.to_vec() }
+        Frame {
+            width: data.len() as u32,
+            height: 1,
+            spectrum: Spectrum::Rgb,
+            data: data.to_vec(),
+        }
     }
 
     #[test]
@@ -826,7 +890,7 @@ mod tests {
             frame(&[100, 50, 200]),
             frame(&[101, 49, 201]),
             frame(&[255, 255, 255]), // the bad frame
-            frame(&[ 99, 51, 199]),
+            frame(&[99, 51, 199]),
             frame(&[100, 50, 200]),
         ];
         let m = median_frame(frames);
@@ -872,7 +936,10 @@ mod tests {
     #[test]
     fn pin_allowlist_parses_multi_camera_set() {
         // Single camera.
-        assert_eq!(parse_pin_allowlist("3277:0059"), Some(vec!["3277:0059".into()]));
+        assert_eq!(
+            parse_pin_allowlist("3277:0059"),
+            Some(vec!["3277:0059".into()])
+        );
         // Built-in + external Brio, with spacing/case normalized.
         assert_eq!(
             parse_pin_allowlist(" 3277:0059, 046D:085E "),

@@ -52,8 +52,8 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 
-    let mut line = serde_json::to_vec(req)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut line =
+        serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');
     (&stream).write_all(&line)?;
     (&stream).flush()?;
@@ -69,8 +69,8 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
             "daemon closed connection without responding",
         ));
     }
-    let parsed = serde_json::from_str(buf.trim())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+    let parsed =
+        serde_json::from_str(buf.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
     // The response may carry an unsealed secret; wipe the raw JSON now that the
     // bytes live inside a zeroizing `SecretBytes` in the parsed value.
     buf.zeroize();

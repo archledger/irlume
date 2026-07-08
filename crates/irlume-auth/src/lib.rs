@@ -94,7 +94,11 @@ impl Engine {
     /// Assurance tier from the hardware: `Secure` with a real RGB+IR camera,
     /// `Convenience` on an RGB-only device.
     pub fn tier(&self) -> Tier {
-        if self.ir_available { Tier::Secure } else { Tier::Convenience }
+        if self.ir_available {
+            Tier::Secure
+        } else {
+            Tier::Convenience
+        }
     }
 
     /// Whether a real IR+RGB Hello camera is present (full face auth available).
@@ -156,7 +160,11 @@ impl Engine {
     /// Capture + assess, choosing the path from the hardware: full cross-spectrum
     /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
-        if self.ir_available { self.assess_full() } else { self.assess_rgb_only() }
+        if self.ir_available {
+            self.assess_full()
+        } else {
+            self.assess_rgb_only()
+        }
     }
 
     /// RGB-only capture + algorithmic (no-IR) liveness — the convenience-tier
@@ -165,9 +173,16 @@ impl Engine {
     /// limited to lock-screen unlock and never releases credentials.
     fn assess_rgb_only(&mut self) -> irlume_common::Result<Assessment> {
         let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
-        let rgb_view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let rgb_view = align::RgbView {
+            data: &rgb.data,
+            width: rgb.width,
+            height: rgb.height,
+        };
         let rgb_faces = self.det.detect(&rgb_view)?;
-        let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
+        let rgb_top = rgb_faces
+            .iter()
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .cloned();
         let (rgb_brightness, rgb_specular) = rgb_top
             .as_ref()
             .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox))
@@ -175,10 +190,15 @@ impl Engine {
         // 2D-FFT moiré / pixel-grid cue (screen-replay deterrent).
         let rgb_moire = rgb_top
             .as_ref()
-            .map(|f| irlume_vision::moire::moire_score(
-                &irlume_vision::moire::face_gray_n(&rgb.data, rgb.width, rgb.height, &f.bbox)))
+            .map(|f| {
+                irlume_vision::moire::moire_score(&irlume_vision::moire::face_gray_n(
+                    &rgb.data, rgb.width, rgb.height, &f.bbox,
+                ))
+            })
             .unwrap_or(0.0);
-        let pose = rgb_top.as_ref().map(|f| irlume_vision::head_pose(&f.landmarks));
+        let pose = rgb_top
+            .as_ref()
+            .map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = Signals {
             rgb_face: rgb_top.as_ref().map(|f| irlume_liveness::FaceBox {
                 cx: (f.bbox[0] + f.bbox[2]) / 2.0 / rgb.width as f32,
@@ -196,13 +216,29 @@ impl Engine {
             rgb_moire_score: rgb_moire,
         };
         let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
-        irlume_common::dlog!("liveness(rgb-only): {verdict:?} ({reason}); bright={:.0} specular={:.2} moire={:.0}",
-            signals.rgb_face_brightness, signals.rgb_specular_frac, signals.rgb_moire_score);
+        irlume_common::dlog!(
+            "liveness(rgb-only): {verdict:?} ({reason}); bright={:.0} specular={:.2} moire={:.0}",
+            signals.rgb_face_brightness,
+            signals.rgb_specular_frac,
+            signals.rgb_moire_score
+        );
         let embedding = match &rgb_top {
-            Some(f) => Some(self.emb.embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?),
+            Some(f) => Some(
+                self.emb
+                    .embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?,
+            ),
             None => None,
         };
-        Ok(Assessment { verdict, reason, embedding, ir_embedding: None, signals, ir_depth: 0.0, ir_brightness: 0.0, eyes_open: false })
+        Ok(Assessment {
+            verdict,
+            reason,
+            embedding,
+            ir_embedding: None,
+            signals,
+            ir_depth: 0.0,
+            ir_brightness: 0.0,
+            eyes_open: false,
+        })
     }
 
     fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
@@ -211,38 +247,73 @@ impl Engine {
         let t = std::time::Instant::now();
         let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
         let rgb_ms = t.elapsed().as_millis();
-        let rgb_view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let rgb_view = align::RgbView {
+            data: &rgb.data,
+            width: rgb.width,
+            height: rgb.height,
+        };
         let rgb_faces = self.det.detect(&rgb_view)?;
-        let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
-        irlume_common::dlog!("assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
-            rgb.width, rgb.height, rgb_faces.len(), rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0));
+        let rgb_top = rgb_faces
+            .iter()
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .cloned();
+        irlume_common::dlog!(
+            "assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
+            rgb.width,
+            rgb.height,
+            rgb_faces.len(),
+            rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
+        );
 
         let t = std::time::Instant::now();
         let ir = irlume_camera::capture_ir(&self.ir_dev)?;
         let ir_ms = t.elapsed().as_millis();
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
-        let ir_view = align::RgbView { data: &ir_grey_rgb, width: ir.width, height: ir.height };
+        let ir_view = align::RgbView {
+            data: &ir_grey_rgb,
+            width: ir.width,
+            height: ir.height,
+        };
         let ir_faces = self.det.detect(&ir_view)?;
-        let ir_top = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)).cloned();
-        irlume_common::dlog!("assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
-            ir.width, ir.height, ir_faces.len(), ir_top.as_ref().map(|f| f.score).unwrap_or(0.0));
+        let ir_top = ir_faces
+            .iter()
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .cloned();
+        irlume_common::dlog!(
+            "assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
+            ir.width,
+            ir.height,
+            ir_faces.len(),
+            ir_top.as_ref().map(|f| f.score).unwrap_or(0.0)
+        );
 
         let fbox = |f: &Detection, w: u32, h: u32| irlume_liveness::FaceBox {
             cx: (f.bbox[0] + f.bbox[2]) / 2.0 / w as f32,
             cy: (f.bbox[1] + f.bbox[3]) / 2.0 / h as f32,
             score: f.score,
         };
-        let ir_brightness = ir_top.as_ref().map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
-        let ir_depth = ir_top.as_ref().map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
+        let ir_brightness = ir_top
+            .as_ref()
+            .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
+            .unwrap_or(0.0);
+        let ir_depth = ir_top
+            .as_ref()
+            .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
+            .unwrap_or(0.0);
         // Head orientation from the RGB face landmarks (Windows-Hello-style
         // frontality gate). Defaults to frontal when there's no RGB face.
-        let pose = rgb_top.as_ref().map(|f| irlume_vision::head_pose(&f.landmarks));
+        let pose = rgb_top
+            .as_ref()
+            .map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = Signals {
             rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width, rgb.height)),
             ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
             ir_face_brightness: ir_brightness,
             ir_center_edge_ratio: ir_depth,
-            ir_eye_glint: ir_top.as_ref().map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0),
+            ir_eye_glint: ir_top
+                .as_ref()
+                .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
+                .unwrap_or(0.0),
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             rgb_face_brightness: 0.0, // IR path doesn't use the RGB-PAD cues
@@ -284,7 +355,16 @@ impl Engine {
             .as_ref()
             .map(|f| both_eyes_open(&ir.data, ir.width, ir.height, &f.landmarks))
             .unwrap_or(false);
-        Ok(Assessment { verdict, reason, embedding, ir_embedding, signals, ir_depth, ir_brightness, eyes_open })
+        Ok(Assessment {
+            verdict,
+            reason,
+            embedding,
+            ir_embedding,
+            signals,
+            ir_depth,
+            ir_brightness,
+            eyes_open,
+        })
     }
 
     /// Passive blink liveness (opt-in, ADR-0002): capture a short IR sequence and
@@ -312,9 +392,18 @@ impl Engine {
         for (i, f) in frames.iter().enumerate() {
             let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
             let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
-            let view = align::RgbView { data: &grey_rgb, width: f.width, height: f.height };
+            let view = align::RgbView {
+                data: &grey_rgb,
+                width: f.width,
+                height: f.height,
+            };
             let mut ear = None;
-            if let Some(t) = self.det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+            if let Some(t) = self
+                .det
+                .detect(&view)?
+                .into_iter()
+                .max_by(|a, b| a.score.total_cmp(&b.score))
+            {
                 let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
                 let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
                 let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
@@ -364,26 +453,51 @@ impl Engine {
         // Fingerprint mode: face is disabled so pam_fprintd drives — never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
-            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "face disabled (fingerprint mode)".into() });
+            return Ok(Outcome {
+                granted: false,
+                live: false,
+                score: 0.0,
+                reason: "face disabled (fingerprint mode)".into(),
+            });
         }
         let Some(enr) = irlume_core::storage::load(user)? else {
-            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' is not enrolled") });
+            return Ok(Outcome {
+                granted: false,
+                live: false,
+                score: 0.0,
+                reason: format!("'{user}' is not enrolled"),
+            });
         };
         if enr.profiles.iter().all(|p| p.scans.is_empty()) {
-            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("'{user}' has no face scans enrolled") });
+            return Ok(Outcome {
+                granted: false,
+                live: false,
+                score: 0.0,
+                reason: format!("'{user}' has no face scans enrolled"),
+            });
         }
         // Anti-swap: refuse if the live camera no longer matches the one this
         // user enrolled on (only enforced once an enrollment carries a binding).
         if let Some(bind) = &enr.camera_binding {
             if let Some(reason) = self.binding_mismatch(bind) {
-                return Ok(Outcome { granted: false, live: false, score: 0.0, reason });
+                return Ok(Outcome {
+                    granted: false,
+                    live: false,
+                    score: 0.0,
+                    reason,
+                });
             }
         }
         let a = self.assess()?;
 
         // Opt-in hard gate: never unlock unless both eyes read open.
         if enr.require_eyes_open && !a.eyes_open {
-            return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "eyes not detected open (require-eyes-open is on)".into() });
+            return Ok(Outcome {
+                granted: false,
+                live: false,
+                score: 0.0,
+                reason: "eyes not detected open (require-eyes-open is on)".into(),
+            });
         }
 
         // best match over a labeled set of templates -> (score, profile name).
@@ -391,14 +505,25 @@ impl Engine {
             scans
                 .iter()
                 .map(|(prof, _scan, t)| (align::cosine(probe, t), prof.to_string()))
-                .fold((f32::NEG_INFINITY, String::new()), |acc, x| if x.0 > acc.0 { x } else { acc })
+                .fold((f32::NEG_INFINITY, String::new()), |acc, x| {
+                    if x.0 > acc.0 {
+                        x
+                    } else {
+                        acc
+                    }
+                })
         };
 
         // Primary path: a visible-light (RGB) face -> full cross-spectrum gate +
         // RGB recognition across all profiles' scans.
         if let Some(probe) = a.embedding {
             if a.verdict != Verdict::Live {
-                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
+                return Ok(Outcome {
+                    granted: false,
+                    live: false,
+                    score: 0.0,
+                    reason: format!("liveness {:?}: {}", a.verdict, a.reason),
+                });
             }
             // Per-user IR-liveness DEPTH floor (anti-screen/photo, calibrated to
             // this user's enrolled 3D face structure): the live frame must clear the
@@ -409,7 +534,11 @@ impl Engine {
             // (`evaluate`) already enforces an ambient-robust IR brightness floor.
             // Only meaningful when IR was actually captured (skip on RGB-only).
             if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
-                irlume_common::dlog!("gate(per-user depth floor): live {:.2} vs floor {:.2}", a.ir_depth, depth_floor);
+                irlume_common::dlog!(
+                    "gate(per-user depth floor): live {:.2} vs floor {:.2}",
+                    a.ir_depth,
+                    depth_floor
+                );
                 if a.ir_depth < depth_floor {
                     return Ok(Outcome {
                         granted: false, live: false, score: 0.0,
@@ -423,9 +552,20 @@ impl Engine {
             let scans = enr.rgb_scans();
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = best(&probe, &scans);
-            irlume_common::dlog!("match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')", scans.len());
+            irlume_common::dlog!(
+                "match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')",
+                scans.len()
+            );
             if score >= thr {
-                return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score, reason: format!("match: {who} (rgb)") });
+                return self.challenge_if_required(
+                    &enr,
+                    Outcome {
+                        granted: true,
+                        live: true,
+                        score,
+                        reason: format!("match: {who} (rgb)"),
+                    },
+                );
             }
             // Stage-2 lighting-adaptive fusion: RGB recognition missed (poor ambient
             // light or a marginal angle). If we also captured an IR face and the user
@@ -460,8 +600,12 @@ impl Engine {
                     } else {
                         irlume_core::IR_MATCH_THRESHOLD
                     };
-                    let ir_thr = irlume_core::scaled_threshold(ir_base, ir_scans.len()) + irlume_core::IR_FALLBACK_MARGIN;
-                    irlume_common::dlog!("match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})", self.ir_adapter.is_some());
+                    let ir_thr = irlume_core::scaled_threshold(ir_base, ir_scans.len())
+                        + irlume_core::IR_FALLBACK_MARGIN;
+                    irlume_common::dlog!(
+                        "match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})",
+                        self.ir_adapter.is_some()
+                    );
                     if ir_score >= ir_thr {
                         return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: ir_score,
                             reason: format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})") });
@@ -471,7 +615,12 @@ impl Engine {
             // The reason keeps the exact score: it reaches only the session's
             // own TUI/CLI (coaching a genuine false reject); the daemon redacts
             // measurements before this line touches the journal (anti-oracle).
-            return Ok(Outcome { granted: false, live: true, score, reason: format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)") });
+            return Ok(Outcome {
+                granted: false,
+                live: true,
+                score,
+                reason: format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)"),
+            });
         }
 
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
@@ -479,13 +628,24 @@ impl Engine {
         if let Some(probe) = a.ir_embedding {
             let scans = enr.ir_scans();
             if scans.is_empty() {
-                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: "dark, but no IR scans enrolled — re-enroll to enable dark unlock".into() });
+                return Ok(Outcome {
+                    granted: false,
+                    live: false,
+                    score: 0.0,
+                    reason: "dark, but no IR scans enrolled — re-enroll to enable dark unlock"
+                        .into(),
+                });
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
             irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2}",
                 a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint);
             if verdict != Verdict::Live {
-                return Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("dark liveness {verdict:?}: {reason}") });
+                return Ok(Outcome {
+                    granted: false,
+                    live: false,
+                    score: 0.0,
+                    reason: format!("dark liveness {verdict:?}: {reason}"),
+                });
             }
             let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
@@ -494,12 +654,33 @@ impl Engine {
             };
             let ir_thr = irlume_core::scaled_threshold(ir_base, scans.len());
             let (score, who) = best(&probe, &scans);
-            irlume_common::dlog!("match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={})", scans.len(), self.ir_adapter.is_some());
+            irlume_common::dlog!(
+                "match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={})",
+                scans.len(),
+                self.ir_adapter.is_some()
+            );
             let granted = score >= ir_thr;
-            return self.challenge_if_required(&enr, Outcome { granted, live: true, score, reason: if granted { format!("match: {who} (ir/dark)") } else { "below threshold (ir)".into() } });
+            return self.challenge_if_required(
+                &enr,
+                Outcome {
+                    granted,
+                    live: true,
+                    score,
+                    reason: if granted {
+                        format!("match: {who} (ir/dark)")
+                    } else {
+                        "below threshold (ir)".into()
+                    },
+                },
+            );
         }
 
-        Ok(Outcome { granted: false, live: false, score: 0.0, reason: format!("no face: {}", a.reason) })
+        Ok(Outcome {
+            granted: false,
+            live: false,
+            score: 0.0,
+            reason: format!("no face: {}", a.reason),
+        })
     }
 
     /// 1:N identify ("who is this?"): one live capture, matched against every
@@ -523,14 +704,32 @@ impl Engine {
 
     fn identify_impl(&mut self, restrict: Option<&str>) -> irlume_common::Result<IdentifyOutcome> {
         if irlume_core::policy::method().face_disabled() {
-            return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: "face disabled (fingerprint mode)".into() });
+            return Ok(IdentifyOutcome {
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: false,
+                reason: "face disabled (fingerprint mode)".into(),
+            });
         }
         let a = self.assess()?;
         let Some(probe) = a.embedding else {
-            return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: format!("no RGB face: {}", a.reason) });
+            return Ok(IdentifyOutcome {
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: false,
+                reason: format!("no RGB face: {}", a.reason),
+            });
         };
         if a.verdict != Verdict::Live {
-            return Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: false, reason: format!("liveness {:?}: {}", a.verdict, a.reason) });
+            return Ok(IdentifyOutcome {
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: false,
+                reason: format!("liveness {:?}: {}", a.verdict, a.reason),
+            });
         }
         let mut best: Option<(f32, String, String)> = None; // (score, user, profile)
         let candidates: Vec<String> = match restrict {
@@ -538,7 +737,9 @@ impl Engine {
             None => irlume_core::storage::list_users(),
         };
         for user in candidates {
-            let Some(enr) = irlume_core::storage::load(&user)? else { continue };
+            let Some(enr) = irlume_core::storage::load(&user)? else {
+                continue;
+            };
             let scans = enr.rgb_scans();
             if scans.is_empty() {
                 continue;
@@ -547,17 +748,32 @@ impl Engine {
             let (score, who) = scans
                 .iter()
                 .map(|(prof, _scan, t)| (align::cosine(&probe, t), prof.to_string()))
-                .fold((f32::NEG_INFINITY, String::new()), |acc, x| if x.0 > acc.0 { x } else { acc });
+                .fold((f32::NEG_INFINITY, String::new()), |acc, x| {
+                    if x.0 > acc.0 {
+                        x
+                    } else {
+                        acc
+                    }
+                });
             if score >= thr && best.as_ref().is_none_or(|b| score > b.0) {
                 best = Some((score, user.clone(), who));
             }
         }
         match best {
             Some((score, user, profile)) => Ok(IdentifyOutcome {
-                user: Some(user), profile: Some(profile), score, live: true,
+                user: Some(user),
+                profile: Some(profile),
+                score,
+                live: true,
                 reason: "match".into(),
             }),
-            None => Ok(IdentifyOutcome { user: None, profile: None, score: 0.0, live: true, reason: "live face, but no enrolled match".into() }),
+            None => Ok(IdentifyOutcome {
+                user: None,
+                profile: None,
+                score: 0.0,
+                live: true,
+                reason: "live face, but no enrolled match".into(),
+            }),
         }
     }
 
@@ -568,16 +784,17 @@ impl Engine {
         let a = self.assess()?;
         let s = &a.signals;
         let live = a.verdict == Verdict::Live;
-        let detail = if live {
-            format!(
+        let detail =
+            if live {
+                format!(
                 "Live — RGB face {}, IR face {} · IR brightness {:.0}, depth {:.2}, glint {:.0}",
                 if s.rgb_face.is_some() { "✓" } else { "✗" },
                 if s.ir_face.is_some() { "✓" } else { "✗" },
                 a.ir_brightness, a.ir_depth, s.ir_eye_glint,
             )
-        } else {
-            format!("{:?} — {}", a.verdict, a.reason)
-        };
+            } else {
+                format!("{:?} — {}", a.verdict, a.reason)
+            };
         Ok((live, detail))
     }
 
@@ -586,24 +803,37 @@ impl Engine {
     /// (the "identical images score 0.6" failure). `Request::SelfTest { AlignmentIdentity }`.
     pub fn alignment_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
         let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
-        let view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let view = align::RgbView {
+            data: &rgb.data,
+            width: rgb.width,
+            height: rgb.height,
+        };
         let faces = self.det.detect(&view)?;
         let Some(f) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-            return Ok((false, "no RGB face detected — face the camera and retry".into()));
+            return Ok((
+                false,
+                "no RGB face detected — face the camera and retry".into(),
+            ));
         };
         let chip = align::align_to_arcface(&view, &f.landmarks)?;
         let a = self.emb.embed(&chip)?;
         let b = self.emb.embed(&chip)?;
         let cos = align::cosine(&a, &b);
-        Ok((cos > 0.999, format!("alignment determinism cosine {cos:.6} (want ≈ 1.000000)")))
+        Ok((
+            cos > 0.999,
+            format!("alignment determinism cosine {cos:.6} (want ≈ 1.000000)"),
+        ))
     }
 
     /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).
     /// Each Live capture yields one (rgb, ir, depth, brightness, pitch). No
     /// enrolling from a photo — the liveness gate rejects spoofs. `pitch_neutral`
     /// centres the frontal gate on this user's camera (None on first enroll).
-    fn capture_scans(&mut self, want: usize, pitch_neutral: Option<f32>)
-        -> irlume_common::Result<Vec<Scan>> {
+    fn capture_scans(
+        &mut self,
+        want: usize,
+        pitch_neutral: Option<f32>,
+    ) -> irlume_common::Result<Vec<Scan>> {
         let mut out = Vec::new();
         // Budget (was ×4) absorbs the added frontality gate — a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved — with enough
@@ -620,7 +850,13 @@ impl Engine {
             // the countdown. Same bounds (and neutral) the enrollment guide uses.
             if a.verdict == Verdict::Live && frontal_signals(&a.signals, pitch_neutral) {
                 if let Some(e) = a.embedding {
-                    out.push((e.to_vec(), a.ir_embedding.clone(), a.ir_depth, a.ir_brightness, a.signals.head_pitch_frac));
+                    out.push((
+                        e.to_vec(),
+                        a.ir_embedding.clone(),
+                        a.ir_depth,
+                        a.ir_brightness,
+                        a.signals.head_pitch_frac,
+                    ));
                 }
             }
         }
@@ -629,29 +865,45 @@ impl Engine {
 
     /// Enroll a NEW face profile with `want` scans (capped at MAX_SCANS_PER_PROFILE).
     /// Errors if the account already has MAX_PROFILES. Returns (profile name, scans).
-    pub fn enroll_profile(&mut self, user: &str, profile_name: Option<String>, want: usize) -> irlume_common::Result<(String, usize)> {
-        use irlume_core::storage::{self, Enrollment, FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE};
+    pub fn enroll_profile(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+    ) -> irlume_common::Result<(String, usize)> {
+        use irlume_core::storage::{
+            self, Enrollment, FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE,
+        };
         let mut enr = storage::load(user)?.unwrap_or_else(|| Enrollment::new(user));
         if enr.profiles.len() >= MAX_PROFILES {
-            return Err(irlume_common::Error::Protocol(format!("at the max of {MAX_PROFILES} face profiles — delete one first")));
+            return Err(irlume_common::Error::Protocol(format!(
+                "at the max of {MAX_PROFILES} face profiles — delete one first"
+            )));
         }
         let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
         let name = profile_name.unwrap_or_else(|| enr.next_profile_name());
         if enr.profiles.iter().any(|p| p.name == name) {
-            return Err(irlume_common::Error::Protocol(format!("a face profile named '{name}' already exists")));
+            return Err(irlume_common::Error::Protocol(format!(
+                "a face profile named '{name}' already exists"
+            )));
         }
         // First enroll: no neutral yet → capture_scans falls back to the global
         // default band; the scans' pitches become this user's neutral for next time.
         let captured = self.capture_scans(want, enr.pitch_neutral())?;
         if captured.len() < want {
             return Err(irlume_common::Error::Protocol(format!(
-                "only {} live scans (need {want}) — check lighting and framing", captured.len()
+                "only {} live scans (need {want}) — check lighting and framing",
+                captured.len()
             )));
         }
         // Anti-mixing: a new profile must be a face not already enrolled elsewhere.
         for (rgb, ..) in &captured {
             if let Some((other, score)) = colliding_profile(&enr, rgb, None) {
-                let cnt = enr.profiles.iter().find(|p| p.name == other).map_or(0, |p| p.scans.len());
+                let cnt = enr
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == other)
+                    .map_or(0, |p| p.scans.len());
                 let hint = if cnt < MAX_SCANS_PER_PROFILE {
                     format!("add scans to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE}) instead of a new profile")
                 } else {
@@ -662,10 +914,20 @@ impl Engine {
                 )));
             }
         }
-        let mut prof = FaceProfile { name: name.clone(), scans: Vec::new() };
+        let mut prof = FaceProfile {
+            name: name.clone(),
+            scans: Vec::new(),
+        };
         for (rgb, ir, d, b, pitch) in captured {
             let sname = prof.next_scan_name();
-            prof.scans.push(FaceScan { name: sname, rgb, ir, ir_depth: d, ir_brightness: b, pitch });
+            prof.scans.push(FaceScan {
+                name: sname,
+                rgb,
+                ir,
+                ir_depth: d,
+                ir_brightness: b,
+                pitch,
+            });
         }
         let n = prof.scans.len();
         enr.profiles.push(prof);
@@ -696,7 +958,10 @@ impl Engine {
         }
         if let Some(want) = &bind.ir {
             if irlume_camera::device_identity(&self.ir_dev).as_ref() != Some(want) {
-                return Some("IR camera changed or absent since enrollment — re-enroll on this camera".into());
+                return Some(
+                    "IR camera changed or absent since enrollment — re-enroll on this camera"
+                        .into(),
+                );
             }
         }
         None
@@ -704,19 +969,42 @@ impl Engine {
 
     /// Add one scan to an existing profile ("improve recognition"). Errors if the
     /// profile is missing or already at MAX_SCANS_PER_PROFILE.
-    pub fn add_scan(&mut self, user: &str, profile_name: &str) -> irlume_common::Result<(String, usize)> {
+    pub fn add_scan(
+        &mut self,
+        user: &str,
+        profile_name: &str,
+    ) -> irlume_common::Result<(String, usize)> {
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
-        let mut enr = storage::load(user)?.ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
-        let idx = enr.profiles.iter().position(|p| p.name == profile_name)
-            .ok_or_else(|| irlume_common::Error::Protocol(format!("no face profile '{profile_name}'")))?;
+        let mut enr = storage::load(user)?
+            .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
+        let idx = enr
+            .profiles
+            .iter()
+            .position(|p| p.name == profile_name)
+            .ok_or_else(|| {
+                irlume_common::Error::Protocol(format!("no face profile '{profile_name}'"))
+            })?;
         if enr.profiles[idx].scans.len() >= MAX_SCANS_PER_PROFILE {
-            return Err(irlume_common::Error::Protocol(format!("'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans")));
+            return Err(irlume_common::Error::Protocol(format!(
+                "'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans"
+            )));
         }
-        let (rgb, ir, d, b, pitch) = self.capture_scans(1, enr.pitch_neutral())?.into_iter().next()
-            .ok_or_else(|| irlume_common::Error::Protocol("no live scan captured — check lighting and framing".into()))?;
+        let (rgb, ir, d, b, pitch) = self
+            .capture_scans(1, enr.pitch_neutral())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                irlume_common::Error::Protocol(
+                    "no live scan captured — check lighting and framing".into(),
+                )
+            })?;
         // Anti-mixing: reject a scan whose face belongs to a different profile.
         if let Some((other, score)) = colliding_profile(&enr, &rgb, Some(profile_name)) {
-            let cnt = enr.profiles.iter().find(|p| p.name == other).map_or(0, |p| p.scans.len());
+            let cnt = enr
+                .profiles
+                .iter()
+                .find(|p| p.name == other)
+                .map_or(0, |p| p.scans.len());
             let hint = if cnt < MAX_SCANS_PER_PROFILE {
                 format!("if you want this face, add the scan to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE})")
             } else {
@@ -728,7 +1016,14 @@ impl Engine {
             )));
         }
         let sname = enr.profiles[idx].next_scan_name();
-        enr.profiles[idx].scans.push(FaceScan { name: sname.clone(), rgb, ir, ir_depth: d, ir_brightness: b, pitch });
+        enr.profiles[idx].scans.push(FaceScan {
+            name: sname.clone(),
+            rgb,
+            ir,
+            ir_depth: d,
+            ir_brightness: b,
+            pitch,
+        });
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
         }
@@ -743,7 +1038,10 @@ impl Engine {
     /// `user` (the account being enrolled) tunes the pitch band to that user's
     /// calibrated neutral when they already have scans — so the guide coaches to
     /// the same window the capture gate will accept.
-    pub fn position_sample(&mut self, user: Option<&str>) -> irlume_common::Result<irlume_common::PositionReport> {
+    pub fn position_sample(
+        &mut self,
+        user: Option<&str>,
+    ) -> irlume_common::Result<irlume_common::PositionReport> {
         use irlume_common::PositionReport;
         const MIN_FRAC: f32 = 0.12;
         const MAX_FRAC: f32 = 0.55;
@@ -756,8 +1054,16 @@ impl Engine {
             .and_then(|e| e.pitch_neutral());
 
         let rgb = irlume_camera::capture_rgb(&self.rgb_dev)?;
-        let view = align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
-        let top = self.det.detect(&view)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+        let view = align::RgbView {
+            data: &rgb.data,
+            width: rgb.width,
+            height: rgb.height,
+        };
+        let top = self
+            .det
+            .detect(&view)?
+            .into_iter()
+            .max_by(|a, b| a.score.total_cmp(&b.score));
         // NB: the framing guide is RGB-only so it stays fast enough to poll (the
         // IR burst would make each sample multi-second). IR readiness is checked
         // at the actual capture, not in the guide.
@@ -766,7 +1072,8 @@ impl Engine {
         let Some(f) = top else {
             return Ok(PositionReport {
                 ir_ok,
-                guidance: "No face detected — look straight at the camera and center yourself".into(),
+                guidance: "No face detected — look straight at the camera and center yourself"
+                    .into(),
                 ..Default::default()
             });
         };
@@ -788,21 +1095,41 @@ impl Engine {
             pose.yaw_asym, pose.yaw_signed, pose.pitch_frac, plo, phi,
             pitch_neutral.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into()), face_frac, brightness);
         if face_frac < MIN_FRAC {
-            guidance = "Move closer".into(); well = false; q -= 45;
+            guidance = "Move closer".into();
+            well = false;
+            q -= 45;
         } else if face_frac > MAX_FRAC {
-            guidance = "Move back a little".into(); well = false; q -= 30;
+            guidance = "Move back a little".into();
+            well = false;
+            q -= 30;
         } else if !centered {
-            guidance = "Center your face in the frame".into(); well = false; q -= 30;
+            guidance = "Center your face in the frame".into();
+            well = false;
+            q -= 30;
         } else if !frontal {
-            guidance = frontality_hint(&pose, pitch_neutral); well = false; q -= 30;
+            guidance = frontality_hint(&pose, pitch_neutral);
+            well = false;
+            q -= 30;
         } else if brightness < DIM {
-            guidance = "Too dark — add light or face a window".into(); well = false; q -= 30;
+            guidance = "Too dark — add light or face a window".into();
+            well = false;
+            q -= 30;
         } else if brightness > BRIGHT {
-            guidance = "Too bright — reduce glare/backlight".into(); well = false; q -= 20;
+            guidance = "Too bright — reduce glare/backlight".into();
+            well = false;
+            q -= 20;
         }
         Ok(PositionReport {
-            face: true, face_frac, centered, yaw_asym: pose.yaw_asym, pitch_frac: pose.pitch_frac,
-            brightness, ir_ok, quality: q.clamp(0, 100) as u8, well_framed: well, guidance,
+            face: true,
+            face_frac,
+            centered,
+            yaw_asym: pose.yaw_asym,
+            pitch_frac: pose.pitch_frac,
+            brightness,
+            ir_ok,
+            quality: q.clamp(0, 100) as u8,
+            well_framed: well,
+            guidance,
         })
     }
 }
@@ -866,8 +1193,11 @@ fn frontality_hint(pose: &irlume_vision::HeadPose, pitch_neutral: Option<f32>) -
     let pitch_sev = (pose.pitch_frac - mid).abs() / ((hi - lo) / 2.0);
     if yaw_off && (!pitch_off || yaw_sev >= pitch_sev) {
         // Nose toward image-left → looking to their right → turn left, and vice versa.
-        if pose.yaw_signed < 0.0 { "Turn your head left to face the camera".into() }
-        else { "Turn your head right to face the camera".into() }
+        if pose.yaw_signed < 0.0 {
+            "Turn your head left to face the camera".into()
+        } else {
+            "Turn your head right to face the camera".into()
+        }
     } else if pose.pitch_frac < lo {
         // Below neutral = nose toward eye line = looking up → bring the chin down.
         "Lower your chin — look down a little".into()
@@ -890,12 +1220,17 @@ fn luma_in_bbox(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
         for x in x1..x2 {
             let i = ((y * w + x) * 3) as usize;
             if i + 2 < rgb.len() {
-                sum += 0.299 * rgb[i] as f64 + 0.587 * rgb[i + 1] as f64 + 0.114 * rgb[i + 2] as f64;
+                sum +=
+                    0.299 * rgb[i] as f64 + 0.587 * rgb[i + 1] as f64 + 0.114 * rgb[i + 2] as f64;
                 n += 1;
             }
         }
     }
-    if n == 0 { 0.0 } else { (sum / n as f64) as f32 }
+    if n == 0 {
+        0.0
+    } else {
+        (sum / n as f64) as f32
+    }
 }
 
 /// Best-matching OTHER profile for `probe` (excluding `exclude`), if it reaches
@@ -963,14 +1298,22 @@ fn rgb_luma_stats(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> (f32, f32) {
         for x in x1..x2 {
             let i = ((y * w + x) * 3) as usize;
             if i + 2 < rgb.len() {
-                let luma = (rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000;
+                let luma =
+                    (rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114)
+                        / 1000;
                 sum += luma as u64;
-                if luma >= 250 { hot += 1; }
+                if luma >= 250 {
+                    hot += 1;
+                }
                 n += 1;
             }
         }
     }
-    if n == 0 { (0.0, 0.0) } else { (sum as f32 / n as f32, hot as f32 / n as f32) }
+    if n == 0 {
+        (0.0, 0.0)
+    } else {
+        (sum as f32 / n as f32, hot as f32 / n as f32)
+    }
 }
 
 pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
@@ -997,7 +1340,12 @@ pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     if bw <= 4.0 || bh <= 4.0 {
         return 0.0;
     }
-    let inner = [bbox[0] + bw * 0.25, bbox[1] + bh * 0.25, bbox[2] - bw * 0.25, bbox[3] - bh * 0.25];
+    let inner = [
+        bbox[0] + bw * 0.25,
+        bbox[1] + bh * 0.25,
+        bbox[2] - bw * 0.25,
+        bbox[3] - bh * 0.25,
+    ];
     let center = mean_in_bbox(grey, w, h, &inner);
     let whole = mean_in_bbox(grey, w, h, bbox);
     let edge = (whole - center * 0.25) / 0.75;
@@ -1033,7 +1381,9 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
 /// spike (hence contrast) collapses. Live-validated 2026-06-30: genuine open-eye
 /// contrast ≈120, a static vinyl banner ≈70 (flat).
 pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
-    let iod = ((landmarks[1].0 - landmarks[0].0).powi(2) + (landmarks[1].1 - landmarks[0].1).powi(2)).sqrt();
+    let iod = ((landmarks[1].0 - landmarks[0].0).powi(2)
+        + (landmarks[1].1 - landmarks[0].1).powi(2))
+    .sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     let at = |(ex, ey): (f32, f32)| -> f32 {
         let (cx, cy) = (ex as i32, ey as i32);
@@ -1049,7 +1399,11 @@ pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -
                 }
             }
         }
-        if cnt == 0 { 0.0 } else { peak as f32 - sum as f32 / cnt as f32 }
+        if cnt == 0 {
+            0.0
+        } else {
+            peak as f32 - sum as f32 / cnt as f32
+        }
     };
     at(landmarks[0]).max(at(landmarks[1]))
 }
@@ -1060,22 +1414,54 @@ mod tests {
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
 
     fn scan(v: Vec<f32>) -> FaceScan {
-        FaceScan { name: "s".into(), rgb: v, ir: None, ir_depth: 0.0, ir_brightness: 0.0, pitch: 0.0 }
+        FaceScan {
+            name: "s".into(),
+            rgb: v,
+            ir: None,
+            ir_depth: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        }
     }
 
     #[test]
     fn frontal_signals_gates_capture() {
-        let s = |yaw: f32, pitch: f32| Signals { head_yaw_asym: yaw, head_pitch_frac: pitch, ..Default::default() };
+        let s = |yaw: f32, pitch: f32| Signals {
+            head_yaw_asym: yaw,
+            head_pitch_frac: pitch,
+            ..Default::default()
+        };
         // Uncalibrated (None) → wide bootstrap band [0.28, 0.75].
-        assert!(frontal_signals(&s(0.0, 0.50), None), "square-on should pass");
-        assert!(frontal_signals(&s(0.20, 0.72), None), "a low laptop-cam neutral still bootstraps");
-        assert!(!frontal_signals(&s(0.45, 0.50), None), "clearly turned is rejected");
-        assert!(!frontal_signals(&s(0.0, 0.20), None), "looking up is rejected");
-        assert!(!frontal_signals(&s(0.0, 0.82), None), "clearly looking down is rejected");
+        assert!(
+            frontal_signals(&s(0.0, 0.50), None),
+            "square-on should pass"
+        );
+        assert!(
+            frontal_signals(&s(0.20, 0.72), None),
+            "a low laptop-cam neutral still bootstraps"
+        );
+        assert!(
+            !frontal_signals(&s(0.45, 0.50), None),
+            "clearly turned is rejected"
+        );
+        assert!(
+            !frontal_signals(&s(0.0, 0.20), None),
+            "looking up is rejected"
+        );
+        assert!(
+            !frontal_signals(&s(0.0, 0.82), None),
+            "clearly looking down is rejected"
+        );
         // Calibrated to a high (laptop-biased) neutral 0.62 → band recentres to
         // 0.62 ± 0.13 = [0.49, 0.75], so a level face reading 0.62 passes and a clear tilt does not.
-        assert!(frontal_signals(&s(0.0, 0.62), Some(0.62)), "at the calibrated neutral passes");
-        assert!(!frontal_signals(&s(0.0, 0.40), Some(0.62)), "well below the neutral is rejected");
+        assert!(
+            frontal_signals(&s(0.0, 0.62), Some(0.62)),
+            "at the calibrated neutral passes"
+        );
+        assert!(
+            !frontal_signals(&s(0.0, 0.40), Some(0.62)),
+            "well below the neutral is rejected"
+        );
     }
 
     #[test]
@@ -1083,21 +1469,50 @@ mod tests {
         use irlume_vision::HeadPose;
         // Turned so the nose sits image-left (yaw_signed<0) → they're looking to
         // their right → we tell them to turn LEFT (non-mirrored capture).
-        let p = HeadPose { yaw_asym: 0.6, yaw_signed: -0.6, pitch_frac: 0.5 };
-        assert_eq!(frontality_hint(&p, None), "Turn your head left to face the camera");
+        let p = HeadPose {
+            yaw_asym: 0.6,
+            yaw_signed: -0.6,
+            pitch_frac: 0.5,
+        };
+        assert_eq!(
+            frontality_hint(&p, None),
+            "Turn your head left to face the camera"
+        );
         // Nose image-right → looking to their left → turn RIGHT.
-        let p = HeadPose { yaw_asym: 0.6, yaw_signed: 0.6, pitch_frac: 0.5 };
-        assert_eq!(frontality_hint(&p, None), "Turn your head right to face the camera");
+        let p = HeadPose {
+            yaw_asym: 0.6,
+            yaw_signed: 0.6,
+            pitch_frac: 0.5,
+        };
+        assert_eq!(
+            frontality_hint(&p, None),
+            "Turn your head right to face the camera"
+        );
         // Looking UP (low pitch = nose toward eye line) → lower chin.
-        let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.10 };
+        let p = HeadPose {
+            yaw_asym: 0.0,
+            yaw_signed: 0.0,
+            pitch_frac: 0.10,
+        };
         assert!(frontality_hint(&p, None).starts_with("Lower your chin"));
         // Looking DOWN (high pitch = nose toward mouth) → lift chin.
-        let p = HeadPose { yaw_asym: 0.0, yaw_signed: 0.0, pitch_frac: 0.90 };
+        let p = HeadPose {
+            yaw_asym: 0.0,
+            yaw_signed: 0.0,
+            pitch_frac: 0.90,
+        };
         assert!(frontality_hint(&p, None).starts_with("Lift your chin"));
         // Both off: the more-severe axis wins (yaw far past its limit) → yaw
         // guidance, not pitch — robust to small bound tweaks.
-        let p = HeadPose { yaw_asym: 0.95, yaw_signed: 0.95, pitch_frac: 0.82 };
-        assert_eq!(frontality_hint(&p, None), "Turn your head right to face the camera");
+        let p = HeadPose {
+            yaw_asym: 0.95,
+            yaw_signed: 0.95,
+            pitch_frac: 0.82,
+        };
+        assert_eq!(
+            frontality_hint(&p, None),
+            "Turn your head right to face the camera"
+        );
     }
 
     #[test]
@@ -1110,8 +1525,14 @@ mod tests {
             require_challenge: false,
             camera_binding: None,
             profiles: vec![
-                FaceProfile { name: "Face Profile 1".into(), scans: vec![scan(face1.clone())] },
-                FaceProfile { name: "Face Profile 2".into(), scans: vec![scan(face2.clone())] },
+                FaceProfile {
+                    name: "Face Profile 1".into(),
+                    scans: vec![scan(face1.clone())],
+                },
+                FaceProfile {
+                    name: "Face Profile 2".into(),
+                    scans: vec![scan(face2.clone())],
+                },
             ],
         };
         // Adding face1 under Face Profile 2 -> flagged as belonging to Profile 1.

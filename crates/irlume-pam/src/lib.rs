@@ -77,11 +77,15 @@ impl PamServiceModule for IrlumePam {
                     return PamError::IGNORE; // password present → keyring self-unlocks
                 }
             }
-            let service = pamh.get_service().ok().flatten()
+            let service = pamh
+                .get_service()
+                .ok()
+                .flatten()
                 .and_then(|c| c.to_str().ok().map(str::to_string));
-            if let Ok(Response::PasswordUnsealed { secret }) =
-                request(&Request::UnsealKeyring { user: user.clone(), service })
-            {
+            if let Ok(Response::PasswordUnsealed { secret }) = request(&Request::UnsealKeyring {
+                user: user.clone(),
+                service,
+            }) {
                 if let Ok(tok) = CString::new(secret.expose()) {
                     let _ = pamh.set_authtok(&tok);
                 }
@@ -259,10 +263,20 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
 /// service so the daemon can apply tier×operation-class gating (an RGB-only
 /// convenience device honours only a screen-unlock service).
 fn try_verify(pamh: &Pam, user: &str) -> PamError {
-    let service = pamh.get_service().ok().flatten()
+    let service = pamh
+        .get_service()
+        .ok()
+        .flatten()
         .map(|s| s.to_string_lossy().into_owned());
-    match request(&Request::Authenticate { user: user.to_string(), service }) {
-        Ok(Response::AuthResult { granted: true, live: true, .. }) => PamError::SUCCESS,
+    match request(&Request::Authenticate {
+        user: user.to_string(),
+        service,
+    }) {
+        Ok(Response::AuthResult {
+            granted: true,
+            live: true,
+            ..
+        }) => PamError::SUCCESS,
         _ => PamError::IGNORE,
     }
 }
@@ -273,9 +287,15 @@ fn try_verify(pamh: &Pam, user: &str) -> PamError {
 fn try_unseal(pamh: &Pam, user: &str) -> PamError {
     // Pass the PAM service name so the daemon can apply opt-in biopolicy
     // operation-class gating (e.g. refuse credential release to a remote service).
-    let service = pamh.get_service().ok().flatten()
+    let service = pamh
+        .get_service()
+        .ok()
+        .flatten()
         .and_then(|c| c.to_str().ok().map(str::to_string));
-    match request(&Request::UnsealPassword { user: user.to_string(), service }) {
+    match request(&Request::UnsealPassword {
+        user: user.to_string(),
+        service,
+    }) {
         Ok(Response::PasswordUnsealed { secret }) => {
             // CString copies the bytes; PAM then copies them into its own store.
             // A login password cannot contain a NUL, so this only fails on a

@@ -64,10 +64,18 @@ impl EmitterControl {
 /// Built-in table, matched on the V4L card name (substring). Verified on-hardware.
 fn known_control(card: &str) -> Option<EmitterControl> {
     if card.contains("ASUS") {
-        return Some(EmitterControl { unit: 14, selector: 6, payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0] });
+        return Some(EmitterControl {
+            unit: 14,
+            selector: 6,
+            payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0],
+        });
     }
     if card.contains("N930W") {
-        return Some(EmitterControl { unit: 4, selector: 6, payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0] });
+        return Some(EmitterControl {
+            unit: 4,
+            selector: 6,
+            payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0],
+        });
     }
     // Other external Hello cameras (e.g. Logitech Brio) aren't hard-coded; run
     // auto-setup (`autoconfigure` / `irlume ir-setup`) or set IRLUME_IR_EMITTER.
@@ -100,7 +108,10 @@ pub fn save_conf(ctrl: &EmitterControl) -> std::io::Result<()> {
 
 /// Persist the emitter and (optionally) a companion boost control. The boost is
 /// written as a second line and is applied ALONGSIDE the emitter by [`enable`].
-pub fn save_conf_full(emitter: &EmitterControl, boost: Option<&EmitterControl>) -> std::io::Result<()> {
+pub fn save_conf_full(
+    emitter: &EmitterControl,
+    boost: Option<&EmitterControl>,
+) -> std::io::Result<()> {
     let path = conf_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -126,7 +137,11 @@ fn parse_control(raw: &str) -> Option<EmitterControl> {
     if payload.is_empty() {
         return None;
     }
-    Some(EmitterControl { unit, selector, payload })
+    Some(EmitterControl {
+        unit,
+        selector,
+        payload,
+    })
 }
 
 fn env_control() -> Option<EmitterControl> {
@@ -144,7 +159,13 @@ fn parse_u8(s: &str) -> Option<u8> {
 // --- low-level UVC extension-unit I/O ------------------------------------------
 
 fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> bool {
-    let mut q = UvcXuControlQuery { unit, selector, query, size: data.len() as u16, data: data.as_mut_ptr() };
+    let mut q = UvcXuControlQuery {
+        unit,
+        selector,
+        query,
+        size: data.len() as u16,
+        data: data.as_mut_ptr(),
+    };
     // SAFETY: fd is a valid open UVC fd owned by the caller; data outlives the call.
     unsafe { libc::ioctl(fd, uvcioc_ctrl_query(), &mut q as *mut UvcXuControlQuery) >= 0 }
 }
@@ -173,11 +194,18 @@ fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> bool {
 /// Light the emitter on the open device `fd` for camera `card`, if a config is
 /// known/configured. Returns true if a SET_CUR succeeded. Best-effort.
 pub fn enable(fd: c_int, card: &str) -> bool {
-    match std::env::var("IRLUME_IR_EMITTER").ok().as_deref().map(str::trim) {
+    match std::env::var("IRLUME_IR_EMITTER")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("off") | Some("none") => return false,
         _ => {}
     }
-    let Some(ctrl) = env_control().or_else(load_conf).or_else(|| known_control(card)) else {
+    let Some(ctrl) = env_control()
+        .or_else(load_conf)
+        .or_else(|| known_control(card))
+    else {
         return false;
     };
     let ok = set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload);
@@ -228,7 +256,9 @@ pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<Em
     let mut best: Option<(EmitterControl, f32)> = None;
     for unit in 0u8..=31 {
         for selector in 0u8..=15 {
-            let Some(len) = get_len(fd, unit, selector) else { continue };
+            let Some(len) = get_len(fd, unit, selector) else {
+                continue;
+            };
             let orig = get_cur(fd, unit, selector, len);
             for payload in candidate_payloads(len) {
                 if !set_cur(fd, unit, selector, &payload) {
@@ -236,7 +266,14 @@ pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<Em
                 }
                 let b = measure();
                 if success(b) && best.as_ref().is_none_or(|(_, bb)| b > *bb) {
-                    best = Some((EmitterControl { unit, selector, payload: payload.clone() }, b));
+                    best = Some((
+                        EmitterControl {
+                            unit,
+                            selector,
+                            payload: payload.clone(),
+                        },
+                        b,
+                    ));
                 }
             }
             // Restore this control before testing the next — so each is measured
@@ -265,7 +302,9 @@ pub fn discover_boost<F: FnMut() -> f32>(
     emitter: &EmitterControl,
     measure: &mut F,
 ) -> Option<EmitterControl> {
-    let relight = |fd: c_int| { let _ = set_cur(fd, emitter.unit, emitter.selector, &emitter.payload); };
+    let relight = |fd: c_int| {
+        let _ = set_cur(fd, emitter.unit, emitter.selector, &emitter.payload);
+    };
     relight(fd);
     let base = measure(); // emitter on, no boost
     let mut best: Option<(EmitterControl, f32)> = None;
@@ -274,7 +313,9 @@ pub fn discover_boost<F: FnMut() -> f32>(
             if unit == emitter.unit && selector == emitter.selector {
                 continue; // that's the emitter itself
             }
-            let Some(len) = get_len(fd, unit, selector) else { continue };
+            let Some(len) = get_len(fd, unit, selector) else {
+                continue;
+            };
             let orig = get_cur(fd, unit, selector, len);
             for payload in boost_candidates(len) {
                 relight(fd); // keep the emitter lit during the boost sweep
@@ -284,7 +325,14 @@ pub fn discover_boost<F: FnMut() -> f32>(
                 let b = measure();
                 // Require a clear lift so we don't latch onto measurement noise.
                 if b >= base + 6.0 && best.as_ref().is_none_or(|(_, bb)| b > *bb) {
-                    best = Some((EmitterControl { unit, selector, payload: payload.clone() }, b));
+                    best = Some((
+                        EmitterControl {
+                            unit,
+                            selector,
+                            payload: payload.clone(),
+                        },
+                        b,
+                    ));
                 }
             }
             if let Some(o) = orig {
@@ -312,7 +360,13 @@ fn boost_candidates(len: usize) -> Vec<Vec<u8>> {
         }
         p
     };
-    let mut v = vec![full(0xFF), full(0x80), full(0x40), low_bytes(1), low_bytes(2)];
+    let mut v = vec![
+        full(0xFF),
+        full(0x80),
+        full(0x40),
+        low_bytes(1),
+        low_bytes(2),
+    ];
     v.dedup();
     v
 }
@@ -337,7 +391,11 @@ mod tests {
 
     #[test]
     fn encode_parse_roundtrip() {
-        let c = EmitterControl { unit: 14, selector: 6, payload: vec![1, 3, 2, 0] };
+        let c = EmitterControl {
+            unit: 14,
+            selector: 6,
+            payload: vec![1, 3, 2, 0],
+        };
         assert_eq!(parse_control(&c.encode()), Some(c));
     }
 

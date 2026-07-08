@@ -97,7 +97,9 @@ pub fn face_gray_n(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> Vec<u8> {
             let sx = x0 + (ox as i32 * bw) / N as i32;
             let i = ((sy.min(h - 1) * w + sx.min(w - 1)) * 3) as usize;
             if i + 2 < rgb.len() {
-                let luma = (rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000;
+                let luma =
+                    (rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114)
+                        / 1000;
                 out[oy * N + ox] = luma as u8;
             }
         }

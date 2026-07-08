@@ -63,16 +63,20 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
     let s = service.trim().to_ascii_lowercase();
     match s.as_str() {
         // Lock screens (live session).
-        "kde" | "kde-fingerprint" | "kscreensaver" | "xscreensaver"
-        | "gnome-screensaver" | "swaylock" | "i3lock" | "hyprlock" => OperationClass::ScreenUnlock,
+        "kde" | "kde-fingerprint" | "kscreensaver" | "xscreensaver" | "gnome-screensaver"
+        | "swaylock" | "i3lock" | "hyprlock" => OperationClass::ScreenUnlock,
         // Display-manager greeters (cold login), incl. GDM's separate
         // fingerprint login service (`gdm-fingerprint`) — same login class.
         // `cosmic-greeter` (COSMIC / Pop!_OS) uses one service for both the cold
         // login and the live lock screen, so the warm/cold flag below is what
         // separates its login from its screen-unlock.
-        "sddm" | "sddm-greeter" | "plasmalogin" | "gdm-password" | "gdm-fingerprint"
-        | "gdm" | "gdm3" | "lightdm" | "login" | "greetd" | "ly" | "cosmic-greeter" => {
-            if warm { OperationClass::ScreenUnlock } else { OperationClass::Login }
+        "sddm" | "sddm-greeter" | "plasmalogin" | "gdm-password" | "gdm-fingerprint" | "gdm"
+        | "gdm3" | "lightdm" | "login" | "greetd" | "ly" | "cosmic-greeter" => {
+            if warm {
+                OperationClass::ScreenUnlock
+            } else {
+                OperationClass::Login
+            }
         }
         // Elevation.
         "sudo" | "sudo-i" | "polkit-1" | "su" | "su-l" | "doas" => OperationClass::Elevation,
@@ -103,13 +107,22 @@ mod tests {
 
     #[test]
     fn screen_unlock_never_unseals() {
-        assert_eq!(decide(classify("kde-fingerprint", true), Tier::Secure), Action::Verify);
+        assert_eq!(
+            decide(classify("kde-fingerprint", true), Tier::Secure),
+            Action::Verify
+        );
     }
 
     #[test]
     fn cold_login_with_ir_unseals_but_rgb_only_denies() {
-        assert_eq!(decide(classify("plasmalogin", false), Tier::Secure), Action::Unseal);
-        assert_eq!(decide(classify("plasmalogin", false), Tier::Convenience), Action::Deny);
+        assert_eq!(
+            decide(classify("plasmalogin", false), Tier::Secure),
+            Action::Unseal
+        );
+        assert_eq!(
+            decide(classify("plasmalogin", false), Tier::Convenience),
+            Action::Deny
+        );
     }
 
     #[test]
@@ -125,8 +138,14 @@ mod tests {
         // must reach Unseal on the Secure (IR) tier — else it classifies Unknown
         // and the daemon denies the face match.
         assert_eq!(classify("cosmic-greeter", false), OperationClass::Login);
-        assert_eq!(classify("cosmic-greeter", true), OperationClass::ScreenUnlock);
-        assert_eq!(decide(classify("cosmic-greeter", false), Tier::Secure), Action::Unseal);
+        assert_eq!(
+            classify("cosmic-greeter", true),
+            OperationClass::ScreenUnlock
+        );
+        assert_eq!(
+            decide(classify("cosmic-greeter", false), Tier::Secure),
+            Action::Unseal
+        );
     }
 
     #[test]
@@ -134,18 +153,27 @@ mod tests {
         // GDM's separate fingerprint login service must classify as a login /
         // unlock class, else the keyring-unseal gate (ADR-0003) refuses it.
         assert_eq!(classify("gdm-fingerprint", false), OperationClass::Login);
-        assert_eq!(classify("gdm-fingerprint", true), OperationClass::ScreenUnlock);
+        assert_eq!(
+            classify("gdm-fingerprint", true),
+            OperationClass::ScreenUnlock
+        );
     }
 
     #[test]
     fn remote_and_unknown_always_deny() {
         assert_eq!(decide(classify("sshd", false), Tier::Secure), Action::Deny);
-        assert_eq!(decide(classify("some-random-service", false), Tier::Secure), Action::Deny);
+        assert_eq!(
+            decide(classify("some-random-service", false), Tier::Secure),
+            Action::Deny
+        );
     }
 
     #[test]
     fn sudo_is_elevation() {
         assert_eq!(classify("sudo", false), OperationClass::Elevation);
-        assert_eq!(decide(OperationClass::Elevation, Tier::Secure), Action::Unseal);
+        assert_eq!(
+            decide(OperationClass::Elevation, Tier::Secure),
+            Action::Unseal
+        );
     }
 }

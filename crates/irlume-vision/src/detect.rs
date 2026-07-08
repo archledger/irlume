@@ -36,7 +36,11 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 
 /// Greedy non-maximum suppression; keeps highest-score boxes, drops overlaps.
 pub fn nms(mut dets: Vec<Detection>, iou_thresh: f32) -> Vec<Detection> {
-    dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    dets.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut keep: Vec<Detection> = Vec::new();
     'outer: for d in dets {
         for k in &keep {
@@ -77,9 +81,16 @@ pub fn decode_stride(
         let (x1, y1) = (cx - w / 2.0, cy - h / 2.0);
         let mut lm: Landmarks5 = [(0.0, 0.0); 5];
         for (k, slot) in lm.iter_mut().enumerate() {
-            *slot = ((c + kps[idx * 10 + 2 * k]) * s, (r + kps[idx * 10 + 2 * k + 1]) * s);
+            *slot = (
+                (c + kps[idx * 10 + 2 * k]) * s,
+                (r + kps[idx * 10 + 2 * k + 1]) * s,
+            );
         }
-        out.push(Detection { bbox: [x1, y1, x1 + w, y1 + h], score, landmarks: lm });
+        out.push(Detection {
+            bbox: [x1, y1, x1 + w, y1 + h],
+            score,
+            landmarks: lm,
+        });
     }
     out
 }
@@ -108,7 +119,11 @@ mod tests {
     use super::*;
 
     fn det(b: [f32; 4], s: f32) -> Detection {
-        Detection { bbox: b, score: s, landmarks: [(0.0, 0.0); 5] }
+        Detection {
+            bbox: b,
+            score: s,
+            landmarks: [(0.0, 0.0); 5],
+        }
     }
 
     #[test]

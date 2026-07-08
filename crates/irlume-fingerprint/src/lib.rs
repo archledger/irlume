@@ -40,7 +40,10 @@ pub fn fprintd_present() -> bool {
 /// True when a fingerprint reader is registered with fprintd right now.
 pub fn reader_present() -> bool {
     let Some(busctl) = busctl() else { return false };
-    match Command::new(busctl).args(["--system", "tree", FPRINT_BUS]).output() {
+    match Command::new(busctl)
+        .args(["--system", "tree", FPRINT_BUS])
+        .output()
+    {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).contains("/net/reactivated/Fprint/Device/")
         }
@@ -52,7 +55,14 @@ pub fn reader_present() -> bool {
 pub fn device_name() -> Option<String> {
     let busctl = busctl()?;
     let out = Command::new(busctl)
-        .args(["--system", "get-property", FPRINT_BUS, DEVICE0, "net.reactivated.Fprint.Device", "name"])
+        .args([
+            "--system",
+            "get-property",
+            FPRINT_BUS,
+            DEVICE0,
+            "net.reactivated.Fprint.Device",
+            "name",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -73,8 +83,12 @@ pub fn available() -> bool {
 
 /// List the fingers `user` has enrolled with fprintd (empty when none/unavailable).
 pub fn enrolled_fingers(user: &str) -> Vec<String> {
-    let Some(list) = tool("fprintd-list") else { return Vec::new() };
-    let Ok(out) = Command::new(list).arg(user).output() else { return Vec::new() };
+    let Some(list) = tool("fprintd-list") else {
+        return Vec::new();
+    };
+    let Ok(out) = Command::new(list).arg(user).output() else {
+        return Vec::new();
+    };
     parse_enrolled_lines(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -85,8 +99,12 @@ pub fn enrolled_fingers(user: &str) -> Vec<String> {
 /// "already open" / "failed to claim" in its output. The cure is restarting
 /// fprintd, which releases the claim.
 pub fn reader_stuck(user: &str) -> bool {
-    let Some(list) = tool("fprintd-list") else { return false };
-    let Ok(out) = Command::new(list).arg(user).output() else { return false };
+    let Some(list) = tool("fprintd-list") else {
+        return false;
+    };
+    let Ok(out) = Command::new(list).arg(user).output() else {
+        return false;
+    };
     let all = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -123,9 +141,16 @@ pub fn has_enrollment(user: &str) -> bool {
 
 /// The ten fprintd finger slots, in offer order.
 pub const FINGERS: [&str; 10] = [
-    "right-index-finger", "left-index-finger", "right-thumb", "left-thumb",
-    "right-middle-finger", "left-middle-finger", "right-ring-finger",
-    "left-ring-finger", "right-little-finger", "left-little-finger",
+    "right-index-finger",
+    "left-index-finger",
+    "right-thumb",
+    "left-thumb",
+    "right-middle-finger",
+    "left-middle-finger",
+    "right-ring-finger",
+    "left-ring-finger",
+    "right-little-finger",
+    "left-little-finger",
 ];
 
 /// The first finger slot `user` has NOT enrolled, or `None` when all ten are taken.
@@ -134,7 +159,10 @@ pub fn free_finger(user: &str) -> Option<&'static str> {
 }
 
 fn first_free(taken: &[String]) -> Option<&'static str> {
-    FINGERS.iter().copied().find(|f| !taken.iter().any(|t| t == f))
+    FINGERS
+        .iter()
+        .copied()
+        .find(|f| !taken.iter().any(|t| t == f))
 }
 
 /// Outcome of an enrollment attempt.
@@ -156,7 +184,11 @@ pub fn enroll_finger(user: &str, finger: &str) -> EnrollOutcome {
     let Some(enroll) = tool("fprintd-enroll") else {
         return EnrollOutcome::Failed("fprintd-enroll not installed".into());
     };
-    let mut child = match Command::new(enroll).args(["-f", finger, user]).stdout(Stdio::piped()).spawn() {
+    let mut child = match Command::new(enroll)
+        .args(["-f", finger, user])
+        .stdout(Stdio::piped())
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => return EnrollOutcome::Failed(format!("spawn fprintd-enroll: {e}")),
     };
@@ -185,7 +217,10 @@ mod tests {
     #[test]
     fn enrolled_line_parser() {
         let sample = "Fingerprints for user x on Synaptics (press):\n - #0: right-index-finger\n - #1: left-index-finger\n";
-        assert_eq!(parse_enrolled_lines(sample), vec!["right-index-finger", "left-index-finger"]);
+        assert_eq!(
+            parse_enrolled_lines(sample),
+            vec!["right-index-finger", "left-index-finger"]
+        );
         assert!(parse_enrolled_lines("User x has no fingers enrolled for Synaptics.").is_empty());
     }
 
@@ -193,13 +228,19 @@ mod tests {
     fn enrolled_dedups_across_duplicate_device_sections() {
         let sample = "Using device /net/reactivated/Fprint/Device/1\n - #0: left-index-finger\n - #1: right-index-finger\n\
             Using device /net/reactivated/Fprint/Device/0\n - #0: left-index-finger\n - #1: right-index-finger\n";
-        assert_eq!(parse_enrolled_lines(sample), vec!["left-index-finger", "right-index-finger"]);
+        assert_eq!(
+            parse_enrolled_lines(sample),
+            vec!["left-index-finger", "right-index-finger"]
+        );
     }
 
     #[test]
     fn first_free_picks_next_unused_slot() {
         assert_eq!(first_free(&[]), Some("right-index-finger"));
-        assert_eq!(first_free(&["right-index-finger".to_string()]), Some("left-index-finger"));
+        assert_eq!(
+            first_free(&["right-index-finger".to_string()]),
+            Some("left-index-finger")
+        );
         let all: Vec<String> = FINGERS.iter().map(|s| s.to_string()).collect();
         assert_eq!(first_free(&all), None);
     }

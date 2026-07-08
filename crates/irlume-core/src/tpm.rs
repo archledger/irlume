@@ -31,7 +31,9 @@ use zeroize::Zeroizing;
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
 use tss_esapi::constants::SessionType;
 use tss_esapi::handles::{KeyHandle, PersistentTpmHandle, SessionHandle, TpmHandle};
-use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm, RsaSchemeAlgorithm};
+use tss_esapi::interface_types::algorithm::{
+    HashingAlgorithm, PublicAlgorithm, RsaSchemeAlgorithm,
+};
 use tss_esapi::interface_types::dynamic_handles::Persistent;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::resource_handles::{Hierarchy, Provision};
@@ -330,7 +332,8 @@ fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
         })
         .map_err(tpm_err)?;
     let _ = ctx.flush_context(transient.into());
-    ctx.tr_set_auth(persisted, Auth::default()).map_err(tpm_err)?;
+    ctx.tr_set_auth(persisted, Auth::default())
+        .map_err(tpm_err)?;
     Ok((KeyHandle::from(ESYS_TR::from(persisted)), true))
 }
 
@@ -598,9 +601,7 @@ fn unseal_authorized(
 
                     // 5. Unseal under the now-satisfied policy session.
                     let data = ctx
-                        .execute_with_session(Some(session), |ctx| {
-                            ctx.unseal(sealed_handle.into())
-                        })
+                        .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
                         .map_err(|e| policy_aware_err(e, env))?;
                     Ok(Zeroizing::new(data.to_vec()))
                 })();
@@ -635,7 +636,11 @@ fn rsa_pem_to_public(pubkey_pem: &str) -> Result<Public> {
         2048 => RsaKeyBits::Rsa2048,
         3072 => RsaKeyBits::Rsa3072,
         4096 => RsaKeyBits::Rsa4096,
-        other => return Err(Error::Policy(format!("unsupported PCR key size: {other} bits"))),
+        other => {
+            return Err(Error::Policy(format!(
+                "unsupported PCR key size: {other} bits"
+            )))
+        }
     };
     let exponent = {
         let e = key.e().to_bytes_be();
@@ -732,9 +737,9 @@ pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope>
 fn policy_aware_err<E: std::fmt::Display>(e: E, env: &SealedEnvelope) -> Error {
     let base = e.to_string();
     match diagnose_pcrs(env) {
-        Ok(changed) if !changed.is_empty() => {
-            Error::Policy(format!("{base}: PCR mismatch: {changed:?} changed since seal"))
-        }
+        Ok(changed) if !changed.is_empty() => Error::Policy(format!(
+            "{base}: PCR mismatch: {changed:?} changed since seal"
+        )),
         _ => Error::Tpm(base),
     }
 }

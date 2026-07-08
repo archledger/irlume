@@ -112,7 +112,11 @@ fn read_efivar_utf16(name: &str) -> Option<String> {
 }
 
 fn grub_artifacts_present() -> bool {
-    ["/boot/grub/grub.cfg", "/boot/grub2/grub.cfg", "/etc/default/grub"]
-        .iter()
-        .any(|p| Path::new(p).exists())
+    [
+        "/boot/grub/grub.cfg",
+        "/boot/grub2/grub.cfg",
+        "/etc/default/grub",
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists())
 }

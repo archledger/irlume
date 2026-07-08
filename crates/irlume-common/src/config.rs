@@ -81,7 +81,9 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     for line in existing.lines() {
         let trimmed = line.trim();
         let is_target = !trimmed.starts_with('#')
-            && trimmed.split_once('=').is_some_and(|(k, _)| k.trim() == key);
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim() == key);
         if is_target {
             if !replaced {
                 out.push_str(&format!("{key}={val}\n"));
@@ -116,9 +118,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
 
-        std::fs::write(config_path("cameras.conf"), "# header\n\n  rgb = /dev/video1 \nir=/dev/video3\n").unwrap();
-        assert_eq!(read_kv("cameras.conf", "rgb").as_deref(), Some("/dev/video1"));
-        assert_eq!(read_kv("cameras.conf", "ir").as_deref(), Some("/dev/video3"));
+        std::fs::write(
+            config_path("cameras.conf"),
+            "# header\n\n  rgb = /dev/video1 \nir=/dev/video3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_kv("cameras.conf", "rgb").as_deref(),
+            Some("/dev/video1")
+        );
+        assert_eq!(
+            read_kv("cameras.conf", "ir").as_deref(),
+            Some("/dev/video3")
+        );
         assert_eq!(read_kv("cameras.conf", "missing"), None);
 
         // Update rgb, add a new key; comments + ir must survive.
@@ -126,11 +138,20 @@ mod tests {
         write_kv("cameras.conf", "fps", "30").unwrap();
         let text = std::fs::read_to_string(config_path("cameras.conf")).unwrap();
         assert!(text.contains("# header"));
-        assert_eq!(read_kv("cameras.conf", "rgb").as_deref(), Some("/dev/video9"));
-        assert_eq!(read_kv("cameras.conf", "ir").as_deref(), Some("/dev/video3"));
+        assert_eq!(
+            read_kv("cameras.conf", "rgb").as_deref(),
+            Some("/dev/video9")
+        );
+        assert_eq!(
+            read_kv("cameras.conf", "ir").as_deref(),
+            Some("/dev/video3")
+        );
         assert_eq!(read_kv("cameras.conf", "fps").as_deref(), Some("30"));
         // No duplicate rgb line.
-        assert_eq!(text.matches("rgb=").count() + text.matches("rgb ").count(), 1);
+        assert_eq!(
+            text.matches("rgb=").count() + text.matches("rgb ").count(),
+            1
+        );
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

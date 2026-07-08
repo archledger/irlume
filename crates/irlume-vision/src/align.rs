@@ -90,8 +90,15 @@ pub fn estimate_similarity(src: &[(f32, f32)], dst: &[(f32, f32)]) -> Option<Aff
         }
     }
     let theta = solve4(n, rhs)?;
-    let (a, b, tx, ty) = (theta[0] as f32, theta[1] as f32, theta[2] as f32, theta[3] as f32);
-    Some(Affine2 { m: [a, -b, tx, b, a, ty] })
+    let (a, b, tx, ty) = (
+        theta[0] as f32,
+        theta[1] as f32,
+        theta[2] as f32,
+        theta[3] as f32,
+    );
+    Some(Affine2 {
+        m: [a, -b, tx, b, a, ty],
+    })
 }
 
 /// Solve a 4x4 system via Gaussian elimination with partial pivoting.
@@ -119,7 +126,12 @@ fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
             b[r] -= f * b[col];
         }
     }
-    Some([b[0] / a[0][0], b[1] / a[1][1], b[2] / a[2][2], b[3] / a[3][3]])
+    Some([
+        b[0] / a[0][0],
+        b[1] / a[1][1],
+        b[2] / a[2][2],
+        b[3] / a[3][3],
+    ])
 }
 
 /// An interleaved RGB8 image view (the RGB capture frame).
@@ -135,7 +147,11 @@ impl RgbView<'_> {
         let x = x.clamp(0, self.width as i32 - 1) as usize;
         let y = y.clamp(0, self.height as i32 - 1) as usize;
         let i = (y * self.width as usize + x) * 3;
-        [self.data[i] as f32, self.data[i + 1] as f32, self.data[i + 2] as f32]
+        [
+            self.data[i] as f32,
+            self.data[i + 1] as f32,
+            self.data[i + 2] as f32,
+        ]
     }
 
     /// Bilinear-sample the RGB image at fractional (x, y), edge-clamped.
@@ -186,7 +202,11 @@ pub fn preprocess_arcface(chip_rgb: &[u8]) -> Vec<f32> {
     debug_assert_eq!(chip_rgb.len(), n * 3);
     let mut t = vec![0.0f32; 3 * n];
     // Destination channel planes: RGB if INPUT_IS_RGB else BGR.
-    let plane_src = if INPUT_IS_RGB { [0usize, 1, 2] } else { [2, 1, 0] };
+    let plane_src = if INPUT_IS_RGB {
+        [0usize, 1, 2]
+    } else {
+        [2, 1, 0]
+    };
     for (plane, &src_c) in plane_src.iter().enumerate() {
         let base = plane * n;
         for px in 0..n {
@@ -255,7 +275,12 @@ mod tests {
     fn cosine_matches_naive() {
         let a: Vec<f32> = (0..crate::EMBED_DIM).map(|i| (i as f32).sin()).collect();
         let b: Vec<f32> = (0..crate::EMBED_DIM).map(|i| (i as f32).cos()).collect();
-        let naive: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum::<f32>().clamp(-1.0, 1.0);
+        let naive: f32 = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| x * y)
+            .sum::<f32>()
+            .clamp(-1.0, 1.0);
         assert!((cosine(&a, &b) - naive).abs() < 1e-4);
     }
 
@@ -264,8 +289,10 @@ mod tests {
         // Apply a known scale/rot/translate to the reference points, then fit.
         let (a, b, tx, ty) = (0.8f32, 0.3f32, 12.0f32, -5.0f32);
         let src: Vec<(f32, f32)> = ARCFACE_REF_112.to_vec();
-        let dst: Vec<(f32, f32)> =
-            src.iter().map(|&(x, y)| (a * x - b * y + tx, b * x + a * y + ty)).collect();
+        let dst: Vec<(f32, f32)> = src
+            .iter()
+            .map(|&(x, y)| (a * x - b * y + tx, b * x + a * y + ty))
+            .collect();
         let est = estimate_similarity(&src, &dst).unwrap();
         for (&(x, y), &(gx, gy)) in src.iter().zip(&dst) {
             let (px, py) = est.apply(x, y);
@@ -294,8 +321,18 @@ mod tests {
                 data[i + 2] = 128;
             }
         }
-        let view = RgbView { data: &data, width: w, height: h };
-        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        let view = RgbView {
+            data: &data,
+            width: w,
+            height: h,
+        };
+        let lm: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (32.0, 36.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
         let c1 = align_to_arcface(&view, &lm).unwrap();
         let c2 = align_to_arcface(&view, &lm).unwrap();
         assert_eq!(c1, c2);

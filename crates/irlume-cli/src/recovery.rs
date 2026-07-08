@@ -26,19 +26,46 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
 
 fn status(user: &str) -> ExitCode {
     match daemon_request(&Request::RecoveryStatus { user: user.into() }) {
-        Ok(Response::RecoveryStatus { encrypted, recovery_set, tpm_present }) => {
+        Ok(Response::RecoveryStatus {
+            encrypted,
+            recovery_set,
+            tpm_present,
+        }) => {
             println!("[recovery] '{user}':");
-            println!("  templates encrypted : {}", if encrypted { "yes ✓ (template key sealed in the TPM)" } else { "no (plaintext at rest)" });
-            println!("  recovery passphrase : {}", if recovery_set { "SET ✓" } else { "not set" });
-            println!("  TPM present         : {}", if tpm_present { "yes" } else { "no — templates stay plaintext on this host" });
+            println!(
+                "  templates encrypted : {}",
+                if encrypted {
+                    "yes ✓ (template key sealed in the TPM)"
+                } else {
+                    "no (plaintext at rest)"
+                }
+            );
+            println!(
+                "  recovery passphrase : {}",
+                if recovery_set { "SET ✓" } else { "not set" }
+            );
+            println!(
+                "  TPM present         : {}",
+                if tpm_present {
+                    "yes"
+                } else {
+                    "no — templates stay plaintext on this host"
+                }
+            );
             if encrypted && !recovery_set {
                 println!("  → no backstop: if the TPM seal breaks (dbx/firmware update, TPM clear, disk move),");
                 println!("    you'd have to re-enroll. Set one now:  irlume recovery setup");
             }
             ExitCode::SUCCESS
         }
-        Ok(other) => { eprintln!("[recovery] unexpected response: {other:?}"); ExitCode::FAILURE }
-        Err(e) => { eprintln!("[recovery] status failed: {e}"); ExitCode::FAILURE }
+        Ok(other) => {
+            eprintln!("[recovery] unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[recovery] status failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -52,8 +79,14 @@ fn setup(user: &str) -> ExitCode {
     let Some(pass) = read_passphrase_confirmed() else {
         return ExitCode::from(2);
     };
-    match daemon_request(&Request::RecoverySetup { user: user.into(), passphrase: SecretBytes::new(pass.into_bytes()) }) {
-        Ok(Response::Ok(msg)) => { println!("[recovery] ✓ {msg}"); ExitCode::SUCCESS }
+    match daemon_request(&Request::RecoverySetup {
+        user: user.into(),
+        passphrase: SecretBytes::new(pass.into_bytes()),
+    }) {
+        Ok(Response::Ok(msg)) => {
+            println!("[recovery] ✓ {msg}");
+            ExitCode::SUCCESS
+        }
         Ok(Response::Error(e)) => {
             eprintln!("[recovery] setup failed: {e}");
             if e.contains("no template key") {
@@ -61,8 +94,14 @@ fn setup(user: &str) -> ExitCode {
             }
             ExitCode::FAILURE
         }
-        Ok(other) => { eprintln!("[recovery] unexpected response: {other:?}"); ExitCode::FAILURE }
-        Err(e) => { eprintln!("[recovery] setup failed: {e}"); ExitCode::FAILURE }
+        Ok(other) => {
+            eprintln!("[recovery] unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[recovery] setup failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -71,24 +110,50 @@ fn restore(user: &str) -> ExitCode {
     let Some(pass) = read_passphrase_once("Recovery passphrase: ") else {
         return ExitCode::from(2);
     };
-    match daemon_request(&Request::RecoveryRestore { user: user.into(), passphrase: SecretBytes::new(pass.into_bytes()) }) {
+    match daemon_request(&Request::RecoveryRestore {
+        user: user.into(),
+        passphrase: SecretBytes::new(pass.into_bytes()),
+    }) {
         Ok(Response::Ok(msg)) => {
             println!("[recovery] ✓ {msg}");
-            println!("[recovery] Encrypted face templates are readable again; face unlock is restored.");
+            println!(
+                "[recovery] Encrypted face templates are readable again; face unlock is restored."
+            );
             ExitCode::SUCCESS
         }
-        Ok(Response::Error(e)) => { eprintln!("[recovery] restore failed: {e}"); ExitCode::FAILURE }
-        Ok(other) => { eprintln!("[recovery] unexpected response: {other:?}"); ExitCode::FAILURE }
-        Err(e) => { eprintln!("[recovery] restore failed: {e}"); ExitCode::FAILURE }
+        Ok(Response::Error(e)) => {
+            eprintln!("[recovery] restore failed: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[recovery] unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[recovery] restore failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
 fn forget(user: &str) -> ExitCode {
     match daemon_request(&Request::RecoveryForget { user: user.into() }) {
-        Ok(Response::Ok(msg)) => { println!("[recovery] {msg}"); ExitCode::SUCCESS }
-        Ok(Response::Error(e)) => { eprintln!("[recovery] forget failed: {e}"); ExitCode::FAILURE }
-        Ok(other) => { eprintln!("[recovery] unexpected response: {other:?}"); ExitCode::FAILURE }
-        Err(e) => { eprintln!("[recovery] forget failed: {e}"); ExitCode::FAILURE }
+        Ok(Response::Ok(msg)) => {
+            println!("[recovery] {msg}");
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("[recovery] forget failed: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[recovery] unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[recovery] forget failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

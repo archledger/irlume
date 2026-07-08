@@ -19,7 +19,13 @@ pub fn uid_for_name(name: &str) -> Option<u32> {
     // SAFETY: all pointers valid for the call; `buf` is sized and owned here;
     // `result` points into `pwd` on success.
     let rc = unsafe {
-        libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
     };
     if rc != 0 || result.is_null() {
         return None;
@@ -35,9 +41,7 @@ pub fn name_for_uid(uid: u32) -> Option<String> {
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: see `uid_for_name`.
-    let rc = unsafe {
-        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
-    };
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
     if rc != 0 || result.is_null() {
         return None;
     }
@@ -54,7 +58,13 @@ pub fn gid_for_group(name: &str) -> Option<u32> {
     let mut result: *mut libc::group = std::ptr::null_mut();
     // SAFETY: see `uid_for_name`.
     let rc = unsafe {
-        libc::getgrnam_r(cname.as_ptr(), &mut grp, buf.as_mut_ptr(), buf.len(), &mut result)
+        libc::getgrnam_r(
+            cname.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
     };
     if rc != 0 || result.is_null() {
         return None;

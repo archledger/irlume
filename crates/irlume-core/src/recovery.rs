@@ -49,7 +49,13 @@ pub struct RecoveryEnvelope {
     pub wrapped: String,
 }
 
-fn derive_key(passphrase: &[u8], salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<Vec<u8>>> {
+fn derive_key(
+    passphrase: &[u8],
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<Zeroizing<Vec<u8>>> {
     let params = Params::new(m, t, p, Some(crypto::KEY_LEN))
         .map_err(|e| Error::Policy(format!("argon2 params: {e}")))?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -85,7 +91,10 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
 /// from tampering, by design.
 pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     if env.kdf != "argon2id" {
-        return Err(Error::Policy(format!("unsupported recovery KDF: {}", env.kdf)));
+        return Err(Error::Policy(format!(
+            "unsupported recovery KDF: {}",
+            env.kdf
+        )));
     }
     let salt = STANDARD
         .decode(&env.salt)

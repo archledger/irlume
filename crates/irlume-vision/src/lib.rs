@@ -55,7 +55,11 @@ pub struct HeadPose {
 pub fn head_pose(lm: &Landmarks5) -> HeadPose {
     let (le, re, nose, lmth, rmth) = (lm[0], lm[1], lm[2], lm[3], lm[4]);
     let (dl, dr) = ((nose.0 - le.0).abs(), (re.0 - nose.0).abs());
-    let yaw_asym = if dl + dr > 1e-3 { (dl - dr).abs() / (dl + dr) } else { 0.0 };
+    let yaw_asym = if dl + dr > 1e-3 {
+        (dl - dr).abs() / (dl + dr)
+    } else {
+        0.0
+    };
     // Signed yaw straight from image x — label-agnostic (uses the eye midpoint,
     // not "which eye is left"). Half the inter-eye span makes it ~unit-scaled.
     let eye_mid_x = (le.0 + re.0) / 2.0;
@@ -63,8 +67,16 @@ pub fn head_pose(lm: &Landmarks5) -> HeadPose {
     let yaw_signed = (nose.0 - eye_mid_x) / half_span;
     let eye_y = (le.1 + re.1) / 2.0;
     let span = (lmth.1 + rmth.1) / 2.0 - eye_y;
-    let pitch_frac = if span.abs() > 1e-3 { (nose.1 - eye_y) / span } else { 0.5 };
-    HeadPose { yaw_asym, yaw_signed, pitch_frac }
+    let pitch_frac = if span.abs() > 1e-3 {
+        (nose.1 - eye_y) / span
+    } else {
+        0.5
+    };
+    HeadPose {
+        yaw_asym,
+        yaw_signed,
+        pitch_frac,
+    }
 }
 
 #[cfg(test)]
@@ -74,7 +86,13 @@ mod head_pose_tests {
     #[test]
     fn frontal_face_is_centered() {
         // ARCFACE reference geometry: nose centered between eyes, mid eye-mouth.
-        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
+        let lm: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (32.0, 36.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
         let p = head_pose(&lm);
         assert!(p.yaw_asym < 0.05, "yaw {}", p.yaw_asym);
         assert!((p.pitch_frac - 0.5).abs() < 0.05, "pitch {}", p.pitch_frac);
@@ -83,21 +101,61 @@ mod head_pose_tests {
     #[test]
     fn turned_head_raises_yaw_asym() {
         // Nose shifted toward the left eye (head turned) -> high asymmetry.
-        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (25.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
-        assert!(head_pose(&lm).yaw_asym > 0.35, "{}", head_pose(&lm).yaw_asym);
+        let lm: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (25.0, 36.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
+        assert!(
+            head_pose(&lm).yaw_asym > 0.35,
+            "{}",
+            head_pose(&lm).yaw_asym
+        );
     }
 
     #[test]
     fn yaw_signed_tracks_nose_side() {
         // Eye midpoint x = 32. Nose toward image-LEFT (x=25 < 32) -> negative.
-        let left: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (25.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
-        assert!(head_pose(&left).yaw_signed < -0.3, "{}", head_pose(&left).yaw_signed);
+        let left: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (25.0, 36.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
+        assert!(
+            head_pose(&left).yaw_signed < -0.3,
+            "{}",
+            head_pose(&left).yaw_signed
+        );
         // Nose toward image-RIGHT (x=39 > 32) -> positive.
-        let right: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (39.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
-        assert!(head_pose(&right).yaw_signed > 0.3, "{}", head_pose(&right).yaw_signed);
+        let right: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (39.0, 36.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
+        assert!(
+            head_pose(&right).yaw_signed > 0.3,
+            "{}",
+            head_pose(&right).yaw_signed
+        );
         // Frontal (nose centered) -> ~0.
-        let mid: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 36.0), (24.0, 48.0), (40.0, 48.0)];
-        assert!(head_pose(&mid).yaw_signed.abs() < 0.05, "{}", head_pose(&mid).yaw_signed);
+        let mid: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (32.0, 36.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
+        assert!(
+            head_pose(&mid).yaw_signed.abs() < 0.05,
+            "{}",
+            head_pose(&mid).yaw_signed
+        );
     }
 
     #[test]
@@ -105,8 +163,18 @@ mod head_pose_tests {
         // Nose risen toward the eye line = looking UP -> small pitch fraction.
         // (Live-verified: looking DOWN instead drives the nose toward the mouth
         // and raises pitch_frac; this geometry is the looking-UP case.)
-        let lm: Landmarks5 = [(20.0, 24.0), (44.0, 24.0), (32.0, 28.0), (24.0, 48.0), (40.0, 48.0)];
-        assert!(head_pose(&lm).pitch_frac < 0.30, "{}", head_pose(&lm).pitch_frac);
+        let lm: Landmarks5 = [
+            (20.0, 24.0),
+            (44.0, 24.0),
+            (32.0, 28.0),
+            (24.0, 48.0),
+            (40.0, 48.0),
+        ];
+        assert!(
+            head_pose(&lm).pitch_frac < 0.30,
+            "{}",
+            head_pose(&lm).pitch_frac
+        );
     }
 }
 
@@ -159,7 +227,9 @@ mod onnx {
 
     impl Embedder {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
-            Ok(Self { session: build(model)? })
+            Ok(Self {
+                session: build(model)?,
+            })
         }
 
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
@@ -198,7 +268,10 @@ mod onnx {
         /// embedding is still L2-normalized; the norm is the quality signal for
         /// fusion weighting / low-quality gating. (AuraFace is ArcFace-trained, not
         /// AdaFace, so the norm↔quality correlation must be validated empirically.)
-        pub fn embed_with_norm(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<(Embedding, f32)> {
+        pub fn embed_with_norm(
+            &mut self,
+            chip_rgb: &[u8],
+        ) -> irlume_common::Result<(Embedding, f32)> {
             let data = align::preprocess_arcface(chip_rgb);
             let n = align::OUT_SIZE as i64;
             let tensor = Tensor::from_array(([1i64, 3, n, n], data)).map_err(err)?;
@@ -229,12 +302,15 @@ mod onnx {
     impl Adapter {
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-            Ok(Self { session: build(&bytes)? })
+            Ok(Self {
+                session: build(&bytes)?,
+            })
         }
 
         /// Adapt one IR embedding -> adapted vector (already L2-normalized).
         pub fn apply(&mut self, emb: &[f32]) -> irlume_common::Result<Vec<f32>> {
-            let tensor = Tensor::from_array(([1i64, emb.len() as i64], emb.to_vec())).map_err(err)?;
+            let tensor =
+                Tensor::from_array(([1i64, emb.len() as i64], emb.to_vec())).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
             Ok(raw.to_vec())
@@ -267,7 +343,9 @@ mod onnx {
 
     impl FaceMesh {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
-            Ok(Self { session: build(model)? })
+            Ok(Self {
+                session: build(model)?,
+            })
         }
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
@@ -353,7 +431,9 @@ mod onnx {
 
     impl Detector {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
-            Ok(Self { session: build(model)? })
+            Ok(Self {
+                session: build(model)?,
+            })
         }
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
@@ -427,8 +507,10 @@ mod onnx {
     fn letterbox_bgr(frame: &align::RgbView, scale: f32, size: usize) -> Vec<f32> {
         let mut t = vec![0.0f32; 3 * size * size];
         let plane = size * size;
-        let (sw, sh) =
-            ((frame.width as f32 * scale) as usize, (frame.height as f32 * scale) as usize);
+        let (sw, sh) = (
+            (frame.width as f32 * scale) as usize,
+            (frame.height as f32 * scale) as usize,
+        );
         for y in 0..sh.min(size) {
             for x in 0..sw.min(size) {
                 let p = frame.sample_bilinear(x as f32 / scale, y as f32 / scale);
@@ -462,7 +544,10 @@ mod onnx {
         };
         let cos = align::cosine(&a, &b);
         let passed = (cos - 1.0).abs() < 1e-4;
-        (passed, format!("cosine(same chip, twice) = {cos:.6} (want ~1.0)"))
+        (
+            passed,
+            format!("cosine(same chip, twice) = {cos:.6} (want ~1.0)"),
+        )
     }
 }
 
@@ -489,14 +574,34 @@ mod ear_tests {
     #[test]
     fn open_eye_has_normal_ear() {
         // corners 10 apart; lids ±2 => EAR = (4+4)/(2*10) = 0.4.
-        let lm = lm_with(&EAR_LEFT, [(0.0, 0.0), (3.0, -2.0), (7.0, -2.0), (10.0, 0.0), (7.0, 2.0), (3.0, 2.0)]);
+        let lm = lm_with(
+            &EAR_LEFT,
+            [
+                (0.0, 0.0),
+                (3.0, -2.0),
+                (7.0, -2.0),
+                (10.0, 0.0),
+                (7.0, 2.0),
+                (3.0, 2.0),
+            ],
+        );
         assert!((eye_ear(&lm, &EAR_LEFT) - 0.4).abs() < 1e-5);
     }
 
     #[test]
     fn closed_eye_ear_near_zero() {
         // lids collapse onto the horizontal line => vertical distances 0 => EAR 0.
-        let lm = lm_with(&EAR_LEFT, [(0.0, 0.0), (3.0, 0.0), (7.0, 0.0), (10.0, 0.0), (7.0, 0.0), (3.0, 0.0)]);
+        let lm = lm_with(
+            &EAR_LEFT,
+            [
+                (0.0, 0.0),
+                (3.0, 0.0),
+                (7.0, 0.0),
+                (10.0, 0.0),
+                (7.0, 0.0),
+                (3.0, 0.0),
+            ],
+        );
         assert!(eye_ear(&lm, &EAR_LEFT) < 1e-5);
     }
 

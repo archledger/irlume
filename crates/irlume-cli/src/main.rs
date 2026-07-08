@@ -25,7 +25,10 @@ mod recovery;
 mod tui;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 /// Developer / benchmark / research subcommands — hidden from `help` and gated
@@ -33,8 +36,18 @@ pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 /// so they EBUSY-conflict on a running install) and some, like `calcapture`,
 /// write RAW face embeddings to a plaintext file — not for end users.
 const DEV_CMDS: &[&str] = &[
-    "capture", "eval", "irbench", "genuine", "calcapture", "normprobe",
-    "liveness", "meshprobe", "selftest", "padcapture", "padreport", "verify",
+    "capture",
+    "eval",
+    "irbench",
+    "genuine",
+    "calcapture",
+    "normprobe",
+    "liveness",
+    "meshprobe",
+    "selftest",
+    "padcapture",
+    "padreport",
+    "verify",
 ];
 
 fn main() -> std::process::ExitCode {
@@ -42,17 +55,24 @@ fn main() -> std::process::ExitCode {
     // `| less` then quit, `| grep -q`) into a "failed printing to stdout: Broken
     // pipe" panic + exit 101. Restore the Unix default so we exit quietly like any
     // other CLI when a downstream reader goes away.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Gate the developer tools unless IRLUME_DEV is set.
     if let Some(cmd) = args.first().map(String::as_str) {
         if DEV_CMDS.contains(&cmd) && std::env::var_os("IRLUME_DEV").is_none() {
-            eprintln!("[irlume] '{cmd}' is a developer/benchmark tool (opens the camera directly, \
-                       not for normal use). Set IRLUME_DEV=1 to enable it.");
+            eprintln!(
+                "[irlume] '{cmd}' is a developer/benchmark tool (opens the camera directly, \
+                       not for normal use). Set IRLUME_DEV=1 to enable it."
+            );
             return std::process::ExitCode::from(2);
         }
     }
-    match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
+    match (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) {
         (Some("selftest"), Some("align")) => selftest_align(&args),
         (Some("capture"), _) => capture(&args),
         (Some("eval"), _) => eval(&args),
@@ -91,7 +111,10 @@ fn main() -> std::process::ExitCode {
         (Some("help" | "--help" | "-h"), _) => commands::help(),
         (Some("tui"), _) => match tui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(e) => { eprintln!("tui: {e}"); std::process::ExitCode::FAILURE }
+            Err(e) => {
+                eprintln!("tui: {e}");
+                std::process::ExitCode::FAILURE
+            }
         },
         (Some(cmd), _) => {
             eprintln!("irlume: unknown command '{cmd}' — run `irlume help`");
@@ -113,12 +136,31 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     if reset {
         eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
     }
-    eprintln!("[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…");
-    match daemon_request(&Request::Enroll { user, profile: name, scans, reset }) {
-        Ok(Response::Ok(msg)) => { println!("[enroll] {msg}"); std::process::ExitCode::SUCCESS }
-        Ok(Response::Error(e)) => { eprintln!("enroll failed: {e}"); std::process::ExitCode::FAILURE }
-        Ok(other) => { eprintln!("enroll: unexpected response {other:?}"); std::process::ExitCode::FAILURE }
-        Err(e) => { eprintln!("enroll: {e}"); std::process::ExitCode::FAILURE }
+    eprintln!(
+        "[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…"
+    );
+    match daemon_request(&Request::Enroll {
+        user,
+        profile: name,
+        scans,
+        reset,
+    }) {
+        Ok(Response::Ok(msg)) => {
+            println!("[enroll] {msg}");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("enroll failed: {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("enroll: unexpected response {other:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("enroll: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -130,52 +172,104 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     let req = match sub {
         None | Some("list") => Request::ListProfiles { user },
         Some("add-scan") => match flag(args, "--profile") {
-            Some(p) => { eprintln!("[profiles] adding a scan to '{p}' — stay in frame…"); Request::AddScan { user, profile: p.into() } }
+            Some(p) => {
+                eprintln!("[profiles] adding a scan to '{p}' — stay in frame…");
+                Request::AddScan {
+                    user,
+                    profile: p.into(),
+                }
+            }
             None => return usage_profiles(),
         },
         Some("delete") => match (flag(args, "--profile"), flag(args, "--scan")) {
-            (Some(p), Some(s)) => Request::DeleteScan { user, profile: p.into(), scan: s.into() },
-            (Some(p), None) => Request::DeleteProfile { user, profile: p.into() },
+            (Some(p), Some(s)) => Request::DeleteScan {
+                user,
+                profile: p.into(),
+                scan: s.into(),
+            },
+            (Some(p), None) => Request::DeleteProfile {
+                user,
+                profile: p.into(),
+            },
             _ => return usage_profiles(),
         },
-        Some("rename") => match (flag(args, "--profile"), flag(args, "--scan"), flag(args, "--name")) {
-            (Some(p), Some(s), Some(n)) => Request::RenameScan { user, profile: p.into(), scan: s.into(), new_name: n.into() },
-            (Some(p), None, Some(n)) => Request::RenameProfile { user, profile: p.into(), new_name: n.into() },
+        Some("rename") => match (
+            flag(args, "--profile"),
+            flag(args, "--scan"),
+            flag(args, "--name"),
+        ) {
+            (Some(p), Some(s), Some(n)) => Request::RenameScan {
+                user,
+                profile: p.into(),
+                scan: s.into(),
+                new_name: n.into(),
+            },
+            (Some(p), None, Some(n)) => Request::RenameProfile {
+                user,
+                profile: p.into(),
+                new_name: n.into(),
+            },
             _ => return usage_profiles(),
         },
         Some("eyes-open") => {
             let on = args.iter().any(|a| a == "on");
             let off = args.iter().any(|a| a == "off");
-            if on == off { eprintln!("usage: irlume profiles eyes-open <on|off> [--user U]"); return std::process::ExitCode::from(2); }
+            if on == off {
+                eprintln!("usage: irlume profiles eyes-open <on|off> [--user U]");
+                return std::process::ExitCode::from(2);
+            }
             Request::SetRequireEyesOpen { user, on }
         }
         Some("challenge") => {
             let on = args.iter().any(|a| a == "on");
             let off = args.iter().any(|a| a == "off");
-            if on == off { eprintln!("usage: irlume profiles challenge <on|off> [--user U]"); return std::process::ExitCode::from(2); }
+            if on == off {
+                eprintln!("usage: irlume profiles challenge <on|off> [--user U]");
+                return std::process::ExitCode::from(2);
+            }
             Request::SetRequireChallenge { user, on }
         }
         _ => return usage_profiles(),
     };
     match daemon_request(&req) {
-        Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) => {
+        Ok(Response::Enrollment {
+            profiles,
+            require_eyes_open,
+            require_challenge,
+        }) => {
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
             } else {
-                println!("[profiles] require-eyes-open: {}  ·  require-challenge (blink): {}",
+                println!(
+                    "[profiles] require-eyes-open: {}  ·  require-challenge (blink): {}",
                     if require_eyes_open { "ON" } else { "off" },
-                    if require_challenge { "ON" } else { "off" });
+                    if require_challenge { "ON" } else { "off" }
+                );
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
-                    for s in &p.scans { println!("      - {s}"); }
+                    for s in &p.scans {
+                        println!("      - {s}");
+                    }
                 }
             }
             std::process::ExitCode::SUCCESS
         }
-        Ok(Response::Ok(msg)) => { println!("[profiles] {msg}"); std::process::ExitCode::SUCCESS }
-        Ok(Response::Error(e)) => { eprintln!("[profiles] {e}"); std::process::ExitCode::FAILURE }
-        Ok(other) => { eprintln!("[profiles] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
-        Err(e) => { eprintln!("[profiles] {e}"); std::process::ExitCode::FAILURE }
+        Ok(Response::Ok(msg)) => {
+            println!("[profiles] {msg}");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("[profiles] {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[profiles] unexpected response {other:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[profiles] {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -187,14 +281,31 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 fn set_cameras(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let (Some(rgb), Some(ir)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: irlume set-cameras <rgb-node> <ir-node>   (root; e.g. /dev/video0 /dev/video2)");
+        eprintln!(
+            "usage: irlume set-cameras <rgb-node> <ir-node>   (root; e.g. /dev/video0 /dev/video2)"
+        );
         return std::process::ExitCode::from(2);
     };
-    match daemon_request(&Request::SetCameras { rgb: rgb.clone(), ir: ir.clone() }) {
-        Ok(Response::Ok(msg)) => { println!("[set-cameras] {msg}"); std::process::ExitCode::SUCCESS }
-        Ok(Response::Error(e)) => { eprintln!("[set-cameras] {e}"); std::process::ExitCode::FAILURE }
-        Ok(other) => { eprintln!("[set-cameras] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
-        Err(e) => { eprintln!("[set-cameras] {e}"); std::process::ExitCode::FAILURE }
+    match daemon_request(&Request::SetCameras {
+        rgb: rgb.clone(),
+        ir: ir.clone(),
+    }) {
+        Ok(Response::Ok(msg)) => {
+            println!("[set-cameras] {msg}");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("[set-cameras] {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[set-cameras] unexpected response {other:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[set-cameras] {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -205,21 +316,35 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
         eprintln!("[ir-setup] probing the IR camera and trying to enable the 850nm emitter (a few seconds)…");
     }
     match daemon_request(&Request::SetupIrEmitter { dry_run: dry }) {
-        Ok(Response::Ok(msg)) => { println!("[ir-setup] {msg}"); std::process::ExitCode::SUCCESS }
-        Ok(Response::Error(e)) => { eprintln!("[ir-setup] {e}"); std::process::ExitCode::FAILURE }
-        Ok(other) => { eprintln!("[ir-setup] unexpected response {other:?}"); std::process::ExitCode::FAILURE }
-        Err(e) => { eprintln!("[ir-setup] {e}"); std::process::ExitCode::FAILURE }
+        Ok(Response::Ok(msg)) => {
+            println!("[ir-setup] {msg}");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("[ir-setup] {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[ir-setup] unexpected response {other:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[ir-setup] {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
 fn usage_profiles() -> std::process::ExitCode {
-    eprintln!("usage: irlume profiles [--user U] <subcommand>\n  \
+    eprintln!(
+        "usage: irlume profiles [--user U] <subcommand>\n  \
         (no sub) | list                         list profiles + scans\n  \
         add-scan --profile P                    add a scan to P (improve recognition)\n  \
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
         eyes-open <on|off>                      require eyes open to unlock\n  \
-        challenge <on|off>                      opt-in passive blink liveness");
+        challenge <on|off>                      opt-in passive blink liveness"
+    );
     std::process::ExitCode::from(2)
 }
 
@@ -233,8 +358,22 @@ fn verify(args: &[String]) -> std::process::ExitCode {
     let user = user_arg(args);
     match engine(det, model, args).and_then(|mut e| e.authenticate(&user)) {
         Ok(o) => {
-            println!("[verify] live={} score {:.3} -> {} ({})", o.live, o.score, if o.granted { "GRANT \u{2705}" } else { "DENY \u{274c}" }, o.reason);
-            if o.granted { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
+            println!(
+                "[verify] live={} score {:.3} -> {} ({})",
+                o.live,
+                o.score,
+                if o.granted {
+                    "GRANT \u{2705}"
+                } else {
+                    "DENY \u{274c}"
+                },
+                o.reason
+            );
+            if o.granted {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
         Err(e) => {
             eprintln!("verify error: {e}");
@@ -259,13 +398,19 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             let pw = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 let first = match rpassword::prompt_password("Login password: ") {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("[keyring] could not read password: {e}"); return std::process::ExitCode::FAILURE; }
+                    Err(e) => {
+                        eprintln!("[keyring] could not read password: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
                 };
                 // Confirm to catch typos — a mistyped seal silently fails to
                 // unlock the wallet at the next face login (key mismatch).
                 let confirm = match rpassword::prompt_password("Confirm login password: ") {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("[keyring] could not read password: {e}"); return std::process::ExitCode::FAILURE; }
+                    Err(e) => {
+                        eprintln!("[keyring] could not read password: {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
                 };
                 if first != confirm {
                     eprintln!("[keyring] passwords do not match — aborted (nothing sealed).");
@@ -276,11 +421,15 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 use std::io::BufRead;
                 let mut line = String::new();
                 if std::io::stdin().lock().read_line(&mut line).is_err() {
-                    eprintln!("[keyring] could not read password from stdin"); return std::process::ExitCode::FAILURE;
+                    eprintln!("[keyring] could not read password from stdin");
+                    return std::process::ExitCode::FAILURE;
                 }
                 line.trim_end_matches(['\n', '\r']).to_string()
             };
-            if pw.is_empty() { eprintln!("[keyring] empty password — aborted"); return std::process::ExitCode::from(2); }
+            if pw.is_empty() {
+                eprintln!("[keyring] empty password — aborted");
+                return std::process::ExitCode::from(2);
+            }
             let req = irlume_common::Request::SealPassword {
                 user: user.clone(),
                 password: irlume_common::SecretBytes::new(pw.into_bytes()),
@@ -291,28 +440,63 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");
                     std::process::ExitCode::SUCCESS
                 }
-                Ok(irlume_common::Response::Error(e)) => { eprintln!("[keyring] arm failed: {e}"); std::process::ExitCode::FAILURE }
-                Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
-                Err(e) => { eprintln!("[keyring] arm failed: {e}"); std::process::ExitCode::FAILURE }
+                Ok(irlume_common::Response::Error(e)) => {
+                    eprintln!("[keyring] arm failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("[keyring] unexpected response: {other:?}");
+                    std::process::ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("[keyring] arm failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
-        Some("status") => match daemon_request(&irlume_common::Request::HasSealedPassword { user: user.clone() }) {
-            Ok(irlume_common::Response::HasPassword(armed)) => {
-                println!("[keyring] '{user}': keyring unlock is {}", if armed { "ARMED \u{2705}" } else { "not armed" });
-                std::process::ExitCode::SUCCESS
+        Some("status") => {
+            match daemon_request(&irlume_common::Request::HasSealedPassword { user: user.clone() })
+            {
+                Ok(irlume_common::Response::HasPassword(armed)) => {
+                    println!(
+                        "[keyring] '{user}': keyring unlock is {}",
+                        if armed { "ARMED \u{2705}" } else { "not armed" }
+                    );
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(irlume_common::Response::Error(e)) => {
+                    eprintln!("[keyring] status failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("[keyring] unexpected response: {other:?}");
+                    std::process::ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("[keyring] status failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
-            Ok(irlume_common::Response::Error(e)) => { eprintln!("[keyring] status failed: {e}"); std::process::ExitCode::FAILURE }
-            Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
-            Err(e) => { eprintln!("[keyring] status failed: {e}"); std::process::ExitCode::FAILURE }
-        },
-        Some("forget") => match daemon_request(&irlume_common::Request::ForgetPassword { user: user.clone() }) {
+        }
+        Some("forget") => match daemon_request(&irlume_common::Request::ForgetPassword {
+            user: user.clone(),
+        }) {
             Ok(irlume_common::Response::PasswordForgotten) => {
                 println!("[keyring] '{user}': sealed password erased — keyring unlock disarmed.");
                 std::process::ExitCode::SUCCESS
             }
-            Ok(irlume_common::Response::Error(e)) => { eprintln!("[keyring] forget failed: {e}"); std::process::ExitCode::FAILURE }
-            Ok(other) => { eprintln!("[keyring] unexpected response: {other:?}"); std::process::ExitCode::FAILURE }
-            Err(e) => { eprintln!("[keyring] forget failed: {e}"); std::process::ExitCode::FAILURE }
+            Ok(irlume_common::Response::Error(e)) => {
+                eprintln!("[keyring] forget failed: {e}");
+                std::process::ExitCode::FAILURE
+            }
+            Ok(other) => {
+                eprintln!("[keyring] unexpected response: {other:?}");
+                std::process::ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("[keyring] forget failed: {e}");
+                std::process::ExitCode::FAILURE
+            }
         },
         _ => {
             eprintln!("usage: irlume keyring <arm|status|forget> [--user U]");
@@ -322,20 +506,29 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
 }
 
 /// Round-trip one request to `irlumed` over the Unix socket and return its reply.
-pub(crate) fn daemon_request(req: &irlume_common::Request) -> Result<irlume_common::Response, String> {
+pub(crate) fn daemon_request(
+    req: &irlume_common::Request,
+) -> Result<irlume_common::Response, String> {
     // Shared client: bounded connect timeout + zeroized wire buffers. The 120s
     // read budget covers slow operations (guided enroll capture loops).
-    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120))
-        .map_err(|e| {
+    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120)).map_err(
+        |e| {
             // The connect-failure message already names irlumed and the exact
             // fix (client.rs); only append the hint where it adds information.
             let m = e.to_string();
-            if m.contains("irlumed") { m } else { format!("{m} (is irlumed running?)") }
-        })
+            if m.contains("irlumed") {
+                m
+            } else {
+                format!("{m} (is irlumed running?)")
+            }
+        },
+    )
 }
 
 pub(crate) fn user_arg(args: &[String]) -> String {
-    flag(args, "--user").map(str::to_string).filter(|s| !s.is_empty())
+    flag(args, "--user")
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()))
 }
 
@@ -359,7 +552,6 @@ fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlu
     }
     Ok(e)
 }
-
 
 /// Mean brightness (0..255) of an 8-bit greyscale frame inside a bbox region.
 fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
@@ -386,13 +578,17 @@ fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
 /// group by person (filename prefix), and report genuine vs impostor cosine
 /// distributions + EER + FAR/FRR. Answers "does AuraFace-on-IR discriminate?".
 fn irbench(args: &[String]) -> std::process::ExitCode {
-    let (Some(dir), Some(det_path), Some(model)) =
-        (flag(args, "--dir"), flag(args, "--det"), flag(args, "--model"))
-    else {
+    let (Some(dir), Some(det_path), Some(model)) = (
+        flag(args, "--dir"),
+        flag(args, "--det"),
+        flag(args, "--model"),
+    ) else {
         eprintln!("usage: irlume irbench --dir <imgdir> --det <yunet.onnx> --model <glintr100.onnx> [--max-persons N] [--lfw] [--impostor-only [--max-images N]]");
         return std::process::ExitCode::from(2);
     };
-    let max_persons: usize = flag(args, "--max-persons").and_then(|s| s.parse().ok()).unwrap_or(80);
+    let max_persons: usize = flag(args, "--max-persons")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
 
     // Impostor-only / FALSE-ACCEPT mode: a directory of distinct-identity images
     // (e.g. SFHQ synthetic faces — every file is a different person), so every
@@ -413,12 +609,17 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     all.sort(); // deterministic
-    let mut by_person: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> = Default::default();
+    let mut by_person: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> =
+        Default::default();
     for p in all {
-        let Some(name) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(name) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let person = if lfw {
             match name.rsplit_once('_') {
-                Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => head.to_string(),
+                Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
+                    head.to_string()
+                }
                 _ => name.to_string(),
             }
         } else {
@@ -427,14 +628,25 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
         by_person.entry(person).or_default().push(p);
     }
     let persons: Vec<_> = by_person.into_iter().take(max_persons).collect();
-    println!("[irbench] {} persons, {} images; embedding (YuNet→align→AuraFace)…",
-        persons.len(), persons.iter().map(|(_, v)| v.len()).sum::<usize>());
+    println!(
+        "[irbench] {} persons, {} images; embedding (YuNet→align→AuraFace)…",
+        persons.len(),
+        persons.iter().map(|(_, v)| v.len()).sum::<usize>()
+    );
 
     let mut det = match irlume_vision::Detector::load_from_file(det_path) {
-        Ok(d) => d, Err(e) => { eprintln!("det load: {e}"); return std::process::ExitCode::FAILURE; }
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("det load: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     let mut emb = match irlume_vision::Embedder::load_from_file(model) {
-        Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("emb load: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
 
     // Experiment knob: --tta = test-time augmentation (embed chip + its mirror,
@@ -454,24 +666,48 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
             let rgb = img.to_rgb8();
             let (w, h) = rgb.dimensions();
             let data = rgb.into_raw();
-            let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
-            let Ok(faces) = det.detect(&view) else { continue };
-            let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { nodet += 1; continue };
+            let view = irlume_vision::align::RgbView {
+                data: &data,
+                width: w,
+                height: h,
+            };
+            let Ok(faces) = det.detect(&view) else {
+                continue;
+            };
+            let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
+                nodet += 1;
+                continue;
+            };
             if let Ok(mut chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
-                if let Some(f) = darken { irlume_vision::light::darken(&mut chip, f); }
+                if let Some(f) = darken {
+                    irlume_vision::light::darken(&mut chip, f);
+                }
                 match lightnorm.as_deref() {
                     Some("gamma") => irlume_vision::light::gamma(&mut chip, 2.2),
                     Some("he") => irlume_vision::light::equalize(&mut chip),
-                    Some("clahe") => irlume_vision::light::clahe(&mut chip, irlume_vision::align::OUT_SIZE as usize, 8, 3.0),
+                    Some("clahe") => irlume_vision::light::clahe(
+                        &mut chip,
+                        irlume_vision::align::OUT_SIZE as usize,
+                        8,
+                        3.0,
+                    ),
                     _ => {}
                 }
                 if tta {
-                    if let (Ok(a), Ok(b)) = (emb.embed(&chip), emb.embed(&irlume_vision::align::flip_h(&chip))) {
+                    if let (Ok(a), Ok(b)) = (
+                        emb.embed(&chip),
+                        emb.embed(&irlume_vision::align::flip_h(&chip)),
+                    ) {
                         let mut v = [0f32; irlume_vision::EMBED_DIM];
                         let mut norm = 0f32;
-                        for k in 0..irlume_vision::EMBED_DIM { v[k] = a[k] + b[k]; norm += v[k] * v[k]; }
+                        for k in 0..irlume_vision::EMBED_DIM {
+                            v[k] = a[k] + b[k];
+                            norm += v[k] * v[k];
+                        }
                         let norm = norm.sqrt().max(1e-12);
-                        for vk in v.iter_mut() { *vk /= norm; }
+                        for vk in v.iter_mut() {
+                            *vk /= norm;
+                        }
                         embs.push((pi, v));
                     }
                 } else if let Ok(e) = emb.embed(&chip) {
@@ -480,7 +716,12 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
             }
         }
     }
-    println!("[irbench] embedded {} faces ({} images had no detectable face){}", embs.len(), nodet, if tta { " [TTA flip-avg]" } else { "" });
+    println!(
+        "[irbench] embedded {} faces ({} images had no detectable face){}",
+        embs.len(),
+        nodet,
+        if tta { " [TTA flip-avg]" } else { "" }
+    );
 
     // Optional: dump (person_index, 512-D embedding) per line for offline training.
     if let Some(out) = flag(args, "--export") {
@@ -507,7 +748,11 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     for i in 0..embs.len() {
         for j in (i + 1)..embs.len() {
             let c = irlume_vision::align::cosine(&embs[i].1, &embs[j].1);
-            if embs[i].0 == embs[j].0 { genuine.push(c) } else { impostor.push(c) }
+            if embs[i].0 == embs[j].0 {
+                genuine.push(c)
+            } else {
+                impostor.push(c)
+            }
         }
     }
     if genuine.is_empty() || impostor.is_empty() {
@@ -518,8 +763,21 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     impostor.sort_by(f32::total_cmp);
     let pct = |v: &[f32], p: f32| v[((p * (v.len() - 1) as f32) as usize).min(v.len() - 1)];
     let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
-    println!("[genuine ] n={:6}  min {:.3}  mean {:.3}  median {:.3}", genuine.len(), genuine[0], mean(&genuine), pct(&genuine, 0.5));
-    println!("[impostor] n={:6}  mean {:.3}  p99 {:.3}  p99.9 {:.3}  max {:.3}", impostor.len(), mean(&impostor), pct(&impostor, 0.99), pct(&impostor, 0.999), impostor[impostor.len() - 1]);
+    println!(
+        "[genuine ] n={:6}  min {:.3}  mean {:.3}  median {:.3}",
+        genuine.len(),
+        genuine[0],
+        mean(&genuine),
+        pct(&genuine, 0.5)
+    );
+    println!(
+        "[impostor] n={:6}  mean {:.3}  p99 {:.3}  p99.9 {:.3}  max {:.3}",
+        impostor.len(),
+        mean(&impostor),
+        pct(&impostor, 0.99),
+        pct(&impostor, 0.999),
+        impostor[impostor.len() - 1]
+    );
 
     // FAR/FRR sweep + EER + the threshold meeting FAR=1e-4.
     let far = |t: f32| impostor.iter().filter(|&&c| c >= t).count() as f64 / impostor.len() as f64;
@@ -532,16 +790,30 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     let mut t = 0.0;
     while t < 1.0 {
         let (a, r) = (far(t), frr(t));
-        if (a - r).abs() < eer.0 { eer = ((a - r).abs(), t); }
+        if (a - r).abs() < eer.0 {
+            eer = ((a - r).abs(), t);
+        }
         t += 0.005;
     }
     let et = eer.1;
-    println!("[EER] ~{:.3} at threshold {et:.3}", (far(et) + frr(et)) / 2.0);
+    println!(
+        "[EER] ~{:.3} at threshold {et:.3}",
+        (far(et) + frr(et)) / 2.0
+    );
     // threshold achieving FAR<=1e-4, and its FRR
     let mut t14 = 1.0f32;
     let mut s = 0.30;
-    while s <= 0.95 { if far(s) <= 1e-4 { t14 = s; break; } s += 0.005; }
-    println!("[FAR≤1e-4] threshold {t14:.3} -> FRR {:.4} (reject rate for genuine at NIST-grade FAR)", frr(t14));
+    while s <= 0.95 {
+        if far(s) <= 1e-4 {
+            t14 = s;
+            break;
+        }
+        s += 0.005;
+    }
+    println!(
+        "[FAR≤1e-4] threshold {t14:.3} -> FRR {:.4} (reject rate for genuine at NIST-grade FAR)",
+        frr(t14)
+    );
     std::process::ExitCode::SUCCESS
 }
 
@@ -553,45 +825,79 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
 /// NIST-grade FAR ≤ 1e-4. Histogram-based, so it scales to millions of pairs
 /// without storing them. FAR only — genuine/FRR come from live captures, not here.
 fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::process::ExitCode {
-    let max_images: usize = flag(args, "--max-images").and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let max_images: usize = flag(args, "--max-images")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
 
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     collect_images(std::path::Path::new(dir), &mut files);
     files.sort(); // deterministic sample
     files.truncate(max_images);
     if files.len() < 2 {
-        eprintln!("[farbench] need >=2 images under {dir} (found {})", files.len());
+        eprintln!(
+            "[farbench] need >=2 images under {dir} (found {})",
+            files.len()
+        );
         return std::process::ExitCode::FAILURE;
     }
-    println!("[farbench] {} images; embedding (YuNet→align→AuraFace)…", files.len());
+    println!(
+        "[farbench] {} images; embedding (YuNet→align→AuraFace)…",
+        files.len()
+    );
 
     let mut det = match irlume_vision::Detector::load_from_file(det_path) {
-        Ok(d) => d, Err(e) => { eprintln!("det load: {e}"); return std::process::ExitCode::FAILURE; }
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("det load: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     let mut emb = match irlume_vision::Embedder::load_from_file(model) {
-        Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("emb load: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
 
     let mut embs: Vec<[f32; irlume_vision::EMBED_DIM]> = Vec::with_capacity(files.len());
     let mut nodet = 0usize;
     for (i, f) in files.iter().enumerate() {
         if i > 0 && i % 1000 == 0 {
-            println!("[farbench]   {}/{} embedded ({} no-face)…", embs.len(), i, nodet);
+            println!(
+                "[farbench]   {}/{} embedded ({} no-face)…",
+                embs.len(),
+                i,
+                nodet
+            );
         }
         let Ok(img) = image::open(f) else { continue };
         let rgb = img.to_rgb8();
         let (w, h) = rgb.dimensions();
         let data = rgb.into_raw();
-        let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
-        let Ok(faces) = det.detect(&view) else { continue };
-        let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { nodet += 1; continue };
+        let view = irlume_vision::align::RgbView {
+            data: &data,
+            width: w,
+            height: h,
+        };
+        let Ok(faces) = det.detect(&view) else {
+            continue;
+        };
+        let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
+            nodet += 1;
+            continue;
+        };
         if let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
             if let Ok(e) = emb.embed(&chip) {
                 embs.push(e);
             }
         }
     }
-    println!("[farbench] embedded {} faces ({} images had no detectable face)", embs.len(), nodet);
+    println!(
+        "[farbench] embedded {} faces ({} images had no detectable face)",
+        embs.len(),
+        nodet
+    );
     if embs.len() < 2 {
         eprintln!("[farbench] too few embeddings for pairwise stats");
         return std::process::ExitCode::FAILURE;
@@ -629,7 +935,9 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
 
     // suffix[k] = #pairs in bins >= k, i.e. cos >= -1 + 2k/BINS → FAR numerator.
     let mut suffix = vec![0u64; BINS + 1];
-    for k in (0..BINS).rev() { suffix[k] = suffix[k + 1] + hist[k]; }
+    for k in (0..BINS).rev() {
+        suffix[k] = suffix[k + 1] + hist[k];
+    }
     let far_at = |t: f32| -> f64 {
         let k = (((t + 1.0) * 0.5 * BINS as f32).ceil() as i64).clamp(0, BINS as i64) as usize;
         suffix[k] as f64 / total as f64
@@ -637,29 +945,62 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
     let pct = |p: f64| -> f32 {
         let target = (p * total as f64) as u64;
         let mut cum = 0u64;
-        for (k, &h) in hist.iter().enumerate() { cum += h; if cum >= target { return -1.0 + 2.0 * k as f32 / BINS as f32; } }
+        for (k, &h) in hist.iter().enumerate() {
+            cum += h;
+            if cum >= target {
+                return -1.0 + 2.0 * k as f32 / BINS as f32;
+            }
+        }
         1.0
     };
-    let max_imp = (0..BINS).rev().find(|&k| hist[k] > 0)
-        .map(|k| -1.0 + 2.0 * (k as f32 + 1.0) / BINS as f32).unwrap_or(1.0);
+    let max_imp = (0..BINS)
+        .rev()
+        .find(|&k| hist[k] > 0)
+        .map(|k| -1.0 + 2.0 * (k as f32 + 1.0) / BINS as f32)
+        .unwrap_or(1.0);
 
-    println!("[impostor] pairs={total}  mean {:.3}  p99 {:.3}  p99.9 {:.3}  p99.99 {:.3}  max {:.3}",
-        sum_c / total as f64, pct(0.99), pct(0.999), pct(0.9999), max_imp);
+    println!(
+        "[impostor] pairs={total}  mean {:.3}  p99 {:.3}  p99.9 {:.3}  p99.99 {:.3}  max {:.3}",
+        sum_c / total as f64,
+        pct(0.99),
+        pct(0.999),
+        pct(0.9999),
+        max_imp
+    );
     println!("[FAR sweep]");
     for t in [0.40f32, 0.45, 0.50, 0.55, 0.60] {
-        println!("  thr {t:.2}: FAR {:.6}  (1 in {:.0})", far_at(t),
-            if far_at(t) > 0.0 { 1.0 / far_at(t) } else { f64::INFINITY });
+        println!(
+            "  thr {t:.2}: FAR {:.6}  (1 in {:.0})",
+            far_at(t),
+            if far_at(t) > 0.0 {
+                1.0 / far_at(t)
+            } else {
+                f64::INFINITY
+            }
+        );
     }
-    let mut t14 = 1.0f32; let mut s = 0.30f32;
-    while s <= 0.95 { if far_at(s) <= 1e-4 { t14 = s; break; } s += 0.005; }
-    println!("[FAR≤1e-4] threshold {t14:.3}  (RGB auth threshold 0.50 → FAR {:.6})", far_at(0.50));
+    let mut t14 = 1.0f32;
+    let mut s = 0.30f32;
+    while s <= 0.95 {
+        if far_at(s) <= 1e-4 {
+            t14 = s;
+            break;
+        }
+        s += 0.005;
+    }
+    println!(
+        "[FAR≤1e-4] threshold {t14:.3}  (RGB auth threshold 0.50 → FAR {:.6})",
+        far_at(0.50)
+    );
     std::process::ExitCode::SUCCESS
 }
 
 /// Recursively collect jpg/jpeg/png/bmp files under `dir`.
 /// Darken a 112x112x3 RGB chip (simulate low light): pixel *= factor.
 fn darken_chip(chip: &[u8], factor: f32) -> Vec<u8> {
-    chip.iter().map(|&p| (p as f32 * factor).round().clamp(0.0, 255.0) as u8).collect()
+    chip.iter()
+        .map(|&p| (p as f32 * factor).round().clamp(0.0, 255.0) as u8)
+        .collect()
 }
 
 /// 3x3 box-blur a 112x112x3 RGB chip (simulate motion/focus blur).
@@ -695,13 +1036,26 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
     let dir = flag(args, "--dir").unwrap_or("");
     let det_path = flag(args, "--det").unwrap_or("models/face_detection_yunet_2023mar.onnx");
     let model = flag(args, "--model").unwrap_or("models/glintr100.onnx");
-    let max = flag(args, "--max").and_then(|s| s.parse::<usize>().ok()).unwrap_or(40);
-    if dir.is_empty() { eprintln!("usage: irlume normprobe --dir <imgs> [--det Y] [--model G] [--max N]"); return std::process::ExitCode::from(2); }
+    let max = flag(args, "--max")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(40);
+    if dir.is_empty() {
+        eprintln!("usage: irlume normprobe --dir <imgs> [--det Y] [--model G] [--max N]");
+        return std::process::ExitCode::from(2);
+    }
     let mut det = match irlume_vision::Detector::load_from_file(det_path) {
-        Ok(d) => d, Err(e) => { eprintln!("det load: {e}"); return std::process::ExitCode::FAILURE; }
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("det load: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     let mut emb = match irlume_vision::Embedder::load_from_file(model) {
-        Ok(d) => d, Err(e) => { eprintln!("emb load: {e}"); return std::process::ExitCode::FAILURE; }
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("emb load: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     let mut files = Vec::new();
     collect_images(std::path::Path::new(dir), &mut files);
@@ -713,25 +1067,57 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
         let rgb = img.to_rgb8();
         let (w, h) = rgb.dimensions();
         let data = rgb.into_raw();
-        let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
-        let Ok(faces) = det.detect(&view) else { continue };
-        let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else { continue };
-        let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) else { continue };
+        let view = irlume_vision::align::RgbView {
+            data: &data,
+            width: w,
+            height: h,
+        };
+        let Ok(faces) = det.detect(&view) else {
+            continue;
+        };
+        let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
+            continue;
+        };
+        let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) else {
+            continue;
+        };
         let (Ok((_, nf)), Ok((_, nd)), Ok((_, nb))) = (
             emb.embed_with_norm(&chip),
             emb.embed_with_norm(&darken_chip(&chip, 0.35)),
             emb.embed_with_norm(&blur_chip(&chip)),
-        ) else { continue };
-        sf += nf as f64; sd += nd as f64; sb += nb as f64; n += 1;
-        if nd < nf { dark_lower += 1; }
-        if nb < nf { blur_lower += 1; }
+        ) else {
+            continue;
+        };
+        sf += nf as f64;
+        sd += nd as f64;
+        sb += nb as f64;
+        n += 1;
+        if nd < nf {
+            dark_lower += 1;
+        }
+        if nb < nf {
+            blur_lower += 1;
+        }
     }
-    if n == 0 { eprintln!("[normprobe] no faces"); return std::process::ExitCode::FAILURE; }
+    if n == 0 {
+        eprintln!("[normprobe] no faces");
+        return std::process::ExitCode::FAILURE;
+    }
     let (nf, nd, nb) = (sf / n as f64, sd / n as f64, sb / n as f64);
     println!("[normprobe] {n} faces — mean feature norm:");
     println!("  full   {nf:.2}");
-    println!("  dark   {nd:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)", (nd - nf) / nf * 100.0, dark_lower, dark_lower as f32 / n as f32 * 100.0);
-    println!("  blur   {nb:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)", (nb - nf) / nf * 100.0, blur_lower, blur_lower as f32 / n as f32 * 100.0);
+    println!(
+        "  dark   {nd:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)",
+        (nd - nf) / nf * 100.0,
+        dark_lower,
+        dark_lower as f32 / n as f32 * 100.0
+    );
+    println!(
+        "  blur   {nb:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)",
+        (nb - nf) / nf * 100.0,
+        blur_lower,
+        blur_lower as f32 / n as f32 * 100.0
+    );
     let verdict = if nd < nf * 0.97 && nb < nf * 0.97 && dark_lower as f32 / n as f32 > 0.8 {
         "✓ feature norm TRACKS quality on AuraFace — usable as a quality signal"
     } else {
@@ -742,13 +1128,22 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
 }
 
 fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
             collect_images(&p, out);
-        } else if p.extension().and_then(|x| x.to_str())
-            .map(|x| matches!(x.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "bmp"))
+        } else if p
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| {
+                matches!(
+                    x.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "bmp"
+                )
+            })
             .unwrap_or(false)
         {
             out.push(p);
@@ -764,7 +1159,12 @@ fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
         return 0.0;
     }
     // Inner box = central 50%.
-    let inner = [bbox[0] + bw * 0.25, bbox[1] + bh * 0.25, bbox[2] - bw * 0.25, bbox[3] - bh * 0.25];
+    let inner = [
+        bbox[0] + bw * 0.25,
+        bbox[1] + bh * 0.25,
+        bbox[2] - bw * 0.25,
+        bbox[3] - bh * 0.25,
+    ];
     let center = mean_in_bbox(grey, w, h, &inner);
     let whole = mean_in_bbox(grey, w, h, bbox);
     // Edge mean ≈ (whole*area - center*inner_area) / edge_area.
@@ -802,31 +1202,52 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
     let rgb_dev = flag(args, "--rgb").unwrap_or(irlume_camera::DEFAULT_RGB_DEVICE);
     let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
     let Some(det_path) = flag(args, "--det") else {
-        eprintln!("usage: irlume liveness --det <yunet.onnx> [--rgb /dev/video0] [--ir /dev/video2]");
+        eprintln!(
+            "usage: irlume liveness --det <yunet.onnx> [--rgb /dev/video0] [--ir /dev/video2]"
+        );
         return std::process::ExitCode::from(2);
     };
     let run = || -> irlume_common::Result<()> {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         // RGB
         let rgb = irlume_camera::capture_rgb(rgb_dev)?;
-        let rgb_view =
-            irlume_vision::align::RgbView { data: &rgb.data, width: rgb.width, height: rgb.height };
+        let rgb_view = irlume_vision::align::RgbView {
+            data: &rgb.data,
+            width: rgb.width,
+            height: rgb.height,
+        };
         let rgb_faces = det.detect(&rgb_view)?;
         let rgb_top = rgb_faces.iter().map(|f| f.score).fold(0.0f32, f32::max);
-        println!("[RGB] {}x{}  faces {}  top score {:.3}", rgb.width, rgb.height, rgb_faces.len(), rgb_top);
+        println!(
+            "[RGB] {}x{}  faces {}  top score {:.3}",
+            rgb.width,
+            rgb.height,
+            rgb_faces.len(),
+            rgb_top
+        );
         // IR
         let ir = irlume_camera::capture_ir(ir_dev)?;
         let (mn, mx, sum) = ir.data.iter().fold((255u8, 0u8, 0u64), |(mn, mx, s), &p| {
             (mn.min(p), mx.max(p), s + p as u64)
         });
         let mean = sum as f64 / ir.data.len() as f64;
-        println!("[IR ] {}x{}  brightness mean {:.1} min {} max {}", ir.width, ir.height, mean, mn, mx);
+        println!(
+            "[IR ] {}x{}  brightness mean {:.1} min {} max {}",
+            ir.width, ir.height, mean, mn, mx
+        );
         let ir_rgb = irlume_camera::grey_to_rgb(&ir.data);
-        let ir_view =
-            irlume_vision::align::RgbView { data: &ir_rgb, width: ir.width, height: ir.height };
+        let ir_view = irlume_vision::align::RgbView {
+            data: &ir_rgb,
+            width: ir.width,
+            height: ir.height,
+        };
         let ir_faces = det.detect(&ir_view)?;
         let ir_top_face = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
-        println!("[IR ] faces {}  top score {:.3}", ir_faces.len(), ir_top_face.map_or(0.0, |f| f.score));
+        println!(
+            "[IR ] faces {}  top score {:.3}",
+            ir_faces.len(),
+            ir_top_face.map_or(0.0, |f| f.score)
+        );
 
         // Build signals for the gate.
         let to_fbox = |f: &irlume_vision::Detection, w: u32, h: u32| irlume_liveness::FaceBox {
@@ -837,10 +1258,12 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_face_brightness = ir_top_face
             .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        let ir_center_edge_ratio =
-            ir_top_face.map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox)).unwrap_or(0.0);
-        let ir_eye_glint =
-            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks)).unwrap_or(0.0);
+        let ir_center_edge_ratio = ir_top_face
+            .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
+            .unwrap_or(0.0);
+        let ir_eye_glint = ir_top_face
+            .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
+            .unwrap_or(0.0);
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
@@ -857,8 +1280,15 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
         println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");
-        println!("[gate] cues: rgb={} ir={} aligned={} ir_reflective={} depth={} glint={}",
-            cues.face_in_rgb, cues.face_in_ir, cues.cross_spectrum_aligned, cues.ir_reflectance_ok, cues.depth_ok, cues.glint_present);
+        println!(
+            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} depth={} glint={}",
+            cues.face_in_rgb,
+            cues.face_in_ir,
+            cues.cross_spectrum_aligned,
+            cues.ir_reflectance_ok,
+            cues.depth_ok,
+            cues.glint_present
+        );
         println!("[GATE] {verdict:?} — {reason}");
         Ok(())
     };
@@ -885,12 +1315,20 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     };
     let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(75);
-    let burst: usize = flag(args, "--burst").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let reps: usize = flag(args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let burst: usize = flag(args, "--burst")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let reps: usize = flag(args, "--reps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let trace_on = args.iter().any(|a| a == "--trace");
     // Optional recording (reuses the padreport JSONL format: Blinked→Live,
     // NoBlink→Uncertain/non-response, NoEyes→Spoof).
-    let record = match (flag(args, "--species"), flag(args, "--kind"), flag(args, "--out")) {
+    let record = match (
+        flag(args, "--species"),
+        flag(args, "--kind"),
+        flag(args, "--out"),
+    ) {
         (Some(s), Some(k), Some(o)) => Some((s.to_string(), k.to_string(), o.to_string())),
         _ => None,
     };
@@ -899,8 +1337,13 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         let mut mesh = irlume_vision::FaceMesh::load_from_file(mesh_path)?;
         let mut out_file = match &record {
-            Some((_, _, o)) => Some(std::fs::OpenOptions::new().create(true).append(true).open(o)
-                .map_err(|e| irlume_common::Error::Io(e.to_string()))?),
+            Some((_, _, o)) => Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(o)
+                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?,
+            ),
             None => None,
         };
         let mut written = 0usize;
@@ -915,25 +1358,48 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
             // brightness column doubles as an emitter duty-cycle probe in dark rooms.
             let mut samples: Vec<irlume_liveness::EarSample> = Vec::new();
             for (i, f) in frames.iter().enumerate() {
-                let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
+                let bri =
+                    f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
                 let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
-                let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: f.width, height: f.height };
+                let iv = irlume_vision::align::RgbView {
+                    data: &ir_rgb,
+                    width: f.width,
+                    height: f.height,
+                };
                 let mut ear_i = None;
-                if let Some(t) = det.detect(&iv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+                if let Some(t) = det
+                    .detect(&iv)?
+                    .into_iter()
+                    .max_by(|a, b| a.score.total_cmp(&b.score))
+                {
                     let lm = mesh.landmarks(&iv, &t.bbox, 0.25)?;
                     let ear = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT)
                         .min(irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT));
                     ears.push(ear);
                     ear_i = Some(ear);
-                    contrast_max = contrast_max.max(irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks));
+                    contrast_max = contrast_max.max(irlume_auth::eye_glint_contrast(
+                        &f.data,
+                        f.width,
+                        f.height,
+                        &t.landmarks,
+                    ));
                 }
-                samples.push(irlume_liveness::EarSample { idx: i, ear: ear_i, bri });
+                samples.push(irlume_liveness::EarSample {
+                    idx: i,
+                    ear: ear_i,
+                    bri,
+                });
             }
             if trace_on {
                 for s in &samples {
                     match s.ear {
-                        Some(e) => println!("    trace {:>3}  ear {e:.3}  bri {:>5.1}", s.idx, s.bri),
-                        None => println!("    trace {:>3}  ear   -    bri {:>5.1}  (no face)", s.idx, s.bri),
+                        Some(e) => {
+                            println!("    trace {:>3}  ear {e:.3}  bri {:>5.1}", s.idx, s.bri)
+                        }
+                        None => println!(
+                            "    trace {:>3}  ear   -    bri {:>5.1}  (no face)",
+                            s.idx, s.bri
+                        ),
                     }
                 }
             }
@@ -944,7 +1410,10 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
                 irlume_liveness::BlinkResult::NoEyes => ("Spoof", false),
             };
             let (mut mn, mut mx) = (1.0f32, 0.0f32);
-            for &e in &ears { mn = mn.min(e); mx = mx.max(e); }
+            for &e in &ears {
+                mn = mn.min(e);
+                mx = mx.max(e);
+            }
             let flag_note = match (&record, live) {
                 (Some((_, k, _)), true) if k == "attack" => " ‼ ACCEPTED (breach!)",
                 (Some((_, k, _)), false) if k == "bonafide" => " ✗ live user not confirmed",
@@ -967,10 +1436,15 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
     };
     match run() {
         Ok(w) => {
-            if let Some((_, _, o)) = &record { println!("[meshprobe] appended {w} presentations to {o} — run `irlume padreport --in {o}`"); }
+            if let Some((_, _, o)) = &record {
+                println!("[meshprobe] appended {w} presentations to {o} — run `irlume padreport --in {o}`");
+            }
             std::process::ExitCode::SUCCESS
         }
-        Err(e) => { eprintln!("meshprobe error: {e}"); std::process::ExitCode::FAILURE }
+        Err(e) => {
+            eprintln!("meshprobe error: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -991,7 +1465,11 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
         println!("[genuine] stay in frame — capturing {FRAMES} frames…");
         for k in 0..FRAMES {
             let f = irlume_camera::capture_rgb(device)?;
-            let view = irlume_vision::align::RgbView { data: &f.data, width: f.width, height: f.height };
+            let view = irlume_vision::align::RgbView {
+                data: &f.data,
+                width: f.width,
+                height: f.height,
+            };
             let faces = det.detect(&view)?;
             match faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                 Some(top) => {
@@ -1014,8 +1492,13 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
         }
         scores.sort_by(f32::total_cmp);
         let mean = scores.iter().sum::<f32>() / scores.len() as f32;
-        println!("[genuine] {} pairs: min {:.3}  mean {:.3}  max {:.3}",
-            scores.len(), scores[0], mean, scores[scores.len() - 1]);
+        println!(
+            "[genuine] {} pairs: min {:.3}  mean {:.3}  max {:.3}",
+            scores.len(),
+            scores[0],
+            mean,
+            scores[scores.len() - 1]
+        );
         let impostor_max = 0.423;
         println!("  impostor max (from eval): {impostor_max:.3}");
         if scores[0] > impostor_max {
@@ -1052,9 +1535,11 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
 /// Capture across lighting with `--tag bright` now and `--tag dim` at sunset.
 fn calcapture(args: &[String]) -> std::process::ExitCode {
     let user = user_arg(args);
-    let (Some(det_path), Some(model), Some(out)) =
-        (flag(args, "--det"), flag(args, "--model"), flag(args, "--out"))
-    else {
+    let (Some(det_path), Some(model), Some(out)) = (
+        flag(args, "--det"),
+        flag(args, "--model"),
+        flag(args, "--out"),
+    ) else {
         eprintln!("usage: irlume calcapture --user U --det <yunet.onnx> --model <glintr100.onnx> --out <cal.jsonl> [--adapter <ir.onnx>] [--rgb /dev/video0] [--ir /dev/video2] [--n 40] [--tag bright]");
         return std::process::ExitCode::from(2);
     };
@@ -1067,18 +1552,27 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
     let mean_bbox = |data: &[u8], w: u32, h: u32, ch: usize, bbox: &[f32; 4]| -> f32 {
         let (x1, y1) = (bbox[0].max(0.0) as u32, bbox[1].max(0.0) as u32);
         let (x2, y2) = ((bbox[2] as u32).min(w), (bbox[3] as u32).min(h));
-        if x2 <= x1 || y2 <= y1 { return 0.0; }
+        if x2 <= x1 || y2 <= y1 {
+            return 0.0;
+        }
         let (mut sum, mut cnt) = (0.0f64, 0u64);
         for y in y1..y2 {
             for x in x1..x2 {
                 let i = ((y * w + x) as usize) * ch;
                 let v = if ch == 3 {
                     0.299 * data[i] as f32 + 0.587 * data[i + 1] as f32 + 0.114 * data[i + 2] as f32
-                } else { data[i] as f32 };
-                sum += v as f64; cnt += 1;
+                } else {
+                    data[i] as f32
+                };
+                sum += v as f64;
+                cnt += 1;
             }
         }
-        if cnt == 0 { 0.0 } else { (sum / cnt as f64) as f32 }
+        if cnt == 0 {
+            0.0
+        } else {
+            (sum / cnt as f64) as f32
+        }
     };
 
     let run = || -> irlume_common::Result<usize> {
@@ -1089,8 +1583,16 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         // record the true probe-vs-enrolled cosine.
         let enr = match irlume_core::storage::load(&user) {
             Ok(Some(e)) => Some(e),
-            Ok(None) => { eprintln!("[calcapture] note: '{user}' not enrolled — cosines from pairwise only"); None }
-            Err(e) => { eprintln!("[calcapture] note: templates unavailable ({e}) — cosines from pairwise only"); None }
+            Ok(None) => {
+                eprintln!("[calcapture] note: '{user}' not enrolled — cosines from pairwise only");
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "[calcapture] note: templates unavailable ({e}) — cosines from pairwise only"
+                );
+                None
+            }
         };
         let rgb_scans = enr.as_ref().map(|e| e.rgb_scans()).unwrap_or_default();
         let ir_scans = enr.as_ref().map(|e| e.ir_scans()).unwrap_or_default();
@@ -1101,26 +1603,47 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             None => None,
         };
         let best = |probe: &[f32], scans: &[(&str, &str, &[f32])]| -> f32 {
-            scans.iter().map(|(_, _, t)| irlume_vision::align::cosine(probe, t))
+            scans
+                .iter()
+                .map(|(_, _, t)| irlume_vision::align::cosine(probe, t))
                 .fold(f32::NEG_INFINITY, f32::max)
         };
-        let mut f = std::fs::File::create(out).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+        let mut f =
+            std::fs::File::create(out).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
         use std::io::Write;
         println!("[calcapture] user={user} tag={tag} n={n} -> {out}");
-        println!("[calcapture] rgb_templates={} ir_templates={} adapter={}",
-            rgb_scans.len(), ir_scans.len(), if adapter.is_some() { "yes" } else { "no" });
+        println!(
+            "[calcapture] rgb_templates={} ir_templates={} adapter={}",
+            rgb_scans.len(),
+            ir_scans.len(),
+            if adapter.is_some() { "yes" } else { "no" }
+        );
         println!("[calcapture] sit naturally in frame; vary pose slightly between samples.");
         let mut written = 0usize;
         for idx in 0..n {
             // RGB (median-denoised, matches the auth path) + IR (brightest-of-burst).
             let rgbf = irlume_camera::capture_rgb_denoised(rgb_dev)?;
-            let rv = irlume_vision::align::RgbView { data: &rgbf.data, width: rgbf.width, height: rgbf.height };
-            let rgb_top = det.detect(&rv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+            let rv = irlume_vision::align::RgbView {
+                data: &rgbf.data,
+                width: rgbf.width,
+                height: rgbf.height,
+            };
+            let rgb_top = det
+                .detect(&rv)?
+                .into_iter()
+                .max_by(|a, b| a.score.total_cmp(&b.score));
 
             let irf = irlume_camera::capture_ir(ir_dev)?;
             let ir_rgb = irlume_camera::grey_to_rgb(&irf.data);
-            let iv = irlume_vision::align::RgbView { data: &ir_rgb, width: irf.width, height: irf.height };
-            let ir_top = det.detect(&iv)?.into_iter().max_by(|a, b| a.score.total_cmp(&b.score));
+            let iv = irlume_vision::align::RgbView {
+                data: &ir_rgb,
+                width: irf.width,
+                height: irf.height,
+            };
+            let ir_top = det
+                .detect(&iv)?
+                .into_iter()
+                .max_by(|a, b| a.score.total_cmp(&b.score));
 
             let mut rec = serde_json::Map::new();
             rec.insert("idx".into(), idx.into());
@@ -1131,7 +1654,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 let chip = irlume_vision::align::align_to_arcface(&rv, &t.landmarks)?;
                 let e = emb.embed_tta(&chip)?; // RGB path = TTA flip-average
                 rgb_bri = mean_bbox(&rgbf.data, rgbf.width, rgbf.height, 3, &t.bbox);
-                if !rgb_scans.is_empty() { rgb_cos = best(&e, &rgb_scans); }
+                if !rgb_scans.is_empty() {
+                    rgb_cos = best(&e, &rgb_scans);
+                }
                 rec.insert("rgb_face_score".into(), json_f32(t.score));
                 rec.insert("rgb_cos".into(), json_f32(rgb_cos));
                 rec.insert("rgb_brightness".into(), json_f32(rgb_bri));
@@ -1139,47 +1664,69 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
 
-            let (mut ir_cos, mut ir_bri, mut ir_depth, mut ir_glint) = (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
+            let (mut ir_cos, mut ir_bri, mut ir_depth, mut ir_glint) =
+                (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
                 ir_bri = mean_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox);
                 // Ambient-INDEPENDENT liveness cues (the depth-primary-floor candidates):
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
-                ir_depth = irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
+                ir_depth =
+                    irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
                 ir_glint = irlume_auth::eye_glint(&irf.data, irf.width, irf.height, &t.landmarks);
                 if let Some(a) = adapter.as_mut() {
                     let adapted = a.apply(&raw)?;
-                    if !ir_scans.is_empty() { ir_cos = best(&adapted, &ir_scans); }
+                    if !ir_scans.is_empty() {
+                        ir_cos = best(&adapted, &ir_scans);
+                    }
                 }
                 rec.insert("ir_face_score".into(), json_f32(t.score));
                 rec.insert("ir_cos_v1".into(), json_f32(ir_cos));
                 rec.insert("ir_brightness".into(), json_f32(ir_bri));
                 rec.insert("ir_depth".into(), json_f32(ir_depth));
                 rec.insert("ir_glint".into(), json_f32(ir_glint));
-                rec.insert("ir_emb_raw".into(), serde_json::to_value(raw.to_vec()).unwrap());
+                rec.insert(
+                    "ir_emb_raw".into(),
+                    serde_json::to_value(raw.to_vec()).unwrap(),
+                );
             }
             rec.insert("ir_present".into(), ir_top.is_some().into());
 
-            writeln!(f, "{}", serde_json::Value::Object(rec)).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            writeln!(f, "{}", serde_json::Value::Object(rec))
+                .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             written += 1;
-            println!("  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} depth {:>5.2} glint {:>3.0}",
+            println!(
+                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} depth {:>5.2} glint {:>3.0}",
                 idx + 1,
-                if rgb_top.is_some() { "✓" } else { "·" }, rgb_bri,
-                if ir_top.is_some() { "✓" } else { "·" }, ir_bri, ir_depth, ir_glint);
+                if rgb_top.is_some() { "✓" } else { "·" },
+                rgb_bri,
+                if ir_top.is_some() { "✓" } else { "·" },
+                ir_bri,
+                ir_depth,
+                ir_glint
+            );
         }
         Ok(written)
     };
     match run() {
-        Ok(w) => { println!("[calcapture] wrote {w} samples to {out}"); std::process::ExitCode::SUCCESS }
-        Err(e) => { eprintln!("calcapture error: {e}"); std::process::ExitCode::FAILURE }
+        Ok(w) => {
+            println!("[calcapture] wrote {w} samples to {out}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("calcapture error: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
 /// JSON number from an f32, mapping non-finite to JSON null (so `NaN` for an
 /// absent cosine round-trips cleanly instead of breaking the encoder).
 fn json_f32(x: f32) -> serde_json::Value {
-    serde_json::Number::from_f64(x as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+    serde_json::Number::from_f64(x as f64)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Embed every detected face in an image and report the pairwise-cosine
@@ -1187,10 +1734,14 @@ fn json_f32(x: f32) -> serde_json::Value {
 /// the IMPOSTOR distribution: it validates AuraFace discriminates (impostors
 /// should score low) and sets the threshold floor (must sit above impostor max).
 fn eval(args: &[String]) -> std::process::ExitCode {
-    let (Some(img), Some(det_path), Some(model)) =
-        (flag(args, "--image"), flag(args, "--det"), flag(args, "--model"))
-    else {
-        eprintln!("usage: irlume eval --image <group.jpg> --det <yunet.onnx> --model <glintr100.onnx>");
+    let (Some(img), Some(det_path), Some(model)) = (
+        flag(args, "--image"),
+        flag(args, "--det"),
+        flag(args, "--model"),
+    ) else {
+        eprintln!(
+            "usage: irlume eval --image <group.jpg> --det <yunet.onnx> --model <glintr100.onnx>"
+        );
         return std::process::ExitCode::from(2);
     };
     let rgb = match image::open(img) {
@@ -1202,14 +1753,22 @@ fn eval(args: &[String]) -> std::process::ExitCode {
     };
     let (w, h) = rgb.dimensions();
     let data = rgb.into_raw();
-    let view = irlume_vision::align::RgbView { data: &data, width: w, height: h };
+    let view = irlume_vision::align::RgbView {
+        data: &data,
+        width: w,
+        height: h,
+    };
 
     let run = || -> irlume_common::Result<()> {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         let mut emb = irlume_vision::Embedder::load_from_file(model)?;
         let grey = args.iter().any(|a| a == "--grey");
         let faces = det.detect(&view)?;
-        println!("[eval] {} faces; embedding each{}…", faces.len(), if grey { " (GREYSCALE / IR-proxy)" } else { "" });
+        println!(
+            "[eval] {} faces; embedding each{}…",
+            faces.len(),
+            if grey { " (GREYSCALE / IR-proxy)" } else { "" }
+        );
         let mut embs = Vec::new();
         for f in &faces {
             let mut chip = irlume_vision::align::align_to_arcface(&view, &f.landmarks)?;
@@ -1217,8 +1776,11 @@ fn eval(args: &[String]) -> std::process::ExitCode {
                 // Simulate the IR modality: drop colour, keep luminance (BT.601),
                 // replicate to 3 channels. Isolates AuraFace's colour-removal loss.
                 for px in chip.chunks_exact_mut(3) {
-                    let y = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) as u8;
-                    px[0] = y; px[1] = y; px[2] = y;
+                    let y =
+                        (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) as u8;
+                    px[0] = y;
+                    px[1] = y;
+                    px[2] = y;
                 }
             }
             embs.push(emb.embed(&chip)?);
@@ -1239,9 +1801,18 @@ fn eval(args: &[String]) -> std::process::ExitCode {
         let mean = scores.iter().sum::<f32>() / n as f32;
         let pct = |p: f32| scores[((p * (n - 1) as f32).round() as usize).min(n - 1)];
         println!("[eval] impostor pairs: {n}");
-        println!("  min {:.3}  mean {:.3}  p95 {:.3}  p99 {:.3}  max {:.3}",
-            scores[0], mean, pct(0.95), pct(0.99), scores[n - 1]);
-        println!("  => threshold floor (above impostor max): {:.3}", scores[n - 1] + 0.02);
+        println!(
+            "  min {:.3}  mean {:.3}  p95 {:.3}  p99 {:.3}  max {:.3}",
+            scores[0],
+            mean,
+            pct(0.95),
+            pct(0.99),
+            scores[n - 1]
+        );
+        println!(
+            "  => threshold floor (above impostor max): {:.3}",
+            scores[n - 1] + 0.02
+        );
         println!("  (genuine pairs — same person, 2 captures — set the ceiling; run two `capture` sessions to measure.)");
         Ok(())
     };
@@ -1258,14 +1829,22 @@ fn eval(args: &[String]) -> std::process::ExitCode {
 /// privacy switch, and confirm models + ONNX Runtime are present.
 /// TPM character device the kernel exposes, if any (resource-managed preferred).
 pub(crate) fn tpm_device() -> Option<&'static str> {
-    ["/dev/tpmrm0", "/dev/tpm0"].into_iter().find(|d| std::path::Path::new(d).exists())
+    ["/dev/tpmrm0", "/dev/tpm0"]
+        .into_iter()
+        .find(|d| std::path::Path::new(d).exists())
 }
 
 fn doctor() -> std::process::ExitCode {
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
-    println!("[doctor] platform: {}", irlume_common::platform::distro_family().as_str());
-    println!("[doctor] install origin: {}", commands::install_origin().describe());
+    println!(
+        "[doctor] platform: {}",
+        irlume_common::platform::distro_family().as_str()
+    );
+    println!(
+        "[doctor] install origin: {}",
+        commands::install_origin().describe()
+    );
     match tpm_device() {
         Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
         None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗ — required for sealing"),
@@ -1279,7 +1858,10 @@ fn doctor() -> std::process::ExitCode {
     } else {
         println!("[doctor] Secure Boot: disabled ⚠ — TPM PCR-7 binding is weak; enable for trust");
     }
-    println!("[doctor] boot mode: {}", secureboot::detect_boot_mode().as_str());
+    println!(
+        "[doctor] boot mode: {}",
+        secureboot::detect_boot_mode().as_str()
+    );
     println!(
         "[doctor] signed PCR policy: {}",
         if irlume_core::pcrsig::signed_policy_available() {
@@ -1296,7 +1878,11 @@ fn doctor() -> std::process::ExitCode {
         println!("  (none found under /dev/video0..9)");
     }
     for (path, role) in &nodes {
-        let priv_on = if irlume_camera::privacy_engaged(path) { "  ⚠ PRIVACY SWITCH ON" } else { "" };
+        let priv_on = if irlume_camera::privacy_engaged(path) {
+            "  ⚠ PRIVACY SWITCH ON"
+        } else {
+            ""
+        };
         println!("  {path}: {role:?}{priv_on}");
     }
 
@@ -1308,12 +1894,21 @@ fn doctor() -> std::process::ExitCode {
         for (f, env) in commands::REQUIRED_MODELS {
             match commands::resolve_model(f, env) {
                 Some(p) => println!("  {f}: present ✓ ({})", p.display()),
-                None => println!("  {f}: not found — install the irlume package (or run from the repo)"),
+                None => {
+                    println!("  {f}: not found — install the irlume package (or run from the repo)")
+                }
             }
         }
     }
     let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
-    println!("[doctor] ORT_DYLIB_PATH: {}", if ort.is_empty() { "(unset)".into() } else { ort });
+    println!(
+        "[doctor] ORT_DYLIB_PATH: {}",
+        if ort.is_empty() {
+            "(unset)".into()
+        } else {
+            ort
+        }
+    );
 
     // --- companion factors / data-at-rest ----------------------------------
     let fp = match irlume_fingerprint::device_name() {
@@ -1375,7 +1970,11 @@ fn capture(args: &[String]) -> std::process::ExitCode {
             }
         }
     };
-    let view = irlume_vision::align::RgbView { data: &data, width, height };
+    let view = irlume_vision::align::RgbView {
+        data: &data,
+        width,
+        height,
+    };
 
     let run = || -> irlume_common::Result<()> {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
@@ -1393,7 +1992,10 @@ fn capture(args: &[String]) -> std::process::ExitCode {
         let mut emb = irlume_vision::Embedder::load_from_file(model)?;
         let e = emb.embed(&chip)?;
         let norm = e.iter().map(|x| x * x).sum::<f32>().sqrt();
-        println!("[embed]  512-D, L2 norm {norm:.4}, head [{:.3}, {:.3}, {:.3}, {:.3}]", e[0], e[1], e[2], e[3]);
+        println!(
+            "[embed]  512-D, L2 norm {norm:.4}, head [{:.3}, {:.3}, {:.3}, {:.3}]",
+            e[0], e[1], e[2], e[3]
+        );
         println!("[ok] full pipeline ran: capture → detect → align → embed.");
         Ok(())
     };

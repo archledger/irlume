@@ -38,11 +38,20 @@ pub fn distro_family() -> DistroFamily {
     let id = field("ID=");
     let like = field("ID_LIKE=");
     let hay = format!("{id} {like}");
-    if ["debian", "ubuntu", "mint", "pop", "raspbian"].iter().any(|d| hay.contains(d)) {
+    if ["debian", "ubuntu", "mint", "pop", "raspbian"]
+        .iter()
+        .any(|d| hay.contains(d))
+    {
         DistroFamily::Debian
-    } else if ["fedora", "rhel", "centos", "rocky", "alma"].iter().any(|d| hay.contains(d)) {
+    } else if ["fedora", "rhel", "centos", "rocky", "alma"]
+        .iter()
+        .any(|d| hay.contains(d))
+    {
         DistroFamily::Fedora
-    } else if ["arch", "manjaro", "endeavouros", "garuda"].iter().any(|d| hay.contains(d)) {
+    } else if ["arch", "manjaro", "endeavouros", "garuda"]
+        .iter()
+        .any(|d| hay.contains(d))
+    {
         DistroFamily::Arch
     } else {
         DistroFamily::Other
@@ -107,7 +116,12 @@ fn session_is_active_user(session: &str) -> bool {
         return false;
     };
     let t = String::from_utf8_lossy(&out.stdout);
-    let val = |k: &str| t.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").trim();
+    let val = |k: &str| {
+        t.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .unwrap_or("")
+            .trim()
+    };
     val("Class=") == "user" && matches!(val("State="), "active" | "online")
 }
 
@@ -120,7 +134,13 @@ fn uid_for_name(name: &str) -> Option<u32> {
     // SAFETY: all pointers are valid for the call; `buf` is sized and owned here;
     // on success `result` points into `pwd`, from which we copy the uid out.
     let rc = unsafe {
-        libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
     };
     if rc != 0 || result.is_null() {
         return None;

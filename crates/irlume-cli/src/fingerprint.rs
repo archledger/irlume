@@ -14,7 +14,11 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     match action {
         None | Some("status") => status(&user),
         Some("add") => {
-            if enroll_one(&user) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            if enroll_one(&user) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Some("enable") => enable(&user),
         Some("disable") => disable(),
@@ -26,7 +30,14 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
 }
 
 fn status(user: &str) -> ExitCode {
-    println!("[fingerprint] fprintd tooling : {}", if fp::fprintd_present() { "installed" } else { "NOT installed (install the 'fprintd' package)" });
+    println!(
+        "[fingerprint] fprintd tooling : {}",
+        if fp::fprintd_present() {
+            "installed"
+        } else {
+            "NOT installed (install the 'fprintd' package)"
+        }
+    );
     let reader = match fp::device_name() {
         Some(n) => n,
         None if fp::reader_present() => "present (unnamed)".into(),
@@ -37,16 +48,25 @@ fn status(user: &str) -> ExitCode {
     if fingers.is_empty() {
         println!("[fingerprint] enrolled       : none for '{user}'");
     } else {
-        println!("[fingerprint] enrolled       : {} ({})", fingers.len(), fingers.join(", "));
+        println!(
+            "[fingerprint] enrolled       : {} ({})",
+            fingers.len(),
+            fingers.join(", ")
+        );
     }
-    println!("[fingerprint] active method   : {}", policy::method().as_str());
+    println!(
+        "[fingerprint] active method   : {}",
+        policy::method().as_str()
+    );
     // Recommendation.
     if !fp::available() {
         println!("  → no usable reader — fingerprint unavailable on this device");
     } else if fingers.is_empty() {
         println!("  → reader present but no finger enrolled: run  irlume fingerprint add");
     } else if policy::method() != Method::Fingerprint {
-        println!("  → enrolled; to make fingerprint the unlock method: sudo irlume fingerprint enable");
+        println!(
+            "  → enrolled; to make fingerprint the unlock method: sudo irlume fingerprint enable"
+        );
     } else {
         println!("  → fingerprint is the active unlock method");
     }
@@ -67,11 +87,22 @@ fn enroll_one(user: &str) -> bool {
         eprintln!("[fingerprint] all 10 fingers are already enrolled for '{user}'");
         return false;
     };
-    println!("[fingerprint] enrolling '{finger}' for '{user}' — place and lift your finger as prompted…");
+    println!(
+        "[fingerprint] enrolling '{finger}' for '{user}' — place and lift your finger as prompted…"
+    );
     match fp::enroll_finger(user, finger) {
-        fp::EnrollOutcome::Enrolled => { println!("[fingerprint] ✓ enrolled '{finger}'"); true }
-        fp::EnrollOutcome::Duplicate => { eprintln!("[fingerprint] that finger is already enrolled"); false }
-        fp::EnrollOutcome::Failed(e) => { eprintln!("[fingerprint] enroll failed: {e}"); false }
+        fp::EnrollOutcome::Enrolled => {
+            println!("[fingerprint] ✓ enrolled '{finger}'");
+            true
+        }
+        fp::EnrollOutcome::Duplicate => {
+            eprintln!("[fingerprint] that finger is already enrolled");
+            false
+        }
+        fp::EnrollOutcome::Failed(e) => {
+            eprintln!("[fingerprint] enroll failed: {e}");
+            false
+        }
     }
 }
 
@@ -87,7 +118,12 @@ fn require_root(op: &str) -> bool {
 fn effective_uid() -> u32 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:").map(|v| v.split_whitespace().nth(1).unwrap_or("1000").to_string())))
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("Uid:")
+                    .map(|v| v.split_whitespace().nth(1).unwrap_or("1000").to_string())
+            })
+        })
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000)
 }
@@ -110,7 +146,8 @@ fn enable(user: &str) -> ExitCode {
     // Wire pam_fprintd into the auth stacks, per distro.
     let wired = match distro_family() {
         DistroFamily::Fedora => {
-            run_cmd("authselect", &["enable-feature", "with-fingerprint"]) && run_cmd("authselect", &["apply-changes"])
+            run_cmd("authselect", &["enable-feature", "with-fingerprint"])
+                && run_cmd("authselect", &["apply-changes"])
         }
         DistroFamily::Debian => run_cmd("pam-auth-update", &["--enable", "fprintd"]),
         DistroFamily::Arch | DistroFamily::Other => {
@@ -137,7 +174,8 @@ fn disable() -> ExitCode {
     }
     let unwired = match distro_family() {
         DistroFamily::Fedora => {
-            run_cmd("authselect", &["disable-feature", "with-fingerprint"]) && run_cmd("authselect", &["apply-changes"])
+            run_cmd("authselect", &["disable-feature", "with-fingerprint"])
+                && run_cmd("authselect", &["apply-changes"])
         }
         DistroFamily::Debian => run_cmd("pam-auth-update", &["--disable", "fprintd"]),
         DistroFamily::Arch | DistroFamily::Other => {
@@ -162,7 +200,13 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
     println!("[fingerprint] $ {cmd} {}", args.join(" "));
     match Command::new(cmd).args(args).status() {
         Ok(s) if s.success() => true,
-        Ok(s) => { eprintln!("[fingerprint] {cmd} exited with {s}"); false }
-        Err(e) => { eprintln!("[fingerprint] could not run {cmd}: {e} (is it installed?)"); false }
+        Ok(s) => {
+            eprintln!("[fingerprint] {cmd} exited with {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[fingerprint] could not run {cmd}: {e} (is it installed?)");
+            false
+        }
     }
 }

@@ -83,7 +83,12 @@ pub fn fuse(p_rgb: f32, w_rgb: f32, p_ir: f32, w_ir: f32) -> Fusion {
         && p_rgb >= FUSION_MIN_PER_MODALITY_PROB
         && p_ir >= FUSION_MIN_PER_MODALITY_PROB
         && w_ir > 0.0;
-    Fusion { prob, p_rgb, p_ir, grant }
+    Fusion {
+        prob,
+        p_rgb,
+        p_ir,
+        grant,
+    }
 }
 
 #[cfg(test)]
@@ -94,7 +99,11 @@ mod tests {
     fn platt_is_monotonic_and_bounded() {
         assert!(rgb_genuine_prob(0.9) > rgb_genuine_prob(0.3));
         assert!(ir_genuine_prob(0.9) > ir_genuine_prob(0.3));
-        for p in [rgb_genuine_prob(1.0), ir_genuine_prob(1.0), rgb_genuine_prob(-1.0)] {
+        for p in [
+            rgb_genuine_prob(1.0),
+            ir_genuine_prob(1.0),
+            rgb_genuine_prob(-1.0),
+        ] {
             assert!((0.0..=1.0).contains(&p));
         }
         // Deployment genuine cosines map to near-certain.
@@ -105,39 +114,62 @@ mod tests {
     #[test]
     fn genuine_both_modalities_grants() {
         // True user, good light: both strong.
-        let f = fuse(rgb_genuine_prob(0.78), rgb_quality_weight(120.0),
-                     ir_genuine_prob(0.72), ir_quality_weight(true, 100.0));
+        let f = fuse(
+            rgb_genuine_prob(0.78),
+            rgb_quality_weight(120.0),
+            ir_genuine_prob(0.72),
+            ir_quality_weight(true, 100.0),
+        );
         assert!(f.grant, "genuine multimodal should grant: {f:?}");
     }
 
     #[test]
     fn genuine_dim_light_ir_rescues() {
         // Dim RGB (marginal) + good IR -> fusion rescues.
-        let f = fuse(rgb_genuine_prob(0.42), rgb_quality_weight(55.0),
-                     ir_genuine_prob(0.70), ir_quality_weight(true, 95.0));
+        let f = fuse(
+            rgb_genuine_prob(0.42),
+            rgb_quality_weight(55.0),
+            ir_genuine_prob(0.70),
+            ir_quality_weight(true, 95.0),
+        );
         assert!(f.grant, "dim-light genuine should be rescued by IR: {f:?}");
     }
 
     #[test]
     fn impostor_both_marginal_rejected() {
         // Impostor near each modality's FAR-1e-3 cosine: must NOT grant.
-        let f = fuse(rgb_genuine_prob(0.29), rgb_quality_weight(120.0),
-                     ir_genuine_prob(0.28), ir_quality_weight(true, 100.0));
+        let f = fuse(
+            rgb_genuine_prob(0.29),
+            rgb_quality_weight(120.0),
+            ir_genuine_prob(0.28),
+            ir_quality_weight(true, 100.0),
+        );
         assert!(!f.grant, "impostor pair must be rejected: {f:?}");
     }
 
     #[test]
     fn one_strong_one_noise_rejected() {
         // Strong RGB but IR is pure noise (cos ~0) -> per-modality floor blocks fusion.
-        let f = fuse(rgb_genuine_prob(0.85), rgb_quality_weight(120.0),
-                     ir_genuine_prob(0.0), ir_quality_weight(true, 100.0));
-        assert!(!f.grant, "single-modality + noise must not grant via fusion: {f:?}");
+        let f = fuse(
+            rgb_genuine_prob(0.85),
+            rgb_quality_weight(120.0),
+            ir_genuine_prob(0.0),
+            ir_quality_weight(true, 100.0),
+        );
+        assert!(
+            !f.grant,
+            "single-modality + noise must not grant via fusion: {f:?}"
+        );
     }
 
     #[test]
     fn no_ir_capture_no_fusion() {
-        let f = fuse(rgb_genuine_prob(0.50), rgb_quality_weight(120.0),
-                     ir_genuine_prob(0.0), ir_quality_weight(false, 0.0));
+        let f = fuse(
+            rgb_genuine_prob(0.50),
+            rgb_quality_weight(120.0),
+            ir_genuine_prob(0.0),
+            ir_quality_weight(false, 0.0),
+        );
         assert!(!f.grant, "fusion requires a real IR capture: {f:?}");
     }
 }

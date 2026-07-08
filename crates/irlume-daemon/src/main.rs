@@ -9,8 +9,8 @@
 
 use irlume_common::{Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
-use zeroize::Zeroize;
 use std::os::unix::net::{UnixListener, UnixStream};
+use zeroize::Zeroize;
 
 mod users;
 
@@ -31,8 +31,12 @@ fn main() {
         let ok = |d: &str| std::path::Path::new(d).exists();
         match (ok(&rgb_dev), ok(&ir_dev)) {
             (true, true) => eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)"),
-            (true, false) => eprintln!("irlumed: camera rgb={rgb_dev}, no IR node (convenience tier — screen unlock only)"),
-            (false, _) => eprintln!("irlumed: no camera found (face auth unavailable; password/fingerprint only)"),
+            (true, false) => eprintln!(
+                "irlumed: camera rgb={rgb_dev}, no IR node (convenience tier — screen unlock only)"
+            ),
+            (false, _) => eprintln!(
+                "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
+            ),
         }
     }
     let mut engine = match irlume_auth::Engine::load(&det, &model)
@@ -41,8 +45,18 @@ fn main() {
         .and_then(|e| e.with_mesh(&mesh))
     {
         Ok(e) => {
-            eprintln!("irlumed: IR adapter {}", if e.has_ir_adapter() { "loaded" } else { "absent (raw IR)" });
-            eprintln!("irlumed: FaceMesh (passive liveness) {}", if e.has_mesh() { "loaded" } else { "absent" });
+            eprintln!(
+                "irlumed: IR adapter {}",
+                if e.has_ir_adapter() {
+                    "loaded"
+                } else {
+                    "absent (raw IR)"
+                }
+            );
+            eprintln!(
+                "irlumed: FaceMesh (passive liveness) {}",
+                if e.has_mesh() { "loaded" } else { "absent" }
+            );
             e
         }
         Err(e) => {
@@ -137,7 +151,11 @@ struct Peer {
 
 fn peer_cred(stream: &UnixStream) -> std::io::Result<Peer> {
     use std::os::unix::io::AsRawFd;
-    let mut ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: valid fd; ucred/len out-params are correctly sized.
     let rc = unsafe {
@@ -152,7 +170,11 @@ fn peer_cred(stream: &UnixStream) -> std::io::Result<Peer> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(Peer { uid: ucred.uid, gid: ucred.gid, pid: ucred.pid })
+    Ok(Peer {
+        uid: ucred.uid,
+        gid: ucred.gid,
+        pid: ucred.pid,
+    })
 }
 
 /// Only root or the target user themselves may enroll/delete that user's data.
@@ -204,20 +226,34 @@ fn valid_username(u: &str) -> bool {
     !u.is_empty()
         && u.len() <= 64
         && !u.starts_with(['-', '.'])
-        && u.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
+        && u.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
 }
 
 /// The `user` field of a request, if it carries one (for the traversal guard).
 fn request_user(req: &Request) -> Option<&str> {
     use Request::*;
     match req {
-        Authenticate { user, .. } | Enroll { user, .. } | ListProfiles { user }
-        | DeleteProfile { user, .. } | DeleteScan { user, .. } | RenameProfile { user, .. }
-        | RenameScan { user, .. } | AddScan { user, .. } | SetRequireEyesOpen { user, .. }
-        | SetRequireChallenge { user, .. } | SealPassword { user, .. } | UnsealPassword { user, .. }
-        | UnsealKeyring { user, .. } | HasSealedPassword { user } | ForgetPassword { user }
-        | ResealPassword { user, .. } | RecoveryStatus { user } | RecoverySetup { user, .. }
-        | RecoveryRestore { user, .. } | RecoveryForget { user } => Some(user.as_str()),
+        Authenticate { user, .. }
+        | Enroll { user, .. }
+        | ListProfiles { user }
+        | DeleteProfile { user, .. }
+        | DeleteScan { user, .. }
+        | RenameProfile { user, .. }
+        | RenameScan { user, .. }
+        | AddScan { user, .. }
+        | SetRequireEyesOpen { user, .. }
+        | SetRequireChallenge { user, .. }
+        | SealPassword { user, .. }
+        | UnsealPassword { user, .. }
+        | UnsealKeyring { user, .. }
+        | HasSealedPassword { user }
+        | ForgetPassword { user }
+        | ResealPassword { user, .. }
+        | RecoveryStatus { user }
+        | RecoverySetup { user, .. }
+        | RecoveryRestore { user, .. }
+        | RecoveryForget { user } => Some(user.as_str()),
         // Framing guide: the (optional) user only tunes the pitch band, but it's
         // still interpolated into a state path, so validate it like the rest.
         PositionSample { user: Some(u) } => Some(u.as_str()),
@@ -259,12 +295,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         // Only tune the band to a user the peer may act for (root, or their own
         // account) — else ignore it. Stops a non-root peer forcing a per-poll TPM
         // unseal of another user's (e.g. root's) enrollment via the framing guide.
-        Request::PositionSample { user } => match engine.position_sample(
-            user.as_deref().filter(|u| authorized_for(peer, u)),
-        ) {
-            Ok(r) => Response::Position(r),
-            Err(e) => Response::Error(e.to_string()),
-        },
+        Request::PositionSample { user } => {
+            match engine.position_sample(user.as_deref().filter(|u| authorized_for(peer, u))) {
+                Ok(r) => Response::Position(r),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::Authenticate { user, service } => {
             // Root (PAM stacks) or the account owner only. Without this gate any
             // local peer could probe Authenticate{other_user} and read the raw
@@ -302,8 +338,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 let class = classify(service.as_deref().unwrap_or(""), warm);
                 if class != OperationClass::ScreenUnlock {
                     eprintln!("irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password", service.as_deref().unwrap_or("?"));
-                    return Response::AuthResult { granted: false, score: 0.0, live: false,
-                        reason: format!("RGB-only convenience: face limited to screen unlock (not {class:?})") };
+                    return Response::AuthResult {
+                        granted: false,
+                        score: 0.0,
+                        live: false,
+                        reason: format!(
+                            "RGB-only convenience: face limited to screen unlock (not {class:?})"
+                        ),
+                    };
                 }
             }
             // Opt-in biopolicy also gates identity VERIFICATION on IR/Secure
@@ -315,8 +357,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 let svc = service.as_deref().unwrap_or("");
                 if decide(classify(svc, false), Tier::Secure) == Action::Deny {
                     eprintln!("irlumed: biopolicy denies verify for service '{svc}' -> password");
-                    return Response::AuthResult { granted: false, score: 0.0, live: false,
-                        reason: format!("biopolicy: face may not satisfy '{svc}'") };
+                    return Response::AuthResult {
+                        granted: false,
+                        score: 0.0,
+                        live: false,
+                        reason: format!("biopolicy: face may not satisfy '{svc}'"),
+                    };
                 }
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
@@ -335,7 +381,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             o.granted, o.live);
                     }
                     irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
-                    Response::AuthResult { granted: o.granted, score: o.score, live: o.live, reason: o.reason }
+                    Response::AuthResult {
+                        granted: o.granted,
+                        score: o.score,
+                        live: o.live,
+                        reason: o.reason,
+                    }
                 }
                 Err(e) => Response::Error(e.to_string()),
             }
@@ -352,13 +403,22 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 match users::name_for_uid(peer.uid) {
                     Some(name) => engine.identify_within(&name),
                     None => Ok(irlume_auth::IdentifyOutcome {
-                        user: None, profile: None, score: 0.0, live: false,
+                        user: None,
+                        profile: None,
+                        score: 0.0,
+                        live: false,
                         reason: "caller has no local account".into(),
                     }),
                 }
             };
             match scoped {
-                Ok(o) => Response::Identified { user: o.user, profile: o.profile, score: o.score, live: o.live, reason: o.reason },
+                Ok(o) => Response::Identified {
+                    user: o.user,
+                    profile: o.profile,
+                    score: o.score,
+                    live: o.live,
+                    reason: o.reason,
+                },
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -368,7 +428,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // video into the match path (spoof) or bricks face auth (DoS). Root
             // only (a system-wide /etc setting isn't an arbitrary peer's to make).
             if peer.uid != 0 {
-                return Response::Error(format!("set_cameras requires root (peer uid {})", peer.uid));
+                return Response::Error(format!(
+                    "set_cameras requires root (peer uid {})",
+                    peer.uid
+                ));
             }
             engine.set_devices(&rgb, &ir);
             let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
@@ -380,7 +443,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             eprintln!("irlumed: {msg}");
             Response::Ok(msg)
         }
-        Request::Enroll { user, profile, scans, reset } => {
+        Request::Enroll {
+            user,
+            profile,
+            scans,
+            reset,
+        } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to enroll '{user}'"));
             }
@@ -408,10 +476,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // Hardware fix on the shared camera; non-destructive on failure.
             if dry_run {
                 match irlume_auth::list_ir_controls(engine.ir_device()) {
-                    Ok(c) if c.is_empty() => Response::Ok("no UVC extension-unit controls found".into()),
+                    Ok(c) if c.is_empty() => {
+                        Response::Ok("no UVC extension-unit controls found".into())
+                    }
                     Ok(c) => Response::Ok(format!(
                         "XU controls: {}",
-                        c.iter().map(|(u, s, l)| format!("unit{u}/sel{s}/{l}B")).collect::<Vec<_>>().join(", ")
+                        c.iter()
+                            .map(|(u, s, l)| format!("unit{u}/sel{s}/{l}B"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )),
                     Err(e) => Response::Error(e.to_string()),
                 }
@@ -419,10 +492,16 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 // The non-dry path brute-forces UVC control writes on the shared
                 // camera — a local peer could thrash the hardware. Root only.
                 if peer.uid != 0 {
-                    return Response::Error(format!("setup_ir_emitter requires root (peer uid {})", peer.uid));
+                    return Response::Error(format!(
+                        "setup_ir_emitter requires root (peer uid {})",
+                        peer.uid
+                    ));
                 }
                 match irlume_auth::setup_ir_emitter(engine.ir_device()) {
-                    Ok(msg) => { eprintln!("irlumed: {msg}"); Response::Ok(msg) }
+                    Ok(msg) => {
+                        eprintln!("irlumed: {msg}");
+                        Response::Ok(msg)
+                    }
                     Err(e) => Response::Error(e.to_string()),
                 }
             }
@@ -432,7 +511,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 return Response::Error(format!("not authorized to modify '{user}'"));
             }
             match engine.add_scan(&user, &profile) {
-                Ok((scan, total)) => Response::Ok(format!("added '{scan}' to '{profile}' ({total} scans)")),
+                Ok((scan, total)) => {
+                    Response::Ok(format!("added '{scan}' to '{profile}' ({total} scans)"))
+                }
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -456,18 +537,25 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // login/lockscreen PAM stack runs as root). A non-root caller never
             // gets it, even with a matching face.
             if peer.uid != 0 {
-                return Response::Error(format!("unseal_password requires root (peer uid {})", peer.uid));
+                return Response::Error(format!(
+                    "unseal_password requires root (peer uid {})",
+                    peer.uid
+                ));
             }
             // Same method gate as Authenticate: fingerprint-configured means no
             // face-driven credential release either.
             if irlume_core::policy::method().face_disabled() {
-                return Response::Error("face auth disabled — the configured method is fingerprint".into());
+                return Response::Error(
+                    "face auth disabled — the configured method is fingerprint".into(),
+                );
             }
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
             // sealed credential — no cold-login / keyring unlock by RGB-only face.
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
                 eprintln!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
-                return Response::Error("RGB-only convenience: face cannot release the login credential".into());
+                return Response::Error(
+                    "RGB-only convenience: face cannot release the login credential".into(),
+                );
             }
             // Opt-in biopolicy: when enforcement is enabled, gate credential
             // release by the PAM service's operation class (e.g. refuse a remote
@@ -481,7 +569,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 let action = decide(classify(svc, false), Tier::Secure);
                 if action != Action::Unseal {
                     eprintln!("irlumed: biopolicy denies unseal for service '{svc}' ({action:?}) -> password");
-                    return Response::Error(format!("biopolicy: '{svc}' may not release the credential"));
+                    return Response::Error(format!(
+                        "biopolicy: '{svc}' may not release the credential"
+                    ));
                 }
             }
             do_unseal_password(&user, engine)
@@ -499,10 +589,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // it; root stays the trust boundary. For daemon-verified biometric
             // release resistant to live root, use the face/IR path.
             if peer.uid != 0 {
-                return Response::Error(format!("unseal_keyring requires root (peer uid {})", peer.uid));
+                return Response::Error(format!(
+                    "unseal_keyring requires root (peer uid {})",
+                    peer.uid
+                ));
             }
             if !irlume_core::keyring::has_sealed_password(&user) {
-                return Response::Error(format!("no sealed password for '{user}' — run `irlume keyring arm`"));
+                return Response::Error(format!(
+                    "no sealed password for '{user}' — run `irlume keyring arm`"
+                ));
             }
             // Only a login / greeter / lock-screen context — never sudo,
             // elevation, remote, or unknown. Defence-in-depth: a direct caller
@@ -513,15 +608,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 use irlume_core::biopolicy::{classify, OperationClass};
                 let class = classify(service.as_deref().unwrap_or(""), true);
                 if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
-                    eprintln!("irlumed: UnsealKeyring refused for service '{}' ({class:?})",
-                        service.as_deref().unwrap_or("?"));
+                    eprintln!(
+                        "irlumed: UnsealKeyring refused for service '{}' ({class:?})",
+                        service.as_deref().unwrap_or("?")
+                    );
                     return Response::Error(format!("keyring unseal not allowed for {class:?}"));
                 }
             }
             match irlume_core::keyring::unseal_password(&user) {
                 Ok(secret) => {
                     eprintln!("irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), password unsealed");
-                    Response::PasswordUnsealed { secret: irlume_common::SecretBytes::new(secret.to_vec()) }
+                    Response::PasswordUnsealed {
+                        secret: irlume_common::SecretBytes::new(secret.to_vec()),
+                    }
                 }
                 Err(e) => {
                     eprintln!("irlumed: UnsealKeyring: TPM unseal FAILED for '{user}': {e}");
@@ -581,7 +680,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             if !irlume_core::template_key::has_key(&user) {
                 if let Ok(Some(enr)) = irlume_core::storage::load(&user) {
                     if let Err(e) = irlume_core::storage::save(&enr) {
-                        return Response::Error(format!("could not encrypt existing templates: {e}"));
+                        return Response::Error(format!(
+                            "could not encrypt existing templates: {e}"
+                        ));
                     }
                     eprintln!("irlumed: RecoverySetup: encrypted existing templates for '{user}'");
                 }
@@ -600,7 +701,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             match irlume_core::template_key::restore_from_recovery(&user, passphrase.expose()) {
                 Ok(()) => {
-                    eprintln!("irlumed: RecoveryRestore: re-sealed '{user}' template key to current PCRs");
+                    eprintln!(
+                        "irlumed: RecoveryRestore: re-sealed '{user}' template key to current PCRs"
+                    );
                     Response::Ok(format!("template key restored and re-sealed for '{user}'"))
                 }
                 Err(e) => Response::Error(e.to_string()),
@@ -631,14 +734,22 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             match irlume_core::storage::load(&user) {
                 Ok(Some(enr)) => Response::Enrollment {
-                    profiles: enr.profiles.iter().map(|p| irlume_common::ProfileSummary {
-                        name: p.name.clone(),
-                        scans: p.scans.iter().map(|s| s.name.clone()).collect(),
-                    }).collect(),
+                    profiles: enr
+                        .profiles
+                        .iter()
+                        .map(|p| irlume_common::ProfileSummary {
+                            name: p.name.clone(),
+                            scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                        })
+                        .collect(),
                     require_eyes_open: enr.require_eyes_open,
                     require_challenge: enr.require_challenge,
                 },
-                Ok(None) => Response::Enrollment { profiles: vec![], require_eyes_open: false, require_challenge: false },
+                Ok(None) => Response::Enrollment {
+                    profiles: vec![],
+                    require_eyes_open: false,
+                    require_challenge: false,
+                },
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -656,38 +767,75 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             })
         }
-        Request::DeleteScan { user, profile, scan } => {
+        Request::DeleteScan {
+            user,
+            profile,
+            scan,
+        } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to modify '{user}'"));
             }
             mutate_enrollment(&user, |enr| {
-                let p = enr.profiles.iter_mut().find(|p| p.name == profile).ok_or(format!("no face profile '{profile}'"))?;
+                let p = enr
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.name == profile)
+                    .ok_or(format!("no face profile '{profile}'"))?;
                 let before = p.scans.len();
                 p.scans.retain(|s| s.name != scan);
-                if p.scans.len() == before { Err(format!("no scan '{scan}' in '{profile}'")) }
-                else if p.scans.is_empty() { Err("a profile must keep at least one scan — delete the profile instead".into()) }
-                else { Ok(format!("deleted scan '{scan}' from '{profile}'")) }
+                if p.scans.len() == before {
+                    Err(format!("no scan '{scan}' in '{profile}'"))
+                } else if p.scans.is_empty() {
+                    Err("a profile must keep at least one scan — delete the profile instead".into())
+                } else {
+                    Ok(format!("deleted scan '{scan}' from '{profile}'"))
+                }
             })
         }
-        Request::RenameProfile { user, profile, new_name } => {
+        Request::RenameProfile {
+            user,
+            profile,
+            new_name,
+        } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to modify '{user}'"));
             }
             mutate_enrollment(&user, |enr| {
-                if enr.profiles.iter().any(|p| p.name == new_name) { return Err(format!("'{new_name}' already exists")); }
-                let p = enr.profiles.iter_mut().find(|p| p.name == profile).ok_or(format!("no face profile '{profile}'"))?;
+                if enr.profiles.iter().any(|p| p.name == new_name) {
+                    return Err(format!("'{new_name}' already exists"));
+                }
+                let p = enr
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.name == profile)
+                    .ok_or(format!("no face profile '{profile}'"))?;
                 p.name = new_name.clone();
                 Ok(format!("renamed profile to '{new_name}'"))
             })
         }
-        Request::RenameScan { user, profile, scan, new_name } => {
+        Request::RenameScan {
+            user,
+            profile,
+            scan,
+            new_name,
+        } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to modify '{user}'"));
             }
             mutate_enrollment(&user, |enr| {
-                let p = enr.profiles.iter_mut().find(|p| p.name == profile).ok_or(format!("no face profile '{profile}'"))?;
-                if p.scans.iter().any(|s| s.name == new_name) { return Err(format!("'{new_name}' already exists in '{profile}'")); }
-                let s = p.scans.iter_mut().find(|s| s.name == scan).ok_or(format!("no scan '{scan}' in '{profile}'"))?;
+                let p = enr
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.name == profile)
+                    .ok_or(format!("no face profile '{profile}'"))?;
+                if p.scans.iter().any(|s| s.name == new_name) {
+                    return Err(format!("'{new_name}' already exists in '{profile}'"));
+                }
+                let s = p
+                    .scans
+                    .iter_mut()
+                    .find(|s| s.name == scan)
+                    .ok_or(format!("no scan '{scan}' in '{profile}'"))?;
                 s.name = new_name.clone();
                 Ok(format!("renamed scan to '{new_name}'"))
             })
@@ -698,7 +846,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             mutate_enrollment(&user, |enr| {
                 enr.require_eyes_open = on;
-                Ok(format!("require-eyes-open {}", if on { "ENABLED" } else { "disabled" }))
+                Ok(format!(
+                    "require-eyes-open {}",
+                    if on { "ENABLED" } else { "disabled" }
+                ))
             })
         }
         Request::SetRequireChallenge { user, on } => {
@@ -707,7 +858,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             mutate_enrollment(&user, |enr| {
                 enr.require_challenge = on;
-                Ok(format!("require-challenge {}", if on { "ENABLED" } else { "disabled" }))
+                Ok(format!(
+                    "require-challenge {}",
+                    if on { "ENABLED" } else { "disabled" }
+                ))
             })
         }
         Request::SelfTest { kind } => {
@@ -726,7 +880,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
 
 /// Load `user`'s enrollment, apply `f`, and save. `f` returns an Ok message or an
 /// error string. Used by the storage-only management operations.
-fn mutate_enrollment(user: &str, f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>) -> Response {
+fn mutate_enrollment(
+    user: &str,
+    f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>,
+) -> Response {
     let mut enr = match irlume_core::storage::load(user) {
         Ok(Some(e)) => e,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
@@ -756,7 +913,11 @@ fn mutate_enrollment(user: &str, f: impl FnOnce(&mut irlume_core::storage::Enrol
 /// Deny-line score display: exact under IRLUME_LOG=debug tracing, else
 /// quantized to one decimal (anti-oracle — see comment at the deny log).
 fn deny_score(s: f32) -> String {
-    if irlume_common::dbglog::on() { format!("{s:.4}") } else { format!("~{s:.1}") }
+    if irlume_common::dbglog::on() {
+        format!("{s:.4}")
+    } else {
+        format!("~{s:.1}")
+    }
 }
 
 /// Prose tokens that legitimately contain digits and must survive redaction —
@@ -784,11 +945,17 @@ fn deny_reason(r: &str) -> String {
             // Grab the number, then any glued alpha suffix (a unit or a prose
             // tail like the "D" in "2D") so we can test the whole token.
             let start = i;
-            while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') { i += 1; }
+            while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') {
+                i += 1;
+            }
             let mut num_end = i;
-            while num_end > start && cs[num_end - 1] == '.' { num_end -= 1; } // sentence period, not a decimal
+            while num_end > start && cs[num_end - 1] == '.' {
+                num_end -= 1;
+            } // sentence period, not a decimal
             let mut tok_end = num_end;
-            while tok_end < cs.len() && cs[tok_end].is_ascii_alphabetic() { tok_end += 1; }
+            while tok_end < cs.len() && cs[tok_end].is_ascii_alphabetic() {
+                tok_end += 1;
+            }
             let token: String = cs[start..tok_end].iter().collect();
             // An identifier (digits glued AFTER letters, e.g. "PCR7") is a name,
             // not a measurement — keep it. Otherwise keep only allowlisted prose.
@@ -812,7 +979,9 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
-        return Response::Error(format!("no sealed password for '{user}' — run `irlume keyring arm`"));
+        return Response::Error(format!(
+            "no sealed password for '{user}' — run `irlume keyring arm`"
+        ));
     }
     let outcome = match engine.authenticate(user) {
         Ok(o) => o,
@@ -828,7 +997,9 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
         // "borderline" from "not even close" for false-reject diagnosis.
         eprintln!(
             "irlumed: UnsealPassword: denied for '{user}' (live={}, score {}: {}) -> password",
-            outcome.live, deny_score(outcome.score), deny_reason(&outcome.reason)
+            outcome.live,
+            deny_score(outcome.score),
+            deny_reason(&outcome.reason)
         );
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }
@@ -838,8 +1009,13 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
                 "irlumed: UnsealPassword: OK for '{user}' (score {:.4}), password unsealed",
                 outcome.score
             );
-            irlume_common::dlog!("unseal '{user}' total {}ms (face + TPM)", t.elapsed().as_millis());
-            Response::PasswordUnsealed { secret: irlume_common::SecretBytes::new(secret.to_vec()) }
+            irlume_common::dlog!(
+                "unseal '{user}' total {}ms (face + TPM)",
+                t.elapsed().as_millis()
+            );
+            Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(secret.to_vec()),
+            }
         }
         // Face matched but the TPM could not release the secret (e.g. PCR drift
         // after a Secure Boot config change). This is the line that explains a
@@ -876,7 +1052,11 @@ mod tests {
 
     #[test]
     fn root_and_self_authorized_others_denied() {
-        let root = Peer { uid: 0, gid: 0, pid: 1 };
+        let root = Peer {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
         // uid_of relies on /etc/passwd; just exercise the root path deterministically.
         assert!(authorized_for(&root, "nonexistent-user"));
     }
@@ -884,13 +1064,20 @@ mod tests {
     #[test]
     fn deny_reason_strips_measurements_keeps_prose() {
         // (tracing is off in tests — IRLUME_LOG unset)
-        assert_eq!(deny_reason("IR too flat (center/edge 1.02) — looks 2D, not a 3D face"),
-                   "IR too flat (center/edge …) — looks 2D, not a 3D face");
+        assert_eq!(
+            deny_reason("IR too flat (center/edge 1.02) — looks 2D, not a 3D face"),
+            "IR too flat (center/edge …) — looks 2D, not a 3D face"
+        );
         assert_eq!(deny_reason("IR face too dark (42)"), "IR face too dark (…)");
-        assert_eq!(deny_reason("below threshold (rgb 0.35, fusion+ir-fallback miss)"),
-                   "below threshold (rgb …, fusion+ir-fallback miss)");
+        assert_eq!(
+            deny_reason("below threshold (rgb 0.35, fusion+ir-fallback miss)"),
+            "below threshold (rgb …, fusion+ir-fallback miss)"
+        );
         // allowlisted prose (dimension labels, wavelength) survives
-        assert_eq!(deny_reason("a real face reflects 850nm"), "a real face reflects 850nm");
+        assert_eq!(
+            deny_reason("a real face reflects 850nm"),
+            "a real face reflects 850nm"
+        );
         assert_eq!(deny_reason("looks 2D not 3D"), "looks 2D not 3D");
         // identifiers (digits glued after letters) survive as names
         assert_eq!(deny_reason("PCR7 drift"), "PCR7 drift");
@@ -901,6 +1088,9 @@ mod tests {
         // trailing sentence period survives a float at end of sentence
         assert_eq!(deny_reason("floor 1.12."), "floor ….");
         // no numbers -> unchanged
-        assert_eq!(deny_reason("'ghost' is not enrolled"), "'ghost' is not enrolled");
+        assert_eq!(
+            deny_reason("'ghost' is not enrolled"),
+            "'ghost' is not enrolled"
+        );
     }
 }

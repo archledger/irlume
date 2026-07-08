@@ -32,7 +32,11 @@ pub fn darken(chip: &mut [u8], factor: f32) {
 pub fn gamma(chip: &mut [u8], g: f32) {
     let inv = 1.0 / g;
     let lut: Vec<u8> = (0..256)
-        .map(|v| (255.0 * (v as f32 / 255.0).powf(inv)).round().clamp(0.0, 255.0) as u8)
+        .map(|v| {
+            (255.0 * (v as f32 / 255.0).powf(inv))
+                .round()
+                .clamp(0.0, 255.0) as u8
+        })
         .collect();
     for v in chip.iter_mut() {
         *v = lut[*v as usize];

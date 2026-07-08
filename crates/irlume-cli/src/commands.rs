@@ -46,8 +46,12 @@ pub fn update(args: &[String]) -> ExitCode {
         // Nothing to run, but a release-asset install still gets the
         // switch-to-repo pointer so FUTURE updates are one command.
         match &origin {
-            InstallOrigin::Copr => println!("  updates come from the Copr: sudo dnf upgrade --refresh irlume"),
-            InstallOrigin::Ppa => println!("  updates come with the system: sudo apt update && sudo apt upgrade"),
+            InstallOrigin::Copr => {
+                println!("  updates come from the Copr: sudo dnf upgrade --refresh irlume")
+            }
+            InstallOrigin::Ppa => {
+                println!("  updates come with the system: sudo apt update && sudo apt upgrade")
+            }
             _ => {}
         }
         recommend_channel(&origin);
@@ -83,10 +87,17 @@ pub fn update(args: &[String]) -> ExitCode {
             recommend_channel(&origin);
         }
         InstallOrigin::LocalDeb => {
-            let ver = latest.as_deref().unwrap_or("vVERSION").trim_start_matches('v');
+            let ver = latest
+                .as_deref()
+                .unwrap_or("vVERSION")
+                .trim_start_matches('v');
             let (deb_arch, _, _) = arch_names();
             println!("  Update the way it was installed — the new .deb from the release page:");
-            release_asset_steps(ver, &format!("irlume_{ver}_{deb_arch}.deb"), "sudo apt install");
+            release_asset_steps(
+                ver,
+                &format!("irlume_{ver}_{deb_arch}.deb"),
+                "sudo apt install",
+            );
             recommend_channel(&origin);
         }
         InstallOrigin::ArchPkg => {
@@ -94,15 +105,27 @@ pub fn update(args: &[String]) -> ExitCode {
             // channel is the prebuilt package on GitHub Releases (pacman -U).
             // The PKGBUILD remains for source builds and will become the
             // update path again once AUR sign-ups reopen.
-            let ver = latest.as_deref().unwrap_or("vVERSION").trim_start_matches('v');
+            let ver = latest
+                .as_deref()
+                .unwrap_or("vVERSION")
+                .trim_start_matches('v');
             let (_, pkg_arch, _) = arch_names();
-            println!("  Update the way it was installed — the prebuilt package from the release page:");
-            release_asset_steps(ver, &format!("irlume-{ver}-1-{pkg_arch}.pkg.tar.zst"), "sudo pacman -U");
+            println!(
+                "  Update the way it was installed — the prebuilt package from the release page:"
+            );
+            release_asset_steps(
+                ver,
+                &format!("irlume-{ver}-1-{pkg_arch}.pkg.tar.zst"),
+                "sudo pacman -U",
+            );
             println!("  (or build from source: makepkg -si  in packaging/arch/)");
         }
         InstallOrigin::Source => {
             println!("  Source install — update the checkout at the tag:");
-            println!("    git -C <clone> fetch --tags && git checkout {}", latest.as_deref().unwrap_or("<latest>"));
+            println!(
+                "    git -C <clone> fetch --tags && git checkout {}",
+                latest.as_deref().unwrap_or("<latest>")
+            );
             println!("    git lfs pull && cargo build --release && sudo bash scripts/install-host.sh --ort <libonnxruntime.so>");
         }
     }
@@ -153,10 +176,19 @@ pub fn install_origin() -> InstallOrigin {
             if !cmd_ok("rpm", &["-q", "irlume"]) {
                 return InstallOrigin::Source;
             }
-            let repo = cmd_stdout("dnf", &["repoquery", "--installed", "--qf", "%{from_repo}\n", "irlume"])
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+            let repo = cmd_stdout(
+                "dnf",
+                &[
+                    "repoquery",
+                    "--installed",
+                    "--qf",
+                    "%{from_repo}\n",
+                    "irlume",
+                ],
+            )
+            .unwrap_or_default()
+            .trim()
+            .to_string();
             if is_copr_repo(&repo) {
                 InstallOrigin::Copr
             } else {
@@ -164,7 +196,8 @@ pub fn install_origin() -> InstallOrigin {
             }
         }
         DistroFamily::Debian => {
-            let status = cmd_stdout("dpkg-query", &["-W", "-f", "${Status}", "irlume"]).unwrap_or_default();
+            let status =
+                cmd_stdout("dpkg-query", &["-W", "-f", "${Status}", "irlume"]).unwrap_or_default();
             if !status.contains("ok installed") {
                 return InstallOrigin::Source;
             }
@@ -210,7 +243,9 @@ fn recommend_channel(origin: &InstallOrigin) {
             };
             match ppa_serves(&codename) {
                 Some(true) => {
-                    println!("  Recommended: Ubuntu's release channel is the PPA — switch once and");
+                    println!(
+                        "  Recommended: Ubuntu's release channel is the PPA — switch once and"
+                    );
                     println!("  future updates arrive with plain `apt upgrade`:");
                     println!("    sudo add-apt-repository ppa:archledger/irlume");
                     println!("    sudo apt install irlume");
@@ -244,7 +279,11 @@ fn ubuntu_codename(os_release: &str) -> Option<String> {
         return None;
     }
     let code = field("UBUNTU_CODENAME=");
-    let code = if code.is_empty() { field("VERSION_CODENAME=") } else { code };
+    let code = if code.is_empty() {
+        field("VERSION_CODENAME=")
+    } else {
+        code
+    };
     (!code.is_empty()).then_some(code)
 }
 
@@ -295,8 +334,12 @@ fn gz_lists_irlume(gz: &[u8]) -> bool {
     if let Some(mut si) = child.stdin.take() {
         let _ = si.write_all(gz); // si dropped here → EOF to gzip
     }
-    let Ok(out) = child.wait_with_output() else { return false };
-    String::from_utf8_lossy(&out.stdout).lines().any(|l| l == "Package: irlume")
+    let Ok(out) = child.wait_with_output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l == "Package: irlume")
 }
 
 /// Run each package-manager step with root: directly if we already are, else
@@ -308,7 +351,9 @@ fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
         let display = step.join(" ");
         println!("  $ {}{display}", if root { "" } else { "sudo " });
         let status = if root {
-            std::process::Command::new(step[0]).args(&step[1..]).status()
+            std::process::Command::new(step[0])
+                .args(&step[1..])
+                .status()
         } else {
             std::process::Command::new("sudo").args(*step).status()
         };
@@ -343,7 +388,8 @@ fn installed_version(origin: &InstallOrigin) -> String {
         }
         InstallOrigin::ArchPkg => {
             // `pacman -Q irlume` → "irlume 0.1.3-1"; take the version field.
-            cmd_stdout("pacman", &["-Q", "irlume"]).and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
+            cmd_stdout("pacman", &["-Q", "irlume"])
+                .and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
         }
         InstallOrigin::Source => None,
     };
@@ -394,9 +440,16 @@ fn arch_names() -> (&'static str, &'static str, &'static str) {
 /// "couldn't tell" and fall back to a best-effort URL rather than a false negative.
 fn release_assets() -> Vec<String> {
     let Ok(out) = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "8", "https://api.github.com/repos/archledger/irlume/releases/latest"])
+        .args([
+            "-fsSL",
+            "--max-time",
+            "8",
+            "https://api.github.com/repos/archledger/irlume/releases/latest",
+        ])
         .output()
-    else { return Vec::new() };
+    else {
+        return Vec::new();
+    };
     if !out.status.success() {
         return Vec::new();
     }
@@ -425,10 +478,15 @@ fn release_assets() -> Vec<String> {
 fn release_asset_steps(ver: &str, asset: &str, install_cmd: &str) {
     let assets = release_assets();
     if assets.is_empty() || assets.iter().any(|a| a == asset) {
-        println!("    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/{asset}");
+        println!(
+            "    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/{asset}"
+        );
         println!("    {install_cmd} ./{asset}");
     } else {
-        println!("  No prebuilt package for this architecture ({}) on release v{ver}.", std::env::consts::ARCH);
+        println!(
+            "  No prebuilt package for this architecture ({}) on release v{ver}.",
+            std::env::consts::ARCH
+        );
         println!("  Build from source, or watch https://github.com/archledger/irlume/releases");
     }
 }
@@ -468,7 +526,10 @@ fn version_gt(a: &str, b: &str) -> bool {
     };
     let (va, vb) = (parse(a), parse(b));
     for i in 0..va.len().max(vb.len()) {
-        let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            va.get(i).copied().unwrap_or(0),
+            vb.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x > y;
         }
@@ -493,42 +554,106 @@ pub fn status(args: &[String]) -> ExitCode {
 
     // Daemon + method.
     let up = daemon_up();
-    println!("  daemon        : {}", if up { format!("running {OK}") } else { format!("NOT reachable {NO} (systemctl status irlumed)") });
+    println!(
+        "  daemon        : {}",
+        if up {
+            format!("running {OK}")
+        } else {
+            format!("NOT reachable {NO} (systemctl status irlumed)")
+        }
+    );
     let method = irlume_core::policy::method();
-    println!("  auth method   : {:?}{}", method, if method.face_disabled() { " (face disabled)" } else { "" });
+    println!(
+        "  auth method   : {:?}{}",
+        method,
+        if method.face_disabled() {
+            " (face disabled)"
+        } else {
+            ""
+        }
+    );
 
     // Enrollment.
     match daemon_request(&Request::ListProfiles { user: user.clone() }) {
-        Ok(Response::Enrollment { profiles, require_eyes_open, require_challenge }) if !profiles.is_empty() => {
+        Ok(Response::Enrollment {
+            profiles,
+            require_eyes_open,
+            require_challenge,
+        }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
-            println!("  enrollment    : {} profile(s), {scans} scan(s) {OK}{}{}",
+            println!(
+                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}{}",
                 profiles.len(),
-                if require_eyes_open { " · eyes-open required" } else { "" },
-                if require_challenge { " · passive blink liveness" } else { "" });
+                if require_eyes_open {
+                    " · eyes-open required"
+                } else {
+                    ""
+                },
+                if require_challenge {
+                    " · passive blink liveness"
+                } else {
+                    ""
+                }
+            );
             for p in &profiles {
                 println!("                  - {} ({} scan(s))", p.name, p.scans.len());
             }
         }
-        Ok(Response::Enrollment { .. }) => println!("  enrollment    : none {WARN} (run `irlume enroll`)"),
+        Ok(Response::Enrollment { .. }) => {
+            println!("  enrollment    : none {WARN} (run `irlume enroll`)")
+        }
         Ok(Response::Error(e)) => println!("  enrollment    : error: {e}"),
         _ => println!("  enrollment    : unknown (daemon unreachable)"),
     }
 
     // Keyring (TPM-sealed login password) + template encryption / recovery.
     match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
-        Ok(Response::HasPassword(armed)) =>
-            println!("  keyring unlock: {}", if armed { format!("armed {OK}") } else { "not armed (run `irlume keyring arm`)".into() }),
+        Ok(Response::HasPassword(armed)) => println!(
+            "  keyring unlock: {}",
+            if armed {
+                format!("armed {OK}")
+            } else {
+                "not armed (run `irlume keyring arm`)".into()
+            }
+        ),
         _ => println!("  keyring unlock: unknown"),
     }
-    if let Ok(Response::RecoveryStatus { encrypted, recovery_set, .. }) = daemon_request(&Request::RecoveryStatus { user: user.clone() }) {
-        println!("  templates     : {}", if encrypted { format!("encrypted at rest {OK}") } else { format!("plaintext {WARN} (run `irlume recovery setup`)") });
-        println!("  recovery pass : {}", if recovery_set { format!("set {OK}") } else { format!("not set {WARN}") });
+    if let Ok(Response::RecoveryStatus {
+        encrypted,
+        recovery_set,
+        ..
+    }) = daemon_request(&Request::RecoveryStatus { user: user.clone() })
+    {
+        println!(
+            "  templates     : {}",
+            if encrypted {
+                format!("encrypted at rest {OK}")
+            } else {
+                format!("plaintext {WARN} (run `irlume recovery setup`)")
+            }
+        );
+        println!(
+            "  recovery pass : {}",
+            if recovery_set {
+                format!("set {OK}")
+            } else {
+                format!("not set {WARN}")
+            }
+        );
     }
 
     // Biopolicy enforcement (opt-in).
     let bio = irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-    println!("  biopolicy     : {}", if bio { format!("ENFORCING {OK} (operation-class gate)") } else { "off (default)".into() });
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    println!(
+        "  biopolicy     : {}",
+        if bio {
+            format!("ENFORCING {OK} (operation-class gate)")
+        } else {
+            "off (default)".into()
+        }
+    );
 
     // Cameras.
     let (rgb, ir) = irlume_camera::select_pair();
@@ -537,7 +662,13 @@ pub fn status(args: &[String]) -> ExitCode {
     // Fingerprint.
     let fp = irlume_fingerprint::device_name()
         .map(|n| format!("{n} {OK}"))
-        .unwrap_or_else(|| if irlume_fingerprint::available() { format!("present {OK}") } else { "none".into() });
+        .unwrap_or_else(|| {
+            if irlume_fingerprint::available() {
+                format!("present {OK}")
+            } else {
+                "none".into()
+            }
+        });
     println!("  fingerprint   : {fp}");
 
     ExitCode::SUCCESS
@@ -550,7 +681,8 @@ pub fn status(args: &[String]) -> ExitCode {
 pub fn detect(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     let installed = ["/usr/local/bin/irlumed", "/usr/bin/irlumed"]
-        .iter().any(|p| std::path::Path::new(p).exists());
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
     if !installed {
         println!("absent: irlumed is not installed");
         return ExitCode::from(20);
@@ -564,9 +696,15 @@ pub fn detect(args: &[String]) -> ExitCode {
         println!("ready: daemon running and a face is enrolled");
         ExitCode::SUCCESS
     } else {
-        println!("partial: installed but not ready ({}{})",
+        println!(
+            "partial: installed but not ready ({}{})",
             if up { "daemon up" } else { "daemon down" },
-            if enrolled { ", enrolled" } else { ", not enrolled" });
+            if enrolled {
+                ", enrolled"
+            } else {
+                ", not enrolled"
+            }
+        );
         ExitCode::from(10)
     }
 }
@@ -575,17 +713,46 @@ pub fn detect(args: &[String]) -> ExitCode {
 pub fn identify(_args: &[String]) -> ExitCode {
     eprintln!("[identify] look at the camera…");
     match daemon_request(&Request::Identify) {
-        Ok(Response::Identified { user: Some(u), profile, score, .. }) => {
-            println!("[identify] {u} (profile '{}', score {score:.3}) {OK}", profile.unwrap_or_default());
+        Ok(Response::Identified {
+            user: Some(u),
+            profile,
+            score,
+            ..
+        }) => {
+            println!(
+                "[identify] {u} (profile '{}', score {score:.3}) {OK}",
+                profile.unwrap_or_default()
+            );
             ExitCode::SUCCESS
         }
-        Ok(Response::Identified { user: None, live, reason, .. }) => {
-            println!("[identify] no match — {} ({reason})", if live { "live face, not enrolled" } else { "no live face" });
+        Ok(Response::Identified {
+            user: None,
+            live,
+            reason,
+            ..
+        }) => {
+            println!(
+                "[identify] no match — {} ({reason})",
+                if live {
+                    "live face, not enrolled"
+                } else {
+                    "no live face"
+                }
+            );
             ExitCode::from(1)
         }
-        Ok(Response::Error(e)) => { eprintln!("[identify] error: {e}"); ExitCode::FAILURE }
-        Ok(other) => { eprintln!("[identify] unexpected response: {other:?}"); ExitCode::FAILURE }
-        Err(e) => { eprintln!("[identify] {e}"); ExitCode::FAILURE }
+        Ok(Response::Error(e)) => {
+            eprintln!("[identify] error: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[identify] unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[identify] {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -602,7 +769,10 @@ pub fn diag(args: &[String]) -> ExitCode {
         Some(d) => println!("  TPM           : {d} {OK}"),
         None => println!("  TPM           : none {NO}"),
     }
-    println!("  boot mode     : {}", secureboot::detect_boot_mode().as_str());
+    println!(
+        "  boot mode     : {}",
+        secureboot::detect_boot_mode().as_str()
+    );
     if secureboot::is_secure_boot_enabled() {
         println!("  secure boot   : enabled {OK}");
     } else if secureboot::is_setup_mode() {
@@ -612,20 +782,29 @@ pub fn diag(args: &[String]) -> ExitCode {
     } else {
         println!("  secure boot   : not a UEFI boot");
     }
-    println!("  signed policy : {}", if irlume_core::pcrsig::signed_policy_available() {
-        "PCR-11 signature present (kernel updates won't need re-seal)"
-    } else {
-        "none — literal PCR-7 seal (re-arm/restore after firmware updates)"
-    });
+    println!(
+        "  signed policy : {}",
+        if irlume_core::pcrsig::signed_policy_available() {
+            "PCR-11 signature present (kernel updates won't need re-seal)"
+        } else {
+            "none — literal PCR-7 seal (re-arm/restore after firmware updates)"
+        }
+    );
 
     // Keyring envelope: policy kind, bound PCRs, drift (root + TPM only).
     let path = irlume_core::keyring::envelope_path(&user);
     match irlume_core::envelope::SealedEnvelope::load(&path) {
         Ok(env) => {
             let kind = match &env.policy {
-                irlume_core::envelope::PolicyKind::PcrLiteral => "literal PolicyPCR (Tier 3)".to_string(),
-                irlume_core::envelope::PolicyKind::Authorized { .. } => "signed PolicyAuthorize (Tier 1)".to_string(),
-                irlume_core::envelope::PolicyKind::PcrlockNv { nv_index } => format!("pcrlock NV 0x{nv_index:x} (Tier 2)"),
+                irlume_core::envelope::PolicyKind::PcrLiteral => {
+                    "literal PolicyPCR (Tier 3)".to_string()
+                }
+                irlume_core::envelope::PolicyKind::Authorized { .. } => {
+                    "signed PolicyAuthorize (Tier 1)".to_string()
+                }
+                irlume_core::envelope::PolicyKind::PcrlockNv { nv_index } => {
+                    format!("pcrlock NV 0x{nv_index:x} (Tier 2)")
+                }
             };
             println!("  seal envelope : {} {OK}", path.display());
             println!("  seal policy   : {kind}, bound PCRs {:?}", env.pcrs);
@@ -658,10 +837,24 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             // an empty list ≠ "not loaded". The live socket label is a reliable
             // positive signal either way (only our type_transition sets it).
             let out = std::process::Command::new("semodule").args(["-l"]).output();
-            let listed = out.as_ref().map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
-            let in_list = out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == "irlume")).unwrap_or(false);
-            let label = std::process::Command::new("ls").args(["-Z", irlume_common::SOCKET_PATH]).output()
-                .ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            let listed = out
+                .as_ref()
+                .map(|o| o.status.success() && !o.stdout.is_empty())
+                .unwrap_or(false);
+            let in_list = out
+                .as_ref()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .any(|l| l.trim() == "irlume")
+                })
+                .unwrap_or(false);
+            let label = std::process::Command::new("ls")
+                .args(["-Z", irlume_common::SOCKET_PATH])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
             let labeled = label.contains("irlume_runtime_t");
             let state = if in_list || labeled {
                 format!("loaded {OK}")
@@ -677,21 +870,39 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("load") => {
-            let pp = ["packaging/selinux/irlume.pp", "/usr/share/irlume/selinux/irlume.pp"]
-                .into_iter().find(|p| std::path::Path::new(p).exists());
+            let pp = [
+                "packaging/selinux/irlume.pp",
+                "/usr/share/irlume/selinux/irlume.pp",
+            ]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
             let Some(pp) = pp else {
                 eprintln!("[selinux] irlume.pp not found — build it: make -f /usr/share/selinux/devel/Makefile -C packaging/selinux irlume.pp");
                 return ExitCode::FAILURE;
             };
             eprintln!("[selinux] semodule -i {pp} (needs root)…");
-            let st = std::process::Command::new("semodule").args(["-i", pp]).status();
+            let st = std::process::Command::new("semodule")
+                .args(["-i", pp])
+                .status();
             match st {
-                Ok(s) if s.success() => { println!("[selinux] loaded {OK}; restart irlumed so the socket relabels"); ExitCode::SUCCESS }
-                Ok(s) => { eprintln!("[selinux] semodule exited {s}"); ExitCode::FAILURE }
-                Err(e) => { eprintln!("[selinux] could not run semodule: {e}"); ExitCode::FAILURE }
+                Ok(s) if s.success() => {
+                    println!("[selinux] loaded {OK}; restart irlumed so the socket relabels");
+                    ExitCode::SUCCESS
+                }
+                Ok(s) => {
+                    eprintln!("[selinux] semodule exited {s}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("[selinux] could not run semodule: {e}");
+                    ExitCode::FAILURE
+                }
             }
         }
-        Some(other) => { eprintln!("[selinux] unknown subcommand '{other}' (use: status | load)"); ExitCode::FAILURE }
+        Some(other) => {
+            eprintln!("[selinux] unknown subcommand '{other}' (use: status | load)");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -703,11 +914,19 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
 pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os(env_var) {
         let p = std::path::PathBuf::from(p);
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
-    for base in ["/usr/share/irlume/models", "/usr/lib/irlume/models", "models"] {
+    for base in [
+        "/usr/share/irlume/models",
+        "/usr/lib/irlume/models",
+        "models",
+    ] {
         let p = std::path::Path::new(base).join(filename);
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
     None
 }
@@ -715,7 +934,11 @@ pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::
 /// `Some(true)` when the daemon reports models loaded (authoritative — it exits
 /// at startup if they can't load); `None` when the daemon is unreachable.
 pub(crate) fn daemon_models_loaded() -> Option<bool> {
-    matches!(daemon_request(&Request::Health), Ok(Response::Health { .. })).then_some(true)
+    matches!(
+        daemon_request(&Request::Health),
+        Ok(Response::Health { .. })
+    )
+    .then_some(true)
 }
 
 /// The two required models as (filename, daemon-env-var) pairs.
@@ -727,7 +950,15 @@ pub(crate) const REQUIRED_MODELS: [(&str, &str); 2] = [
 pub fn deps(_args: &[String]) -> ExitCode {
     let mut ok = true;
     let mut check = |label: &str, present: bool, hint: &str| {
-        println!("  {label:<14}: {}", if present { OK.to_string() } else { ok = false; format!("{NO} {hint}") });
+        println!(
+            "  {label:<14}: {}",
+            if present {
+                OK.to_string()
+            } else {
+                ok = false;
+                format!("{NO} {hint}")
+            }
+        );
     };
     // The daemon can't load models or run without ONNX Runtime, so a running
     // daemon is proof onnxruntime is present — authoritative and cross-distro
@@ -735,21 +966,48 @@ pub fn deps(_args: &[String]) -> ExitCode {
     // /usr/lib/x86_64-linux-gnu and the daemon's ORT_DYLIB_PATH env isn't in the
     // user's shell). Fall back to an explicit path or a well-known location.
     let loaded = daemon_models_loaded() == Some(true);
-    let ort_env = std::env::var("ORT_DYLIB_PATH").ok().filter(|p| std::path::Path::new(p).exists());
+    let ort_env = std::env::var("ORT_DYLIB_PATH")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists());
     let ort_sys = [
         "/usr/lib64/libonnxruntime.so",
         "/usr/lib/libonnxruntime.so",
         "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
-    ].iter().any(|p| std::path::Path::new(p).exists());
-    check("onnxruntime", loaded || ort_env.is_some() || ort_sys, "install onnxruntime or set ORT_DYLIB_PATH");
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists());
+    check(
+        "onnxruntime",
+        loaded || ort_env.is_some() || ort_sys,
+        "install onnxruntime or set ORT_DYLIB_PATH",
+    );
     for (f, env) in REQUIRED_MODELS {
-        check(f, loaded || resolve_model(f, env).is_some(), "install the irlume package (or run from the repo)");
+        check(
+            f,
+            loaded || resolve_model(f, env).is_some(),
+            "install the irlume package (or run from the repo)",
+        );
     }
-    check("TPM", tpm_device().is_some(), "no /dev/tpmrm0 (sealing unavailable)");
+    check(
+        "TPM",
+        tpm_device().is_some(),
+        "no /dev/tpmrm0 (sealing unavailable)",
+    );
     let have_video = (0..10).any(|n| std::path::Path::new(&format!("/dev/video{n}")).exists());
     check("camera (v4l)", have_video, "no /dev/video* nodes");
-    println!("deps: {}", if ok { format!("all present {OK}") } else { format!("missing dependencies {WARN}") });
-    if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    println!(
+        "deps: {}",
+        if ok {
+            format!("all present {OK}")
+        } else {
+            format!("missing dependencies {WARN}")
+        }
+    );
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 /// `irlume reseal` — safely re-bind the TPM-sealed login password to the CURRENT
@@ -767,15 +1025,32 @@ pub fn reseal(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
         Ok(Response::HasPassword(true)) => {}
-        _ => { eprintln!("[reseal] daemon unreachable"); return ExitCode::FAILURE; }
+        _ => {
+            eprintln!("[reseal] daemon unreachable");
+            return ExitCode::FAILURE;
+        }
     }
     println!("[reseal] Re-binding '{user}'s sealed password to the current TPM/PCR state.");
-    let Some(pw) = prompt_login_password() else { return ExitCode::from(2) };
-    let req = Request::SealPassword { user, password: irlume_common::SecretBytes::new(pw.into_bytes()) };
+    let Some(pw) = prompt_login_password() else {
+        return ExitCode::from(2);
+    };
+    let req = Request::SealPassword {
+        user,
+        password: irlume_common::SecretBytes::new(pw.into_bytes()),
+    };
     match daemon_request(&req) {
-        Ok(Response::PasswordSealed) => { println!("[reseal] re-bound to current PCRs {OK} — face unlock will release it again."); ExitCode::SUCCESS }
-        Ok(other) => { eprintln!("[reseal] unexpected response: {other:?}"); ExitCode::FAILURE }
-        Err(e) => { eprintln!("[reseal] failed: {e}"); ExitCode::FAILURE }
+        Ok(Response::PasswordSealed) => {
+            println!("[reseal] re-bound to current PCRs {OK} — face unlock will release it again.");
+            ExitCode::SUCCESS
+        }
+        Ok(other) => {
+            eprintln!("[reseal] unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[reseal] failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -787,15 +1062,23 @@ pub(crate) fn prompt_login_password() -> Option<String> {
     if std::io::stdin().is_terminal() {
         let a = rpassword::prompt_password("Login password: ").ok()?;
         let b = rpassword::prompt_password("Confirm login password: ").ok()?;
-        if a != b { eprintln!("passwords do not match — aborted (nothing changed)."); return None; }
-        if a.is_empty() { eprintln!("empty password — aborted."); return None; }
+        if a != b {
+            eprintln!("passwords do not match — aborted (nothing changed).");
+            return None;
+        }
+        if a.is_empty() {
+            eprintln!("empty password — aborted.");
+            return None;
+        }
         Some(a)
     } else {
         use std::io::BufRead;
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line).ok()?;
         let pw = line.trim_end_matches(['\n', '\r']).to_string();
-        if pw.is_empty() { return None; }
+        if pw.is_empty() {
+            return None;
+        }
         Some(pw)
     }
 }
@@ -833,9 +1116,15 @@ pub fn setup(args: &[String]) -> ExitCode {
 
     // 3. Keyring arm.
     println!("\n[3/6] Keyring unlock (face login opens your wallet)");
-    if yes_no("  Arm keyring unlock now (you'll enter your login password)?", true) {
+    if yes_no(
+        "  Arm keyring unlock now (you'll enter your login password)?",
+        true,
+    ) {
         if let Some(pw) = prompt_login_password() {
-            match daemon_request(&Request::SealPassword { user: user.clone(), password: irlume_common::SecretBytes::new(pw.into_bytes()) }) {
+            match daemon_request(&Request::SealPassword {
+                user: user.clone(),
+                password: irlume_common::SecretBytes::new(pw.into_bytes()),
+            }) {
                 Ok(Response::PasswordSealed) => println!("  armed {OK}"),
                 r => eprintln!("  arm failed: {r:?}"),
             }
@@ -851,7 +1140,9 @@ pub fn setup(args: &[String]) -> ExitCode {
     // 5. Fingerprint.
     println!("\n[5/6] Fingerprint (optional companion factor)");
     match irlume_fingerprint::device_name() {
-        Some(n) => println!("  reader '{n}' present — manage with `irlume fingerprint add` / `enable`"),
+        Some(n) => {
+            println!("  reader '{n}' present — manage with `irlume fingerprint add` / `enable`")
+        }
         None => println!("  no fingerprint reader detected — skipping"),
     }
 
@@ -869,7 +1160,12 @@ pub fn setup(args: &[String]) -> ExitCode {
 /// Enroll via the daemon (capture happens daemon-side; no camera contention).
 fn run_enroll(user: &str, reset: bool) {
     eprintln!("  capturing — stay in frame, look at the camera…");
-    match daemon_request(&Request::Enroll { user: user.into(), profile: None, scans: None, reset }) {
+    match daemon_request(&Request::Enroll {
+        user: user.into(),
+        profile: None,
+        scans: None,
+        reset,
+    }) {
         Ok(Response::Ok(msg)) => println!("  {msg} {OK}"),
         r => eprintln!("  enroll failed: {r:?}"),
     }
@@ -897,7 +1193,8 @@ fn yes_no(q: &str, default_yes: bool) -> bool {
 
 /// `irlume help` / no args — top-level command listing.
 pub fn help() -> ExitCode {
-    println!("\
+    println!(
+        "\
 irlume — local face authentication
 
 USAGE: irlume <command> [options]   (default user = $USER; override with --user U)
@@ -935,7 +1232,8 @@ SYSTEM INTEGRATION
   version                         print the installed irlume version
 
   (developer/benchmark tools are hidden — set IRLUME_DEV=1 to enable them)
-");
+"
+    );
     ExitCode::SUCCESS
 }
 
@@ -945,8 +1243,12 @@ mod origin_tests {
 
     #[test]
     fn copr_from_repo_matches_only_our_project() {
-        assert!(is_copr_repo("copr:copr.fedorainfracloud.org:archledger:irlume"));
-        assert!(!is_copr_repo("copr:copr.fedorainfracloud.org:archledger:linhello"));
+        assert!(is_copr_repo(
+            "copr:copr.fedorainfracloud.org:archledger:irlume"
+        ));
+        assert!(!is_copr_repo(
+            "copr:copr.fedorainfracloud.org:archledger:linhello"
+        ));
         assert!(!is_copr_repo("fedora"));
         assert!(!is_copr_repo("@commandline"));
         assert!(!is_copr_repo("")); // no dnf history record

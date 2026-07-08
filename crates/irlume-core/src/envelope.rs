@@ -121,7 +121,10 @@ mod tests {
             pcrs: vec![7],
             public: vec![1, 2, 3],
             private: vec![4, 5, 6],
-            pcr_values: vec![PcrValue { pcr: 7, value: vec![0xab; 32] }],
+            pcr_values: vec![PcrValue {
+                pcr: 7,
+                value: vec![0xab; 32],
+            }],
         };
         let s = serde_json::to_string(&env).unwrap();
         let back: SealedEnvelope = serde_json::from_str(&s).unwrap();

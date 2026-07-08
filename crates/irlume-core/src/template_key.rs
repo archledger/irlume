@@ -74,7 +74,9 @@ pub fn ensure_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
     if !path.exists() {
-        return Err(Error::Policy(format!("no template key sealed for '{user}'")));
+        return Err(Error::Policy(format!(
+            "no template key sealed for '{user}'"
+        )));
     }
     let env = SealedEnvelope::load(&path)?;
     tpm::unseal(&env)
@@ -179,7 +181,10 @@ mod tests {
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/tmp/irlume-tk");
         std::env::set_var("IRLUME_RECOVERY_DIR", "/tmp/irlume-rec");
         assert_eq!(key_path("bob"), PathBuf::from("/tmp/irlume-tk/bob.json"));
-        assert_eq!(recovery_path("bob"), PathBuf::from("/tmp/irlume-rec/bob.json"));
+        assert_eq!(
+            recovery_path("bob"),
+            PathBuf::from("/tmp/irlume-rec/bob.json")
+        );
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::env::remove_var("IRLUME_RECOVERY_DIR");
     }
@@ -228,7 +233,11 @@ mod tests {
         assert!(!has_key("rt"));
         restore_from_recovery("rt", b"my recovery passphrase").unwrap();
         assert!(has_key("rt"));
-        assert_eq!(&*load_key("rt").unwrap(), &*k1, "restored key must match original");
+        assert_eq!(
+            &*load_key("rt").unwrap(),
+            &*k1,
+            "restored key must match original"
+        );
 
         forget_key("rt").unwrap();
         forget_recovery("rt").unwrap();

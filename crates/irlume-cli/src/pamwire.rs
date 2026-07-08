@@ -39,10 +39,12 @@ fn debian_greeter_line(mode: &str, kr: bool) -> String {
     format!("auth       sufficient   pam_irlume.so unseal {mode}{kr_arg}")
 }
 /// Jump-style variant for a non-`@include` (e.g. Fedora) COSMIC stack.
-const GREETER_UNSEAL_COSMIC_JUMP: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand";
+const GREETER_UNSEAL_COSMIC_JUMP: &str =
+    "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand";
 // Tagged so unwire strips OUR landing but never a foreign pam_permit.so the
 // stack legitimately carries (the trailing `#…` is a PAM comment, ignored).
-const PERMIT_LANDING: &str = "auth       optional                     pam_permit.so   # irlume-landing";
+const PERMIT_LANDING: &str =
+    "auth       optional                     pam_permit.so   # irlume-landing";
 const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so reseal";
 /// Post-auth login-keyring unlock for the FINGERPRINT path: runs after a trusted
 /// factor succeeded; if no password is present (fingerprint login) it unseals
@@ -60,27 +62,49 @@ struct Svc {
 }
 
 const GREETERS: &[Svc] = &[
-    Svc { etc: "/etc/pam.d/gdm-password", vendor: None }, // GNOME / GDM
-    Svc { etc: "/etc/pam.d/sddm", vendor: None },
-    Svc { etc: "/etc/pam.d/lightdm", vendor: None },
-    Svc { etc: "/etc/pam.d/plasmalogin", vendor: Some("/usr/lib/pam.d/plasmalogin") }, // Plasma 6
-    Svc { etc: "/etc/pam.d/cosmic-greeter", vendor: None }, // COSMIC (Pop!_OS / System76)
-    Svc { etc: "/etc/pam.d/greetd", vendor: None }, // greetd (sway / wayland / tuigreet)
+    Svc {
+        etc: "/etc/pam.d/gdm-password",
+        vendor: None,
+    }, // GNOME / GDM
+    Svc {
+        etc: "/etc/pam.d/sddm",
+        vendor: None,
+    },
+    Svc {
+        etc: "/etc/pam.d/lightdm",
+        vendor: None,
+    },
+    Svc {
+        etc: "/etc/pam.d/plasmalogin",
+        vendor: Some("/usr/lib/pam.d/plasmalogin"),
+    }, // Plasma 6
+    Svc {
+        etc: "/etc/pam.d/cosmic-greeter",
+        vendor: None,
+    }, // COSMIC (Pop!_OS / System76)
+    Svc {
+        etc: "/etc/pam.d/greetd",
+        vendor: None,
+    }, // greetd (sway / wayland / tuigreet)
 ];
 // KDE lock: wire the submit-driven `kde` password service with the on-demand
 // face block, NOT KDE's ambient `kde-fingerprint` parallel-biometric slot — so
 // face engages only on an empty-field Enter (never continuously scanning). The
 // `kde` service classifies as ScreenUnlock, so `ondemand` verifies identity and
 // releases no credential.
-const LOCKSCREEN: Svc = Svc { etc: "/etc/pam.d/kde", vendor: None };
+const LOCKSCREEN: Svc = Svc {
+    etc: "/etc/pam.d/kde",
+    vendor: None,
+};
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
 /// distinct from `gdm-password` (password/face). It runs pam_fprintd then
 /// pam_gnome_keyring — which finds no password and leaves the wallet locked. We
 /// slot the `keyring` unseal line between them (ADR-0003) so a fingerprint login
 /// opens the wallet. Only present on GNOME/GDM systems; skipped elsewhere.
-const FP_GREETERS: &[Svc] = &[
-    Svc { etc: "/etc/pam.d/gdm-fingerprint", vendor: None },
-];
+const FP_GREETERS: &[Svc] = &[Svc {
+    etc: "/etc/pam.d/gdm-fingerprint",
+    vendor: None,
+}];
 const SUDO: &str = "/etc/pam.d/sudo";
 
 // ---- CLI entry ---------------------------------------------------------------
@@ -104,14 +128,22 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
 /// plus a trailing SELinux row. Mirrors what `status()` prints.
 pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
     let mut out = Vec::new();
-    for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
+    for s in GREETERS
+        .iter()
+        .chain(FP_GREETERS.iter())
+        .chain(std::iter::once(&LOCKSCREEN))
+    {
         match service_present(s) {
             Some(p) => out.push((label_of(s.etc), true, file_has_module(&p))),
             None => out.push((label_of(s.etc), false, false)),
         }
     }
     let sudo = Path::new(SUDO);
-    out.push(("sudo".into(), sudo.exists(), sudo.exists() && file_has_module(sudo)));
+    out.push((
+        "sudo".into(),
+        sudo.exists(),
+        sudo.exists() && file_has_module(sudo),
+    ));
     out
 }
 
@@ -119,7 +151,11 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
 /// "is face login actually wired" probe for the TUI dashboard (sudo excluded:
 /// face-sudo alone doesn't make the login screen work).
 pub(crate) fn login_wired() -> bool {
-    for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
+    for s in GREETERS
+        .iter()
+        .chain(FP_GREETERS.iter())
+        .chain(std::iter::once(&LOCKSCREEN))
+    {
         if let Some(p) = service_present(s) {
             if file_has_module(&p) {
                 return true;
@@ -155,8 +191,13 @@ const GDM_ONDEMAND_MIN_GNOME: u32 = 46;
 /// GNOME Shell major version via `gnome-shell --version` ("GNOME Shell 50.1" →
 /// 50). None when gnome-shell is absent/unparseable (→ conservative facefirst).
 fn gnome_shell_major() -> Option<u32> {
-    let out = std::process::Command::new("gnome-shell").arg("--version").output().ok()?;
-    if !out.status.success() { return None; }
+    let out = std::process::Command::new("gnome-shell")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .find_map(|tok| tok.split('.').next().and_then(|n| n.parse::<u32>().ok()))
@@ -190,7 +231,9 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
         "cosmic-greeter" => DmProfile { ondemand: true },
         // GDM (GNOME): modern gnome-shell submits the empty field (ondemand);
         // older gnome-shell blocked the probe → facefirst.
-        "gdm-password" => DmProfile { ondemand: gdm_uses_ondemand(gnome) },
+        "gdm-password" => DmProfile {
+            ondemand: gdm_uses_ondemand(gnome),
+        },
         // LightDM (lightdm-gtk-greeter) and SDDM: both validated on Ubuntu 26.04
         // — they answer the active probe on submit and auto-log-in on face
         // success, so `ondemand` gives a clean empty-Enter→face with no spurious
@@ -285,41 +328,69 @@ fn status() -> ExitCode {
     }
     let mut any = false;
     let mut any_ondemand = false;
-    for s in GREETERS.iter().chain(FP_GREETERS.iter()).chain(std::iter::once(&LOCKSCREEN)) {
+    for s in GREETERS
+        .iter()
+        .chain(FP_GREETERS.iter())
+        .chain(std::iter::once(&LOCKSCREEN))
+    {
         if let Some(present) = service_present(s) {
             let content = std::fs::read_to_string(&present).unwrap_or_default();
             let wired = content_has_module(&content);
             any |= wired;
             // Surface HOW face fires on this service — on-demand (the consent
             // model) is invisible in the PAM file to a user, so name it here.
-            let label = if !wired { "○ not wired" }
-                else if !content.contains("unseal") { "● wired" } // keyring-only line
-                else if content.contains("ondemand") { any_ondemand = true; "● wired (face on-demand)" }
-                else { "● wired (face-first)" };
+            let label = if !wired {
+                "○ not wired"
+            } else if !content.contains("unseal") {
+                "● wired"
+            }
+            // keyring-only line
+            else if content.contains("ondemand") {
+                any_ondemand = true;
+                "● wired (face on-demand)"
+            } else {
+                "● wired (face-first)"
+            };
             println!("  {:<34} {}", present.display(), label);
         }
     }
     if Path::new(SUDO).exists() {
         let wired = file_has_module(Path::new(SUDO));
-        println!("  {:<34} {}", SUDO, if wired { "● wired (sudo)" } else { "○ not wired (sudo)" });
+        println!(
+            "  {:<34} {}",
+            SUDO,
+            if wired {
+                "● wired (sudo)"
+            } else {
+                "○ not wired (sudo)"
+            }
+        );
     }
     if any_ondemand {
         println!("  on-demand: leave the password empty and press Enter to use your face");
     }
-    println!("[login] SELinux module: {}", match selinux_loaded() {
-        Some(true) => "loaded",
-        Some(false) => "not loaded",
-        None => "unknown (run as root to check)",
-    });
+    println!(
+        "[login] SELinux module: {}",
+        match selinux_loaded() {
+            Some(true) => "loaded",
+            Some(false) => "not loaded",
+            None => "unknown (run as root to check)",
+        }
+    );
     if !any {
-        println!("  → enable with:  sudo irlume login enable --apply   (add --with-sudo for face-sudo)");
+        println!(
+            "  → enable with:  sudo irlume login enable --apply   (add --with-sudo for face-sudo)"
+        );
     }
     ExitCode::SUCCESS
 }
 
 fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     if apply && effective_uid() != 0 {
-        eprintln!("[login] applying changes needs root — run: sudo irlume login {} --apply", if enable { "enable" } else { "disable" });
+        eprintln!(
+            "[login] applying changes needs root — run: sudo irlume login {} --apply",
+            if enable { "enable" } else { "disable" }
+        );
         return ExitCode::FAILURE;
     }
     if !apply {
@@ -342,27 +413,47 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     let want_fp_keyring = fp_ready && !is_face_method;
     if enable {
         match active_display_manager() {
-            Some(dm) => println!("  login manager: {dm}   ·   method: {}   ·   {}",
+            Some(dm) => println!(
+                "  login manager: {dm}   ·   method: {}   ·   {}",
                 method.as_str(),
-                if caps.ir_pair { "IR/Secure tier" } else if caps.rgb { "RGB/Convenience tier" } else { "no camera" }),
-            None => println!("  no active login manager (headless?)   ·   method: {}", method.as_str()),
+                if caps.ir_pair {
+                    "IR/Secure tier"
+                } else if caps.rgb {
+                    "RGB/Convenience tier"
+                } else {
+                    "no camera"
+                }
+            ),
+            None => println!(
+                "  no active login manager (headless?)   ·   method: {}",
+                method.as_str()
+            ),
         }
         let onoff = |b: bool| if b { "on" } else { "—" };
-        println!("  plan → face login: {}   face lock: {}   fingerprint keyring: {}",
-            onoff(want_face_login), onoff(want_face_lock), onoff(want_fp_keyring));
+        println!(
+            "  plan → face login: {}   face lock: {}   fingerprint keyring: {}",
+            onoff(want_face_login),
+            onoff(want_face_lock),
+            onoff(want_fp_keyring)
+        );
         if caps.rgb && !caps.ir_pair && !is_fp_method {
-            println!("  (RGB-only: face satisfies the LOCK SCREEN only; login/sudo keep the password)");
+            println!(
+                "  (RGB-only: face satisfies the LOCK SCREEN only; login/sudo keep the password)"
+            );
         }
         // Tell the user HOW face will fire at their greeter — on-demand (the
         // consent model) is not discoverable from the greeter UI itself.
         if want_face_login {
             if let Some(dm) = active_display_manager() {
                 let (greeter, _) = dm_pam_services(&dm);
-                println!("  face trigger: {}", if dm_profile(&format!("/etc/pam.d/{greeter}"), gnome_shell_major()).ondemand {
-                    "on-demand — leave the password empty and press Enter to use your face"
-                } else {
-                    "face-first — the camera verifies as soon as your account is selected"
-                });
+                println!(
+                    "  face trigger: {}",
+                    if dm_profile(&format!("/etc/pam.d/{greeter}"), gnome_shell_major()).ondemand {
+                        "on-demand — leave the password empty and press Enter to use your face"
+                    } else {
+                        "face-first — the camera verifies as soon as your account is selected"
+                    }
+                );
             }
         }
     }
@@ -372,7 +463,10 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         // unwire everything (want is ANDed with `enable`).
         match wire_service(s, enable && want, apply, wire) {
             Ok(msg) => println!("  {msg}"),
-            Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
+            Err(e) => {
+                eprintln!("  ✗ {e}");
+                errs += 1;
+            }
         }
     };
     // Greeters (gdm-password etc.) carry the FACE lines (only Secure-tier face
@@ -388,7 +482,8 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         // whenever face login OR face lock is wanted — an RGB (convenience) box
         // still gets face LOCK there (a cold login on that tier stays denied by
         // the daemon's credential-release gate).
-        let unified_login_lock = s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
+        let unified_login_lock =
+            s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
         let face = want_face_login || (unified_login_lock && want_face_lock);
         let greeter_wire = |c: &str| wire_greeter_impl(c, face, want_fp_keyring, prof.ondemand);
         do_svc(s, &greeter_wire, face || want_fp_keyring);
@@ -403,16 +498,30 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     // unwire it — "disable --apply undoes everything" is a documented promise,
     // and a stale sudo line would point at a module the user may remove next.
     if with_sudo || !enable {
-        match wire_service(&Svc { etc: SUDO, vendor: None }, enable, apply, &wire_sudo) {
+        match wire_service(
+            &Svc {
+                etc: SUDO,
+                vendor: None,
+            },
+            enable,
+            apply,
+            &wire_sudo,
+        ) {
             Ok(msg) => println!("  {msg}"),
-            Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
+            Err(e) => {
+                eprintln!("  ✗ {e}");
+                errs += 1;
+            }
         }
     }
     // SELinux (Fedora): the confined GDM/greeter needs the policy to reach the socket.
     if matches!(distro_family(), DistroFamily::Fedora) {
         match selinux(enable, apply) {
             Ok(msg) => println!("  {msg}"),
-            Err(e) => { eprintln!("  ✗ {e}"); errs += 1; }
+            Err(e) => {
+                eprintln!("  ✗ {e}");
+                errs += 1;
+            }
         }
     }
     if !apply {
@@ -420,11 +529,20 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     } else if errs == 0 {
         println!("[login] done. Password remains the fallback everywhere.");
     }
-    if errs == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if errs == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// Wire (or unwire) one service, choosing override-materialize vs edit-in-place.
-fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (String, bool)) -> Result<String, String> {
+fn wire_service(
+    s: &Svc,
+    enable: bool,
+    apply: bool,
+    wire: &dyn Fn(&str) -> (String, bool),
+) -> Result<String, String> {
     let etc = Path::new(s.etc);
     // vendor-only service with no admin /etc copy → override strategy.
     let use_override = s.vendor.is_some() && (!etc.exists() || file_is_created_override(etc));
@@ -440,11 +558,15 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
             }
             let (base, _) = unwire_lines(&read(vendor)?);
             let (wired, _) = wire(&base);
-            let body = format!("{CREATED_PREFIX}{vendor} — delete this file to restore the vendor copy\n{wired}");
+            let body = format!(
+                "{CREATED_PREFIX}{vendor} — delete this file to restore the vendor copy\n{wired}"
+            );
             if etc.exists() && read(s.etc).ok().as_deref() == Some(body.as_str()) {
                 return Ok(format!("· {} — already correctly wired", s.etc));
             }
-            if apply { write_atomic(etc, &body)?; }
+            if apply {
+                write_atomic(etc, &body)?;
+            }
             Ok(format!("✓ {} — materialized override from {vendor}", s.etc))
         } else {
             if !etc.exists() {
@@ -454,7 +576,11 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
             // Rebuild from the pristine stock: the backup if we've wired before,
             // else the current file — then strip any irlume lines and re-apply.
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
-            let origin = if bak.exists() { read(&bak.to_string_lossy())? } else { current.clone() };
+            let origin = if bak.exists() {
+                read(&bak.to_string_lossy())?
+            } else {
+                current.clone()
+            };
             let (base, _) = unwire_lines(&origin);
             let (wired, changed) = wire(&base);
             if !changed {
@@ -463,13 +589,18 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
             if wired == current {
                 return Ok(format!("· {} — already correctly wired", s.etc));
             }
-            if apply { backup(etc)?; write_atomic(etc, &wired)?; }
+            if apply {
+                backup(etc)?;
+                write_atomic(etc, &wired)?;
+            }
             Ok(format!("✓ {} — wired (backup {}{})", s.etc, s.etc, BACKUP))
         }
     } else {
         // disable / unwire
         if use_override && etc.exists() && file_is_created_override(etc) {
-            if apply { std::fs::remove_file(etc).map_err(|e| format!("rm {}: {e}", s.etc))?; }
+            if apply {
+                std::fs::remove_file(etc).map_err(|e| format!("rm {}: {e}", s.etc))?;
+            }
             Ok(format!("✓ {} — removed override (vendor restored)", s.etc))
         } else if !use_override && etc.exists() {
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
@@ -483,15 +614,22 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
                 let (stripped, _) = unwire_lines(&read(s.etc)?);
                 let bak_content = read(&bak.to_string_lossy())?;
                 if stripped == bak_content {
-                    if apply { std::fs::rename(&bak, etc).map_err(|e| format!("restore {}: {e}", s.etc))?; }
+                    if apply {
+                        std::fs::rename(&bak, etc)
+                            .map_err(|e| format!("restore {}: {e}", s.etc))?;
+                    }
                     Ok(format!("✓ {} — restored from backup", s.etc))
                 } else {
-                    if apply { write_atomic(etc, &stripped)?; }
+                    if apply {
+                        write_atomic(etc, &stripped)?;
+                    }
                     Ok(format!("✓ {} — stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
                 }
             } else if file_has_module(etc) {
                 let (clean, _) = unwire_lines(&read(s.etc)?);
-                if apply { write_atomic(etc, &clean)?; }
+                if apply {
+                    write_atomic(etc, &clean)?;
+                }
                 Ok(format!("✓ {} — stripped irlume lines", s.etc))
             } else {
                 Ok(format!("· {} — not wired", s.etc))
@@ -505,23 +643,36 @@ fn wire_service(s: &Svc, enable: bool, apply: bool, wire: &dyn Fn(&str) -> (Stri
 // ---- pure PAM-text mechanics (unit-tested) -----------------------------------
 
 fn content_has_module(c: &str) -> bool {
-    c.lines().any(|l| { let t = l.trim_start(); !t.starts_with('#') && t.contains(MODULE) })
+    c.lines().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.contains(MODULE)
+    })
 }
 
 /// `<kind>` is `auth`/`session`; matches a `(substack|include) (password-auth|
 /// system-auth)` line — the shared substack the success=1 jump skips.
 fn is_passwd_substack(line: &str, kind: &str) -> bool {
     let t = line.trim_start();
-    if t.starts_with('#') { return false; }
-    let toks: Vec<&str> = t.strip_prefix('-').unwrap_or(t).split_whitespace().collect();
+    if t.starts_with('#') {
+        return false;
+    }
+    let toks: Vec<&str> = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .split_whitespace()
+        .collect();
     toks.first() == Some(&kind)
         && toks.iter().any(|w| *w == "substack" || *w == "include")
-        && toks.iter().any(|w| *w == "password-auth" || *w == "system-auth")
+        && toks
+            .iter()
+            .any(|w| *w == "password-auth" || *w == "system-auth")
 }
 
 fn is_auth_directive(line: &str) -> bool {
     let t = line.trim_start();
-    if t.starts_with('#') { return false; }
+    if t.starts_with('#') {
+        return false;
+    }
     t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
 }
 
@@ -535,8 +686,12 @@ fn is_auth_directive(line: &str) -> bool {
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
 fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
-    if !face && !keyring { return (content.to_string(), false); }
-    if content_has_module(content) { return (content.to_string(), false); }
+    if !face && !keyring {
+        return (content.to_string(), false);
+    }
+    if content_has_module(content) {
+        return (content.to_string(), false);
+    }
     let lines: Vec<&str> = content.lines().collect();
     // Debian/Ubuntu layout: face-first `sufficient` before the password path;
     // keyring-unseal after it (runs on any auth success — incl. a fingerprint via
@@ -552,9 +707,16 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
-                if face { out.push(debian_greeter_line(if ondemand { "ondemand" } else { "facefirst" }, true)); }
+                if face {
+                    out.push(debian_greeter_line(
+                        if ondemand { "ondemand" } else { "facefirst" },
+                        true,
+                    ));
+                }
                 out.push((*l).to_string());
-                if keyring { out.push(KEYRING_UNSEAL.to_string()); }
+                if keyring {
+                    out.push(KEYRING_UNSEAL.to_string());
+                }
                 out.push(RESEAL_AUTH.to_string());
             } else if l.trim_start().starts_with("@include common-session") {
                 out.push((*l).to_string());
@@ -568,21 +730,34 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
         }
         return (format!("{}\n", out.join("\n")), true);
     }
-    let auth_at = lines.iter().position(|l| is_passwd_substack(l, "auth"))
+    let auth_at = lines
+        .iter()
+        .position(|l| is_passwd_substack(l, "auth"))
         .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
     let sess_at = lines.iter().position(|l| is_passwd_substack(l, "session"));
-    let Some(auth_at) = auth_at else { return (content.to_string(), false); };
+    let Some(auth_at) = auth_at else {
+        return (content.to_string(), false);
+    };
     let mut out = Vec::with_capacity(lines.len() + 5);
     for (i, l) in lines.iter().enumerate() {
         if i == auth_at {
             if face {
-                out.push(if ondemand { GREETER_UNSEAL_COSMIC_JUMP } else { GREETER_UNSEAL }.to_string());
+                out.push(
+                    if ondemand {
+                        GREETER_UNSEAL_COSMIC_JUMP
+                    } else {
+                        GREETER_UNSEAL
+                    }
+                    .to_string(),
+                );
                 out.push((*l).to_string());
                 out.push(PERMIT_LANDING.to_string());
             } else {
                 out.push((*l).to_string());
             }
-            if keyring { out.push(KEYRING_UNSEAL.to_string()); }
+            if keyring {
+                out.push(KEYRING_UNSEAL.to_string());
+            }
             out.push(RESEAL_AUTH.to_string());
         } else if Some(i) == sess_at {
             out.push((*l).to_string());
@@ -598,7 +773,9 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
 }
 
 fn wire_single(content: &str, stanza: &str) -> (String, bool) {
-    if content_has_module(content) { return (content.to_string(), false); }
+    if content_has_module(content) {
+        return (content.to_string(), false);
+    }
     let mut out = Vec::new();
     let mut done = false;
     for l in content.lines() {
@@ -608,7 +785,9 @@ fn wire_single(content: &str, stanza: &str) -> (String, bool) {
         }
         out.push(l.to_string());
     }
-    if !done { out.push(stanza.to_string()); }
+    if !done {
+        out.push(stanza.to_string());
+    }
     (format!("{}\n", out.join("\n")), true)
 }
 
@@ -619,21 +798,32 @@ fn wire_single(content: &str, stanza: &str) -> (String, bool) {
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
 fn wire_lock(content: &str) -> (String, bool) {
-    if content_has_module(content) { return (content.to_string(), false); }
+    if content_has_module(content) {
+        return (content.to_string(), false);
+    }
     let lines: Vec<&str> = content.lines().collect();
     // Debian `@include common-auth` layout → face-first `sufficient` before it.
-    if let Some(inc_at) = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")) {
+    if let Some(inc_at) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("@include common-auth"))
+    {
         let mut out = Vec::with_capacity(lines.len() + 1);
         for (i, l) in lines.iter().enumerate() {
-            if i == inc_at { out.push(debian_greeter_line("ondemand", false)); }
+            if i == inc_at {
+                out.push(debian_greeter_line("ondemand", false));
+            }
             out.push((*l).to_string());
         }
         return (format!("{}\n", out.join("\n")), true);
     }
     // Fedora `substack password-auth` layout → jump stanza + permit landing.
-    let auth_at = lines.iter().position(|l| is_passwd_substack(l, "auth"))
+    let auth_at = lines
+        .iter()
+        .position(|l| is_passwd_substack(l, "auth"))
         .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
-    let Some(auth_at) = auth_at else { return (content.to_string(), false); };
+    let Some(auth_at) = auth_at else {
+        return (content.to_string(), false);
+    };
     let mut out = Vec::with_capacity(lines.len() + 2);
     for (i, l) in lines.iter().enumerate() {
         if i == auth_at {
@@ -662,7 +852,9 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
         let t = l.trim_start();
         !t.starts_with('#') && t.starts_with("auth") && t.contains("pam_fprintd.so")
     });
-    let Some(fp_at) = fp_at else { return (content.to_string(), false); };
+    let Some(fp_at) = fp_at else {
+        return (content.to_string(), false);
+    };
     let mut out = Vec::with_capacity(lines.len() + 1);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());
@@ -672,7 +864,9 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
     }
     (format!("{}\n", out.join("\n")), true)
 }
-fn wire_sudo(content: &str) -> (String, bool) { wire_single(content, SUDO_STANZA) }
+fn wire_sudo(content: &str) -> (String, bool) {
+    wire_single(content, SUDO_STANZA)
+}
 
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists — the backup-restore path is preferred).
@@ -680,14 +874,21 @@ fn unwire_lines(content: &str) -> (String, bool) {
     // Strip every pam_irlume line, plus ONLY the pam_permit landing WE tagged
     // (`# irlume-landing`) — never a foreign pam_permit.so.
     let mut changed = false;
-    let kept: Vec<&str> = content.lines().filter(|l| {
-        let t = l.trim_start();
-        if t.starts_with('#') { return true; }
-        let drop = t.contains(MODULE)
-            || (t.contains("pam_permit.so") && l.contains("# irlume-landing"));
-        if drop { changed = true; }
-        !drop
-    }).collect();
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            if t.starts_with('#') {
+                return true;
+            }
+            let drop = t.contains(MODULE)
+                || (t.contains("pam_permit.so") && l.contains("# irlume-landing"));
+            if drop {
+                changed = true;
+            }
+            !drop
+        })
+        .collect();
     (format!("{}\n", kept.join("\n")), changed)
 }
 
@@ -697,14 +898,22 @@ fn read(p: &str) -> Result<String, String> {
     std::fs::read_to_string(p).map_err(|e| format!("read {p}: {e}"))
 }
 fn file_has_module(p: &Path) -> bool {
-    std::fs::read_to_string(p).map(|c| content_has_module(&c)).unwrap_or(false)
+    std::fs::read_to_string(p)
+        .map(|c| content_has_module(&c))
+        .unwrap_or(false)
 }
 fn file_is_created_override(p: &Path) -> bool {
-    std::fs::read_to_string(p).map(|c| c.starts_with(CREATED_PREFIX)).unwrap_or(false)
+    std::fs::read_to_string(p)
+        .map(|c| c.starts_with(CREATED_PREFIX))
+        .unwrap_or(false)
 }
 fn service_present(s: &Svc) -> Option<PathBuf> {
-    if Path::new(s.etc).exists() { return Some(PathBuf::from(s.etc)); }
-    s.vendor.filter(|v| Path::new(v).exists()).map(|_| PathBuf::from(s.etc))
+    if Path::new(s.etc).exists() {
+        return Some(PathBuf::from(s.etc));
+    }
+    s.vendor
+        .filter(|v| Path::new(v).exists())
+        .map(|_| PathBuf::from(s.etc))
 }
 fn backup(path: &Path) -> Result<(), String> {
     let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
@@ -721,7 +930,10 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
-    std::fs::rename(&tmp, path).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("rename into {}: {e}", path.display()) })
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename into {}: {e}", path.display())
+    })
 }
 
 // ---- SELinux (Fedora) --------------------------------------------------------
@@ -732,7 +944,11 @@ fn selinux_loaded() -> Option<bool> {
     if !out.status.success() {
         return None; // needs root to read the policy store
     }
-    Some(String::from_utf8_lossy(&out.stdout).lines().any(|l| l.split_whitespace().next() == Some("irlume")))
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some("irlume")),
+    )
 }
 /// Locate the compiled SELinux policy module. Packaged installs ship it under
 /// /usr/share/irlume/selinux; an env override and the in-repo build dir cover
@@ -741,40 +957,61 @@ fn selinux_loaded() -> Option<bool> {
 fn selinux_pp() -> Option<String> {
     if let Some(p) = std::env::var_os("IRLUME_SELINUX_PP") {
         let p = p.to_string_lossy().into_owned();
-        if Path::new(&p).exists() { return Some(p); }
+        if Path::new(&p).exists() {
+            return Some(p);
+        }
     }
     for p in [
         "/usr/share/irlume/selinux/irlume.pp",
         "/usr/lib/irlume/selinux/irlume.pp",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/selinux/irlume.pp"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/selinux/irlume.pp"
+        ),
     ] {
-        if Path::new(p).exists() { return Some(p.to_string()); }
+        if Path::new(p).exists() {
+            return Some(p.to_string());
+        }
     }
     None
 }
 
 fn selinux(enable: bool, apply: bool) -> Result<String, String> {
     if enable {
-        if selinux_loaded() == Some(true) { return Ok("· SELinux module already loaded".into()); }
+        if selinux_loaded() == Some(true) {
+            return Ok("· SELinux module already loaded".into());
+        }
         let Some(pp) = selinux_pp() else {
-            return Ok("· SELinux: irlume.pp not found (install the selinux subpackage) — skipped".into());
+            return Ok(
+                "· SELinux: irlume.pp not found (install the selinux subpackage) — skipped".into(),
+            );
         };
         if apply {
-            let ok = Command::new("semodule").args(["-i", pp.as_str()]).status().map(|s| s.success()).unwrap_or(false);
-            if !ok { return Err("semodule -i irlume.pp failed".into()); }
+            let ok = Command::new("semodule")
+                .args(["-i", pp.as_str()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return Err("semodule -i irlume.pp failed".into());
+            }
             // The already-bound socket keeps its pre-policy label — the greeter
             // stays blocked until the daemon rebinds. Restart it now so face
             // login works at the very next lock/login, not the next reboot;
             // restorecon (backed by the irlume.fc entry) settles the label even
             // if the bind raced the policy commit.
-            let _ = Command::new("systemctl").args(["try-restart", "irlumed.service"]).status();
+            let _ = Command::new("systemctl")
+                .args(["try-restart", "irlumed.service"])
+                .status();
             let _ = Command::new("restorecon").arg("/run/irlume.sock").status();
             Ok("✓ SELinux module loaded (daemon restarted to relabel its socket)".into())
         } else {
             Ok("→ would load the SELinux module (greeter→daemon socket)".into())
         }
     } else {
-        if selinux_loaded() == Some(false) { return Ok("· SELinux module not loaded".into()); }
+        if selinux_loaded() == Some(false) {
+            return Ok("· SELinux module not loaded".into());
+        }
         if apply {
             let _ = Command::new("semodule").args(["-r", "irlume"]).status();
             Ok("✓ SELinux module removed".into())
@@ -785,9 +1022,16 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
 }
 
 fn effective_uid() -> u32 {
-    std::fs::read_to_string("/proc/self/status").ok()
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:").map(|v| v.split_whitespace().nth(1).unwrap_or("1000").to_string())))
-        .and_then(|v| v.parse().ok()).unwrap_or(1000)
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("Uid:")
+                    .map(|v| v.split_whitespace().nth(1).unwrap_or("1000").to_string())
+            })
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
 }
 
 #[cfg(test)]
@@ -803,13 +1047,24 @@ mod tests {
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let unseal = lines.iter().position(|l| l.contains("unseal")).unwrap();
-        let substack = lines.iter().position(|l| l.contains("auth     substack      password-auth")).unwrap();
-        let permit = lines.iter().position(|l| l.contains("pam_permit.so")).unwrap();
-        let reseal_auth = lines.iter().position(|l| l.contains("auth") && l.contains("reseal")).unwrap();
+        let substack = lines
+            .iter()
+            .position(|l| l.contains("auth     substack      password-auth"))
+            .unwrap();
+        let permit = lines
+            .iter()
+            .position(|l| l.contains("pam_permit.so"))
+            .unwrap();
+        let reseal_auth = lines
+            .iter()
+            .position(|l| l.contains("auth") && l.contains("reseal"))
+            .unwrap();
         // unseal BEFORE substack; permit + reseal AFTER it.
         assert!(unseal < substack && substack < permit && permit < reseal_auth);
         // session reseal present after the session substack.
-        assert!(lines.iter().any(|l| l.starts_with("session") && l.contains("reseal")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("session") && l.contains("reseal")));
     }
 
     // Debian/Ubuntu cosmic-greeter layout (@include-based; one service drives
@@ -825,8 +1080,14 @@ mod tests {
         assert!(w.contains("pam_irlume.so unseal ondemand"));
         assert!(!w.contains("facefirst"));
         let lines: Vec<&str> = w.lines().collect();
-        let unseal = lines.iter().position(|l| l.contains("unseal ondemand")).unwrap();
-        let inc = lines.iter().position(|l| l.trim_start().starts_with("@include common-auth")).unwrap();
+        let unseal = lines
+            .iter()
+            .position(|l| l.contains("unseal ondemand"))
+            .unwrap();
+        let inc = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("@include common-auth"))
+            .unwrap();
         assert!(unseal < inc);
         // A non-cosmic Debian greeter (ondemand=false) still gets facefirst.
         let (g, _) = wire_greeter_impl(COSMIC, true, false, false);
@@ -845,12 +1106,21 @@ mod tests {
         assert!(changed);
         assert!(w.contains("pam_irlume.so unseal ondemand"));
         let lines: Vec<&str> = w.lines().collect();
-        let unseal = lines.iter().position(|l| l.contains("unseal ondemand")).unwrap();
-        let inc = lines.iter().position(|l| l.trim_start().starts_with("@include login")).unwrap();
+        let unseal = lines
+            .iter()
+            .position(|l| l.contains("unseal ondemand"))
+            .unwrap();
+        let inc = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("@include login"))
+            .unwrap();
         assert!(unseal < inc, "face line must precede @include login");
         // keyring-unseal rides just after the include, ahead of greetd's own
         // pam_gnome_keyring so the unsealed AUTHTOK is in place for it.
-        let kr = lines.iter().position(|l| l.contains("pam_irlume.so keyring")).unwrap();
+        let kr = lines
+            .iter()
+            .position(|l| l.contains("pam_irlume.so keyring"))
+            .unwrap();
         assert!(kr > inc);
     }
 
@@ -861,8 +1131,8 @@ mod tests {
         // GDM: ondemand is version-gated (modern GNOME) → facefirst below.
         assert!(dm_profile("/etc/pam.d/gdm-password", Some(50)).ondemand);
         assert!(!dm_profile("/etc/pam.d/gdm-password", Some(3)).ondemand); // old GNOME → facefirst
-        assert!(!dm_profile("/etc/pam.d/gdm-password", None).ondemand);    // undetected → facefirst
-        // LightDM + SDDM: validated → on-demand.
+        assert!(!dm_profile("/etc/pam.d/gdm-password", None).ondemand); // undetected → facefirst
+                                                                        // LightDM + SDDM: validated → on-demand.
         assert!(dm_profile("/etc/pam.d/lightdm", None).ondemand);
         assert!(dm_profile("/etc/pam.d/sddm", None).ondemand);
         // greetd: submit-driven family → on-demand.
@@ -911,11 +1181,17 @@ mod tests {
         // face-only → (strip) → keyring-only must actually change the lines
         // (the method-switch case the old skip-if-present logic silently no-op'd).
         let (face_only, _) = wire_greeter_impl(GDM, true, false, false);
-        assert!(face_only.contains("pam_irlume.so unseal") && !face_only.contains("pam_irlume.so keyring"));
+        assert!(
+            face_only.contains("pam_irlume.so unseal")
+                && !face_only.contains("pam_irlume.so keyring")
+        );
         let (base, stripped) = unwire_lines(&face_only);
         assert!(stripped && !base.contains(MODULE));
         let (keyring_only, _) = wire_greeter_impl(&base, false, true, false);
-        assert!(keyring_only.contains("pam_irlume.so keyring") && !keyring_only.contains("pam_irlume.so unseal"));
+        assert!(
+            keyring_only.contains("pam_irlume.so keyring")
+                && !keyring_only.contains("pam_irlume.so unseal")
+        );
         assert_ne!(face_only, keyring_only);
     }
 
@@ -948,8 +1224,14 @@ mod tests {
         assert!(!w.contains("reseal"));
         // face-first before the password substack, with the permit landing.
         let lines: Vec<&str> = w.lines().collect();
-        let face = lines.iter().position(|l| l.contains("unseal ondemand")).unwrap();
-        let substack = lines.iter().position(|l| l.contains("substack      password-auth")).unwrap();
+        let face = lines
+            .iter()
+            .position(|l| l.contains("unseal ondemand"))
+            .unwrap();
+        let substack = lines
+            .iter()
+            .position(|l| l.contains("substack      password-auth"))
+            .unwrap();
         assert!(face < substack);
         assert!(w.contains("pam_permit.so") && w.contains("irlume-landing"));
         // fully reversible.
@@ -959,9 +1241,15 @@ mod tests {
 
     #[test]
     fn passwd_substack_matcher() {
-        assert!(is_passwd_substack("auth     substack      password-auth", "auth"));
+        assert!(is_passwd_substack(
+            "auth     substack      password-auth",
+            "auth"
+        ));
         assert!(is_passwd_substack("auth  include system-auth", "auth"));
-        assert!(is_passwd_substack("session include password-auth", "session"));
+        assert!(is_passwd_substack(
+            "session include password-auth",
+            "session"
+        ));
         assert!(!is_passwd_substack("auth required pam_unix.so", "auth"));
         assert!(!is_passwd_substack("# auth substack password-auth", "auth"));
     }

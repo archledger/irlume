@@ -41,12 +41,16 @@ impl Method {
 }
 
 fn path() -> PathBuf {
-    std::env::var("IRLUME_METHOD_CONF").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/etc/irlume/method"))
+    std::env::var("IRLUME_METHOD_CONF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/etc/irlume/method"))
 }
 
 /// The active method (default `Auto` if unset/unreadable).
 pub fn method() -> Method {
-    std::fs::read_to_string(path()).map(|s| Method::parse(&s)).unwrap_or_default()
+    std::fs::read_to_string(path())
+        .map(|s| Method::parse(&s))
+        .unwrap_or_default()
 }
 
 /// Persist the active method (creates `/etc/irlume` if needed; needs root).

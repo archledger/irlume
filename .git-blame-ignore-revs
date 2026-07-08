@@ -1,0 +1,9 @@
+# Commits that ONLY reformat code (no logic changes) — skipped by `git blame`
+# so blame points at the real author of each line, not the formatting sweep.
+#
+# Enable locally once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub applies this file automatically.
+
+# Format the entire codebase with rustfmt (2026-07-08)
+b247f32c54810d98e0e0c0f4cf1119619a7eea3c

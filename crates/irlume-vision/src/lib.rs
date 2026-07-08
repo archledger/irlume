@@ -461,7 +461,7 @@ mod onnx {
                 let (shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
                 let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
                 let ch = *dims.last().unwrap_or(&1);
-                let count = if ch == 0 { 0 } else { raw.len() / ch };
+                let count = raw.len().checked_div(ch).unwrap_or(0);
                 let stride = STRIDES.iter().copied().find(|&s| {
                     let f = INPUT_SIZE / s;
                     f * f == count

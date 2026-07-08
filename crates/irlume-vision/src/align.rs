@@ -120,8 +120,9 @@ fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
                 continue;
             }
             let f = a[r][col] / a[col][col];
-            for c in col..4 {
-                a[r][c] -= f * a[col][c];
+            let pivot = a[col];
+            for (c, arc) in a[r].iter_mut().enumerate().skip(col) {
+                *arc -= f * pivot[c];
             }
             b[r] -= f * b[col];
         }

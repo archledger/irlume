@@ -7,15 +7,16 @@
 #
 # Run on an Ubuntu/Debian box from a repo checkout with real LFS models.
 #
-# A PPA is keyed on the Ubuntu SERIES codename, not the derivative name, so one
-# build per LTS base covers every derivative on it (noble -> Pop!_OS 24.04, Mint
-# 22, Zorin 18, elementary 8, Ubuntu 24.04; jammy -> the 22.04 generation).
-# Build + upload each series you want to support — at minimum the current LTS:
-#   for s in noble jammy resolute; do
-#     SERIES=$s bash scripts/build-ppa-source.sh
-#     debsign  "$HOME/ppa-build/irlume_"*"~${s}1_source.changes"   # release key
-#     dput ppa:archledger/irlume "$HOME/ppa-build/irlume_"*"~${s}1_source.changes"
-#   done
+# The PPA targets ONLY the current Ubuntu LTS (its cargo is new enough for our
+# ort/edition-2024 deps). Older LTSs like noble (24.04, cargo 1.75) can't build
+# irlume at all, so their derivatives (Mint, Pop!_OS, Zorin, elementary) use the
+# universal .deb from the GitHub release instead — built on the oldest supported
+# base + rustup in a container (see the noble-container build). Build + upload
+# just the current series:
+#   SERIES=resolute bash scripts/build-ppa-source.sh
+#   debsign  "$HOME/ppa-build/irlume_"*"~resolute1_source.changes"   # release key
+#   dput ppa:archledger/irlume "$HOME/ppa-build/irlume_"*"~resolute1_source.changes"
+# (The deterministic orig below still lets a NEW LTS be added cleanly later.)
 #
 # Env knobs: SERIES (default resolute), PPAREV (0ppa1), ORT_VER (1.24.4),
 # BUILDROOT (~/ppa-build), SKIP_BUILD_CHECK=1 to skip the offline test build.
@@ -72,9 +73,9 @@ fi
 echo "==> creating orig tarball (deterministic — same bytes for every series)"
 cd "$BUILDROOT"
 rm -f "irlume_${VERSION}.orig.tar.gz"
-# Multi-series PPAs upload the SAME upstream version to noble/jammy/resolute/…,
-# and Launchpad keeps one orig tarball per version — a second upload with a
-# different checksum is rejected ("already exists with different contents"). So
+# If more than one Ubuntu series is ever uploaded for the same upstream version,
+# Launchpad keeps one orig tarball per version — a second upload with a different
+# checksum is rejected ("already exists with different contents"). So
 # pack reproducibly: fixed mtime/owner, sorted names, gzip without a timestamp,
 # so every series build yields a byte-identical orig. mtime = the release tag's
 # commit date (override with SOURCE_DATE_EPOCH).

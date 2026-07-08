@@ -73,8 +73,11 @@ pub fn update(args: &[String]) -> ExitCode {
             }
         }
         InstallOrigin::LocalRpm(_) => {
-            // Fedora releases don't ship a standalone .rpm asset — the Copr is
-            // the only Fedora channel, so the recommendation IS the update path.
+            // A release may ship a standalone .rpm for direct download, but it's
+            // Fedora-version-specific (fc44…) and its SELinux policy is a separate
+            // Recommends that a local `dnf install ./x.rpm` won't auto-pull — so
+            // the Copr stays the recommended Fedora channel (in-place upgrades +
+            // the selinux subpackage pulled automatically). Point there.
             recommend_channel(&origin);
         }
         InstallOrigin::LocalDeb => {
@@ -259,11 +262,39 @@ fn ppa_serves(codename: &str) -> Option<bool> {
     let url = format!(
         "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/main/binary-{ppa_arch}/Packages.gz"
     );
-    let status = std::process::Command::new("sh")
-        .args(["-c", &format!("curl -fsSL --max-time 8 '{url}' | gzip -dc 2>/dev/null | grep -q '^Package: irlume$'")])
-        .status()
+    // Distinguish an HTTP error (404 = series genuinely not served) from a
+    // network/tooling failure (offline), so we never tell a CURRENT-LTS user
+    // "the PPA doesn't serve you" just because they happen to be offline.
+    let out = std::process::Command::new("curl")
+        .args(["-fsS", "--max-time", "8", &url])
+        .output()
         .ok()?;
-    Some(status.success())
+    match out.status.code() {
+        Some(0) => Some(gz_lists_irlume(&out.stdout)),
+        Some(22) => Some(false), // curl -f exits 22 on HTTP >= 400 (404) → not served
+        _ => None,               // DNS/connect/timeout → couldn't tell
+    }
+}
+
+/// Does a gzipped Debian `Packages` index list our package? Decompresses via
+/// `gzip -dc` (no bundled zlib) and looks for a `Package: irlume` line. The
+/// index is tiny (one package), so writing it to gzip's stdin can't deadlock.
+fn gz_lists_irlume(gz: &[u8]) -> bool {
+    use std::io::Write;
+    let Ok(mut child) = std::process::Command::new("gzip")
+        .arg("-dc")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(gz); // si dropped here → EOF to gzip
+    }
+    let Ok(out) = child.wait_with_output() else { return false };
+    String::from_utf8_lossy(&out.stdout).lines().any(|l| l == "Package: irlume")
 }
 
 /// Run each package-manager step with root: directly if we already are, else

@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: archledger <archledger236@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cargo,
-               rustc (>= 1.75),
+               rustc (>= 1.88),
                clang,
                libclang-dev,
                pkg-config,

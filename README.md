@@ -117,9 +117,10 @@ sudo apt install \
 </tr>
 </table>
 
-Fedora and Ubuntu update with the system (`dnf upgrade` / `apt upgrade`); on an
-Ubuntu series the [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
-doesn't build for yet, use the Debian `.deb` from
+Fedora and current-LTS Ubuntu update with the system (`dnf upgrade` /
+`apt upgrade`). The [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
+carries the **current Ubuntu LTS only**; on an older LTS or a derivative (Mint,
+Pop!_OS, Zorin, elementary) use the universal Debian `.deb` from
 [Releases](https://github.com/archledger/irlume/releases). `irlume update`
 handles every case — it detects how irlume was installed and updates the same way.
 

@@ -1281,7 +1281,7 @@ impl App {
     /// A red, dismissible error banner centred on screen.
     fn error_modal(&self, f: &mut Frame, msg: &str) {
         let area = f.area();
-        let w = area.width.saturating_sub(8).min(78).max(30);
+        let w = area.width.saturating_sub(8).clamp(30, 78);
         let h = 7u16;
         let rect = Rect { x: area.width.saturating_sub(w) / 2, y: area.height.saturating_sub(h) / 2, width: w, height: h };
         f.render_widget(Clear, rect);
@@ -1904,7 +1904,7 @@ impl App {
 
     fn modal(&self, f: &mut Frame, title: &str, body: &str) {
         let area = f.area();
-        let w = area.width.saturating_sub(8).min(72).max(24);
+        let w = area.width.saturating_sub(8).clamp(24, 72);
         let rect = Rect { x: area.width.saturating_sub(w) / 2, y: area.height.saturating_sub(5) / 2, width: w, height: 5.min(area.height) };
         f.render_widget(Clear, rect);
         let blk = Block::bordered().title(format!(" {title} ")).border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT)).padding(ratatui::widgets::Padding::horizontal(1));

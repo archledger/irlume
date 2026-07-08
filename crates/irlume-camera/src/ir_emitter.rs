@@ -235,7 +235,7 @@ pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<Em
                     continue;
                 }
                 let b = measure();
-                if success(b) && best.as_ref().map_or(true, |(_, bb)| b > *bb) {
+                if success(b) && best.as_ref().is_none_or(|(_, bb)| b > *bb) {
                     best = Some((EmitterControl { unit, selector, payload: payload.clone() }, b));
                 }
             }
@@ -283,7 +283,7 @@ pub fn discover_boost<F: FnMut() -> f32>(
                 }
                 let b = measure();
                 // Require a clear lift so we don't latch onto measurement noise.
-                if b >= base + 6.0 && best.as_ref().map_or(true, |(_, bb)| b > *bb) {
+                if b >= base + 6.0 && best.as_ref().is_none_or(|(_, bb)| b > *bb) {
                     best = Some((EmitterControl { unit, selector, payload: payload.clone() }, b));
                 }
             }

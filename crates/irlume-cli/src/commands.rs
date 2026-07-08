@@ -461,7 +461,7 @@ fn latest_release_tag() -> Option<String> {
 /// missing fields = 0). Pre-release suffixes are ignored (compared as the base).
 fn version_gt(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
-        s.split(|c: char| c == '.' || c == '-')
+        s.split(['.', '-'])
             .take_while(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
             .map(|p| p.parse().unwrap_or(0))
             .collect()
@@ -520,12 +520,9 @@ pub fn status(args: &[String]) -> ExitCode {
             println!("  keyring unlock: {}", if armed { format!("armed {OK}") } else { "not armed (run `irlume keyring arm`)".into() }),
         _ => println!("  keyring unlock: unknown"),
     }
-    match daemon_request(&Request::RecoveryStatus { user: user.clone() }) {
-        Ok(Response::RecoveryStatus { encrypted, recovery_set, .. }) => {
-            println!("  templates     : {}", if encrypted { format!("encrypted at rest {OK}") } else { format!("plaintext {WARN} (run `irlume recovery setup`)") });
-            println!("  recovery pass : {}", if recovery_set { format!("set {OK}") } else { format!("not set {WARN}") });
-        }
-        _ => {}
+    if let Ok(Response::RecoveryStatus { encrypted, recovery_set, .. }) = daemon_request(&Request::RecoveryStatus { user: user.clone() }) {
+        println!("  templates     : {}", if encrypted { format!("encrypted at rest {OK}") } else { format!("plaintext {WARN} (run `irlume recovery setup`)") });
+        println!("  recovery pass : {}", if recovery_set { format!("set {OK}") } else { format!("not set {WARN}") });
     }
 
     // Biopolicy enforcement (opt-in).
@@ -730,7 +727,7 @@ pub(crate) const REQUIRED_MODELS: [(&str, &str); 2] = [
 pub fn deps(_args: &[String]) -> ExitCode {
     let mut ok = true;
     let mut check = |label: &str, present: bool, hint: &str| {
-        println!("  {label:<14}: {}", if present { format!("{OK}") } else { ok = false; format!("{NO} {hint}") });
+        println!("  {label:<14}: {}", if present { OK.to_string() } else { ok = false; format!("{NO} {hint}") });
     };
     // The daemon can't load models or run without ONNX Runtime, so a running
     // daemon is proof onnxruntime is present — authoritative and cross-distro

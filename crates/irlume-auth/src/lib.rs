@@ -73,6 +73,10 @@ pub struct IdentifyOutcome {
     pub reason: String,
 }
 
+/// One live enrollment scan: (rgb embedding, optional ir embedding, depth,
+/// brightness, signed pitch).
+type Scan = (Vec<f32>, Option<Vec<f32>>, f32, f32, f32);
+
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         Ok(Self {
@@ -544,7 +548,7 @@ impl Engine {
                 .iter()
                 .map(|(prof, _scan, t)| (align::cosine(&probe, t), prof.to_string()))
                 .fold((f32::NEG_INFINITY, String::new()), |acc, x| if x.0 > acc.0 { x } else { acc });
-            if score >= thr && best.as_ref().map_or(true, |b| score > b.0) {
+            if score >= thr && best.as_ref().is_none_or(|b| score > b.0) {
                 best = Some((score, user.clone(), who));
             }
         }
@@ -599,7 +603,7 @@ impl Engine {
     /// enrolling from a photo — the liveness gate rejects spoofs. `pitch_neutral`
     /// centres the frontal gate on this user's camera (None on first enroll).
     fn capture_scans(&mut self, want: usize, pitch_neutral: Option<f32>)
-        -> irlume_common::Result<Vec<(Vec<f32>, Option<Vec<f32>>, f32, f32, f32)>> {
+        -> irlume_common::Result<Vec<Scan>> {
         let mut out = Vec::new();
         // Budget (was ×4) absorbs the added frontality gate — a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved — with enough
@@ -910,7 +914,7 @@ fn colliding_profile(
         }
         for s in &p.scans {
             let c = align::cosine(probe, &s.rgb);
-            if c >= irlume_core::RGB_MATCH_THRESHOLD && best.as_ref().map_or(true, |b| c > b.1) {
+            if c >= irlume_core::RGB_MATCH_THRESHOLD && best.as_ref().is_none_or(|b| c > b.1) {
                 best = Some((p.name.clone(), c));
             }
         }

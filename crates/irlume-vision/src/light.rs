@@ -15,8 +15,8 @@ fn apply_luma_map(chip: &mut [u8], new_y: &[f32]) {
     for (i, px) in chip.chunks_mut(3).enumerate() {
         let y = luma(px[0], px[1], px[2]).max(1.0);
         let gain = (new_y[i] / y).clamp(0.0, 8.0);
-        for c in 0..3 {
-            px[c] = ((px[c] as f32) * gain).round().clamp(0.0, 255.0) as u8;
+        for pc in px.iter_mut() {
+            *pc = ((*pc as f32) * gain).round().clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -167,7 +167,6 @@ mod tests {
             darken(&mut c, 0.4);
             f(&mut c);
             assert_eq!(c.len(), 112 * 112 * 3);
-            assert!(c.iter().all(|&v| v <= 255));
         }
     }
 

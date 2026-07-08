@@ -2,9 +2,9 @@
 //!
 //! Commercially-clean, GPL-3.0-compatible bill of materials (all permissive):
 //!   * Detection  — YuNet  (MIT)      `face_detection_yunet_2023mar.onnx`
-//!                  bbox + 5 landmarks; ~1.6 ms @320x320 on a laptop CPU.
+//!     bbox + 5 landmarks; ~1.6 ms @320x320 on a laptop CPU.
 //!   * Recognition— AuraFace (Apache) `glintr100.onnx`, ResNet100/ArcFace,
-//!                  512-D embedding, 112x112 input, standard 5-point alignment.
+//!     512-D embedding, 112x112 input, standard 5-point alignment.
 //!
 //! These bundle directly (`include_bytes!`) — no fetch-models step. Do NOT swap
 //! in InsightFace buffalo_l/antelopev2 or YuNet's bundled SCRFD: their weights
@@ -315,7 +315,7 @@ mod onnx {
                     lm_raw = Some(raw.to_vec());
                 }
             }
-            let raw = lm_raw.ok_or_else(|| err(format!("no {}-landmark output", MESH_N)))?;
+            let raw = lm_raw.ok_or_else(|| err(format!("no {MESH_N}-landmark output")))?;
             // Map input-space (0..192) coords back to the frame crop.
             let mut out = Vec::with_capacity(MESH_N);
             for k in 0..MESH_N {

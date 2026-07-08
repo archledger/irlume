@@ -471,7 +471,7 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
                         let mut norm = 0f32;
                         for k in 0..irlume_vision::EMBED_DIM { v[k] = a[k] + b[k]; norm += v[k] * v[k]; }
                         let norm = norm.sqrt().max(1e-12);
-                        for k in 0..irlume_vision::EMBED_DIM { v[k] /= norm; }
+                        for vk in v.iter_mut() { *vk /= norm; }
                         embs.push((pi, v));
                     }
                 } else if let Ok(e) = emb.embed(&chip) {
@@ -637,7 +637,7 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
     let pct = |p: f64| -> f32 {
         let target = (p * total as f64) as u64;
         let mut cum = 0u64;
-        for k in 0..BINS { cum += hist[k]; if cum >= target { return -1.0 + 2.0 * k as f32 / BINS as f32; } }
+        for (k, &h) in hist.iter().enumerate() { cum += h; if cum >= target { return -1.0 + 2.0 * k as f32 / BINS as f32; } }
         1.0
     };
     let max_imp = (0..BINS).rev().find(|&k| hist[k] > 0)

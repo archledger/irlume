@@ -371,7 +371,7 @@ pub enum BlinkResult {
     NoEyes,
 }
 
-fn median(xs: &mut Vec<f32>) -> Option<f32> {
+fn median(xs: &mut [f32]) -> Option<f32> {
     if xs.is_empty() {
         return None;
     }
@@ -408,7 +408,7 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
     };
     // Per-class open baseline; classes too small or never-open don't count as eyes.
     let mut baseline = [None::<f32>; 2];
-    for class in 0..2 {
+    for (class, slot) in baseline.iter_mut().enumerate() {
         let mut ears: Vec<f32> = samples
             .iter()
             .enumerate()
@@ -416,7 +416,7 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
             .map(|(_, s)| s.ear.unwrap())
             .collect();
         if ears.len() >= BLINK_MIN_CLASS_SAMPLES {
-            baseline[class] = median(&mut ears).filter(|m| *m >= BLINK_MIN_OPEN_EAR);
+            *slot = median(&mut ears).filter(|m| *m >= BLINK_MIN_OPEN_EAR);
         }
     }
     // Merged ratio timeline (frame order, each sample against its class baseline).
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(detect_blink(&flat(&[0.05, 0.06, 0.04, 0.05, 0.05])), BlinkResult::NoEyes);
         assert_eq!(detect_blink(&[]), BlinkResult::NoEyes);
         // Dark closet: frames captured but no face anywhere → NoEyes.
-        let none = strobed(&[], &vec![None; 20]);
+        let none = strobed(&[], &[None; 20]);
         assert_eq!(detect_blink(&none), BlinkResult::NoEyes);
     }
 }

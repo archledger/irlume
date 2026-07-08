@@ -124,10 +124,10 @@ pub fn classify(device: &str) -> Role {
     let mut has_grey = false;
     for f in &formats {
         let cc = &f.fourcc.repr;
-        if COLOUR_FOURCCS.iter().any(|c| *c == cc) {
+        if COLOUR_FOURCCS.contains(&cc) {
             has_colour = true;
         }
-        if GREY_FOURCCS.iter().any(|c| *c == cc) {
+        if GREY_FOURCCS.contains(&cc) {
             has_grey = true;
         }
     }
@@ -223,7 +223,7 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     let dev_dir = find_attr_dir(&real, "idVendor");
     if let Some(allow) = pin_allowlist() {
         match dev_dir.as_ref().and_then(|d| read_vidpid(d)) {
-            Some(g) if allow.iter().any(|w| *w == g) => {}
+            Some(g) if allow.contains(&g) => {}
             Some(g) => {
                 return Err(Error::Hardware(format!(
                     "{device}: camera {g} not in pinned set {allow:?} — refusing"
@@ -539,7 +539,7 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
     // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
     // don't have a table entry for. Guide the user to configure it.
-    if !lit && best_mean >= 0.0 && best_mean < 35.0 {
+    if !lit && (0.0..35.0).contains(&best_mean) {
         eprintln!(
             "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter — for an \
              external Hello camera run `linux-enable-ir-emitter configure`, then set \
@@ -629,7 +629,7 @@ pub fn capture_ir_sequence(device: &str, samples: usize, burst: usize) -> irlume
                 restarts += 1;
                 dead_run = 0;
                 last_sig = None;
-                stream = None; // stop + release buffers before re-arming
+                drop(stream.take()); // stop + release buffers before re-arming
                 stream = Some(
                     v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
                         .map_err(|e| map_io(device, e))?,

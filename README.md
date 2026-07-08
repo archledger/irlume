@@ -313,9 +313,12 @@ from other hardware are very welcome.
 
 ## 🛠️ Status
 
-**v0.1.2 — working, validated on real hardware across Fedora (full IR Secure tier,
-end-to-end), Ubuntu (RGB Convenience tier + fingerprint), and Arch (packaging +
-CLI/daemon; camera-less testbed).** Packaged for all three. Actively hardened; interfaces may still shift before 1.0.
+**v0.1.4 — working, validated on real hardware across Fedora (full IR Secure tier,
+end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
+CLI/daemon; camera-less testbed).** Packaged for all three families. **Contributor-ready:**
+a reproducible Nix dev shell + [developer guide](docs/DEVELOPMENT.md), with CI running
+fmt / clippy / build / test on every push and PR. Actively hardened; interfaces may still
+shift before 1.0.
 
 ## 🤝 Contributing & license
 

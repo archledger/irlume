@@ -211,10 +211,11 @@ fn recommend_channel(origin: &InstallOrigin) {
                     println!("    sudo apt install irlume");
                 }
                 Some(false) => {
-                    println!("  (the PPA doesn't build for Ubuntu `{codename}` yet — the release .deb is the right channel)");
+                    println!("  The PPA carries only the current Ubuntu LTS; for `{codename}` the release");
+                    println!("  .deb IS your update channel — re-run `irlume update` when a new one is out.");
                 }
                 None => {
-                    println!("  If the PPA builds for your Ubuntu series, switching makes future updates automatic:");
+                    println!("  If the PPA serves your Ubuntu series, switching makes future updates automatic:");
                     println!("    sudo add-apt-repository ppa:archledger/irlume && sudo apt install irlume");
                 }
             }
@@ -245,11 +246,20 @@ fn ubuntu_codename(os_release: &str) -> Option<String> {
 /// Does the PPA publish for this Ubuntu series? HTTP 200 on the series
 /// Release file means yes. None = couldn't check (offline / no curl).
 fn ppa_serves(codename: &str) -> Option<bool> {
-    let url = format!("https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/Release");
-    let status = std::process::Command::new("curl")
-        .args(["-fsI", "--max-time", "5", "-o", "/dev/null", &url])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+    // Whether the PPA has an actually-INSTALLABLE irlume for this Ubuntu series,
+    // checked against the binary Packages index — NOT just a `Release` file. A
+    // Release file lingers for a series long after its packages are deleted
+    // (e.g. noble, whose builds were removed once its toolchain proved too old
+    // to compile irlume), so probing Release alone would wrongly steer a
+    // derivative user to a PPA that can't serve them. By design the PPA carries
+    // only the current Ubuntu LTS; every older derivative uses the universal
+    // .deb from the release page. Shells out (no bundled zlib): 404/empty →
+    // false, an `irlume` entry present → true.
+    let url = format!(
+        "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/main/binary-amd64/Packages.gz"
+    );
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("curl -fsSL --max-time 8 '{url}' | gzip -dc 2>/dev/null | grep -q '^Package: irlume$'")])
         .status()
         .ok()?;
     Some(status.success())

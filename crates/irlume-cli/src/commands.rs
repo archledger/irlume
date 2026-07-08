@@ -79,9 +79,9 @@ pub fn update(args: &[String]) -> ExitCode {
         }
         InstallOrigin::LocalDeb => {
             let ver = latest.as_deref().unwrap_or("vVERSION").trim_start_matches('v');
+            let (deb_arch, _, _) = arch_names();
             println!("  Update the way it was installed — the new .deb from the release page:");
-            println!("    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/irlume_{ver}_amd64.deb");
-            println!("    sudo apt install ./irlume_{ver}_amd64.deb");
+            release_asset_steps(ver, &format!("irlume_{ver}_{deb_arch}.deb"), "sudo apt install");
             recommend_channel(&origin);
         }
         InstallOrigin::ArchPkg => {
@@ -90,9 +90,9 @@ pub fn update(args: &[String]) -> ExitCode {
             // The PKGBUILD remains for source builds and will become the
             // update path again once AUR sign-ups reopen.
             let ver = latest.as_deref().unwrap_or("vVERSION").trim_start_matches('v');
+            let (_, pkg_arch, _) = arch_names();
             println!("  Update the way it was installed — the prebuilt package from the release page:");
-            println!("    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/irlume-{ver}-1-x86_64.pkg.tar.zst");
-            println!("    sudo pacman -U ./irlume-{ver}-1-x86_64.pkg.tar.zst");
+            release_asset_steps(ver, &format!("irlume-{ver}-1-{pkg_arch}.pkg.tar.zst"), "sudo pacman -U");
             println!("  (or build from source: makepkg -si  in packaging/arch/)");
         }
         InstallOrigin::Source => {
@@ -255,8 +255,9 @@ fn ppa_serves(codename: &str) -> Option<bool> {
     // only the current Ubuntu LTS; every older derivative uses the universal
     // .deb from the release page. Shells out (no bundled zlib): 404/empty →
     // false, an `irlume` entry present → true.
+    let (_, _, ppa_arch) = arch_names();
     let url = format!(
-        "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/main/binary-amd64/Packages.gz"
+        "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/main/binary-{ppa_arch}/Packages.gz"
     );
     let status = std::process::Command::new("sh")
         .args(["-c", &format!("curl -fsSL --max-time 8 '{url}' | gzip -dc 2>/dev/null | grep -q '^Package: irlume$'")])
@@ -318,6 +319,63 @@ fn cmd_stdout(prog: &str, args: &[&str]) -> Option<String> {
 /// Best-effort latest release tag from the GitHub API via curl. None if curl is
 /// missing, offline, or the response can't be parsed — the caller degrades to
 /// just printing the update method.
+/// Architecture names for (Debian `.deb`, pacman/tarball, PPA binary index),
+/// derived from the arch THIS binary runs on — a native binary's compile-time
+/// target arch is the machine's arch. Keeps the updater correct on arm64 etc.,
+/// not just x86_64.
+fn arch_names() -> (&'static str, &'static str, &'static str) {
+    match std::env::consts::ARCH {
+        "x86_64" => ("amd64", "x86_64", "amd64"),
+        "aarch64" => ("arm64", "aarch64", "arm64"),
+        "arm" => ("armhf", "armv7h", "armhf"),
+        other => (other, other, other), // best effort for the unusual
+    }
+}
+
+/// File names of the assets on the latest GitHub release (`.deb`/`.rpm`/pacman
+/// packages). Empty when offline or on an API hiccup — callers treat "empty" as
+/// "couldn't tell" and fall back to a best-effort URL rather than a false negative.
+fn release_assets() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("curl")
+        .args(["-fsSL", "--max-time", "8", "https://api.github.com/repos/archledger/irlume/releases/latest"])
+        .output()
+    else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let mut names = Vec::new();
+    let mut rest: &str = &body;
+    // Scan every "name": "…" and keep the package-file-looking ones (the release
+    // title is also a "name" but doesn't end in a package extension).
+    while let Some(i) = rest.find("\"name\":") {
+        rest = &rest[i + 7..];
+        let Some(q1) = rest.find('"') else { break };
+        let after = &rest[q1 + 1..];
+        let Some(q2) = after.find('"') else { break };
+        let n = &after[..q2];
+        if n.ends_with(".deb") || n.ends_with(".rpm") || n.ends_with(".pkg.tar.zst") {
+            names.push(n.to_string());
+        }
+        rest = &after[q2..];
+    }
+    names
+}
+
+/// Print download+install steps for a release asset, but only if the running
+/// architecture's asset actually exists on the release — else say so honestly
+/// instead of printing a dead link.
+fn release_asset_steps(ver: &str, asset: &str, install_cmd: &str) {
+    let assets = release_assets();
+    if assets.is_empty() || assets.iter().any(|a| a == asset) {
+        println!("    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/{asset}");
+        println!("    {install_cmd} ./{asset}");
+    } else {
+        println!("  No prebuilt package for this architecture ({}) on release v{ver}.", std::env::consts::ARCH);
+        println!("  Build from source, or watch https://github.com/archledger/irlume/releases");
+    }
+}
+
 fn latest_release_tag() -> Option<String> {
     let out = std::process::Command::new("curl")
         .args([

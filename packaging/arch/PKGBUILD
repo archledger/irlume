@@ -24,6 +24,7 @@ install=irlume.install
 prepare() {
     cd "$srcdir/$pkgname"
     git lfs install --local
+    git config lfs.url https://github.com/archledger/irlume.git/info/lfs
     git lfs pull
 }
 

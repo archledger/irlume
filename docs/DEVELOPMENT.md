@@ -115,7 +115,7 @@ export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so"
 
 ```sh
 cargo build --release
-cargo clippy                    # required before a PR
+cargo clippy --all-targets      # required before a PR (what CI runs, as -D warnings)
 cargo fmt                       # required before a PR
 cargo test
 cargo run -p irlume-cli -- doctor   # platform / TPM / camera / model check

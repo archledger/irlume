@@ -1,0 +1,58 @@
+# Format, lint, build, and test on every push / PR to main.
+#
+# Mirrors the Ubuntu path in docs/DEVELOPMENT.md and pins Rust to the project
+# MSRV (1.88 — the ort / edition-2024 floor), so CI matches `nix develop` and a
+# contributor who follows the developer guide gets the same result CI does.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same ref cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt · clippy · build · test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true # pull the ONNX model weights (Git LFS)
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+
+      - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
+        run: |
+          ver=1.24.4
+          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --release --locked
+
+      - name: test
+        run: cargo test --workspace

@@ -30,9 +30,11 @@ you certify the DCO. That's it — no forms, no rights assignment.
   `padreport` and
   include the per-species APCER/BPCER numbers. See
   [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
-- Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR. The
-  codebase is rustfmt-formatted (default style); the bulk-format commit is in
-  `.git-blame-ignore-revs`, so run `git config blame.ignoreRevsFile
+- Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR — CI
+  runs the same checks (`cargo fmt --check`, `cargo clippy -D warnings`, build,
+  test on Rust 1.88) on every push and PR, so a green local run means a green CI.
+  The codebase is rustfmt-formatted (default style); the bulk-format commit is
+  in `.git-blame-ignore-revs`, so run `git config blame.ignoreRevsFile
   .git-blame-ignore-revs` once to keep `git blame` meaningful.
 
 ## Setting up a dev environment

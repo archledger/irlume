@@ -10,12 +10,38 @@
 //! index; no reseal of our object required. This is the GRUB2 answer to PCR 7
 //! drift that the signed-UKI path (Tier 1) can't cover.
 //!
-//! tss-esapi 7.x ships the `Esys_PolicyAuthorizeNV` binding but no safe wrapper,
-//! so the policy session is driven through that raw FFI here.
+//! Implementation path (scoped 2026-07-09 against tss-esapi 7.7.0 + systemd 259):
+//!
+//! 1. `TPM2_PolicyAuthorizeNV` has NO safe wrapper in tss-esapi (7.7.0, the
+//!    latest release, has `policy_authorize`/`policy_pcr`/`policy_secret` but
+//!    not `policy_authorize_nv` nor `policy_nv`). The raw `Esys_PolicyAuthorizeNV`
+//!    binding exists in tss-esapi-sys, BUT it needs the `*mut ESYS_CONTEXT` and
+//!    the `optional_session_*` handles, which are CRATE-PRIVATE on
+//!    `tss_esapi::Context` (`mut_context()` is private, no public accessor). So
+//!    the "drive it via raw FFI from here" plan is not possible from this crate.
+//!    The correct path is to add the safe `policy_authorize_nv` wrapper to
+//!    tss-esapi upstream (mirror `Context::policy_authorize`, ~15 lines),
+//!    PR it to parallaxsecond/rust-tss-esapi, and use a `[patch.crates-io]`
+//!    git/fork dependency until it releases.
+//!
+//! 2. systemd-pcrlock `make-policy` allocates the NV index dynamically (index +
+//!    TPM info recorded in `/var/lib/systemd/pcrlock.json`; the index carries a
+//!    self-referential policy binding it to itself, which is the `authHandle`
+//!    for PolicyAuthorizeNV). Read that JSON for the live NV index.
+//!
+//! 3. `seal_pcrlock`: sealed object's `authPolicy` = the PolicyAuthorizeNV policy
+//!    digest over the NV index (compute via a trial policy session running the
+//!    new wrapper); create the object with that policy (mirror `seal_with_pcrs`).
+//!
+//! 4. `unseal_pcrlock`: load the object, start a Policy session, run
+//!    `policy_authorize_nv(authHandle=nv, nvIndex=nv, session)`, unseal.
+//!
+//! 5. HW-validate on a provisioned box: seal → unseal, then re-run `make-policy`
+//!    (rewrites the NV index) and confirm the SAME object still unseals without
+//!    a reseal (the whole point vs. the literal PCR-7 seal).
 //!
 //! NOTE: implementation pending (task: Tier 2). The seal/unseal below return a
-//! clear error until the raw-FFI path is wired and HW-validated against a real
-//! pcrlock NV index.
+//! clear error until the upstream wrapper lands and the path is HW-validated.
 
 use crate::envelope::SealedEnvelope;
 use irlume_common::{Error, Result};

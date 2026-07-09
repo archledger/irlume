@@ -6,14 +6,14 @@
 //!
 //! The auth path overlaps the RGB and IR captures on two threads: measured on
 //! the ASUS built-in and the NexiGo N930W (examples/concurrency_probe.rs),
-//! both deliver frames concurrently, 0.5 s (ASUS) to ~1.7 s (NexiGo) faster
+//! both deliver frames concurrently, ~0.7 s (ASUS) to ~1.3 s (NexiGo) faster
 //! than back-to-back. A shared-USB module that HARD-fails a starved stream
-//! shows up as a capture error, and the caller retries that side alone on the
-//! then-idle link. A module that instead degrades a frame silently (the
-//! NexiGo's RGB came back dimmer under concurrent load) is not caught here;
-//! the RGB burst's auto-exposure warmup and the fusion dim-rescue absorb it,
-//! but a new module still wants a re-enroll/match check, and
-//! `IRLUME_SEQUENTIAL_CAPTURE=1` forces back-to-back capture if it misbehaves.
+//! shows up as a capture error and the caller retries that side alone; a
+//! module that instead degrades the RGB frame silently (the NexiGo dims it
+//! from mean ~120 to ~71, below YuNet's detection floor) is recovered by the
+//! cross-spectrum self-heal in irlume-auth (IR-has-a-face while RGB-does-not
+//! triggers an RGB-alone recapture). `IRLUME_SEQUENTIAL_CAPTURE=1` forces
+//! back-to-back capture if a module misbehaves.
 //!
 //! Implementation: the `v4l` crate (V4L2). RGB capture requests YUYV and converts
 //! to RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries

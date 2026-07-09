@@ -247,17 +247,16 @@ impl Engine {
         //
         // The two captures OVERLAP on separate threads: measured on the ASUS
         // built-in and the NexiGo N930W (examples/concurrency_probe.rs in
-        // irlume-camera), both deliver frames concurrently, ~0.5 s (ASUS) to
-        // ~1.7 s (NexiGo) faster than back-to-back. The retry below only
-        // covers a HARD failure (a starved stream that returns an error): a
-        // module that instead degrades a frame silently (the NexiGo's RGB
-        // came back dimmer under concurrent load) returns Ok and is NOT
-        // retried. That degradation is absorbed by the RGB burst's
-        // auto-exposure warmup and, at match time, the fusion dim-rescue; it
-        // is not a guarantee, so a new module wants a re-enroll/match check
-        // before trusting overlapped capture. `IRLUME_SEQUENTIAL_CAPTURE=1`
-        // forces strict back-to-back capture (RGB, then IR only if RGB
-        // succeeded) to isolate a suspected concurrency problem.
+        // irlume-camera), both deliver frames concurrently, ~0.7 s (ASUS) to
+        // ~1.3 s (NexiGo) faster than back-to-back. Two degradation modes are
+        // handled: a HARD capture failure is retried alone just below; a
+        // SILENT one (the NexiGo's RGB returns Ok but too dim for detection,
+        // measured mean ~71 vs ~120 sequential, so YuNet finds no face) is
+        // caught after detection by the cross-spectrum self-heal further down
+        // (IR-has-a-face while RGB-does-not => recapture RGB alone). The ASUS
+        // never triggers either path. `IRLUME_SEQUENTIAL_CAPTURE=1` forces
+        // strict back-to-back capture (RGB, then IR only if RGB succeeded) to
+        // isolate a suspected concurrency problem.
         let sequential = std::env::var("IRLUME_SEQUENTIAL_CAPTURE").is_ok_and(|v| v.trim() == "1");
         let (rgb_res, rgb_ms, ir_res, ir_ms) = if sequential {
             let t = std::time::Instant::now();
@@ -298,20 +297,21 @@ impl Engine {
         // bandwidth-starved capture succeeds; a genuine fault (privacy
         // switch, missing node) fails again with the same error. Logged so a
         // silent retry can't make the timing lines below lie about a slow login.
-        let rgb = match rgb_res {
+        let mut rgb_hard_retried = false;
+        let mut rgb = match rgb_res {
             Ok(f) => f,
             Err(e) => {
                 irlume_common::dlog!("assess: rgb capture retry (concurrent failed: {e})");
+                rgb_hard_retried = true;
                 irlume_camera::capture_rgb_denoised(&self.rgb_dev)?
             }
         };
-        let rgb_view = align::RgbView {
+        let mut rgb_faces = self.det.detect(&align::RgbView {
             data: &rgb.data,
             width: rgb.width,
             height: rgb.height,
-        };
-        let rgb_faces = self.det.detect(&rgb_view)?;
-        let rgb_top = rgb_faces
+        })?;
+        let mut rgb_top = rgb_faces
             .iter()
             .max_by(|a, b| a.score.total_cmp(&b.score))
             .cloned();
@@ -352,6 +352,37 @@ impl Engine {
             ir_faces.len(),
             ir_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
+
+        // Cross-spectrum self-heal for overlapped-capture RGB dimming. Some
+        // Hello modules (measured: NexiGo N930W) starve the RGB stream when
+        // both are read at once: the frame arrives without error but too dim
+        // for YuNet to find the face, which would silently deny to password.
+        // IR is unaffected, so IR-has-a-face while RGB-does-not is the
+        // degradation signature (a genuinely absent user shows no face in
+        // either, so this does not fire). Recapture RGB alone on the idle
+        // link. Skipped in sequential mode and if RGB was already re-fetched.
+        if rgb_top.is_none() && ir_top.is_some() && !sequential && !rgb_hard_retried {
+            irlume_common::dlog!(
+                "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
+            );
+            rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+            rgb_faces = self.det.detect(&align::RgbView {
+                data: &rgb.data,
+                width: rgb.width,
+                height: rgb.height,
+            })?;
+            rgb_top = rgb_faces
+                .iter()
+                .max_by(|a, b| a.score.total_cmp(&b.score))
+                .cloned();
+            irlume_common::dlog!(
+                "assess: rgb (recaptured) {}x{}, faces={} top-det={:.2}",
+                rgb.width,
+                rgb.height,
+                rgb_faces.len(),
+                rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
+            );
+        }
 
         let fbox = |f: &Detection, w: u32, h: u32| irlume_liveness::FaceBox {
             cx: (f.bbox[0] + f.bbox[2]) / 2.0 / w as f32,
@@ -394,6 +425,13 @@ impl Engine {
             signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
             signals.head_yaw_asym, signals.head_pitch_frac);
 
+        // Rebuild the view against the final RGB frame (it may have been
+        // recaptured by the cross-spectrum self-heal above).
+        let rgb_view = align::RgbView {
+            data: &rgb.data,
+            width: rgb.width,
+            height: rgb.height,
+        };
         let embedding = match &rgb_top {
             Some(f) => {
                 let chip = align::align_to_arcface(&rgb_view, &f.landmarks)?;

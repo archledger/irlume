@@ -502,6 +502,7 @@ impl Engine {
                 height: f.height,
             };
             let mut ear = None;
+            let (mut cx, mut cy, mut fsize) = (0.0, 0.0, 0.0);
             if let Some(t) = self
                 .det
                 .detect(&view)?
@@ -512,8 +513,18 @@ impl Engine {
                 let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
                 let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
                 ear = Some(l.min(r));
+                cx = (t.bbox[0] + t.bbox[2]) * 0.5;
+                cy = (t.bbox[1] + t.bbox[3]) * 0.5;
+                fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
             }
-            samples.push(irlume_liveness::EarSample { idx: i, ear, bri });
+            samples.push(irlume_liveness::EarSample {
+                idx: i,
+                ear,
+                bri,
+                cx,
+                cy,
+                fsize,
+            });
         }
         Ok(irlume_liveness::detect_blink(&samples))
     }

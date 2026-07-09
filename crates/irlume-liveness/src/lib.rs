@@ -402,17 +402,38 @@ pub const BLINK_MIN_CLASS_SAMPLES: usize = 8;
 /// factor of the dip's; EAR shifts with exposure, so a dip during auto-exposure
 /// slewing (measured live 2026-07-01) must not pass as a blink.
 pub const BLINK_V_BRI_BAND: f32 = 0.25;
+/// Motion gate: reject a "blink" when the face's median per-frame speed over the
+/// window exceeds this fraction of a face-width. A moving print or panning
+/// camera jitters the mesh landmarks into fake EAR dips; a real blink is a
+/// LOCAL eye change with the head essentially still. Calibrated live on the
+/// NexiGo N930W 2026-07-09: genuine still-head blinks read median speed
+/// 0.007-0.010, while a moving banner's false-accept reps read 0.045-0.047, a
+/// clean gap. 0.02 sits in it with 2x margin on both sides. A genuinely moving
+/// user is rejected here and falls back to the password (never a lockout).
+///
+/// The value is normalized by face width (distance/scale invariant), but not by
+/// frame rate or a camera's bbox-jitter floor, so it is per-camera; override
+/// with `IRLUME_BLINK_MOTION_MAX` (a float) after re-calibrating on new hardware.
+pub const BLINK_MOTION_MAX_MEDIAN: f32 = 0.02;
 
 /// One observation from an IR capture sequence: frame index in the sequence, the
 /// min-eye EAR when a face was detected in that frame, and the frame's mean
 /// brightness. The IR emitter STROBES (alternate frames are emitter-lit vs
 /// ambient-only), and ambient-only frames read systematically lower EAR, so the
 /// detector baselines each brightness class separately instead of one median.
+///
+/// `cx`/`cy`/`fsize` carry the detected face's center and width (frame pixels,
+/// all 0 when no face); [`face_speeds`] uses them to reject blinks that
+/// coincide with whole-face motion (a moving print/camera jitters the mesh
+/// landmarks into fake EAR dips), which a real, local blink does not.
 #[derive(Clone, Copy, Debug)]
 pub struct EarSample {
     pub idx: usize,
     pub ear: Option<f32>,
     pub bri: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub fsize: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,6 +454,44 @@ fn median(xs: &mut [f32]) -> Option<f32> {
     }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Some(xs[xs.len() / 2])
+}
+
+/// Per-frame face-center speed between consecutive face-detected frames,
+/// normalized by face width (so it's distance-invariant): the fraction of a
+/// face-width the face travels per frame. A still head during a natural blink
+/// reads near 0; a moving print or panning camera reads high. Used both as a
+/// diagnostic and by [`detect_blink`]'s motion gate.
+///
+/// Returns per-sample speed aligned to `samples` (0.0 where either this or the
+/// previous face-detected frame is missing), plus the median and max over the
+/// frames that have a value.
+pub fn face_speeds(samples: &[EarSample]) -> (Vec<f32>, f32, f32) {
+    let mut speeds = vec![0.0f32; samples.len()];
+    let mut vals: Vec<f32> = Vec::new();
+    let mut prev: Option<(usize, f32, f32, f32)> = None; // idx, cx, cy, fsize
+    for (i, s) in samples.iter().enumerate() {
+        if s.fsize <= 0.0 {
+            continue; // no face this frame
+        }
+        if let Some((pi, pcx, pcy, pfs)) = prev {
+            let gap = (s.idx.saturating_sub(pi)).max(1) as f32;
+            let scale = ((s.fsize + pfs) * 0.5).max(1.0);
+            let d = ((s.cx - pcx).powi(2) + (s.cy - pcy).powi(2)).sqrt();
+            let v = d / scale / gap; // face-widths per frame
+            speeds[i] = v;
+            vals.push(v);
+        }
+        prev = Some((s.idx, s.cx, s.cy, s.fsize));
+    }
+    let (mut med, mut mx) = (0.0f32, 0.0f32);
+    if !vals.is_empty() {
+        for &v in &vals {
+            mx = mx.max(v);
+        }
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        med = vals[vals.len() / 2];
+    }
+    (speeds, med, mx)
 }
 
 /// Detect a natural blink PASSIVELY from a raw-frame-rate EAR sequence.
@@ -509,6 +568,22 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         .collect();
     if ratios.is_empty() {
         return BlinkResult::NoEyes;
+    }
+    // Motion gate: a moving print/camera fakes EAR dips via landmark jitter. If
+    // the face was moving through the window (median speed over threshold), we
+    // can't trust any dip as a real blink; downgrade to NoBlink (password
+    // fallback), never granting on motion. A real blink keeps the head still.
+    // The threshold is per-camera-calibrated (NexiGo default); a camera with a
+    // different frame rate or bbox-jitter floor can override it via
+    // IRLUME_BLINK_MOTION_MAX without a rebuild.
+    let motion_max = std::env::var("IRLUME_BLINK_MOTION_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(BLINK_MOTION_MAX_MEDIAN);
+    let (_, motion_med, _) = face_speeds(samples);
+    if motion_med > motion_max {
+        return BlinkResult::NoBlink;
     }
     if ratios.iter().any(|o| o.ratio <= BLINK_EAR_DIP_RATIO) {
         return BlinkResult::Blinked;
@@ -646,6 +721,10 @@ mod tests {
                 idx: i,
                 ear: Some(e),
                 bri: 60.0,
+                // Still face (constant position) so the motion gate passes.
+                cx: 100.0,
+                cy: 100.0,
+                fsize: 100.0,
             })
             .collect()
     }
@@ -660,6 +739,9 @@ mod tests {
                     idx: 2 * i,
                     ear: Some(lit[i]),
                     bri: 60.0,
+                    cx: 100.0,
+                    cy: 100.0,
+                    fsize: 100.0,
                 });
             }
             if i < dark.len() {
@@ -667,6 +749,9 @@ mod tests {
                     idx: 2 * i + 1,
                     ear: dark[i],
                     bri: 9.0,
+                    cx: 100.0,
+                    cy: 100.0,
+                    fsize: dark[i].map_or(0.0, |_| 100.0),
                 });
             }
         }
@@ -678,6 +763,32 @@ mod tests {
         // Night-validation shape: open ≈0.24, blink to ≈0.15 (0.63× → deep rule).
         let seq = flat(&[0.24, 0.24, 0.23, 0.15, 0.16, 0.24, 0.24, 0.23, 0.24]);
         assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
+    }
+
+    /// Same deep-dip EAR shape, but the face is translating fast every frame (a
+    /// moving print/panning camera): the motion gate rejects it as NoBlink even
+    /// though the EAR trace alone looks like a blink. Calibrated on the NexiGo:
+    /// genuine still-head median speed ~0.008, moving false-accepts ~0.045.
+    #[test]
+    fn moving_face_dip_is_gated_out() {
+        let ears = [0.24, 0.24, 0.23, 0.15, 0.16, 0.24, 0.24, 0.23, 0.24];
+        let seq: Vec<EarSample> = ears
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| EarSample {
+                idx: i,
+                ear: Some(e),
+                bri: 60.0,
+                // Face marches ~5% of a face-width per frame (median well above
+                // the 0.02 gate); fsize 100 so the normalization matches.
+                cx: 100.0 + i as f32 * 5.0,
+                cy: 100.0,
+                fsize: 100.0,
+            })
+            .collect();
+        // Sanity: the same EAR shape with a still face still passes.
+        assert_eq!(detect_blink(&flat(&ears)), BlinkResult::Blinked);
+        assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
     }
 
     #[test]
@@ -762,6 +873,9 @@ mod tests {
             idx,
             ear: Some(e),
             bri: b,
+            cx: 100.0,
+            cy: 100.0,
+            fsize: 100.0,
         })
         .collect();
         for i in 5..30 {
@@ -769,6 +883,9 @@ mod tests {
                 idx: 2 * i,
                 ear: None,
                 bri: 144.0,
+                cx: 0.0,
+                cy: 0.0,
+                fsize: 0.0,
             });
         }
         assert_eq!(detect_blink(&seq), BlinkResult::NoEyes);
@@ -798,6 +915,9 @@ mod tests {
             idx,
             ear: Some(e),
             bri: b,
+            cx: 100.0,
+            cy: 100.0,
+            fsize: 100.0,
         })
         .collect();
         assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);

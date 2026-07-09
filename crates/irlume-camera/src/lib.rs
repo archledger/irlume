@@ -491,8 +491,10 @@ pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<Frame> {
 
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
 /// across the burst, keeps the middle value). Returns the lone frame unchanged
-/// for a degenerate burst.
-pub fn median_frame(mut frames: Vec<Frame>) -> Frame {
+/// for a degenerate burst. Private on purpose: callers must pass at least one
+/// frame (`capture_rgb_burst` clamps to n.max(1)), and keeping it crate-local
+/// keeps that invariant next to the only code that must uphold it.
+fn median_frame(mut frames: Vec<Frame>) -> Frame {
     if frames.len() <= 1 {
         return frames.pop().expect("median_frame: empty burst");
     }
@@ -820,53 +822,6 @@ pub fn yuyv_to_rgb(yuyv: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
     rgb
-}
-
-/// Owns the camera devices. Lives only inside the privileged daemon.
-pub struct Cameras {
-    rgb_device: String,
-    #[allow(dead_code)]
-    ir_device: String,
-}
-
-impl Cameras {
-    /// Discover and classify the RGB + IR nodes (linhello lesson: don't hardcode).
-    /// Falls back to the default nodes if discovery finds nothing.
-    pub fn open() -> irlume_common::Result<Self> {
-        // TODO: device-trust binding (pin by topology/descriptor; reject virtual
-        // cams); the CVE-2021-34466 defense.
-        let nodes = discover_nodes();
-        let rgb = nodes
-            .iter()
-            .find(|(_, r)| *r == Role::Rgb)
-            .map(|(p, _)| p.clone())
-            .unwrap_or_else(|| DEFAULT_RGB_DEVICE.into());
-        let ir = nodes
-            .iter()
-            .find(|(_, r)| *r == Role::Ir)
-            .map(|(p, _)| p.clone())
-            .unwrap_or_else(|| DEFAULT_IR_DEVICE.into());
-        if privacy_engaged(&rgb) {
-            return Err(Error::Hardware(format!(
-                "{rgb}: hardware privacy switch is ON; disable it to authenticate"
-            )));
-        }
-        Ok(Self {
-            rgb_device: rgb,
-            ir_device: ir,
-        })
-    }
-
-    /// Capture an AE-warmed RGB frame.
-    pub fn capture_rgb(&mut self) -> irlume_common::Result<Frame> {
-        capture_rgb(&self.rgb_device)
-    }
-
-    /// Fire the IR emitter, capture an IR burst, return the brightest strobe phase.
-    pub fn capture_ir_burst(&mut self) -> irlume_common::Result<Frame> {
-        // TODO: UVC-XU SET_CUR to fire emitter; warmup; pick brightest frame.
-        todo!("IR capture + emitter (P2 liveness)")
-    }
 }
 
 #[cfg(test)]

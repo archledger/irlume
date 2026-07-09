@@ -6,7 +6,9 @@
 //!   * Recognition: AuraFace (Apache) `glintr100.onnx`, ResNet100/ArcFace,
 //!     512-D embedding, 112x112 input, standard 5-point alignment.
 //!
-//! These bundle directly (`include_bytes!`); no fetch-models step. Do NOT swap
+//! The weights ship inside the distro packages (installed to
+//! /usr/share/irlume/models and loaded from disk at daemon start; a git clone
+//! carries them via Git LFS, so there is no fetch-models step). Do NOT swap
 //! in InsightFace buffalo_l/antelopev2 or YuNet's bundled SCRFD: their weights
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 

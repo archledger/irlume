@@ -641,6 +641,7 @@ dependencies = [
  "irlume-core",
  "libc",
  "serde_json",
+ "sha2",
  "zeroize",
 ]
 
@@ -664,6 +665,7 @@ dependencies = [
  "irlume-common",
  "pamsm",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

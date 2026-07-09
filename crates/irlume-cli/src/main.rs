@@ -553,25 +553,10 @@ fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlu
     Ok(e)
 }
 
-/// Mean brightness (0..255) of an 8-bit greyscale frame inside a bbox region.
-fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
-    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
-    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
-    let x2 = (bbox[2].max(0.0) as u32).min(w);
-    let y2 = (bbox[3].max(0.0) as u32).min(h);
-    let (mut sum, mut n) = (0u64, 0u64);
-    for y in y1..y2 {
-        for x in x1..x2 {
-            sum += grey[(y * w + x) as usize] as u64;
-            n += 1;
-        }
-    }
-    if n == 0 {
-        0.0
-    } else {
-        sum as f32 / n as f32
-    }
-}
+// Brightness/depth cue helpers live in irlume-auth (the daemon-side pipeline
+// owns them); re-exported so the dev tools here and in pad.rs measure with the
+// exact same code the gate uses.
+pub(crate) use irlume_auth::{center_edge_ratio, mean_in_bbox};
 
 /// `irlume irbench --dir <nir_images> --det .. --model ..`: the real IR
 /// recognition benchmark: embed real NIR faces (YuNet detect → align → AuraFace),
@@ -1148,31 +1133,6 @@ fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         {
             out.push(p);
         }
-    }
-}
-
-/// Center-to-edge IR brightness ratio inside a face bbox (anti-flat depth cue):
-/// mean of the inner half vs. the surrounding border. >1 ⇒ 3D falloff.
-fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
-    let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
-    if bw <= 4.0 || bh <= 4.0 {
-        return 0.0;
-    }
-    // Inner box = central 50%.
-    let inner = [
-        bbox[0] + bw * 0.25,
-        bbox[1] + bh * 0.25,
-        bbox[2] - bw * 0.25,
-        bbox[3] - bh * 0.25,
-    ];
-    let center = mean_in_bbox(grey, w, h, &inner);
-    let whole = mean_in_bbox(grey, w, h, bbox);
-    // Edge mean ≈ (whole*area - center*inner_area) / edge_area.
-    let edge = (whole * 1.0 - center * 0.25) / 0.75; // areas: inner=0.25, edge=0.75
-    if edge <= 1.0 {
-        0.0
-    } else {
-        center / edge
     }
 }
 

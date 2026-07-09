@@ -14,6 +14,58 @@ use zeroize::Zeroize;
 
 mod users;
 
+/// Release checksums of the bundled models (models/SHA256SUMS, committed next
+/// to the weights and embedded at build time).
+const MODEL_MANIFEST: &str = include_str!("../../../models/SHA256SUMS");
+
+/// Hash each configured model file and compare against the release manifest.
+/// Matching by digest (not filename) so packaging renames stay irrelevant.
+/// Unknown weights WARN by default: operators legitimately deploy self-trained
+/// adapters, and refusing to start would turn a model swap into a lockout.
+/// `IRLUME_MODELS_STRICT=1` upgrades the warning to a startup refusal.
+fn verify_models(paths: &[&str]) {
+    use sha2::Digest;
+    let known: std::collections::HashSet<&str> = MODEL_MANIFEST
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let strict = std::env::var("IRLUME_MODELS_STRICT")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
+    for path in paths {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                // Strict must also catch a *deleted* model: silently skipping
+                // would let removal (not just tampering) downgrade liveness.
+                if strict {
+                    eprintln!(
+                        "irlumed: IRLUME_MODELS_STRICT: cannot read model {path} ({e}); refusing to start"
+                    );
+                    std::process::exit(1);
+                }
+                // Without strict, the loader reports missing/optional models.
+                continue;
+            }
+        };
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if !known.contains(digest.as_str()) {
+            eprintln!(
+                "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
+            );
+            if strict {
+                eprintln!(
+                    "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models"
+                );
+                std::process::exit(1);
+            }
+            eprintln!(
+                "irlumed: continuing with unverified weights (expected for custom or \
+                 self-trained models; set IRLUME_MODELS_STRICT=1 to refuse instead)"
+            );
+        }
+    }
+}
+
 fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
@@ -22,6 +74,7 @@ fn main() {
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
+    verify_models(&[&det, &model, &adapter, &mesh]);
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
     // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
     let (rgb_dev, ir_dev) = irlume_auth::select_pair();

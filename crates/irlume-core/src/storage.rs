@@ -265,8 +265,12 @@ struct EncEnvelope {
 fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Result<Vec<u8>> {
     match key {
         Some(k) => {
-            let json = serde_json::to_vec(e)
-                .map_err(|er| irlume_common::Error::Protocol(er.to_string()))?;
+            // The serialized enrollment is template plaintext; keep it zeroized
+            // once the encrypted blob exists (mirrors the load path).
+            let json = Zeroizing::new(
+                serde_json::to_vec(e)
+                    .map_err(|er| irlume_common::Error::Protocol(er.to_string()))?,
+            );
             let blob = crypto::encrypt(k, &json)?;
             let env = EncEnvelope {
                 version: 2,

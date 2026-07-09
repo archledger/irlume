@@ -124,11 +124,14 @@ with a fabricated print.
 
 ## Side channels
 
-- **Constant-time match decision.** The cosine/threshold comparison must not
-  branch or vary in timing on the similarity value, so an attacker cannot probe
-  response time to learn how close a presented face is to an enrolled template
-  (which would enable hill-climbing toward a match). Compare against the
-  threshold without early-out; keep the decision value-independent.
+- **No early-out in matching.** Every enrolled scan is scored: fixed-length
+  cosine over the full embedding, fold-max across all templates, no early
+  exit. Response time therefore does not reveal how close a probe came or
+  which template it approached. The grant/deny outcome itself is observable
+  by design; what keeps timing from becoming a hill-climbing oracle is that
+  the deny path runs the same fusion/fallback stages regardless of how close
+  the score was, and the score never reaches unprivileged callers (next
+  bullet).
 - **Score exposure is authorization-gated.** `Authenticate` (which returns the
   similarity score) is answered only for root peers (the PAM stacks) or the
   account owner probing themselves; any other local peer is refused outright,

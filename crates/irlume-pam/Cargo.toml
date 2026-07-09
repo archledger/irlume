@@ -13,4 +13,5 @@ crate-type = ["cdylib"]
 [dependencies]
 irlume-common.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 pamsm = { version = "0.5", features = ["libpam"] }

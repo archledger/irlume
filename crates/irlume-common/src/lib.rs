@@ -24,9 +24,18 @@ pub const SOCKET_PATH: &str = "/run/irlume.sock";
 /// `Debug` is redacted, so it never lingers on the daemon/PAM heap longer than
 /// needed nor leaks into a log line. `#[serde(transparent)]` so it ships as a
 /// plain byte array over the IPC channel.
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Default)]
 #[serde(transparent)]
 pub struct SecretBytes(Vec<u8>);
+
+// Manual impl (not derived) so deserialization routes through `new()`: a
+// secret received over IPC gets the same memlock treatment as one built
+// locally. The derive would construct the inner Vec directly and skip it.
+impl<'de> Deserialize<'de> for SecretBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(SecretBytes::new(<Vec<u8> as Deserialize>::deserialize(d)?))
+    }
+}
 
 impl SecretBytes {
     pub fn new(bytes: Vec<u8>) -> Self {
@@ -64,10 +73,6 @@ impl std::fmt::Debug for SecretBytes {
         write!(f, "SecretBytes([{} bytes redacted])", self.0.len())
     }
 }
-
-/// Where models live at runtime (bundled via `include_bytes!` in `irlume-vision`,
-/// this path is only for optional overrides / operator-supplied weights).
-pub const MODEL_DIR: &str = "/usr/share/irlume/models";
 
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";

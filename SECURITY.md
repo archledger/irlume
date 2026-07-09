@@ -29,8 +29,9 @@ branch; security fixes land on `main` and ship in the next release.
 Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
 
 - **Authentication bypass**: `PAM_SUCCESS` without a genuine live match; FFI
-  unsoundness in the PAM module. The module fails **closed**: any error, timeout,
-  or unavailable daemon returns failure so the stack falls through to password.
+  unsoundness in the PAM module. The module never grants on error: any error,
+  timeout, or unavailable daemon returns `PAM_IGNORE` (a neutral result, never
+  `SUCCESS`), so the stack falls through to the password.
 - **Presentation/injection attacks**: printed/screen/3D-mask spoofs and the
   Windows Hello-class USB IR-frame injection (CVE-2021-34466). Defended by the
   algorithmic IR liveness gate, device-trust binding, and cross-spectrum RGB↔IR
@@ -43,7 +44,12 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
 - **Model integrity**: model weights are content-addressed in Git LFS
   (SHA-256 object ids pinned in the repo) and ship inside the distro packages,
   whose own integrity checking covers them; only the permissive, audited BOM is
-  shipped. Load-time checksum re-verification is planned, not yet implemented.
+  shipped. At startup the daemon re-hashes each configured model against the
+  release manifest (`models/SHA256SUMS`, embedded at build time) and logs a
+  loud warning on any mismatch; `IRLUME_MODELS_STRICT=1` turns both a
+  mismatch and an unreadable/deleted model into a startup refusal. Warn-first
+  is the default so operators can run self-trained weights without being
+  locked out.
 
 ## Reporting a vulnerability
 

@@ -1,0 +1,22 @@
+# cargo-deny configuration; CI runs `cargo deny check advisories bans`.
+# The license check is not enabled yet (needs a curated allowlist first).
+
+[advisories]
+version = 2
+ignore = [
+    # RUSTSEC-2023-0071 ("Marvin" RSA timing side-channel): no fixed release
+    # exists upstream. irlume uses the rsa crate only to parse the systemd
+    # PCR-signing PUBLIC key and verify signatures (crates/irlume-core/src/
+    # pcrsig.rs); no private-key operations run, so the side channel has no
+    # secret to leak here. Re-check when rsa publishes a fixed version.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2024-0436: `paste` is unmaintained (not a vulnerability). It is
+    # a compile-time proc-macro pulled in by ratatui 0.29 for the TUI; no
+    # paste code exists at runtime. Drop this when ratatui replaces it.
+    "RUSTSEC-2024-0436",
+]
+
+[bans]
+# Duplicate crate versions cost compile time and binary size but are not
+# errors; ort pins its own ndarray 0.17 while the workspace uses 0.16.
+multiple-versions = "warn"

@@ -88,6 +88,9 @@ impl PamServiceModule for IrlumePam {
             }) {
                 if let Ok(tok) = CString::new(secret.expose()) {
                     let _ = pamh.set_authtok(&tok);
+                    // PAM copied the token into its own store; wipe our copy so
+                    // the plaintext password does not linger on this heap.
+                    zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
                 }
             }
             return PamError::IGNORE;
@@ -297,14 +300,19 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
         service,
     }) {
         Ok(Response::PasswordUnsealed { secret }) => {
-            // CString copies the bytes; PAM then copies them into its own store.
-            // A login password cannot contain a NUL, so this only fails on a
-            // malformed secret; treat as decline.
+            // CString copies the bytes; PAM then copies them into its own store,
+            // after which we wipe our copy so the plaintext password does not
+            // linger on this heap. A login password cannot contain a NUL, so
+            // construction only fails on a malformed secret; treat as decline.
             match CString::new(secret.expose()) {
-                Ok(tok) => match pamh.set_authtok(&tok) {
-                    Ok(()) => PamError::SUCCESS,
-                    Err(_) => PamError::IGNORE,
-                },
+                Ok(tok) => {
+                    let set = pamh.set_authtok(&tok);
+                    zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
+                    match set {
+                        Ok(()) => PamError::SUCCESS,
+                        Err(_) => PamError::IGNORE,
+                    }
+                }
                 Err(_) => PamError::IGNORE,
             }
         }

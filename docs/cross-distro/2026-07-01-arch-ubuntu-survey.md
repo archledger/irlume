@@ -8,7 +8,7 @@ First run of irlume outside Fedora. Live testing over ssh on real hardware:
 | Build | reference | **clean, 1m30s, 17/17 suites** | **clean, 2m05s, 17/17 suites** |
 | onnxruntime | 1.24.4 (own Copr) | 1.24.4 system (`/usr/lib`, w/ CUDA EPs) | repo had only 1.22 → installed official MS 1.24.4 tarball to `/opt/onnxruntime-1.24.4` (`api-24` pin needs ≥1.24) |
 | Toolchain deps | n/a | pam headers, tss2, clang all present | ditto (`libpam0g-dev`-equivalent, tss2 present) |
-| LSM | SELinux (module shipped) | none by default | **AppArmor on** (daemon unconfined; profile TODO) |
+| LSM | SELinux (module shipped) | none by default | **AppArmor on** (profile ships and loads in complain mode; enforce pending a soak) |
 | PAM manager | authselect | plain `/etc/pam.d` (+ `/usr/lib/pam.d` overrides) | `pam-auth-update` + `@include common-auth` |
 | Greeter detected | plasmalogin | sddm + plasmalogin | gdm-password |
 | Daemon install | reference | `scripts/install-host.sh` → active first try | ditto |

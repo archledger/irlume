@@ -57,7 +57,10 @@ just above a floor is visible here long before it becomes a false reject. The
 dim/dark paths add `match(fusion)`, `match(ir-fallback)`,
 `liveness(ir-only/dark)`, and `match(ir/dark)` lines with the same shape. Most
 wall-clock time goes to camera I/O; the `assess:` lines show it, which helps
-when chasing a slow login.
+when chasing a slow login. The RGB and IR captures run overlapped on the IR
+path, so those two times overlap rather than sum; setting
+`IRLUME_SEQUENTIAL_CAPTURE=1` on the daemon forces the old back-to-back order
+when isolating a camera problem.
 
 The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.

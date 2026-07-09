@@ -244,9 +244,67 @@ impl Engine {
     fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
-        let t = std::time::Instant::now();
-        let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
-        let rgb_ms = t.elapsed().as_millis();
+        //
+        // The two captures OVERLAP on separate threads: measured on the ASUS
+        // built-in and the NexiGo N930W (examples/concurrency_probe.rs in
+        // irlume-camera), both deliver frames concurrently, ~0.5 s (ASUS) to
+        // ~1.7 s (NexiGo) faster than back-to-back. The retry below only
+        // covers a HARD failure (a starved stream that returns an error): a
+        // module that instead degrades a frame silently (the NexiGo's RGB
+        // came back dimmer under concurrent load) returns Ok and is NOT
+        // retried. That degradation is absorbed by the RGB burst's
+        // auto-exposure warmup and, at match time, the fusion dim-rescue; it
+        // is not a guarantee, so a new module wants a re-enroll/match check
+        // before trusting overlapped capture. `IRLUME_SEQUENTIAL_CAPTURE=1`
+        // forces strict back-to-back capture (RGB, then IR only if RGB
+        // succeeded) to isolate a suspected concurrency problem.
+        let sequential = std::env::var("IRLUME_SEQUENTIAL_CAPTURE").is_ok_and(|v| v.trim() == "1");
+        let (rgb_res, rgb_ms, ir_res, ir_ms) = if sequential {
+            let t = std::time::Instant::now();
+            let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
+            let rgb_ms = t.elapsed().as_millis();
+            // Match the old short-circuit: don't fire the IR emitter after an
+            // RGB fault (privacy switch, missing node); the shared retry below
+            // surfaces the RGB error.
+            if rgb.is_err() {
+                (rgb, rgb_ms, Ok(None), 0)
+            } else {
+                let t = std::time::Instant::now();
+                let ir = irlume_camera::capture_ir(&self.ir_dev);
+                (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
+            }
+        } else {
+            std::thread::scope(|s| {
+                let ir_dev = self.ir_dev.clone();
+                let ir_thread = s.spawn(move || {
+                    let t = std::time::Instant::now();
+                    (irlume_camera::capture_ir(&ir_dev), t.elapsed().as_millis())
+                });
+                let t = std::time::Instant::now();
+                let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
+                let rgb_ms = t.elapsed().as_millis();
+                let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
+                    (
+                        Err(irlume_common::Error::Hardware(
+                            "IR capture thread panicked".into(),
+                        )),
+                        0,
+                    )
+                });
+                (rgb, rgb_ms, ir.map(Some), ir_ms)
+            })
+        };
+        // Retry a hard-failed side alone: with the other stream stopped, a
+        // bandwidth-starved capture succeeds; a genuine fault (privacy
+        // switch, missing node) fails again with the same error. Logged so a
+        // silent retry can't make the timing lines below lie about a slow login.
+        let rgb = match rgb_res {
+            Ok(f) => f,
+            Err(e) => {
+                irlume_common::dlog!("assess: rgb capture retry (concurrent failed: {e})");
+                irlume_camera::capture_rgb_denoised(&self.rgb_dev)?
+            }
+        };
         let rgb_view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,
@@ -265,9 +323,17 @@ impl Engine {
             rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
 
-        let t = std::time::Instant::now();
-        let ir = irlume_camera::capture_ir(&self.ir_dev)?;
-        let ir_ms = t.elapsed().as_millis();
+        // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
+        // above already returned, so reaching here with `None` is unreachable,
+        // but capture alone rather than unwrap to stay panic-free.
+        let ir = match ir_res {
+            Ok(Some(f)) => f,
+            Ok(None) => irlume_camera::capture_ir(&self.ir_dev)?,
+            Err(e) => {
+                irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
+                irlume_camera::capture_ir(&self.ir_dev)?
+            }
+        };
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
         let ir_view = align::RgbView {
             data: &ir_grey_rgb,

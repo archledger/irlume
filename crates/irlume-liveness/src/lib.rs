@@ -415,6 +415,20 @@ pub const BLINK_V_BRI_BAND: f32 = 0.25;
 /// frame rate or a camera's bbox-jitter floor, so it is per-camera; override
 /// with `IRLUME_BLINK_MOTION_MAX` (a float) after re-calibrating on new hardware.
 pub const BLINK_MOTION_MAX_MEDIAN: f32 = 0.02;
+/// Corneal-contrast gate: a real blink must show the eye's specular glint
+/// COLLAPSE under the lid, i.e. open-eye contrast at least this many times the
+/// contrast at the closed (lowest-EAR) frame. A diffuse print has no glint to
+/// lose, so its ratio sits at ~1.0. This is a RATIO, so it is camera-invariant
+/// (sensor gain cancels), unlike an absolute contrast floor. Calibrated live on
+/// the NexiGo 2026-07-09: genuine blinks 1.41-2.63, a banner 0.88-1.38 (its
+/// high end only under motion, which the motion gate independently rejects).
+/// 1.15 clears every flat-print reading with margin below the genuine floor.
+/// Second, independent cue (corneal specular, an established liveness signal);
+/// override with `IRLUME_BLINK_CONTRAST_DROP`. UNTESTED FRR risk: glasses (a
+/// static lens IR reflection inflates the closed-frame contrast, shrinking the
+/// ratio) and strong ambient IR (washes out the corneal peak); both fail safe
+/// to the password. Wants a glasses/bright-ambient genuine pass before wide use.
+pub const BLINK_CONTRAST_DROP_MIN: f32 = 1.15;
 
 /// One observation from an IR capture sequence: frame index in the sequence, the
 /// min-eye EAR when a face was detected in that frame, and the frame's mean
@@ -434,6 +448,10 @@ pub struct EarSample {
     pub cx: f32,
     pub cy: f32,
     pub fsize: f32,
+    /// Corneal specular contrast (peak − local-mean at the eye, 0 when no face).
+    /// A live open eye spikes high and collapses on closure; a diffuse print
+    /// stays flat. The second liveness cue: a real blink shows this DROP.
+    pub contrast: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +510,40 @@ pub fn face_speeds(samples: &[EarSample]) -> (Vec<f32>, f32, f32) {
         med = vals[vals.len() / 2];
     }
     (speeds, med, mx)
+}
+
+/// Corneal-contrast signature of the window: the open-eye contrast (median
+/// specular contrast over the frames where the eye is most open) and the dip
+/// contrast (contrast at the lowest-EAR frame). A real eye's corneal glint is
+/// bright when open and collapses under the lid on a blink, so open ≫ dip; a
+/// diffuse print has no glint to lose, so open ≈ dip. Returns (open, dip);
+/// both 0 if no usable face frames. Diagnostic for calibrating the second cue.
+pub fn contrast_signature(samples: &[EarSample]) -> (f32, f32) {
+    let faces: Vec<&EarSample> = samples
+        .iter()
+        .filter(|s| s.fsize > 0.0 && s.ear.is_some_and(|e| e.is_finite()))
+        .collect();
+    if faces.is_empty() {
+        return (0.0, 0.0);
+    }
+    let max_ear = faces
+        .iter()
+        .map(|s| s.ear.unwrap())
+        .fold(f32::NEG_INFINITY, f32::max);
+    // Open-eye frames: EAR within 85% of this window's max (clearly not mid-blink).
+    let mut open: Vec<f32> = faces
+        .iter()
+        .filter(|s| s.ear.unwrap() >= 0.85 * max_ear)
+        .map(|s| s.contrast)
+        .collect();
+    let open_c = median(&mut open).unwrap_or(0.0);
+    // Dip contrast: at the single lowest-EAR face frame.
+    let dip_c = faces
+        .iter()
+        .min_by(|a, b| a.ear.unwrap().total_cmp(&b.ear.unwrap()))
+        .map(|s| s.contrast)
+        .unwrap_or(0.0);
+    (open_c, dip_c)
 }
 
 /// Detect a natural blink PASSIVELY from a raw-frame-rate EAR sequence.
@@ -584,6 +636,22 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
     let (_, motion_med, _) = face_speeds(samples);
     if motion_med > motion_max {
         return BlinkResult::NoBlink;
+    }
+    // Corneal-contrast gate (second, independent cue): a real blink occludes the
+    // eye's specular glint under the lid, so open-eye contrast must exceed the
+    // closed-frame contrast by a ratio. A diffuse print has no glint to lose
+    // (ratio ~1). Skipped when no contrast was measured (all samples 0.0), so
+    // callers that don't populate it keep the prior behaviour.
+    let (open_c, dip_c) = contrast_signature(samples);
+    if open_c > 0.0 && dip_c > 0.0 {
+        let drop_min = std::env::var("IRLUME_BLINK_CONTRAST_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(BLINK_CONTRAST_DROP_MIN);
+        if open_c / dip_c < drop_min {
+            return BlinkResult::NoBlink;
+        }
     }
     if ratios.iter().any(|o| o.ratio <= BLINK_EAR_DIP_RATIO) {
         return BlinkResult::Blinked;
@@ -725,6 +793,10 @@ mod tests {
                 cx: 100.0,
                 cy: 100.0,
                 fsize: 100.0,
+                // Contrast tracks EAR (open eye = bright corneal glint, blink =
+                // glint occluded), so a real blink shows the contrast drop the
+                // gate requires; a flat EAR trace stays flat here too.
+                contrast: e * 500.0,
             })
             .collect()
     }
@@ -742,6 +814,7 @@ mod tests {
                     cx: 100.0,
                     cy: 100.0,
                     fsize: 100.0,
+                    contrast: lit[i] * 500.0,
                 });
             }
             if i < dark.len() {
@@ -752,6 +825,7 @@ mod tests {
                     cx: 100.0,
                     cy: 100.0,
                     fsize: dark[i].map_or(0.0, |_| 100.0),
+                    contrast: dark[i].map_or(0.0, |e| e * 500.0),
                 });
             }
         }
@@ -784,11 +858,38 @@ mod tests {
                 cx: 100.0 + i as f32 * 5.0,
                 cy: 100.0,
                 fsize: 100.0,
+                contrast: e * 500.0,
             })
             .collect();
         // Sanity: the same EAR shape with a still face still passes.
         assert_eq!(detect_blink(&flat(&ears)), BlinkResult::Blinked);
         assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
+    }
+
+    /// Same deep-dip EAR shape, still face, but FLAT corneal contrast (a diffuse
+    /// print has no glint to lose): the contrast gate rejects it as NoBlink even
+    /// though EAR and motion both look like a blink. Calibrated on the NexiGo:
+    /// genuine drop 1.41-2.63, a flat print ~1.0.
+    #[test]
+    fn flat_contrast_dip_is_gated_out() {
+        let ears = [0.24, 0.24, 0.23, 0.15, 0.16, 0.24, 0.24, 0.23, 0.24];
+        let seq: Vec<EarSample> = ears
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| EarSample {
+                idx: i,
+                ear: Some(e),
+                bri: 60.0,
+                cx: 100.0,
+                cy: 100.0,
+                fsize: 100.0,
+                contrast: 60.0, // flat: no glint collapse on the "blink"
+            })
+            .collect();
+        assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
+        // The same EAR/motion with a real glint collapse (flat() ties contrast
+        // to EAR) is accepted, so it's the contrast that gates, not the shape.
+        assert_eq!(detect_blink(&flat(&ears)), BlinkResult::Blinked);
     }
 
     #[test]
@@ -876,6 +977,7 @@ mod tests {
             cx: 100.0,
             cy: 100.0,
             fsize: 100.0,
+            contrast: e * 500.0,
         })
         .collect();
         for i in 5..30 {
@@ -886,6 +988,7 @@ mod tests {
                 cx: 0.0,
                 cy: 0.0,
                 fsize: 0.0,
+                contrast: 0.0,
             });
         }
         assert_eq!(detect_blink(&seq), BlinkResult::NoEyes);
@@ -918,6 +1021,7 @@ mod tests {
             cx: 100.0,
             cy: 100.0,
             fsize: 100.0,
+            contrast: e * 500.0,
         })
         .collect();
         assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);

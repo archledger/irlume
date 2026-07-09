@@ -1327,7 +1327,7 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
                     height: f.height,
                 };
                 let mut ear_i = None;
-                let (mut cx, mut cy, mut fsize) = (0.0, 0.0, 0.0);
+                let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
                 if let Some(t) = det
                     .detect(&iv)?
                     .into_iter()
@@ -1338,12 +1338,9 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
                         .min(irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT));
                     ears.push(ear);
                     ear_i = Some(ear);
-                    contrast_max = contrast_max.max(irlume_auth::eye_glint_contrast(
-                        &f.data,
-                        f.width,
-                        f.height,
-                        &t.landmarks,
-                    ));
+                    contrast =
+                        irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                    contrast_max = contrast_max.max(contrast);
                     cx = (t.bbox[0] + t.bbox[2]) * 0.5;
                     cy = (t.bbox[1] + t.bbox[3]) * 0.5;
                     fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
@@ -1355,6 +1352,7 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
                     cx,
                     cy,
                     fsize,
+                    contrast,
                 });
             }
             if trace_on {
@@ -1386,8 +1384,10 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
                 (Some((_, k, _)), false) if k == "bonafide" => " ✗ live user not confirmed",
                 _ => "",
             };
-            let (_, mot_med, mot_max) = irlume_liveness::face_speeds(&samples);
-            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3}  contrast_max {contrast_max:>5.0}  motion med {mot_med:.3} max {mot_max:.3}  (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
+            let (_, mot_med, _) = irlume_liveness::face_speeds(&samples);
+            let (open_c, dip_c) = irlume_liveness::contrast_signature(&samples);
+            let drop = if dip_c > 0.0 { open_c / dip_c } else { 0.0 };
+            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3}  contrast open {open_c:>4.0} dip {dip_c:>4.0} drop {drop:.2}  motion med {mot_med:.3}  (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
             if let (Some(f), Some((sp, kind, _))) = (out_file.as_mut(), &record) {
                 let rec = serde_json::json!({
                     "species": sp, "kind": kind, "path": "ear", "idx": rep,

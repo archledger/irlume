@@ -502,7 +502,7 @@ impl Engine {
                 height: f.height,
             };
             let mut ear = None;
-            let (mut cx, mut cy, mut fsize) = (0.0, 0.0, 0.0);
+            let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
             if let Some(t) = self
                 .det
                 .detect(&view)?
@@ -516,6 +516,9 @@ impl Engine {
                 cx = (t.bbox[0] + t.bbox[2]) * 0.5;
                 cy = (t.bbox[1] + t.bbox[3]) * 0.5;
                 fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
+                // Corneal specular contrast from the IR frame at the eye
+                // landmarks (the second liveness cue: collapses on a real blink).
+                contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
             }
             samples.push(irlume_liveness::EarSample {
                 idx: i,
@@ -524,6 +527,7 @@ impl Engine {
                 cx,
                 cy,
                 fsize,
+                contrast,
             });
         }
         Ok(irlume_liveness::detect_blink(&samples))

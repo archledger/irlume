@@ -1,18 +1,21 @@
 # AppArmor profile for the irlume face-authentication daemon (Debian/Ubuntu
-# parity with the Fedora SELinux module in packaging/selinux/).
+# parity with the enforced Fedora SELinux module in packaging/selinux/).
 #
-# Ship-in-COMPLAIN first: install, exercise every auth path (enroll, verify,
-# lock screen, TUI), check `journalctl -k | grep -i apparmor` for would-be
-# denials, then flip to enforce. Authentication must never break on a policy
-# gap — the profile is defense-in-depth, not the security boundary.
+# ENFORCE by default. Soak-validated 2026-07-09 on Ubuntu 26.04 (ThinkPad X13,
+# TPM + IR/RGB camera): the profile loaded in complain first and every auth
+# path (doctor, identify, enroll, keyring arm/TPM seal, diag, pamtester
+# UnsealPassword) produced ZERO would-be-denials, then ran clean under enforce.
+# A policy gap here degrades face auth to the password (irlume never locks out),
+# so enforce is fail-safe; still soak new hardware/derivatives in complain
+# before trusting enforce there (drop in `flags=(complain)` below to do so).
 #
-# Install:  cp usr.local.bin.irlumed /etc/apparmor.d/ && apparmor_parser -r -C /etc/apparmor.d/usr.local.bin.irlumed
-# Enforce:  aa-enforce /etc/apparmor.d/usr.local.bin.irlumed
+# Reload:  apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed
+# Complain (per-box soak):  add `flags=(complain)` to the profile line + reload.
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile irlumed /usr/bin/irlumed flags=(complain) {
+profile irlumed /usr/bin/irlumed {
   include <abstractions/base>
   # uid→name lookups for SO_PEERCRED authz (/etc/nsswitch.conf, passwd, group).
   include <abstractions/nameservice>
@@ -23,11 +26,13 @@ profile irlumed /usr/bin/irlumed flags=(complain) {
   /sys/class/ r,
   /sys/class/*/ r,
 
-  # ONNX Runtime (mmap-exec): system lib dirs or a versioned /opt install.
+  # ONNX Runtime (mmap-exec): system lib dirs, a versioned /opt install, or the
+  # bundled runtime under /usr/share (ORT_DYLIB_PATH is set per-distro).
   /usr/lib{,64}/libonnxruntime*.so* mr,
   /usr/local/lib/libonnxruntime*.so* mr,
   /opt/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
   /opt/onnxruntime-*/lib/libonnxruntime*.so* mr,
+  /usr/share/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
 
   # Models: packaged location or a hand-installed repo checkout.
   /usr/share/irlume/models/*.onnx r,
@@ -47,6 +52,11 @@ profile irlumed /usr/bin/irlumed flags=(complain) {
   /dev/tpmrm[0-9] rw,
   /dev/tpm[0-9] rw,
 
+  # systemd signed-PCR policy artifacts (Tier-1 unseal on signed-UKI boxes;
+  # absent on GRUB installs, where the read is existence-gated).
+  /{etc,run,usr/lib}/systemd/tpm2-pcr-signature.json r,
+  /{etc,run,usr/lib}/systemd/tpm2-pcr-public-key.pem r,
+
   # Config + state: enrollments (per-user), template keys, recovery blobs.
   /etc/irlume/ r,
   /etc/irlume/** rw,
@@ -55,11 +65,12 @@ profile irlumed /usr/bin/irlumed flags=(complain) {
   /var/lib/irlume/ rw,
   /var/lib/irlume/** rw,
 
-  # Camera-busy diagnostics name the process holding the device.
+  # Camera-busy diagnostics name the process holding the device (readdir /proc,
+  # readlink each fd to find who holds the camera node, read its comm).
   /proc/ r,
   /proc/[0-9]*/fd/ r,
+  /proc/[0-9]*/fd/[0-9]* r,
   /proc/[0-9]*/comm r,
-  /proc/[0-9]*/cmdline r,
 
   # Reading another user's state dir as the root daemon.
   capability dac_override,

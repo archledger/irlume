@@ -2,8 +2,8 @@
 
 irlume bundles a **permissive, GPLv3-compatible** model stack. All weights are
 committed to this repo via **Git LFS** (see `../.gitattributes`) and loaded from
-`/usr/share/irlume/models/` (packages) or this dir (dev) — a clone or package is
-fully self-contained, no runtime download or fetch step. After cloning, run
+`/usr/share/irlume/models/` (packages) or this dir (dev); a clone or package is
+self-contained, no runtime download or fetch step. After cloning, run
 `git lfs pull` if your client didn't fetch LFS objects automatically.
 
 | File | Stage | Source | License | Notes |
@@ -13,36 +13,36 @@ fully self-contained, no runtime download or fetch step. After cloning, run
 | `face_landmark.onnx` | liveness (EAR) | Google MediaPipe FaceMesh (`face_landmark.tflite`) | **Apache-2.0** | 468 landmarks; input `[1,192,192,3]` RGB → `1404` + face flag. Eye-contour EAR for passive blink liveness. See note below. |
 | `ir_adapter.onnx` | recognition (IR domain) | self-trained residual adapter (512→512), trained on the author's own IR captures | **GPL-3.0-or-later** (project) | boosts IR-frame match scores toward the RGB enrollment; no third-party training data |
 
-### MediaPipe FaceMesh — license-verified (unlike Silent-Face)
+### MediaPipe FaceMesh: license-verified (unlike Silent-Face)
 
 Cleared the clean-BOM gate 2026-07-01 against Google's **official model card**
 (`storage.googleapis.com/mediapipe-assets/…FaceMesh…`). Unlike Silent-Face, the
 model card **itself states "LICENSED UNDER Apache License, Version 2.0"** (weights,
 not just code; authored by Google) and documents **first-party training data**
-(Google-collected smartphone/AR images — no MS-Celeb-1M / CelebA-Spoof taint). →
+(Google-collected smartphone/AR images, no MS-Celeb-1M / CelebA-Spoof taint). →
 warrantable, GPLv3-compatible. **Sourced 2026-07-01** by converting Google's
 canonical Apache-2.0 `face_landmark.tflite`
 (`storage.googleapis.com/mediapipe-assets/`) with `tf2onnx --opset 13` on archhost
 (TF needs Python ≤3.12 via a `uv` venv; neither box ships one by default). The
 `face_landmark_with_attention.tflite` (478 + iris) does **not** convert to a runnable
-ONNX — tf2onnx leaves a MediaPipe custom op (`TFL_Landmarks2TransformMatrix`) that
-onnxruntime rejects — so we use the basic 468-landmark model, whose eye-contour
-points suffice for EAR. Honest,
-non-license caveats to document at use: the card's out-of-scope notes ("not for
+ONNX: tf2onnx leaves a MediaPipe custom op (`TFL_Landmarks2TransformMatrix`) that
+onnxruntime rejects, so we use the basic 468-landmark model, whose eye-contour
+points suffice for EAR. Non-license
+caveats to document at use: the card's out-of-scope notes ("not for
 facial recognition/identification", "not for life-critical decisions") are
-**advisory** — irlume uses it for LIVENESS only (EAR/blink, not recognition) with a
+**advisory**: irlume uses it for LIVENESS only (EAR/blink, not recognition) with a
 mandatory password fallback; and it is RGB/selfie-trained, so IR-grey performance
 must be validated (see ADR-0002).
 
 ## Do NOT use
 
 - **AuraFace's bundled `scrfd_10g_bnkps.onnx`** (and `1k3d68`, `2d106det`,
-  `genderage`) — those are InsightFace detection/aux models with **non-commercial**
+  `genderage`): those are InsightFace detection/aux models with **non-commercial**
   weights. Take only `glintr100.onnx` from that repo; use YuNet for detection.
-- **InsightFace buffalo_l / antelopev2** (`w600k_r50`, `det_10g`) — non-commercial
+- **InsightFace buffalo_l / antelopev2** (`w600k_r50`, `det_10g`): non-commercial
   weights, **incompatible with GPL** (which guarantees downstream commercial use).
 - **Silent-Face / MiniFASNet anti-spoofing weights** (minivision-ai, incl. HF ONNX
-  re-exports) — the *code* is Apache-2.0 but the **weights carry no explicit license
+  re-exports): the *code* is Apache-2.0 but the **weights carry no explicit license
   and no documented training data** (verified 2026-06-30; the re-export disclaims
   training and gives no warranty). Weights ≠ code: an Apache `LICENSE` on the source
   does not license weights whose provenance is unwarrantable. **Fails the clean-BOM

@@ -3,11 +3,11 @@
 You've installed irlume (see the [README](../README.md#-install) for `dnf` /
 `apt` / `pacman`). This guide takes you from there to a working face login.
 
-The package **starts the `irlumed` daemon for you** — nothing else is running or
+The package **starts the `irlumed` daemon for you**; nothing else is running or
 wired yet, and nothing touches your login until you ask. Two ways to set up:
 
-- **[Guided (TUI)](#guided-setup-tui)** — one screen walks you through it.
-- **[Manual (CLI)](#manual-setup-cli)** — the individual commands, scriptable.
+- **[Guided (TUI)](#guided-setup-tui)**: one screen walks you through it.
+- **[Manual (CLI)](#manual-setup-cli)**: the individual commands, scriptable.
 
 Both do the same thing. The password is always the fallback; no step can lock
 you out.
@@ -20,26 +20,26 @@ you out.
 irlume tui
 ```
 
-The TUI opens on a six-step wizard — **Welcome → Profiles → Keyring → Recovery →
+The TUI opens on a six-step wizard: **Welcome → Profiles → Keyring → Recovery →
 Login wiring → Done**. `Tab` moves forward, `⇧Tab` back, `[v]` reveals the
 advanced tabs (Cameras, Identify, Settings), and each screen shows its own keys
 in the footer.
 
-1. **Welcome** — press `[e]` to enroll right away, or `Tab` to walk the steps.
-2. **Profiles** — `[e]` enrolls a face. Look at the camera; it guides your
+1. **Welcome**: press `[e]` to enroll right away, or `Tab` to walk the steps.
+2. **Profiles**: `[e]` enrolls a face. Look at the camera; it guides your
    framing and captures three scans automatically. Wear glasses sometimes?
    Enroll a second profile for that look.
-3. **Keyring** *(recommended; IR camera + TPM)* — arm TPM keyring unlock so a
+3. **Keyring** *(recommended; IR camera + TPM)*: arm TPM keyring unlock so a
    face login opens your wallet with no prompt. You'll enter your login password
    once; it is sealed in the TPM, never stored in plaintext. Skip it and your
    wallet just prompts separately after login.
-4. **Recovery** *(recommended)* — set a recovery passphrase. It restores your
+4. **Recovery** *(recommended)*: set a recovery passphrase. It restores your
    templates after a TPM clear or firmware update without re-enrolling; without
    it, such a change forces a full re-enroll.
-5. **Login wiring** — press `[w]` to wire the **greeter and lock screen**
+5. **Login wiring**: press `[w]` to wire the **greeter and lock screen**
    (runs `sudo irlume login enable --apply`). Face-`sudo` is opt-in and *not*
-   included by `[w]` — see [face-sudo](#face-sudo-optional) below.
-6. **Done** — a dashboard of everything's state. If anything failed, the
+   included by `[w]`; see [face-sudo](#face-sudo-optional) below.
+6. **Done**: a dashboard of everything's state. If anything failed, the
    **Repair** tab appears with one-key fixes.
 
 That's it. Skip to [Verify](#verify) to confirm, or read on for the manual
@@ -121,18 +121,18 @@ the plan and writes nothing.
 [login] done. Password remains the fallback everywhere.
 ```
 
-**How you log in:** face is **on-demand** — at the greeter (and lock screen),
+**How you log in:** face is **on-demand**. At the greeter (and lock screen),
 leave the password field **empty and press Enter**; the camera fires only then,
 never on its own. Typing a password never starts the camera, and the password
 always works. The one exception is older GNOME greeters (Shell < 46), whose
-greeter can't relay the empty-field probe — there the camera verifies as soon
+greeter can't relay the empty-field probe; there the camera verifies as soon
 as your account is selected (face-first). `irlume login status` shows which
 mode each wired service uses.
 
-### 4. Keyring unlock — recommended (IR camera + TPM)
+### 4. Keyring unlock: recommended (IR camera + TPM)
 
 This is what makes a face login open your GNOME Keyring / KWallet with no
-separate prompt — the Windows-Hello-style experience. Skip it and face login
+separate prompt, the Windows-Hello-style experience. Skip it and face login
 still works, but your wallet stays locked and prompts you for its password after
 every login, which is half the point.
 
@@ -141,11 +141,11 @@ irlume keyring arm
 ```
 
 It prompts for your **login password** (typed twice, to catch a typo), which it
-seals in the TPM — never stored in plaintext. Re-run it after you change your
+seals in the TPM; the password is never stored in plaintext. Re-run it after you change your
 login password. On a fingerprint machine a fingerprint login unseals the wallet
 the same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
-### 5. Recovery passphrase — recommended
+### 5. Recovery passphrase: recommended
 
 Set this. It's your backstop: without it, a TPM clear or a routine
 firmware/dbx/Secure-Boot update can invalidate the TPM-sealed key and force you
@@ -164,14 +164,14 @@ somewhere safe (like a disk-encryption recovery key).
 ## face-sudo (optional)
 
 `login enable` and the TUI's `[w]` deliberately wire only the greeter and lock
-screen. Granting **root by face** is a trade-off worth choosing on purpose, so
-`sudo` is separate:
+screen. Granting **root by face** is its own decision, so `sudo` is
+separate:
 
 ```sh
 sudo irlume login enable --with-sudo --apply
 ```
 
-The password still works for `sudo` too — face is `sufficient`, not required.
+The password still works for `sudo` too; face is `sufficient`, not required.
 Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
 `sudo true`.
 

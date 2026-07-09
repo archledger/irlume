@@ -1,7 +1,7 @@
 # Contributing to irlume
 
-Thanks for your interest! irlume is **GPL-3.0-or-later** and intends to stay
-fully open source forever. There is **no CLA** and no commercial relicensing —
+Thanks for your interest. irlume is **GPL-3.0-or-later** and intends to stay
+fully open source forever. There is **no CLA** and no commercial relicensing;
 your contributions remain under the same copyleft terms everyone else enjoys.
 
 ## Developer Certificate of Origin (DCO)
@@ -15,22 +15,22 @@ git commit -s -m "your message"
 ```
 
 This appends a `Signed-off-by: Your Name <you@example.com>` line. By signing off
-you certify the DCO. That's it — no forms, no rights assignment.
+you certify the DCO. That's it: no forms, no rights assignment.
 
 ## Ground rules for a security project
 
-- **Never commit biometric data** — no captured frames, embeddings, or
+- **Never commit biometric data**: no captured frames, embeddings, or
   templates, even as test fixtures. Use synthetic or your own clearly-consented
   data, kept out of the repo.
 - **Keep the model BOM permissive.** Any new model must be clean at all three
   layers (code, weights, training data). No InsightFace buffalo_l/antelopev2 or
-  other non-commercial weights — they conflict with GPL.
+  other non-commercial weights; they conflict with GPL.
 - **Liveness/PAD changes** should come with a self-test against the relevant
-  ISO/IEC 30107-3 attack class — run `IRLUME_DEV=1 irlume padcapture` /
+  ISO/IEC 30107-3 attack class: run `IRLUME_DEV=1 irlume padcapture` /
   `padreport` and
   include the per-species APCER/BPCER numbers. See
   [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
-- Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR — CI
+- Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR; CI
   runs the same checks (`cargo fmt --check`, `cargo clippy -D warnings`, build,
   test on Rust 1.88) on every push and PR, so a green local run means a green CI.
   The codebase is rustfmt-formatted (default style); the bulk-format commit is
@@ -40,7 +40,7 @@ you certify the DCO. That's it — no forms, no rights assignment.
 ## Setting up a dev environment
 
 See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full walkthrough. The
-quickest path is Nix — `nix develop` gives you the whole pinned toolchain
+quickest path is Nix: `nix develop` gives you the whole pinned toolchain
 (Rust, libclang, TPM/PAM libs, the ONNX runtime) on any distro with one
 command; the guide also lists the per-distro `dnf`/`apt`/`pacman` dependencies
 if you'd rather install them by hand. Note the models live in Git LFS

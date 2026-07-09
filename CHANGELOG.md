@@ -3,22 +3,22 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.4] — 2026-07-07
+## [0.1.4] - 2026-07-07
 
-A distribution and self-update release — face authentication itself is
+A distribution and self-update release: face authentication itself is
 unchanged; this makes installing and updating irlume smooth on every distro.
 
 ### Changed
 
 - **`irlume update` is fully adaptive.** It reports the version your package
-  manager actually has installed, detects the exact channel it came from (Copr,
+  manager has installed, detects the exact channel it came from (Copr,
   PPA, the GitHub `.deb`, the pacman package, or a source build), matches the
   release asset for your CPU architecture, and only offers a download that
-  actually exists — no more dead links or steering an Ubuntu derivative to a PPA
+  exists: no more dead links or steering an Ubuntu derivative to a PPA
   that can't serve it.
 - **Two Ubuntu lanes.** The PPA carries the current Ubuntu LTS (native,
   auto-updating); every derivative (Mint, Pop!_OS, Zorin, elementary) uses the
-  universal `.deb` below — one binary that installs on Ubuntu 24.04 and newer.
+  universal `.deb` below: one binary that installs on Ubuntu 24.04 and newer.
 - Declared minimum Rust is now 1.88 (the real floor, via the ONNX Runtime binding).
 
 ### Fixed
@@ -26,44 +26,44 @@ unchanged; this makes installing and updating irlume smooth on every distro.
 - Arch: `git lfs pull` fetches the model weights correctly under `makepkg`.
 - PPA source builds pack a deterministic orig tarball.
 
-### Downloads — which asset do I need?
+### Downloads: which asset do I need?
 
 Prefer your distro's repo (`dnf` / the PPA / the AUR-style package) so updates
 arrive automatically; these assets are direct downloads for everyone else.
 
-- **`irlume_0.1.4_amd64.deb`** — Debian and Ubuntu derivatives. Built on the
+- **`irlume_0.1.4_amd64.deb`**: Debian and Ubuntu derivatives. Built on the
   oldest supported Ubuntu base, so this single file installs on Mint, Pop!_OS,
   Zorin, elementary, and any newer Ubuntu (`sudo apt install ./…`).
-- **`irlume-0.1.4-1-x86_64.pkg.tar.zst`** — Arch Linux (`sudo pacman -U ./…`).
-- **`irlume-0.1.4-1.fc44.x86_64.rpm`** — Fedora, the main package
+- **`irlume-0.1.4-1-x86_64.pkg.tar.zst`**: Arch Linux (`sudo pacman -U ./…`).
+- **`irlume-0.1.4-1.fc44.x86_64.rpm`**: Fedora, the main package
   (`sudo dnf install ./…`). The [Copr](https://copr.fedorainfracloud.org/coprs/archledger/irlume)
   is the auto-updating Fedora channel and pulls the SELinux policy in for you.
-- **`irlume-selinux-0.1.4-1.fc44.noarch.rpm`** — the SELinux policy companion for
+- **`irlume-selinux-0.1.4-1.fc44.noarch.rpm`**: the SELinux policy companion for
   the Fedora RPM. Fedora enforces SELinux by default and the login greeter can't
   reach the daemon without this module. It's a *weak* dependency, so a local
-  `dnf install ./main.rpm` won't pull it automatically — install it alongside the
+  `dnf install ./main.rpm` won't pull it automatically; install it alongside the
   main RPM on an enforcing system. It's `noarch` because the policy is
   architecture-independent (that's also why it's a separate package, not baked
   into the `x86_64` RPM).
 
-## [0.1.3] — 2026-07-07
+## [0.1.3] - 2026-07-07
 
-Display-manager coverage, a diagnostics story, security hardening, and a much
+Display-manager coverage, new diagnostics, security hardening, and a much
 friendlier guided enrollment.
 
 ### Added
 
 - **Every major login manager is now profiled** for consent-driven face auth:
   GDM (on-demand on GNOME ≥ 46, face-first below), SDDM, LightDM (gtk + slick),
-  greetd, COSMIC's greeter, and KDE's Plasma Login Manager — each wired to the
-  behaviour its greeter actually supports. Face is **on-demand** by default:
+  greetd, COSMIC's greeter, and KDE's Plasma Login Manager, each wired to the
+  behaviour its greeter supports. Face is **on-demand** by default:
   leave the password empty and press Enter; typing a password never starts the
   camera.
-- **`irlume logs`** — the whole face-auth story (daemon, PAM grantors, keyring
-  modules) in one journal view, with `-f` / `--since`. **`irlume logs debug
-  on|off`** toggles per-stage pipeline tracing (`IRLUME_LOG=debug`) — capture
-  timings, liveness cues vs thresholds, match scores — for diagnosing a failed
-  or slow login. Numbers only; never frames, embeddings, or secrets.
+- **`irlume logs`**: every face-auth journal line (daemon, PAM grantors, keyring
+  modules) in one view, with `-f` / `--since`. **`irlume logs debug
+  on|off`** toggles per-stage pipeline tracing (`IRLUME_LOG=debug`) for
+  diagnosing a failed or slow login: capture timings, liveness cues vs
+  thresholds, match scores. Numbers only; never frames, embeddings, or secrets.
 - **Directional enrollment guidance**: the framing guide now tells you which way
   to turn ("Turn your head left") and tilt ("Lift your chin"), and **auto-
   calibrates the frontal pitch neutral per user/camera** so the coaching centres
@@ -85,10 +85,10 @@ friendlier guided enrollment.
 ### Fixed
 
 - **Enrollment enforces frontal framing at capture, not just before the
-  countdown** — drifting off-angle during the 3-2-1 re-frames instead of saving
+  countdown**: drifting off-angle during the 3-2-1 re-frames instead of saving
   a bad-angle template.
 
-## [0.1.2] — 2026-07-05
+## [0.1.2] - 2026-07-05
 
 First-run smoothness release, driven by a screen-recorded fresh-install test
 on Fedora: install → `irlume tui` → press `[e]` → enrolled → `[w]` → wired,
@@ -102,7 +102,7 @@ with no terminal detours.
   and the first enrollment failed with a cryptic `os error 2`.
 - **SELinux**: `dnf install irlume` now pulls the policy subpackage in by
   default (weak dependency), and both the subpackage scriptlet and
-  `irlume login enable` restart the daemon after loading the module — the
+  `irlume login enable` restart the daemon after loading the module; the
   already-bound socket kept its pre-policy label, which silently blocked the
   confined greeter until the next reboot.
 - `sudo irlume login disable --apply` now always unwires `/etc/pam.d/sudo`
@@ -118,22 +118,22 @@ with no terminal detours.
 
 ### Changed
 
-- **TUI essential view**: the wizard shows only the setup path — Welcome →
+- **TUI essential view**: the wizard shows only the setup path: Welcome →
   Enroll → Keyring → Recovery → Login wiring → Done. `[v]` reveals all tabs;
-  Repair appears automatically when something actually fails.
+  Repair appears automatically when something fails.
 - **Press `[e]` and it works**: enrolling with a stopped daemon now runs the
   sudo enable+start fix and resumes enrollment automatically.
 - **`[w]` wires login from the TUI** (Done tab and Login-wiring tab); the Done
   dashboard gained a "login wiring" row and says "one step left" instead of a
   premature "All set".
 - Enrollment guidance (glasses profile, appearance changes, sunlight) on the
-  Profiles tab and in the README FAQ; THREAT_MODEL now states plainly that the
+  Profiles tab and in the README FAQ; THREAT_MODEL now states that the
   fingerprint companion has no presentation-attack detection of its own.
 - New `irlume version` subcommand, and `irlume update` now detects how irlume
   was installed (Copr, PPA, release asset, source) and updates through that
   same channel.
 
-## [0.1.1] — 2026-07-04
+## [0.1.1] - 2026-07-04
 
 Packaging-only patch release: makes the Fedora Copr pipeline work end-to-end.
 No functional changes to the daemon, CLI, or PAM module.
@@ -155,15 +155,15 @@ No functional changes to the daemon, CLI, or PAM module.
 - Arch (`.pkg.tar.zst`) and Debian/Ubuntu (`.deb`) packages are functionally
   unchanged from v0.1.0; the v0.1.1 release ships freshly built assets.
 
-## [0.1.0] — 2026-07-03
+## [0.1.0] - 2026-07-03
 
-First public release. Local infrared face authentication for Linux —
+First public release. Local infrared face authentication for Linux:
 clean-BOM, TPM-sealed, engineered to meet or beat Windows Hello. The password
 is always the fallback: no lockout, ever.
 
 ### Added
 
-- **Privilege-separated architecture** — a thin `pam_irlume.so` module and
+- **Privilege-separated architecture**: a thin `pam_irlume.so` module and
   `irlume` CLI are untrusted clients of a privileged `irlumed` daemon (the only
   component that touches the camera, IR emitter, models, templates, or TPM),
   over a `SO_PEERCRED`-authenticated Unix socket.
@@ -171,19 +171,19 @@ is always the fallback: no lockout, ever.
   YuNet (MIT) detection, AuraFace 512-D ArcFace (Apache-2.0) recognition,
   self-built algorithmic IR liveness, and opt-in passive blink liveness via
   MediaPipe FaceMesh (Apache-2.0) eye-aspect-ratio.
-- **Encrypted at rest** — templates are 512-D embeddings only (never images),
+- **Encrypted at rest**: templates are 512-D embeddings only (never images),
   AES-256-GCM encrypted under a key the TPM seals to boot state. Disk-theft
   tested: sealed data is undecryptable on another machine.
-- **Hardware tiers** — IR camera → Secure (login, `sudo`, lock screen, keyring
+- **Hardware tiers**: IR camera → Secure (login, `sudo`, lock screen, keyring
   unlock); RGB-only → Convenience (screen unlock only); optional fingerprint
   companion factor.
-- **TPM-sealed keyring unlock** — a face login unseals the login password and
+- **TPM-sealed keyring unlock**: a face login unseals the login password and
   hands it to gnome-keyring / KWallet, so the wallet opens with no prompt.
 - **Method/tier/login-manager-aware PAM wiring** (`irlume login enable`) for
   GDM, SDDM, and Plasma `plasmalogin`; opt-in, never auto-wired on install.
 - **Guided TUI** (`irlume tui`) for enrollment, configuration, live status, and
   a Repair tab that detects and fixes common issues.
-- **Packaging for all three families** — Fedora RPM (Copr/Packit), Arch
+- **Packaging for all three families**: Fedora RPM (Copr/Packit), Arch
   PKGBUILD, Debian/Ubuntu `.deb` (nfpm). onnxruntime is bundled on Fedora and
   Debian/Ubuntu; Arch uses the system package.
 
@@ -198,11 +198,13 @@ is always the fallback: no lockout, ever.
 
 - Passive blink liveness is a deterrent, not a guarantee: a determined
   life-size glossy print can still slip through occasionally, and it does not
-  cover glasses-wearers — every miss falls safely to the password.
+  cover glasses-wearers; every miss falls safely to the password.
 - RGB-only laptops get the Convenience tier by design (face never releases
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[0.1.4]: https://github.com/archledger/irlume/releases/tag/v0.1.4
+[0.1.3]: https://github.com/archledger/irlume/releases/tag/v0.1.3
 [0.1.2]: https://github.com/archledger/irlume/releases/tag/v0.1.2
 [0.1.1]: https://github.com/archledger/irlume/releases/tag/v0.1.1
 [0.1.0]: https://github.com/archledger/irlume/releases/tag/v0.1.0

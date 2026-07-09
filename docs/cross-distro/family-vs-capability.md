@@ -7,7 +7,7 @@ distro. The rule:
 > **Detect the distro family when the difference is set by the distro's
 > conventions. Detect the live capability when the difference is set by the
 > machine's hardware or boot configuration.** Family is a proxy; when a real
-> runtime signal exists, prefer it — a family guess can be wrong within a family.
+> runtime signal exists, prefer it; a family guess can be wrong within a family.
 
 ## Family-determined (use `distro_family()`)
 
@@ -36,7 +36,7 @@ wrong. irlume detects the live condition instead:
 | **Signed-PCR seal usable** | **seal→unseal round-trip** | **boot loader (UKI vs GRUB), not distro** |
 | Fingerprint reader | fprintd + reader probe | hardware |
 
-### The proof: signed-PCR policy is boot-config, not family
+### Signed-PCR policy follows boot config, not family
 
 Measured live across all three boxes (`/run/systemd/tpm2-pcr-*`):
 
@@ -46,7 +46,7 @@ Measured live across all three boxes (`/run/systemd/tpm2-pcr-*`):
 | ThinkPad | Ubuntu | **no** → literal PCR-7 |
 | archhost | Arch | **yes** (but GRUB boot ⇒ don't match the live PCRs) |
 
-The *only* box with signed artifacts is the Arch one — the opposite of the
+The *only* box with signed artifacts is the Arch one, the opposite of the
 "Fedora/UKI has them" intuition. A family rule would misfire in every
 direction. So irlume seals via the signed path only if the sealed envelope
 **actually round-trips** (`tpm::seal` test-unseals before trusting it), else
@@ -61,6 +61,6 @@ per-family PAM module install dir, onnxruntime dependency, and post-install
 PAM wiring. A small `irlume doctor` line printing the detected family + the
 choices it implies would make the adaptation transparent (candidate).
 
-Capability-detection stays the tool for everything the daemon does at runtime —
+Capability-detection stays the tool for everything the daemon does at runtime;
 it already is, and the TPM round-trip is the model to follow for any future
 "does this actually work here?" decision.

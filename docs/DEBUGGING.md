@@ -1,20 +1,20 @@
 # Debugging & scrutiny guide
 
-Everything here is for reading irlume's decisions — whether you're diagnosing
+Everything here is for reading irlume's decisions: diagnosing
 "face login didn't work", timing a slow verify, or auditing that the system
 does what the docs claim. Nothing in this guide can weaken auth: traces log
-**numbers only** (scores, thresholds, cue values, timings) — never camera
+**numbers only** (scores, thresholds, cue values, timings), never camera
 frames, embeddings, passwords, or anything reusable.
 
 ## The journal, in one view
 
 All auth decisions land in the system journal. `irlume logs` shows the whole
-story in one stream — daemon lines, the PAM audit records that say what the
+story in one stream: daemon lines, the PAM audit records that say what the
 greeter actually granted, and the keyring modules a face login feeds:
 
 ```sh
 irlume logs                     # this boot (sudo if the system journal is hidden)
-irlume logs -f                  # live — watch while you test a login
+irlume logs -f                  # live: watch while you test a login
 irlume logs --since "20 min ago"
 ```
 
@@ -26,7 +26,7 @@ How to read the key lines:
 | `irlumed: UnsealPassword: OK for 'x' (score 0.88)` | face matched AND the TPM released the sealed password |
 | `…face matched … but TPM unseal FAILED` | face was fine; PCR drift kept the keyring locked → `irlume diag`, then `sudo irlume reseal` |
 | `audit … grantors=pam_irlume` | PAM's own record that the grant came from face, not password fallthrough |
-| `pam_unix(<svc>:auth): authentication failure` with **no** irlumed line before it | a typed (wrong) password — correct on-demand behavior: typing never fires the camera |
+| `pam_unix(<svc>:auth): authentication failure` with **no** irlumed line before it | a typed (wrong) password; correct on-demand behavior: typing never fires the camera |
 | `plasma-kwallet-pam` / `pam_gnome_keyring` lines | the unsealed password reaching your wallet/keyring |
 
 ## Per-stage pipeline tracing
@@ -52,32 +52,32 @@ irlume[debug]: verify 'x' total 1843ms
 ```
 
 Every gate that can reject prints its measured value next to the threshold it
-was compared against, **on pass as well as fail** — a genuine user skating
+was compared against, **on pass as well as fail**. A genuine user skating
 just above a floor is visible here long before it becomes a false reject. The
 dim/dark paths add `match(fusion)`, `match(ir-fallback)`,
 `liveness(ir-only/dark)`, and `match(ir/dark)` lines with the same shape. Most
-wall-clock time is camera I/O (`assess:` lines), not inference — useful when
-chasing a slow login.
+wall-clock time goes to camera I/O; the `assess:` lines show it, which helps
+when chasing a slow login.
 
 The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
 
-**Security note — treat tracing as a diagnostic session, not a resident
+**Security note: treat tracing as a diagnostic session, not a resident
 setting.** While tracing is on, *denied* attempts log their exact match score
 next to the threshold. To anyone who can read the system journal (root or the
 `systemd-journal` group) that is an oracle: present a spoof, read how close it
-got, adjust, repeat — most relevant if you enabled face-`sudo`, where a
+got, adjust, repeat. This is most relevant if you enabled face-`sudo`, where a
 compromised user session would be the one reading the journal. Both halves are
 privileged (enabling tracing needs root; reading the system journal needs
-root/`systemd-journal`), so this does not weaken a default setup — but the
+root/`systemd-journal`), so this does not weaken a default setup, but the
 habit that keeps it irrelevant is: turn tracing on, reproduce your problem,
 turn it off. With tracing **off** (the default), the journal's denied-attempt
 lines are deliberately coarsened: scores quantize to one decimal
 (`score ~0.4`) and measured cue values are redacted (`IR too flat
-(center/edge …)`) — the categorical reason (which gate fired) stays, the
+(center/edge …)`). The categorical reason (which gate fired) stays; the
 per-attempt gradient goes. The **exact** numbers still reach the one place a
 genuine user is being coached through a false reject: the TUI/CLI in their
-own session (the IPC reply), which a greeter-side attacker never sees — the
+own session (the IPC reply), which a greeter-side attacker never sees; the
 PAM module ignores the reason text entirely. Nothing else changes while
 tracing is on: gates, thresholds, and what the daemon will or will not
 release are identical.
@@ -100,7 +100,7 @@ sudo pamtester <service> $USER authenticate
 ```
 
 `<service>` is your greeter's PAM service: `plasmalogin`, `sddm`, `lightdm`,
-`greetd`, `gdm-password`, `cosmic-greeter` — `irlume login status` prints the
+`greetd`, `gdm-password`, `cosmic-greeter`. `irlume login status` prints the
 active one. On an on-demand wiring, press **Enter on the empty password
 prompt** to trigger face; type the password to confirm the no-camera path.
 Watch `irlume logs -f` in a second terminal.
@@ -116,10 +116,10 @@ Expected on-demand matrix (all live-validated):
 
 ## Platform checks
 
-- **SELinux (Fedora):** `sudo ausearch -m avc -ts recent | grep irlume` — must
-  be empty; the shipped policy covers the confined greeter → daemon socket.
+- **SELinux (Fedora):** `sudo ausearch -m avc -ts recent | grep irlume` must
+  come back empty; the shipped policy covers the confined greeter → daemon socket.
 - **KWallet false alarm:** `busctl call org.kde.kwalletd6 … isOpen` can report
-  `false` even when your wallet is open — it activates an empty legacy
+  `false` even when your wallet is open; it activates an empty legacy
   `kwalletd6`, the wrong daemon. Query the real one instead:
   `busctl --user get-property org.freedesktop.secrets
   /org/freedesktop/secrets/collection/kdewallet org.freedesktop.Secret.Collection Locked`
@@ -128,7 +128,7 @@ Expected on-demand matrix (all live-validated):
 ## Developer / benchmark tools
 
 Gated behind `IRLUME_DEV=1` because they open the camera directly (bypassing
-the daemon) — measurement tools, not attack surface:
+the daemon); they measure, and hold no privileged path:
 
 | Tool | What it does |
 |---|---|

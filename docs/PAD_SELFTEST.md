@@ -14,14 +14,14 @@ form of the "self-test against ISO/IEC 30107-3 attack classes" milestone named i
 > **This is a self-administered engineering test, not a certification.** It follows
 > the ISO metrics and an iBeta-shaped protocol so results are comparable to the
 > literature, but it is **not** a lab-accredited evaluation and confers no iBeta /
-> FIDO certificate. Its purpose is to *measure* the gate honestly and to *drive
+> FIDO certificate. Its purpose is to *measure* the gate and to *drive
 > threshold hardening* from real attack data instead of guesses.
 
 ---
 
 ## 1. What is under test
 
-The **credential-releasing IR gate** — the hard, single-frame IR-physics gate that
+The **credential-releasing IR gate**: the hard, single-frame IR-physics gate that
 must pass before any match releases a secret. Two code paths are in scope:
 
 | Path (`--path`) | Gate function | When it runs |
@@ -29,7 +29,7 @@ must pass before any match releases a secret. Two code paths are in scope:
 | `full` (default) | `LivenessGate::evaluate` | RGB + IR present (normal, lit use) |
 | `ir-only` | `LivenessGate::evaluate_ir_only` | dark operation (no visible-light face) |
 
-**Out of scope — deliberately.** The **RGB-only** convenience tier
+**Deliberately out of scope.** The **RGB-only** convenience tier
 (`evaluate_rgb_only`) is deterrent-grade only: it is limited to lock-screen unlock
 and **never releases credentials, logs in, or elevates**. Measuring its APCER would
 overstate what it is trusted to do, so it is excluded from the PAD claim. Its
@@ -55,19 +55,19 @@ Attack Instrument categories, ISO term). Constants are the current values in
 | `ir_reflectance_ok` | active-emitter skin remission floor (melanin-independent > 1.2 µm → skin-tone fair) | dark / low-reflectance flat media | IR face mean ≥ `IR_FACE_MIN_BRIGHTNESS` (35) |
 | `depth_ok` | shape-from-shading: a 3D face is brighter center→edge under a near-coaxial emitter; flat media are uniform | **printed photo**, flat screen, paper **cutout** | center/edge ratio ≥ `DEPTH_MIN_RATIO` (1.03) |
 | `frontal_ok` | Windows-Hello-style ±15° pose gate (quality, not spoof → `Uncertain`) | off-angle / partial captures | yaw ≤ 0.40, pitch ∈ [0.20, 0.80] |
-| `glint_present` | corneal retro-reflection of the emitter | *supporting only* — never decisive (standalone-glint liveness is refuted) | eye peak ≥ `GLINT_MIN` (180) |
+| `glint_present` | corneal retro-reflection of the emitter | *supporting only*, never decisive (standalone-glint liveness is refuted) | eye peak ≥ `GLINT_MIN` (180) |
 
 The **per-user calibrated IR floor** (a depth-only floor stored at enrollment by
 `irlume-core`, enforced in `Engine::authenticate`) tightens the depth gate for a
 specific user without depending on ambient brightness. `padcapture` exercises
-the **global** gate only — the per-user floor applies at real authentication,
+the **global** gate only; the per-user floor applies at real authentication,
 not in this self-test.
 
 ---
 
 ## 3. PAI species set
 
-### In scope for V1.0 (2D artefacts — the iBeta Level 1 family)
+### In scope for V1.0 (2D artefacts, the iBeta Level 1 family)
 
 | Species (`--species`) | Instrument |
 |---|---|
@@ -78,14 +78,14 @@ not in this self-test.
 | `laptop_replay` | photo/video on a laptop display |
 | `cutout` | printed photo with the eyes cut out / bent for pseudo-depth |
 
-Use a **high-quality image of the genuine enrolled user** for every instrument —
+Use a **high-quality image of the genuine enrolled user** for every instrument;
 the attack must target *that identity*, or it tests nothing (a stranger's photo is
 rejected by recognition, not PAD). Vary distance, angle, and (for prints) curvature
 across the presentations of a species.
 
 ### Out of scope for V1.0 (documented, accepted gaps)
 
-- **3D masks** (silicone / resin / wrapped-paper — the iBeta Level 2 family) and
+- **3D masks** (silicone / resin / wrapped-paper, the iBeta Level 2 family) and
 - **active IR-emitting spoofs**
 
 are **accepted residual risk** per [ADR-0001](adr/0001-liveness-pad-strategy.md) §
@@ -99,26 +99,26 @@ own-IR-rig data is the revisit path. Do **not** report a "pass" as covering thes
 Definitions follow ISO/IEC 30107-3. Implementation and unit tests live in
 `crates/irlume-core/src/pad.rs`.
 
-- **APCER** — Attack Presentation Classification Error Rate: fraction of *attack*
+- **APCER** (Attack Presentation Classification Error Rate): fraction of *attack*
   presentations of a PAI species classified as **bona fide** (the gate returned
   `Live`). Computed **per species**; the report headline is the **worst-case (max)
-  across species**, never an average — one weak species is the system's true
+  across species**, never an average; one weak species is the system's true
   exposure.
-- **BPCER** — Bona-fide Presentation Classification Error Rate: fraction of
+- **BPCER** (Bona-fide Presentation Classification Error Rate): fraction of
   *bona-fide* presentations classified as an attack (a genuine user returned
   `Spoof`). The false-reject cost.
-- **Non-response** — presentations that returned `Uncertain` ("re-present / face the
+- **Non-response**: presentations that returned `Uncertain` ("re-present / face the
   camera"). Reported **separately** per ISO. An `Uncertain` attack did **not**
   succeed (it is not counted in APCER's numerator), but a species whose attacks
-  merely *stall* is flagged, because an attacker can retry — treat a high attack
+  merely *stall* is flagged, because an attacker can retry; treat a high attack
   non-response rate as unresolved, not as a defence.
 - **ACER** = (worst-case APCER + BPCER) / 2. Deprecated by newer ISO revisions but
   still the legacy iBeta single headline; reported for continuity only.
-- **95% confidence intervals** — every rate carries a **Clopper-Pearson exact
+- **95% confidence intervals**: every rate carries a **Clopper-Pearson exact
   binomial** interval. This is essential at self-test sample sizes: *0 of 20 attacks
-  accepted is not "0% APCER" — it is "APCER ≤ 16.8% with 95% confidence."* Read the
+  accepted means "APCER ≤ 16.8% with 95% confidence", not "0% APCER".* Read the
   upper bound, not the point estimate.
-- **Per-cue attribution** — for each species, which hard cue caught the rejected
+- **Per-cue attribution**: for each species, which hard cue caught the rejected
   attacks (`face_in_ir`, `ir_reflectance`, `depth`). This points hardening at the
   cue that is (or isn't) doing the work.
 
@@ -146,11 +146,11 @@ sourcing), hence the runnable tier below.
 
 Per in-scope species: **≥ 20 attack presentations**, plus a shared **≥ 10 bona-fide
 baseline**. Vary distance / angle / lighting across presentations. This is enough to
-*catch a broken cue* and to bound APCER with an honest CI; it is **not** enough to
+*catch a broken cue* and to bound APCER with an exact-binomial CI; it is **not** enough to
 claim a low APCER with tight confidence (20 clean trials only proves APCER ≤ ~17%).
 Scale up any species that shows a non-zero APCER or a wide interval.
 
-### Self-imposed pass targets ("better than Windows Hello" bar)
+### Self-imposed pass targets: the better-than-Windows-Hello bar
 
 | Metric | Target |
 |---|---|
@@ -158,7 +158,7 @@ Scale up any species that shows a non-zero APCER or a wide interval.
 | BPCER | ≤ 5% (genuine users rarely re-tried) |
 | Attack non-response | low, and never masking an unresolved species |
 
-A single accepted 2D attack is a **release-blocker** — investigate the species and
+A single accepted 2D attack is a **release-blocker**: investigate the species and
 tighten the responsible cue before shipping.
 
 ---
@@ -175,7 +175,7 @@ export ORT_DYLIB_PATH=/usr/lib64/libonnxruntime.so
 DET=models/face_detection_yunet_2023mar.onnx
 LOG=pad-$(git rev-parse --short HEAD).jsonl     # tie the log to the gate commit
 
-# 1) Bona-fide baseline — the live enrolled user (≥10):
+# 1) Bona-fide baseline, the live enrolled user (≥10):
 irlume padcapture --species bonafide --kind bonafide --det $DET --out $LOG --n 10
 
 # 2) Each attack species (≥20 each). Prompts before every presentation so you can
@@ -199,7 +199,7 @@ for the report to notice a hole.
 
 Each JSONL record carries the ground-truth label (`species`, `kind`), the gate
 `verdict`, the catching cue (`caught`), and the raw signals (`ir_brightness`,
-`ir_depth`, `ir_glint`, `cross_dist`, pose) — so a marginal near-threshold attack
+`ir_depth`, `ir_glint`, `cross_dist`, pose), so a marginal near-threshold attack
 can be inspected to tune the exact constant responsible.
 
 ---
@@ -216,18 +216,18 @@ can be inspected to tune the exact constant responsible.
 5. **Hardware-specific.** Thresholds are calibrated to the Zenbook S14 IR module;
    results and constants do not transfer across cameras without re-calibration.
 6. **A passing spoof yields full unlock.** Face is `auth sufficient`, so the
-   password fallback does not gate a spoof that *passes* — which is exactly why
+   password fallback does not gate a spoof that *passes*, which is why
    APCER, not BPCER, is the number that matters here.
 
 ---
 
 ## 8. References
 
-- ISO/IEC 30107-3:2023 — *Biometric presentation attack detection — Part 3: Testing
+- ISO/IEC 30107-3:2023, *Biometric presentation attack detection — Part 3: Testing
   and reporting* (APCER / BPCER / non-response definitions).
 - iBeta / ISO 30107-3 PAD test methodology (protocol shape: 150 PA + ~50 BF per PAI
   species; Level 1 = 2D, Level 2 = 3D).
-- FIDO Biometric Requirements — IAPAR ≤ 0.07 overlay.
-- [`adr/0001-liveness-pad-strategy.md`](adr/0001-liveness-pad-strategy.md) — why
+- FIDO Biometric Requirements: IAPAR ≤ 0.07 overlay.
+- [`adr/0001-liveness-pad-strategy.md`](adr/0001-liveness-pad-strategy.md): why
   single-frame IR physics, and the accepted 3D/active-IR residual risk.
-- [`THREAT_MODEL.md`](THREAT_MODEL.md) — liveness cues and the certification caveat.
+- [`THREAT_MODEL.md`](THREAT_MODEL.md): liveness cues and the certification caveat.

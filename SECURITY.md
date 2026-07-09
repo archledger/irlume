@@ -1,7 +1,7 @@
 # Security Policy
 
 irlume is biometric authentication software: a bug here can mean unauthorized
-login. We take reports seriously and ask researchers to disclose responsibly.
+login.
 
 ## Status
 
@@ -28,19 +28,19 @@ branch; security fixes land on `main` and ship in the next release.
 
 Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
 
-- **Authentication bypass** — `PAM_SUCCESS` without a genuine live match; FFI
+- **Authentication bypass**: `PAM_SUCCESS` without a genuine live match; FFI
   unsoundness in the PAM module. The module fails **closed**: any error, timeout,
   or unavailable daemon returns failure so the stack falls through to password.
-- **Presentation/injection attacks** — printed/screen/3D-mask spoofs and the
+- **Presentation/injection attacks**: printed/screen/3D-mask spoofs and the
   Windows Hello-class USB IR-frame injection (CVE-2021-34466). Defended by the
   algorithmic IR liveness gate, device-trust binding, and cross-spectrum RGB↔IR
   consistency.
-- **Biometric data leakage** — templates/embeddings are sensitive. They are
+- **Biometric data leakage**: templates/embeddings are sensitive. They are
   zeroized where the exposure is real (keys, secrets, IPC buffers); frames/embeddings are transient daemon memory, never logged, and the unlock secret is TPM-sealed (not the
   template).
-- **Side channels** — the match comparison is value-independent in timing so a
+- **Side channels**: the match comparison is value-independent in timing so a
   similarity score cannot be inferred from response time.
-- **Model integrity** — model weights are content-addressed in Git LFS
+- **Model integrity**: model weights are content-addressed in Git LFS
   (SHA-256 object ids pinned in the repo) and ship inside the distro packages,
   whose own integrity checking covers them; only the permissive, audited BOM is
   shipped. Load-time checksum re-verification is planned, not yet implemented.

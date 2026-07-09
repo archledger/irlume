@@ -1,6 +1,6 @@
 # ADR-0002: Challenge-response temporal liveness for IR-reflective print attacks
 
-**Status:** Accepted — the shipped design is **passive EAR** liveness (MediaPipe
+**Status:** Accepted. The shipped design is **passive EAR** liveness (MediaPipe
 FaceMesh), opt-in/off, implemented & validated 2026-07-01 (APCER 0% / BPCER 0% on
 the banner attack; see below). The earlier *prompted deliberate-blink* variant was
 built then withdrawn for bad UX. Revises the reasoning of
@@ -15,13 +15,13 @@ demonstrated a real breach: a **life-size glossy vinyl print** (graduation banne
 defeated the single-frame IR gate at **98.6% APCER**. Vinyl reflects 850 nm (so it
 renders a real IR face, defeating `face_in_ir`), and on a **2D-IR camera** (not a
 structured-light depth sensor) the brightness-ratio "depth" cue is mimicked by a
-large flat surface's illumination falloff — banner depth (1.02–1.58) *overlaps and
+large flat surface's illumination falloff: banner depth (1.02–1.58) *overlaps and
 exceeds* the genuine range (1.37–1.40), so **no threshold separates them.**
 
 Two prior options are now closed:
 
-1. **Threshold tuning** — proven not to work (overlap; ADR-0001 validation update).
-2. **A clean-licensed trained PAD model** — still unavailable. Re-verified
+1. **Threshold tuning**: proven not to work (overlap; ADR-0001 validation update).
+2. **A clean-licensed trained PAD model**: still unavailable. Re-verified
    2026-06-30: **Silent-Face / MiniFASNet** is Apache-2.0 *for its code*, but the
    **weights carry no explicit license and no documented training data** (the HF
    ONNX re-export assumes inheritance, disclaims training, gives no warranty). That
@@ -41,16 +41,16 @@ still stands and is not challenged here.
 
 Add an **optional challenge-response temporal-liveness stage** to the
 credential-releasing path, as **defense-in-depth on top of** (never replacing) the
-single-frame IR gate. The insight: **a static print cannot blink or move on
-command.** This is not rPPG (no physiological-signal recovery, no ~10 s window) —
+single-frame IR gate. **A static print cannot blink or move on
+command.** This is not rPPG (no physiological-signal recovery, no ~10 s window);
 it is a sub-second **motion challenge** that specifically defeats static artefacts.
 
 The primary mechanism reuses signals irlume already computes:
 
 - **Blink via glint *transition*.** The corneal glint (`eye_glint`) was the one cue
-  that still separated genuine (224–254) from the banner (≤193) in the self-test —
+  that still separated genuine (224–254) from the banner (≤193) in the self-test,
   but its *absolute* level is fragile (the banner reached 193; glasses/dry-eyes drop
-  a live user's glint). The **temporal transition** is the robust signal: over a
+  a live user's glint). The **temporal transition** is the reliable signal: over a
   short multi-frame capture, a live user blinking shows glint **high → low → high**
   (eyes open → closed → open); a static print holds glint constant and **cannot
   produce the transition**, regardless of its absolute glint level. This reuses the
@@ -69,12 +69,12 @@ The primary mechanism reuses signals irlume already computes:
 3. **Verdict.** Transition seen within the window → `Live`. No transition within
    the timeout → `Uncertain` (not `Spoof`): re-prompt once, then **fall through to
    the non-biometric fallback (password).** A challenge failure must **never lock
-   the user out** — it degrades to the existing fallback, same as any biometric miss.
-4. **Blink-detection robustness / clean upgrade path.** YuNet's 5 landmarks give
-   two eye points — enough to place the glint ROI, not enough for eye-aspect-ratio
+   the user out**; it degrades to the existing fallback, same as any biometric miss.
+4. **Blink-detection reliability / clean upgrade path.** YuNet's 5 landmarks give
+   two eye points: enough to place the glint ROI, not enough for eye-aspect-ratio
    (EAR). If glint-transition proves unreliable (glasses, low light, fast blinks),
    the clean upgrade is a richer landmarker for EAR-based blink: **MediaPipe Face
-   Mesh (Apache-2.0)** or **dlib-68 (Boost Software License)** — both GPLv3-clean
+   Mesh (Apache-2.0)** or **dlib-68 (Boost Software License)**; both are GPLv3-clean
    *landmark* models (general face geometry, not NC-trained spoof classifiers, so
    they do **not** hit the Silent-Face weights problem). Add only if needed.
 5. **Alternative challenge.** A **head-turn / nod** (small yaw or pitch change on
@@ -94,16 +94,16 @@ The primary mechanism reuses signals irlume already computes:
 
 ## Consequences
 
-- **Closes the demonstrated vinyl-print class** — a static print cannot satisfy the
+- **Closes the demonstrated vinyl-print class**: a static print cannot satisfy the
   motion challenge.
 - **Costs** ~1–1.5 s added latency and a small user action on the challenge path;
   mitigated by shipping opt-in and keeping the fast IR gate as the first filter.
 - **Does not** address **active IR-emitting spoofs** or a **video replay that
-  reproduces an 850 nm face and responds to prompts** — still out of scope
+  reproduces an 850 nm face and responds to prompts**; both stay out of scope
   (ADR-0001 residual risk), and the reason to keep randomized challenge on the
   roadmap.
 - **The trained-PAD track stays blocked** (no clean weights). Challenge-response +
-  IR physics is the "better-than-Hello" bar without a trained model.
+  IR physics stands in until clean weights exist.
 
 ## Implementation & validation (2026-07-01)
 
@@ -112,7 +112,7 @@ bring-up (both via a new `irlume meshprobe` diagnostic that plots the per-frame
 signal):
 
 1. **Metric: specular *contrast*, not raw glint peak.** Raw eye-glint barely drops
-   on a blink — a closed lid still reflects 850 nm, so peak stays ~140–190 and the
+   on a blink: a closed lid still reflects 850 nm, so peak stays ~140–190 and the
    blink is lost in noise. **Specular contrast** (peak − local-mean at the eye)
    collapses on closure (a real cornea makes a sharp spike; a lid/print is diffuse)
    and separates cleanly. Implemented as `irlume_auth::eye_glint_contrast`; the
@@ -132,19 +132,19 @@ signal):
 | banner + hand cover/uncover (adversarial) | ~45 | **NoEyes** (reject) |
 
 **End-to-end** through `authenticate` with `require_challenge` on: a genuine held
-blink **granted** (recognition 0.861 + Blinked); the banner — *recognized* as the
-user (0.650) so it would otherwise grant — was **denied** by the challenge
+blink **granted** (recognition 0.861 + Blinked); the banner was *recognized* as the
+user (0.650), so it would otherwise grant, but was **denied** by the challenge
 ("no live eyes (looks like a print)"). The 98.6%-APCER banner breach is closed.
 
 Shipped **opt-in** (`irlume profiles challenge on|off`, per-user `require_challenge`
 in storage; daemon `SetRequireChallenge`). The open-eye contrast floor (banner ≤46
 vs genuine ≥120) is itself a strong guard: a diffuse print can't reach it, so hand
 cover/uncover can't fake a blink. Residual: gluing specular dots on a print's eyes
-to fake the corneal spike + coordinated cover — defeated by deferred randomized
+to fake the corneal spike + coordinated cover, defeated by deferred randomized
 prompts.
 
 **Known follow-up:** no greeter/lock-screen "blink to confirm" prompt is wired yet,
-so the challenge relies on the user knowing to blink during the ~4 s window — hence
+so the challenge relies on the user knowing to blink during the ~4 s window; hence
 opt-in only for now. A UI prompt is the prerequisite for considering default-on.
 
 ## UX finding & revised direction (2026-07-01)
@@ -155,7 +155,7 @@ blink* unsuitable as a default gate, and redirects the work:
 - **A deliberate, timed blink is poor ergonomics.** People blink naturally every
   few seconds; a natural blink (~150 ms) is too fast for the 15 fps IR sensor to
   catch, so the gate requires an *unnatural held blink*. Worse, the flow is two
-  captures — match (scan 1) then challenge (scan 2) — and the user must keep eyes
+  captures, match (scan 1) then challenge (scan 2), and the user must keep eyes
   open on scan 1 (blinking there weakens the match so it never reaches the
   challenge) and blink only on scan 2. Without a precisely-timed "blink now" cue
   that is impossible to guess.
@@ -164,27 +164,27 @@ blink* unsuitable as a default gate, and redirects the work:
   sudo** at all; correct timing needs a two-phase daemon protocol, and the KDE
   greeter may not surface a parallel biometric's PAM messages regardless.
 
-**Key realization for the better path:** the discriminator is not the blink *motion*
+The discriminator is not the blink *motion*
 but the **corneal specular contrast** itself. Live eye contrast measured 120–129; the
-vinyl banner measured 46–70 even at specular angles and when hand-modulated — a
+vinyl banner measured 46–70 even at specular angles and when hand-modulated. A
 diffuse print physically cannot make a real cornea's sharp specular. So the durable
 answer is **passive**, no user action:
 
 - **Chosen direction: MediaPipe FaceMesh (Apache-2.0, clean) for eye-aspect-ratio
   (EAR).** Dense eye-contour landmarks give an unambiguous EAR that collapses to ~0
   on closure (unlike the noisy brightness metric), so a **natural** blink can be
-  detected **passively** over the ~2 s the user is already in front of the camera —
-  no prompt, no timing, no deliberate action. This is the real "better than Hello"
-  liveness, deferred to its own session (source/verify the ONNX model, run it on IR,
+  detected **passively** over the ~2 s the user is already in front of the camera:
+  no prompt, no timing, no deliberate action. That upgrade is deferred to its
+  own session (source/verify the ONNX model, run it on IR,
   compute EAR, and validate FRR across glasses/angles/dark + banner FAR across
-  specular angles — the same rigor as the PAD self-test).
+  specular angles, the same rigor as the PAD self-test).
 
 **Disposition:** the prompted blink challenge stays **opt-in and OFF by default**
 (committed, works for anyone who accepts the deliberate-blink UX). The `PAM_TEXT_INFO`
 prompt hint was reverted (dead end; the passive path needs no prompt). Default-on
 liveness waits on the passive EAR work above.
 
-## Passive EAR — implemented & validated (2026-07-01)
+## Passive EAR: implemented & validated (2026-07-01)
 
 Built and validated (commit `a8d839d`). `detect_blink` now takes a per-frame EAR
 sequence and finds a natural blink as a dip below **0.72× the median-EAR baseline**
@@ -192,13 +192,13 @@ sequence and finds a natural blink as a dip below **0.72× the median-EAR baseli
 captures a ~5 s IR window, runs FaceMesh per frame (smaller eye's EAR), and gates the
 grant; it **skips gracefully** (logs) if `face_landmark.onnx` isn't loaded, and
 `NoBlink`/`NoEyes` fall through to the password (never a lockout). No prompt, no
-deliberate action — the user just looks at the camera.
+deliberate action; the user just looks at the camera.
 
 **Validation** ([`../pad-results/2026-07-01-passive-ear-liveness.md`](../pad-results/2026-07-01-passive-ear-liveness.md),
-`meshprobe` → `padreport`): the vinyl-banner breach is **closed — APCER 0% (0/10),
+`meshprobe` → `padreport`): the vinyl-banner breach is **closed: APCER 0% (0/10),
 BPCER 0% (0/10), non-response 10%**. Live blinks dip to 0.55–0.65× baseline; the
 banner's jitter only to 0.75–0.90×, so the relative detector separates them. **Still
-opt-in/OFF** — default-on awaits broader-condition validation (glasses / dark /
+opt-in/OFF**; default-on awaits broader-condition validation (glasses / dark /
 distance / extreme angle for FRR; a moving banner across more specular angles for
 FAR), per the results doc's limitations.
 
@@ -217,6 +217,6 @@ FAR), per the results doc's limitations.
 
 *2026-07-05 update:* the deep-dip detector described above was reworked into a
 strobe-aware **V-shape** blink detector (baselining per strobe class, run-length
-cap, brightness-band check) after real-world non-response findings — see
+cap, brightness-band check) after real-world non-response findings; see
 `docs/pad-results/` for the follow-up records. The probe tool is `irlume
 meshprobe` (formerly `blinkprobe`).

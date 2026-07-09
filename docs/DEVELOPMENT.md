@@ -2,9 +2,9 @@
 
 This guide gets you from a fresh clone to a working build. There are two paths:
 
-- **[Nix](#option-a--nix-recommended)** — one command, identical on every
+- **[Nix](#option-a-nix-recommended)**: one command, identical on every
   distro, nothing installed globally. Recommended.
-- **[Manual, per distro](#option-b--manual-per-distro)** — install the build
+- **[Manual, per distro](#option-b-manual-per-distro)**: install the build
   dependencies yourself with `dnf` / `apt` / `pacman`.
 
 For *what* you're building (the daemon/PAM/CLI split and the model pipeline),
@@ -25,7 +25,7 @@ git lfs install
 git lfs pull            # fetch the real models/*.onnx
 ```
 
-## Option A — Nix (recommended)
+## Option A: Nix (recommended)
 
 ### 1. Install Nix (once)
 
@@ -46,7 +46,7 @@ cargo build --release
 ```
 
 The first `nix develop` writes a `flake.lock` pinning every input to an exact
-commit — **commit that file** so everyone (and CI) gets identical tooling.
+commit. **Commit that file** so everyone (and CI) gets identical tooling.
 
 ### What the flake pins for you
 
@@ -71,7 +71,7 @@ If you use [direnv](https://direnv.net/) with
 containing `use flake` in the repo root and the shell loads automatically when
 you `cd` in.
 
-## Option B — Manual, per distro
+## Option B: Manual, per distro
 
 Install the build dependencies, then use `cargo` as usual.
 
@@ -82,7 +82,7 @@ sudo dnf install cargo rust clang-devel pkgconf-pkg-config gcc \
     pam-devel tpm2-tss-devel kernel-headers git-lfs
 ```
 
-**Ubuntu / Debian** — the archive's `rustc` is usually too old (the `ort`
+**Ubuntu / Debian**: the archive's `rustc` is usually too old (the `ort`
 binding needs Rust ≥ 1.88), so install the toolchain with
 [rustup](https://rustup.rs/):
 
@@ -126,13 +126,13 @@ Developer-only benchmark and capture subcommands are gated behind `IRLUME_DEV=1`
 
 ## What the dev shell can't do: real-hardware testing
 
-The build shell compiles and runs the code, but the security-critical paths —
-**an IR camera, TPM sealing, PAM wiring, greeter/lock integration, SELinux** —
+The build shell compiles and runs the code, but the security-critical paths
+(**an IR camera, TPM sealing, PAM wiring, greeter/lock integration, SELinux**)
 can only be exercised on a physical machine. For enrolling, wiring a greeter,
 and end-to-end login/lock/sudo testing on real hardware, follow
 [`SETUP.md`](SETUP.md). To build the distro packages (RPM/`.deb`/Arch), see the
 recipes under [`../packaging/`](../packaging/). Liveness/PAD changes must ship
-with an ISO/IEC 30107-3 self-test — see [`PAD_SELFTEST.md`](PAD_SELFTEST.md).
+with an ISO/IEC 30107-3 self-test; see [`PAD_SELFTEST.md`](PAD_SELFTEST.md).
 
 ## Project layout
 
@@ -148,13 +148,13 @@ Crate roles (details and the privilege-separation diagram are in
 | `irlume-core` | matching, encrypted template storage, TPM-bound secret release (`tss-esapi`) |
 | `irlume-auth` | shared authentication orchestration (the security-critical decision flow) |
 | `irlume-fingerprint` | optional fprintd companion factor |
-| `irlume-daemon` | privileged `irlumed` — the only thing that touches hardware |
-| `irlume-pam` | `pam_irlume.so` — the untrusted PAM client |
+| `irlume-daemon` | privileged `irlumed`, the only thing that touches hardware |
+| `irlume-pam` | `pam_irlume.so`, the untrusted PAM client |
 | `irlume-cli` | the `irlume` command + guided TUI |
 
 ## Before you open a PR
 
-Sign your commits (DCO — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md)):
+Sign your commits (DCO; see [`../CONTRIBUTING.md`](../CONTRIBUTING.md)):
 
 ```sh
 git commit -s -m "your message"

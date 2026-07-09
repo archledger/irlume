@@ -562,22 +562,71 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     let lit = ir_emitter::enable(dev.handle().fd(), &card);
     // The emitter may STROBE (pulse), so grab a burst and keep the brightest
     // frame, the lit strobe phase (linhello lesson). Re-fire mid-burst in case
-    // the control self-clears.
-    let mut best: Option<Vec<u8>> = None;
-    let mut best_mean = -1.0f64;
-    let mut bmin = 255.0f64;
-    let mut bmax = 0.0f64;
+    // the control self-clears. Keep every frame so the optional ambient
+    // subtraction below can pair the lit frame with an adjacent emitter-off one.
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
+    let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
     for i in 0..IR_BURST {
         if i == IR_BURST / 2 {
             ir_emitter::enable(dev.handle().fd(), &card);
         }
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        let mean = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
-        bmin = bmin.min(mean);
-        bmax = bmax.max(mean);
-        if mean > best_mean {
-            best_mean = mean;
-            best = Some(buf.to_vec());
+        means.push(buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64);
+        frames.push(buf.to_vec());
+    }
+    let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
+    let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // First frame holding the max mean (strictly-greater scan), matching the
+    // original incremental behaviour exactly so the flag-off path is unchanged
+    // (max_by would keep the LAST tie, changing the chosen frame on ties).
+    let mut best_i = 0usize;
+    let mut best_mean = -1.0f64;
+    for (i, &m) in means.iter().enumerate() {
+        if m > best_mean {
+            best_mean = m;
+            best_i = i;
+        }
+    }
+    let mut best = Some(frames[best_i].clone());
+
+    // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in: on a
+    // strobing emitter the frame adjacent to the brightest is an emitter-OFF
+    // exposure that captured only ambient IR. Subtracting it removes ambient
+    // IR (sunlight) that would otherwise wash out the emitter's reflection,
+    // exactly as Hello's illuminated/ambient-pair mode does. Indoors the
+    // ambient frame is ~0, so this is a no-op; the payoff is under strong
+    // ambient IR. Gated on a real strobe (clear off-frame) so a steady
+    // emitter is left untouched.
+    //
+    // NOT a validated security control yet, two reasons it stays behind a flag:
+    //   1. The liveness DEPTH cue is center/edge RATIO, which is non-monotonic
+    //      under subtraction: removing an ambient frame that is brighter at the
+    //      border than the center RAISES the ratio, so a subtracted frame could
+    //      pass the depth floor a raw frame would fail. The depth floor must be
+    //      re-tuned against subtracted frames before this can be a default.
+    //   2. The IR frame also feeds dark-mode IR matching, so enrollment and
+    //      auth must use the SAME setting; toggling it requires a re-enroll.
+    // Both are moot while the flag is unset (the shipped default).
+    let subtract = std::env::var("IRLUME_IR_AMBIENT_SUBTRACT").is_ok_and(|v| v.trim() == "1");
+    if subtract {
+        let neighbors = [best_i.wrapping_sub(1), best_i + 1];
+        let ambient_i = neighbors
+            .iter()
+            .filter(|&&j| j < means.len())
+            .min_by(|&&a, &&b| means[a].total_cmp(&means[b]))
+            .copied();
+        if let Some(ai) = ambient_i {
+            // Only subtract when the neighbor is genuinely an off-frame (a
+            // real strobe), never when both frames are lit (steady emitter).
+            if means[best_i] - means[ai] > 20.0 {
+                best = Some(ir_probe::subtract(&frames[best_i], &frames[ai]));
+                if std::env::var("IRLUME_DEBUG_IR").is_ok() {
+                    eprintln!(
+                        "[ir] ambient-subtract: lit frame {best_i} ({:.0}) - ambient frame {ai} ({:.0})",
+                        means[best_i], means[ai]
+                    );
+                }
+            }
         }
     }
     if std::env::var("IRLUME_DEBUG_IR").is_ok() {
@@ -600,6 +649,103 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
         spectrum: Spectrum::Ir,
         data: grey,
     })
+}
+
+/// Ambient-subtraction helpers (Windows-Hello-style illuminated minus ambient).
+/// `subtract` is used by `capture_ir` when `IRLUME_IR_AMBIENT_SUBTRACT=1`
+/// (experimental, off by default); `capture_raw_burst`/`center_border_ratio`
+/// are diagnostics for the strobe-probe example. Kept in the crate so the
+/// example and the capture path share one implementation.
+pub mod ir_probe {
+    use super::{ir_emitter, map_io, privacy_engaged, verify_pinned, Error, Frame, Spectrum};
+    use super::{Capture, CaptureStream, Device, Format, FourCC, Type};
+    use super::{IR_H, IR_W};
+
+    /// Mean brightness of an 8-bit greyscale buffer.
+    pub fn mean(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            0.0
+        } else {
+            data.iter().map(|&p| p as f64).sum::<f64>() / data.len() as f64
+        }
+    }
+
+    /// Per-pixel saturating subtraction `lit - ambient`, clamped at 0. Isolates
+    /// the emitter's own reflected light (Hello's ambient-subtraction step): a
+    /// screen or print emitting its own IR appears in both frames and cancels;
+    /// the emitter-lit face does not. Falls back to `lit` on a size mismatch.
+    pub fn subtract(lit: &[u8], ambient: &[u8]) -> Vec<u8> {
+        if lit.len() != ambient.len() {
+            return lit.to_vec();
+        }
+        lit.iter()
+            .zip(ambient)
+            .map(|(&l, &a)| l.saturating_sub(a))
+            .collect()
+    }
+
+    /// Ratio of mean brightness in the center 50% box to the surrounding
+    /// border. The emitter lights the near subject more than the far
+    /// background, so a real emitter-lit face reads > 1; a flat, uniformly
+    /// lit scene reads ~1. A proxy for how well subtraction isolates the
+    /// subject.
+    pub fn center_border_ratio(data: &[u8], w: u32, h: u32) -> f64 {
+        if data.len() < (w * h) as usize || w < 4 || h < 4 {
+            return 0.0;
+        }
+        let (x0, x1) = (w / 4, w * 3 / 4);
+        let (y0, y1) = (h / 4, h * 3 / 4);
+        let (mut c_sum, mut c_n, mut b_sum, mut b_n) = (0u64, 0u64, 0u64, 0u64);
+        for y in 0..h {
+            for x in 0..w {
+                let p = data[(y * w + x) as usize] as u64;
+                if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                    c_sum += p;
+                    c_n += 1;
+                } else {
+                    b_sum += p;
+                    b_n += 1;
+                }
+            }
+        }
+        let c = c_sum as f64 / c_n.max(1) as f64;
+        let b = b_sum as f64 / b_n.max(1) as f64;
+        if b < 1.0 {
+            return 0.0;
+        }
+        c / b
+    }
+
+    /// Capture `n` raw IR frames (GREY 8-bit) with the emitter enabled, without
+    /// the brightest-frame reduction `capture_ir` does. Used to inspect the
+    /// strobe pattern and prototype subtraction.
+    pub fn capture_raw_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
+        verify_pinned(device)?;
+        if privacy_engaged(device) {
+            return Err(Error::Hardware(format!(
+                "{device}: hardware privacy switch is ON"
+            )));
+        }
+        let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+        let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
+        let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
+        let (w, h) = (fmt.width, fmt.height);
+        let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+            .map_err(|e| map_io(device, e))?;
+        let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
+        ir_emitter::enable(dev.handle().fd(), &card);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            out.push(Frame {
+                width: w,
+                height: h,
+                spectrum: Spectrum::Ir,
+                data: buf.to_vec(),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for

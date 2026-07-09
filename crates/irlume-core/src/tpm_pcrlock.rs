@@ -7,7 +7,7 @@
 //! `PolicyAuthorizeNV` over that index unseals whenever the live PCRs satisfy
 //! the policy the index currently holds. After a firmware / Secure Boot update
 //! the admin (or a packaging hook) re-runs `make-policy`, which rewrites the NV
-//! index — no reseal of our object required. This is the GRUB2 answer to PCR 7
+//! index; no reseal of our object required. This is the GRUB2 answer to PCR 7
 //! drift that the signed-UKI path (Tier 1) can't cover.
 //!
 //! tss-esapi 7.x ships the `Esys_PolicyAuthorizeNV` binding but no safe wrapper,

@@ -1,12 +1,12 @@
 //! The ML pipeline: detect -> align -> embed. CPU-first ONNX via `ort`.
 //!
 //! Commercially-clean, GPL-3.0-compatible bill of materials (all permissive):
-//!   * Detection  — YuNet  (MIT)      `face_detection_yunet_2023mar.onnx`
+//!   * Detection:   YuNet  (MIT)      `face_detection_yunet_2023mar.onnx`
 //!     bbox + 5 landmarks; ~1.6 ms @320x320 on a laptop CPU.
-//!   * Recognition— AuraFace (Apache) `glintr100.onnx`, ResNet100/ArcFace,
+//!   * Recognition: AuraFace (Apache) `glintr100.onnx`, ResNet100/ArcFace,
 //!     512-D embedding, 112x112 input, standard 5-point alignment.
 //!
-//! These bundle directly (`include_bytes!`) — no fetch-models step. Do NOT swap
+//! These bundle directly (`include_bytes!`); no fetch-models step. Do NOT swap
 //! in InsightFace buffalo_l/antelopev2 or YuNet's bundled SCRFD: their weights
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 
@@ -27,7 +27,7 @@ pub struct Detection {
     pub landmarks: Landmarks5,
 }
 
-/// Approximate head orientation from the 5 landmarks, with no 3D model — a 2D
+/// Approximate head orientation from the 5 landmarks, with no 3D model: a 2D
 /// heuristic for a frontality gate (Windows Hello uses a ±15° head-orientation
 /// step). It rejects clearly off-angle presentations; it is *not* degree-
 /// calibrated. `yaw_asym` and `pitch_frac` are scale-invariant (ratios).
@@ -46,7 +46,7 @@ pub struct HeadPose {
     /// Nose's vertical position between the eye line and mouth line. ~0.5
     /// frontal. Verified against a live camera: SMALLER when looking UP (the
     /// nose tip swings up toward the eye line), LARGER when looking DOWN (the
-    /// nose tip drops toward the mouth) — the opposite of the naive reading.
+    /// nose tip drops toward the mouth), the opposite of the naive reading.
     pub pitch_frac: f32,
 }
 
@@ -60,7 +60,7 @@ pub fn head_pose(lm: &Landmarks5) -> HeadPose {
     } else {
         0.0
     };
-    // Signed yaw straight from image x — label-agnostic (uses the eye midpoint,
+    // Signed yaw straight from image x, label-agnostic (uses the eye midpoint,
     // not "which eye is left"). Half the inter-eye span makes it ~unit-scaled.
     let eye_mid_x = (le.0 + re.0) / 2.0;
     let half_span = ((re.0 - le.0).abs() / 2.0).max(1e-3);
@@ -249,7 +249,7 @@ mod onnx {
         /// Test-time augmentation: embed the chip + its horizontal mirror, average,
         /// renormalize. Benchmarked on LFW to cut RGB false-rejects (~27% relative
         /// at thr 0.50; FRR@0.55 13.6%→9.5%) with FAR unchanged (≤1e-4). RGB PATH
-        /// ONLY — on NIR it over-smooths the low-texture embedding (no EER gain,
+        /// ONLY: on NIR it over-smooths the low-texture embedding (no EER gain,
         /// slightly worse at low FAR), so the IR path keeps plain `embed`.
         pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
             let a = self.embed(chip_rgb)?;
@@ -262,7 +262,7 @@ mod onnx {
             Ok(out)
         }
 
-        /// Embed AND return the PRE-normalization L2 norm of the raw feature — an
+        /// Embed AND return the PRE-normalization L2 norm of the raw feature: an
         /// AdaFace/MagFace-style quality proxy (clearer faces tend to produce
         /// larger feature norms; degraded/low-light faces smaller). The returned
         /// embedding is still L2-normalized; the norm is the quality signal for
@@ -275,7 +275,7 @@ mod onnx {
             let data = align::preprocess_arcface(chip_rgb);
             let n = align::OUT_SIZE as i64;
             let tensor = Tensor::from_array(([1i64, 3, n, n], data)).map_err(err)?;
-            // Positional input (single-input model) — avoids needing the input name.
+            // Positional input (single-input model); avoids needing the input name.
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
             if raw.len() != EMBED_DIM {
@@ -289,7 +289,7 @@ mod onnx {
         }
     }
 
-    /// IR embedding adapter (512→512) — the v3 residZero CLIP-adapter (out = x +
+    /// IR embedding adapter (512→512): the v3 residZero CLIP-adapter (out = x +
     /// 0.6·A(x), A zero-init) trained on NIR faces (CBSR+Oulu COMBINED, multi-sensor)
     /// that tightens IR genuine/impostor separation and generalizes across NIR
     /// cameras. Real-ASUS-validated vs the prior v1 (512→256) adapter: no regression
@@ -326,7 +326,7 @@ mod onnx {
         }
     }
 
-    /// MediaPipe FaceMesh (`face_landmark.onnx`, Apache-2.0) — 468 dense facial
+    /// MediaPipe FaceMesh (`face_landmark.onnx`, Apache-2.0): 468 dense facial
     /// landmarks. irlume uses it ONLY for passive blink liveness (eye-aspect-ratio,
     /// ADR-0002), never recognition. Input is NHWC `[1,192,192,3]` (unlike the
     /// NCHW recognizer); output `conv2d_21` is 468×3 landmarks in the 192×192 input
@@ -369,7 +369,7 @@ mod onnx {
             let side = 2.0 * half;
             let n = MESH_INPUT as usize;
             // NHWC, normalized to [0,1] (MediaPipe face_landmark expects [0,1]; flip
-            // to (px/127.5−1) if landmarks come out garbage — the first thing to try).
+            // to (px/127.5−1) if landmarks come out garbage; the first thing to try).
             let mut data = vec![0.0f32; n * n * 3];
             for oy in 0..n {
                 for ox in 0..n {
@@ -412,7 +412,7 @@ mod onnx {
 
     /// Eye-aspect-ratio for one eye from its 6 landmarks: `(|p2−p6| + |p3−p5|) /
     /// (2·|p1−p4|)`. Scale-invariant (a ratio): ~0.3 open, →0 closed. This is the
-    /// clean blink signal — collapses on closure, unlike the noisy IR-glint metric.
+    /// clean blink signal: collapses on closure, unlike the noisy IR-glint metric.
     pub fn eye_ear(lm: &[(f32, f32)], idx: &[usize; 6]) -> f32 {
         let d = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
         let p = |k: usize| lm[idx[k]];
@@ -526,7 +526,7 @@ mod onnx {
     /// Phase-1 gate: embed the SAME aligned chip twice; cosine MUST be ~= 1.0.
     /// Validates that the ONNX path is deterministic and the preprocessing is
     /// wired correctly before any matching logic is trusted. Returns (passed,
-    /// detail). A synthetic chip is sufficient — this checks the pipeline, not
+    /// detail). A synthetic chip is sufficient; this checks the pipeline, not
     /// recognition accuracy (that needs real faces, a later step).
     pub fn selftest_alignment_identity(embedder: &mut Embedder) -> (bool, String) {
         let n = (align::OUT_SIZE * align::OUT_SIZE) as usize;

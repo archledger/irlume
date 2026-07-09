@@ -7,12 +7,12 @@
 use std::fs;
 use std::path::Path;
 
-/// How the system booted — informs which TPM PCR-binding tier is meaningful.
+/// How the system booted; informs which TPM PCR-binding tier is meaningful.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootMode {
-    /// Unified Kernel Image (systemd-stub) — eligible for signed PCR-11 policy.
+    /// Unified Kernel Image (systemd-stub); eligible for signed PCR-11 policy.
     Uki,
-    /// GRUB / systemd-boot / traditional loader — uses self-healing PCR-7.
+    /// GRUB / systemd-boot / traditional loader; uses self-healing PCR-7.
     Grub,
     /// Couldn't determine.
     Unknown,
@@ -33,7 +33,7 @@ const EFIVARS: &str = "/sys/firmware/efi/efivars";
 
 /// Global EFI SecureBoot variable.
 const SECUREBOOT_VAR: &str = "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
-/// `SetupMode` — when 1, platform keys are not enrolled (SB not enforcing).
+/// `SetupMode`: when 1, platform keys are not enrolled (SB not enforcing).
 const SETUPMODE_VAR: &str = "SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// systemd-stub writes this when a UKI is booted (Loader interface GUID).
 const STUB_INFO_VAR: &str = "StubInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";

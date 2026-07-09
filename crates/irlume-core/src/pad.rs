@@ -4,24 +4,24 @@
 //! standard PAD error rates, so the `irlume padreport` tool (and its tests) share
 //! one authoritative implementation. Definitions follow ISO/IEC 30107-3:
 //!
-//!  * **APCER** (Attack Presentation Classification Error Rate) — the fraction of
+//!  * **APCER** (Attack Presentation Classification Error Rate): the fraction of
 //!    *attack* presentations classified as bona fide, computed **per PAI species**
 //!    and reported at the **worst-case (max) species**, never averaged across
 //!    species. This is the number that says "did a spoof get in".
-//!  * **BPCER** (Bona-fide Presentation Classification Error Rate) — the fraction
+//!  * **BPCER** (Bona-fide Presentation Classification Error Rate): the fraction
 //!    of *bona-fide* presentations classified as attacks (a live user wrongly
 //!    rejected).
-//!  * **Non-response** — presentations that yielded no decision (our `Uncertain`
+//!  * **Non-response**: presentations that yielded no decision (our `Uncertain`
 //!    verdict: "re-present / face the camera"). ISO reports these separately from
 //!    APCER/BPCER; we keep them in the denominator (so they lower APCER, since an
 //!    Uncertain attack did NOT succeed) but surface the rate on its own so a
-//!    species whose attacks merely stall — and could be retried — is visible.
-//!  * **ACER** = (APCER_worst + BPCER) / 2 — deprecated by newer ISO revisions but
+//!    species whose attacks merely stall (and could be retried) is visible.
+//!  * **ACER** = (APCER_worst + BPCER) / 2, deprecated by newer ISO revisions but
 //!    still the iBeta-style single headline; reported for continuity only.
 //!
 //! Every rate carries a **Clopper-Pearson exact 95% binomial confidence interval**.
 //! With the small sample sizes a home self-test can realistically capture, the
-//! point estimate alone is misleading (0/20 attacks accepted is NOT "0% APCER" —
+//! point estimate alone is misleading (0/20 attacks accepted is NOT "0% APCER";
 //! it is "APCER ≤ 16.8% at 95% confidence"). The interval keeps the claim honest.
 
 /// Ground-truth label of a presentation.
@@ -38,7 +38,7 @@ pub enum Outcome {
     Accepted,
     /// Classified as a spoof (`Verdict::Spoof`).
     Rejected,
-    /// No decision — asked to re-present (`Verdict::Uncertain`).
+    /// No decision; asked to re-present (`Verdict::Uncertain`).
     NonResponse,
 }
 
@@ -48,7 +48,7 @@ pub struct Trial {
     pub species: String,
     pub label: Label,
     pub outcome: Outcome,
-    /// Cue(s) that rejected this presentation (empty unless `Rejected`) — used for
+    /// Cue(s) that rejected this presentation (empty unless `Rejected`), used for
     /// per-species attribution so hardening targets the cue that actually catches
     /// (or fails to catch) each attack species.
     pub caught: Vec<String>,
@@ -102,7 +102,7 @@ pub struct SpeciesReport {
 #[derive(Debug, Clone)]
 pub struct PadReport {
     pub species: Vec<SpeciesReport>,
-    /// Worst-case (species, APCER point estimate) — the ISO headline. `None` when
+    /// Worst-case (species, APCER point estimate), the ISO headline. `None` when
     /// there were no attack presentations.
     pub worst_apcer: Option<(String, f64)>,
     pub n_attacks: usize,

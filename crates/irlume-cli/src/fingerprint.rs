@@ -1,4 +1,4 @@
-//! `irlume fingerprint <status|add|enable|disable>` — fingerprint as a companion
+//! `irlume fingerprint <status|add|enable|disable>`: fingerprint as a companion
 //! auth modality via stock fprintd + pam_fprintd. irlume never claims the sensor;
 //! it orchestrates enrollment (fprintd CLI) and wires pam_fprintd per distro.
 //! `enable` also records the active method so the daemon disables face and lets
@@ -60,7 +60,7 @@ fn status(user: &str) -> ExitCode {
     );
     // Recommendation.
     if !fp::available() {
-        println!("  → no usable reader — fingerprint unavailable on this device");
+        println!("  → no usable reader; fingerprint unavailable on this device");
     } else if fingers.is_empty() {
         println!("  → reader present but no finger enrolled: run  irlume fingerprint add");
     } else if policy::method() != Method::Fingerprint {
@@ -76,7 +76,7 @@ fn status(user: &str) -> ExitCode {
 /// Enroll the first free finger for `user`. Returns success.
 fn enroll_one(user: &str) -> bool {
     if !fp::fprintd_present() {
-        eprintln!("[fingerprint] fprintd not installed — install the 'fprintd' package first");
+        eprintln!("[fingerprint] fprintd not installed; install the 'fprintd' package first");
         return false;
     }
     if !fp::reader_present() {
@@ -88,7 +88,7 @@ fn enroll_one(user: &str) -> bool {
         return false;
     };
     println!(
-        "[fingerprint] enrolling '{finger}' for '{user}' — place and lift your finger as prompted…"
+        "[fingerprint] enrolling '{finger}' for '{user}': place and lift your finger as prompted…"
     );
     match fp::enroll_finger(user, finger) {
         fp::EnrollOutcome::Enrolled => {
@@ -108,7 +108,7 @@ fn enroll_one(user: &str) -> bool {
 
 fn require_root(op: &str) -> bool {
     if effective_uid() != 0 {
-        eprintln!("[fingerprint] '{op}' modifies the system PAM config — run with: sudo irlume fingerprint {op}");
+        eprintln!("[fingerprint] '{op}' modifies the system PAM config; run with: sudo irlume fingerprint {op}");
         return false;
     }
     true
@@ -138,7 +138,7 @@ fn enable(user: &str) -> ExitCode {
     }
     // Enroll a finger first if the user has none.
     if !fp::has_enrollment(user) {
-        println!("[fingerprint] no finger enrolled yet — enrolling one now");
+        println!("[fingerprint] no finger enrolled yet; enrolling one now");
         if !enroll_one(user) {
             return ExitCode::FAILURE;
         }
@@ -157,14 +157,14 @@ fn enable(user: &str) -> ExitCode {
         }
     };
     if !wired {
-        eprintln!("[fingerprint] failed to wire pam_fprintd — check the command output above");
+        eprintln!("[fingerprint] failed to wire pam_fprintd; check the command output above");
         return ExitCode::FAILURE;
     }
     if let Err(e) = policy::set_method(Method::Fingerprint) {
         eprintln!("[fingerprint] wired, but could not record method: {e}");
         return ExitCode::FAILURE;
     }
-    println!("[fingerprint] ✓ enabled — fingerprint now unlocks; irlume face is disabled (pam_fprintd drives, password is the fallback)");
+    println!("[fingerprint] ✓ enabled: fingerprint now unlocks; irlume face is disabled (pam_fprintd drives, password is the fallback)");
     ExitCode::SUCCESS
 }
 
@@ -184,14 +184,14 @@ fn disable() -> ExitCode {
         }
     };
     if !unwired {
-        eprintln!("[fingerprint] failed to unwire pam_fprintd — check the output above");
+        eprintln!("[fingerprint] failed to unwire pam_fprintd; check the output above");
         return ExitCode::FAILURE;
     }
     if let Err(e) = policy::set_method(Method::Auto) {
         eprintln!("[fingerprint] unwired, but could not reset method: {e}");
         return ExitCode::FAILURE;
     }
-    println!("[fingerprint] ✓ disabled — face (irlume) is the active method again");
+    println!("[fingerprint] ✓ disabled: face (irlume) is the active method again");
     ExitCode::SUCCESS
 }
 

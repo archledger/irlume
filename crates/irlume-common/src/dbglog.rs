@@ -2,7 +2,7 @@
 //!
 //! `IRLUME_LOG=debug` turns on per-stage pipeline traces (capture timings,
 //! detection results, every liveness cue with its threshold verdict, match
-//! scores vs thresholds) so a failed — or suspiciously slow — auth can be
+//! scores vs thresholds) so a failed (or suspiciously slow) auth can be
 //! diagnosed from the journal alone. Traces carry NUMBERS ONLY: never frames,
 //! embeddings, or secrets. Off by default; toggle on a running system with
 //! `sudo irlume logs debug on` (writes a systemd drop-in and restarts irlumed).
@@ -17,7 +17,7 @@ pub fn on() -> bool {
     })
 }
 
-/// `dlog!("capture rgb {}ms", ms)` — one stderr line, only under IRLUME_LOG.
+/// `dlog!("capture rgb {}ms", ms)`: one stderr line, only under IRLUME_LOG.
 /// stderr is journald for the daemon and the terminal for CLI tools.
 #[macro_export]
 macro_rules! dlog {

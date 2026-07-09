@@ -1,11 +1,11 @@
-//! `irlume tui` — keyboard-driven setup/management over the `irlumed` socket.
+//! `irlume tui`: keyboard-driven setup/management over the `irlumed` socket.
 //!
 //! Layout & feel follow linhello: a step-wizard (Tab/⇧Tab between steps, a
 //! "step N/M" header), a blue Activity bar that shows in plain language exactly
 //! what irlume is doing to the system (transparency, inspired by linutil), and a
-//! static keybind footer. Enrollment uses linhello-style **guided cues** — a
+//! static keybind footer. Enrollment uses linhello-style **guided cues**, a
 //! live framing guide (quality + checklist + guidance) with a 3-2-1 countdown
-//! and auto-capture — instead of a live video preview (which a terminal can't
+//! and auto-capture, instead of a live video preview (which a terminal can't
 //! show). A thin client: all work happens in the daemon.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -67,7 +67,7 @@ enum Pending {
     RenameProfile(String),
     RenameScan(String, String),
     // Masked password/passphrase entry, handled in-TUI (sent to the root daemon
-    // over the socket — no sudo, no screen teardown). The `Option<String>` holds
+    // over the socket; no sudo, no screen teardown). The `Option<String>` holds
     // the first entry while confirming (double-entry catches typos).
     KeyringPw(Option<String>),
     RecoveryPw(Option<String>),
@@ -84,7 +84,7 @@ impl Pending {
     }
 }
 
-/// Interactive flow that needs a cooked terminal — the TUI tears down the
+/// Interactive flow that needs a cooked terminal; the TUI tears down the
 /// alt-screen, runs it via the existing CLI handler (no-echo prompts), then
 /// re-enters. Mirrors linhello's suspend pattern.
 /// Flows that genuinely need the cooked terminal: an interactive root tool
@@ -98,12 +98,12 @@ enum Suspend {
     RestartDaemon,
     RestartFprintd,
     SelinuxLoad,
-    /// Switch the active camera pair — root op (writes /etc), so it suspends to
+    /// Switch the active camera pair; root op (writes /etc), so it suspends to
     /// `sudo irlume set-cameras <rgb> <ir>`.
     SetCameras(String, String),
-    /// Auto-configure the IR emitter — root op, suspends to `sudo irlume ir-setup`.
+    /// Auto-configure the IR emitter; root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
-    /// View the face-auth journal (`sudo irlume logs`) — the daemon's lines live
+    /// View the face-auth journal (`sudo irlume logs`); the daemon's lines live
     /// in the system journal, so it runs under sudo to guarantee they show.
     Logs,
 }
@@ -129,11 +129,11 @@ enum Fix {
     Root(&'static str),
 }
 
-/// A parked enrollment intent — what to resume after the daemon fix brings
+/// A parked enrollment intent: what to resume after the daemon fix brings
 /// irlumed up (see `daemon_gate`).
 #[derive(Clone)]
 enum ResumeEnroll {
-    /// `begin_enroll` — re-open the new-profile name prompt.
+    /// `begin_enroll`: re-open the new-profile name prompt.
     New,
     /// Add one scan to this existing profile.
     Add(String),
@@ -242,13 +242,13 @@ struct App {
     /// A prominent, dismissible error banner (e.g. "camera busy") so failures
     /// are never silently buried in the Activity log.
     error: Option<String>,
-    /// Live daemon reachability (a real Ping, refreshed each tick) — not a
+    /// Live daemon reachability (a real Ping, refreshed each tick), not a
     /// hardcoded socket-path check.
     daemon_up: bool,
-    /// Last ListProfiles error (corrupt enrollment / missing template key) —
+    /// Last ListProfiles error (corrupt enrollment / missing template key);
     /// distinguishes "file broken" from "no profiles" on the Repair tab.
     enroll_error: Option<String>,
-    /// Daemon self-report (Request::Health): its camera tier and loaded models —
+    /// Daemon self-report (Request::Health): its camera tier and loaded models:
     /// ground truth for the Repair rows (static path probes lie when the daemon
     /// runs with its own env, e.g. a packaged install).
     health: Option<HealthInfo>,
@@ -280,7 +280,7 @@ pub fn run() -> std::io::Result<()> {
         ratatui::crossterm::event::EnableMouseCapture
     );
     let mut app = App::new();
-    app.log('·', format!("irlume — managing '{}' (live)", app.user));
+    app.log('·', format!("irlume: managing '{}' (live)", app.user));
     app.refresh();
     let res = app.main_loop(&mut terminal);
     let _ = ratatui::crossterm::execute!(
@@ -340,7 +340,7 @@ impl App {
     }
 
     /// Which wizard steps to show. The DEFAULT view is the essential setup
-    /// path only — Welcome → Enroll → Keyring → Recovery → Login wiring →
+    /// path only: Welcome → Enroll → Keyring → Recovery → Login wiring →
     /// Done. Diagnostic/advanced screens earn their place instead of always
     /// claiming one: Repair appears only when something actually needs fixing
     /// (daemon down or a failing check), and Cameras / Identify / Settings
@@ -397,11 +397,11 @@ impl App {
     /// Capability-aware recommended unlock method (item: "suggest the best one").
     fn recommended(&self) -> &'static str {
         match (self.caps.ir_pair, self.caps.rgb, self.fp_present) {
-            (true, _, _) => "Face (IR) — secure: login, sudo, lock screen, dark mode",
-            (false, true, true) => "Fingerprint (secure) — or Face (RGB) for lock-screen only",
-            (false, true, false) => "Face (RGB) — convenience: lock-screen unlock only",
+            (true, _, _) => "Face (IR) · secure: login, sudo, lock screen, dark mode",
+            (false, true, true) => "Fingerprint (secure), or Face (RGB) for lock-screen only",
+            (false, true, false) => "Face (RGB) · convenience: lock-screen unlock only",
             (false, false, true) => "Fingerprint",
-            (false, false, false) => "Password only — no supported biometric hardware",
+            (false, false, false) => "Password only (no supported biometric hardware)",
         }
     }
 
@@ -429,7 +429,7 @@ impl App {
     }
 
     /// CHEAP live poll (runs on the fast ~2.5s timer): daemon state + camera
-    /// nodes only — all sub-millisecond, no subprocess spawns. Keeps the panel
+    /// nodes only; all sub-millisecond, no subprocess spawns. Keeps the panel
     /// live without periodic UI hitches. SILENT (no Activity spam).
     fn refresh_light(&mut self) {
         self.daemon_up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
@@ -465,7 +465,7 @@ impl App {
                 self.enroll_error = None;
             }
             // A corrupt/unreadable enrollment (or a missing template key for an
-            // encrypted file) surfaces as an Error, not empty — don't silently
+            // encrypted file) surfaces as an Error, not empty; don't silently
             // show "no face enrolled"; capture it so Repair can flag+fix it.
             Ok(Response::Error(e)) => self.enroll_error = Some(e),
             _ => {}
@@ -502,7 +502,7 @@ impl App {
 
     /// FULL refresh = cheap poll + the heavier probes (fingerprint via fprintd,
     /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
-    /// on demand ([r]), after an op, and when opening Repair/Fingerprint — but
+    /// on demand ([r]), after an op, and when opening Repair/Fingerprint, but
     /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
     fn refresh(&mut self) {
         self.refresh_light();
@@ -513,7 +513,7 @@ impl App {
             method: irlume_core::policy::method().as_str().to_string(),
         };
         self.run_checks();
-        // Visibility is state-driven (Repair appears when something fails) —
+        // Visibility is state-driven (Repair appears when something fails);
         // re-derive it from the fresh diagnostics.
         self.recompute_visible();
     }
@@ -544,7 +544,7 @@ impl App {
             },
         ));
 
-        // ONNX Runtime + Models: the daemon is the ground truth — if it answers
+        // ONNX Runtime + Models: the daemon is the ground truth: if it answers
         // Health it loaded both at startup (it exits otherwise). Static path
         // probes are only a fallback while the daemon is down; they can't know
         // the daemon's env (ORT_DYLIB_PATH / IRLUME_*_MODEL of a packaged unit).
@@ -574,14 +574,14 @@ impl App {
                 _ if priv_on => (Sev::Warn, "camera present, but a privacy switch is ON".to_string(),
                     Fix::Manual("turn off the camera privacy switch".into())),
                 "secure" => (Sev::Ok,
-                    format!("RGB + IR ({} + {}) — secure tier",
+                    format!("RGB + IR ({} + {}): secure tier",
                         h.rgb_dev.as_deref().unwrap_or("?"), h.ir_dev.as_deref().unwrap_or("?")),
                     Fix::None),
                 "convenience" => (Sev::Warn,
-                    format!("RGB-only ({}) — convenience tier: face unlocks the screen only, never sudo/login",
+                    format!("RGB-only ({}), convenience tier: face unlocks the screen only, never sudo/login",
                         h.rgb_dev.as_deref().unwrap_or("?")),
                     Fix::None),
-                _ => (Sev::Warn, "no camera — face auth unavailable (password/fingerprint only)".to_string(),
+                _ => (Sev::Warn, "no camera: face auth unavailable (password/fingerprint only)".to_string(),
                     Fix::None),
             };
             v.push(mk("Cameras", csev, cdetail, cfix));
@@ -608,7 +608,7 @@ impl App {
                 if ort {
                     "library found".into()
                 } else {
-                    "libonnxruntime.so not found (daemon down — local probe)".into()
+                    "libonnxruntime.so not found (daemon down; local probe)".into()
                 },
                 if ort {
                     Fix::None
@@ -618,7 +618,7 @@ impl App {
             ));
 
             // Resolve models the way the daemon does (env → /usr/share/irlume/models
-            // → repo cwd), NOT just cwd-relative — a packaged install keeps them in
+            // → repo cwd), NOT just cwd-relative; a packaged install keeps them in
             // /usr/share and the TUI is rarely launched from the repo.
             let m1 = crate::commands::resolve_model("glintr100.onnx", "IRLUME_MODEL").is_some();
             let m2 = crate::commands::resolve_model(
@@ -632,7 +632,7 @@ impl App {
                 if m1 && m2 {
                     "YuNet + AuraFace present".into()
                 } else {
-                    "not found (daemon down — local probe)".into()
+                    "not found (daemon down; local probe)".into()
                 },
                 if m1 && m2 {
                     Fix::None
@@ -659,13 +659,13 @@ impl App {
             let (csev, cdetail, cfix) = if !rgb && !ir {
                 (
                     Sev::Warn,
-                    "no camera — face auth unavailable (password/fingerprint only)".to_string(),
+                    "no camera: face auth unavailable (password/fingerprint only)".to_string(),
                     Fix::None,
                 )
             } else if !ir {
                 (
                     Sev::Warn,
-                    "RGB-only — convenience tier: face unlocks the screen only".to_string(),
+                    "RGB-only, convenience tier: face unlocks the screen only".to_string(),
                     Fix::None,
                 )
             } else if priv_on {
@@ -713,7 +713,7 @@ impl App {
                 if labeled {
                     "irlume module loaded (socket labeled)".into()
                 } else if wired {
-                    "module not loaded — greeter can't reach the daemon".into()
+                    "module not loaded: greeter can't reach the daemon".into()
                 } else {
                     "loads automatically when you wire login (Done tab → [w])".into()
                 },
@@ -727,7 +727,7 @@ impl App {
 
         let enrolled = !self.profiles.is_empty();
         if let Some(err) = &self.enroll_error {
-            // File present but unreadable — never silently read as "not enrolled".
+            // File present but unreadable; never silently read as "not enrolled".
             v.push(mk("Enrollment", Sev::Fail,
                 format!("enrollment unreadable: {err}"),
                 Fix::Manual("restore the backup, or re-enroll (Profiles → [e]); if encrypted, the template key may be missing".into())));
@@ -749,18 +749,18 @@ impl App {
         }
 
         // ---- Checks distilled from live cross-distro debugging (2026-07-01):
-        // every failure mode below cost a human diagnosis session once — Repair
+        // every failure mode below cost a human diagnosis session once; Repair
         // detects and resolves them now.
 
         // Stale daemon build: the installed daemon predates this CLI (bit us on
-        // Fedora — an old daemon silently missing new behavior).
+        // Fedora: an old daemon silently missing new behavior).
         if let Some(h) = &self.health {
             if !h.version.is_empty() && h.version != env!("CARGO_PKG_VERSION") {
                 v.push(mk(
                     "Daemon build",
                     Sev::Warn,
                     format!(
-                        "daemon v{} ≠ CLI v{} — reinstall/restart the daemon",
+                        "daemon v{} ≠ CLI v{}; reinstall/restart the daemon",
                         h.version,
                         env!("CARGO_PKG_VERSION")
                     ),
@@ -769,12 +769,12 @@ impl App {
             }
         }
         // Blink challenge configured but the FaceMesh model isn't loaded: the
-        // challenge silently skips — surface it instead.
+        // challenge silently skips; surface it instead.
         if self.challenge && self.health.as_ref().is_some_and(|h| !h.mesh) {
             v.push(mk(
                 "Blink challenge",
                 Sev::Fail,
-                "require-challenge is ON but FaceMesh isn't loaded — the challenge is skipped"
+                "require-challenge is ON but FaceMesh isn't loaded; the challenge is skipped"
                     .into(),
                 Fix::Manual(
                     "set IRLUME_MESH_MODEL=<models/face_landmark.onnx> in the irlumed unit".into(),
@@ -788,7 +788,7 @@ impl App {
                 v.push(mk(
                     "Fingerprint reader",
                     Sev::Fail,
-                    "reader is claimed by a stale session — finger prompts fail silently".into(),
+                    "reader is claimed by a stale session; finger prompts fail silently".into(),
                     Fix::Root("restart-fprintd"),
                 ));
             } else {
@@ -802,7 +802,7 @@ impl App {
         }
         // Method ↔ PAM-wiring coherence: competing biometric stacks intercept
         // each other's prompts; a chosen method that isn't wired does nothing.
-        // Active (non-comment) PAM lines only — a commented-out module is not wired.
+        // Active (non-comment) PAM lines only; a commented-out module is not wired.
         let pam_has = |needle: &str| {
             ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
                 .iter()
@@ -854,8 +854,7 @@ impl App {
                         v.push(mk(
                             "FP keyring unlock",
                             Sev::Warn,
-                            "wallet won't auto-unlock on fingerprint login — arm the keyring"
-                                .into(),
+                            "wallet won't auto-unlock on fingerprint login; arm the keyring".into(),
                             Fix::Manual("Keyring tab → [a] arm (seal your login password)".into()),
                         ));
                     } else if !wired {
@@ -877,12 +876,12 @@ impl App {
             }
             // Competing prompts need a reader that actually answers: a vendor
             // pam_fprintd line with NO fingerprint hardware fails instantly and
-            // PAM moves on — warning about it would alarm every reader-less box.
+            // PAM moves on; warning about it would alarm every reader-less box.
             _ if fprintd_wired && enrolled && self.fp.available => {
                 v.push(mk(
                     "Method wiring",
                     Sev::Warn,
-                    "fingerprint (pam_fprintd) AND face are both wired — prompts compete/intercept"
+                    "fingerprint (pam_fprintd) AND face are both wired; prompts compete/intercept"
                         .into(),
                     Fix::Manual(
                         "pick one: `sudo irlume fingerprint enable` or `... disable`".into(),
@@ -896,7 +895,7 @@ impl App {
         for foreign in ["howdy", "linhello"] {
             if pam_has(foreign) {
                 v.push(mk("Other face auth", Sev::Warn,
-                    format!("another face-auth module ({foreign}) is wired — it will conflict with irlume"),
+                    format!("another face-auth module ({foreign}) is wired; it will conflict with irlume"),
                     Fix::Manual(format!("remove the {foreign} lines from /etc/pam.d (or uninstall it)"))));
             }
         }
@@ -908,7 +907,7 @@ impl App {
             .is_some_and(|h| h.tier == "convenience")
         {
             v.push(mk("RGB anti-spoof", Sev::Ok,
-                "moiré screen-detector active — if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
+                "moiré screen-detector active; if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
                 Fix::None));
         }
         // AppArmor (Debian-family) parity with the SELinux check.
@@ -920,7 +919,7 @@ impl App {
                 if profiled {
                     "irlume profile installed".into()
                 } else {
-                    "daemon unconfined — optional hardening profile available".into()
+                    "daemon unconfined; optional hardening profile available".into()
                 },
                 if profiled {
                     Fix::None
@@ -947,7 +946,7 @@ impl App {
                     if r.encrypted {
                         "encrypted + recovery set".into()
                     } else if r.tpm_present {
-                        "templates not encrypted yet (TPM available — encrypts at enroll)".into()
+                        "templates not encrypted yet (TPM available; encrypts at enroll)".into()
                     } else {
                         "templates not encrypted (no TPM on this device)".into()
                     },
@@ -958,7 +957,7 @@ impl App {
 
         // TPM presence: without one, templates are root-only plaintext (not
         // encrypted at rest) and keyring auto-unlock can't be armed at all.
-        // Face login + sudo still work — this only bounds at-rest hardening and
+        // Face login + sudo still work; this only bounds at-rest hardening and
         // the wallet-on-login convenience. Info, not a failure.
         let tpm = self
             .recovery
@@ -966,7 +965,7 @@ impl App {
             .unwrap_or_else(|| crate::tpm_device().is_some());
         if !tpm {
             v.push(mk("TPM", Sev::Warn,
-                "no TPM — templates stored root-only plaintext; keyring auto-unlock unavailable (face login/sudo still work)".into(),
+                "no TPM: templates stored root-only plaintext; keyring auto-unlock unavailable (face login/sudo still work)".into(),
                 Fix::Manual("optional: enable the firmware TPM (fTPM/PTT) in BIOS, then re-enroll to encrypt at rest".into())));
         } else {
             // Secure Boot binds the TPM seal to the boot state (PCR-7). Off ⇒ the
@@ -974,7 +973,7 @@ impl App {
             use irlume_common::secureboot;
             if secureboot::secure_boot_present() && !secureboot::is_secure_boot_enabled() {
                 v.push(mk("Secure Boot", Sev::Warn,
-                    "Secure Boot is OFF — TPM seals still work but aren't bound to a trusted boot chain (weaker tamper resistance)".into(),
+                    "Secure Boot is OFF; TPM seals still work but aren't bound to a trusted boot chain (weaker tamper resistance)".into(),
                     Fix::Manual("optional: enable Secure Boot in firmware for boot-state-bound sealing".into())));
             }
         }
@@ -995,13 +994,13 @@ impl App {
         match fix {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
-            // Emitter setup writes the persisted UVC control — a root op now.
+            // Emitter setup writes the persisted UVC control, a root op now.
             Fix::Daemon("ir-emitter") => {
-                self.log('→', "sudo irlume ir-setup — enable the 850nm emitter (you'll be asked for your password)");
+                self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
             }
             Fix::Daemon(id) => {
-                self.set_error(format!("no handler for fix '{id}' — please report this"))
+                self.set_error(format!("no handler for fix '{id}'; please report this"))
             }
             Fix::Root("restart-daemon") => {
                 self.log(
@@ -1013,14 +1012,14 @@ impl App {
             Fix::Root("restart-fprintd") => {
                 self.log(
                     '→',
-                    "sudo systemctl restart fprintd — releases a stale reader claim",
+                    "sudo systemctl restart fprintd: releases a stale reader claim",
                 );
                 self.suspend = Some(Suspend::RestartFprintd);
             }
             Fix::Root("login-enable") => {
                 self.log(
                     '→',
-                    "sudo irlume login enable --apply — wires the login stack for your method",
+                    "sudo irlume login enable --apply: wires the login stack for your method",
                 );
                 self.suspend = Some(Suspend::LoginEnable);
             }
@@ -1036,7 +1035,7 @@ impl App {
                 self.suspend = Some(Suspend::SelinuxLoad);
             }
             Fix::Root(id) => {
-                self.set_error(format!("no handler for fix '{id}' — please report this"))
+                self.set_error(format!("no handler for fix '{id}'; please report this"))
             }
         }
     }
@@ -1173,7 +1172,7 @@ impl App {
                     }
                     WMsg::Err(e) => {
                         let e = e.strip_prefix("hardware: ").unwrap_or(&e);
-                        self.set_error(format!("Enrollment failed — {e}"));
+                        self.set_error(format!("Enrollment failed: {e}"));
                         finished = true;
                     }
                 }
@@ -1240,7 +1239,7 @@ impl App {
                 );
                 terminal.clear()?;
                 self.refresh();
-                // irlumed binds its socket only after loading the ONNX models —
+                // irlumed binds its socket only after loading the ONNX models;
                 // give a just-started daemon a bounded moment before judging.
                 if self.resume_enroll.is_some() && !self.daemon_up {
                     for _ in 0..40 {
@@ -1252,12 +1251,12 @@ impl App {
                     }
                 }
                 // A parked enrollment resumes exactly once: only if the daemon
-                // now answers (the fix worked); otherwise drop it — the error
+                // now answers (the fix worked); otherwise drop it; the error
                 // banner from the failed sudo step explains what happened.
                 if let Some(r) = self.resume_enroll.take() {
                     if self.daemon_up {
                         self.screen = SC_PROFILES;
-                        self.log('✓', "daemon is up — continuing enrollment");
+                        self.log('✓', "daemon is up; continuing enrollment");
                         match r {
                             ResumeEnroll::New => self.begin_enroll(),
                             ResumeEnroll::Add(p) => self.start_enroll(Some(p)),
@@ -1279,20 +1278,20 @@ impl App {
     /// `ir-setup` leaves no re-checkable state, so we log ✓ on success and raise
     /// the error banner on failure.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
-        eprintln!("\n{what} — running: sudo {}…", args.join(" "));
+        eprintln!("\n{what}; running: sudo {}…", args.join(" "));
         match std::process::Command::new("sudo").args(args).status() {
             Ok(st) if st.success() => self.log('✓', format!("{what}: done")),
             Ok(st) => {
-                // A failed/cancelled sudo can't have started the daemon — drop
+                // A failed/cancelled sudo can't have started the daemon; drop
                 // any parked enrollment so the resume path doesn't sit through
                 // its bounded daemon wait for nothing.
                 self.resume_enroll = None;
                 match st.code() {
                     Some(c) => self.set_error(format!(
-                        "{what}: sudo exited {c} — not applied (cancelled or failed)"
+                        "{what}: sudo exited {c}; not applied (cancelled or failed)"
                     )),
                     None => {
-                        self.set_error(format!("{what}: sudo terminated by a signal — not applied"))
+                        self.set_error(format!("{what}: sudo terminated by a signal; not applied"))
                     }
                 }
             }
@@ -1348,7 +1347,7 @@ impl App {
                 ],
             ),
             // Load the policy AND restart the daemon so the socket relabels to
-            // irlume_runtime_t — otherwise the existing socket keeps its old label
+            // irlume_runtime_t; otherwise the existing socket keeps its old label
             // and the check would still fail.
             Suspend::SelinuxLoad => self.sudo_step(
                 "load the SELinux module + relabel the socket",
@@ -1382,7 +1381,7 @@ impl App {
         }
         if self.op.is_some() {
             // An op (Identify / IR self-test) otherwise eats every key until the
-            // worker returns — up to the 120s daemon budget. Keep a quit escape
+            // worker returns, up to the 120s daemon budget. Keep a quit escape
             // hatch so a stalled probe can never trap the user; the worker result
             // is harmlessly dropped when we exit.
             if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
@@ -1424,9 +1423,9 @@ impl App {
                 self.log(
                     '·',
                     if self.advanced {
-                        "advanced view — all tabs shown ([v] to simplify)"
+                        "advanced view: all tabs shown ([v] to simplify)"
                     } else {
-                        "essential view — setup steps only ([v] for all tabs)"
+                        "essential view: setup steps only ([v] for all tabs)"
                     },
                 );
             }
@@ -1491,7 +1490,7 @@ impl App {
                 self.refresh();
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
-            // The quick launchers only make sense where their screens exist — on a
+            // The quick launchers only make sense where their screens exist: on a
             // camera-less box Profiles/Identify are hidden, so explain instead of
             // jumping into an enrollment that cannot work.
             (SC_WELCOME, KeyCode::Char('e')) if self.visible.contains(&SC_PROFILES) => {
@@ -1508,9 +1507,9 @@ impl App {
                 );
             }
             (SC_WELCOME, KeyCode::Char('e' | 'i')) => {
-                self.log('·', "no camera on this device — face enrollment/identify unavailable (see Fingerprint/Settings)");
+                self.log('·', "no camera on this device: face enrollment/identify unavailable (see Fingerprint/Settings)");
             }
-            // Cameras: switch the active pair — persists to /etc, so it's a root
+            // Cameras: switch the active pair; persists to /etc, so it's a root
             // op that suspends to `sudo irlume set-cameras`.
             (SC_CAMERAS, KeyCode::Enter) => {
                 let pairs = irlume_camera::list_pairs();
@@ -1535,11 +1534,11 @@ impl App {
             }
             // View the face-auth journal to see WHY a check failed. `logs debug
             // on` (a console step) adds per-stage tracing when a number is needed.
-            // Key is 'g' — 'v' is the global basic/all-tabs toggle (on_key).
+            // Key is 'g'; 'v' is the global basic/all-tabs toggle (on_key).
             (SC_REPAIR, KeyCode::Char('g')) => {
                 self.log(
                     '→',
-                    "sudo irlume logs — the daemon/PAM/keyring journal in one view",
+                    "sudo irlume logs: the daemon/PAM/keyring journal in one view",
                 );
                 self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
                 self.suspend = Some(Suspend::Logs);
@@ -1552,10 +1551,10 @@ impl App {
                 },
                 map_selftest,
             ),
-            // Cameras: IR emitter auto-setup (root — writes the persisted UVC
+            // Cameras: IR emitter auto-setup (root; writes the persisted UVC
             // control) suspends to sudo; the [p] probe below is read-only.
             (SC_CAMERAS, KeyCode::Char('s')) => {
-                self.log('→', "sudo irlume ir-setup — enable the 850nm emitter (you'll be asked for your password)");
+                self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
             }
             (SC_CAMERAS, KeyCode::Char('p')) => self.start_async(
@@ -1580,7 +1579,7 @@ impl App {
                 Request::Identify,
                 map_identify,
             ),
-            // Keyring — masked in-TUI entry (goes to the root daemon; no sudo).
+            // Keyring: masked in-TUI entry (goes to the root daemon; no sudo).
             (SC_KEYRING, KeyCode::Char('a')) => {
                 self.input = Some((
                     "Login password to seal (••):".into(),
@@ -1596,7 +1595,7 @@ impl App {
                     },
                 ));
             }
-            // Recovery — masked in-TUI entry.
+            // Recovery: masked in-TUI entry.
             (SC_RECOVERY, KeyCode::Char('s')) => {
                 self.input = Some((
                     "New recovery passphrase (••):".into(),
@@ -1628,12 +1627,12 @@ impl App {
                 }
             }
             // Login wiring (PAM): [w] wires the login stack (root, suspends to
-            // sudo) from either the wiring tab or the Done dashboard — the last
+            // sudo) from either the wiring tab or the Done dashboard; the last
             // setup mile must not require leaving the TUI for a manual command.
             (SC_PAM, KeyCode::Char('w')) | (SC_DONE, KeyCode::Char('w')) => {
-                self.log('→', "sudo irlume login enable --apply — wires the greeter + lock screen for your method");
+                self.log('→', "sudo irlume login enable --apply: wires the greeter + lock screen for your method");
                 self.log('·', "at the login/lock screen: leave the password empty and press Enter to use your face");
-                self.log('·', "face-sudo is opt-in — add it later with: sudo irlume login enable --with-sudo --apply");
+                self.log('·', "face-sudo is opt-in; add it later with: sudo irlume login enable --with-sudo --apply");
                 self.suspend = Some(Suspend::LoginEnable);
             }
             // Login wiring (PAM): show status outside the alt-screen.
@@ -1657,7 +1656,7 @@ impl App {
 
     /// Enrollment (and add-scan) needs the daemon. When it's down, route
     /// straight into the Repair fix (sudo enable+start) instead of starting a
-    /// doomed capture — the #1 first-run state (fresh package install, unit
+    /// doomed capture, the #1 first-run state (fresh package install, unit
     /// disabled by distro preset policy). The enroll intent is remembered and
     /// resumes automatically once the daemon answers.
     fn daemon_gate(&mut self, resume: ResumeEnroll) -> bool {
@@ -1666,7 +1665,7 @@ impl App {
         }
         self.log(
             '✗',
-            "irlumed isn't running — starting it now (enrollment continues automatically)",
+            "irlumed isn't running; starting it now (enrollment continues automatically)",
         );
         self.recompute_visible(); // daemon down ⇒ Repair earns its tab back
         self.screen = SC_REPAIR;
@@ -1684,7 +1683,7 @@ impl App {
         if self.profiles.len() >= MAX_PROFILES {
             self.log(
                 '✗',
-                format!("at the max {MAX_PROFILES} profiles — delete one first"),
+                format!("at the max {MAX_PROFILES} profiles; delete one first"),
             );
         } else {
             self.input = Some((
@@ -1789,7 +1788,7 @@ impl App {
             // Passwords: use the RAW buffer (never trim). Double-entry to confirm.
             Pending::KeyringPw(None) => {
                 if buf.is_empty() {
-                    self.set_error("empty password — aborted (nothing sealed)");
+                    self.set_error("empty password; aborted (nothing sealed)");
                     return;
                 }
                 self.input = Some((
@@ -1800,7 +1799,7 @@ impl App {
             }
             Pending::KeyringPw(Some(first)) => {
                 if buf != first {
-                    self.set_error("passwords don't match — aborted (nothing sealed)");
+                    self.set_error("passwords don't match; aborted (nothing sealed)");
                     return;
                 }
                 let req = Request::SealPassword {
@@ -1812,7 +1811,7 @@ impl App {
             }
             Pending::RecoveryPw(None) => {
                 if buf.is_empty() {
-                    self.set_error("empty passphrase — aborted");
+                    self.set_error("empty passphrase; aborted");
                     return;
                 }
                 self.input = Some((
@@ -1823,7 +1822,7 @@ impl App {
             }
             Pending::RecoveryPw(Some(first)) => {
                 if buf != first {
-                    self.set_error("passphrases don't match — aborted");
+                    self.set_error("passphrases don't match; aborted");
                     return;
                 }
                 let req = Request::RecoverySetup {
@@ -1834,7 +1833,7 @@ impl App {
             }
             Pending::RecoveryRestorePw => {
                 if buf.is_empty() {
-                    self.set_error("empty passphrase — aborted");
+                    self.set_error("empty passphrase; aborted");
                     return;
                 }
                 let req = Request::RecoveryRestore {
@@ -1971,17 +1970,17 @@ impl App {
 
     /// A single plain-language line under the header: what THIS tab is for and
     /// the one thing to do here. The whole point is that a first-time user never
-    /// lands on a screen not knowing why they're there — no jargon, names the key.
+    /// lands on a screen not knowing why they're there: no jargon, names the key.
     fn draw_hint(&self, f: &mut Frame, area: Rect) {
-        // During a capture the whole UI is about holding still — don't distract.
+        // During a capture the whole UI is about holding still; don't distract.
         // Kept to ~70 chars so it never wraps off this single row on an 80-col
         // terminal (the "  ℹ " prefix eats ~4). Each names the key to press.
         let text = if self.enroll.is_some() {
-            "Look at the camera and hold still — the checklist turns green as you go."
+            "Look at the camera and hold still; the checklist turns green as you go."
         } else {
             match self.screen {
                 SC_WELCOME => {
-                    "New here? Press [e] to scan your face — your password still works too."
+                    "New here? Press [e] to scan your face; your password still works too."
                 }
                 SC_REPAIR => {
                     "A red row is a problem: highlight it, press [f] to fix or [g] for logs."
@@ -1994,11 +1993,11 @@ impl App {
                 SC_KEYRING => {
                     "Let your face open your password wallet: press [a], type your password."
                 }
-                SC_RECOVERY => "Set a backup passphrase so you're never locked out — press [s].",
+                SC_RECOVERY => "Set a backup passphrase so you're never locked out; press [s].",
                 SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
                 SC_PAM => "Turn on face login for your screen: press [w] (asks for your password).",
                 SC_SETTINGS => {
-                    "Optional stricter checks — highlight one and press [enter] to toggle."
+                    "Optional stricter checks: highlight one and press [enter] to toggle."
                 }
                 SC_DONE => {
                     "All set! Green = done; anything left shows its key. Press [q] to close."
@@ -2064,7 +2063,7 @@ impl App {
         let mut lines = vec![
             Line::from(Span::styled(
                 format!(
-                    "Enrolling '{}'  —  scan {}/{}",
+                    "Enrolling '{}' (scan {}/{})",
                     e.profile, e.captured, e.target
                 ),
                 Style::new().add_modifier(Modifier::BOLD),
@@ -2094,7 +2093,7 @@ impl App {
         ];
         if let Some(c) = e.count {
             lines.push(Line::from(Span::styled(
-                format!("  ● Hold still — capturing in {c}…",),
+                format!("  ● Hold still; capturing in {c}…",),
                 Style::new().fg(OK).add_modifier(Modifier::BOLD),
             )));
         } else {
@@ -2116,7 +2115,7 @@ impl App {
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
         if self.profiles.is_empty() {
-            f.render_widget(Paragraph::new("\nNo face profiles yet.\n\nPress [e] to enroll — irlume will guide your framing and capture automatically.")
+            f.render_widget(Paragraph::new("\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically.")
                 .wrap(Wrap { trim: true }).dim(), area);
             return;
         }
@@ -2240,7 +2239,7 @@ impl App {
                             Style::new().add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            "RGB-only — convenience tier (face unlocks the screen only)",
+                            "RGB-only, convenience tier (face unlocks the screen only)",
                             Style::new().dim(),
                         ),
                     ])));
@@ -2248,12 +2247,12 @@ impl App {
             }
             if v.is_empty() {
                 v.push(ListItem::new(Span::styled(
-                    "no camera found — face auth unavailable on this device",
+                    "no camera found: face auth unavailable on this device",
                     Style::new().dim(),
                 )));
             } else {
                 v.push(ListItem::new(Span::styled(
-                    "   no IR node — the Secure tier (sudo/login/keyring) needs an IR Hello camera",
+                    "   no IR node: the Secure tier (sudo/login/keyring) needs an IR Hello camera",
                     Style::new().dim(),
                 )));
             }
@@ -2317,7 +2316,7 @@ impl App {
         );
 
         // ---- info: active pair, selected pair nodes, emitter ----
-        // Only claim a node as "active" if it exists — select_pair's fixed
+        // Only claim a node as "active" if it exists; select_pair's fixed
         // fallback names devices that may be absent on this hardware.
         let ex = |d: &str| std::path::Path::new(d).exists();
         let active = match (ex(&argb), ex(&air)) {
@@ -2412,7 +2411,7 @@ impl App {
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                "No usable reader on this device — fingerprint unavailable.",
+                "No usable reader on this device; fingerprint unavailable.",
                 Style::new().dim(),
             )));
         }
@@ -2452,7 +2451,7 @@ impl App {
             ]),
             Line::raw(""),
             Line::from(Span::styled(
-                "A recovery passphrase backs up the face-template key — the manual",
+                "A recovery passphrase backs up the face-template key, the manual",
                 Style::new().dim(),
             )),
             Line::from(Span::styled(
@@ -2463,7 +2462,7 @@ impl App {
         ];
         if !r.tpm_present {
             lines.push(Line::from(Span::styled(
-                "No TPM on this host — templates stay plaintext; recovery N/A.",
+                "No TPM on this host: templates stay plaintext; recovery N/A.",
                 Style::new().fg(ERR),
             )));
         } else if r.encrypted && !r.recovery_set {
@@ -2542,7 +2541,7 @@ impl App {
                 "fingerprint"
             };
             lines.push(Line::from(Span::styled(
-                format!("  Not armed — {how} login won't open your wallet yet."),
+                format!("  Not armed; {how} login won't open your wallet yet."),
                 Style::new().dim(),
             )));
         }
@@ -2561,7 +2560,7 @@ impl App {
         let rec = self.recovery.unwrap_or_default();
         let lines = vec![
             Line::from(Span::styled(
-                "  irlume — local face authentication",
+                "  irlume - local face authentication",
                 Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
@@ -2596,7 +2595,7 @@ impl App {
                 Span::styled(self.recommended(), Style::new().fg(OK)),
             ]),
             Line::from(Span::styled(
-                "  (you can change the method any time — [v] shows every tab)",
+                "  (you can change the method any time; [v] shows every tab)",
                 Style::new().dim(),
             )),
             Line::raw(""),
@@ -2620,7 +2619,7 @@ impl App {
                 ])
             },
             Line::from(Span::styled(
-                "  Live panel — changes to irlume appear here automatically.",
+                "  Live panel: changes to irlume appear here automatically.",
                 Style::new().dim(),
             )),
         ];
@@ -2703,14 +2702,14 @@ impl App {
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
                 // "no action needed" next to a non-zero fail count reads as a
-                // contradiction — point at the failing rows instead.
+                // contradiction; point at the failing rows instead.
                 Fix::None if fail > 0 => {
-                    "this row is fine — ↑↓ select a failing row for its fix".to_string()
+                    "this row is fine; ↑↓ select a failing row for its fix".to_string()
                 }
                 Fix::None => "no action needed".to_string(),
                 Fix::Manual(cmd) => format!("manual: {cmd}"),
-                Fix::Daemon(_) => "press [f] — irlume fixes this via the daemon".to_string(),
-                Fix::Root(_) => "press [f] — irlume runs the fix with sudo".to_string(),
+                Fix::Daemon(_) => "press [f]: irlume fixes this via the daemon".to_string(),
+                Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
             };
             lines.push(Line::from(vec![
                 Span::styled("  → ", Style::new().fg(ACCENT)),
@@ -2770,13 +2769,13 @@ impl App {
 
     fn draw_identify(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![
-            section("1:N identify — \"who is this?\""),
+            section("1:N identify (\"who is this?\")"),
             Line::from(Span::styled(
                 "  Capture once and match against your enrollment (every user when",
                 Style::new().dim(),
             )),
             Line::from(Span::styled(
-                "  run as root). Liveness-gated, RGB primary — a diagnostic, not unlock.",
+                "  run as root). Liveness-gated, RGB primary; a diagnostic, not unlock.",
                 Style::new().dim(),
             )),
             Line::raw(""),
@@ -2818,10 +2817,10 @@ impl App {
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![section("PAM services (face auth wiring)")];
-        // Inline per-service status — same data as `irlume login status`.
+        // Inline per-service status, same data as `irlume login status`.
         for (label, present, wired) in crate::pamwire::status_report() {
             let val = if !present {
-                Span::styled("— not present", Style::new().dim())
+                Span::styled("(not present)", Style::new().dim())
             } else if wired {
                 Span::styled("● wired", Style::new().fg(OK).add_modifier(Modifier::BOLD))
             } else {
@@ -2830,7 +2829,7 @@ impl App {
             lines.push(Line::from(vec![Span::raw(format!("  {label:<16}")), val]));
         }
         // LSM row is distro-aware: SELinux (Fedora-family), AppArmor
-        // (Debian/Ubuntu-family), or nothing (e.g. Arch default) — showing a
+        // (Debian/Ubuntu-family), or nothing (e.g. Arch default); showing a
         // SELinux row on a non-SELinux system reads as a fault that isn't one.
         if std::path::Path::new("/sys/fs/selinux").exists() {
             let sel = match crate::pamwire::selinux_state() {
@@ -2853,7 +2852,7 @@ impl App {
                     Span::styled("● irlume profile installed", Style::new().fg(OK))
                 } else {
                     Span::styled(
-                        "active — irlume unconfined (profile optional)",
+                        "active; irlume unconfined (profile optional)",
                         Style::new().dim(),
                     )
                 },
@@ -2863,11 +2862,11 @@ impl App {
         lines.push(section("What each does"));
         // Tier-accurate: only the Secure (IR) tier releases the login credential
         // at the greeter. On a convenience (RGB-only) box face is lock-screen
-        // only — describing keyring-unseal there would be a false promise.
+        // only; describing keyring-unseal there would be a false promise.
         match self.health.as_ref().map(|h| h.tier.as_str()) {
             Some("convenience") => {
                 lines.push(Line::from(Span::styled(
-                    "  greeter (RGB-only): face is NOT accepted for login — password only",
+                    "  greeter (RGB-only): face is NOT accepted for login; password only",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
@@ -2885,14 +2884,14 @@ impl App {
                     Style::new().dim(),
                 )));
             }
-            // Daemon unreachable/older, or no camera — don't promise credential release.
+            // Daemon unreachable/older, or no camera; don't promise credential release.
             _ => lines.push(Line::from(Span::styled(
-                "  tier unknown (daemon unreachable) — password remains the fallback",
+                "  tier unknown (daemon unreachable); password remains the fallback",
                 Style::new().dim(),
             ))),
         }
         lines.push(Line::from(Span::styled(
-            "  always fail-safe to the password — no lockout.",
+            "  always fail-safe to the password: no lockout.",
             Style::new().dim(),
         )));
         lines.push(Line::raw(""));
@@ -2905,7 +2904,7 @@ impl App {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "  at the greeter/lock: leave the password empty, press Enter — face fires only then",
+            "  at the greeter/lock: leave the password empty, press Enter; face fires only then",
             Style::new().dim(),
         )));
         lines.push(Line::from(vec![
@@ -2980,13 +2979,13 @@ impl App {
             Line::raw(""),
             Line::from(Span::styled(
                 if !self.daemon_up {
-                    "  Daemon not running — see the Repair tab before quitting."
+                    "  Daemon not running; see the Repair tab before quitting."
                 } else if self.profiles.is_empty() && self.caps.rgb {
-                    "  Not set up yet — enroll a face (Welcome [e]) to begin."
+                    "  Not set up yet; enroll a face (Welcome [e]) to begin."
                 } else if self.profiles.is_empty() {
-                    "  No face hardware — fingerprint/password remain your methods."
+                    "  No face hardware; fingerprint/password remain your methods."
                 } else if !wired {
-                    "  One step left: your login screen isn't wired yet — press [w] (sudo; password stays the fallback)."
+                    "  One step left: your login screen isn't wired yet; press [w] (sudo; password stays the fallback)."
                 } else {
                     "  All set. irlume keeps running as a daemon; this panel is safe to quit."
                 },
@@ -3012,10 +3011,10 @@ impl App {
         let title = match (&self.op, scrolled) {
             (Some(op), _) => format!(" ● Activity   {} {}… ", SPIN[self.spin], op.label),
             (None, true) => format!(
-                " ● Activity — ↑ history ({} up · PgDn/End to follow) ",
+                " ● Activity: ↑ history ({} up · PgDn/End to follow) ",
                 self.act_scroll
             ),
-            (None, false) => " ● Activity — newest last · PgUp to scroll back ".to_string(),
+            (None, false) => " ● Activity: newest last · PgUp to scroll back ".to_string(),
         };
         let blk = Block::bordered()
             .title(title)
@@ -3048,7 +3047,7 @@ impl App {
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let key =
             |k: &str| Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT));
-        // Guided enrollment swallows every key but Esc — show only that, so the
+        // Guided enrollment swallows every key but Esc; show only that, so the
         // footer doesn't advertise dead nav/action keys during a capture.
         if self.enroll.is_some() {
             let spans = vec![
@@ -3239,7 +3238,7 @@ fn map_confirm(resp: Response) -> (bool, String) {
         Response::Ok(m) => (true, m),
         Response::PasswordForgotten => (
             true,
-            "sealed login password erased — keyring unlock disarmed".into(),
+            "sealed login password erased; keyring unlock disarmed".into(),
         ),
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),
@@ -3251,7 +3250,7 @@ fn map_sealed(resp: Response) -> (bool, String) {
     match resp {
         Response::PasswordSealed => (
             true,
-            "keyring armed — face login will open your wallet".into(),
+            "keyring armed; face login will open your wallet".into(),
         ),
         Response::Error(e) => (false, format!("arm failed: {e}")),
         o => (false, format!("arm failed: {o:?}")),
@@ -3281,7 +3280,7 @@ fn map_settings(resp: Response) -> (bool, String) {
 }
 
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,
-/// then capture — repeating until `target` scans. Streams cues to the UI.
+/// then capture, repeating until `target` scans. Streams cues to the UI.
 fn enroll_worker(
     user: String,
     profile: String,
@@ -3328,7 +3327,7 @@ fn enroll_worker(
                     }
                 }
             }
-            // 3-2-1 countdown — re-verify framing at each beat (the poll lands
+            // 3-2-1 countdown: re-verify framing at each beat (the poll lands
             // just before the next beat / the capture). Drift off-angle aborts.
             for c in (1..=3).rev() {
                 if stop.load(Ordering::Relaxed) {
@@ -3341,7 +3340,7 @@ fn enroll_worker(
                 match crate::daemon_request(&Request::PositionSample {
                     user: Some(user.clone()),
                 }) {
-                    // Still framed: keep counting (don't send a Cue — that would
+                    // Still framed: keep counting (don't send a Cue; that would
                     // clear the on-screen count). Only surface a cue on abort.
                     Ok(Response::Position(r)) if r.well_framed => {}
                     Ok(Response::Position(r)) => {

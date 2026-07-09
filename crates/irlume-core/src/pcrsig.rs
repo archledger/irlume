@@ -3,8 +3,8 @@
 //! When a Unified Kernel Image is built with `ukify --pcr-private-key` /
 //! `--pcr-public-key` (or `systemd-measure sign`), systemd-stub exposes, at
 //! boot:
-//!   * `/run/systemd/tpm2-pcr-signature.json` — per-PCR-state signatures
-//!   * `/run/systemd/tpm2-pcr-public-key.pem` — the authorizing public key
+//!   * `/run/systemd/tpm2-pcr-signature.json`: per-PCR-state signatures
+//!   * `/run/systemd/tpm2-pcr-public-key.pem`: the authorizing public key
 //!
 //! Each kernel update reships a fresh signature inside the new UKI, so a
 //! `PolicyAuthorize`-bound secret keeps unsealing across updates with no reseal
@@ -82,7 +82,7 @@ fn discover(file: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// True when both signed-policy artifacts are present — i.e. the signed-PCR
+/// True when both signed-policy artifacts are present, i.e. the signed-PCR
 /// policy path is usable on this machine.
 pub fn signed_policy_available() -> bool {
     discover_signature_path().is_some() && discover_pubkey_path().is_some()

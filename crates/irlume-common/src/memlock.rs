@@ -13,8 +13,8 @@ pub fn lock_slice(buf: &[u8]) {
         return;
     }
     // `mlock` rounds an unaligned start down to the page, but
-    // `madvise(MADV_DONTDUMP)` returns EINVAL unless the address is page-aligned
-    // — so a raw Vec pointer silently failed DONTDUMP. Align the start down and
+    // `madvise(MADV_DONTDUMP)` returns EINVAL unless the address is page-aligned,
+    // so a raw Vec pointer silently failed DONTDUMP. Align the start down and
     // extend the length so both calls cover the pages backing the secret.
     let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
         n if n > 0 => n as usize,
@@ -28,7 +28,7 @@ pub fn lock_slice(buf: &[u8]) {
     unsafe {
         if libc::mlock(ptr, len) != 0 {
             eprintln!(
-                "irlume: mlock failed ({}); secret may be swappable — raise RLIMIT_MEMLOCK",
+                "irlume: mlock failed ({}); secret may be swappable; raise RLIMIT_MEMLOCK",
                 std::io::Error::last_os_error()
             );
         }

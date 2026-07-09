@@ -1,4 +1,4 @@
-//! `irlume` — operator CLI. A thin, unprivileged client of `irlumed` (same socket
+//! `irlume`: operator CLI. A thin, unprivileged client of `irlumed` (same socket
 //! protocol as the PAM module). Enrollment requests are authorized by the daemon
 //! via SO_PEERCRED, not by this binary.
 //!
@@ -31,10 +31,10 @@ pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// Developer / benchmark / research subcommands — hidden from `help` and gated
+/// Developer / benchmark / research subcommands: hidden from `help` and gated
 /// behind `IRLUME_DEV=1`. They open the camera directly (bypassing the daemon,
 /// so they EBUSY-conflict on a running install) and some, like `calcapture`,
-/// write RAW face embeddings to a plaintext file — not for end users.
+/// write RAW face embeddings to a plaintext file; not for end users.
 const DEV_CMDS: &[&str] = &[
     "capture",
     "eval",
@@ -117,14 +117,14 @@ fn main() -> std::process::ExitCode {
             }
         },
         (Some(cmd), _) => {
-            eprintln!("irlume: unknown command '{cmd}' — run `irlume help`");
+            eprintln!("irlume: unknown command '{cmd}'; run `irlume help`");
             std::process::ExitCode::from(2)
         }
         (None, _) => commands::help(),
     }
 }
 
-/// `irlume enroll --user U [--name "..."]` — enroll a NEW face profile (captures
+/// `irlume enroll --user U [--name "..."]`: enroll a NEW face profile (captures
 /// the default number of scans) via the daemon, which owns the camera. Default
 /// profile name is "Face Profile N".
 fn enroll(args: &[String]) -> std::process::ExitCode {
@@ -137,7 +137,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
     }
     eprintln!(
-        "[enroll] '{user}' — capturing a new face profile; stay in frame, look at the camera…"
+        "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
     );
     match daemon_request(&Request::Enroll {
         user,
@@ -164,7 +164,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume profiles [list|add-scan|rename|delete|eyes-open] ...` — manage the up-
+/// `irlume profiles [list|add-scan|rename|delete|eyes-open] ...`: manage the up-
 /// to-3 face profiles and their scans via the daemon.
 fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
@@ -173,7 +173,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         None | Some("list") => Request::ListProfiles { user },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
-                eprintln!("[profiles] adding a scan to '{p}' — stay in frame…");
+                eprintln!("[profiles] adding a scan to '{p}'; stay in frame…");
                 Request::AddScan {
                     user,
                     profile: p.into(),
@@ -273,11 +273,11 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume ir-setup [--dry-run]` — auto-enable the IR emitter via the daemon
+/// `irlume ir-setup [--dry-run]`: auto-enable the IR emitter via the daemon
 /// (integrated linux-enable-ir-emitter). `--dry-run` only lists XU controls.
-/// `irlume set-cameras <rgb> <ir>` — persist the active RGB+IR pair. Root only
+/// `irlume set-cameras <rgb> <ir>`: persist the active RGB+IR pair. Root only
 /// (the daemon writes /etc/irlume/cameras.conf); the TUI camera picker runs this
-/// via sudo. Not shown in help — it's the picker's backing command.
+/// via sudo. Not shown in help; it's the picker's backing command.
 fn set_cameras(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let (Some(rgb), Some(ir)) = (args.get(1), args.get(2)) else {
@@ -348,7 +348,7 @@ fn usage_profiles() -> std::process::ExitCode {
     std::process::ExitCode::from(2)
 }
 
-/// `irlume verify --user U` — full auth via the engine: liveness gate then match
+/// `irlume verify --user U`: full auth via the engine: liveness gate then match
 /// (RGB recognition in light, IR recognition in the dark).
 fn verify(args: &[String]) -> std::process::ExitCode {
     let (Some(det), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
@@ -382,7 +382,7 @@ fn verify(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume keyring <arm|status|forget>` — manage the TPM-sealed login password
+/// `irlume keyring <arm|status|forget>`: manage the TPM-sealed login password
 /// that lets a face login unlock the GNOME-keyring / KWallet. Talks to `irlumed`
 /// over the socket (the daemon owns the TPM + the root-only sealed store).
 pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
@@ -403,7 +403,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                         return std::process::ExitCode::FAILURE;
                     }
                 };
-                // Confirm to catch typos — a mistyped seal silently fails to
+                // Confirm to catch typos: a mistyped seal silently fails to
                 // unlock the wallet at the next face login (key mismatch).
                 let confirm = match rpassword::prompt_password("Confirm login password: ") {
                     Ok(p) => p,
@@ -413,7 +413,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     }
                 };
                 if first != confirm {
-                    eprintln!("[keyring] passwords do not match — aborted (nothing sealed).");
+                    eprintln!("[keyring] passwords do not match; aborted (nothing sealed).");
                     return std::process::ExitCode::from(2);
                 }
                 first
@@ -427,7 +427,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 line.trim_end_matches(['\n', '\r']).to_string()
             };
             if pw.is_empty() {
-                eprintln!("[keyring] empty password — aborted");
+                eprintln!("[keyring] empty password; aborted");
                 return std::process::ExitCode::from(2);
             }
             let req = irlume_common::Request::SealPassword {
@@ -482,7 +482,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             user: user.clone(),
         }) {
             Ok(irlume_common::Response::PasswordForgotten) => {
-                println!("[keyring] '{user}': sealed password erased — keyring unlock disarmed.");
+                println!("[keyring] '{user}': sealed password erased; keyring unlock disarmed.");
                 std::process::ExitCode::SUCCESS
             }
             Ok(irlume_common::Response::Error(e)) => {
@@ -543,12 +543,12 @@ fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlu
     let adapter = flag(args, "--adapter").unwrap_or("models/ir_adapter.onnx");
     let e = e.with_ir_adapter(adapter)?;
     if e.has_ir_adapter() {
-        eprintln!("[engine] IR adapter loaded ({adapter}) — dark mode uses adapted recognition");
+        eprintln!("[engine] IR adapter loaded ({adapter}); dark mode uses adapted recognition");
     }
     let mesh = flag(args, "--mesh").unwrap_or("models/face_landmark.onnx");
     let e = e.with_mesh(mesh)?;
     if e.has_mesh() {
-        eprintln!("[engine] FaceMesh loaded ({mesh}) — passive EAR liveness available");
+        eprintln!("[engine] FaceMesh loaded ({mesh}); passive EAR liveness available");
     }
     Ok(e)
 }
@@ -573,7 +573,7 @@ fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
-/// `irlume irbench --dir <nir_images> --det .. --model ..` — the real IR
+/// `irlume irbench --dir <nir_images> --det .. --model ..`: the real IR
 /// recognition benchmark: embed real NIR faces (YuNet detect → align → AuraFace),
 /// group by person (filename prefix), and report genuine vs impostor cosine
 /// distributions + EER + FAR/FRR. Answers "does AuraFace-on-IR discriminate?".
@@ -591,7 +591,7 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
         .unwrap_or(80);
 
     // Impostor-only / FALSE-ACCEPT mode: a directory of distinct-identity images
-    // (e.g. SFHQ synthetic faces — every file is a different person), so every
+    // (e.g. SFHQ synthetic faces; every file is a different person), so every
     // pair is an impostor pair. Measures FAR only (no genuine pairs / FRR).
     if args.iter().any(|a| a == "--impostor-only") {
         return farbench(dir, det_path, model, args);
@@ -818,12 +818,12 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
 }
 
 /// Large-scale RGB FALSE-ACCEPT benchmark (the visible-light sibling of the IR
-/// `irbench`). Every image under `--dir` is treated as a distinct identity — true
-/// for SFHQ synthetic faces — so every pair is an impostor pair. Embeds each face
+/// `irbench`). Every image under `--dir` is treated as a distinct identity (true
+/// for SFHQ synthetic faces), so every pair is an impostor pair. Embeds each face
 /// through the real auth pipeline (YuNet → align → AuraFace) and reports the
 /// impostor cosine tail + FAR at the auth thresholds + the threshold achieving
 /// NIST-grade FAR ≤ 1e-4. Histogram-based, so it scales to millions of pairs
-/// without storing them. FAR only — genuine/FRR come from live captures, not here.
+/// without storing them. FAR only; genuine/FRR come from live captures, not here.
 fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::process::ExitCode {
     let max_images: usize = flag(args, "--max-images")
         .and_then(|s| s.parse().ok())
@@ -904,7 +904,7 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
     }
 
     // Optional: dump the raw 512-D embeddings (one per line) for offline analysis
-    // — e.g. apply a debiasing adapter and recompute FAR per demographic group.
+    // (e.g. apply a debiasing adapter and recompute FAR per demographic group).
     if let Some(out) = flag(args, "--export") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::File::create(out) {
@@ -1104,7 +1104,7 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     let (nf, nd, nb) = (sf / n as f64, sd / n as f64, sb / n as f64);
-    println!("[normprobe] {n} faces — mean feature norm:");
+    println!("[normprobe] {n} faces, mean feature norm:");
     println!("  full   {nf:.2}");
     println!(
         "  dark   {nd:.2}  ({:+.1}%, lower in {}/{n} = {:.0}%)",
@@ -1119,9 +1119,9 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
         blur_lower as f32 / n as f32 * 100.0
     );
     let verdict = if nd < nf * 0.97 && nb < nf * 0.97 && dark_lower as f32 / n as f32 > 0.8 {
-        "✓ feature norm TRACKS quality on AuraFace — usable as a quality signal"
+        "✓ feature norm TRACKS quality on AuraFace; usable as a quality signal"
     } else {
-        "✗ weak/no correlation — feature norm NOT a reliable quality signal here"
+        "✗ weak/no correlation; feature norm NOT a reliable quality signal here"
     };
     println!("[normprobe] {verdict}");
     std::process::ExitCode::SUCCESS
@@ -1194,7 +1194,7 @@ fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &irlume_vision::Landmarks5)
     peak as f32
 }
 
-/// P2 probe: capture RGB + IR and report what the IR stream gives us — mean/min/
+/// P2 probe: capture RGB + IR and report what the IR stream gives us: mean/min/
 /// max brightness (is the emitter illuminating?), and whether YuNet finds a face
 /// in each spectrum (the basis for the cross-spectrum liveness cue). Diagnostic,
 /// not yet a gate.
@@ -1289,7 +1289,7 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             cues.depth_ok,
             cues.glint_present
         );
-        println!("[GATE] {verdict:?} — {reason}");
+        println!("[GATE] {verdict:?}: {reason}");
         Ok(())
     };
     match run() {
@@ -1351,7 +1351,7 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
             let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
             let mut ears: Vec<f32> = Vec::new();
             // Per-frame corneal-specular CONTRAST (the candidate 2nd cue): peak eye
-            // contrast over the window. Banner ≤70, no-glasses live ~120 — the open
+            // contrast over the window. Banner ≤70, no-glasses live ~120; the open
             // question is where glasses-genuine lands (does it clear the floor?).
             let mut contrast_max = 0.0f32;
             // Full EarSample stream (index + EAR-if-face + frame brightness): the
@@ -1437,7 +1437,7 @@ fn meshprobe(args: &[String]) -> std::process::ExitCode {
     match run() {
         Ok(w) => {
             if let Some((_, _, o)) = &record {
-                println!("[meshprobe] appended {w} presentations to {o} — run `irlume padreport --in {o}`");
+                println!("[meshprobe] appended {w} presentations to {o}; run `irlume padreport --in {o}`");
             }
             std::process::ExitCode::SUCCESS
         }
@@ -1462,7 +1462,7 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         let mut emb = irlume_vision::Embedder::load_from_file(model)?;
         let mut embs = Vec::new();
-        println!("[genuine] stay in frame — capturing {FRAMES} frames…");
+        println!("[genuine] stay in frame; capturing {FRAMES} frames…");
         for k in 0..FRAMES {
             let f = irlume_camera::capture_rgb(device)?;
             let view = irlume_vision::align::RgbView {
@@ -1481,7 +1481,7 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
             }
         }
         if embs.len() < 2 {
-            println!("[genuine] need >=2 frames with a face — re-run staying in view.");
+            println!("[genuine] need >=2 frames with a face; re-run staying in view.");
             return Ok(());
         }
         let mut scores = Vec::new();
@@ -1503,10 +1503,12 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
         println!("  impostor max (from eval): {impostor_max:.3}");
         if scores[0] > impostor_max {
             let mid = (scores[0] + impostor_max) / 2.0;
-            println!("  ✓ SEPARABLE — genuine min {:.3} > impostor max {:.3}; midpoint threshold ≈ {:.3}",
-                scores[0], impostor_max, mid);
+            println!(
+                "  ✓ SEPARABLE: genuine min {:.3} > impostor max {:.3}; midpoint threshold ≈ {:.3}",
+                scores[0], impostor_max, mid
+            );
         } else {
-            println!("  ⚠ overlap — genuine min {:.3} ≤ impostor max; needs better alignment/lighting or per-profile (e.g. glasses) enrollment",
+            println!("  ⚠ overlap: genuine min {:.3} ≤ impostor max; needs better alignment/lighting or per-profile (e.g. glasses) enrollment",
                 scores[0]);
         }
         Ok(())
@@ -1528,9 +1530,9 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
 /// user and, per sample, records the genuine cosine vs the user's own templates
 /// (RGB TTA-512 space; IR in the deployed v1-adapter space) plus face brightness
 /// and the RAW 512-D RGB and IR embeddings. The dump feeds two offline jobs:
-///   #3 Platt recalibration — real genuine RGB/IR cosine+brightness distribution
+///   #3 Platt recalibration: real genuine RGB/IR cosine+brightness distribution
 ///      (the academic-fit consts in fusion.rs are a prior; this is ground truth);
-///   #4 adapter-v3 validation — raw IR embeddings re-scored through v1 vs the
+///   #4 adapter-v3 validation: raw IR embeddings re-scored through v1 vs the
 ///      banked residZero+ASnorm adapter, with academic impostors, before deploy.
 /// Capture across lighting with `--tag bright` now and `--tag dim` at sunset.
 fn calcapture(args: &[String]) -> std::process::ExitCode {
@@ -1584,12 +1586,12 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         let enr = match irlume_core::storage::load(&user) {
             Ok(Some(e)) => Some(e),
             Ok(None) => {
-                eprintln!("[calcapture] note: '{user}' not enrolled — cosines from pairwise only");
+                eprintln!("[calcapture] note: '{user}' not enrolled; cosines from pairwise only");
                 None
             }
             Err(e) => {
                 eprintln!(
-                    "[calcapture] note: templates unavailable ({e}) — cosines from pairwise only"
+                    "[calcapture] note: templates unavailable ({e}); cosines from pairwise only"
                 );
                 None
             }
@@ -1813,7 +1815,7 @@ fn eval(args: &[String]) -> std::process::ExitCode {
             "  => threshold floor (above impostor max): {:.3}",
             scores[n - 1] + 0.02
         );
-        println!("  (genuine pairs — same person, 2 captures — set the ceiling; run two `capture` sessions to measure.)");
+        println!("  (genuine pairs of the same person across 2 captures set the ceiling; run two `capture` sessions to measure.)");
         Ok(())
     };
     match run() {
@@ -1847,16 +1849,18 @@ fn doctor() -> std::process::ExitCode {
     );
     match tpm_device() {
         Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
-        None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗ — required for sealing"),
+        None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗; required for sealing"),
     }
     if !secureboot::secure_boot_present() {
         println!("[doctor] Secure Boot: unknown (not a UEFI boot?)");
     } else if secureboot::is_secure_boot_enabled() {
         println!("[doctor] Secure Boot: enabled ✓");
     } else if secureboot::is_setup_mode() {
-        println!("[doctor] Secure Boot: SETUP MODE ⚠ — keys not enrolled; PCR-7 binding is NOT enforcing");
+        println!(
+            "[doctor] Secure Boot: SETUP MODE ⚠ (keys not enrolled); PCR-7 binding is NOT enforcing"
+        );
     } else {
-        println!("[doctor] Secure Boot: disabled ⚠ — TPM PCR-7 binding is weak; enable for trust");
+        println!("[doctor] Secure Boot: disabled ⚠ (TPM PCR-7 binding is weak; enable for trust)");
     }
     println!(
         "[doctor] boot mode: {}",
@@ -1865,9 +1869,9 @@ fn doctor() -> std::process::ExitCode {
     println!(
         "[doctor] signed PCR policy: {}",
         if irlume_core::pcrsig::signed_policy_available() {
-            "systemd PCR-11 signature present ✓ — kernel updates won't need re-seal"
+            "systemd PCR-11 signature present ✓; kernel updates won't need re-seal"
         } else {
-            "none — relies on PCR-7 literal seal + recovery passphrase (re-arm/restore after firmware updates)"
+            "none: relies on PCR-7 literal seal + recovery passphrase (re-arm/restore after firmware updates)"
         }
     );
 
@@ -1895,7 +1899,7 @@ fn doctor() -> std::process::ExitCode {
             match commands::resolve_model(f, env) {
                 Some(p) => println!("  {f}: present ✓ ({})", p.display()),
                 None => {
-                    println!("  {f}: not found — install the irlume package (or run from the repo)")
+                    println!("  {f}: not found; install the irlume package (or run from the repo)")
                 }
             }
         }
@@ -1928,7 +1932,7 @@ fn doctor() -> std::process::ExitCode {
                 if recovery_set { "SET ✓" } else { "not set (run `irlume recovery setup`)" },
             );
         }
-        _ => println!("[doctor] templates ({user}): unknown (daemon not reachable — run `irlume recovery status`)"),
+        _ => println!("[doctor] templates ({user}): unknown (daemon not reachable; run `irlume recovery status`)"),
     }
 
     std::process::ExitCode::SUCCESS
@@ -1981,7 +1985,7 @@ fn capture(args: &[String]) -> std::process::ExitCode {
         let faces = det.detect(&view)?;
         println!("[detect] {} face(s)", faces.len());
         let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
-            println!("  no face in frame — sit in view and re-run.");
+            println!("  no face in frame; sit in view and re-run.");
             return Ok(());
         };
         println!(
@@ -2009,7 +2013,7 @@ fn capture(args: &[String]) -> std::process::ExitCode {
 }
 
 /// Phase-1 make-or-break: load the recognition model and embed the same chip
-/// twice — cosine MUST be ~1.0. Proves the ONNX path is deterministic and the
+/// twice: cosine MUST be ~1.0. Proves the ONNX path is deterministic and the
 /// preprocessing is wired before any matching is trusted. Needs the AuraFace
 /// model file and `libonnxruntime.so` available at runtime.
 fn selftest_align(args: &[String]) -> std::process::ExitCode {
@@ -2025,10 +2029,10 @@ fn selftest_align(args: &[String]) -> std::process::ExitCode {
             let (passed, detail) = irlume_vision::selftest_alignment_identity(&mut emb);
             println!("[selftest align] {detail}");
             if passed {
-                println!("[selftest align] PASS — ONNX embed path is deterministic.");
+                println!("[selftest align] PASS: ONNX embed path is deterministic.");
                 std::process::ExitCode::SUCCESS
             } else {
-                eprintln!("[selftest align] FAIL — check preprocessing / channel order.");
+                eprintln!("[selftest align] FAIL: check preprocessing / channel order.");
                 std::process::ExitCode::FAILURE
             }
         }

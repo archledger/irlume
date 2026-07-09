@@ -1,17 +1,17 @@
-//! Per-distro abstraction. A minimal port of linhello's platform layer — just
+//! Per-distro abstraction. A minimal port of linhello's platform layer: just
 //! the distro-family detection that the fingerprint (and, later, login) wiring
 //! needs to pick the right mechanism (authselect vs pam-auth-update vs direct).
 
 /// Distro family, for choosing the PAM-wiring mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistroFamily {
-    /// Debian/Ubuntu/Mint — `pam-auth-update` + `/usr/share/pam-configs`.
+    /// Debian/Ubuntu/Mint: `pam-auth-update` + `/usr/share/pam-configs`.
     Debian,
-    /// Fedora/RHEL/derivatives — `authselect` custom profiles.
+    /// Fedora/RHEL/derivatives: `authselect` custom profiles.
     Fedora,
-    /// Arch/Manjaro/EndeavourOS — edit `/etc/pam.d` services directly.
+    /// Arch/Manjaro/EndeavourOS: edit `/etc/pam.d` services directly.
     Arch,
-    /// Anything else — direct `/etc/pam.d` edits, best-effort.
+    /// Anything else: direct `/etc/pam.d` edits, best-effort.
     Other,
 }
 
@@ -58,7 +58,7 @@ pub fn distro_family() -> DistroFamily {
     }
 }
 
-/// Best-effort "does this user already have a live login session" — the same
+/// Best-effort "does this user already have a live login session", the same
 /// heuristic the daemon uses for its warm/cold classification: `/run/user/<uid>`
 /// exists. The PAM module uses it to distinguish a COLD login (unlock the login
 /// keyring: let the auth stack continue so pam_gnome_keyring runs) from a WARM
@@ -68,7 +68,7 @@ pub fn distro_family() -> DistroFamily {
 pub fn user_has_live_session(user: &str) -> bool {
     // Prefer logind: an ACTIVE, `user`-class session. Unlike a bare
     // `/run/user/<uid>` check, this is NOT fooled by a runtime dir that lingers
-    // after logout — which otherwise makes a logout→login look "warm" and skip
+    // after logout, which otherwise makes a logout→login look "warm" and skip
     // the cold-login keyring unlock. Fall back to `/run/user/<uid>` if logind is
     // unavailable.
     if let Some(active) = active_graphical_session(user) {
@@ -79,7 +79,7 @@ pub fn user_has_live_session(user: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `Some(active?)` from logind — does `user` own an active/online `user`-class
+/// `Some(active?)` from logind: does `user` own an active/online `user`-class
 /// session right now? `None` if `loginctl` is missing/unparsable (→ caller falls
 /// back to the runtime-dir heuristic).
 fn active_graphical_session(user: &str) -> Option<bool> {

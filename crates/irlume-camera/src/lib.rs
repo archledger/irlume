@@ -4,11 +4,11 @@
 //! and one greyscale IR sensor (`/dev/video2`), plus an 850/940nm emitter fired
 //! via a UVC Extension-Unit control write (cf. linux-enable-ir-emitter).
 //!
-//! Capture order matters: grab RGB+detect FIRST, then IR — never concurrently —
+//! Capture order matters: grab RGB+detect FIRST, then IR, never concurrently,
 //! because shared-USB Hello modules starve one stream if both are read at once.
 //!
 //! Implementation: the `v4l` crate (V4L2). RGB capture requests YUYV and converts
-//! to RGB8. FOOTGUN: enumerate V4L2 controls defensively — naive control queries
+//! to RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
 pub mod ir_emitter;
@@ -40,9 +40,9 @@ const RGB_W: u32 = 640;
 const RGB_H: u32 = 480;
 const AE_WARMUP: usize = 6; // discard frames while auto-exposure settles
 
-/// V4L2 privacy-control id (`V4L2_CID_PRIVACY`) — a hardware shutter/kill switch.
+/// V4L2 privacy-control id (`V4L2_CID_PRIVACY`), a hardware shutter/kill switch.
 pub const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
-/// `V4L2_CID_BACKLIGHT_COMPENSATION` — makes auto-exposure favor the (face)
+/// `V4L2_CID_BACKLIGHT_COMPENSATION`: makes auto-exposure favor the (face)
 /// subject over a bright background, fixing the backlit-window case.
 pub const V4L2_CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
 
@@ -64,14 +64,14 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
     match e.raw_os_error() {
         Some(16) => {
             let who = camera_holder(device)
-                .map(|h| format!(" — in use by {h}"))
-                .unwrap_or_else(|| " — another app is using it".into());
+                .map(|h| format!(", in use by {h}"))
+                .unwrap_or_else(|| ", another app is using it".into());
             Error::Hardware(format!(
                 "{device}: camera busy{who}. Close that app (e.g. a camera/video/conferencing app) and retry."
             ))
         }
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
-            "{device}: permission denied — add your user to the 'video' group (camera) and re-login"
+            "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
         )),
         _ => Error::Hardware(format!("{device}: {e}")),
     }
@@ -121,7 +121,7 @@ pub enum Role {
 
 /// Classify a single `/dev/videoN` node by enumerating its pixel formats.
 /// Defensive: enumerate FORMATS (safe), never `query_controls` (panics on some
-/// UVC drivers — a hard-won linhello lesson).
+/// UVC drivers; a hard-won linhello lesson).
 pub fn classify(device: &str) -> Role {
     let Ok(dev) = Device::with_path(device) else {
         return Role::Other;
@@ -204,16 +204,16 @@ fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathB
 /// injection (v4l2loopback / OBS virtual camera). See docs/THREAT_MODEL.md.
 ///
 /// Always enforced: the device must resolve through sysfs to a physical bus
-/// (USB/PCI), never a virtual/platform node — the anti-injection gate, needs no
+/// (USB/PCI), never a virtual/platform node; the anti-injection gate, needs no
 /// per-host config. Additionally, when `IRLUME_CAMERA_PIN` is set the USB
-/// descriptor must be in the allowlist — a comma-separated set of `"vid:pid"`
+/// descriptor must be in the allowlist: a comma-separated set of `"vid:pid"`
 /// lowercase hex (e.g. `3277:0059,046d:085e` to allow the built-in *and* an
 /// external Logitech Brio); when `IRLUME_CAMERA_REQUIRE_FIXED=1` the `removable`
-/// attribute must read `fixed` (rejects a hot-plugged external camera —
+/// attribute must read `fixed` (rejects a hot-plugged external camera;
 /// supplementary, and intentionally *off* by default so external Hello cameras
 /// work; `removable` is also frequently `unknown` even for legitimate devices).
 pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
-    // Distinguish "no camera at all" from "a node that isn't physical" — the
+    // Distinguish "no camera at all" from "a node that isn't physical"; the
     // anti-injection message only makes sense when something answered to the path.
     if !std::path::Path::new(device).exists() {
         return Err(Error::Hardware(format!("{device}: no camera found")));
@@ -222,13 +222,13 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     let link = format!("/sys/class/video4linux/{node}/device");
     let real = std::fs::canonicalize(&link).map_err(|_| {
         Error::Hardware(format!(
-            "{device}: no physical device in sysfs (virtual camera?) — refusing to authenticate"
+            "{device}: no physical device in sysfs (virtual camera?); refusing to authenticate"
         ))
     })?;
     let p = real.to_string_lossy();
     if !is_physical_camera_path(&p) {
         return Err(Error::Hardware(format!(
-            "{device}: '{p}' is not a physical-bus camera — refusing (anti-injection)"
+            "{device}: '{p}' is not a physical-bus camera; refusing (anti-injection)"
         )));
     }
     let dev_dir = find_attr_dir(&real, "idVendor");
@@ -237,12 +237,12 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
             Some(g) if allow.contains(&g) => {}
             Some(g) => {
                 return Err(Error::Hardware(format!(
-                    "{device}: camera {g} not in pinned set {allow:?} — refusing"
+                    "{device}: camera {g} not in pinned set {allow:?}; refusing"
                 )))
             }
             None => {
                 return Err(Error::Hardware(format!(
-                    "{device}: no USB descriptor to match pin {allow:?} — refusing"
+                    "{device}: no USB descriptor to match pin {allow:?}; refusing"
                 )))
             }
         }
@@ -257,7 +257,7 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
             .map(|s| s.trim().to_string());
         if removable.as_deref() != Some("fixed") {
             return Err(Error::Hardware(format!(
-                "{device}: removable='{}' (want fixed) — refusing hot-plugged camera",
+                "{device}: removable='{}' (want fixed); refusing hot-plugged camera",
                 removable.as_deref().unwrap_or("?")
             )));
         }
@@ -305,7 +305,7 @@ pub fn device_identity(device: &str) -> Option<String> {
 }
 
 /// The sysfs USB-device dir shared by all interfaces (RGB + IR) of one physical
-/// camera — two `/dev/videoN` nodes with the same id are the same camera.
+/// camera; two `/dev/videoN` nodes with the same id are the same camera.
 fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let real = std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device")).ok()?;
@@ -480,7 +480,7 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
         .ok_or_else(|| Error::Hardware("no frames captured".into()))
 }
 
-/// Capture an RGB burst and return its per-pixel temporal median — the
+/// Capture an RGB burst and return its per-pixel temporal median, the
 /// recognition path's denoise. A single motion-blurred, over-exposed, or
 /// transiently corrupt frame is rejected by the median, so it can't drop a
 /// genuine match below threshold (false reject). Used for auth/enroll; the
@@ -518,7 +518,7 @@ pub fn median_frame(mut frames: Vec<Frame>) -> Frame {
 const IR_W: u32 = 640;
 const IR_H: u32 = 400;
 // Grab a short burst and keep the brightest frame (the lit strobe phase). The
-// IR node caps at 15 fps, so each frame costs ~67ms — 10 frames (~0.67s) still
+// IR node caps at 15 fps, so each frame costs ~67ms; 10 frames (~0.67s) still
 // catches the emitter's strobe peak (it re-fires at mid-burst) while ~halving
 // the old 24-frame (~1.6s) cost. Bump back up if dark-mode genuine scores drop.
 const IR_BURST: usize = 10;
@@ -551,7 +551,7 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     let lit = ir_emitter::enable(dev.handle().fd(), &card);
     // The emitter may STROBE (pulse), so grab a burst and keep the brightest
-    // frame — the lit strobe phase (linhello lesson). Re-fire mid-burst in case
+    // frame, the lit strobe phase (linhello lesson). Re-fire mid-burst in case
     // the control self-clears.
     let mut best: Option<Vec<u8>> = None;
     let mut best_mean = -1.0f64;
@@ -578,7 +578,7 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     // don't have a table entry for. Guide the user to configure it.
     if !lit && (0.0..35.0).contains(&best_mean) {
         eprintln!(
-            "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter — for an \
+            "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter; for an \
              external Hello camera run `linux-enable-ir-emitter configure`, then set \
              IRLUME_IR_EMITTER=unit:sel:b,b,... (or IRLUME_IR_EMITTER=off to silence)"
         );
@@ -596,7 +596,7 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
 /// temporal liveness (the blink challenge). Unlike [`capture_ir`], the eyes-closed
 /// dip of a blink must survive, so this returns every sample rather than only the
 /// brightest. Each of `samples` frames is the brightest of a `burst`-frame
-/// mini-burst — `burst=1` yields raw frames (to reveal whether the emitter
+/// mini-burst: `burst=1` yields raw frames (to reveal whether the emitter
 /// strobes); `burst>=2` de-strobes locally while keeping enough temporal
 /// resolution for a blink (the IR node is ~15 fps, so a mini-burst of 2 ≈ 133 ms).
 pub fn capture_ir_sequence(
@@ -629,7 +629,7 @@ pub fn capture_ir_sequence(
     ir_emitter::enable(dev.handle().fd(), &card);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
-    // constant mid-grey for the rest of the window) — real sensor noise never
+    // constant mid-grey for the rest of the window); real sensor noise never
     // repeats exactly. Saturated and near-black frames are excluded from the
     // check: those are optical states (exposure blow-out / emitter-off phase),
     // not a stall, and restarting mid-settle only prolongs the settle.
@@ -688,7 +688,7 @@ pub fn capture_ir_sequence(
         }
         dead_run = 0;
         if best_mean >= 245.0 {
-            // Exposure blow-out: no face is detectable in a saturated frame —
+            // Exposure blow-out: no face is detectable in a saturated frame;
             // skip it rather than spend a window slot on it.
             continue;
         }
@@ -702,10 +702,10 @@ pub fn capture_ir_sequence(
     Ok(frames)
 }
 
-/// Auto-configure the IR emitter for `device` — irlume's integrated
+/// Auto-configure the IR emitter for `device`, irlume's integrated
 /// linux-enable-ir-emitter: enumerate the camera's UVC extension-unit controls,
 /// try candidate payloads, and keep the one that makes the IR image bright
-/// (success detected automatically from IR brightness — no phone-camera step).
+/// (success detected automatically from IR brightness; no phone-camera step).
 /// Persists the discovered control so every later capture uses it. Returns a
 /// human description, or errors if nothing worked. Non-destructive: controls
 /// that don't help are restored.
@@ -739,17 +739,17 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     match ir_emitter::autoconfigure(fd, &mut measure) {
         Some(ctrl) => {
             // With the emitter lit, look for a companion control that brightens
-            // the IR further (an exposure/gain-like vendor XU control) — persist
+            // the IR further (an exposure/gain-like vendor XU control); persist
             // it alongside the emitter so every capture applies both.
             let boost = ir_emitter::discover_boost(fd, &ctrl, &mut measure);
             ir_emitter::save_conf_full(&ctrl, boost.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
             Ok(match &boost {
                 Some(b) => format!(
-                    "IR emitter enabled — control {} + brightness boost {} (saved; future captures use both)",
+                    "IR emitter enabled: control {} + brightness boost {} (saved; future captures use both)",
                     ctrl.encode(), b.encode()
                 ),
                 None => format!(
-                    "IR emitter enabled — control {} (saved; no extra brightness control found)",
+                    "IR emitter enabled: control {} (saved; no extra brightness control found)",
                     ctrl.encode()
                 ),
             })
@@ -762,7 +762,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
 }
 
 /// Read-only list of the IR camera's UVC extension-unit controls (unit, selector,
-/// size) — for `ir-setup --dry-run` diagnostics. Touches no settings.
+/// size), for `ir-setup --dry-run` diagnostics. Touches no settings.
 pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<(u8, u8, usize)>> {
     verify_pinned(device)?;
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
@@ -778,7 +778,7 @@ pub fn ensure_ir_emitter(device: &str) -> irlume_common::Result<bool> {
     let mean_of =
         |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
     if mean_of(&capture_ir(device)?) >= 40.0 {
-        return Ok(true); // already working — do not touch the camera
+        return Ok(true); // already working; do not touch the camera
     }
     // Dark: attempt integrated auto-setup, then re-check.
     setup_ir_emitter(device)?;
@@ -834,7 +834,7 @@ impl Cameras {
     /// Falls back to the default nodes if discovery finds nothing.
     pub fn open() -> irlume_common::Result<Self> {
         // TODO: device-trust binding (pin by topology/descriptor; reject virtual
-        // cams) — the CVE-2021-34466 defense.
+        // cams); the CVE-2021-34466 defense.
         let nodes = discover_nodes();
         let rgb = nodes
             .iter()
@@ -848,7 +848,7 @@ impl Cameras {
             .unwrap_or_else(|| DEFAULT_IR_DEVICE.into());
         if privacy_engaged(&rgb) {
             return Err(Error::Hardware(format!(
-                "{rgb}: hardware privacy switch is ON — disable it to authenticate"
+                "{rgb}: hardware privacy switch is ON; disable it to authenticate"
             )));
         }
         Ok(Self {
@@ -924,7 +924,7 @@ mod tests {
         assert!(is_physical_camera_path(
             "/sys/devices/pci0000:00/0000:00:1f.6/cam0"
         ));
-        // v4l2loopback / OBS virtual cameras — the injection vector — are rejected.
+        // v4l2loopback / OBS virtual cameras, the injection vector, are rejected.
         assert!(!is_physical_camera_path(
             "/sys/devices/platform/v4l2loopback-000/video4linux/video0"
         ));

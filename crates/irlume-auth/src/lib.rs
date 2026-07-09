@@ -1,4 +1,4 @@
-//! Shared authentication orchestration — the one place the security-critical
+//! Shared authentication orchestration: the one place the security-critical
 //! pipeline lives. Both the CLI and the `irlumed` daemon drive this.
 //!
 //! Flow: capture RGB + IR (firing the IR emitter) → detect → align → embed (RGB)
@@ -22,7 +22,7 @@ pub struct Engine {
     emb: Embedder,
     /// Optional IR domain-adaptation MLP (applied to IR embeddings in the dark).
     ir_adapter: Option<Adapter>,
-    /// Optional MediaPipe FaceMesh — dense landmarks for the passive EAR blink
+    /// Optional MediaPipe FaceMesh: dense landmarks for the passive EAR blink
     /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
     /// the opt-in passive-liveness gate (it can't run without landmarks).
     mesh: Option<irlume_vision::FaceMesh>,
@@ -42,9 +42,9 @@ pub use irlume_core::biopolicy::Tier;
 pub struct Assessment {
     pub verdict: Verdict,
     pub reason: String,
-    /// RGB-face embedding (visible light) — the primary identity.
+    /// RGB-face embedding (visible light), the primary identity.
     pub embedding: Option<[f32; EMBED_DIM]>,
-    /// IR-face embedding (for dark operation), if a face was found in IR —
+    /// IR-face embedding (for dark operation), if a face was found in IR:
     /// adapter-transformed (256-D) when the IR adapter is loaded, else raw 512-D.
     pub ir_embedding: Option<Vec<f32>>,
     pub signals: Signals,
@@ -143,7 +143,7 @@ impl Engine {
     }
 
     /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
-    /// the file is absent this is a no-op — the opt-in passive gate then can't run
+    /// the file is absent this is a no-op; the opt-in passive gate then can't run
     /// and is skipped (logged), so face auth keeps working.
     pub fn with_mesh(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
@@ -167,7 +167,7 @@ impl Engine {
         }
     }
 
-    /// RGB-only capture + algorithmic (no-IR) liveness — the convenience-tier
+    /// RGB-only capture + algorithmic (no-IR) liveness, the convenience-tier
     /// path for devices without an IR camera. Anti-spoof here is DETERRENT-grade
     /// (well-lit + frontal + screen/glare heuristic), which is why this tier is
     /// limited to lock-screen unlock and never releases credentials.
@@ -321,7 +321,7 @@ impl Engine {
             rgb_specular_frac: 0.0,
         };
         let (verdict, _cues, reason) = self.gate.evaluate(&signals);
-        // Log the cue values on PASS too — a near-miss on a genuine user is
+        // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
             "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} yaw_asym={:.2} pitch={:.2}",
@@ -368,7 +368,7 @@ impl Engine {
     }
 
     /// Passive blink liveness (opt-in, ADR-0002): capture a short IR sequence and
-    /// look for a NATURAL blink via EAR — no prompt, no deliberate action. Per frame
+    /// look for a NATURAL blink via EAR: no prompt, no deliberate action. Per frame
     /// we run FaceMesh (from the detected face crop) and take the smaller eye's EAR;
     /// [`irlume_liveness::detect_blink`] then finds a dip below the open baseline. A
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
@@ -376,7 +376,7 @@ impl Engine {
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
         // Raw frame rate (~15 fps, no de-strobe burst): the detector separates
         // emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
-        // spans only 2–3 raw frames — halving the rate loses it (measured 2026-07-01).
+        // spans only 2–3 raw frames; halving the rate loses it (measured 2026-07-01).
         const SAMPLES: usize = 75; // ~5s window
         const BURST: usize = 1;
         let Some(mesh) = self.mesh.as_mut() else {
@@ -416,9 +416,9 @@ impl Engine {
 
     /// If the user opted into passive liveness and we're about to grant, require a
     /// natural blink before releasing anything. Failure downgrades to a non-grant
-    /// with an Uncertain-style reason (PAM cascades to the password fallback — never
+    /// with an Uncertain-style reason (PAM cascades to the password fallback, never
     /// a lockout). No-op unless the outcome is a grant, the flag is on, IR is
-    /// available, and the FaceMesh model is loaded (else the gate can't run — we log
+    /// available, and the FaceMesh model is loaded (else the gate can't run; we log
     /// and skip rather than lock the user out of an undeployed model).
     fn challenge_if_required(
         &mut self,
@@ -429,7 +429,7 @@ impl Engine {
             return Ok(outcome);
         }
         if self.mesh.is_none() {
-            eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded — skipping (set IRLUME_MESH_MODEL)");
+            eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded; skipping (set IRLUME_MESH_MODEL)");
             return Ok(outcome);
         }
         use irlume_liveness::BlinkResult;
@@ -437,7 +437,7 @@ impl Engine {
             BlinkResult::Blinked => outcome,
             BlinkResult::NoBlink => Outcome {
                 granted: false, live: true, score: outcome.score,
-                reason: "passive liveness: no natural blink in the window — look at the camera a moment longer".into(),
+                reason: "passive liveness: no natural blink in the window; look at the camera a moment longer".into(),
             },
             BlinkResult::NoEyes => Outcome {
                 granted: false, live: false, score: outcome.score,
@@ -450,7 +450,7 @@ impl Engine {
     /// then 1:N cosine match against every scan in every enrolled face profile
     /// (any enrolled face unlocks). Threshold scales with the total scan count.
     pub fn authenticate(&mut self, user: &str) -> irlume_common::Result<Outcome> {
-        // Fingerprint mode: face is disabled so pam_fprintd drives — never engage
+        // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
             return Ok(Outcome {
@@ -527,11 +527,11 @@ impl Engine {
             }
             // Per-user IR-liveness DEPTH floor (anti-screen/photo, calibrated to
             // this user's enrolled 3D face structure): the live frame must clear the
-            // enrolled depth floor. Depth only — a per-user IR *brightness* floor was
+            // enrolled depth floor. Depth only: a per-user IR *brightness* floor was
             // removed because IR face brightness is ambient-dependent (emitter-only
             // ~40 in the dark vs ~140 lit) and a lit-enrollment floor false-rejected
             // genuine dim/night logins as "screen/photo". The global gate above
-            // (`evaluate`) already enforces an ambient-robust IR brightness floor.
+            // (`evaluate`) already enforces an ambient-tolerant IR brightness floor.
             // Only meaningful when IR was actually captured (skip on RGB-only).
             if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
                 irlume_common::dlog!(
@@ -543,7 +543,7 @@ impl Engine {
                     return Ok(Outcome {
                         granted: false, live: false, score: 0.0,
                         reason: format!(
-                            "IR depth {:.2} below your calibrated floor {:.2} — looks 2D (screen/photo)",
+                            "IR depth {:.2} below your calibrated floor {:.2}; looks 2D (screen/photo)",
                             a.ir_depth, depth_floor
                         ),
                     });
@@ -570,7 +570,7 @@ impl Engine {
             // Stage-2 lighting-adaptive fusion: RGB recognition missed (poor ambient
             // light or a marginal angle). If we also captured an IR face and the user
             // enrolled IR templates, fuse the two CALIBRATED scores, each weighted by
-            // its modality's capture quality — a marginal RGB + marginal IR can jointly
+            // its modality's capture quality; a marginal RGB + marginal IR can jointly
             // grant while FMR stays bounded (an impostor must fool BOTH at once). The
             // cross-spectrum liveness gate + per-user IR floor already passed above.
             // This is the bright→RGB / dark→IR / dim→FUSE story.
@@ -578,7 +578,7 @@ impl Engine {
                 let ir_scans = enr.ir_scans();
                 if !ir_scans.is_empty() {
                     let (ir_score, ir_who) = best(ir_probe, &ir_scans);
-                    // (a) calibrated quality-weighted fusion — the dim/mixed-light path.
+                    // (a) calibrated quality-weighted fusion: the dim/mixed-light path.
                     let f = irlume_core::fusion::fuse(
                         irlume_core::fusion::rgb_genuine_prob(score),
                         irlume_core::fusion::rgb_quality_weight(a.signals.rgb_face_brightness),
@@ -592,7 +592,7 @@ impl Engine {
                         return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: f.prob,
                             reason: format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob) });
                     }
-                    // (b) pure IR fallback — still valid when IR alone is clearly strong
+                    // (b) pure IR fallback: still valid when IR alone is clearly strong
                     // (e.g. IR-only enrollment, or RGB template absent). Stricter than the
                     // dark path (+IR_FALLBACK_MARGIN) for the second-modality risk.
                     let ir_base = if self.ir_adapter.is_some() {
@@ -632,7 +632,7 @@ impl Engine {
                     granted: false,
                     live: false,
                     score: 0.0,
-                    reason: "dark, but no IR scans enrolled — re-enroll to enable dark unlock"
+                    reason: "dark, but no IR scans enrolled; re-enroll to enable dark unlock"
                         .into(),
                 });
             }
@@ -686,8 +686,8 @@ impl Engine {
     /// 1:N identify ("who is this?"): one live capture, matched against every
     /// enrolled user's RGB profiles (no claimed identity). Liveness-gated like
     /// auth; reports the best above-threshold (user, profile, score). RGB primary
-    /// path only — a diagnostic, not a dark-mode unlock.
-    /// 1:N identify across every enrolled user. Full cross-user search — an
+    /// path only: a diagnostic, not a dark-mode unlock.
+    /// 1:N identify across every enrolled user. Full cross-user search, an
     /// admin/testing capability; the daemon restricts a non-root caller to
     /// [`identify_within`] so the returned score can't become a hill-climbing
     /// oracle against other users' templates.
@@ -697,7 +697,7 @@ impl Engine {
 
     /// Identify scoped to a single enrolled user ("is this `user`?"). Same
     /// liveness gate and RGB match as [`identify`], but the search set is just
-    /// this one account — what a non-root peer is allowed to ask about itself.
+    /// this one account: what a non-root peer is allowed to ask about itself.
     pub fn identify_within(&mut self, user: &str) -> irlume_common::Result<IdentifyOutcome> {
         self.identify_impl(Some(user))
     }
@@ -784,17 +784,18 @@ impl Engine {
         let a = self.assess()?;
         let s = &a.signals;
         let live = a.verdict == Verdict::Live;
-        let detail =
-            if live {
-                format!(
-                "Live — RGB face {}, IR face {} · IR brightness {:.0}, depth {:.2}, glint {:.0}",
+        let detail = if live {
+            format!(
+                "Live: RGB face {}, IR face {} · IR brightness {:.0}, depth {:.2}, glint {:.0}",
                 if s.rgb_face.is_some() { "✓" } else { "✗" },
                 if s.ir_face.is_some() { "✓" } else { "✗" },
-                a.ir_brightness, a.ir_depth, s.ir_eye_glint,
+                a.ir_brightness,
+                a.ir_depth,
+                s.ir_eye_glint,
             )
-            } else {
-                format!("{:?} — {}", a.verdict, a.reason)
-            };
+        } else {
+            format!("{:?}: {}", a.verdict, a.reason)
+        };
         Ok((live, detail))
     }
 
@@ -812,7 +813,7 @@ impl Engine {
         let Some(f) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
             return Ok((
                 false,
-                "no RGB face detected — face the camera and retry".into(),
+                "no RGB face detected; face the camera and retry".into(),
             ));
         };
         let chip = align::align_to_arcface(&view, &f.landmarks)?;
@@ -827,7 +828,7 @@ impl Engine {
 
     /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).
     /// Each Live capture yields one (rgb, ir, depth, brightness, pitch). No
-    /// enrolling from a photo — the liveness gate rejects spoofs. `pitch_neutral`
+    /// enrolling from a photo; the liveness gate rejects spoofs. `pitch_neutral`
     /// centres the frontal gate on this user's camera (None on first enroll).
     fn capture_scans(
         &mut self,
@@ -835,8 +836,8 @@ impl Engine {
         pitch_neutral: Option<f32>,
     ) -> irlume_common::Result<Vec<Scan>> {
         let mut out = Vec::new();
-        // Budget (was ×4) absorbs the added frontality gate — a frame grabbed the
-        // instant the user drifts off-angle is rejected, not saved — with enough
+        // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
+        // instant the user drifts off-angle is rejected, not saved) with enough
         // retries that a brief drift near the capture moment doesn't abort enroll.
         for _ in 0..(want * 10) {
             if out.len() >= want {
@@ -877,7 +878,7 @@ impl Engine {
         let mut enr = storage::load(user)?.unwrap_or_else(|| Enrollment::new(user));
         if enr.profiles.len() >= MAX_PROFILES {
             return Err(irlume_common::Error::Protocol(format!(
-                "at the max of {MAX_PROFILES} face profiles — delete one first"
+                "at the max of {MAX_PROFILES} face profiles; delete one first"
             )));
         }
         let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
@@ -892,7 +893,7 @@ impl Engine {
         let captured = self.capture_scans(want, enr.pitch_neutral())?;
         if captured.len() < want {
             return Err(irlume_common::Error::Protocol(format!(
-                "only {} live scans (need {want}) — check lighting and framing",
+                "only {} live scans (need {want}); check lighting and framing",
                 captured.len()
             )));
         }
@@ -910,7 +911,7 @@ impl Engine {
                     format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
                 };
                 return Err(irlume_common::Error::Protocol(format!(
-                    "this face is already enrolled as '{other}' (match {score:.2}) — {hint}"
+                    "this face is already enrolled as '{other}' (match {score:.2}); {hint}"
                 )));
             }
         }
@@ -948,19 +949,18 @@ impl Engine {
     }
 
     /// If the live cameras no longer match the enrolled binding, return a reason
-    /// to refuse (anti-swap). A bound device that now reads differently — or an
-    /// enrolled IR camera that's gone — fails; an unbound side is not checked.
+    /// to refuse (anti-swap). A bound device that now reads differently, or an
+    /// enrolled IR camera that's gone, fails; an unbound side is not checked.
     fn binding_mismatch(&self, bind: &irlume_core::storage::CameraBinding) -> Option<String> {
         if let Some(want) = &bind.rgb {
             if irlume_camera::device_identity(&self.rgb_dev).as_ref() != Some(want) {
-                return Some("camera changed since enrollment (RGB device identity differs) — re-enroll on this camera".into());
+                return Some("camera changed since enrollment (RGB device identity differs); re-enroll on this camera".into());
             }
         }
         if let Some(want) = &bind.ir {
             if irlume_camera::device_identity(&self.ir_dev).as_ref() != Some(want) {
                 return Some(
-                    "IR camera changed or absent since enrollment — re-enroll on this camera"
-                        .into(),
+                    "IR camera changed or absent since enrollment; re-enroll on this camera".into(),
                 );
             }
         }
@@ -995,7 +995,7 @@ impl Engine {
             .next()
             .ok_or_else(|| {
                 irlume_common::Error::Protocol(
-                    "no live scan captured — check lighting and framing".into(),
+                    "no live scan captured; check lighting and framing".into(),
                 )
             })?;
         // Anti-mixing: reject a scan whose face belongs to a different profile.
@@ -1011,7 +1011,7 @@ impl Engine {
                 format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
             };
             return Err(irlume_common::Error::Protocol(format!(
-                "the scanned face belongs to '{other}' (match {score:.2}), not '{profile_name}' — {hint}. \
+                "the scanned face belongs to '{other}' (match {score:.2}), not '{profile_name}'; {hint}. \
                  Scans of different faces can't be mixed in one profile."
             )));
         }
@@ -1036,7 +1036,7 @@ impl Engine {
     /// report how the user is positioned (no enrollment, no auth). The gates
     /// mirror the enroll/auth path so `well_framed` implies a capture will take.
     /// `user` (the account being enrolled) tunes the pitch band to that user's
-    /// calibrated neutral when they already have scans — so the guide coaches to
+    /// calibrated neutral when they already have scans, so the guide coaches to
     /// the same window the capture gate will accept.
     pub fn position_sample(
         &mut self,
@@ -1072,7 +1072,7 @@ impl Engine {
         let Some(f) = top else {
             return Ok(PositionReport {
                 ir_ok,
-                guidance: "No face detected — look straight at the camera and center yourself"
+                guidance: "No face detected; look straight at the camera and center yourself"
                     .into(),
                 ..Default::default()
             });
@@ -1085,15 +1085,15 @@ impl Engine {
         let brightness = luma_in_bbox(&rgb.data, rgb.width, rgb.height, &f.bbox);
 
         let mut q = 100i32;
-        let mut guidance = "Hold still — looking good".to_string();
+        let mut guidance = "Hold still, looking good".to_string();
         let mut well = true;
         let (plo, phi) = pitch_band(pitch_neutral);
         let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX && (plo..=phi).contains(&pose.pitch_frac);
         // Live pose numbers for calibrating the framing bounds to a given camera
-        // (`IRLUME_LOG=debug`); `neutral` is this user's calibrated centre (or —).
+        // (`IRLUME_LOG=debug`); `neutral` is this user's calibrated centre (or -).
         irlume_common::dlog!("framing: yaw_asym={:.2} yaw_signed={:.2} pitch={:.2} band=[{:.2},{:.2}] neutral={} face_frac={:.2} bright={:.0}",
             pose.yaw_asym, pose.yaw_signed, pose.pitch_frac, plo, phi,
-            pitch_neutral.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into()), face_frac, brightness);
+            pitch_neutral.map(|n| format!("{n:.2}")).unwrap_or_else(|| "-".into()), face_frac, brightness);
         if face_frac < MIN_FRAC {
             guidance = "Move closer".into();
             well = false;
@@ -1111,11 +1111,11 @@ impl Engine {
             well = false;
             q -= 30;
         } else if brightness < DIM {
-            guidance = "Too dark — add light or face a window".into();
+            guidance = "Too dark: add light or face a window".into();
             well = false;
             q -= 30;
         } else if brightness > BRIGHT {
-            guidance = "Too bright — reduce glare/backlight".into();
+            guidance = "Too bright: reduce glare/backlight".into();
             well = false;
             q -= 20;
         }
@@ -1134,17 +1134,17 @@ impl Engine {
     }
 }
 
-/// Framing-guide frontality bounds — deliberately STRICTER than the liveness
+/// Framing-guide frontality bounds: deliberately STRICTER than the liveness
 /// anti-spoof gate (yaw 0.40 / pitch 0.20–0.80). The wide liveness pitch band
 /// meant a normal chin tilt never left "frontal", so "lift/lower your chin"
-/// almost never fired — and by the time a tilt was steep enough to trip the
+/// almost never fired, and by the time a tilt was steep enough to trip the
 /// liveness band, the detector had already lost the face ("no face detected").
 /// A tighter band makes the up/down cue fire at a MODERATE, still-detectable
 /// tilt. Low pitch = looking up, high pitch = looking down (live-verified). A
 /// below-eye-level laptop camera looks UP at the face, biasing neutral toward
 /// the LOW (looking-up) end. This is the UNCALIBRATED bootstrap band, used only
 /// until a user has ≥2 enrolled scans: it is deliberately WIDE so a FIRST
-/// enrollment succeeds on any camera geometry — a below-eye laptop cam can read
+/// enrollment succeeds on any camera geometry: a below-eye laptop cam can read
 /// a level face at ~0.72, an eye-level cam at ~0.45, so the window must span both
 /// or first enroll could loop with no escape. Once calibrated, [`pitch_band`]
 /// recentres a tighter `neutral ± PITCH_TOL` window on the user's own camera.
@@ -1154,7 +1154,7 @@ const FRAME_PITCH_MIN: f32 = 0.28;
 const FRAME_PITCH_MAX: f32 = 0.75;
 /// Half-width of the pitch window once the user's neutral is known. Tighter than
 /// the wide bootstrap band because it's centred on the camera's actual level
-/// reading — coaches a squarely-frontal capture without nagging a level face.
+/// reading; coaches a squarely-frontal capture without nagging a level face.
 const PITCH_TOL: f32 = 0.13;
 
 /// The pitch acceptance window: `neutral ± PITCH_TOL` once this user has a
@@ -1167,7 +1167,7 @@ fn pitch_band(pitch_neutral: Option<f32>) -> (f32, f32) {
     }
 }
 
-/// True when a head pose is squarely-frontal enough to enroll — the capture-time
+/// True when a head pose is squarely-frontal enough to enroll: the capture-time
 /// gate (in [`Engine::capture_scans`]) and the guide's `well_framed` share these
 /// bounds (and the same `pitch_neutral`), so what the guide coaches to is exactly
 /// what gets saved.
@@ -1200,10 +1200,10 @@ fn frontality_hint(pose: &irlume_vision::HeadPose, pitch_neutral: Option<f32>) -
         }
     } else if pose.pitch_frac < lo {
         // Below neutral = nose toward eye line = looking up → bring the chin down.
-        "Lower your chin — look down a little".into()
+        "Lower your chin, look down a little".into()
     } else if pose.pitch_frac > hi {
         // Above neutral = nose toward mouth = looking down → bring the chin up.
-        "Lift your chin — look up a little".into()
+        "Lift your chin, look up a little".into()
     } else {
         "Look straight at the camera".into()
     }
@@ -1234,7 +1234,7 @@ fn luma_in_bbox(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
 }
 
 /// Best-matching OTHER profile for `probe` (excluding `exclude`), if it reaches
-/// the identity threshold — i.e. this face already belongs to a different
+/// the identity threshold, i.e. this face already belongs to a different
 /// profile. Stops the same person's scans being split across profiles (which
 /// would corrupt recognition and the 1:N unlock model).
 fn colliding_profile(
@@ -1259,7 +1259,7 @@ fn colliding_profile(
 
 /// Per-eye open check (IR corneal-glint heuristic): an open eye reflects the
 /// 850nm emitter as a bright specular point near the eye landmark; a closed
-/// eyelid does not. Conservative — requires the glint, so an unverifiable eye
+/// eyelid does not. Conservative: requires the glint, so an unverifiable eye
 /// reads closed (auth falls back to password). Heuristic; used only when a
 /// profile opts into the require-eyes-open gate.
 const EYE_OPEN_PEAK_MIN: f32 = 200.0;
@@ -1375,7 +1375,7 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
 
 /// Specular contrast at the eyes = peak − local-mean brightness, max over both
 /// eyes. A live OPEN eye makes a sharp corneal specular spike (high contrast); a
-/// CLOSED lid — or a printed/vinyl "eye" — is diffuse (low). This is the basis of
+/// CLOSED lid (or a printed/vinyl "eye") is diffuse (low). This is the basis of
 /// the ADR-0002 blink challenge and has far better SNR than raw peak glint: a
 /// closed lid still reflects 850nm, so peak alone barely drops, but the specular
 /// spike (hence contrast) collapses. Live-validated 2026-06-30: genuine open-eye
@@ -1503,7 +1503,7 @@ mod tests {
         };
         assert!(frontality_hint(&p, None).starts_with("Lift your chin"));
         // Both off: the more-severe axis wins (yaw far past its limit) → yaw
-        // guidance, not pitch — robust to small bound tweaks.
+        // guidance, not pitch; holds up under small bound tweaks.
         let p = HeadPose {
             yaw_asym: 0.95,
             yaw_signed: 0.95,
@@ -1542,7 +1542,7 @@ mod tests {
         );
         // A novel face collides with nothing.
         assert!(colliding_profile(&enr, &[0.0, 0.0, 1.0], None).is_none());
-        // Same face into its OWN profile (excluded) is fine — that's improving it.
+        // Same face into its OWN profile (excluded) is fine; that's improving it.
         assert!(colliding_profile(&enr, &face1, Some("Face Profile 1")).is_none());
     }
 }

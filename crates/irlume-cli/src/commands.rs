@@ -8,7 +8,7 @@ use crate::{daemon_request, tpm_device, user_arg};
 use irlume_common::{Request, Response};
 use std::process::ExitCode;
 
-/// `irlume update` — origin-aware updater. Detects how this install got onto
+/// `irlume update`: origin-aware updater. Detects how this install got onto
 /// the system and updates through that same channel, never a different one:
 /// repo-backed installs (Fedora Copr, Launchpad PPA) are upgraded in place by
 /// running the package manager; release-asset and source installs get the
@@ -18,8 +18,8 @@ use std::process::ExitCode;
 pub fn update(args: &[String]) -> ExitCode {
     let check_only = args.iter().any(|a| a == "--check" || a == "-n");
     let origin = install_origin();
-    // The version the package manager actually has installed — the source of
-    // truth for "is a newer one out?" — not just this binary's compiled version
+    // The version the package manager actually has installed (the source of
+    // truth for "is a newer one out?"), not just this binary's compiled version
     // (which can differ from the package on a dev/overlaid box).
     let current = installed_version(&origin);
     println!("[update] installed: {current}");
@@ -37,7 +37,7 @@ pub fn update(args: &[String]) -> ExitCode {
             }
         }
         None => {
-            println!("[update] couldn't reach the release feed (offline?) — not updating; the channel for this install:");
+            println!("[update] couldn't reach the release feed (offline?). Not updating; the channel for this install:");
             false
         }
     };
@@ -81,7 +81,7 @@ pub fn update(args: &[String]) -> ExitCode {
         InstallOrigin::LocalRpm(_) => {
             // A release may ship a standalone .rpm for direct download, but it's
             // Fedora-version-specific (fc44…) and its SELinux policy is a separate
-            // Recommends that a local `dnf install ./x.rpm` won't auto-pull — so
+            // Recommends that a local `dnf install ./x.rpm` won't auto-pull, so
             // the Copr stays the recommended Fedora channel (in-place upgrades +
             // the selinux subpackage pulled automatically). Point there.
             recommend_channel(&origin);
@@ -92,7 +92,7 @@ pub fn update(args: &[String]) -> ExitCode {
                 .unwrap_or("vVERSION")
                 .trim_start_matches('v');
             let (deb_arch, _, _) = arch_names();
-            println!("  Update the way it was installed — the new .deb from the release page:");
+            println!("  Update the way it was installed (the new .deb from the release page):");
             release_asset_steps(
                 ver,
                 &format!("irlume_{ver}_{deb_arch}.deb"),
@@ -111,7 +111,7 @@ pub fn update(args: &[String]) -> ExitCode {
                 .trim_start_matches('v');
             let (_, pkg_arch, _) = arch_names();
             println!(
-                "  Update the way it was installed — the prebuilt package from the release page:"
+                "  Update the way it was installed (the prebuilt package from the release page):"
             );
             release_asset_steps(
                 ver,
@@ -121,7 +121,7 @@ pub fn update(args: &[String]) -> ExitCode {
             println!("  (or build from source: makepkg -si  in packaging/arch/)");
         }
         InstallOrigin::Source => {
-            println!("  Source install — update the checkout at the tag:");
+            println!("  Source install. Update the checkout at the tag:");
             println!(
                 "    git -C <clone> fetch --tags && git checkout {}",
                 latest.as_deref().unwrap_or("<latest>")
@@ -133,14 +133,14 @@ pub fn update(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// How this irlume install got onto the system — decides the update channel.
+/// How this irlume install got onto the system; decides the update channel.
 pub enum InstallOrigin {
-    /// Fedora Copr repo — the recommended Fedora channel.
+    /// Fedora Copr repo, the recommended Fedora channel.
     Copr,
     /// rpm-owned but not from the Copr (hand-built / local rpm). Carries
     /// dnf's `from_repo` string for display (may be empty or a history hash).
     LocalRpm(String),
-    /// Launchpad PPA — the recommended Ubuntu channel.
+    /// Launchpad PPA, the recommended Ubuntu channel.
     Ppa,
     /// dpkg-owned with no PPA source behind it (release-asset .deb).
     LocalDeb,
@@ -231,7 +231,7 @@ fn is_copr_repo(repo: &str) -> bool {
 fn recommend_channel(origin: &InstallOrigin) {
     match origin {
         InstallOrigin::LocalRpm(_) => {
-            println!("  Recommended: Fedora's release channel is the Copr — switch once and");
+            println!("  Recommended: Fedora's release channel is the Copr; switch once and");
             println!("  future updates arrive with plain `dnf upgrade`:");
             println!("    sudo dnf copr enable archledger/irlume");
             println!("    sudo dnf install irlume");
@@ -243,16 +243,14 @@ fn recommend_channel(origin: &InstallOrigin) {
             };
             match ppa_serves(&codename) {
                 Some(true) => {
-                    println!(
-                        "  Recommended: Ubuntu's release channel is the PPA — switch once and"
-                    );
+                    println!("  Recommended: Ubuntu's release channel is the PPA; switch once and");
                     println!("  future updates arrive with plain `apt upgrade`:");
                     println!("    sudo add-apt-repository ppa:archledger/irlume");
                     println!("    sudo apt install irlume");
                 }
                 Some(false) => {
                     println!("  The PPA carries only the current Ubuntu LTS; for `{codename}` the release");
-                    println!("  .deb IS your update channel — re-run `irlume update` when a new one is out.");
+                    println!("  .deb IS your update channel; re-run `irlume update` when a new one is out.");
                 }
                 None => {
                     println!("  If the PPA serves your Ubuntu series, switching makes future updates automatic:");
@@ -291,7 +289,7 @@ fn ubuntu_codename(os_release: &str) -> Option<String> {
 /// Release file means yes. None = couldn't check (offline / no curl).
 fn ppa_serves(codename: &str) -> Option<bool> {
     // Whether the PPA has an actually-INSTALLABLE irlume for this Ubuntu series,
-    // checked against the binary Packages index — NOT just a `Release` file. A
+    // checked against the binary Packages index, NOT just a `Release` file. A
     // Release file lingers for a series long after its packages are deleted
     // (e.g. noble, whose builds were removed once its toolchain proved too old
     // to compile irlume), so probing Release alone would wrongly steer a
@@ -360,7 +358,7 @@ fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
-                eprintln!("[update] `{display}` exited with {s} — stopping.");
+                eprintln!("[update] `{display}` exited with {s}; stopping.");
                 return ExitCode::FAILURE;
             }
             Err(e) => {
@@ -373,7 +371,7 @@ fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The version actually installed, from the owning package manager — the source
+/// The version actually installed, from the owning package manager, the source
 /// of truth for "is a newer one out?". Falls back to this binary's own compiled
 /// version for source/dev installs (no package owns them). Package versions
 /// carry distro suffixes (`…-1.fc44`, `…-0ppa1~resolute1`, `…-1`); `version_gt`
@@ -420,10 +418,10 @@ fn cmd_stdout(prog: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Best-effort latest release tag from the GitHub API via curl. None if curl is
-/// missing, offline, or the response can't be parsed — the caller degrades to
+/// missing, offline, or the response can't be parsed; the caller degrades to
 /// just printing the update method.
 /// Architecture names for (Debian `.deb`, pacman/tarball, PPA binary index),
-/// derived from the arch THIS binary runs on — a native binary's compile-time
+/// derived from the arch THIS binary runs on: a native binary's compile-time
 /// target arch is the machine's arch. Keeps the updater correct on arm64 etc.,
 /// not just x86_64.
 fn arch_names() -> (&'static str, &'static str, &'static str) {
@@ -436,7 +434,7 @@ fn arch_names() -> (&'static str, &'static str, &'static str) {
 }
 
 /// File names of the assets on the latest GitHub release (`.deb`/`.rpm`/pacman
-/// packages). Empty when offline or on an API hiccup — callers treat "empty" as
+/// packages). Empty when offline or on an API hiccup; callers treat "empty" as
 /// "couldn't tell" and fall back to a best-effort URL rather than a false negative.
 fn release_assets() -> Vec<String> {
     let Ok(out) = std::process::Command::new("curl")
@@ -473,7 +471,7 @@ fn release_assets() -> Vec<String> {
 }
 
 /// Print download+install steps for a release asset, but only if the running
-/// architecture's asset actually exists on the release — else say so honestly
+/// architecture's asset actually exists on the release; else say so honestly
 /// instead of printing a dead link.
 fn release_asset_steps(ver: &str, asset: &str, install_cmd: &str) {
     let assets = release_assets();
@@ -505,7 +503,7 @@ fn latest_release_tag() -> Option<String> {
         return None;
     }
     let body = String::from_utf8_lossy(&out.stdout);
-    // Tiny scan for "tag_name": "vX.Y.Z" — avoids a JSON dependency for one field.
+    // Tiny scan for "tag_name": "vX.Y.Z"; avoids a JSON dependency for one field.
     let key = "\"tag_name\"";
     let i = body.find(key)?;
     let after = &body[i + key.len()..];
@@ -546,7 +544,7 @@ fn daemon_up() -> bool {
     matches!(daemon_request(&Request::Ping), Ok(Response::Pong))
 }
 
-/// `irlume status` — one-shot health dashboard. Always exits 0 (it reports state,
+/// `irlume status`: one-shot health dashboard. Always exits 0 (it reports state,
 /// it doesn't gate anything); use `irlume detect` for script-friendly exit codes.
 pub fn status(args: &[String]) -> ExitCode {
     let user = user_arg(args);
@@ -674,7 +672,7 @@ pub fn status(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `irlume detect` — script-friendly install-state probe. Exit codes:
+/// `irlume detect`: script-friendly install-state probe. Exit codes:
 ///   0  = ready    (daemon reachable AND the user is enrolled)
 ///   10 = partial  (installed but not ready: daemon down or not enrolled)
 ///   20 = absent   (irlumed is not installed)
@@ -709,7 +707,7 @@ pub fn detect(args: &[String]) -> ExitCode {
     }
 }
 
-/// `irlume identify` — 1:N "who is this?" over a live capture (no claimed user).
+/// `irlume identify`: 1:N "who is this?" over a live capture (no claimed user).
 pub fn identify(_args: &[String]) -> ExitCode {
     eprintln!("[identify] look at the camera…");
     match daemon_request(&Request::Identify) {
@@ -732,7 +730,7 @@ pub fn identify(_args: &[String]) -> ExitCode {
             ..
         }) => {
             println!(
-                "[identify] no match — {} ({reason})",
+                "[identify] no match: {} ({reason})",
                 if live {
                     "live face, not enrolled"
                 } else {
@@ -756,7 +754,7 @@ pub fn identify(_args: &[String]) -> ExitCode {
     }
 }
 
-/// `irlume diag` — TPM seal / PCR-drift diagnostics (the dbx/firmware debugger).
+/// `irlume diag`: TPM seal / PCR-drift diagnostics (the dbx/firmware debugger).
 /// Needs root + TPM access to read the root-only envelope and replay PCRs; falls
 /// back to a daemon-only summary otherwise.
 pub fn diag(args: &[String]) -> ExitCode {
@@ -787,7 +785,7 @@ pub fn diag(args: &[String]) -> ExitCode {
         if irlume_core::pcrsig::signed_policy_available() {
             "PCR-11 signature present (kernel updates won't need re-seal)"
         } else {
-            "none — literal PCR-7 seal (re-arm/restore after firmware updates)"
+            "none; literal PCR-7 seal (re-arm/restore after firmware updates)"
         }
     );
 
@@ -809,16 +807,16 @@ pub fn diag(args: &[String]) -> ExitCode {
             println!("  seal envelope : {} {OK}", path.display());
             println!("  seal policy   : {kind}, bound PCRs {:?}", env.pcrs);
             match irlume_core::tpm::diagnose_pcrs(&env) {
-                Ok(d) if d.is_empty() => println!("  PCR drift     : none {OK} — the seal still satisfies; face unlock will release the password"),
-                Ok(d) => println!("  PCR drift     : DRIFTED at {d:?} {WARN} — unseal will FAIL until you `irlume keyring arm` (or `irlume recovery restore`)"),
-                Err(e) => println!("  PCR drift     : could not replay PCRs ({e}) — need TPM access (tss group / root)"),
+                Ok(d) if d.is_empty() => println!("  PCR drift     : none {OK} (the seal still satisfies; face unlock will release the password)"),
+                Ok(d) => println!("  PCR drift     : DRIFTED at {d:?} {WARN}; unseal will FAIL until you `irlume keyring arm` (or `irlume recovery restore`)"),
+                Err(e) => println!("  PCR drift     : could not replay PCRs ({e}); need TPM access (tss group / root)"),
             }
         }
         Err(_) => {
             // No readable envelope: either not armed, or not root.
             match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
                 Ok(Response::HasPassword(true)) =>
-                    println!("  seal envelope : armed, but not readable here — run `sudo irlume diag` for PCR-drift detail"),
+                    println!("  seal envelope : armed, but not readable here; run `sudo irlume diag` for PCR-drift detail"),
                 Ok(Response::HasPassword(false)) =>
                     println!("  seal envelope : not armed (run `irlume keyring arm`)"),
                 _ => println!("  seal envelope : unknown (daemon unreachable)"),
@@ -828,7 +826,7 @@ pub fn diag(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `irlume selinux <status|load>` — manage the policy module that lets the
+/// `irlume selinux <status|load>`: manage the policy module that lets the
 /// confined greeter (`xdm_t`) reach the daemon socket at login.
 pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
     match sub {
@@ -859,7 +857,7 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             let state = if in_list || labeled {
                 format!("loaded {OK}")
             } else if !listed {
-                format!("unknown {WARN} (run `sudo irlume selinux status` — semodule needs root)")
+                format!("unknown {WARN} (run `sudo irlume selinux status`; semodule needs root)")
             } else {
                 format!("not loaded {WARN} (run `sudo irlume selinux load`)")
             };
@@ -877,7 +875,7 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             .into_iter()
             .find(|p| std::path::Path::new(p).exists());
             let Some(pp) = pp else {
-                eprintln!("[selinux] irlume.pp not found — build it: make -f /usr/share/selinux/devel/Makefile -C packaging/selinux irlume.pp");
+                eprintln!("[selinux] irlume.pp not found; build it: make -f /usr/share/selinux/devel/Makefile -C packaging/selinux irlume.pp");
                 return ExitCode::FAILURE;
             };
             eprintln!("[selinux] semodule -i {pp} (needs root)…");
@@ -906,10 +904,10 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
     }
 }
 
-/// `irlume deps` — verify the runtime dependencies are present.
+/// `irlume deps`: verify the runtime dependencies are present.
 /// Resolve a bundled model the way the daemon does: an explicit env path, the
 /// packaged /usr/share/irlume/models, then a repo-relative models/ (dev). This is
-/// why `doctor`/`deps` must NOT probe cwd-relative `models/` alone — a user runs
+/// why `doctor`/`deps` must NOT probe cwd-relative `models/` alone; a user runs
 /// them from their home dir, where that path never resolves.
 pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os(env_var) {
@@ -931,7 +929,7 @@ pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::
     None
 }
 
-/// `Some(true)` when the daemon reports models loaded (authoritative — it exits
+/// `Some(true)` when the daemon reports models loaded (authoritative; it exits
 /// at startup if they can't load); `None` when the daemon is unreachable.
 pub(crate) fn daemon_models_loaded() -> Option<bool> {
     matches!(
@@ -961,7 +959,7 @@ pub fn deps(_args: &[String]) -> ExitCode {
         );
     };
     // The daemon can't load models or run without ONNX Runtime, so a running
-    // daemon is proof onnxruntime is present — authoritative and cross-distro
+    // daemon is proof onnxruntime is present; authoritative and cross-distro
     // (avoids false "missing" on Debian/Ubuntu multiarch, where the lib lives at
     // /usr/lib/x86_64-linux-gnu and the daemon's ORT_DYLIB_PATH env isn't in the
     // user's shell). Fall back to an explicit path or a well-known location.
@@ -1010,7 +1008,7 @@ pub fn deps(_args: &[String]) -> ExitCode {
     }
 }
 
-/// `irlume reseal` — safely re-bind the TPM-sealed login password to the CURRENT
+/// `irlume reseal`: safely re-bind the TPM-sealed login password to the CURRENT
 /// PCR state (after a firmware / Secure Boot / kernel update that moved PCR 7).
 /// This is the manual, verified path: you re-enter your login password, so a
 /// stale seal can never be silently overwritten with a typo (the daemon's
@@ -1021,7 +1019,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
     // Only meaningful if already armed (we never auto-arm from here).
     match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
         Ok(Response::HasPassword(false)) => {
-            eprintln!("[reseal] '{user}' has no sealed password — nothing to re-bind. Run `irlume keyring arm` to set one up.");
+            eprintln!("[reseal] '{user}' has no sealed password; nothing to re-bind. Run `irlume keyring arm` to set one up.");
             return ExitCode::from(2);
         }
         Ok(Response::HasPassword(true)) => {}
@@ -1040,7 +1038,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
     };
     match daemon_request(&req) {
         Ok(Response::PasswordSealed) => {
-            println!("[reseal] re-bound to current PCRs {OK} — face unlock will release it again.");
+            println!("[reseal] re-bound to current PCRs {OK}; face unlock will release it again.");
             ExitCode::SUCCESS
         }
         Ok(other) => {
@@ -1063,11 +1061,11 @@ pub(crate) fn prompt_login_password() -> Option<String> {
         let a = rpassword::prompt_password("Login password: ").ok()?;
         let b = rpassword::prompt_password("Confirm login password: ").ok()?;
         if a != b {
-            eprintln!("passwords do not match — aborted (nothing changed).");
+            eprintln!("passwords do not match; aborted (nothing changed).");
             return None;
         }
         if a.is_empty() {
-            eprintln!("empty password — aborted.");
+            eprintln!("empty password; aborted.");
             return None;
         }
         Some(a)
@@ -1083,7 +1081,7 @@ pub(crate) fn prompt_login_password() -> Option<String> {
     }
 }
 
-/// `irlume setup` — guided onboarding that ties the existing pieces together:
+/// `irlume setup`: guided onboarding that ties the existing pieces together:
 /// preflight → camera pick → enroll → keyring arm → recovery → fingerprint →
 /// login wiring. Each step is opt-in (y/N); nothing destructive runs unprompted.
 pub fn setup(args: &[String]) -> ExitCode {
@@ -1093,7 +1091,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     // 1. Preflight.
     println!("[1/6] Preflight");
     if !daemon_up() {
-        eprintln!("  daemon not reachable — start it first: sudo systemctl enable --now irlumed");
+        eprintln!("  daemon not reachable; start it first: sudo systemctl enable --now irlumed");
         return ExitCode::FAILURE;
     }
     println!("  daemon running {OK}");
@@ -1134,16 +1132,16 @@ pub fn setup(args: &[String]) -> ExitCode {
     // 4. Recovery passphrase + template encryption.
     println!("\n[4/6] Recovery passphrase (encrypts templates; backstop for TPM/firmware changes)");
     if yes_no("  Set a recovery passphrase now?", true) {
-        println!("  (run `irlume recovery setup` — it prompts for a separate recovery passphrase)");
+        println!("  (run `irlume recovery setup`; it prompts for a separate recovery passphrase)");
     }
 
     // 5. Fingerprint.
     println!("\n[5/6] Fingerprint (optional companion factor)");
     match irlume_fingerprint::device_name() {
         Some(n) => {
-            println!("  reader '{n}' present — manage with `irlume fingerprint add` / `enable`")
+            println!("  reader '{n}' present; manage with `irlume fingerprint add` / `enable`")
         }
-        None => println!("  no fingerprint reader detected — skipping"),
+        None => println!("  no fingerprint reader detected; skipping"),
     }
 
     // 6. Login wiring.
@@ -1159,7 +1157,7 @@ pub fn setup(args: &[String]) -> ExitCode {
 
 /// Enroll via the daemon (capture happens daemon-side; no camera contention).
 fn run_enroll(user: &str, reset: bool) {
-    eprintln!("  capturing — stay in frame, look at the camera…");
+    eprintln!("  capturing: stay in frame, look at the camera…");
     match daemon_request(&Request::Enroll {
         user: user.into(),
         profile: None,
@@ -1191,11 +1189,11 @@ fn yes_no(q: &str, default_yes: bool) -> bool {
     }
 }
 
-/// `irlume help` / no args — top-level command listing.
+/// `irlume help` / no args: top-level command listing.
 pub fn help() -> ExitCode {
     println!(
         "\
-irlume — local face authentication
+irlume - local face authentication
 
 USAGE: irlume <command> [options]   (default user = $USER; override with --user U)
 
@@ -1215,7 +1213,7 @@ ENROLLMENT & AUTH
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed login password for wallet unlock
   reseal                re-bind the sealed password to current PCRs (after a
-                        firmware/kernel update) — safe, re-enters the password
+                        firmware/kernel update); safe, re-enters the password
   recovery <status|setup|restore|forget>   recovery passphrase + encryption
   diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)
 
@@ -1226,12 +1224,12 @@ SYSTEM INTEGRATION
   fingerprint <status|add|enable|disable>   fprintd companion factor
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely
-                        needed — enroll auto-runs it when IR frames are dark)
+                        needed; enroll auto-runs it when IR frames are dark)
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   version                         print the installed irlume version
 
-  (developer/benchmark tools are hidden — set IRLUME_DEV=1 to enable them)
+  (developer/benchmark tools are hidden; set IRLUME_DEV=1 to enable them)
 "
     );
     ExitCode::SUCCESS

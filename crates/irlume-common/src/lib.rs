@@ -77,7 +77,7 @@ pub const STATE_DIR: &str = "/var/lib/irlume";
 pub enum Request {
     /// Attempt to authenticate `user` from a live capture. The default,
     /// unprivileged operation. `service` is the PAM service name (e.g. `sudo`,
-    /// `kde-fingerprint`) for tier×operation-class gating — on an RGB-only
+    /// `kde-fingerprint`) for tier×operation-class gating; on an RGB-only
     /// (convenience) device only a screen-unlock service is honoured. `None`
     /// from older callers (treated as unrestricted on IR hardware).
     Authenticate {
@@ -87,7 +87,7 @@ pub enum Request {
     },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
-    /// `reset` (default false) wipes the user's existing enrollment first — a
+    /// `reset` (default false) wipes the user's existing enrollment first, a
     /// clean re-enroll that also clears a stale camera binding.
     Enroll {
         user: String,
@@ -100,7 +100,7 @@ pub enum Request {
     /// enrolled user, no claimed identity. Unprivileged (no credential release).
     Identify,
     /// Switch the active RGB+IR camera pair, persisting it (cameras.conf) so it
-    /// survives a daemon restart. PRIVILEGED (root or self) — writes /etc/irlume.
+    /// survives a daemon restart. PRIVILEGED (root or self); writes /etc/irlume.
     SetCameras { rgb: String, ir: String },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
@@ -141,10 +141,10 @@ pub enum Request {
     /// Liveness/health ping.
     Ping,
     /// Daemon self-report: what it actually has loaded and which camera tier it
-    /// operates in — ground truth for the Repair tab (a daemon that answers at
+    /// operates in: ground truth for the Repair tab (a daemon that answers at
     /// all has, by construction, working ONNX Runtime + recognition models).
     Health,
-    /// One framing-guide sample (no enrollment, no auth) — captures a frame and
+    /// One framing-guide sample (no enrollment, no auth): captures a frame and
     /// returns a [`PositionReport`] of how the user is positioned, for the guided
     /// enrollment cues. Safe to poll repeatedly. `user` is the account being
     /// enrolled: it tunes the pitch band to that user's calibrated neutral (a
@@ -157,7 +157,7 @@ pub enum Request {
     SealPassword { user: String, password: SecretBytes },
     /// Face-verify `user` and, on a live match, release the TPM-sealed password
     /// so the caller can set it as `PAM_AUTHTOK` (login keyring unlock).
-    /// PRIVILEGED: root only — the sealed login password is never released to a
+    /// PRIVILEGED: root only; the sealed login password is never released to a
     /// non-root peer.
     UnsealPassword {
         user: String,
@@ -167,12 +167,12 @@ pub enum Request {
         service: Option<String>,
     },
     /// Release the TPM-sealed password to unlock the login keyring WITHOUT a
-    /// face match — for the fingerprint path, where `pam_fprintd` has already
+    /// face match, for the fingerprint path, where `pam_fprintd` has already
     /// authenticated the user in this PAM transaction (this request only runs at
     /// the post-auth landing). The daemon cannot re-verify a fingerprint
     /// (fprintd owns the sensor), so the gate is: root peer + a login/unlock
     /// service class. Preserves at-rest protection (a stolen disk still can't
-    /// unseal); a live root attacker in a login context can obtain it — see
+    /// unseal); a live root attacker in a login context can obtain it; see
     /// ADR-0003 / THREAT_MODEL. PRIVILEGED: root only.
     UnsealKeyring {
         user: String,
@@ -189,7 +189,7 @@ pub enum Request {
     /// ONLY if a sealed password is already armed (never auto-arms a fresh user)
     /// and only if it actually changed (the PCRs moved, e.g. a dbx/Secure Boot
     /// update, or the user changed their password). Fired from the login
-    /// **session** phase — which runs only after authentication SUCCEEDED — so
+    /// **session** phase, which runs only after authentication SUCCEEDED, so
     /// `password` is always one `pam_unix` accepted (never a typo). PRIVILEGED:
     /// root or `user`.
     ResealPassword { user: String, password: SecretBytes },
@@ -234,7 +234,7 @@ pub struct ProfileSummary {
     pub scans: Vec<String>,
 }
 
-/// Framing-guide sample for guided enrollment — no raw image, safe to poll. The
+/// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
 /// gates that set `well_framed` mirror the enroll/auth path, so "well framed"
 /// implies a capture will succeed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -252,7 +252,7 @@ pub struct PositionReport {
     pub ir_ok: bool,
     /// Composite framing quality, 0–100.
     pub quality: u8,
-    /// All gates pass — ready to capture.
+    /// All gates pass; ready to capture.
     pub well_framed: bool,
     /// One plain-language cue for the user ("Move closer", "Hold still", …).
     pub guidance: String,
@@ -305,7 +305,7 @@ pub enum Response {
         mesh: bool,
         /// IR domain adapter loaded.
         adapter: bool,
-        /// The daemon's crate version — lets the TUI flag a stale installed
+        /// The daemon's crate version; lets the TUI flag a stale installed
         /// build (daemon predating the CLI it's talking to).
         #[serde(default)]
         version: String,

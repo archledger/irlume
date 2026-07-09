@@ -39,12 +39,12 @@ pub fn request(req: &Request) -> io::Result<Response> {
 pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<Response> {
     let stream = connect_with_timeout(&socket_path(), CONNECT_TIMEOUT).map_err(|e| {
         // A missing socket / nobody listening is the #1 first-run failure
-        // (fresh package install, unit disabled by distro preset policy) —
+        // (fresh package install, unit disabled by distro preset policy), so
         // name the daemon and the exact command instead of "os error 2".
         match e.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => io::Error::new(
                 e.kind(),
-                "irlumed is not running — start it with: sudo systemctl enable --now irlumed",
+                "irlumed is not running; start it with: sudo systemctl enable --now irlumed",
             ),
             _ => e,
         }

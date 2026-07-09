@@ -2,7 +2,7 @@
 //!
 //! Each modality's cosine is mapped to a *calibrated* genuine-probability (Platt
 //! scaling), weighted by capture quality, then fused. This lets a marginal-RGB +
-//! marginal-IR capture JOINTLY grant in mixed light — while keeping the false-match
+//! marginal-IR capture JOINTLY grant in mixed light, while keeping the false-match
 //! rate bounded, because an impostor must fool BOTH modalities at once (the two
 //! score distributions are near-independent). Fusion only ADDS dim-light rescues on
 //! top of the existing single-modality thresholds; it never relaxes them.
@@ -25,7 +25,7 @@ pub const IR_PLATT_B: f32 = -16.2221;
 pub const FUSION_PROB_THRESHOLD: f32 = 0.50;
 
 /// Each modality must independently clear this genuine-probability for fusion to
-/// fire — blocks "one strong modality + pure noise" from granting (anti
+/// fire; blocks "one strong modality + pure noise" from granting (anti
 /// single-modality-spoof). Set just above chance.
 pub const FUSION_MIN_PER_MODALITY_PROB: f32 = 0.10;
 

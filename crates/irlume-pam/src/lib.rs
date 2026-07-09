@@ -1,14 +1,14 @@
-//! `pam_irlume.so` — the thin, UNPRIVILEGED PAM module.
+//! `pam_irlume.so`: the thin, UNPRIVILEGED PAM module.
 //!
 //! It does almost nothing itself: open the Unix socket to `irlumed`, send a
 //! request, and map the reply to a PAM return code. No camera, no models, no
-//! templates, no image data ever live here — that is the privilege split.
+//! templates, no image data ever live here; that is the privilege split.
 //!
 //! Two modes, selected by a module argument in the PAM line:
-//!   * default (`auth sufficient pam_irlume.so`) — VERIFY only. Sends
+//!   * default (`auth sufficient pam_irlume.so`): VERIFY only. Sends
 //!     `Authenticate`; a live match grants WITHOUT touching the password. Use for
 //!     `sudo`, polkit, and in-session unlocks where the keyring is already open.
-//!   * `unseal` (`auth sufficient pam_irlume.so unseal`) — VERIFY + KEYRING
+//!   * `unseal` (`auth sufficient pam_irlume.so unseal`): VERIFY + KEYRING
 //!     UNLOCK. Sends `UnsealPassword`; on a live match the daemon releases the
 //!     TPM-sealed login password, which we set as `PAM_AUTHTOK` so a downstream
 //!     `pam_kwallet5` / `pam_gnome_keyring` unlocks the wallet. Use for login
@@ -24,7 +24,7 @@
 //! Per NIST SP 800-63B-4, face is one factor and a non-biometric fallback MUST
 //! always exist: on any decline/timeout we return `PAM_IGNORE` so the stack
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
-//! log a failure — the password is always the floor).
+//! log a failure; the password is always the floor).
 
 use irlume_common::{Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 /// How long `wait` keeps retrying before giving up to the password fallback.
 const WAIT_BUDGET: Duration = Duration::from_secs(20);
-/// Pause between attempts in `wait` mode — lets the daemon release the camera
+/// Pause between attempts in `wait` mode: lets the daemon release the camera
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
 
@@ -56,7 +56,7 @@ impl PamServiceModule for IrlumePam {
         // `kr` (keyring-continue): on a Debian `@include` greeter whose face line
         // is `sufficient`, a plain SUCCESS short-circuits before pam_gnome_keyring,
         // so a COLD face login leaves the login keyring locked. With `kr` we
-        // instead return IGNORE on a cold login that released the password —
+        // instead return IGNORE on a cold login that released the password;
         // `sufficient` then CONTINUES, pam_unix authenticates with the token, and
         // pam_gnome_keyring unlocks the keyring. A WARM lock still returns SUCCESS
         // (short-circuit: keyring already open, and cosmic's locker needs it).
@@ -66,7 +66,7 @@ impl PamServiceModule for IrlumePam {
         // `keyring` mode: post-auth login-keyring unlock for the FINGERPRINT
         // path. This line sits at the auth landing, after a trusted factor has
         // already succeeded. If a password is present (the user typed one, or an
-        // earlier face `unseal` set it) the keyring unlocks from it — do nothing.
+        // earlier face `unseal` set it) the keyring unlocks from it; do nothing.
         // If PAM_AUTHTOK is empty (a fingerprint login provides no password), ask
         // the daemon to release the TPM-sealed password and set it, so a later
         // pam_gnome_keyring/pam_kwallet opens the wallet. ALWAYS IGNORE: keyring
@@ -94,7 +94,7 @@ impl PamServiceModule for IrlumePam {
         }
         // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
         // active password probe until the user types (unlike plasmalogin/SDDM,
-        // which answer instantly from the buffered field) — so skip the probe and
+        // which answer instantly from the buffered field), so skip the probe and
         // scan right away; a typed password still wins via the modules after us.
         let facefirst = args.iter().any(|a| a == "facefirst");
 
@@ -102,7 +102,7 @@ impl PamServiceModule for IrlumePam {
         // active probe from the buffered field (like plasmalogin) but drives BOTH
         // the cold login and the live lock screen through ONE service (like GDM).
         // So we want the on-demand ACTIVE probe (face engages only when the user
-        // submits an empty field — never ambient, never after a typed/rejected
+        // submits an empty field; never ambient, never after a typed/rejected
         // password) AND the warm `unseal→verify` fallback below (so the lock
         // screen still unlocks). It is `facefirst`'s warm-fallback WITHOUT its
         // scan-immediately probe. Uses the active-probe path (it never sets
@@ -113,7 +113,7 @@ impl PamServiceModule for IrlumePam {
         // current PAM_AUTHTOK into PAM transaction data so the matching `reseal`
         // SESSION line can re-bind it later. We deliberately do NOT contact the
         // daemon or touch the TPM here, because this auth line runs even after a
-        // FAILED password attempt — acting on the token here is exactly the bug
+        // FAILED password attempt; acting on the token here is exactly the bug
         // that let a typo overwrite the good seal. The mutation happens in
         // open_session, which PAM only runs once auth has SUCCEEDED, so the token
         // it acts on is always one pam_unix accepted. Always IGNORE.
@@ -122,7 +122,7 @@ impl PamServiceModule for IrlumePam {
             return PamError::IGNORE;
         }
 
-        // If the user has typed a password, defer to it — don't power up the
+        // If the user has typed a password, defer to it; don't power up the
         // camera at all. Scanning a face when they already chose to type would be
         // a 2-3s annoyance for nothing, and we lose no capability by skipping:
         // pam_kwallet5/pam_gnome_keyring open the wallet from the typed password
@@ -131,17 +131,17 @@ impl PamServiceModule for IrlumePam {
         //
         // Learning whether they typed depends on the surface:
         //
-        //  * Active probe (interactive login greeter — `unseal`, no `wait`): the
+        //  * Active probe (interactive login greeter; `unseal`, no `wait`): the
         //    plasmalogin/SDDM greeter does NOT pre-set PAM_AUTHTOK; the typed
         //    password only reaches PAM when a module asks for it. So we ask, once:
         //    `pam_get_authtok` returns whatever the user already entered (an empty
         //    string if they submitted a blank field to choose face) WITHOUT
-        //    re-prompting — the greeter answers it immediately from the password
-        //    it buffered on submit — and caches a non-empty answer as PAM_AUTHTOK
+        //    re-prompting (the greeter answers it immediately from the password
+        //    it buffered on submit) and caches a non-empty answer as PAM_AUTHTOK
         //    so the downstream pam_unix reuses it with no second prompt. Any
         //    typed character ⇒ non-empty ⇒ we bail before the camera.
         //
-        //  * Passive peek (everything else — sudo verify, lock screen `wait`): just
+        //  * Passive peek (everything else: sudo verify, lock screen `wait`): just
         //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
         //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
         //    biometric device (kde-fingerprint) and cancels us natively the moment
@@ -175,7 +175,7 @@ impl PamServiceModule for IrlumePam {
             let mut unsealed = unseal && attempt == PamError::SUCCESS;
             // GDM and cosmic-greeter each drive BOTH the cold greeter and the
             // live lock screen through one service. Unsealing is refused on the
-            // convenience tier (and on an un-armed keyring) — a warm screen unlock
+            // convenience tier (and on an un-armed keyring); a warm screen unlock
             // only needs identity, so fall back to a plain verify before giving up
             // to the password. `try_verify` re-applies biopolicy in the daemon, so
             // a cold login on a convenience tier still returns Deny here: the
@@ -227,7 +227,7 @@ impl PamServiceModule for IrlumePam {
 }
 
 /// AUTH-phase half of `reseal`: copy the current PAM_AUTHTOK into PAM
-/// transaction data for the SESSION half to pick up. Pure read + stash — no
+/// transaction data for the SESSION half to pick up. Pure read + stash; no
 /// daemon, no TPM. If auth ultimately fails the session never opens and PAM
 /// drops this data without it ever being acted on. We stash only a non-empty
 /// token (a blank submit on the face path has nothing to heal with).
@@ -249,7 +249,7 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
     let pw = match pamh.retrieve_bytes(RESEAL_STASH_KEY) {
         Ok(bytes) if !bytes.is_empty() => SecretBytes::new(bytes),
         // No stash (e.g. a pure face login that submitted a blank field, or auth
-        // took a path that never set a token) — nothing to heal.
+        // took a path that never set a token); nothing to heal.
         _ => return,
     };
     let _ = request(&Request::ResealPassword {
@@ -299,7 +299,7 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
         Ok(Response::PasswordUnsealed { secret }) => {
             // CString copies the bytes; PAM then copies them into its own store.
             // A login password cannot contain a NUL, so this only fails on a
-            // malformed secret — treat as decline.
+            // malformed secret; treat as decline.
             match CString::new(secret.expose()) {
                 Ok(tok) => match pamh.set_authtok(&tok) {
                     Ok(()) => PamError::SUCCESS,

@@ -1,4 +1,4 @@
-//! `irlume login <status|enable|disable>` — wire face auth into the login
+//! `irlume login <status|enable|disable>`: wire face auth into the login
 //! greeters (GDM/SDDM/LightDM/plasmalogin), the KDE lock screen, and (opt-in)
 //! sudo. The Rust replacement for scripts/deploy-keyring-unlock.sh. Ported from
 //! linhello's pamwire framework, adapted to irlume's keyring-unlock greeter
@@ -6,7 +6,7 @@
 //! self-heal) and the `wait` lock stanza.
 //!
 //! FAIL-SAFE: every face line is `[success=1 default=ignore]` or `sufficient`,
-//! so the password is always the floor — wiring cannot lock the user out.
+//! so the password is always the floor; wiring cannot lock the user out.
 //!
 //! Two file strategies: real `/etc/pam.d` files (gdm-password/sddm/lightdm/sudo)
 //! are backed up to `*.pre-irlume` and edited in place (restore = move the backup
@@ -21,18 +21,21 @@ use std::process::{Command, ExitCode};
 const MODULE: &str = "pam_irlume.so";
 const BACKUP: &str = ".pre-irlume";
 const CREATED_PREFIX: &str = "# irlume: created from ";
+/// The one sentence that explains the on-demand trigger; shared so the status
+/// line, the plan line, and docs/SETUP.md's mirror never drift apart.
+const ONDEMAND_HINT: &str = "leave the password empty and press Enter to use your face";
 
 // Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
 const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
 /// The Debian/Ubuntu greeter face line, for the `@include common-auth` layout (a
 /// `success=N` jump can't skip an include expansion, so this can't be the jump
-/// form). Always `sufficient` — the same control works for EVERY DM's locker
+/// form). Always `sufficient`: the same control works for EVERY DM's locker
 /// (GDM and cosmic alike short-circuit on a warm unlock). Cold-login keyring
 /// unlock is handled by the module's `kr` arg, NOT the control: on a cold login
 /// the module returns IGNORE (having set the token), so `sufficient` continues to
 /// pam_unix + pam_gnome_keyring; a warm lock returns SUCCESS and short-circuits.
 /// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (empty-Enter). `kr`
-/// adds the keyring-continue arg — true for greeters (cold login unlocks the
+/// adds the keyring-continue arg: true for greeters (cold login unlocks the
 /// keyring), false for a separate warm lock service (keyring already open).
 fn debian_greeter_line(mode: &str, kr: bool) -> String {
     let kr_arg = if kr { " kr" } else { "" };
@@ -88,7 +91,7 @@ const GREETERS: &[Svc] = &[
     }, // greetd (sway / wayland / tuigreet)
 ];
 // KDE lock: wire the submit-driven `kde` password service with the on-demand
-// face block, NOT KDE's ambient `kde-fingerprint` parallel-biometric slot — so
+// face block, NOT KDE's ambient `kde-fingerprint` parallel-biometric slot, so
 // face engages only on an empty-field Enter (never continuously scanning). The
 // `kde` service classifies as ScreenUnlock, so `ondemand` verifies identity and
 // releases no credential.
@@ -98,7 +101,7 @@ const LOCKSCREEN: Svc = Svc {
 };
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
 /// distinct from `gdm-password` (password/face). It runs pam_fprintd then
-/// pam_gnome_keyring — which finds no password and leaves the wallet locked. We
+/// pam_gnome_keyring, which finds no password and leaves the wallet locked. We
 /// slot the `keyring` unseal line between them (ADR-0003) so a fingerprint login
 /// opens the wallet. Only present on GNOME/GDM systems; skipped elsewhere.
 const FP_GREETERS: &[Svc] = &[Svc {
@@ -118,7 +121,7 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
         Some("disable") => act(false, apply, with_sudo),
         _ => {
             eprintln!("usage: irlume login <status|enable|disable> [--with-sudo] [--apply]");
-            eprintln!("  (without --apply, prints what it WOULD change — a dry run)");
+            eprintln!("  (without --apply, prints what it WOULD change: a dry run)");
             ExitCode::from(2)
         }
     }
@@ -147,7 +150,7 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
     out
 }
 
-/// True when any greeter or the lock screen carries the irlume wiring — the
+/// True when any greeter or the lock screen carries the irlume wiring; the
 /// "is face login actually wired" probe for the TUI dashboard (sudo excluded:
 /// face-sudo alone doesn't make the login screen work).
 pub(crate) fn login_wired() -> bool {
@@ -234,13 +237,13 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
         "gdm-password" => DmProfile {
             ondemand: gdm_uses_ondemand(gnome),
         },
-        // LightDM (lightdm-gtk-greeter) and SDDM: both validated on Ubuntu 26.04
-        // — they answer the active probe on submit and auto-log-in on face
+        // LightDM (lightdm-gtk-greeter) and SDDM: both validated on Ubuntu 26.04;
+        // they answer the active probe on submit and auto-log-in on face
         // success, so `ondemand` gives a clean empty-Enter→face with no spurious
         // "incorrect password" that facefirst caused.
         "lightdm" | "sddm" => DmProfile { ondemand: true },
         // greetd (agreety / tuigreet / sway sessions): a submit-driven greeter that
-        // reads a password line then hands it to PAM — same on-demand family as
+        // reads a password line then hands it to PAM; same on-demand family as
         // lightdm/sddm. (cosmic-greeter, itself an ondemand greetd greeter, is the
         // System76 case handled above.)
         "greetd" => DmProfile { ondemand: true },
@@ -248,7 +251,7 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
         // answers the empty-field probe like sddm → ondemand. Validated live on
         // Fedora 44 KDE (the [success=1] substack layout).
         "plasmalogin" => DmProfile { ondemand: true },
-        // other/unknown submit-driven greeters — default to the safe facefirst
+        // other/unknown submit-driven greeters: default to the safe facefirst
         // until each is validated for the on-demand probe.
         _ => DmProfile { ondemand: false },
     }
@@ -286,7 +289,7 @@ pub(crate) fn selinux_state() -> Option<bool> {
 }
 
 /// True when the fingerprint keyring-unlock (`keyring`) line is present in EVERY
-/// login service the active login manager consults that exists — for GDM that is
+/// login service the active login manager consults that exists: for GDM that is
 /// BOTH gdm-password AND gdm-fingerprint (the session opens via gdm-password even
 /// on a fingerprint login), for KDE/others the single greeter. Used by the TUI
 /// Repair tab to tell "fully wired" from "partially/not wired". Returns false if
@@ -337,7 +340,7 @@ fn status() -> ExitCode {
             let content = std::fs::read_to_string(&present).unwrap_or_default();
             let wired = content_has_module(&content);
             any |= wired;
-            // Surface HOW face fires on this service — on-demand (the consent
+            // Surface HOW face fires on this service: on-demand (the consent
             // model) is invisible in the PAM file to a user, so name it here.
             let label = if !wired {
                 "○ not wired"
@@ -367,7 +370,7 @@ fn status() -> ExitCode {
         );
     }
     if any_ondemand {
-        println!("  on-demand: leave the password empty and press Enter to use your face");
+        println!("  on-demand: {ONDEMAND_HINT}");
     }
     println!(
         "[login] SELinux module: {}",
@@ -388,16 +391,16 @@ fn status() -> ExitCode {
 fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     if apply && effective_uid() != 0 {
         eprintln!(
-            "[login] applying changes needs root — run: sudo irlume login {} --apply",
+            "[login] applying changes needs root; run: sudo irlume login {} --apply",
             if enable { "enable" } else { "disable" }
         );
         return ExitCode::FAILURE;
     }
     if !apply {
-        println!("[login] DRY RUN — showing what `--apply` would change (nothing is written):");
+        println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
     // Method + tier aware plan: wire exactly what the chosen method needs on
-    // this hardware, and (on enable) UNWIRE what it doesn't — so switching method
+    // this hardware, and (on enable) UNWIRE what it doesn't, so switching method
     // re-configures cleanly instead of leaving stale lines. `want_*` gate each
     // factor; on disable everything is unwired.
     let caps = irlume_camera::capabilities();
@@ -441,7 +444,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
                 "  (RGB-only: face satisfies the LOCK SCREEN only; login/sudo keep the password)"
             );
         }
-        // Tell the user HOW face will fire at their greeter — on-demand (the
+        // Tell the user HOW face will fire at their greeter; on-demand (the
         // consent model) is not discoverable from the greeter UI itself.
         if want_face_login {
             if let Some(dm) = active_display_manager() {
@@ -449,9 +452,10 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
                 println!(
                     "  face trigger: {}",
                     if dm_profile(&format!("/etc/pam.d/{greeter}"), gnome_shell_major()).ondemand {
-                        "on-demand — leave the password empty and press Enter to use your face"
+                        format!("on-demand; {ONDEMAND_HINT}")
                     } else {
-                        "face-first — the camera verifies as soon as your account is selected"
+                        "face-first; the camera verifies as soon as your account is selected"
+                            .to_string()
                     }
                 );
             }
@@ -470,7 +474,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         }
     };
     // Greeters (gdm-password etc.) carry the FACE lines (only Secure-tier face
-    // login) AND the KEYRING line (fingerprint keyring unlock) — independent, so
+    // login) AND the KEYRING line (fingerprint keyring unlock); independent, so
     // an RGB+fingerprint box gets keyring-only here, while GDM's session keyring
     // unlock (which runs through gdm-password) still finds the password.
     let gnome = gnome_shell_major();
@@ -479,7 +483,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
         let prof = dm_profile(s.etc, gnome);
         // cosmic-greeter and gdm-password each drive BOTH the cold login and the
         // live lock screen through ONE service, so they carry the face line
-        // whenever face login OR face lock is wanted — an RGB (convenience) box
+        // whenever face login OR face lock is wanted; an RGB (convenience) box
         // still gets face LOCK there (a cold login on that tier stays denied by
         // the daemon's credential-release gate).
         let unified_login_lock =
@@ -491,11 +495,11 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     for s in FP_GREETERS {
         do_svc(s, &wire_fp_keyring, want_fp_keyring);
     }
-    // A separate lock service (KDE `kde`) is a WARM screen unlock — the module
+    // A separate lock service (KDE `kde`) is a WARM screen unlock: the module
     // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
     do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
     // face-sudo is opt-in on enable (--with-sudo), but disable must ALWAYS
-    // unwire it — "disable --apply undoes everything" is a documented promise,
+    // unwire it: "disable --apply undoes everything" is a documented promise,
     // and a stale sudo line would point at a module the user may remove next.
     if with_sudo || !enable {
         match wire_service(
@@ -549,12 +553,12 @@ fn wire_service(
     if enable {
         // RECONCILE, don't skip-if-present: re-wire always rebuilds the desired
         // line set from the ORIGINAL stack (the vendor copy / the backup) so a
-        // method switch — which changes which lines are wanted — actually takes
+        // method switch (which changes which lines are wanted) actually takes
         // effect instead of being a silent no-op when any pam_irlume line exists.
         if use_override {
             let vendor = s.vendor.unwrap();
             if !Path::new(vendor).exists() {
-                return Ok(format!("· {} — not installed (skipped)", s.etc));
+                return Ok(format!("· {}: not installed (skipped)", s.etc));
             }
             let (base, _) = unwire_lines(&read(vendor)?);
             let (wired, _) = wire(&base);
@@ -562,19 +566,19 @@ fn wire_service(
                 "{CREATED_PREFIX}{vendor} — delete this file to restore the vendor copy\n{wired}"
             );
             if etc.exists() && read(s.etc).ok().as_deref() == Some(body.as_str()) {
-                return Ok(format!("· {} — already correctly wired", s.etc));
+                return Ok(format!("· {}: already correctly wired", s.etc));
             }
             if apply {
                 write_atomic(etc, &body)?;
             }
-            Ok(format!("✓ {} — materialized override from {vendor}", s.etc))
+            Ok(format!("✓ {}: materialized override from {vendor}", s.etc))
         } else {
             if !etc.exists() {
-                return Ok(format!("· {} — not installed (skipped)", s.etc));
+                return Ok(format!("· {}: not installed (skipped)", s.etc));
             }
             let current = read(s.etc)?;
             // Rebuild from the pristine stock: the backup if we've wired before,
-            // else the current file — then strip any irlume lines and re-apply.
+            // else the current file, then strip any irlume lines and re-apply.
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
             let origin = if bak.exists() {
                 read(&bak.to_string_lossy())?
@@ -584,16 +588,16 @@ fn wire_service(
             let (base, _) = unwire_lines(&origin);
             let (wired, changed) = wire(&base);
             if !changed {
-                return Ok(format!("· {} — no anchor to wire (skipped)", s.etc));
+                return Ok(format!("· {}: no anchor to wire (skipped)", s.etc));
             }
             if wired == current {
-                return Ok(format!("· {} — already correctly wired", s.etc));
+                return Ok(format!("· {}: already correctly wired", s.etc));
             }
             if apply {
                 backup(etc)?;
                 write_atomic(etc, &wired)?;
             }
-            Ok(format!("✓ {} — wired (backup {}{})", s.etc, s.etc, BACKUP))
+            Ok(format!("✓ {}: wired (backup {}{})", s.etc, s.etc, BACKUP))
         }
     } else {
         // disable / unwire
@@ -601,12 +605,12 @@ fn wire_service(
             if apply {
                 std::fs::remove_file(etc).map_err(|e| format!("rm {}: {e}", s.etc))?;
             }
-            Ok(format!("✓ {} — removed override (vendor restored)", s.etc))
+            Ok(format!("✓ {}: removed override (vendor restored)", s.etc))
         } else if !use_override && etc.exists() {
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
             if bak.exists() {
                 // Restore the backup ONLY when it equals the current file minus
-                // our lines — i.e. nothing else changed since we wired. If an
+                // our lines, i.e. nothing else changed since we wired. If an
                 // admin (or another package) edited the file after wiring,
                 // restoring the stale snapshot would silently revert their
                 // change (e.g. a faillock line added to sudo): strip in place
@@ -618,24 +622,24 @@ fn wire_service(
                         std::fs::rename(&bak, etc)
                             .map_err(|e| format!("restore {}: {e}", s.etc))?;
                     }
-                    Ok(format!("✓ {} — restored from backup", s.etc))
+                    Ok(format!("✓ {}: restored from backup", s.etc))
                 } else {
                     if apply {
                         write_atomic(etc, &stripped)?;
                     }
-                    Ok(format!("✓ {} — stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
+                    Ok(format!("✓ {}: stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
                 }
             } else if file_has_module(etc) {
                 let (clean, _) = unwire_lines(&read(s.etc)?);
                 if apply {
                     write_atomic(etc, &clean)?;
                 }
-                Ok(format!("✓ {} — stripped irlume lines", s.etc))
+                Ok(format!("✓ {}: stripped irlume lines", s.etc))
             } else {
-                Ok(format!("· {} — not wired", s.etc))
+                Ok(format!("· {}: not wired", s.etc))
             }
         } else {
-            Ok(format!("· {} — not wired", s.etc))
+            Ok(format!("· {}: not wired", s.etc))
         }
     }
 }
@@ -650,7 +654,7 @@ fn content_has_module(c: &str) -> bool {
 }
 
 /// `<kind>` is `auth`/`session`; matches a `(substack|include) (password-auth|
-/// system-auth)` line — the shared substack the success=1 jump skips.
+/// system-auth)` line, the shared substack the success=1 jump skips.
 fn is_passwd_substack(line: &str, kind: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with('#') {
@@ -682,7 +686,7 @@ fn is_auth_directive(line: &str) -> bool {
 /// no password substack.
 /// Wire a display-manager greeter. `face` adds the face-first login lines
 /// (Secure-tier credential release); `keyring` adds the post-auth keyring-unseal
-/// line (fingerprint keyring unlock — needed in gdm-password too, since GDM's
+/// line (fingerprint keyring unlock; needed in gdm-password too, since GDM's
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
 fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
@@ -694,10 +698,10 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
     }
     let lines: Vec<&str> = content.lines().collect();
     // Debian/Ubuntu layout: face-first `sufficient` before the password path;
-    // keyring-unseal after it (runs on any auth success — incl. a fingerprint via
+    // keyring-unseal after it (runs on any auth success, incl. a fingerprint via
     // common-auth's pam_fprintd). Most greeters `@include common-auth` directly;
     // greetd instead `@include login` (which itself pulls in common-auth) and adds
-    // its own keyring modules after — inserting the face line before that include
+    // its own keyring modules after; inserting the face line before that include
     // works identically (face IGNORE on cold login → the include's pam_unix +
     // greetd's pam_gnome_keyring run with the unsealed AUTHTOK → keyring unlocks).
     if let Some(inc_at) = lines.iter().position(|l| {
@@ -869,10 +873,10 @@ fn wire_sudo(content: &str) -> (String, bool) {
 }
 
 /// Remove every irlume line AND the pam_permit landing we added (used only when
-/// no backup exists — the backup-restore path is preferred).
+/// no backup exists; the backup-restore path is preferred).
 fn unwire_lines(content: &str) -> (String, bool) {
     // Strip every pam_irlume line, plus ONLY the pam_permit landing WE tagged
-    // (`# irlume-landing`) — never a foreign pam_permit.so.
+    // (`# irlume-landing`), never a foreign pam_permit.so.
     let mut changed = false;
     let kept: Vec<&str> = content
         .lines()
@@ -983,7 +987,7 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
         }
         let Some(pp) = selinux_pp() else {
             return Ok(
-                "· SELinux: irlume.pp not found (install the selinux subpackage) — skipped".into(),
+                "· SELinux: irlume.pp not found (install the selinux subpackage); skipped".into(),
             );
         };
         if apply {
@@ -995,7 +999,7 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             if !ok {
                 return Err("semodule -i irlume.pp failed".into());
             }
-            // The already-bound socket keeps its pre-policy label — the greeter
+            // The already-bound socket keeps its pre-policy label; the greeter
             // stays blocked until the daemon rebinds. Restart it now so face
             // login works at the very next lock/login, not the next reboot;
             // restorecon (backed by the irlume.fc entry) settles the label even
@@ -1095,7 +1099,7 @@ mod tests {
     }
 
     // greetd layout: `@include login` (which itself pulls in common-auth) plus its
-    // own keyring modules after — NOT a direct `@include common-auth`.
+    // own keyring modules after, NOT a direct `@include common-auth`.
     const GREETD: &str = "#%PAM-1.0\n@include login\n-auth        optional        pam_gnome_keyring.so\n-auth        optional        pam_kwallet5.so\n-session     optional        pam_gnome_keyring.so auto_start\n-session     optional        pam_kwallet5.so auto_start\n";
 
     #[test]

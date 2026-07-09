@@ -1,15 +1,15 @@
-//! `irlume padcapture` / `irlume padreport` — the ISO/IEC 30107-3 presentation-
+//! `irlume padcapture` / `irlume padreport`: the ISO/IEC 30107-3 presentation-
 //! attack-detection (PAD) self-test harness.
 //!
 //! `padcapture` runs the REAL liveness gate (`irlume_liveness::LivenessGate`, the
-//! same code the daemon authenticates with) over operator-labeled presentations —
+//! same code the daemon authenticates with) over operator-labeled presentations,
 //! bona-fide live faces and attack instruments (printed photos, screen replays,
-//! cutouts) — and appends one record per presentation to a JSONL log. `padreport`
+//! cutouts), and appends one record per presentation to a JSONL log. `padreport`
 //! aggregates that log into the standard PAD metrics (APCER per PAI species,
 //! worst-case; BPCER; non-response; ACER) with exact confidence intervals via
 //! [`irlume_core::pad`].
 //!
-//! Scope: the harness measures the **credential-releasing IR gate** — the full
+//! Scope: the harness measures the **credential-releasing IR gate**: the full
 //! RGB+IR path (`--path full`, default) and the dark IR-only path
 //! (`--path ir-only`). The RGB-only convenience tier is deterrent-grade, is limited
 //! to lock-screen unlock and never releases credentials, and is deliberately
@@ -294,7 +294,7 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
             );
         }
         if kind == "attack" && accepted_attacks > 0 {
-            println!("[padcapture] ⚠ {accepted_attacks}/{written} attack presentations were ACCEPTED — investigate before trusting this build.");
+            println!("[padcapture] ⚠ {accepted_attacks}/{written} attack presentations were ACCEPTED; investigate before trusting this build.");
         }
         Ok(written)
     };
@@ -419,7 +419,7 @@ fn pct(x: f64) -> String {
 
 fn render_human(r: &metrics::PadReport, input: &str, paths: &[String]) -> String {
     let mut o = String::new();
-    o.push_str(&format!("\nISO/IEC 30107-3 PAD self-test — {input}\n"));
+    o.push_str(&format!("\nISO/IEC 30107-3 PAD self-test: {input}\n"));
     o.push_str(&format!(
         "gate path(s): {}   attack presentations: {}   bona-fide: {}\n\n",
         if paths.is_empty() {
@@ -485,10 +485,10 @@ fn render_human(r: &metrics::PadReport, input: &str, paths: &[String]) -> String
     }
 
     // Honest reading of the numbers.
-    o.push_str("\nReading this: a 0% point estimate does NOT prove 0% — read the upper CI\n");
+    o.push_str("\nReading this: a 0% point estimate does NOT prove 0%; read the upper CI\n");
     o.push_str("bound. Small n gives wide intervals; capture more presentations to tighten.\n");
     if r.n_bonafide == 0 {
-        o.push_str("NOTE: no bona-fide presentations captured — BPCER is undefined. Capture a\n");
+        o.push_str("NOTE: no bona-fide presentations captured; BPCER is undefined. Capture a\n");
         o.push_str(
             "      bona-fide baseline (--kind bonafide) so false-reject rate is measured.\n",
         );

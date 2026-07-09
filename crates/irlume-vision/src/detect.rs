@@ -6,7 +6,7 @@
 //! NCHW; outputs per stride are cls(1) · obj(1) → score, bbox(4), kps(10).
 //!
 //! NOTE: validate the exact output layout against a real `face_detection_yunet`
-//! model with `Detector::describe_io()` — but because score = √(cls·obj) is
+//! model with `Detector::describe_io()`; but because score = √(cls·obj) is
 //! symmetric and we group outputs by tensor shape, cls/obj order is irrelevant
 //! and naming differences don't matter.
 

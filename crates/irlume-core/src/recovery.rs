@@ -1,7 +1,7 @@
 //! Dedicated recovery passphrase for the per-user template key.
 //!
 //! This is the deliberate, manual backstop for the cases TPM-sealing cannot
-//! cover — Secure Boot turned off, the TPM cleared, a dbx/firmware update that
+//! cover: Secure Boot turned off, the TPM cleared, a dbx/firmware update that
 //! moves the PCRs, or the disk moved to another machine. It is **separate from
 //! the login/keyring password** (by design: a user may not want their face
 //! template recoverable with the same secret that unlocks their account), and
@@ -87,7 +87,7 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
 }
 
 /// Recover the template key from a recovery envelope and passphrase. Returns a
-/// generic error on a wrong passphrase (AES-GCM tag mismatch) — indistinguishable
+/// generic error on a wrong passphrase (AES-GCM tag mismatch), indistinguishable
 /// from tampering, by design.
 pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     if env.kdf != "argon2id" {

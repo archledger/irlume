@@ -1,4 +1,4 @@
-//! Algorithmic IR presentation-attack detection (PAD) — NO trained weights.
+//! Algorithmic IR presentation-attack detection (PAD): NO trained weights.
 //!
 //! Why no model: every public anti-spoof dataset is non-commercial, so a trained
 //! PAD model is license-tainted. We gate on documented physics instead, which is
@@ -30,14 +30,14 @@ pub struct Signals {
     /// Top face in the IR frame, if any (a screen/print won't reflect 850nm IR
     /// like skin, so it usually yields no IR face).
     pub ir_face: Option<FaceBox>,
-    /// Mean brightness (0..255) inside the IR face region — skin reflects the
+    /// Mean brightness (0..255) inside the IR face region; skin reflects the
     /// active emitter strongly; a screen/print does not.
     pub ir_face_brightness: f32,
     /// Center-to-edge IR brightness ratio in the face region. A real 3D face lit
     /// by a near-coaxial emitter is brighter at the center/nose and falls off at
     /// the edges (ratio > 1); a flat photo/screen is more uniform (~1). Anti-flat.
     pub ir_center_edge_ratio: f32,
-    /// Peak IR brightness (0..255) at the eyes — the emitter's specular corneal
+    /// Peak IR brightness (0..255) at the eyes: the emitter's specular corneal
     /// glint. Supporting cue only (glint alone is not decisive).
     pub ir_eye_glint: f32,
     /// Head-orientation yaw asymmetry from the RGB face landmarks (0 frontal,
@@ -46,14 +46,14 @@ pub struct Signals {
     /// Head-orientation pitch fraction (0.5 frontal; lower = chin down, higher =
     /// chin up). Defaults to 0.5 (frontal) when not computed.
     pub head_pitch_frac: f32,
-    /// Mean RGB-face luma (0–255) — RGB-only path: the face must be lit enough to
+    /// Mean RGB-face luma (0–255). RGB-only path: the face must be lit enough to
     /// recognize. Unused on the IR path.
     pub rgb_face_brightness: f32,
-    /// Fraction (0–1) of near-white pixels in the RGB face region — RGB-only
+    /// Fraction (0–1) of near-white pixels in the RGB face region; RGB-only
     /// screen/glare deterrent cue. Unused on the IR path.
     pub rgb_specular_frac: f32,
     /// High-frequency spectral peakiness of the RGB face region (2D-FFT moiré /
-    /// pixel-grid cue) — RGB-only screen-replay deterrent. Unused on the IR path.
+    /// pixel-grid cue); RGB-only screen-replay deterrent. Unused on the IR path.
     pub rgb_moire_score: f32,
 }
 
@@ -79,18 +79,18 @@ pub const RGB_FACE_MIN_BRIGHTNESS: f32 = 60.0;
 /// And not blown out (sunlight/overexposure makes recognition unreliable too).
 pub const RGB_FACE_MAX_BRIGHTNESS: f32 = 245.0;
 /// Above this near-white fraction in the face region, treat it as a screen/glare
-/// spoof (deterrent-grade — emissive displays & glossy prints blow out).
+/// spoof (deterrent-grade; emissive displays & glossy prints blow out).
 pub const RGB_SPECULAR_MAX: f32 = 0.18;
 /// Above this high-frequency spectral peakiness, treat the face region as a
 /// display (periodic pixel-grid / moiré). DETERRENT-grade and hardware-specific.
 /// Calibrated on the Shinetech RGB cam: a real lit face read ~9–13; a high-PPI
-/// phone held VERY CLOSE (the best case for moiré) read only ~15–38 — and moiré
+/// phone held VERY CLOSE (the best case for moiré) read only ~15–38, and moiré
 /// weakens with distance, so at arm's length a replay would overlap real faces
-/// entirely. This is NOT a robust PAD — the real mitigation for RGB-only is the
+/// entirely. This is NOT a strong PAD; the real mitigation for RGB-only is the
 /// convenience-tier policy (lock-screen unlock only, never credential release).
 ///
 /// PER-CAMERA SPREAD IS REAL (cross-distro survey 2026-07-01): a live face reads
-/// 9–13 on the Zenbook's Shinetech but 18–27 on a ThinkPad Chicony — the old 18
+/// 9–13 on the Zenbook's Shinetech but 18–27 on a ThinkPad Chicony; the old 18
 /// hard-rejected a real user on the latter, and the two cameras' live/replay
 /// ranges overlap so no universal threshold exists. 28 clears every observed
 /// live face and still catches the top of the close-replay band (~30–38);
@@ -111,17 +111,17 @@ pub fn rgb_moire_max() -> f32 {
 #[derive(Debug, Default, Clone)]
 pub struct Cues {
     pub face_in_rgb: bool,
-    /// Face present in IR — defeats screen/print attacks (the core cue).
+    /// Face present in IR; defeats screen/print attacks (the core cue).
     pub face_in_ir: bool,
-    /// RGB and IR face roughly co-located — defeats RGB-deepfake + IR-blocker.
+    /// RGB and IR face roughly co-located; defeats RGB-deepfake + IR-blocker.
     pub cross_spectrum_aligned: bool,
     /// IR face region is brightly lit by the emitter (skin reflectance).
     pub ir_reflectance_ok: bool,
-    /// 3D structure present (center brighter than edges) — anti-flat-spoof.
+    /// 3D structure present (center brighter than edges); anti-flat-spoof.
     pub depth_ok: bool,
     /// Corneal glint present (supporting; logged, not decisive).
     pub glint_present: bool,
-    /// Face is frontal enough (≈±15°) to make a decision — Windows-Hello-style
+    /// Face is frontal enough (≈±15°) to make a decision; Windows-Hello-style
     /// head-orientation gate.
     pub frontal_ok: bool,
 }
@@ -141,7 +141,7 @@ pub const DEPTH_MIN_RATIO: f32 = 1.03;
 /// Eye IR peak above this counts as a corneal glint (supporting cue).
 pub const GLINT_MIN: f32 = 180.0;
 /// Head-orientation gate (Windows-Hello-style ±15° frontality), approximated
-/// from 2D landmarks. Deliberately PERMISSIVE — rejects only clearly off-angle
+/// from 2D landmarks. Deliberately PERMISSIVE: rejects only clearly off-angle
 /// faces, to avoid false-rejects; a non-frontal face yields `Uncertain` ("face
 /// the camera"), never `Spoof`. Also gates enrollment, keeping templates frontal.
 /// PITCH is intentionally wide: a top-bezel camera sees the user pitched ~15-17°
@@ -171,7 +171,7 @@ impl LivenessGate {
             return (
                 Verdict::Uncertain,
                 cues,
-                "no face in RGB — present your face".into(),
+                "no face in RGB; present your face".into(),
             );
         };
         cues.face_in_rgb = true;
@@ -182,7 +182,7 @@ impl LivenessGate {
             return (
                 Verdict::Spoof,
                 cues,
-                "no face in IR — a real face reflects 850nm; a screen/print does not".into(),
+                "no face in IR: a real face reflects 850nm; a screen/print does not".into(),
             );
         };
         cues.face_in_ir = true;
@@ -194,7 +194,7 @@ impl LivenessGate {
             return (
                 Verdict::Uncertain,
                 cues,
-                format!("RGB/IR face mismatch (dist {dist:.2}) — re-center"),
+                format!("RGB/IR face mismatch (dist {dist:.2}); re-center"),
             );
         }
 
@@ -209,7 +209,7 @@ impl LivenessGate {
                 Verdict::Uncertain,
                 cues,
                 format!(
-                    "not facing the camera (yaw {:.2}, pitch {:.2}) — look directly at it",
+                    "not facing the camera (yaw {:.2}, pitch {:.2}); look directly at it",
                     s.head_yaw_asym, s.head_pitch_frac
                 ),
             );
@@ -222,7 +222,7 @@ impl LivenessGate {
                 Verdict::Spoof,
                 cues,
                 format!(
-                    "IR face too dark ({:.0}) — not reflecting IR like skin",
+                    "IR face too dark ({:.0}); not reflecting IR like skin",
                     s.ir_face_brightness
                 ),
             );
@@ -235,13 +235,13 @@ impl LivenessGate {
                 Verdict::Spoof,
                 cues,
                 format!(
-                    "IR too flat (center/edge {:.2}) — looks 2D, not a 3D face",
+                    "IR too flat (center/edge {:.2}); looks 2D, not a 3D face",
                     s.ir_center_edge_ratio
                 ),
             );
         }
 
-        // Corneal glint — supporting only; logged, never decisive on its own.
+        // Corneal glint: supporting only; logged, never decisive on its own.
         cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
 
         (
@@ -263,7 +263,7 @@ impl LivenessGate {
             return (
                 Verdict::Uncertain,
                 cues,
-                "no face — present your face to the camera".into(),
+                "no face; present your face to the camera".into(),
             );
         };
         cues.face_in_rgb = true;
@@ -273,33 +273,33 @@ impl LivenessGate {
             return (
                 Verdict::Uncertain,
                 cues,
-                "not facing the camera — look directly at it".into(),
+                "not facing the camera; look directly at it".into(),
             );
         }
         if s.rgb_face_brightness < RGB_FACE_MIN_BRIGHTNESS {
             return (
                 Verdict::Uncertain,
                 cues,
-                "too dark — add light on your face (RGB-only mode needs a lit face)".into(),
+                "too dark: add light on your face (RGB-only mode needs a lit face)".into(),
             );
         }
         if s.rgb_face_brightness > RGB_FACE_MAX_BRIGHTNESS {
             return (
                 Verdict::Uncertain,
                 cues,
-                "overexposed — reduce the light/backlight".into(),
+                "overexposed; reduce the light/backlight".into(),
             );
         }
         if s.rgb_specular_frac > RGB_SPECULAR_MAX {
             return (
                 Verdict::Spoof,
                 cues,
-                "screen/glare detected (blown-out highlights) — RGB-only anti-spoof".into(),
+                "screen/glare detected (blown-out highlights); RGB-only anti-spoof".into(),
             );
         }
         if s.rgb_moire_score > rgb_moire_max() {
             return (Verdict::Spoof, cues,
-                format!("screen pixel-grid/moiré pattern detected (peakiness {:.0}) — RGB-only anti-spoof", s.rgb_moire_score));
+                format!("screen pixel-grid/moiré pattern detected (peakiness {:.0}); RGB-only anti-spoof", s.rgb_moire_score));
         }
         (
             Verdict::Live,
@@ -313,7 +313,7 @@ impl LivenessGate {
 
     /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no
     /// visible-light face. Weaker than the full gate (no cross-spectrum anti-
-    /// injection) but keeps IR reflectance + 3D depth + glint — same basis
+    /// injection) but keeps IR reflectance + 3D depth + glint; same basis
     /// Windows Hello uses in the dark.
     pub fn evaluate_ir_only(&self, s: &Signals) -> (Verdict, Cues, String) {
         let mut cues = Cues::default();
@@ -353,12 +353,12 @@ impl LivenessGate {
 // vinyl banner passed the single-frame gate at 98.6% APCER, 2026-06-30): a static
 // print cannot blink. Given a per-frame eye-aspect-ratio (EAR) sequence
 // (`irlume_vision::eye_ear` over MediaPipe FaceMesh landmarks, in capture order),
-// we PASSIVELY look for a natural blink — an EAR dip well below the user's open
+// we PASSIVELY look for a natural blink: an EAR dip well below the user's open
 // baseline. No prompt, no deliberate action: the user just looks at the camera and
 // blinks naturally within the window; the print holds EAR flat and never dips.
 //
 // Why EAR (and not the earlier IR-glint metric): live-validated 2026-07-01, EAR is
-// the clean signal — open eye ≈0.24 (rock-stable), a natural blink dips to ≈0.15,
+// the clean signal: open eye ≈0.24 (rock-stable), a natural blink dips to ≈0.15,
 // while a static vinyl banner sits flat 0.21–0.24 (min ≈0.206, spread ≈0.034, no
 // dips). The deliberate-blink glint challenge that preceded this was replaced for
 // bad UX (natural blinks too fast for the glint metric; a timed held blink is not
@@ -369,7 +369,7 @@ impl LivenessGate {
 /// original depth rule, kept: live blinks hit ≈0.64×, banner jitter stays ≥0.75×).
 pub const BLINK_EAR_DIP_RATIO: f32 = 0.72;
 /// The open baseline (per-class median EAR) must be at least this to trust a
-/// plausibly-open eye was seen — guards against the mesh failing / a squint spoof.
+/// plausibly-open eye was seen; guards against the mesh failing / a squint spoof.
 /// Lowered 0.15 → 0.12 (2026-07-01): glasses depress the open baseline to
 /// 0.13–0.14 on IR, which read NoEyes and cost half the glasses catch rate; the
 /// banner sits at 0.20–0.24 so this floor was never its rejector (re-validated
@@ -377,36 +377,36 @@ pub const BLINK_EAR_DIP_RATIO: f32 = 0.72;
 pub const BLINK_MIN_OPEN_EAR: f32 = 0.12;
 // -- V-shape (velocity) rule, added 2026-07-01 after real-world traces showed
 // natural blinks at 15 fps dip only to 0.78–0.85× baseline (mid-closure sampled,
-// full closure missed) — above the depth cutoff but with a sharp drop-and-recover
+// full closure missed); above the depth cutoff but with a sharp drop-and-recover
 // transient a static print's slow jitter does not produce.
 /// Samples at/below this ratio are candidates for a blink "run".
 pub const BLINK_V_RUN_RATIO: f32 = 0.88;
 /// A single-sample run must dip at least this deep (one 66 ms frame at full
-/// closure) — deeper than the multi-sample floor to resist one-frame mesh noise.
+/// closure); deeper than the multi-sample floor to resist one-frame mesh noise.
 pub const BLINK_V_MIN_SINGLE: f32 = 0.82;
 /// A multi-sample run's deepest sample must reach this.
 pub const BLINK_V_MIN_MULTI: f32 = 0.85;
 /// Runs longer than this many samples are a squint / pose change, not a blink.
 pub const BLINK_V_MAX_RUN: usize = 6;
-/// The eye must be near-open (≥ this ratio) shortly before AND after the run —
+/// The eye must be near-open (≥ this ratio) shortly before AND after the run:
 /// the sharp V. Slow drifts (auto-exposure settling, gaze shifts) fail this.
 pub const BLINK_V_OPEN_RATIO: f32 = 0.93;
 /// How many frames before the run start the near-open pre-sample may be.
 pub const BLINK_V_PRE_WIN: usize = 4;
 /// How many frames after the run end the near-open recovery may be (~400 ms).
 pub const BLINK_V_POST_WIN: usize = 6;
-/// A brightness class needs at least this many face samples to be trusted —
+/// A brightness class needs at least this many face samples to be trusted;
 /// tiny windows (camera stream died / exposure never settled) read NoEyes.
 pub const BLINK_MIN_CLASS_SAMPLES: usize = 8;
 /// The V's pre/post near-open samples must have frame brightness within this
-/// factor of the dip's — EAR shifts with exposure, so a dip during auto-exposure
+/// factor of the dip's; EAR shifts with exposure, so a dip during auto-exposure
 /// slewing (measured live 2026-07-01) must not pass as a blink.
 pub const BLINK_V_BRI_BAND: f32 = 0.25;
 
 /// One observation from an IR capture sequence: frame index in the sequence, the
 /// min-eye EAR when a face was detected in that frame, and the frame's mean
 /// brightness. The IR emitter STROBES (alternate frames are emitter-lit vs
-/// ambient-only), and ambient-only frames read systematically lower EAR — so the
+/// ambient-only), and ambient-only frames read systematically lower EAR, so the
 /// detector baselines each brightness class separately instead of one median.
 #[derive(Clone, Copy, Debug)]
 pub struct EarSample {
@@ -419,7 +419,7 @@ pub struct EarSample {
 pub enum BlinkResult {
     /// A natural blink was observed (a clear EAR dip below the open baseline) → live.
     Blinked,
-    /// A plausibly-open eye was seen but no blink in the window (a static artefact —
+    /// A plausibly-open eye was seen but no blink in the window (a static artefact,
     /// or the user simply didn't blink; caller re-captures / falls back to password).
     NoBlink,
     /// No plausibly-open eye anywhere in the window (mesh failed, or a non-eye/print):
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn static_banner_flat_ear_is_not_a_blink() {
-        // Real banner trace: flat 0.21–0.24, min 0.206 (≈0.91× median) — too shallow
+        // Real banner trace: flat 0.21–0.24, min 0.206 (≈0.91× median): too shallow
         // for a run sample, no V, no deep dip.
         let banner = flat(&[
             0.221, 0.236, 0.227, 0.229, 0.206, 0.232, 0.226, 0.224, 0.223,
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn slow_drift_is_not_a_blink() {
         // Slow U-drift (gaze shift / AE settling, ~1s down and back): the bottom
-        // sample only reaches 0.87× of median — a lone sample must reach the
+        // sample only reaches 0.87× of median; a lone sample must reach the
         // single-frame depth (0.82×) to count, so no blink.
         let seq = flat(&[
             0.240, 0.236, 0.230, 0.224, 0.216, 0.208, 0.200, 0.193, 0.187, 0.193, 0.200, 0.208,
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn long_depression_is_not_a_blink() {
         // Real AE-settle trace (dark room 2026-07-01): EAR depressed for ~7
-        // consecutive samples while exposure stabilises — longer than any real
+        // consecutive samples while exposure stabilises, longer than any real
         // blink; the run-length cap rejects it even though it is deep.
         let lit = [
             0.190, 0.168, 0.182, 0.159, 0.155, 0.159, 0.154, 0.158, 0.144, 0.137, 0.164, 0.185,
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn tiny_window_is_no_eyes() {
         // Real closet trace 2026-07-01: the stream froze after 5 face frames whose
-        // EAR dipped in sync with auto-exposure slewing (bri 182→57) — previously
+        // EAR dipped in sync with auto-exposure slewing (bri 182→57); previously
         // scored Live. Too few samples to trust: NoEyes.
         let mut seq: Vec<EarSample> = [
             (0usize, 0.236f32, 182.4f32),

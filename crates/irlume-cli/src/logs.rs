@@ -1,4 +1,4 @@
-//! `irlume logs` — one journal view for diagnosing auth problems, and the
+//! `irlume logs`: one journal view for diagnosing auth problems, and the
 //! switch for the daemon's diagnostic tracing.
 //!
 //!   irlume logs                    irlume-related journal lines, this boot
@@ -59,7 +59,7 @@ fn view(opts: &[String]) -> ExitCode {
         cmd.arg("-b");
     } // default: this boot
     if !is_root() {
-        eprintln!("[logs] note: without root (or the systemd-journal group) the system journal may be hidden — re-run with sudo if this looks empty");
+        eprintln!("[logs] note: without root (or the systemd-journal group) the system journal may be hidden; re-run with sudo if this looks empty");
     }
     match cmd.status() {
         Ok(s) if s.success() => ExitCode::SUCCESS,
@@ -91,14 +91,14 @@ fn debug(action: Option<&str>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             if let Err(e) = std::fs::create_dir_all(DROPIN_DIR).and_then(|()| std::fs::write(DROPIN,
-                "# irlume: created by `irlume logs debug on` — remove with `irlume logs debug off`\n[Service]\nEnvironment=IRLUME_LOG=debug\n"))
+                "# irlume: created by `irlume logs debug on`; remove with `irlume logs debug off`\n[Service]\nEnvironment=IRLUME_LOG=debug\n"))
             {
                 eprintln!("[logs] could not write {DROPIN}: {e}");
                 return ExitCode::FAILURE;
             }
             restart_daemon();
-            println!("[logs] tracing ON — the daemon now logs per-stage pipeline lines (capture/detect/liveness cues/match scores; numbers only, never frames or embeddings).");
-            println!("[logs] ⚠ while on, DENIED attempts log their score vs threshold — feedback a journal-reader could use to tune a spoof. Diagnose, then turn it off:");
+            println!("[logs] tracing ON: the daemon now logs per-stage pipeline lines (capture/detect/liveness cues/match scores; numbers only, never frames or embeddings).");
+            println!("[logs] ⚠ while on, DENIED attempts log their score vs threshold: feedback a journal-reader could use to tune a spoof. Diagnose, then turn it off:");
             println!("[logs] watch live with:  irlume logs -f    ·   turn off with:  sudo irlume logs debug off");
             ExitCode::SUCCESS
         }

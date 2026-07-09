@@ -2,7 +2,7 @@
 //!
 //! Two uses: (a) resolve the `irlume` group so the socket can be `0660
 //! root:irlume` instead of world-writable, and (b) map a connecting peer's uid
-//! to the username it may act on — via NSS, so LDAP/SSSD/systemd-homed users
+//! to the username it may act on, via NSS, so LDAP/SSSD/systemd-homed users
 //! resolve too (the old hand-rolled `/etc/passwd` parse missed them). The
 //! plain `getpwnam`/`getgrnam` share a static buffer and aren't safe under
 //! concurrent request handling, so we use the `_r` variants with our own buffer.

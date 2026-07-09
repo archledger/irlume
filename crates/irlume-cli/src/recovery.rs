@@ -1,7 +1,7 @@
-//! `irlume recovery <status|setup|restore|forget>` — manage the recovery
+//! `irlume recovery <status|setup|restore|forget>`: manage the recovery
 //! passphrase that backs up the per-user template key (the AES key encrypting
 //! enrolled faces at rest). It's the manual backstop for when the TPM seal can
-//! no longer be satisfied — Secure Boot off, TPM cleared, a dbx/firmware PCR
+//! no longer be satisfied: Secure Boot off, TPM cleared, a dbx/firmware PCR
 //! move, or the disk moved to another machine. Talks to `irlumed`, which owns
 //! the TPM and the root-only key store.
 
@@ -49,7 +49,7 @@ fn status(user: &str) -> ExitCode {
                 if tpm_present {
                     "yes"
                 } else {
-                    "no — templates stay plaintext on this host"
+                    "no (templates stay plaintext on this host)"
                 }
             );
             if encrypted && !recovery_set {
@@ -73,7 +73,7 @@ fn setup(user: &str) -> ExitCode {
     println!(
         "[recovery] Setting a recovery passphrase for '{user}'.\n\
          This wraps the face-template key so you can restore it after a TPM clear,\n\
-         firmware/dbx update, or disk move — WITHOUT re-enrolling. It is separate\n\
+         firmware/dbx update, or disk move, WITHOUT re-enrolling. It is separate\n\
          from your login password; store it somewhere safe (like a BitLocker/LUKS key)."
     );
     let Some(pass) = read_passphrase_confirmed() else {
@@ -90,7 +90,7 @@ fn setup(user: &str) -> ExitCode {
         Ok(Response::Error(e)) => {
             eprintln!("[recovery] setup failed: {e}");
             if e.contains("no template key") {
-                eprintln!("[recovery] (templates aren't encrypted yet — enroll a face first, then re-run this.)");
+                eprintln!("[recovery] (templates aren't encrypted yet; enroll a face first, then re-run this.)");
             }
             ExitCode::FAILURE
         }
@@ -164,11 +164,11 @@ fn read_passphrase_confirmed() -> Option<String> {
         let first = rpassword::prompt_password("Recovery passphrase: ").ok()?;
         let confirm = rpassword::prompt_password("Confirm recovery passphrase: ").ok()?;
         if first != confirm {
-            eprintln!("[recovery] passphrases do not match — aborted (nothing set).");
+            eprintln!("[recovery] passphrases do not match; aborted (nothing set).");
             return None;
         }
         if first.is_empty() {
-            eprintln!("[recovery] empty passphrase — aborted.");
+            eprintln!("[recovery] empty passphrase; aborted.");
             return None;
         }
         Some(first)
@@ -184,7 +184,7 @@ fn read_passphrase_once(prompt: &str) -> Option<String> {
         read_piped_line()?
     };
     if pass.is_empty() {
-        eprintln!("[recovery] empty passphrase — aborted.");
+        eprintln!("[recovery] empty passphrase; aborted.");
         return None;
     }
     Some(pass)

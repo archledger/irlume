@@ -1,7 +1,7 @@
 //! Active-IR emitter activation for Windows-Hello-class UVC cameras.
 //!
 //! Hello camera modules pair a greyscale NIR sensor with an 850nm illuminator
-//! that `uvcvideo` does not drive — on Windows the vendor driver pulses it via a
+//! that `uvcvideo` does not drive; on Windows the vendor driver pulses it via a
 //! UVC Extension Unit (XU) control; on Linux nothing does, so IR frames come back
 //! black. We replay that XU `SET_CUR` write (the same mechanism as
 //! `linux-enable-ir-emitter`) **right after opening our own IR stream**.
@@ -17,7 +17,7 @@
 //! control it touches if it didn't help, so a failed search leaves the camera
 //! unchanged.
 //!
-//! Approach credit: EmixamPP/linux-enable-ir-emitter (MIT) — the iterative
+//! Approach credit: EmixamPP/linux-enable-ir-emitter (MIT), the iterative
 //! XU-control discovery idea. This is an independent reimplementation over the
 //! kernel UVC ioctl API (no code copied); MIT is GPLv3-compatible regardless, so
 //! the technique is clean for irlume's BOM.
@@ -89,13 +89,13 @@ fn conf_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/var/lib/irlume/ir_emitter.conf"))
 }
 
-/// Emitter control — the FIRST line of the conf.
+/// Emitter control: the FIRST line of the conf.
 fn load_conf() -> Option<EmitterControl> {
     let raw = std::fs::read_to_string(conf_path()).ok()?;
     parse_control(raw.lines().next()?.trim())
 }
 
-/// Optional companion BOOST control — the SECOND line of the conf, if present.
+/// Optional companion BOOST control: the SECOND line of the conf, if present.
 fn load_boost() -> Option<EmitterControl> {
     let raw = std::fs::read_to_string(conf_path()).ok()?;
     parse_control(raw.lines().nth(1)?.trim())
@@ -210,14 +210,14 @@ pub fn enable(fd: c_int, card: &str) -> bool {
     };
     let ok = set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload);
     // Apply a discovered companion brightness-boost control (conf-only) alongside
-    // the emitter — best-effort, never gates the emitter result.
+    // the emitter; best-effort, never gates the emitter result.
     if let Some(b) = load_boost() {
         let _ = set_cur(fd, b.unit, b.selector, &b.payload);
     }
     ok
 }
 
-/// Candidate SET_CUR payloads to try for a control of `size` bytes — the common
+/// Candidate SET_CUR payloads to try for a control of `size` bytes: the common
 /// Hello-emitter patterns, padded/truncated to size.
 fn candidate_payloads(size: usize) -> Vec<Vec<u8>> {
     let mk = |bytes: &[u8]| {
@@ -243,7 +243,7 @@ fn candidate_payloads(size: usize) -> Vec<Vec<u8>> {
 
 /// Auto-discover the emitter control: enumerate XU controls and try candidate
 /// payloads, using `measure` (mean IR brightness while streaming) to detect
-/// success — no human "is it flashing?" step. Returns the control+payload that
+/// success; no human "is it flashing?" step. Returns the control+payload that
 /// yields the BRIGHTEST IR (not merely the first one that clears the threshold),
 /// so a camera with several viable emitter controls gets the one with the most
 /// headroom above the liveness floor. Each control is tested in isolation
@@ -276,7 +276,7 @@ pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<Em
                     ));
                 }
             }
-            // Restore this control before testing the next — so each is measured
+            // Restore this control before testing the next, so each is measured
             // against the emitter-off baseline, not a lingering set control.
             if let Some(o) = orig {
                 let _ = set_cur(fd, unit, selector, &o);
@@ -291,7 +291,7 @@ pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<Em
 }
 
 /// After the emitter is set, look for a COMPANION XU control that further
-/// brightens the IR — an exposure/gain-like vendor control (e.g. the NexiGo
+/// brightens the IR: an exposure/gain-like vendor control (e.g. the NexiGo
 /// N930W's second control, unit4/sel9). With the emitter kept LIT, sweep each
 /// OTHER XU control's boost candidates and keep the one that lifts mean IR
 /// brightness the most above the emitter-alone level; restore the rest. Returns
@@ -349,7 +349,7 @@ pub fn discover_boost<F: FnMut() -> f32>(
 
 /// Candidate payloads for a companion BOOST control (an unknown vendor control
 /// that may raise IR exposure/gain). We can't read its semantics, so sweep a few
-/// magnitudes low→high — a genuine brightness control gets brighter as the value
+/// magnitudes low→high; a genuine brightness control gets brighter as the value
 /// rises, which `discover_boost` detects from the IR image.
 fn boost_candidates(len: usize) -> Vec<Vec<u8>> {
     let full = |v: u8| vec![v; len];

@@ -84,8 +84,9 @@ irlume enroll
 
 Look at the camera. It captures three scans and saves a profile:
 
+<!-- mirrors the enroll output in crates/irlume-cli/src/main.rs; keep in sync -->
 ```
-[enroll] 'you' — capturing a new face profile; stay in frame, look at the camera…
+[enroll] 'you': capturing a new face profile; stay in frame, look at the camera…
 [enroll] enrolled 'Face Profile 1' with 3 scans
 ```
 
@@ -112,12 +113,13 @@ This wires the **greeter and lock screen** for your login manager (GDM, SDDM,
 Plasma, LightDM, greetd, COSMIC). Without `--apply` it's a dry run that prints
 the plan and writes nothing.
 
+<!-- mirrors the `login enable` plan output in crates/irlume-cli/src/pamwire.rs; keep in sync -->
 ```
   login manager: plasmalogin   ·   method: auto   ·   IR/Secure tier
   plan → face login: on   face lock: on   fingerprint keyring: —
-  face trigger: on-demand — leave the password empty and press Enter to use your face
-  ✓ /etc/pam.d/plasmalogin — materialized override from /usr/lib/pam.d/plasmalogin
-  ✓ /etc/pam.d/kde-fingerprint — wired (backup /etc/pam.d/kde-fingerprint.pre-irlume)
+  face trigger: on-demand; leave the password empty and press Enter to use your face
+  ✓ /etc/pam.d/plasmalogin: materialized override from /usr/lib/pam.d/plasmalogin
+  ✓ /etc/pam.d/kde-fingerprint: wired (backup /etc/pam.d/kde-fingerprint.pre-irlume)
 [login] done. Password remains the fallback everywhere.
 ```
 

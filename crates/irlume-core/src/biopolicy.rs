@@ -1,12 +1,12 @@
 //! Tiered biometric decision policy (opt-in).
 //!
 //! Two axes decide what a face match is allowed to do:
-//!   * **Tier** — the assurance of the modality that produced the match.
+//!   * **Tier**: the assurance of the modality that produced the match.
 //!     `Secure` = an IR-verified match (irlume's cross-spectrum liveness gate
 //!     ran), `Convenience` = RGB-only. (In practice irlume's liveness already
 //!     requires IR for any grant, so a grant is normally `Secure`; the tier is
 //!     kept explicit for correctness and future RGB-only fallbacks.)
-//!   * **OperationClass** — what the PAM service is trying to do, derived from
+//!   * **OperationClass**: what the PAM service is trying to do, derived from
 //!     its service name.
 //!
 //! [`decide`] maps `(class, tier)` to an [`Action`]: release the sealed
@@ -16,13 +16,13 @@
 //! unknown / remote service is always denied.
 //!
 //! This is pure logic with no I/O; the daemon consults it only when biopolicy
-//! enforcement is enabled (default off — see the daemon), so it never changes
+//! enforcement is enabled (default off; see the daemon), so it never changes
 //! behaviour until an operator opts in.
 
 /// Assurance tier of a face match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// RGB-only — no IR liveness behind the match.
+    /// RGB-only; no IR liveness behind the match.
     Convenience,
     /// IR-verified (cross-spectrum liveness ran).
     Secure,
@@ -39,9 +39,9 @@ pub enum OperationClass {
     Login,
     /// Privilege elevation (sudo/polkit): verify identity; no keyring.
     Elevation,
-    /// Remote access (sshd, etc.) — face auth must never satisfy this.
+    /// Remote access (sshd, etc.); face auth must never satisfy this.
     Remote,
-    /// Unrecognised service — fail closed.
+    /// Unrecognised service; fail closed.
     Unknown,
 }
 
@@ -66,7 +66,7 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
         "kde" | "kde-fingerprint" | "kscreensaver" | "xscreensaver" | "gnome-screensaver"
         | "swaylock" | "i3lock" | "hyprlock" => OperationClass::ScreenUnlock,
         // Display-manager greeters (cold login), incl. GDM's separate
-        // fingerprint login service (`gdm-fingerprint`) — same login class.
+        // fingerprint login service (`gdm-fingerprint`), same login class.
         // `cosmic-greeter` (COSMIC / Pop!_OS) uses one service for both the cold
         // login and the live lock screen, so the warm/cold flag below is what
         // separates its login from its screen-unlock.
@@ -80,7 +80,7 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
         }
         // Elevation.
         "sudo" | "sudo-i" | "polkit-1" | "su" | "su-l" | "doas" => OperationClass::Elevation,
-        // Remote / network — never satisfiable by face.
+        // Remote / network: never satisfiable by face.
         "sshd" | "remote" | "cockpit" => OperationClass::Remote,
         _ => OperationClass::Unknown,
     }
@@ -135,7 +135,7 @@ mod tests {
     fn cosmic_greeter_logs_in_cold_and_unlocks_warm() {
         // COSMIC uses one `cosmic-greeter` service for both the cold login and
         // the live lock screen; the warm flag must split them, and a cold login
-        // must reach Unseal on the Secure (IR) tier — else it classifies Unknown
+        // must reach Unseal on the Secure (IR) tier; else it classifies Unknown
         // and the daemon denies the face match.
         assert_eq!(classify("cosmic-greeter", false), OperationClass::Login);
         assert_eq!(

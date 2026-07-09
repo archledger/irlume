@@ -3,7 +3,7 @@
 //! BRIGHT enrolled template (recover recognition in poor ambient light), without
 //! inflating impostor similarity. All methods operate on LUMA and rescale RGB by
 //! the per-pixel luma gain, preserving hue. Whether any of these actually helps
-//! AuraFace is an empirical question — A/B before wiring (see scripts/lightnorm A/B).
+//! AuraFace is an empirical question; A/B before wiring (see scripts/lightnorm A/B).
 
 #[inline]
 fn luma(r: u8, g: u8, b: u8) -> f32 {

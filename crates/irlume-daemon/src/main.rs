@@ -1,4 +1,4 @@
-//! `irlumed` — the privileged daemon. Owns the camera + models and is the only
+//! `irlumed`: the privileged daemon. Owns the camera + models and is the only
 //! component that runs the biometric pipeline. Untrusted clients (`pam_irlume`,
 //! the CLI) connect over a Unix socket and send line-delimited JSON requests;
 //! the daemon authenticates each peer with `SO_PEERCRED` before honoring
@@ -25,14 +25,14 @@ fn main() {
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
     // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
     let (rgb_dev, ir_dev) = irlume_auth::select_pair();
-    // Log what is actually usable, not the raw (possibly fallback) selection —
+    // Log what is actually usable, not the raw (possibly fallback) selection;
     // on camera-less or RGB-only hardware the fixed default pair doesn't exist.
     {
         let ok = |d: &str| std::path::Path::new(d).exists();
         match (ok(&rgb_dev), ok(&ir_dev)) {
             (true, true) => eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)"),
             (true, false) => eprintln!(
-                "irlumed: camera rgb={rgb_dev}, no IR node (convenience tier — screen unlock only)"
+                "irlumed: camera rgb={rgb_dev}, no IR node (convenience tier: screen unlock only)"
             ),
             (false, _) => eprintln!(
                 "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
@@ -92,12 +92,12 @@ fn main() {
     }
     eprintln!("irlumed: listening on {socket}");
     if irlume_common::dbglog::on() {
-        eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug) — per-stage pipeline lines follow; numbers only, never frames/embeddings");
+        eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
     }
 
     // Socket watchdog: if our socket file is deleted/replaced out from under us
     // (a stale-runtime cleanup, a botched reinstall), the bound fd keeps working
-    // but no client can ever connect again — a silent outage. Detect it and exit
+    // but no client can ever connect again: a silent outage. Detect it and exit
     // so systemd (Restart=on-failure) re-binds a fresh socket. Self-heals what
     // the Repair tab otherwise needs a manual restart for.
     {
@@ -105,7 +105,7 @@ fn main() {
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(3));
             if !std::path::Path::new(&socket).exists() {
-                eprintln!("irlumed: socket {socket} vanished — exiting for a clean re-bind");
+                eprintln!("irlumed: socket {socket} vanished; exiting for a clean re-bind");
                 std::process::exit(1);
             }
         });
@@ -212,7 +212,7 @@ fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Resu
             return respond(stream, &Response::Error("bad request".into()));
         }
     };
-    // The line may hold a plaintext secret (SealPassword/RecoverySetup) — wipe it
+    // The line may hold a plaintext secret (SealPassword/RecoverySetup); wipe it
     // now that it's parsed into the zeroizing SecretBytes.
     line.zeroize();
     let resp = dispatch(req, &peer, engine);
@@ -221,7 +221,7 @@ fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Resu
 
 /// A username is interpolated into `<user>.json` paths (enrollment, sealed key,
 /// keyring). Reject anything that could traverse or escape the state dir before
-/// any path is built — defence-in-depth on top of the NSS `authorized_for` check.
+/// any path is built; defence-in-depth on top of the NSS `authorized_for` check.
 fn valid_username(u: &str) -> bool {
     !u.is_empty()
         && u.len() <= 64
@@ -271,7 +271,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         Request::Ping => Response::Pong,
         Request::Health => {
             // Live probe (cameras can appear/vanish); report selected nodes only
-            // when they actually exist — never the unvalidated fallback pair.
+            // when they actually exist; never the unvalidated fallback pair.
             let caps = irlume_auth::capabilities();
             let (rgb, ir) = irlume_auth::select_pair();
             let rgb_dev = (caps.rgb && std::path::Path::new(&rgb).exists()).then_some(rgb);
@@ -293,7 +293,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         // Only tune the band to a user the peer may act for (root, or their own
-        // account) — else ignore it. Stops a non-root peer forcing a per-poll TPM
+        // account); else ignore it. Stops a non-root peer forcing a per-poll TPM
         // unseal of another user's (e.g. root's) enrollment via the framing guide.
         Request::PositionSample { user } => {
             match engine.position_sample(user.as_deref().filter(|u| authorized_for(peer, u))) {
@@ -304,30 +304,30 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         Request::Authenticate { user, service } => {
             // Root (PAM stacks) or the account owner only. Without this gate any
             // local peer could probe Authenticate{other_user} and read the raw
-            // similarity score — a hill-climbing oracle toward a match (the
+            // similarity score, a hill-climbing oracle toward a match (the
             // threat model promises scores never leak to unprivileged peers).
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to authenticate '{user}'"));
             }
             // Honor the configured unlock method: if the admin chose fingerprint,
             // face must actually stand down (pam_fprintd drives; password is the
-            // fallback) — not just be claimed disabled by the CLI message.
+            // fallback), not just be claimed disabled by the CLI message.
             if irlume_core::policy::method().face_disabled() {
                 return Response::AuthResult {
                     granted: false,
                     score: 0.0,
                     live: false,
-                    reason: "face auth disabled — the configured method is fingerprint".into(),
+                    reason: "face auth disabled: the configured method is fingerprint".into(),
                 };
             }
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
-            // match may ONLY satisfy a screen unlock — never login, elevation, or
+            // match may ONLY satisfy a screen unlock; never login, elevation, or
             // a remote/unknown service (those keep the password). Always-on for
             // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
                 use irlume_core::biopolicy::{classify, OperationClass};
                 // "Warm" = the user already has a running session (their systemd
-                // runtime dir exists) — then an ambiguous greeter service (GDM
+                // runtime dir exists); then an ambiguous greeter service (GDM
                 // drives cold login AND the lock screen through gdm-password) is
                 // a screen unlock, not a login. Caveat: lingering user services
                 // also create /run/user/<uid>; acceptable for the convenience
@@ -349,7 +349,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             }
             // Opt-in biopolicy also gates identity VERIFICATION on IR/Secure
-            // hardware (mirrors the credential-release gate) — else a face grant
+            // hardware (mirrors the credential-release gate); else a face grant
             // for a Remote/Unknown service would bypass the "face never satisfies
             // remote" invariant. Off by default (behaviour unchanged).
             if biopolicy_enforced() && engine.tier() != irlume_core::biopolicy::Tier::Convenience {
@@ -395,7 +395,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // 1:N identify returns an exact similarity score, so an ungated
             // socket peer could hill-climb it to tune a spoof or enumerate who
             // is enrolled. Root keeps the full cross-user search (admin/test);
-            // a non-root peer is scoped to its OWN account — the score then only
+            // a non-root peer is scoped to its OWN account; the score then only
             // concerns a face the caller already controls, not other users'.
             let scoped = if peer.uid == 0 {
                 engine.identify()
@@ -423,7 +423,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::SetCameras { rgb, ir } => {
-            // Persists to /etc and repoints the camera the daemon trusts — an
+            // Persists to /etc and repoints the camera the daemon trusts; an
             // attacker who could set this to a v4l2loopback node feeds recorded
             // video into the match path (spoof) or bricks face auth (DoS). Root
             // only (a system-wide /etc setting isn't an arbitrary peer's to make).
@@ -438,7 +438,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
                 .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
             {
-                msg = format!("{msg} (live only — could not persist: {e})");
+                msg = format!("{msg} (live only; could not persist: {e})");
             }
             eprintln!("irlumed: {msg}");
             Response::Ok(msg)
@@ -461,10 +461,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
             // Auto-fix a dark/disabled IR emitter so dark-mode scans enroll
-            // cleanly — only runs the brute-force if IR is actually dark.
+            // cleanly; only runs the brute-force if IR is actually dark.
             match irlume_auth::ensure_ir_emitter(engine.ir_device()) {
                 Ok(true) => {}
-                Ok(false) => eprintln!("irlumed: IR still dark after auto-setup — enrolling RGB (dark unlock unavailable)"),
+                Ok(false) => eprintln!("irlumed: IR still dark after auto-setup; enrolling RGB (dark unlock unavailable)"),
                 Err(e) => eprintln!("irlumed: IR emitter auto-setup skipped: {e}"),
             }
             match engine.enroll_profile(&user, profile, want) {
@@ -490,7 +490,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             } else {
                 // The non-dry path brute-forces UVC control writes on the shared
-                // camera — a local peer could thrash the hardware. Root only.
+                // camera; a local peer could thrash the hardware. Root only.
                 if peer.uid != 0 {
                     return Response::Error(format!(
                         "setup_ir_emitter requires root (peer uid {})",
@@ -546,11 +546,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // face-driven credential release either.
             if irlume_core::policy::method().face_disabled() {
                 return Response::Error(
-                    "face auth disabled — the configured method is fingerprint".into(),
+                    "face auth disabled: the configured method is fingerprint".into(),
                 );
             }
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
-            // sealed credential — no cold-login / keyring unlock by RGB-only face.
+            // sealed credential: no cold-login / keyring unlock by RGB-only face.
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
                 eprintln!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
                 return Response::Error(
@@ -579,13 +579,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         Request::UnsealKeyring { user, service } => {
             // Fingerprint keyring unlock. pam_fprintd has ALREADY authenticated
             // the user in this PAM transaction (pam_irlume `keyring` only runs at
-            // the post-auth landing). The daemon can't re-verify a fingerprint —
-            // fprintd owns the sensor — so the trust is: root peer + a login /
+            // the post-auth landing). The daemon can't re-verify a fingerprint
+            // (fprintd owns the sensor), so the trust is: root peer + a login /
             // unlock service class. Releases the sealed login password so
             // pam_gnome_keyring can open the wallet, matching Windows Hello's
             // functional model. SECURITY (ADR-0003 / THREAT_MODEL): preserves
-            // at-rest protection — a stolen disk still can't unseal (needs the
-            // live TPM) — but a live root attacker in a login context can obtain
+            // at-rest protection (a stolen disk still can't unseal; it needs the
+            // live TPM), but a live root attacker in a login context can obtain
             // it; root stays the trust boundary. For daemon-verified biometric
             // release resistant to live root, use the face/IR path.
             if peer.uid != 0 {
@@ -596,10 +596,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             if !irlume_core::keyring::has_sealed_password(&user) {
                 return Response::Error(format!(
-                    "no sealed password for '{user}' — run `irlume keyring arm`"
+                    "no sealed password for '{user}': run `irlume keyring arm`"
                 ));
             }
-            // Only a login / greeter / lock-screen context — never sudo,
+            // Only a login / greeter / lock-screen context; never sudo,
             // elevation, remote, or unknown. Defence-in-depth: a direct caller
             // can forge the service string (root can call us directly), so this
             // does not stop a root attacker; it does stop the keyring line being
@@ -647,7 +647,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // Self-heal hook from the login SESSION phase (runs only after auth
             // succeeded, so `password` is verified-correct). Same authz as arming
             // (root or the user), but it can only ever *re-seal an already armed*
-            // password against today's PCRs — it never arms a fresh user, so a
+            // password against today's PCRs; it never arms a fresh user, so a
             // self-peer cannot use it to plant a sealed password they didn't set.
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to reseal password for '{user}'"));
@@ -674,7 +674,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 return Response::Error(format!("not authorized to set recovery for '{user}'"));
             }
             // If templates are still plaintext (pre-encryption enrollment), mint
-            // and seal a template key now by re-saving — encryption takes effect
+            // and seal a template key now by re-saving; encryption takes effect
             // and there's a key for the recovery passphrase to wrap. A no-op when
             // already encrypted or when the user isn't enrolled.
             if !irlume_core::template_key::has_key(&user) {
@@ -786,7 +786,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 if p.scans.len() == before {
                     Err(format!("no scan '{scan}' in '{profile}'"))
                 } else if p.scans.is_empty() {
-                    Err("a profile must keep at least one scan — delete the profile instead".into())
+                    Err("a profile must keep at least one scan; delete the profile instead".into())
                 } else {
                     Ok(format!("deleted scan '{scan}' from '{profile}'"))
                 }
@@ -911,7 +911,7 @@ fn mutate_enrollment(
 /// password without a live face that matches the enrolled templates. We log the
 /// decision + cosine score, but never the password or its length.
 /// Deny-line score display: exact under IRLUME_LOG=debug tracing, else
-/// quantized to one decimal (anti-oracle — see comment at the deny log).
+/// quantized to one decimal (anti-oracle; see comment at the deny log).
 fn deny_score(s: f32) -> String {
     if irlume_common::dbglog::on() {
         format!("{s:.4}")
@@ -920,7 +920,7 @@ fn deny_score(s: f32) -> String {
     }
 }
 
-/// Prose tokens that legitimately contain digits and must survive redaction —
+/// Prose tokens that legitimately contain digits and must survive redaction:
 /// dimension labels and the emitter wavelength. FAIL-CLOSED: the redactor keeps
 /// ONLY these exact tokens; every other number (including a future unit-suffixed
 /// measurement like `12ms` or `3px`) is stripped by default, so adding a new
@@ -928,7 +928,7 @@ fn deny_score(s: f32) -> String {
 const REASON_PROSE_KEEP: &[&str] = &["2D", "3D", "850nm"];
 
 /// Journal-side deny-reason display. Deny reasons embed measured values
-/// ("IR too flat (1.02)", "rgb 0.35") as coaching for a genuine false reject —
+/// ("IR too flat (1.02)", "rgb 0.35") as coaching for a genuine false reject,
 /// but in the JOURNAL those same numbers are per-attempt feedback a spoofer
 /// could tune against. The exact reason still goes back over IPC to the
 /// session's own TUI/CLI; here we strip every numeric payload unless tracing is
@@ -958,7 +958,7 @@ fn deny_reason(r: &str) -> String {
             }
             let token: String = cs[start..tok_end].iter().collect();
             // An identifier (digits glued AFTER letters, e.g. "PCR7") is a name,
-            // not a measurement — keep it. Otherwise keep only allowlisted prose.
+            // not a measurement; keep it. Otherwise keep only allowlisted prose.
             let is_ident = start > 0 && cs[start - 1].is_ascii_alphabetic();
             if is_ident || REASON_PROSE_KEEP.contains(&token.as_str()) {
                 out.extend(&cs[start..tok_end]);
@@ -980,7 +980,7 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
         return Response::Error(format!(
-            "no sealed password for '{user}' — run `irlume keyring arm`"
+            "no sealed password for '{user}': run `irlume keyring arm`"
         ));
     }
     let outcome = match engine.authenticate(user) {
@@ -1035,7 +1035,7 @@ fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
     json.push(b'\n');
     stream.write_all(&json)?;
     let r = stream.flush();
-    // The response may carry an unsealed secret (PasswordUnsealed) — wipe the
+    // The response may carry an unsealed secret (PasswordUnsealed); wipe the
     // serialized line, same hygiene as the request path and the client side.
     json.zeroize();
     r
@@ -1063,10 +1063,10 @@ mod tests {
 
     #[test]
     fn deny_reason_strips_measurements_keeps_prose() {
-        // (tracing is off in tests — IRLUME_LOG unset)
+        // (tracing is off in tests; IRLUME_LOG unset)
         assert_eq!(
-            deny_reason("IR too flat (center/edge 1.02) — looks 2D, not a 3D face"),
-            "IR too flat (center/edge …) — looks 2D, not a 3D face"
+            deny_reason("IR too flat (center/edge 1.02); looks 2D, not a 3D face"),
+            "IR too flat (center/edge …); looks 2D, not a 3D face"
         );
         assert_eq!(deny_reason("IR face too dark (42)"), "IR face too dark (…)");
         assert_eq!(

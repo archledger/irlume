@@ -1,7 +1,7 @@
 //! TPM 2.0 sealing of the unlock secret (not the template).
 //!
-//! We seal a secret — the user's login password, used to unlock the
-//! GNOME-keyring / KWallet after a face login — into the TPM under a
+//! We seal a secret (the user's login password, used to unlock the
+//! GNOME-keyring / KWallet after a face login) into the TPM under a
 //! `PolicyPCR` over PCR 7 (the UEFI Secure Boot state). The TPM releases it only
 //! while the machine boots in the same Secure Boot configuration it was sealed
 //! under; `irlumed` then asks for it only after a successful live+match. This
@@ -13,7 +13,7 @@
 //! `PolicyAuthorize` policy that survives kernel updates without a re-seal; that
 //! is deliberately NOT ported here yet. PCR 7 is stable across kernel updates
 //! (it only moves on Secure Boot key / dbx changes), so a literal PCR-7 seal is
-//! robust for day-to-day use; a Secure Boot config change requires a re-seal
+//! reliable for day-to-day use; a Secure Boot config change requires a re-seal
 //! (the daemon falls back to the password and the user re-arms keyring unlock).
 //!
 //! Every transient handle (SRK, loaded sealed object, trial/policy session) is
@@ -251,7 +251,7 @@ fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
     PersistentTpmHandle::new(raw).map_err(tpm_err)
 }
 
-/// True iff `public` is irlume's own SRK — RSA, our [`srk_template`] attributes,
+/// True iff `public` is irlume's own SRK: RSA, our [`srk_template`] attributes,
 /// SHA-256 name hash, an empty authPolicy, and a 2048-bit key. A non-match means
 /// another stack's key is squatting our persistent handle (clevis /
 /// systemd-cryptenroll keys carry a non-empty authPolicy, and may be ECC), so it
@@ -291,7 +291,7 @@ fn is_irlume_srk(public: &Public) -> Result<bool> {
 /// Get irlume's SRK, persisting it on first use.
 ///
 /// `create_primary` over [`srk_template`] is deterministic, but deriving an
-/// RSA-2048 primary costs >10s on slow firmware TPMs — too slow for the PAM
+/// RSA-2048 primary costs >10s on slow firmware TPMs, too slow for the PAM
 /// client timeout on every unseal. We derive it once and `evict_control` it to a
 /// persistent handle; every later call just loads that handle. The persisted key
 /// is bit-for-bit identical, so envelopes sealed earlier still load.
@@ -338,7 +338,7 @@ fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
 }
 
 /// Run `body` with irlume's persistent SRK as parent. Never flushes the SRK when
-/// persistent — persistence is the whole point (avoids re-deriving a slow RSA
+/// persistent: persistence is the whole point (avoids re-deriving a slow RSA
 /// primary on every call).
 fn with_srk<T>(
     ctx: &mut Context,
@@ -353,15 +353,15 @@ fn with_srk<T>(
 }
 
 /// Seal `secret` under the best policy available on this machine:
-///   * Tier 1 — if systemd has published signed-PCR artifacts (UKI / systemd-boot),
+///   * Tier 1: if systemd has published signed-PCR artifacts (UKI / systemd-boot),
 ///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
 ///     (typically PCR 11). Survives kernel updates with no reseal.
-///   * Tier 3 — otherwise a literal `PolicyPCR` over the configured PCRs
+///   * Tier 3: otherwise a literal `PolicyPCR` over the configured PCRs
 ///     ([`policy_pcrs`], default PCR 7). If those PCRs move (dbx/Secure Boot
 ///     update) the envelope stops unsealing and the user re-runs `keyring arm`.
 ///
 /// (Tier 2, pcrlock `PolicyAuthorizeNV`, is selected explicitly via
-/// [`seal_pcrlock`] when a pcrlock policy has been provisioned — it is not
+/// [`seal_pcrlock`] when a pcrlock policy has been provisioned; it is not
 /// auto-chosen here because it requires admin setup.)
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
@@ -371,7 +371,7 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
             // value that only matches a UKI/measured-boot chain. On a GRUB box
             // (or any host where those don't correspond to the live PCRs) the
             // envelope seals fine but PolicyAuthorize fails at unseal (TPM
-            // 0x4c4) — the "sealed but unusable" trap that broke enrollment.
+            // 0x4c4): the "sealed but unusable" trap that broke enrollment.
             // So round-trip it: only trust the authorized envelope if it
             // actually unseals right now; otherwise fall back to the literal
             // PCR seal, which is bound to values we read from this TPM.
@@ -392,7 +392,7 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     seal_with_pcrs(secret, &policy_pcrs())
 }
 
-/// Seal `secret` under a literal `PolicyPCR` over `pcrs` (empty ⇒ no binding —
+/// Seal `secret` under a literal `PolicyPCR` over `pcrs` (empty ⇒ no binding:
 /// any boot state can unseal; use only for testing).
 pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     let pcrs = pcrs.to_vec();
@@ -485,7 +485,7 @@ fn unseal_literal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
 /// Seal `secret` under a `PolicyAuthorize` over systemd's PCR-signing public
 /// key. The object's `authPolicy` commits only to that key's Name (not to any
 /// concrete PCR value), so any PCR state for which systemd has shipped a valid
-/// signature can unseal — the basis for surviving kernel/UKI updates without a
+/// signature can unseal, the basis for surviving kernel/UKI updates without a
 /// reseal. Binds exactly the PCRs systemd signs (read from the signature file,
 /// typically PCR 11). Uses an empty `policyRef`, matching systemd's convention.
 fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
@@ -553,7 +553,7 @@ fn unseal_authorized(
                 let policy_session = PolicySession::try_from(session).map_err(tpm_err)?;
 
                 // 1. Fold the current PCR state in and read the resulting policy
-                //    digest — the "approved policy" that must carry a signature.
+                //    digest, the "approved policy" that must carry a signature.
                 let sel = pcr_selection(&env.pcrs)?;
                 ctx.policy_pcr(policy_session, Digest::default(), sel)
                     .map_err(tpm_err)?;
@@ -565,7 +565,7 @@ fn unseal_authorized(
                     .ok_or_else(|| {
                         Error::Policy(
                             "no signed PCR policy matches the current boot state \
-                             (kernel/UKI not yet enrolled — re-sign required)"
+                             (kernel/UKI not yet enrolled; re-sign required)"
                                 .into(),
                         )
                     })?;

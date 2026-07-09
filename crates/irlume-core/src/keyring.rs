@@ -7,7 +7,7 @@
 //! sets it as `PAM_AUTHTOK` so the downstream keyring module unlocks the wallet.
 //!
 //! The sealed envelope is stored ROOT-ONLY under `/var/lib/irlume/keyring`
-//! (override `IRLUME_KEYRING_DIR`) — deliberately NOT in the user's home (where
+//! (override `IRLUME_KEYRING_DIR`), deliberately NOT in the user's home (where
 //! the templates live), so the wrapped login secret is never under user control.
 //! It is TPM-wrapped regardless, but defence in depth.
 
@@ -39,14 +39,14 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
 }
 
 /// Release `user`'s sealed password from the TPM. Fails if none is armed or if
-/// the bound PCR policy is no longer satisfied (e.g. Secure Boot config changed)
-/// — the caller then falls back to the typed password and the wallet stays
+/// the bound PCR policy is no longer satisfied (e.g. Secure Boot config changed);
+/// the caller then falls back to the typed password and the wallet stays
 /// locked until the user re-arms.
 pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     let path = envelope_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
-            "no sealed password for '{user}' — run `irlume keyring arm`"
+            "no sealed password for '{user}': run `irlume keyring arm`"
         )));
     }
     let env = SealedEnvelope::load(&path)?;
@@ -56,14 +56,14 @@ pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 /// Outcome of [`reseal_password`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reseal {
-    /// No sealed password is armed for this user — nothing was done. We never
+    /// No sealed password is armed for this user; nothing was done. We never
     /// auto-arm from the login hook; arming stays an explicit `keyring arm`.
     NotArmed,
     /// The existing envelope already unseals to this exact password under the
-    /// current PCR policy — left untouched (the steady-state on every login).
+    /// current PCR policy; left untouched (the steady-state on every login).
     Unchanged,
     /// The envelope was re-sealed against the current PCR policy. Either it no
-    /// longer unsealed (PCRs moved — dbx/Secure Boot update) or the password
+    /// longer unsealed (PCRs moved: dbx/Secure Boot update) or the password
     /// differed (the user changed it). This is the self-heal.
     Resealed,
 }
@@ -71,13 +71,13 @@ pub enum Reseal {
 /// Self-heal: re-seal `user`'s login password against the *current* PCR policy,
 /// but only when it's both armed and actually stale.
 ///
-/// SAFETY CONTRACT — the caller MUST pass only a password that has been
+/// SAFETY CONTRACT: the caller MUST pass only a password that has been
 /// VERIFIED correct (i.e. `pam_unix` accepted it). This function cannot tell a
 /// genuine new password from a typo on its own; that guarantee comes from
 /// WHERE it is called: the PAM **session** phase, which only runs after
 /// authentication has already succeeded. (An earlier version called it from an
 /// `optional` auth line that also ran after a FAILED password attempt, which let
-/// a typo overwrite the good seal — that path has been deleted. Never call this
+/// a typo overwrite the good seal; that path has been deleted. Never call this
 /// anywhere auth success is not already established.)
 ///
 /// Given a verified password it writes nothing in the common case:
@@ -98,7 +98,7 @@ pub fn reseal_password(user: &str, password: &[u8]) -> Result<Reseal> {
         return Ok(Reseal::NotArmed);
     }
     // If the current envelope still unseals to the same secret, there is nothing
-    // to do — don't churn the TPM on every single login.
+    // to do; don't churn the TPM on every single login.
     if let Ok(current) = unseal_password(user) {
         if current.as_slice() == password {
             return Ok(Reseal::Unchanged);
@@ -158,7 +158,7 @@ mod tests {
     /// unseals, Resealed when the password differs. The PCR-moved -> Resealed
     /// branch can't be exercised without changing PCRs, but the differ branch
     /// hits the same reseal path. (Callers gate this on a verified password via
-    /// the PAM session phase — see the SAFETY CONTRACT on `reseal_password`.)
+    /// the PAM session phase; see the SAFETY CONTRACT on `reseal_password`.)
     #[test]
     #[ignore = "requires real TPM (/dev/tpmrm0)"]
     fn reseal_only_when_stale() {

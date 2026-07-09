@@ -5,12 +5,12 @@
 //! templates headlessly at the login greeter, no user interaction) and stored
 //! root-only under `/var/lib/irlume/template-keys/<user>.json`. The same key may
 //! also be **recovery-wrapped** under an Argon2id passphrase
-//! ([`crate::recovery`]) and stored under `/var/lib/irlume/recovery/<user>.json`
-//! — the manual backstop for when the TPM seal can no longer be satisfied
+//! ([`crate::recovery`]) and stored under `/var/lib/irlume/recovery/<user>.json`,
+//! the manual backstop for when the TPM seal can no longer be satisfied
 //! (Secure Boot off, TPM cleared, dbx/firmware PCR move, disk moved machines).
 //!
 //! Reliability note: like the keyring seal, the TPM-sealed key inherits PCR
-//! fragility — after a dbx/firmware update the seal may stop unsealing, and face
+//! fragility: after a dbx/firmware update the seal may stop unsealing, and face
 //! auth then falls back to the password until `irlume recovery restore` (or a
 //! re-enroll) re-binds the key to the current PCRs. Encrypting templates is the
 //! security/reliability trade the operator opted into.
@@ -70,7 +70,7 @@ pub fn ensure_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Unseal the existing template key for `user`. Errors if none is sealed (the
-/// caller must NOT generate one here — that would orphan already-encrypted data).
+/// caller must NOT generate one here; that would orphan already-encrypted data).
 pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
     if !path.exists() {
@@ -126,7 +126,7 @@ pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     let path = recovery_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
-            "no recovery passphrase set for '{user}' — run `irlume recovery setup`"
+            "no recovery passphrase set for '{user}'; run `irlume recovery setup`"
         )));
     }
     let env = load_recovery(user)?;

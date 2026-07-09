@@ -13,7 +13,7 @@ use crate::Landmarks5;
 
 /// Canonical ArcFace 5-point reference landmarks for a 112x112 chip
 /// (left eye, right eye, nose tip, left mouth corner, right mouth corner).
-/// These are the InsightFace `arcface_src` constants — do not "tidy" them.
+/// These are the InsightFace `arcface_src` constants; do not "tidy" them.
 pub const ARCFACE_REF_112: Landmarks5 = [
     (38.2946, 51.6963),
     (73.5318, 51.5014),
@@ -28,7 +28,7 @@ pub const OUT_SIZE: u32 = 112;
 /// Channel order fed to the recognition net. InsightFace ArcFace recognition
 /// models were exported with `blobFromImage(..., swapRB=true)`, i.e. **RGB**.
 /// If the Phase-1 self-test or a two-photo match test shows collapsed genuine
-/// scores, flip this and re-test — it is the most common alignment-stage bug.
+/// scores, flip this and re-test; it is the most common alignment-stage bug.
 pub const INPUT_IS_RGB: bool = true;
 
 /// A 2x3 affine transform, row-major: maps (x,y) -> (m0·x+m1·y+m2, m3·x+m4·y+m5).
@@ -72,7 +72,7 @@ impl Affine2 {
 /// Model (no reflection): X = a·x − b·y + tx,  Y = b·x + a·y + ty.
 /// Each correspondence gives two linear rows in the unknowns θ = [a, b, tx, ty];
 /// we solve the 4x4 normal equations directly (no SVD needed for a non-reflective
-/// similarity — equivalent to the Umeyama/`skimage.SimilarityTransform` result).
+/// similarity; equivalent to the Umeyama/`skimage.SimilarityTransform` result).
 pub fn estimate_similarity(src: &[(f32, f32)], dst: &[(f32, f32)]) -> Option<Affine2> {
     assert_eq!(src.len(), dst.len());
     let mut n = [[0.0f64; 4]; 4]; // AᵀA
@@ -221,11 +221,11 @@ pub fn preprocess_arcface(chip_rgb: &[u8]) -> Vec<f32> {
 ///
 /// Written as an 8-lane unrolled fold so LLVM auto-vectorizes it to SSE/AVX
 /// under `target-cpu` / `target-feature=+avx2` (see `.cargo/config.toml`). For
-/// a 512-D vector this is already negligible vs ONNX inference — the real
+/// a 512-D vector this is already negligible vs ONNX inference; the real
 /// acceleration is the ONNX Runtime execution provider, not this loop.
 /// Horizontally mirror a 112×112×3 RGB chip (for test-time-augmentation: embed
-/// a face and its mirror, then average the two embeddings — a standard ArcFace
-/// inference trick that adds robustness for free, no retraining).
+/// a face and its mirror, then average the two embeddings, a standard ArcFace
+/// inference trick that cuts false rejects for free, no retraining).
 pub fn flip_h(chip: &[u8]) -> Vec<u8> {
     let n = OUT_SIZE as usize;
     let mut out = vec![0u8; chip.len()];

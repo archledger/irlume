@@ -68,13 +68,13 @@ pub struct Enrollment {
     #[serde(default)]
     pub require_eyes_open: bool,
     /// Per-user opt-in: require a blink challenge (temporal liveness) to unlock
-    /// (default off). Defeats static IR-reflective prints — a print can't blink.
+    /// (default off). Defeats static IR-reflective prints: a print can't blink.
     /// See ADR-0002. Only enforced when IR is available (the glint challenge needs
     /// the emitter).
     #[serde(default)]
     pub require_challenge: bool,
     /// Camera identity captured at enroll, verified at auth (anti-swap). `None`
-    /// for pre-binding enrollments — enforcement only kicks in once bound.
+    /// for pre-binding enrollments; enforcement only kicks in once bound.
     #[serde(default)]
     pub camera_binding: Option<CameraBinding>,
 }
@@ -121,19 +121,19 @@ impl Enrollment {
     }
 
     /// Per-user IR-liveness floor `(depth_ratio, brightness)` derived from the
-    /// enrolled scans' own IR calibration — the live frame must clear it, so the
+    /// enrolled scans' own IR calibration: the live frame must clear it, so the
     /// anti-screen / anti-photo threshold adapts to this user's camera/rig
     /// instead of a one-size global constant. Returns `None` until there are at
     /// least two IR-bearing scans (enough to be representative). The floor is the
     /// weakest enrolled value with a 25% margin below it (live IR varies).
     /// Per-user IR **depth** floor (center/edge ratio, a 3D-structure cue) for the
     /// anti-screen/photo gate: 75% of the weakest enrolled IR depth. Needs ≥2 IR
-    /// scans. DEPTH ONLY — the former per-user IR *brightness* floor was removed:
+    /// scans. DEPTH ONLY; the former per-user IR *brightness* floor was removed:
     /// IR face brightness is strongly ambient-dependent (emitter-only ~40 in the
     /// dark vs ~140 in a lit room, measured on the ASUS Hello cam), so a brightness
     /// floor derived from lit enrollment false-rejects a genuine dim/night login as
     /// a "screen/photo". The global liveness gate (`evaluate`) already enforces an
-    /// ambient-robust IR brightness floor (`IR_FACE_MIN_BRIGHTNESS`) and depth floor
+    /// ambient-tolerant IR brightness floor (`IR_FACE_MIN_BRIGHTNESS`) and depth floor
     /// (`DEPTH_MIN_RATIO`); this adds a personalized depth tightening on top.
     pub fn ir_calibration(&self) -> Option<f32> {
         let mut depths = Vec::new();
@@ -151,8 +151,8 @@ impl Enrollment {
         Some(min * 0.75)
     }
 
-    /// This user's frontal pitch neutral — the median of the per-scan capture
-    /// pitches — or `None` until at least two calibrated scans exist. Lets the
+    /// This user's frontal pitch neutral (the median of the per-scan capture
+    /// pitches), or `None` until at least two calibrated scans exist. Lets the
     /// framing guide + capture gate centre on where a LEVEL face actually reads
     /// on this camera instead of a hand-tuned global constant. Scans with pitch
     /// 0.0 (pre-calibration) are ignored, so it stays backward-compatible.
@@ -260,7 +260,7 @@ struct EncEnvelope {
 }
 
 /// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
-/// host) or emitting pretty plaintext when not (dev / no-TPM). Pure — tested
+/// host) or emitting pretty plaintext when not (dev / no-TPM). Pure; tested
 /// without a TPM.
 fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Result<Vec<u8>> {
     match key {
@@ -282,7 +282,7 @@ fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Re
 
 /// Parse on-disk bytes into an `Enrollment`, handling all three formats:
 /// encrypted (v2, needs `key`), plaintext multi-profile, and the legacy
-/// single-profile layout (migrated). Pure — tested without a TPM.
+/// single-profile layout (migrated). Pure; tested without a TPM.
 fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Result<Enrollment> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
@@ -326,7 +326,7 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
     let key = save_key(&e.user)?;
     let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
     // Atomic + never world-readable: 0600 temp file in the same dir, then
-    // rename over the target — a crash mid-write can't leave a truncated
+    // rename over the target: a crash mid-write can't leave a truncated
     // profile, and there is no umask window on the real path.
     let tmp = path.with_extension("json.tmp");
     write_0600(&tmp, &bytes).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
@@ -356,8 +356,8 @@ fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Load an enrollment, transparently decrypting (v2) and migrating the legacy
 /// single-profile format. A plaintext file loads without touching the TPM; an
-/// encrypted file unseals the template key (and fails cleanly — face auth then
-/// falls back to the password — if the seal can no longer be satisfied).
+/// encrypted file unseals the template key (and fails cleanly, with face auth
+/// falling back to the password, if the seal can no longer be satisfied).
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     let path = profile_path(user);
     if !path.exists() {
@@ -536,7 +536,7 @@ mod tests {
         assert!(e.ir_calibration().is_none());
 
         // Two+ scans -> depth floor at 75% of the weakest enrolled depth.
-        // (brightness is intentionally NOT floored per-user — ambient-dependent.)
+        // (brightness is intentionally NOT floored per-user; it is ambient-dependent.)
         e.profiles[0].scans.push(scan_with_ir(1.2, 80.0));
         let depth_floor = e.ir_calibration().unwrap();
         assert!((depth_floor - 1.2 * 0.75).abs() < 1e-5);

@@ -12,7 +12,7 @@
 //!
 //! The sealed object's `authPolicy` is a literal `PolicyPCR` digest over `pcrs`
 //! (here PCR 7, the UEFI Secure Boot state). The TPM rejects unseal the moment
-//! any bound PCR drifts. `pcr_values` is diagnostics only — the TPM itself
+//! any bound PCR drifts. `pcr_values` is diagnostics only; the TPM itself
 //! enforces policy via the digest baked into `public`.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -80,7 +80,7 @@ impl SealedEnvelope {
         serde_json::from_str(&s).map_err(|e| Error::Protocol(e.to_string()))
     }
 
-    /// Write the envelope as a root-only (0600) file — it contains the wrapped
+    /// Write the envelope as a root-only (0600) file: it contains the wrapped
     /// secret blob; only the TPM can unseal it, but keep it unreadable anyway.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {

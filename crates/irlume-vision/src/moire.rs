@@ -1,14 +1,14 @@
 //! Frequency-domain screen/replay deterrent for the RGB-only (convenience) path.
 //!
 //! A camera pointed at a *display* captures the panel's regular pixel grid (and
-//! the moiré beat between that grid and the sensor) — a strongly *periodic*
+//! the moiré beat between that grid and the sensor), a strongly *periodic*
 //! texture that shows up as sharp, isolated peaks in the 2D FFT. Real skin has
 //! broadband, non-periodic texture, so its spectrum falls off smoothly. We
 //! measure "peakiness" (max / mean magnitude) in the high-frequency band: a high
 //! value ⇒ periodic ⇒ likely a screen.
 //!
 //! Model-free (clean BOM). DETERRENT-grade only: high-res panels far from the
-//! camera show weak moiré, and very sharp natural texture can read high — so this
+//! camera show weak moiré, and very sharp natural texture can read high, so this
 //! is one cue layered onto lit + frontal + glare, used only in convenience tier.
 
 use rustfft::{num_complex::Complex, FftPlanner};
@@ -81,7 +81,7 @@ pub fn moire_score(gray: &[u8]) -> f32 {
 }
 
 /// Crop `bbox` from an RGB8 frame, grayscale it, and NEAREST-resample to `N`×`N`
-/// for [`moire_score`]. Nearest (not bilinear) is deliberate — interpolation
+/// for [`moire_score`]. Nearest (not bilinear) is deliberate; interpolation
 /// low-passes the very grid we want to keep.
 pub fn face_gray_n(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> Vec<u8> {
     let (w, h) = (w as i32, h as i32);

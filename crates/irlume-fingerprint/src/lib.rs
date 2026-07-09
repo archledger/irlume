@@ -1,5 +1,5 @@
 //! Fingerprint modality, backed by **fprintd** (the standard Linux fingerprint
-//! service). irlume does not talk to the sensor directly — it drives fprintd,
+//! service). irlume does not talk to the sensor directly; it drives fprintd,
 //! which owns libfprint and the device. Verification is performed by
 //! `pam_fprintd` in the PAM stack (wired by `irlume fingerprint enable`), so
 //! irlume never claims the device and coexists with the desktop greeter's native
@@ -7,9 +7,9 @@
 //!
 //! No async D-Bus stack: we use fprintd's shipped tooling with **absolute paths**
 //! (so `$PATH` can't be hijacked for an auth-critical helper):
-//!   * `busctl tree net.reactivated.Fprint`            — is a reader present?
-//!   * `busctl get-property … Device/0 name`           — friendly device name
-//!   * `fprintd-list <user>` / `fprintd-enroll`        — enrolled fingers / enroll
+//!   * `busctl tree net.reactivated.Fprint`            - is a reader present?
+//!   * `busctl get-property … Device/0 name`           - friendly device name
+//!   * `fprintd-list <user>` / `fprintd-enroll`        - enrolled fingers / enroll
 //!
 //! Ported from linhello (archledger/linhello, the predecessor project).
 
@@ -20,7 +20,7 @@ const FPRINT_BUS: &str = "net.reactivated.Fprint";
 const DEVICE0: &str = "/net/reactivated/Fprint/Device/0";
 
 /// Resolve a tool to an absolute path under the standard system dirs, or `None`.
-/// Absolute paths only — never trust `$PATH` for an auth-critical helper.
+/// Absolute paths only; never trust `$PATH` for an auth-critical helper.
 fn tool(name: &str) -> Option<PathBuf> {
     ["/usr/bin", "/bin", "/usr/local/bin"]
         .iter()
@@ -94,7 +94,7 @@ pub fn enrolled_fingers(user: &str) -> Vec<String> {
 
 /// True when the reader is CLAIMED by a stale fprintd session (a crashed or
 /// aborted enrollment holds the device open; `pam_fprintd` then fails silently
-/// and the finger prompt never appears — observed live 2026-07-01). Detection:
+/// and the finger prompt never appears; observed live 2026-07-01). Detection:
 /// `fprintd-list` must claim the device, and a stuck claim surfaces as
 /// "already open" / "failed to claim" in its output. The cure is restarting
 /// fprintd, which releases the claim.

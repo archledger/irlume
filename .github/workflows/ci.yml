@@ -1,7 +1,7 @@
 # Format, lint, build, and test on every push / PR to main.
 #
 # Mirrors the Ubuntu path in docs/DEVELOPMENT.md and pins Rust to the project
-# MSRV (1.88 — the ort / edition-2024 floor), so CI matches `nix develop` and a
+# MSRV (1.88, the ort / edition-2024 floor), so CI matches `nix develop` and a
 # contributor who follows the developer guide gets the same result CI does.
 name: CI
 
@@ -10,6 +10,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Least privilege for GITHUB_TOKEN: this workflow only reads the repo
+# (checkout + LFS); nothing here publishes or writes.
+permissions:
+  contents: read
 
 # A newer push to the same ref cancels the in-flight run.
 concurrency:

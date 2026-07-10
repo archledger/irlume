@@ -74,30 +74,16 @@
 //!      nv_index = deserialized handle). Compares the session digest to the NV
 //!      content and, on match, resets it to the authPolicy term of SEAL step 3.
 //!   5. Esys_Unseal with the session.
-//!   Failure at step 4 with TPM2_RC_VALUE (systemd EREMCHG) ⇒ the step-3 PCR
-//!   replay didn't reproduce the stored digest; at step 5 ⇒ wrong Name (usually
-//!   the missing WRITTEN bit).
 //!
-//! STATUS: implementation pending HW validation. The seal/unseal below return a
-//! clear error. The required wrapper `Context::policy_authorize_nv` is absent
-//! from released tss-esapi; a patched fork adding it exists at
-//! archledger/rust-tss-esapi @ policy-authorize-nv (branched from v7.7.0,
-//! compiles) and will be pinned via a workspace `[patch.crates-io]` in the same
-//! commit that implements seal/unseal. The super-PCR replay and Name marshalling
-//! are byte-exact-or-nothing and must be developed against a provisioned pcrlock
-//! NV index on real hardware, not blind.
-
-use crate::envelope::SealedEnvelope;
-use irlume_common::{Error, Result};
-use zeroize::Zeroizing;
-
-pub fn seal_pcrlock(_secret: &[u8], _nv_index: u32) -> Result<SealedEnvelope> {
-    Err(Error::Policy(
-        "pcrlock seal not yet implemented (provision with `systemd-pcrlock make-policy` first)"
-            .into(),
-    ))
-}
-
-pub fn unseal_pcrlock(_env: &SealedEnvelope, _nv_index: u32) -> Result<Zeroizing<Vec<u8>>> {
-    Err(Error::Policy("pcrlock unseal not yet implemented".into()))
-}
+//! Failure at step 4 with TPM2_RC_VALUE (systemd EREMCHG) means the step-3 PCR
+//! replay didn't reproduce the stored digest; at step 5 it means a wrong Name
+//! (usually the missing WRITTEN bit).
+//!
+//! STATUS: implemented in [`crate::tpm`] (`seal_pcrlock`/`unseal_pcrlock`),
+//! co-located with the shared TPM session helpers it reuses. The wrapper
+//! `Context::policy_authorize_nv` (absent from released tss-esapi) is supplied
+//! by the fork archledger/rust-tss-esapi @ policy-authorize-nv, pinned via the
+//! workspace `[patch.crates-io]`. The super-PCR composition was derived and the
+//! full seal/unseal round-trip validated against a provisioned pcrlock NV index
+//! on real hardware (single-value PCRs 13/15 as one PolicyPCR; multi-value PCRs
+//! 2/3 each PolicyPCR+PolicyOR) before landing.

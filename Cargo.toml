@@ -64,3 +64,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 [profile.release]
 lto = true
 strip = true
+
+# tss-esapi patched to add Context::policy_authorize_nv (TPM2_PolicyAuthorizeNV),
+# required for the Tier-2 systemd-pcrlock seal. Upstreamable; drop when released.
+[patch.crates-io]
+tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "policy-authorize-nv" }

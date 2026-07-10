@@ -30,7 +30,10 @@ use zeroize::Zeroizing;
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
 use tss_esapi::constants::SessionType;
-use tss_esapi::handles::{KeyHandle, PersistentTpmHandle, SessionHandle, TpmHandle};
+use tss_esapi::handles::{
+    AuthHandle, KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle,
+    SessionHandle, TpmHandle,
+};
 use tss_esapi::interface_types::algorithm::{
     HashingAlgorithm, PublicAlgorithm, RsaSchemeAlgorithm,
 };
@@ -39,10 +42,10 @@ use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::resource_handles::{Hierarchy, Provision};
 use tss_esapi::interface_types::session_handles::{AuthSession, PolicySession};
 use tss_esapi::structures::{
-    Auth, Digest, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder, PcrSlot,
-    Private, Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters, PublicRsaParameters,
-    RsaExponent, RsaScheme, RsaSignature, SensitiveData, Signature, SymmetricDefinition,
-    SymmetricDefinitionObject,
+    Auth, Digest, DigestList, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder,
+    PcrSlot, Private, Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters,
+    PublicRsaParameters, RsaExponent, RsaScheme, RsaSignature, SensitiveData, Signature,
+    SymmetricDefinition, SymmetricDefinitionObject,
 };
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::ESYS_TR;
@@ -712,18 +715,302 @@ fn a_hash(approved_policy: &[u8], policy_ref: &[u8]) -> Result<Digest> {
 // Tier 2: systemd-pcrlock PolicyAuthorizeNV (GRUB2 + Secure Boot/dbx). Binds the
 // object to a pcrlock NV index that holds the currently-valid PCR policy; the
 // admin re-runs `systemd-pcrlock make-policy` to re-predict it across firmware
-// updates. Implemented with raw `Esys_PolicyAuthorizeNV` FFI (no tss-esapi safe
-// wrapper) in [`crate::tpm_pcrlock`].
+// updates. See [`crate::tpm_pcrlock`] for the verified seal/unseal spec this
+// implements. The seal side is a trial-session `PolicyAuthorizeNV` over the NV
+// index; the unseal side replays systemd's "super PCR" policy (one PolicyPCR
+// over the single-value PCRs, then PolicyPCR+PolicyOR per multi-value PCR) into
+// a live policy session before the PolicyAuthorizeNV, exactly reproducing the
+// digest `make-policy` stored in the index.
 // ---------------------------------------------------------------------------
+
+/// systemd's pcrlock prediction, read from `/var/lib/systemd/pcrlock.json`.
+const PCRLOCK_JSON: &str = "/var/lib/systemd/pcrlock.json";
+
+#[derive(serde::Deserialize)]
+struct PcrlockJson {
+    #[serde(rename = "pcrBank")]
+    pcr_bank: String,
+    #[serde(rename = "pcrValues")]
+    pcr_values: Vec<PcrlockEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct PcrlockEntry {
+    pcr: u32,
+    /// One or more allowed SHA-256 PCR values (hex), as predicted by make-policy.
+    values: Vec<String>,
+}
+
+fn read_pcrlock_json() -> Result<PcrlockJson> {
+    let raw = std::fs::read(PCRLOCK_JSON).map_err(|e| {
+        Error::Policy(format!(
+            "cannot read {PCRLOCK_JSON}: {e} (run `systemd-pcrlock make-policy` first)"
+        ))
+    })?;
+    let plock: PcrlockJson = serde_json::from_slice(&raw)
+        .map_err(|e| Error::Policy(format!("malformed {PCRLOCK_JSON}: {e}")))?;
+    if plock.pcr_bank != "sha256" {
+        return Err(Error::Policy(format!(
+            "pcrlock bank is {:?}; only sha256 is supported",
+            plock.pcr_bank
+        )));
+    }
+    Ok(plock)
+}
+
+fn hex32(s: &str) -> Result<[u8; 32]> {
+    let bytes = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect::<std::result::Result<Vec<u8>, _>>()
+        .map_err(|e| Error::Policy(format!("bad hex in pcrlock.json: {e}")))?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| Error::Policy("pcrlock PCR value is not 32 bytes".into()))
+}
+
+/// The `pcrDigest` a `TPM2_PolicyPCR` commits to for a selection: SHA-256 over
+/// the selected PCR values, concatenated in ascending PCR order (the order the
+/// TPM itself uses). `values` must already be in that order.
+fn pcr_composite_digest(values: &[[u8; 32]]) -> Result<Digest> {
+    let mut h = Sha256::new();
+    for v in values {
+        h.update(v);
+    }
+    Digest::try_from(h.finalize().to_vec()).map_err(tpm_err)
+}
+
+fn nv_index_handle(ctx: &mut Context, nv_index: u32) -> Result<NvIndexHandle> {
+    let tpm_handle = NvIndexTpmHandle::new(nv_index).map_err(tpm_err)?;
+    let obj: ObjectHandle = ctx
+        .tr_from_tpm_public(TpmHandle::NvIndex(tpm_handle))
+        .map_err(tpm_err)?;
+    Ok(NvIndexHandle::from(obj))
+}
+
+/// One step of a systemd super-PCR policy, replayable in a trial session to
+/// derive intermediate digests (the OR-branch digests the live session needs).
+enum PolicyStep {
+    /// `TPM2_PolicyPCR` over `sel` committing to the given composite `digest`.
+    Pcr { sel: Vec<u32>, digest: Digest },
+    /// `TPM2_PolicyOR` over precomputed branch digests.
+    Or(Vec<Digest>),
+}
+
+/// Run `steps` in a fresh trial session and return the resulting policy digest.
+/// Used offline (no live PCRs) to compute the OR-branch digests of the super
+/// policy, each of which is a full prefix replay with one candidate PCR value.
+fn trial_replay(ctx: &mut Context, steps: &[PolicyStep]) -> Result<Digest> {
+    with_session(ctx, SessionType::Trial, |ctx, session| {
+        let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+        for step in steps {
+            match step {
+                PolicyStep::Pcr { sel, digest } => {
+                    ctx.policy_pcr(policy, digest.clone(), pcr_selection(sel)?)
+                        .map_err(tpm_err)?;
+                }
+                PolicyStep::Or(branches) => {
+                    ctx.policy_or(policy, digest_list(branches)?)
+                        .map_err(tpm_err)?;
+                }
+            }
+        }
+        ctx.policy_get_digest(policy).map_err(tpm_err)
+    })
+}
+
+fn digest_list(digests: &[Digest]) -> Result<DigestList> {
+    let mut list = DigestList::new();
+    for d in digests {
+        list.add(d.clone()).map_err(tpm_err)?;
+    }
+    Ok(list)
+}
+
+/// A single-value PCR group plus the ordered multi-value PCRs of a super policy.
+struct SuperPcr {
+    /// Single-value PCRs, ascending (replayed live as one PolicyPCR at unseal).
+    singles: Vec<u32>,
+    /// Multi-value PCRs, ascending: the PCR and its OR-branch policy digests.
+    multis: Vec<(u32, Vec<Digest>)>,
+}
+
+/// Reconstruct systemd's super-PCR policy structure from the prediction, deriving
+/// each multi-value PCR's OR-branch digests via trial replays of the growing
+/// prefix (mirrors `tpm2_calculate_policy_super_pcr`).
+fn build_super_pcr(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
+    let mut entries: Vec<(u32, Vec<[u8; 32]>)> = plock
+        .pcr_values
+        .iter()
+        .map(|e| {
+            let vals = e
+                .values
+                .iter()
+                .map(|s| hex32(s))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((e.pcr, vals))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by_key(|(pcr, _)| *pcr);
+
+    let singles: Vec<u32> = entries
+        .iter()
+        .filter(|(_, v)| v.len() == 1)
+        .map(|(pcr, _)| *pcr)
+        .collect();
+    let single_values: Vec<[u8; 32]> = entries
+        .iter()
+        .filter(|(_, v)| v.len() == 1)
+        .map(|(_, v)| v[0])
+        .collect();
+
+    // The growing prefix of policy steps, replayed in trial sessions to derive
+    // each multi-value PCR's branch digests from the correct intermediate state.
+    let mut prefix: Vec<PolicyStep> = Vec::new();
+    if !singles.is_empty() {
+        prefix.push(PolicyStep::Pcr {
+            sel: singles.clone(),
+            digest: pcr_composite_digest(&single_values)?,
+        });
+    }
+
+    let mut multis: Vec<(u32, Vec<Digest>)> = Vec::new();
+    for (pcr, values) in entries.iter().filter(|(_, v)| v.len() > 1) {
+        let mut branches = Vec::with_capacity(values.len());
+        for val in values {
+            let mut steps = prefix_clone(&prefix);
+            steps.push(PolicyStep::Pcr {
+                sel: vec![*pcr],
+                digest: pcr_composite_digest(&[*val])?,
+            });
+            branches.push(trial_replay(ctx, &steps)?);
+        }
+        // Advance the prefix past this PCR: PolicyPCR (any branch value; the
+        // following PolicyOR collapses them to one digest) then PolicyOR.
+        prefix.push(PolicyStep::Pcr {
+            sel: vec![*pcr],
+            digest: pcr_composite_digest(&[values[0]])?,
+        });
+        prefix.push(PolicyStep::Or(branches.clone()));
+        multis.push((*pcr, branches));
+    }
+
+    Ok(SuperPcr { singles, multis })
+}
+
+fn prefix_clone(prefix: &[PolicyStep]) -> Vec<PolicyStep> {
+    prefix
+        .iter()
+        .map(|s| match s {
+            PolicyStep::Pcr { sel, digest } => PolicyStep::Pcr {
+                sel: sel.clone(),
+                digest: digest.clone(),
+            },
+            PolicyStep::Or(d) => PolicyStep::Or(d.clone()),
+        })
+        .collect()
+}
+
+/// Compute the sealed object's `authPolicy` (a `PolicyAuthorizeNV` over the NV
+/// index) using a trial session. The index's Name (WRITTEN bit set once
+/// make-policy has written it) fully determines the digest; the TPM reads it.
+fn pcrlock_auth_policy(ctx: &mut Context, nv: NvIndexHandle) -> Result<Digest> {
+    with_session(ctx, SessionType::Trial, |ctx, session| {
+        let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+        ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.policy_authorize_nv(policy, AuthHandle::Owner, nv)
+        })
+        .map_err(tpm_err)?;
+        ctx.policy_get_digest(policy).map_err(tpm_err)
+    })
+}
 
 /// Seal `secret` bound to the systemd-pcrlock NV index at `nv_index`.
 fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
-    crate::tpm_pcrlock::seal_pcrlock(secret, nv_index)
+    let plock = read_pcrlock_json()?;
+    let mut pcrs: Vec<u32> = plock.pcr_values.iter().map(|e| e.pcr).collect();
+    pcrs.sort_unstable();
+
+    let mut ctx = open_context()?;
+    let pcr_values = read_pcr_values(&mut ctx, &pcrs)?;
+    let nv = nv_index_handle(&mut ctx, nv_index)?;
+    let auth_policy = pcrlock_auth_policy(&mut ctx, nv)?;
+
+    with_srk(&mut ctx, |ctx, srk| {
+        let tmpl = sealed_template(auth_policy.clone())?;
+        let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
+        let created = ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.create(*srk, tmpl, None, Some(sensitive), None, None)
+            })
+            .map_err(tpm_err)?;
+
+        Ok(SealedEnvelope {
+            version: crate::envelope::CURRENT_VERSION,
+            policy: PolicyKind::PcrlockNv { nv_index },
+            pcrs: pcrs.clone(),
+            public: created.out_public.marshall().map_err(tpm_err)?,
+            private: created.out_private.to_vec(),
+            pcr_values: pcr_values.clone(),
+        })
+    })
 }
 
-/// Unseal a `PolicyAuthorizeNV`-bound object against `nv_index`.
+/// Unseal a `PolicyAuthorizeNV`-bound object against `nv_index`: replay the live
+/// super-PCR policy, run PolicyAuthorizeNV, and unseal.
+#[allow(clippy::redundant_closure_call)]
 fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u8>>> {
-    crate::tpm_pcrlock::unseal_pcrlock(env, nv_index)
+    let plock = read_pcrlock_json()?;
+    let mut ctx = open_context()?;
+    let nv = nv_index_handle(&mut ctx, nv_index)?;
+    let super_pcr = build_super_pcr(&mut ctx, &plock)?;
+
+    with_srk(&mut ctx, |ctx, srk| {
+        let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
+        let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
+        let sealed_handle = ctx
+            .execute_with_nullauth_session(|ctx| ctx.load(*srk, private, public))
+            .map_err(tpm_err)?;
+
+        let result: Result<Zeroizing<Vec<u8>>> = (|| {
+            with_session(ctx, SessionType::Policy, |ctx, session| {
+                let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+
+                // Super-PCR replay against LIVE PCRs (empty digest => the TPM
+                // reads current PCRs). Single-value PCRs first as one PolicyPCR,
+                // then each multi-value PCR: live PolicyPCR + PolicyOR over the
+                // precomputed branch digests. Unseal fails here if the live PCRs
+                // don't match any predicted branch (i.e. the box booted into a
+                // state make-policy didn't authorize).
+                if !super_pcr.singles.is_empty() {
+                    ctx.policy_pcr(
+                        policy,
+                        Digest::default(),
+                        pcr_selection(&super_pcr.singles)?,
+                    )
+                    .map_err(tpm_err)?;
+                }
+                for (pcr, branches) in &super_pcr.multis {
+                    ctx.policy_pcr(policy, Digest::default(), pcr_selection(&[*pcr])?)
+                        .map_err(tpm_err)?;
+                    ctx.policy_or(policy, digest_list(branches)?)
+                        .map_err(tpm_err)?;
+                }
+
+                ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
+                    ctx.policy_authorize_nv(policy, AuthHandle::Owner, nv)
+                })
+                .map_err(|e| policy_aware_err(e, env))?;
+
+                let data = ctx
+                    .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
+                    .map_err(|e| policy_aware_err(e, env))?;
+                Ok(Zeroizing::new(data.to_vec()))
+            })
+        })();
+
+        let _ = ctx.flush_context(sealed_handle.into());
+        result
+    })
 }
 
 /// Public entry point used by the CLI / daemon to arm a pcrlock-bound seal once
@@ -813,5 +1100,54 @@ mod tests {
         let env = seal_with_pcrs(secret, &[7]).expect("seal");
         let got = unseal(&env).expect("unseal");
         assert_eq!(&*got, secret, "round-trip must match");
+    }
+
+    /// Real Tier-2 pcrlock seal→unseal on the host TPM. Ignored by default: needs
+    /// /dev/tpmrm0, root, and a provisioned pcrlock policy
+    /// (`systemd-pcrlock make-policy`, NV index in /var/lib/systemd/pcrlock.json).
+    #[test]
+    #[ignore = "requires real TPM + provisioned systemd-pcrlock policy; run as root"]
+    fn seal_unseal_pcrlock_roundtrip_real_tpm() {
+        let raw = std::fs::read(PCRLOCK_JSON).expect("read pcrlock.json");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse pcrlock.json");
+        let nv_index = v["nvIndex"].as_u64().expect("nvIndex") as u32;
+
+        let secret = b"irlume-pcrlock-roundtrip-secret!";
+        let env = seal_with_pcrlock(secret, nv_index).expect("seal_pcrlock");
+        assert!(
+            matches!(env.policy, PolicyKind::PcrlockNv { .. }),
+            "envelope must be a pcrlock policy"
+        );
+        let got = unseal(&env).expect("unseal_pcrlock");
+        assert_eq!(&*got, secret, "pcrlock round-trip must match");
+    }
+
+    /// Durability phase 1: seal a pcrlock envelope and persist it to
+    /// `$IRLUME_PCRLOCK_ENV_OUT`. Paired with the phase-2 test across a
+    /// `systemd-pcrlock make-policy` NV rewrite to prove no reseal is needed.
+    #[test]
+    #[ignore = "durability phase 1; run as root with IRLUME_PCRLOCK_ENV_OUT set"]
+    fn pcrlock_seal_to_file() {
+        let out = std::env::var("IRLUME_PCRLOCK_ENV_OUT").expect("IRLUME_PCRLOCK_ENV_OUT");
+        let raw = std::fs::read(PCRLOCK_JSON).expect("read pcrlock.json");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse");
+        let nv_index = v["nvIndex"].as_u64().expect("nvIndex") as u32;
+        let env = seal_with_pcrlock(b"durable-across-make-policy!!", nv_index).expect("seal");
+        std::fs::write(&out, serde_json::to_vec(&env).expect("ser")).expect("write env");
+    }
+
+    /// Durability phase 2: unseal the envelope written by phase 1, after the NV
+    /// index was rewritten. Must still release the secret with no reseal.
+    #[test]
+    #[ignore = "durability phase 2; run as root with IRLUME_PCRLOCK_ENV_IN set"]
+    fn pcrlock_unseal_from_file() {
+        let inp = std::env::var("IRLUME_PCRLOCK_ENV_IN").expect("IRLUME_PCRLOCK_ENV_IN");
+        let raw = std::fs::read(&inp).expect("read env file");
+        let env: SealedEnvelope = serde_json::from_slice(&raw).expect("deser env");
+        let got = unseal(&env).expect("unseal after make-policy rewrite");
+        assert_eq!(
+            &*got, b"durable-across-make-policy!!",
+            "must survive NV rewrite"
+        );
     }
 }

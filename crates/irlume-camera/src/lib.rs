@@ -533,6 +533,16 @@ const IR_H: u32 = 400;
 // the old 24-frame (~1.6s) cost. Bump back up if dark-mode genuine scores drop.
 const IR_BURST: usize = 10;
 
+/// Ambient-subtraction gates (used only when `IRLUME_IR_AMBIENT_SUBTRACT=1`).
+/// `STROBE_MIN_GAP`: the lit frame must be this much brighter (mean) than its
+/// off-frame neighbor, i.e. a real strobe with a genuine emitter-off exposure to
+/// pair against; a steady emitter has no such neighbor and is left untouched.
+/// `LOW_AMBIENT_SKIP`: if the off-frame mean is below this, there is essentially
+/// no ambient IR to remove (indoors the off-frame is near-black), so subtracting
+/// it would only inject sensor noise; skip and keep the raw lit frame.
+const STROBE_MIN_GAP: f64 = 20.0;
+const LOW_AMBIENT_SKIP: f64 = 5.0;
+
 /// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
 /// emitter must be illuminating for a usable image; on integrated Hello modules
 /// it often fires when the stream opens, otherwise it needs a UVC-XU write (TODO,
@@ -589,14 +599,21 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     }
     let mut best = Some(frames[best_i].clone());
 
-    // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in: on a
+    // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in. On a
     // strobing emitter the frame adjacent to the brightest is an emitter-OFF
-    // exposure that captured only ambient IR. Subtracting it removes ambient
-    // IR (sunlight) that would otherwise wash out the emitter's reflection,
-    // exactly as Hello's illuminated/ambient-pair mode does. Indoors the
-    // ambient frame is ~0, so this is a no-op; the payoff is under strong
-    // ambient IR. Gated on a real strobe (clear off-frame) so a steady
-    // emitter is left untouched.
+    // exposure that captured only ambient IR. Subtracting it isolates the
+    // emitter's own reflected light, the same illuminated/ambient-pair step
+    // Hello uses. Its purpose is EXPOSURE ROBUSTNESS: under strong ambient IR
+    // (sunlight) the pedestal would otherwise wash out the emitter reflection.
+    // It is not primarily a spoof control (Hello credits spoof resistance to the
+    // IR wavelength plus a separate liveness stage, which is where irlume's
+    // depth/glint cues live). Indoors the off-frame is ~0, so it is a no-op.
+    //
+    // The subtraction assumes the lit and off frames share an exposure; pairing
+    // ADJACENT burst frames (after AE_WARMUP) keeps auto-exposure drift between
+    // the pair small. Pixels where the lit frame is saturated (255) carry no
+    // reliable subtracted value; the debug line reports the clipped fraction so a
+    // blown exposure is visible rather than silently trusted.
     //
     // NOT a validated security control yet, two reasons it stays behind a flag:
     //   1. The liveness DEPTH cue is center/edge RATIO, which is non-monotonic
@@ -608,6 +625,7 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     //      auth must use the SAME setting; toggling it requires a re-enroll.
     // Both are moot while the flag is unset (the shipped default).
     let subtract = std::env::var("IRLUME_IR_AMBIENT_SUBTRACT").is_ok_and(|v| v.trim() == "1");
+    let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
     if subtract {
         let neighbors = [best_i.wrapping_sub(1), best_i + 1];
         let ambient_i = neighbors
@@ -616,20 +634,32 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
             .min_by(|&&a, &&b| means[a].total_cmp(&means[b]))
             .copied();
         if let Some(ai) = ambient_i {
-            // Only subtract when the neighbor is genuinely an off-frame (a
-            // real strobe), never when both frames are lit (steady emitter).
-            if means[best_i] - means[ai] > 20.0 {
+            let (lit_mean, amb_mean) = (means[best_i], means[ai]);
+            // Subtract only when there is a real strobe gap (a genuine off-frame,
+            // never a steady emitter) AND enough ambient IR to be worth removing.
+            if lit_mean - amb_mean > STROBE_MIN_GAP && amb_mean >= LOW_AMBIENT_SKIP {
                 best = Some(ir_probe::subtract(&frames[best_i], &frames[ai]));
-                if std::env::var("IRLUME_DEBUG_IR").is_ok() {
+                if debug_ir {
+                    let clipped = ir_probe::saturated_fraction(&frames[best_i]);
                     eprintln!(
-                        "[ir] ambient-subtract: lit frame {best_i} ({:.0}) - ambient frame {ai} ({:.0})",
-                        means[best_i], means[ai]
+                        "[ir] ambient-subtract: lit frame {best_i} ({lit_mean:.0}) - ambient frame {ai} ({amb_mean:.0}); lit clipped {:.1}%{}",
+                        clipped * 100.0,
+                        if clipped > 0.05 {
+                            " (blown exposure; subtracted frame unreliable)"
+                        } else {
+                            ""
+                        }
                     );
                 }
+            } else if debug_ir {
+                eprintln!(
+                    "[ir] ambient-subtract: skipped (ambient {amb_mean:.0} < {LOW_AMBIENT_SKIP:.0} or strobe gap {:.0} <= {STROBE_MIN_GAP:.0})",
+                    lit_mean - amb_mean
+                );
             }
         }
     }
-    if std::env::var("IRLUME_DEBUG_IR").is_ok() {
+    if debug_ir {
         eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
     }
     // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
@@ -670,10 +700,12 @@ pub mod ir_probe {
         }
     }
 
-    /// Per-pixel saturating subtraction `lit - ambient`, clamped at 0. Isolates
-    /// the emitter's own reflected light (Hello's ambient-subtraction step): a
-    /// screen or print emitting its own IR appears in both frames and cancels;
-    /// the emitter-lit face does not. Falls back to `lit` on a size mismatch.
+    /// Per-pixel saturating subtraction `lit - ambient`, clamped at 0. Removes the
+    /// ambient IR pedestal (Hello's ambient-subtraction step) so the emitter's own
+    /// reflection survives a bright-ambient exposure: light present in both frames
+    /// (sunlight, a screen's own IR) cancels; the emitter-lit face does not. This
+    /// is an exposure-robustness step, not a standalone spoof control. Falls back
+    /// to `lit` on a size mismatch.
     pub fn subtract(lit: &[u8], ambient: &[u8]) -> Vec<u8> {
         if lit.len() != ambient.len() {
             return lit.to_vec();
@@ -682,6 +714,18 @@ pub mod ir_probe {
             .zip(ambient)
             .map(|(&l, &a)| l.saturating_sub(a))
             .collect()
+    }
+
+    /// Fraction of pixels at the 8-bit ceiling (255). A high clipped fraction in
+    /// the lit frame means the exposure is blown: those pixels lost their true
+    /// emitter return, so both the raw and the ambient-subtracted frame are
+    /// unreliable there. Used as a capture-quality signal, not a hard gate.
+    pub fn saturated_fraction(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+        let clipped = data.iter().filter(|&&p| p == 255).count();
+        clipped as f64 / data.len() as f64
     }
 
     /// Ratio of mean brightness in the center 50% box to the surrounding
@@ -1010,6 +1054,24 @@ mod tests {
     fn median_frame_passes_lone_frame_through() {
         let m = median_frame(vec![frame(&[1, 2, 3])]);
         assert_eq!(m.data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ambient_subtract_cancels_shared_pedestal_and_clamps() {
+        // Ambient light present in both frames cancels; the emitter's extra
+        // return survives; nothing goes negative (saturating clamp at 0).
+        let lit = [200u8, 60, 10];
+        let ambient = [50u8, 60, 90];
+        assert_eq!(ir_probe::subtract(&lit, &ambient), vec![150, 0, 0]);
+        // Size mismatch falls back to the lit frame unchanged.
+        assert_eq!(ir_probe::subtract(&lit, &[1, 2]), lit.to_vec());
+    }
+
+    #[test]
+    fn saturated_fraction_counts_clipped_pixels() {
+        assert_eq!(ir_probe::saturated_fraction(&[255, 255, 0, 0]), 0.5);
+        assert_eq!(ir_probe::saturated_fraction(&[0, 1, 254]), 0.0);
+        assert_eq!(ir_probe::saturated_fraction(&[]), 0.0);
     }
 
     #[test]

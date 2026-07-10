@@ -40,8 +40,52 @@
 //!    (rewrites the NV index) and confirm the SAME object still unseals without
 //!    a reseal (the whole point vs. the literal PCR-7 seal).
 //!
-//! NOTE: implementation pending (task: Tier 2). The seal/unseal below return a
-//! clear error until the upstream wrapper lands and the path is HW-validated.
+//! EXACT SEAL/UNSEAL SPEC (verified 2026-07-09 against systemd main
+//! src/shared/tpm2-util.c + src/pcrlock/pcrlock.c). The two sides are
+//! deliberately ASYMMETRIC; getting this wrong yields "seals but never unseals".
+//!
+//! pcrlock.json (/var/lib/systemd/pcrlock.json) fields to read: `pcrBank` (hash
+//! alg), `pcrValues` (per-PCR allowed-value prediction, ≤8 each), `nvIndex`
+//! (u32), `nvHandle` (base64 serialized ESYS_TR), `nvPublic` (base64 marshalled
+//! TPM2B_NV_PUBLIC), `srkHandle`.
+//!
+//! SEAL (pure software policy calc, then Create under the SRK):
+//!   1. Unmarshal `nvPublic` → TPM2B_NV_PUBLIC; copy it and set TPMA_NV_WRITTEN
+//!      (CRITICAL: the index's Name uses the *written* public; omit and it never
+//!      unseals).
+//!   2. nvName = 0x000B ‖ SHA256(marshal(TPMS_NV_PUBLIC_with_WRITTEN)).
+//!   3. authPolicy = SHA256( zero32 ‖ TPM_CC_PolicyAuthorizeNV(0x00000192, 4B BE)
+//!      ‖ nvName ).  This is the WHOLE policy — NO PolicyPCR term (PolicyAuthorizeNV
+//!      resets the running digest, discarding any prior PCR work).
+//!   4. Esys_Create under SRK: inPublic.authPolicy = authPolicy, policy-only
+//!      (clear userWithAuth), sensitive = secret. Store public/private in the
+//!      envelope with PolicyKind::PcrlockNv { nv_index }.
+//!
+//! UNSEAL (real policy session):
+//!   1. StartAuthSession TPM2_SE_POLICY, SHA256.
+//!   2. Esys_TR_Deserialize(nvHandle) → NV ESYS_TR.
+//!   3. Super-PCR replay reproducing what make-policy WROTE into the index (a
+//!      single marshalled TPMT_HA = the "super PCR" digest): from a zero digest,
+//!      one PolicyPCR over all SINGLE-value PCRs, then for each MULTI-value PCR
+//!      (ascending) a PolicyPCR followed by a PolicyOR over its ≤8 precomputed
+//!      branch digests. Bank = `pcrBank`, values from `pcrValues`.
+//!   4. policy_authorize_nv(policy_session, authHandle = ESYS_TR_RH_OWNER with
+//!      ESYS_TR_PASSWORD (empty owner auth; the index is TPMA_NV_OWNERREAD),
+//!      nv_index = deserialized handle). Compares the session digest to the NV
+//!      content and, on match, resets it to the authPolicy term of SEAL step 3.
+//!   5. Esys_Unseal with the session.
+//!   Failure at step 4 with TPM2_RC_VALUE (systemd EREMCHG) ⇒ the step-3 PCR
+//!   replay didn't reproduce the stored digest; at step 5 ⇒ wrong Name (usually
+//!   the missing WRITTEN bit).
+//!
+//! STATUS: implementation pending HW validation. The seal/unseal below return a
+//! clear error. The required wrapper `Context::policy_authorize_nv` is absent
+//! from released tss-esapi; a patched fork adding it exists at
+//! archledger/rust-tss-esapi @ policy-authorize-nv (branched from v7.7.0,
+//! compiles) and will be pinned via a workspace `[patch.crates-io]` in the same
+//! commit that implements seal/unseal. The super-PCR replay and Name marshalling
+//! are byte-exact-or-nothing and must be developed against a provisioned pcrlock
+//! NV index on real hardware, not blind.
 
 use crate::envelope::SealedEnvelope;
 use irlume_common::{Error, Result};

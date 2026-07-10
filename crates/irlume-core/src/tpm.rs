@@ -747,13 +747,32 @@ fn read_pcrlock_json() -> Result<PcrlockJson> {
             "cannot read {PCRLOCK_JSON}: {e} (run `systemd-pcrlock make-policy` first)"
         ))
     })?;
-    let plock: PcrlockJson = serde_json::from_slice(&raw)
+    parse_pcrlock_json(&raw)
+}
+
+/// Parse and validate a pcrlock prediction. Rejects a policy that would provide
+/// no measured-boot protection: an empty protection mask (zero PCRs) or any PCR
+/// entry with no predicted values. `systemd-pcrlock make-policy` emits an empty
+/// mask when nothing in the boot chain correlates with its components ("Set of
+/// PCRs to use for policy is empty. Generated policy will not provide any
+/// protection"); binding a secret to that is a false sense of security, so both
+/// seal (refuse to arm) and unseal (fail-safe to the password) reject it here.
+fn parse_pcrlock_json(raw: &[u8]) -> Result<PcrlockJson> {
+    let plock: PcrlockJson = serde_json::from_slice(raw)
         .map_err(|e| Error::Policy(format!("malformed {PCRLOCK_JSON}: {e}")))?;
     if plock.pcr_bank != "sha256" {
         return Err(Error::Policy(format!(
             "pcrlock bank is {:?}; only sha256 is supported",
             plock.pcr_bank
         )));
+    }
+    if plock.pcr_values.is_empty() || plock.pcr_values.iter().any(|e| e.values.is_empty()) {
+        return Err(Error::Policy(
+            "pcrlock policy covers no PCRs (empty protection mask); it would provide no \
+             measured-boot protection. Re-run `systemd-pcrlock make-policy` with a full \
+             component set, or arm a literal-PCR / signed-PCR seal instead."
+                .into(),
+        ));
     }
     Ok(plock)
 }
@@ -1085,6 +1104,22 @@ mod tests {
     }
 
     #[test]
+    fn pcrlock_json_rejects_empty_protection_mask() {
+        // A policy covering ≥1 PCR parses.
+        let good = br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":["aa"]}]}"#;
+        assert!(parse_pcrlock_json(good).is_ok());
+        // Empty protection mask (no PCRs) is refused: no measured-boot protection.
+        let empty = br#"{"pcrBank":"sha256","pcrValues":[]}"#;
+        assert!(matches!(parse_pcrlock_json(empty), Err(Error::Policy(_))));
+        // A PCR entry with no predicted values is refused (would be silently dropped).
+        let novals = br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":[]}]}"#;
+        assert!(matches!(parse_pcrlock_json(novals), Err(Error::Policy(_))));
+        // Wrong bank is refused.
+        let sha1 = br#"{"pcrBank":"sha1","pcrValues":[{"pcr":7,"values":["aa"]}]}"#;
+        assert!(matches!(parse_pcrlock_json(sha1), Err(Error::Policy(_))));
+    }
+
+    #[test]
     fn policy_pcrs_parses_env() {
         // Default when unset is PCR 7.
         std::env::remove_var("IRLUME_PCRS");
@@ -1149,5 +1184,91 @@ mod tests {
             &*got, b"durable-across-make-policy!!",
             "must survive NV rewrite"
         );
+    }
+
+    // ---- Generic fault-injection hooks (battle test) ----
+    // Seal to a file, inject a TPM fault out-of-band (tpm2_clear, pcrextend,
+    // evictcontrol, nvundefine, blob corruption), then assert unseal fails
+    // GRACEFULLY (Err, not panic/hang/segfault) so the daemon denies and PAM
+    // falls back to the password. `*_expect_ok` verifies recovery after re-arm.
+    const FAULT_SECRET: &[u8] = b"irlume-fault-injection-secret!!!";
+
+    /// Seal via the auto-selected tier (`seal`) to `$IRLUME_ENV_OUT`.
+    #[test]
+    #[ignore = "fault-injection; run as root with IRLUME_ENV_OUT set"]
+    fn fault_seal_default_to_file() {
+        let out = std::env::var("IRLUME_ENV_OUT").expect("IRLUME_ENV_OUT");
+        let env = seal(FAULT_SECRET).expect("seal");
+        std::fs::write(&out, serde_json::to_vec(&env).expect("ser")).expect("write");
+    }
+
+    /// Seal a literal `PolicyPCR` over `$IRLUME_TEST_PCRS` (default 7) to
+    /// `$IRLUME_ENV_OUT` (for the PCR-drift / firmware-update simulation).
+    #[test]
+    #[ignore = "fault-injection; run as root with IRLUME_ENV_OUT set"]
+    fn fault_seal_pcrs_to_file() {
+        let out = std::env::var("IRLUME_ENV_OUT").expect("IRLUME_ENV_OUT");
+        let pcrs: Vec<u32> = std::env::var("IRLUME_TEST_PCRS")
+            .unwrap_or_else(|_| "7".into())
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let env = seal_with_pcrs(FAULT_SECRET, &pcrs).expect("seal_with_pcrs");
+        std::fs::write(&out, serde_json::to_vec(&env).expect("ser")).expect("write");
+    }
+
+    /// Seal a Tier-2 pcrlock envelope to `$IRLUME_ENV_OUT`.
+    #[test]
+    #[ignore = "fault-injection; run as root with IRLUME_ENV_OUT set"]
+    fn fault_seal_pcrlock_to_file() {
+        let out = std::env::var("IRLUME_ENV_OUT").expect("IRLUME_ENV_OUT");
+        let raw = std::fs::read(PCRLOCK_JSON).expect("read pcrlock.json");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse");
+        let nv_index = v["nvIndex"].as_u64().expect("nvIndex") as u32;
+        let env = seal_with_pcrlock(FAULT_SECRET, nv_index).expect("seal_pcrlock");
+        std::fs::write(&out, serde_json::to_vec(&env).expect("ser")).expect("write");
+    }
+
+    /// Assert unseal of `$IRLUME_ENV_IN` fails GRACEFULLY (Err). Passing this
+    /// test after a fault = fail-safe confirmed (daemon denies -> password).
+    /// A wrongly SUCCESSFUL unseal (state should have invalidated it) is a
+    /// security failure and panics loudly.
+    #[test]
+    #[ignore = "fault-injection; run as root with IRLUME_ENV_IN set"]
+    fn fault_unseal_expect_err() {
+        let inp = std::env::var("IRLUME_ENV_IN").expect("IRLUME_ENV_IN");
+        let raw = std::fs::read(&inp).expect("read env");
+        let env: SealedEnvelope = serde_json::from_slice(&raw).expect("deser");
+        match unseal(&env) {
+            Ok(_) => {
+                panic!("SECURITY: unseal SUCCEEDED under injected fault (expected a graceful Err)")
+            }
+            Err(e) => eprintln!("GRACEFUL-ERR (fail-safe ok): {e}"),
+        }
+    }
+
+    /// Assert unseal of `$IRLUME_ENV_IN` succeeds and matches (recovery check).
+    #[test]
+    #[ignore = "fault-injection; run as root with IRLUME_ENV_IN set"]
+    fn fault_unseal_expect_ok() {
+        let inp = std::env::var("IRLUME_ENV_IN").expect("IRLUME_ENV_IN");
+        let raw = std::fs::read(&inp).expect("read env");
+        let env: SealedEnvelope = serde_json::from_slice(&raw).expect("deser");
+        let got = unseal(&env).expect("unseal should succeed after recovery");
+        assert_eq!(&*got, FAULT_SECRET, "recovered secret must match");
+    }
+
+    /// Corrupt an envelope's sealed private blob (flip bytes) and rewrite it,
+    /// so a following `fault_unseal_expect_err` exercises the load-failure path.
+    #[test]
+    #[ignore = "fault-injection; corrupts $IRLUME_ENV_IN in place"]
+    fn fault_corrupt_env_blob() {
+        let inp = std::env::var("IRLUME_ENV_IN").expect("IRLUME_ENV_IN");
+        let raw = std::fs::read(&inp).expect("read env");
+        let mut env: SealedEnvelope = serde_json::from_slice(&raw).expect("deser");
+        for b in env.private.iter_mut().take(16) {
+            *b ^= 0xff;
+        }
+        std::fs::write(&inp, serde_json::to_vec(&env).expect("ser")).expect("write");
     }
 }

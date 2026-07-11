@@ -1660,7 +1660,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi"
 version = "7.7.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=policy-authorize-nv#d8f62ce8e7972cc069c10a1e9b220fc9d4c8ebba"
+source = "git+https://github.com/archledger/rust-tss-esapi?branch=policy-authorize-nv#9a4a37d187538e8279b403590cf43ad662a9ce8e"
 dependencies = [
  "bitfield",
  "enumflags2",
@@ -1682,7 +1682,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi-sys"
 version = "0.6.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=policy-authorize-nv#d8f62ce8e7972cc069c10a1e9b220fc9d4c8ebba"
+source = "git+https://github.com/archledger/rust-tss-esapi?branch=policy-authorize-nv#9a4a37d187538e8279b403590cf43ad662a9ce8e"
 dependencies = [
  "pkg-config",
  "target-lexicon",

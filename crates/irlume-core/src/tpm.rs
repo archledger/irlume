@@ -31,15 +31,15 @@ use zeroize::Zeroizing;
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
 use tss_esapi::constants::SessionType;
 use tss_esapi::handles::{
-    AuthHandle, KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle,
-    SessionHandle, TpmHandle,
+    KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle, SessionHandle,
+    TpmHandle,
 };
 use tss_esapi::interface_types::algorithm::{
     HashingAlgorithm, PublicAlgorithm, RsaSchemeAlgorithm,
 };
 use tss_esapi::interface_types::dynamic_handles::Persistent;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
-use tss_esapi::interface_types::resource_handles::{Hierarchy, Provision};
+use tss_esapi::interface_types::resource_handles::{Hierarchy, NvAuth, Provision};
 use tss_esapi::interface_types::session_handles::{AuthSession, PolicySession};
 use tss_esapi::structures::{
     Auth, Digest, DigestList, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder,
@@ -936,7 +936,7 @@ fn pcrlock_auth_policy(ctx: &mut Context, nv: NvIndexHandle) -> Result<Digest> {
     with_session(ctx, SessionType::Trial, |ctx, session| {
         let policy = PolicySession::try_from(session).map_err(tpm_err)?;
         ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
-            ctx.policy_authorize_nv(policy, AuthHandle::Owner, nv)
+            ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
         })
         .map_err(tpm_err)?;
         ctx.policy_get_digest(policy).map_err(tpm_err)
@@ -1016,7 +1016,7 @@ fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u
                 }
 
                 ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
-                    ctx.policy_authorize_nv(policy, AuthHandle::Owner, nv)
+                    ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
                 })
                 .map_err(|e| policy_aware_err(e, env))?;
 

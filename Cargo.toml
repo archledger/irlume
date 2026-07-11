@@ -75,8 +75,9 @@ strip = true
 # of upstream's own implementation onto the 7.7.0 tag.
 #
 # Exit plan: when tss-esapi 8.0.0 releases stable with the method built in, delete
-# this fork + the [patch] and update the one call site. Upstream's signature uses
-# `auth_handle: NvAuth`; the fork currently uses `AuthHandle` (both accept the
-# owner handle we pass), so aligning to `NvAuth` here would make that swap a no-op.
+# this fork + the [patch] and switch to the crates.io release. The fork's signature
+# already matches upstream's (`auth_handle: NvAuth`), so that switch is a call-site
+# no-op; only the fork's body stays 7.7.0-flavoured (Error::from_tss_rc /
+# optional_session_1 vs 8.0's ReturnCode / required_session_1).
 [patch.crates-io]
 tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "policy-authorize-nv" }

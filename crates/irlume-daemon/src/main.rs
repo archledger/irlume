@@ -1039,7 +1039,17 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
     let outcome = match engine.authenticate(user) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}");
+            // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it
+            // is TPM-sealed to the same PCRs), so the daemon can't decrypt the face
+            // to match at all: face auth is locked until the template key is
+            // re-bound. `keyring arm` won't fix it (that only re-seals the
+            // password); the user must re-enroll or run `irlume recovery restore`.
+            let hint = if is_pcr_drift(&e) {
+                " -- a firmware/Secure Boot change locked your enrolled face; re-enroll or run `irlume recovery restore`"
+            } else {
+                ""
+            };
+            eprintln!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}{hint}");
             return Response::Error(e.to_string());
         }
     };
@@ -1074,13 +1084,28 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
         // after a Secure Boot config change). This is the line that explains a
         // face login that nonetheless leaves the keyring locked.
         Err(e) => {
+            // Here the template key unsealed (face matched) but the PASSWORD seal
+            // did not. A PCR drift on this path is fixed by re-binding the password
+            // with `irlume keyring arm` (the enrolled face still works).
+            let hint = if is_pcr_drift(&e) {
+                " -- re-run `irlume keyring arm` to re-bind the password to the current PCRs"
+            } else {
+                ""
+            };
             eprintln!(
-                "irlumed: UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}",
+                "irlumed: UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}{hint}",
                 outcome.score
             );
             Response::Error(e.to_string())
         }
     }
+}
+
+/// A PCR-drift unseal failure (Secure Boot / firmware / dbx change moved a bound
+/// PCR). [`irlume_core::tpm`] tags these by naming the changed PCRs in the error,
+/// so the daemon can print the right remedy without re-reading the TPM.
+fn is_pcr_drift(e: &irlume_common::Error) -> bool {
+    matches!(e, irlume_common::Error::Policy(m) if m.contains("PCR mismatch"))
 }
 
 fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
@@ -1102,6 +1127,24 @@ fn set_mode(path: &str, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_pcr_drift_matches_the_real_error_shape() {
+        use irlume_common::Error;
+        // The exact message tpm::policy_aware_err produces on a PCR move.
+        let drift = Error::Policy(
+            "a policy check failed (associated with session number 1): PCR mismatch: [7] changed since seal".into(),
+        );
+        assert!(is_pcr_drift(&drift));
+        // A generic policy error (e.g. no signed policy) is NOT a drift.
+        assert!(!is_pcr_drift(&Error::Policy(
+            "no signed PCR policy matches".into()
+        )));
+        // A non-policy TPM error (corrupt blob, TPM cleared) is not a drift either.
+        assert!(!is_pcr_drift(&Error::Tpm(
+            "structure is the wrong size".into()
+        )));
+    }
 
     #[test]
     fn root_and_self_authorized_others_denied() {

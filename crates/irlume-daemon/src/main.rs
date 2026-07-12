@@ -301,6 +301,7 @@ fn request_user(req: &Request) -> Option<&str> {
         | UnsealPassword { user, .. }
         | UnsealKeyring { user, .. }
         | HasSealedPassword { user }
+        | KeyringInfo { user }
         | ForgetPassword { user }
         | ResealPassword { user, .. }
         | RecoveryStatus { user }
@@ -686,6 +687,34 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 return Response::Error(format!("not authorized to query '{user}'"));
             }
             Response::HasPassword(irlume_core::keyring::has_sealed_password(&user))
+        }
+        Request::KeyringInfo { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to query '{user}'"));
+            }
+            let armed = irlume_core::keyring::has_sealed_password(&user);
+            let path = irlume_core::keyring::envelope_path(&user);
+            match irlume_core::envelope::SealedEnvelope::load(&path) {
+                Ok(env) => Response::KeyringInfo {
+                    armed,
+                    policy: Some(env.policy.describe()),
+                    pcrs: env.pcrs.clone(),
+                    // None when the envelope carries no PCR snapshot or the
+                    // replay failed; the CLI then just omits the drift note.
+                    drifted: irlume_core::tpm::diagnose_pcrs(&env)
+                        .ok()
+                        .filter(|_| !env.pcr_values.is_empty())
+                        .map(|d| !d.is_empty()),
+                },
+                // Not armed, or the envelope is unreadable/corrupt: report the
+                // armed bit alone rather than failing the whole query.
+                Err(_) => Response::KeyringInfo {
+                    armed,
+                    policy: None,
+                    pcrs: Vec::new(),
+                    drifted: None,
+                },
+            }
         }
         Request::ForgetPassword { user } => {
             if !authorized_for(peer, &user) {

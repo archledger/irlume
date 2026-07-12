@@ -218,6 +218,11 @@ struct App {
     eyes_open: bool,
     challenge: bool,
     keyring_armed: Option<bool>,
+    /// Seal-tier label from `KeyringInfo` (e.g. "pcrlock NV 0x… (Tier 2)");
+    /// `None` when not armed or the daemon predates the request.
+    keyring_policy: Option<String>,
+    /// Whether the bound PCRs drifted since sealing (`KeyringInfo`).
+    keyring_drift: Option<bool>,
     nodes: Vec<(String, irlume_camera::Role)>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
@@ -310,6 +315,8 @@ impl App {
             eyes_open: false,
             challenge: false,
             keyring_armed: None,
+            keyring_policy: None,
+            keyring_drift: None,
             nodes: irlume_camera::discover_nodes(),
             activity: Vec::new(),
             input: None,
@@ -470,12 +477,32 @@ impl App {
             Ok(Response::Error(e)) => self.enroll_error = Some(e),
             _ => {}
         }
-        self.keyring_armed = match crate::daemon_request(&Request::HasSealedPassword {
+        // KeyringInfo adds the seal tier and PCR drift; an older daemon
+        // answers it with an error, so fall back to the plain armed bit.
+        match crate::daemon_request(&Request::KeyringInfo {
             user: self.user.clone(),
         }) {
-            Ok(Response::HasPassword(b)) => Some(b),
-            _ => self.keyring_armed,
-        };
+            Ok(Response::KeyringInfo {
+                armed,
+                policy,
+                drifted,
+                ..
+            }) => {
+                self.keyring_armed = Some(armed);
+                self.keyring_policy = policy;
+                self.keyring_drift = drifted;
+            }
+            _ => {
+                self.keyring_armed = match crate::daemon_request(&Request::HasSealedPassword {
+                    user: self.user.clone(),
+                }) {
+                    Ok(Response::HasPassword(b)) => Some(b),
+                    _ => self.keyring_armed,
+                };
+                self.keyring_policy = None;
+                self.keyring_drift = None;
+            }
+        }
         if let Ok(Response::RecoveryStatus {
             encrypted,
             recovery_set,
@@ -1365,6 +1392,23 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // Activity history scroll works in every state except text entry:
+        // mid-enroll and mid-op, when lines stream fastest, is exactly when
+        // the user wants to read back. Handled before the state gates below
+        // so those can't swallow it.
+        if self.input.is_none() {
+            match code {
+                KeyCode::PageUp => {
+                    self.act_scroll = (self.act_scroll + 3).min(self.act_max());
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.act_scroll = self.act_scroll.saturating_sub(3);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Guided enroll: only Esc (cancel).
         if let Some(e) = &self.enroll {
             if matches!(code, KeyCode::Esc) {
@@ -1433,9 +1477,8 @@ impl App {
             KeyCode::BackTab | KeyCode::Left => self.step(-1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
-            // Activity panel history scroll (auto-follows newest when at bottom).
-            KeyCode::PageUp => self.act_scroll = (self.act_scroll + 3).min(self.act_max()),
-            KeyCode::PageDown => self.act_scroll = self.act_scroll.saturating_sub(3),
+            // Activity jump-to-oldest/newest (PgUp/PgDn are handled at the top
+            // of on_key so they also work mid-op and mid-enroll).
             KeyCode::Home => self.act_scroll = self.act_max(),
             KeyCode::End => self.act_scroll = 0,
             _ => self.on_action(code),
@@ -1490,15 +1533,21 @@ impl App {
                 self.refresh();
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
-            // The quick launchers only make sense where their screens exist: on a
-            // camera-less box Profiles/Identify are hidden, so explain instead of
-            // jumping into an enrollment that cannot work.
-            (SC_WELCOME, KeyCode::Char('e')) if self.visible.contains(&SC_PROFILES) => {
+            // Gate on the CAMERA, not tab visibility: Identify is an
+            // advanced-view tab, so a visibility gate made [i] a silent
+            // no-op (then claim "no camera") in the default essential view
+            // on a camera-equipped machine.
+            (SC_WELCOME, KeyCode::Char('e')) if self.caps.rgb => {
                 self.screen = SC_PROFILES;
                 self.begin_enroll();
             }
-            (SC_WELCOME, KeyCode::Char('i')) if self.visible.contains(&SC_IDENTIFY) => {
-                self.screen = SC_IDENTIFY;
+            (SC_WELCOME, KeyCode::Char('i')) if self.caps.rgb => {
+                // Only jump to the Identify tab where it exists (advanced
+                // view); in essential view stay put and let the result land
+                // in Activity.
+                if self.visible.contains(&SC_IDENTIFY) {
+                    self.screen = SC_IDENTIFY;
+                }
                 self.start_async(
                     "Identify (1:N)",
                     OpTag::Identify,
@@ -2490,6 +2539,24 @@ impl App {
         let mut lines = vec![
             section("TPM keyring unlock"),
             Line::from(vec![Span::raw("  state    "), status]),
+        ];
+        if self.keyring_drift == Some(true) {
+            lines.push(Line::from(vec![
+                Span::raw("  PCRs     "),
+                Span::styled(
+                    "drifted since sealing; re-arm to rebind",
+                    Style::new().fg(WARN),
+                ),
+            ]));
+        }
+        // Show the envelope's actual policy tier when the daemon reports it;
+        // the static text is the pre-KeyringInfo default (and what a fresh
+        // arm lands on when neither Tier 1 nor Tier 2 exists on this box).
+        let binding = self
+            .keyring_policy
+            .clone()
+            .unwrap_or_else(|| "PCR-7 (Secure Boot state)".to_string());
+        lines.extend([
             Line::from(vec![
                 Span::raw("  TPM      "),
                 if tpm {
@@ -2500,10 +2567,10 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  binding  "),
-                Span::styled("PCR-7 (Secure Boot state)", Style::new().dim()),
+                Span::styled(binding, Style::new().dim()),
             ]),
             Line::raw(""),
-        ];
+        ]);
         // The unlock trigger depends on this box's hardware.
         if self.caps.ir_pair {
             lines.push(Line::from(Span::styled(
@@ -2526,14 +2593,29 @@ impl App {
         }
         lines.push(Line::raw(""));
         if armed {
-            lines.push(Line::from(Span::styled(
-                "  ⚠ if a firmware/dbx update moves PCR-7, unseal fails → use the",
-                Style::new().fg(WARN),
-            )));
-            lines.push(Line::from(Span::styled(
-                "    Repair tab or `irlume reseal` to re-bind to current PCRs.",
-                Style::new().dim(),
-            )));
+            let tier2 = self
+                .keyring_policy
+                .as_deref()
+                .is_some_and(|p| p.contains("Tier 2"));
+            if tier2 {
+                lines.push(Line::from(Span::styled(
+                    "  after a firmware/Secure Boot update, re-run `systemd-pcrlock",
+                    Style::new().dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  make-policy` as root; the seal keeps working with no re-arm.",
+                    Style::new().dim(),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  ⚠ if a firmware/dbx update moves the bound PCRs, unseal fails →",
+                    Style::new().fg(WARN),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    use the Repair tab or `irlume reseal` to re-bind to current PCRs.",
+                    Style::new().dim(),
+                )));
+            }
         } else {
             let how = if self.caps.ir_pair {
                 "face"

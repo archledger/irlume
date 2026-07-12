@@ -49,6 +49,18 @@ pub enum PolicyKind {
     PcrlockNv { nv_index: u32 },
 }
 
+impl PolicyKind {
+    /// Human-readable tier label, shared by `irlume diag`, `status`, and the
+    /// TUI so every surface names the tiers the same way.
+    pub fn describe(&self) -> String {
+        match self {
+            PolicyKind::PcrLiteral => "literal PolicyPCR (Tier 3)".to_string(),
+            PolicyKind::Authorized { .. } => "signed PolicyAuthorize (Tier 1)".to_string(),
+            PolicyKind::PcrlockNv { nv_index } => format!("pcrlock NV 0x{nv_index:x} (Tier 2)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PcrValue {
     pub pcr: u32,

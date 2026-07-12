@@ -2,19 +2,18 @@
 //!
 //! We seal a secret (the user's login password, used to unlock the
 //! GNOME-keyring / KWallet after a face login) into the TPM under a
-//! `PolicyPCR` over PCR 7 (the UEFI Secure Boot state). The TPM releases it only
-//! while the machine boots in the same Secure Boot configuration it was sealed
-//! under; `irlumed` then asks for it only after a successful live+match. This
-//! mirrors Windows Hello's TPM-bound credential model and gives revocability:
-//! re-seal under a fresh secret to revoke.
+//! measured-boot policy. The TPM releases it only while the machine boots in a
+//! state the policy accepts; `irlumed` then asks for it only after a
+//! successful live+match. This mirrors Windows Hello's TPM-bound credential
+//! model and gives revocability: re-seal under a fresh secret to revoke.
 //!
-//! Ported from linhello's literal-PolicyPCR path (the proven, self-contained
-//! half of its TPM core). linhello additionally supports a signed
-//! `PolicyAuthorize` policy that survives kernel updates without a re-seal; that
-//! is deliberately NOT ported here yet. PCR 7 is stable across kernel updates
-//! (it only moves on Secure Boot key / dbx changes), so a literal PCR-7 seal is
-//! reliable for day-to-day use; a Secure Boot config change requires a re-seal
-//! (the daemon falls back to the password and the user re-arms keyring unlock).
+//! [`seal`] picks the strongest policy the machine supports (the tier ladder):
+//! a signed `PolicyAuthorize` over systemd's PCR signature (Tier 1, survives
+//! kernel updates), `PolicyAuthorizeNV` against a provisioned systemd-pcrlock
+//! NV index (Tier 2, survives firmware / Secure Boot updates once the admin
+//! re-runs `make-policy`), or a literal `PolicyPCR` over PCR 7 (Tier 3, the
+//! universal fallback; a Secure Boot config change requires a re-arm, and the
+//! daemon falls back to the typed password until then).
 //!
 //! Every transient handle (SRK, loaded sealed object, trial/policy session) is
 //! flushed on both success and error paths via the scope helpers below. TPMs
@@ -355,17 +354,24 @@ fn with_srk<T>(
     result
 }
 
-/// Seal `secret` under the best policy available on this machine:
+/// Seal `secret` under the best policy available on this machine, trying each
+/// tier in order and round-trip-verifying before trusting it:
 ///   * Tier 1: if systemd has published signed-PCR artifacts (UKI / systemd-boot),
 ///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
 ///     (typically PCR 11). Survives kernel updates with no reseal.
+///   * Tier 2: if a systemd-pcrlock policy is provisioned
+///     ([`pcrlock_provisioned`]), a `PolicyAuthorizeNV` against its NV index.
+///     `make-policy` re-predicts the index across firmware / Secure Boot
+///     updates, so those don't require a reseal either. Explicit sealing at
+///     this tier is also available via [`seal_with_pcrlock`].
 ///   * Tier 3: otherwise a literal `PolicyPCR` over the configured PCRs
 ///     ([`policy_pcrs`], default PCR 7). If those PCRs move (dbx/Secure Boot
 ///     update) the envelope stops unsealing and the user re-runs `keyring arm`.
 ///
-/// (Tier 2, pcrlock `PolicyAuthorizeNV`, is selected explicitly via
-/// [`seal_pcrlock`] when a pcrlock policy has been provisioned; it is not
-/// auto-chosen here because it requires admin setup.)
+/// Every producer funnels through here (keyring arm, the template key, both
+/// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
+/// up a tier when one became available, and only lands on a lower tier when
+/// the higher one genuinely does not unseal on this machine.
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
         match seal_authorized(secret) {
@@ -389,6 +395,25 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
             },
             Err(e) => eprintln!(
                 "irlume: signed-PCR seal unavailable ({e}); falling back to literal PCR seal"
+            ),
+        }
+    }
+    if let Some(nv_index) = pcrlock_provisioned() {
+        // Same trap as Tier 1: a pcrlock seal can succeed yet not unseal on
+        // this boot (e.g. the policy predicts a PCR this OS never extends, so
+        // the super-PCR replay fails). Only trust it after a round-trip.
+        match seal_pcrlock(secret, nv_index) {
+            Ok(env) => match unseal(&env) {
+                Ok(rt) if rt.as_slice() == secret => return Ok(env),
+                Ok(_) => eprintln!(
+                    "irlume: pcrlock seal round-trip mismatch; falling back to literal PCR seal"
+                ),
+                Err(e) => eprintln!(
+                    "irlume: pcrlock seal doesn't unseal on this boot ({e}); falling back to literal PCR seal"
+                ),
+            },
+            Err(e) => eprintln!(
+                "irlume: pcrlock seal unavailable ({e}); falling back to literal PCR seal"
             ),
         }
     }
@@ -732,6 +757,10 @@ struct PcrlockJson {
     pcr_bank: String,
     #[serde(rename = "pcrValues")]
     pcr_values: Vec<PcrlockEntry>,
+    /// The self-referential policy NV index, absent when `make-policy` ran
+    /// without allocating one (e.g. `--recovery-pin=yes` setups).
+    #[serde(rename = "nvIndex", default)]
+    nv_index: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1038,6 +1067,15 @@ pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope>
     seal_pcrlock(secret, nv_index)
 }
 
+/// The NV index of a usable systemd-pcrlock policy, or `None` when this
+/// machine has none: `pcrlock.json` absent (the common case), unparseable,
+/// rejected by the empty-policy guard, or carrying no NV index. [`seal`] uses
+/// this to decide whether the Tier 2 rung exists on this machine.
+pub fn pcrlock_provisioned() -> Option<u32> {
+    let plock = read_pcrlock_json().ok()?;
+    u32::try_from(plock.nv_index?).ok()
+}
+
 /// If the TSS error looks like a policy mismatch, enrich it with the list of
 /// PCRs that have changed since seal time.
 fn policy_aware_err<E: std::fmt::Display>(e: E, env: &SealedEnvelope) -> Error {
@@ -1120,6 +1158,21 @@ mod tests {
     }
 
     #[test]
+    fn pcrlock_json_nv_index_is_optional() {
+        // With an NV index (the make-policy default): parsed and exposed.
+        let with_nv =
+            br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":["aa"]}],"nvIndex":26196898}"#;
+        assert_eq!(
+            parse_pcrlock_json(with_nv).expect("parse").nv_index,
+            Some(26_196_898)
+        );
+        // Without one (recovery-pin setups): still a valid prediction, but no
+        // Tier 2 rung.
+        let without = br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":["aa"]}]}"#;
+        assert_eq!(parse_pcrlock_json(without).expect("parse").nv_index, None);
+    }
+
+    #[test]
     fn policy_pcrs_parses_env() {
         // Default when unset is PCR 7.
         std::env::remove_var("IRLUME_PCRS");
@@ -1143,9 +1196,7 @@ mod tests {
     #[test]
     #[ignore = "requires real TPM + provisioned systemd-pcrlock policy; run as root"]
     fn seal_unseal_pcrlock_roundtrip_real_tpm() {
-        let raw = std::fs::read(PCRLOCK_JSON).expect("read pcrlock.json");
-        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse pcrlock.json");
-        let nv_index = v["nvIndex"].as_u64().expect("nvIndex") as u32;
+        let nv_index = pcrlock_provisioned().expect("provisioned pcrlock policy with an NV index");
 
         let secret = b"irlume-pcrlock-roundtrip-secret!";
         let env = seal_with_pcrlock(secret, nv_index).expect("seal_pcrlock");
@@ -1157,6 +1208,61 @@ mod tests {
         assert_eq!(&*got, secret, "pcrlock round-trip must match");
     }
 
+    /// The auto-tier ladder in [`seal`] on real hardware: whatever tier it
+    /// lands on must round-trip. When the pcrlock rung is genuinely usable
+    /// (provisioned AND a direct pcrlock seal round-trips) and no signed
+    /// policy outranks it, the ladder must land on Tier 2. When pcrlock is
+    /// provisioned but broken (e.g. Pop!_OS predicts a PCR 15 the OS never
+    /// extends, so the policy can never be satisfied), the ladder must NOT
+    /// land there; falling through to the literal seal is the correct result.
+    #[test]
+    #[ignore = "requires real TPM + provisioned systemd-pcrlock policy; run as root"]
+    fn seal_ladder_lands_on_pcrlock_real_tpm() {
+        let nv_index = pcrlock_provisioned()
+            .expect("test needs a provisioned pcrlock policy with an NV index");
+        let secret = b"irlume-auto-ladder-roundtrip-ok!";
+
+        let pcrlock_usable = seal_with_pcrlock(secret, nv_index)
+            .ok()
+            .and_then(|e| unseal(&e).ok())
+            .is_some_and(|rt| rt.as_slice() == secret);
+
+        let env = seal(secret).expect("seal");
+        let got = unseal(&env).expect("unseal");
+        assert_eq!(&*got, secret, "ladder round-trip must match");
+
+        let landed_pcrlock = matches!(env.policy, PolicyKind::PcrlockNv { .. });
+        if pcrlock_usable && !crate::pcrsig::signed_policy_available() {
+            assert!(
+                landed_pcrlock,
+                "usable pcrlock + no signed policy: seal() must pick Tier 2, got {:?}",
+                env.policy
+            );
+        }
+        if !pcrlock_usable {
+            assert!(
+                !landed_pcrlock,
+                "seal() must not land on a pcrlock policy that cannot unseal here"
+            );
+        }
+    }
+
+    /// Upgrade-path check, run on a box that armed its envelope with an OLDER
+    /// irlume build: the current build must load and unseal it unchanged.
+    /// Gated on `IRLUME_UPGRADE_CHECK_USER` naming the user whose envelope to
+    /// test; needs root (the envelope is 0600 root) and the same TPM/boot
+    /// state the envelope was sealed under.
+    #[test]
+    #[ignore = "upgrade check; run as root with IRLUME_UPGRADE_CHECK_USER set"]
+    fn unseal_preexisting_user_envelope() {
+        let user = std::env::var("IRLUME_UPGRADE_CHECK_USER").expect("IRLUME_UPGRADE_CHECK_USER");
+        let secret = crate::keyring::unseal_password(&user).expect("old envelope must unseal");
+        assert!(
+            !secret.is_empty(),
+            "unsealed password must not be empty for '{user}'"
+        );
+    }
+
     /// Durability phase 1: seal a pcrlock envelope and persist it to
     /// `$IRLUME_PCRLOCK_ENV_OUT`. Paired with the phase-2 test across a
     /// `systemd-pcrlock make-policy` NV rewrite to prove no reseal is needed.
@@ -1164,9 +1270,7 @@ mod tests {
     #[ignore = "durability phase 1; run as root with IRLUME_PCRLOCK_ENV_OUT set"]
     fn pcrlock_seal_to_file() {
         let out = std::env::var("IRLUME_PCRLOCK_ENV_OUT").expect("IRLUME_PCRLOCK_ENV_OUT");
-        let raw = std::fs::read(PCRLOCK_JSON).expect("read pcrlock.json");
-        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse");
-        let nv_index = v["nvIndex"].as_u64().expect("nvIndex") as u32;
+        let nv_index = pcrlock_provisioned().expect("provisioned pcrlock policy with an NV index");
         let env = seal_with_pcrlock(b"durable-across-make-policy!!", nv_index).expect("seal");
         std::fs::write(&out, serde_json::to_vec(&env).expect("ser")).expect("write env");
     }
@@ -1222,9 +1326,7 @@ mod tests {
     #[ignore = "fault-injection; run as root with IRLUME_ENV_OUT set"]
     fn fault_seal_pcrlock_to_file() {
         let out = std::env::var("IRLUME_ENV_OUT").expect("IRLUME_ENV_OUT");
-        let raw = std::fs::read(PCRLOCK_JSON).expect("read pcrlock.json");
-        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse");
-        let nv_index = v["nvIndex"].as_u64().expect("nvIndex") as u32;
+        let nv_index = pcrlock_provisioned().expect("provisioned pcrlock policy with an NV index");
         let env = seal_with_pcrlock(FAULT_SECRET, nv_index).expect("seal_pcrlock");
         std::fs::write(&out, serde_json::to_vec(&env).expect("ser")).expect("write");
     }

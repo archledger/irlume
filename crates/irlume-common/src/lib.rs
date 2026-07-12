@@ -187,6 +187,14 @@ pub enum Request {
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.
     HasSealedPassword { user: String },
+    /// Describe `user`'s sealed-password envelope: whether one is armed and,
+    /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer
+    /// sibling of `HasSealedPassword` for status surfaces (the envelope file
+    /// is root-only, so the CLI and TUI ask the daemon instead of reading it).
+    /// Callers must fall back to `HasSealedPassword` on an error reply: a
+    /// daemon from before this request answers with a parse error.
+    /// Unprivileged: root or `user`.
+    KeyringInfo { user: String },
     /// Erase `user`'s sealed password (disarms keyring unlock). PRIVILEGED:
     /// root or `user`.
     ForgetPassword { user: String },
@@ -328,6 +336,18 @@ pub enum Response {
     },
     /// Whether a sealed password exists (`HasSealedPassword`).
     HasPassword(bool),
+    /// Envelope detail (`KeyringInfo`). `policy` is `None` and `pcrs` empty
+    /// when nothing is armed (or the envelope is unreadable); `drifted` is
+    /// `None` when there is nothing to compare or the PCR replay failed.
+    KeyringInfo {
+        armed: bool,
+        #[serde(default)]
+        policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pcrs: Vec<u32>,
+        #[serde(default)]
+        drifted: Option<bool>,
+    },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
     /// Outcome of a `ResealPassword`. `changed` is true when the envelope was

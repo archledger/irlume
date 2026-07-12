@@ -605,16 +605,36 @@ pub fn status(args: &[String]) -> ExitCode {
     }
 
     // Keyring (TPM-sealed login password) + template encryption / recovery.
-    match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
-        Ok(Response::HasPassword(armed)) => println!(
-            "  keyring unlock: {}",
-            if armed {
-                format!("armed {OK}")
-            } else {
-                "not armed (run `irlume keyring arm`)".into()
-            }
-        ),
-        _ => println!("  keyring unlock: unknown"),
+    // KeyringInfo adds the seal tier and drift; an older daemon answers it
+    // with an error, so fall back to the plain armed bit.
+    match daemon_request(&Request::KeyringInfo { user: user.clone() }) {
+        Ok(Response::KeyringInfo {
+            armed: true,
+            policy,
+            drifted,
+            ..
+        }) => {
+            let tier = policy.map(|p| format!(", {p}")).unwrap_or_default();
+            let drift = match drifted {
+                Some(true) => format!(" PCR DRIFT {WARN} (re-run `irlume keyring arm`)"),
+                _ => String::new(),
+            };
+            println!("  keyring unlock: armed {OK}{tier}{drift}");
+        }
+        Ok(Response::KeyringInfo { armed: false, .. }) => {
+            println!("  keyring unlock: not armed (run `irlume keyring arm`)");
+        }
+        _ => match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
+            Ok(Response::HasPassword(armed)) => println!(
+                "  keyring unlock: {}",
+                if armed {
+                    format!("armed {OK}")
+                } else {
+                    "not armed (run `irlume keyring arm`)".into()
+                }
+            ),
+            _ => println!("  keyring unlock: unknown"),
+        },
     }
     if let Ok(Response::RecoveryStatus {
         encrypted,
@@ -783,27 +803,25 @@ pub fn diag(args: &[String]) -> ExitCode {
     println!(
         "  signed policy : {}",
         if irlume_core::pcrsig::signed_policy_available() {
-            "PCR-11 signature present (kernel updates won't need re-seal)"
+            "PCR-11 signature present (Tier 1: kernel updates won't need re-seal)"
         } else {
-            "none; literal PCR-7 seal (re-arm/restore after firmware updates)"
+            "none (no Tier 1 on this boot chain)"
         }
     );
+    match irlume_core::tpm::pcrlock_provisioned() {
+        Some(nv) => println!(
+            "  pcrlock       : provisioned, NV 0x{nv:x} (Tier 2 candidate: an arm uses it only if it unseals on this boot, else falls back to literal PCR 7)"
+        ),
+        None => println!(
+            "  pcrlock       : not provisioned (optional; `systemd-pcrlock make-policy` enables Tier 2, else seals use literal PCR 7)"
+        ),
+    }
 
     // Keyring envelope: policy kind, bound PCRs, drift (root + TPM only).
     let path = irlume_core::keyring::envelope_path(&user);
     match irlume_core::envelope::SealedEnvelope::load(&path) {
         Ok(env) => {
-            let kind = match &env.policy {
-                irlume_core::envelope::PolicyKind::PcrLiteral => {
-                    "literal PolicyPCR (Tier 3)".to_string()
-                }
-                irlume_core::envelope::PolicyKind::Authorized { .. } => {
-                    "signed PolicyAuthorize (Tier 1)".to_string()
-                }
-                irlume_core::envelope::PolicyKind::PcrlockNv { nv_index } => {
-                    format!("pcrlock NV 0x{nv_index:x} (Tier 2)")
-                }
-            };
+            let kind = env.policy.describe();
             println!("  seal envelope : {} {OK}", path.display());
             println!("  seal policy   : {kind}, bound PCRs {:?}", env.pcrs);
             match irlume_core::tpm::diagnose_pcrs(&env) {

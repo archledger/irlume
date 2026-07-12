@@ -101,8 +101,16 @@ Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/20
 ## Storage
 
 Seal a random release secret (or the login password) in the **TPM**, gated by
-**PCR policy**; release only on a successful live+match. Never store a
-recoverable face image; decrypted template plaintext and keys are zeroized.
+**PCR policy**; release only on a successful live+match. Sealing picks the
+strongest policy the machine supports: a signed `PolicyAuthorize` over
+systemd's PCR-11 signature where a UKI publishes one (Tier 1; kernel updates
+need no re-seal), `PolicyAuthorizeNV` against a provisioned systemd-pcrlock NV
+index (Tier 2; after a firmware or Secure Boot update the admin re-runs
+`systemd-pcrlock make-policy` and the seal keeps working), or a literal
+`PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change requires a re-arm). Each
+candidate is round-trip verified at seal time, so a policy that cannot unseal
+on the current boot never holds the secret. Never store a recoverable face
+image; decrypted template plaintext and keys are zeroized.
 
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
 releases the sealed login password on *root peer + login-service-class*, without

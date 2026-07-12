@@ -10,6 +10,13 @@
 //! index; no reseal of our object required. This is the GRUB2 answer to PCR 7
 //! drift that the signed-UKI path (Tier 1) can't cover.
 //!
+//! Attribution: the seal/unseal scheme (the authPolicy construction, the
+//! WRITTEN-bit NV Name, the super-PCR replay with `PolicyOR` branches, and the
+//! owner-auth `PolicyAuthorizeNV` call) follows what systemd implements in
+//! `src/shared/tpm2-util.c` and `src/pcrlock/pcrlock.c` (LGPL-2.1-or-later);
+//! the Rust implementation in `tpm.rs` was written against that reference and
+//! validated byte-for-byte against a live index with tpm2-tools.
+//!
 //! Implementation path (scoped 2026-07-09 against tss-esapi 7.7.0 + systemd 259):
 //!
 //! 1. `TPM2_PolicyAuthorizeNV` has NO safe wrapper in tss-esapi (7.7.0, the

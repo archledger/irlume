@@ -529,7 +529,16 @@ pub(crate) fn user_arg(args: &[String]) -> String {
     flag(args, "--user")
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()))
+        .unwrap_or_else(|| {
+            // Under `sudo irlume …` (which status/diag themselves recommend
+            // for envelope detail) $USER is root, but the person almost
+            // always means their own profile: prefer the invoking user.
+            std::env::var("SUDO_USER")
+                .ok()
+                .filter(|s| !s.is_empty() && unsafe { libc::geteuid() } == 0)
+                .or_else(|| std::env::var("USER").ok())
+                .unwrap_or_else(|| "user".into())
+        })
 }
 
 /// Build an Engine: optional --rgb/--ir device overrides, and auto-load the IR
@@ -1839,7 +1848,19 @@ fn doctor() -> std::process::ExitCode {
         if irlume_core::pcrsig::signed_policy_available() {
             "systemd PCR-11 signature present ✓; kernel updates won't need re-seal"
         } else {
-            "none: relies on PCR-7 literal seal + recovery passphrase (re-arm/restore after firmware updates)"
+            "none (no Tier 1 on this boot chain)"
+        }
+    );
+    println!(
+        "[doctor] pcrlock: {}",
+        match irlume_core::tpm::pcrlock_provisioned() {
+            Some(nv) => format!(
+                "provisioned, NV 0x{nv:x}; an arm binds to it if it unseals on this boot (Tier 2)"
+            ),
+            None => "not provisioned: seals use the literal PCR-7 policy + recovery passphrase \
+                     (re-arm/restore after firmware updates); `systemd-pcrlock make-policy` \
+                     enables Tier 2"
+                .to_string(),
         }
     );
 

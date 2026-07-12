@@ -3,6 +3,46 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Tier 2 TPM sealing via systemd-pcrlock.** On a machine where the admin has
+  run `systemd-pcrlock make-policy`, new seals bind to the pcrlock NV index
+  (`TPM2_PolicyAuthorizeNV`). A firmware or Secure Boot update then needs one
+  `make-policy` re-run instead of a re-arm, and the sealed password keeps
+  releasing. Sealing tries Tier 1 (signed PCR policy), then Tier 2, then the
+  literal PCR-7 seal, and round-trip-verifies each candidate before trusting
+  it, so a policy that cannot unseal on the current boot never holds the
+  secret. Existing envelopes are untouched until the next arm or reseal.
+- `irlume status` and the TUI keyring panel now name the seal tier and warn
+  when the bound PCRs have drifted since sealing. This uses a new daemon
+  `KeyringInfo` request; against an older daemon both surfaces fall back to
+  the previous armed yes/no display.
+- `irlume diag` reports whether a pcrlock policy is provisioned and which NV
+  index new seals would bind to.
+- The daemon log names the exact remedy when a PCR drift locks face
+  authentication (re-arm for a literal seal, `make-policy` for pcrlock).
+- TPM fault-injection test hooks and ignored real-hardware tests covering
+  pcrlock seal/unseal, drift, and the seal-tier ladder.
+
+### Changed
+
+- The `tss-esapi` dependency builds from the `irlume-patches` branch of our
+  fork: tss-esapi 7.7.0 plus the `PolicyAuthorizeNV` wrapper (upstream merged
+  it in 2024 but never shipped it in a 7.x release) and upstream PR #530's
+  session-handle leak fix. `Cargo.lock` pins the exact commit.
+- IR ambient subtraction (opt-in via `IRLUME_IR_AMBIENT_SUBTRACT=1`) now runs
+  only against a genuine strobe pair: the lit frame must average at least 20
+  brightness levels above its emitter-off neighbor, and a near-black off-frame
+  (mean below 5) is skipped rather than subtracted, since subtracting it only
+  injected sensor noise.
+
+### Fixed
+
+- A pcrlock policy that covers zero PCRs is refused at seal and unseal time;
+  binding a secret to it would give no measured-boot protection.
+
 ## [0.1.4] - 2026-07-07
 
 A distribution and self-update release: face authentication itself is

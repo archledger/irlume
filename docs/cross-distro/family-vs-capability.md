@@ -50,9 +50,15 @@ The *only* box with signed artifacts is the Arch one, the opposite of the
 "Fedora/UKI has them" intuition. A family rule would misfire in every
 direction. So irlume seals via the signed path only if the sealed envelope
 **actually round-trips** (`tpm::seal` test-unseals before trusting it), else
-falls back to literal PCR-7. This is correct on every machine regardless of
-family or boot loader (fix committed `e1e7cf1`; caught the archhost enrollment
-failure live).
+falls back. This is correct on every machine regardless of family or boot
+loader (fix committed `e1e7cf1`; caught the archhost enrollment failure live).
+
+The same round-trip rule later gained a middle rung: when the admin has run
+`systemd-pcrlock make-policy`, `tpm::seal` tries the pcrlock NV policy (Tier 2)
+after the signed path and before the literal PCR-7 seal, again trusting it
+only if it round-trips. The Pop!_OS box is the cautionary tale that makes the
+round-trip mandatory there too: its `make-policy` predicts a PCR 15 value the
+OS never extends, so a pcrlock seal succeeds but can never unseal.
 
 ## What to add (packaging phase)
 

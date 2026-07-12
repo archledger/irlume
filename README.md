@@ -65,13 +65,32 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 
 ## 📦 Install
 
-> **v0.1.4.** Works end-to-end on real hardware across all three families. Not
+> **v0.1.5.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass); see [Honest limitations](#️-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM; the distros below are
 packaged and tested. A **TPM 2.0** is strongly recommended (encrypted templates,
 keyring unlock) but not required. Any camera works; it just sets your tier:
 **IR camera** → secure login · **RGB webcam** → screen unlock · **fingerprint** → companion.
+
+### One-step install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/install.sh | sh
+```
+
+Detects your distro and installs from the **signed Copr repo** (Fedora) or
+**PPA** (Ubuntu LTS), or a **checksum-verified** release package (Arch, Debian,
+Ubuntu derivatives). It installs a package only and wires nothing into your
+login, and it stops without changing anything if irlume is already installed
+(use `irlume update` to upgrade). Prefer to read it before running it?
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/install.sh -o install.sh
+less install.sh && sh install.sh
+```
+
+Or install manually with your package manager:
 
 <table>
 <tr><th>Fedora</th><th>Ubuntu</th><th>Arch</th><th>Debian</th></tr>

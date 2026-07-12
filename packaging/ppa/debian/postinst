@@ -4,8 +4,10 @@ set -e
 case "$1" in
     configure)
         # Load the AppArmor profile (enforces, soak-validated - see the profile
-        # header). Runs before #DEBHELPER# starts/restarts the unit, so the
-        # daemon is confined at exec time on both fresh install and upgrade.
+        # header). Runs before the debhelper-inserted section starts or restarts
+        # the unit, so the daemon is confined at exec time on both fresh install
+        # and upgrade. (Do not write the debhelper token inside this comment: it
+        # is substituted at build time and would split the comment.)
         if command -v apparmor_parser >/dev/null 2>&1; then
             apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>/dev/null || true
         fi

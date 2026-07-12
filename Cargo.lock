@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-auth"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irlume-camera",
  "irlume-common",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-camera"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irlume-common",
  "libc",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "image",
  "irlume-auth",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-common"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "serde",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-daemon"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irlume-auth",
  "irlume-common",
@@ -647,11 +647,11 @@ dependencies = [
 
 [[package]]
 name = "irlume-fingerprint"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "irlume-liveness"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irlume-camera",
  "irlume-common",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-pam"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irlume-common",
  "pamsm",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-vision"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irlume-camera",
  "irlume-common",

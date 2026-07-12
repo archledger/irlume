@@ -3,7 +3,7 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.5] - 2026-07-12
 
 ### Added
 

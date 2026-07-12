@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.1.4
+Version:        0.1.5
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -134,6 +134,19 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sat Jul 12 2026 archledger <archledger236@gmail.com> - 0.1.5-1
+- Tier 2 TPM sealing via systemd-pcrlock: on a pcrlock-provisioned machine new
+  seals bind to the pcrlock NV index, so a firmware/Secure Boot update needs one
+  `make-policy` re-run instead of a re-arm. Sealing tries signed, then pcrlock,
+  then the literal PCR-7 policy, round-trip-verifying each; existing envelopes
+  are untouched until the next arm/reseal.
+- `status`, `diag`, and the TUI name the seal tier and warn on PCR drift.
+- TUI fix: Activity history scroll (PgUp/PgDn) now works mid-operation and
+  mid-enrollment; the Welcome [i] identify key works in the default view.
+- tss-esapi builds from the archledger fork (7.7.0 + PolicyAuthorizeNV wrapper +
+  upstream PR #530 session-leak fix), pinned to an exact commit.
+- Opt-in IR ambient subtraction gate reworked against a real sunlight dataset.
+
 * Tue Jul 07 2026 archledger <archledger236@gmail.com> - 0.1.4-1
 - Distribution/maintenance release (face auth unchanged): `irlume update` now
   adapts to distro, install channel, and CPU arch, and reports the real

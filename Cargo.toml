@@ -65,19 +65,27 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 lto = true
 strip = true
 
-# tss-esapi fork adds Context::policy_authorize_nv (TPM2_PolicyAuthorizeNV), which
-# the Tier-2 systemd-pcrlock seal needs (see crates/irlume-core/src/tpm_pcrlock.rs).
+# archledger/rust-tss-esapi @ irlume-patches: a stable tss-esapi RELEASE plus the
+# minimal patches irlume needs. Today that is one method, Context::policy_authorize_nv
+# (TPM2_PolicyAuthorizeNV), required by the Tier-2 systemd-pcrlock seal (see
+# crates/irlume-core/src/tpm_pcrlock.rs). Cargo.lock pins an exact commit, so this
+# is a frozen dependency: it never moves under a user, only when we bump it.
 #
-# Why a fork and not a release: upstream already wrote this method (parallaxsecond
-# PR #486, merged to main 2024-01-23) but never backported it to the 7.x release
-# branch, so 7.6.0 and 7.7.0 both ship `// Missing function: PolicyAuthorizeNV`;
-# it only lands in the unreleased 8.0.0-alpha line. This fork is a clean backport
-# of upstream's own implementation onto the 7.7.0 tag.
+# Why the fork exists: upstream wrote this method (parallaxsecond PR #486, merged
+# to main 2024-01-23) but never backported it to a 7.x release, so 7.6.0/7.7.0 both
+# ship `// Missing function: PolicyAuthorizeNV`. It only lands in 8.0, whose stable
+# release has been the open tracking issue #495 since Feb 2024 (2.5+ years, only
+# alphas out, a large breaking change set pending). So "just wait for a release" is
+# not a near-term option; we maintain the fork branch instead.
 #
-# Exit plan: when tss-esapi 8.0.0 releases stable with the method built in, delete
-# this fork + the [patch] and switch to the crates.io release. The fork's signature
-# already matches upstream's (`auth_handle: NvAuth`), so that switch is a call-site
-# no-op; only the fork's body stays 7.7.0-flavoured (Error::from_tss_rc /
-# optional_session_1 vs 8.0's ReturnCode / required_session_1).
+# Branch model: our fork's `main` mirrors upstream `main` for reference only. The
+# `irlume-patches` branch sits on a STABLE release tag (currently v7.7.0) + our
+# patches; that is what this [patch] pins. When a newer stable release lands we
+# rebase the patches onto it, HW-validate the pcrlock round-trip, then bump. The
+# signature already matches upstream's (`auth_handle: NvAuth`), so adopting a
+# released crate that carries the method upstream would be a call-site no-op; the
+# only fork-local delta is the 7.7.0-flavoured body (Error::from_tss_rc /
+# optional_session_1 vs 8.0's ReturnCode / required_session_1). Only move to a
+# plain crates.io release after that release exists AND passes the HW round-trip.
 [patch.crates-io]
-tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "policy-authorize-nv" }
+tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "irlume-patches" }

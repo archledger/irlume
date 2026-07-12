@@ -313,12 +313,26 @@ from other hardware are very welcome.
 
 ## 🛠️ Status
 
-**v0.1.4: working, validated on real hardware across Fedora (full IR Secure tier,
+**v0.1.5: working, validated on real hardware** across Fedora (full IR Secure tier,
 end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
-CLI/daemon; camera-less testbed).** Packaged for all three families. **Contributor-ready:**
-a reproducible Nix dev shell + [developer guide](docs/DEVELOPMENT.md), with CI running
-fmt / clippy / build / test on every push and PR. Actively hardened; interfaces may still
-shift before 1.0.
+CLI/daemon on a camera-less testbed). Packaged for all three families (see [Install](#-install)).
+
+0.1.5 adds **Tier-2 TPM sealing via systemd-pcrlock**: on a pcrlock-provisioned machine a
+firmware or Secure Boot update needs one `systemd-pcrlock make-policy` run instead of
+re-arming the keyring, and the sealed password keeps releasing. Sealing picks the best
+policy the machine supports (signed PCR, then pcrlock, then a literal PCR-7 seal) and
+round-trip-verifies it before trusting it, so a policy that cannot unseal on the current
+boot never holds the secret.
+
+**Presentation attacks tested and denied** on a NexiGo HelloCam N930W: a printed photo
+(including in direct sunlight), a laptop screen, a phone screen at full brightness, and a
+video replay with real head motion. Each is rejected at the infrared face-detection stage,
+because print and screens do not reproduce a face at 850nm. A physical 3D mask is not yet
+tested; see [contributing](#-contributing--license) if you can run that.
+
+**Contributor-ready:** a reproducible Nix dev shell and [developer guide](docs/DEVELOPMENT.md),
+with CI running fmt / clippy / build / test on every push and PR. Interfaces may still shift
+before 1.0.
 
 ## 🙏 Credits
 

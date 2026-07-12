@@ -330,6 +330,30 @@ install, and the full CLI/daemon stack (that testbed has no camera). Reports
 from other hardware are very welcome.
 </details>
 
+<details>
+<summary><b>I changed my login password and now my keyring/wallet won't open</b></summary>
+
+This is general Linux behaviour, not specific to irlume. Changing your login
+password (`passwd` or a settings dialog) updates `/etc/shadow`, but it does not
+re-encrypt your KWallet / GNOME keyring. The wallet keeps the key derived from
+your old password until you change the wallet's password separately, so it no
+longer matches the new login password.
+
+irlume seals whatever password you armed and hands it to the wallet, so it
+passes along the old one and cannot fix this by itself. To bring all three back
+in sync after a password change:
+
+1. **Login password** is already updated by `passwd`.
+2. **Wallet password**: change it to the new one in KWallet Manager →
+   "Change Password" (KDE), or Seahorse → the "Login" keyring →
+   "Change Password" (GNOME).
+3. **irlume's sealed copy**: run `irlume keyring arm` to re-seal the new password.
+
+Rule of thumb: whenever the wallet password changes, re-run `irlume keyring arm`
+so irlume's seal keeps matching it. Your typed password opens everything in the
+meantime, so nothing locks you out.
+</details>
+
 ## 🛠️ Status
 
 **v0.1.5: working, validated on real hardware** across Fedora (full IR Secure tier,

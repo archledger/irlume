@@ -320,6 +320,23 @@ a reproducible Nix dev shell + [developer guide](docs/DEVELOPMENT.md), with CI r
 fmt / clippy / build / test on every push and PR. Actively hardened; interfaces may still
 shift before 1.0.
 
+## 🙏 Credits
+
+irlume relies on models and code from other projects. The bundled models:
+
+- **[YuNet](https://github.com/opencv/opencv_zoo)** (OpenCV Zoo, MIT) detects faces in both the RGB and IR streams.
+- **[AuraFace](https://huggingface.co/fal/AuraFace-v1)** by fal (Apache-2.0) is the 512-D ArcFace recognizer; irlume ships only its `glintr100.onnx`.
+- **[MediaPipe FaceMesh](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** (Google, Apache-2.0) supplies the eye landmarks for the opt-in blink liveness.
+
+The TPM and camera code builds on:
+
+- **[rust-tss-esapi](https://github.com/parallaxsecond/rust-tss-esapi)** (the Parsec project, Apache-2.0) wraps the TPM 2.0 ESAPI. irlume builds from a small patch branch that adds the `PolicyAuthorizeNV` wrapper (upstream [PR #486](https://github.com/parallaxsecond/rust-tss-esapi/pull/486)) plus the [PR #530](https://github.com/parallaxsecond/rust-tss-esapi/pull/530) session-leak fix, pinned to an exact commit.
+- **[systemd](https://github.com/systemd/systemd)** (LGPL-2.1-or-later): the Tier-2 pcrlock seal and unseal in `crates/irlume-core/src/tpm.rs` follows the scheme in systemd's `src/shared/tpm2-util.c` and `src/pcrlock/pcrlock.c`.
+- **[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)** documented the UVC Extension-Unit writes that fire the 850nm emitter on integrated Hello cameras.
+- **[ort](https://github.com/pykeio/ort)** binds Microsoft's ONNX Runtime, which irlume loads at runtime for every model above.
+
+Prior art that shaped the design: **Windows Hello** for the infrared, dual-sensor credential model, and [Howdy](https://github.com/boltgolt/howdy) and [visage](https://github.com/sovren-software/visage) as the existing Linux face-unlock projects (see the [comparison](#-comparison-windows-hello-howdy-visage)). irlume is the from-scratch successor to the author's earlier linhello.
+
 ## 🤝 Contributing & license
 
 **GPL-3.0-or-later**, fully open, copyleft: modifications stay free, nobody can

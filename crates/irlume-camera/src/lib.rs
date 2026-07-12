@@ -534,14 +534,30 @@ const IR_H: u32 = 400;
 const IR_BURST: usize = 10;
 
 /// Ambient-subtraction gates (used only when `IRLUME_IR_AMBIENT_SUBTRACT=1`).
-/// `STROBE_MIN_GAP`: the lit frame must be this much brighter (mean) than its
-/// off-frame neighbor, i.e. a real strobe with a genuine emitter-off exposure to
-/// pair against; a steady emitter has no such neighbor and is left untouched.
-/// `LOW_AMBIENT_SKIP`: if the off-frame mean is below this, there is essentially
-/// no ambient IR to remove (indoors the off-frame is near-black), so subtracting
-/// it would only inject sensor noise; skip and keep the raw lit frame.
-const STROBE_MIN_GAP: f64 = 20.0;
+///
+/// `STROBE_MIN_GAP`: the lit frame must clear its off-frame neighbor by at
+/// least this much (mean) for a genuine emitter-off exposure to exist to pair
+/// against; a steady emitter has no such neighbor. Set to the sensor-noise
+/// floor (8), NOT a large absolute gap: under strong ambient IR (direct sun)
+/// the sensor saturates and a real strobe compresses to a gap of ~8-10, so the
+/// old value of 20 blocked subtraction in exactly the sunlit bursts that need
+/// it most (dataset `~/irlume-suncal`: bursts 06-08, gap 8-9, raw depth
+/// 0.96-0.97, subtracted 1.37-1.46).
+///
+/// `LOW_AMBIENT_SKIP`: if the off-frame mean is below this, there is
+/// essentially no ambient IR to remove (indoors the off-frame is near-black),
+/// so subtracting it would only inject sensor noise; skip and keep the raw
+/// lit frame.
+///
+/// `SUBTRACT_MIN_RESULT`: after subtracting, the result must retain at least
+/// this much mean signal. When lit approx-equals ambient (the emitter added
+/// little over a bright pedestal) the subtracted frame collapses to noise and
+/// the face becomes undetectable (dataset bursts 09/14: subtracted face
+/// vanished). Below this floor we revert to the raw lit frame rather than hand
+/// downstream a blank frame.
+const STROBE_MIN_GAP: f64 = 8.0;
 const LOW_AMBIENT_SKIP: f64 = 5.0;
+const SUBTRACT_MIN_RESULT: f64 = 12.0;
 
 /// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
 /// emitter must be illuminating for a usable image; on integrated Hello modules
@@ -638,11 +654,24 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
             // Subtract only when there is a real strobe gap (a genuine off-frame,
             // never a steady emitter) AND enough ambient IR to be worth removing.
             if lit_mean - amb_mean > STROBE_MIN_GAP && amb_mean >= LOW_AMBIENT_SKIP {
-                best = Some(ir_probe::subtract(&frames[best_i], &frames[ai]));
+                let sub = ir_probe::subtract(&frames[best_i], &frames[ai]);
+                let sub_mean = ir_probe::mean(&sub);
+                // Revert when subtraction collapses the signal: if the emitter
+                // barely cleared a bright pedestal, the result is noise and the
+                // face becomes undetectable. Keep the raw lit frame instead of
+                // handing downstream a blank one.
+                if sub_mean >= SUBTRACT_MIN_RESULT {
+                    best = Some(sub);
+                }
                 if debug_ir {
                     let clipped = ir_probe::saturated_fraction(&frames[best_i]);
+                    let action = if sub_mean >= SUBTRACT_MIN_RESULT {
+                        "applied"
+                    } else {
+                        "reverted (result too dark; face would vanish)"
+                    };
                     eprintln!(
-                        "[ir] ambient-subtract: lit frame {best_i} ({lit_mean:.0}) - ambient frame {ai} ({amb_mean:.0}); lit clipped {:.1}%{}",
+                        "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}; lit clipped {:.1}%{}",
                         clipped * 100.0,
                         if clipped > 0.05 {
                             " (blown exposure; subtracted frame unreliable)"

@@ -22,6 +22,7 @@ mod logs;
 mod pad;
 mod pamwire;
 mod recovery;
+mod suncal;
 mod tui;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -48,6 +49,7 @@ const DEV_CMDS: &[&str] = &[
     "padcapture",
     "padreport",
     "verify",
+    "suncal",
 ];
 
 fn main() -> std::process::ExitCode {
@@ -81,6 +83,7 @@ fn main() -> std::process::ExitCode {
         (Some("calcapture"), _) => calcapture(&args),
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
+        (Some("suncal"), _) => suncal::run(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),

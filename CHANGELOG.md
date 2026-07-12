@@ -32,11 +32,18 @@ All notable changes to irlume are documented here. This project adheres to
   fork: tss-esapi 7.7.0 plus the `PolicyAuthorizeNV` wrapper (upstream merged
   it in 2024 but never shipped it in a 7.x release) and upstream PR #530's
   session-handle leak fix. `Cargo.lock` pins the exact commit.
-- IR ambient subtraction (opt-in via `IRLUME_IR_AMBIENT_SUBTRACT=1`) now runs
-  only against a genuine strobe pair: the lit frame must average at least 20
-  brightness levels above its emitter-off neighbor, and a near-black off-frame
-  (mean below 5) is skipped rather than subtracted, since subtracting it only
-  injected sensor noise.
+- IR ambient subtraction (opt-in via `IRLUME_IR_AMBIENT_SUBTRACT=1`) reworked
+  its gate against a real sunlight dataset. Under strong ambient IR the sensor
+  saturates and a genuine strobe compresses to a gap of ~8-10, so the old
+  fixed gap of 20 blocked subtraction in exactly the sunlit captures that
+  needed it; the strobe threshold is now the sensor-noise floor (8). After
+  subtracting, the result must retain enough mean signal (12) or the raw lit
+  frame is kept, so a bright pedestal that collapses the subtracted frame can
+  no longer hand a blank image downstream. On 33 genuine bursts this lifts the
+  IR depth cue over its floor in 7 more cases with no regression to any that
+  already passed. Still opt-in: enabling it by default needs flat-spoof
+  captures under the same light and a re-enroll so the per-user floor matches.
+  A new `IRLUME_DEV=1 irlume suncal <det> <dir>` tool scores such a dataset.
 
 ### Fixed
 

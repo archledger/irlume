@@ -6,7 +6,7 @@
 name: irlume
 arch: amd64
 platform: linux
-version: v0.1.5
+version: 0.1.5
 section: admin
 priority: optional
 maintainer: archledger <archledger236@gmail.com>

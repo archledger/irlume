@@ -7,7 +7,7 @@ self-contained, no runtime download or fetch step. After cloning, run
 `git lfs pull` if your client didn't fetch LFS objects automatically.
 
 `SHA256SUMS` holds the release checksums; the daemon embeds it at build time
-and warns at startup when a loaded model doesn't match (see SECURITY.md).
+and warns at startup when a loaded model doesn't match (see ../SECURITY.md).
 After changing any shipped model, regenerate it and commit both:
 `cd models && sha256sum face_detection_yunet_2023mar.onnx face_landmark.onnx glintr100.onnx ir_adapter.onnx > SHA256SUMS`.
 

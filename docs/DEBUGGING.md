@@ -23,7 +23,7 @@ How to read the key lines:
 | Line | Meaning |
 |---|---|
 | `irlumed: UnsealPassword: attempt for 'x'` | a greeter/lock asked for a face login (camera fires now) |
-| `irlumed: UnsealPassword: OK for 'x' (score 0.88)` | face matched AND the TPM released the sealed password |
+| `irlumed: UnsealPassword: OK for 'x' (score 0.8800), password unsealed` | face matched AND the TPM released the sealed password |
 | `…face matched … but TPM unseal FAILED` | face was fine; PCR drift kept the keyring locked → `irlume diag`, then `sudo irlume reseal` |
 | `audit … grantors=pam_irlume` | PAM's own record that the grant came from face, not password fallthrough |
 | `pam_unix(<svc>:auth): authentication failure` with **no** irlumed line before it | a typed (wrong) password; correct on-demand behavior: typing never fires the camera |

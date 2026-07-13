@@ -1,8 +1,11 @@
 //! Matching, template storage, and TPM-bound secret release.
 //!
 //! Decision rule (NIST SP 800-63B-4 aligned): grant only if the liveness gate
-//! says Live AND the best cosine >= a FIXED threshold tuned for FMR <= 1e-4
-//! across demographics. Threshold is NOT ported from linhello (0.60): AuraFace's
+//! says Live AND the best cosine >= a FIXED threshold (0.55). That threshold
+//! clears FMR <= 1e-4 per demographic group on FairFace, but unconstrained
+//! real-world FAR is higher (2.0e-3 @ 0.55 on LFW); the mandatory password
+//! fallback bounds the residual. See the `RGB` threshold constant below for the
+//! measured numbers. Threshold is NOT ported from linhello (0.60): AuraFace's
 //! score scale differs; derive it from a genuine/impostor ROC on real data.
 //!
 //! Storage: never store a raw recoverable face image. Store L2-normalized

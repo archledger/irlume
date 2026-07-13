@@ -86,7 +86,7 @@ Around 108 tests pass; a handful that need camera or TPM hardware are marked
 [`PAD_SELFTEST.md`](PAD_SELFTEST.md).
 
 The tooling is dev-gated (`IRLUME_DEV=1`) and opens the camera directly. A live
-bona-fide capture works out of the box:
+bona-fide capture works with no extra configuration:
 
 ```sh
 IRLUME_DEV=1 irlume padcapture --species live --kind bonafide \

@@ -63,7 +63,12 @@ requires cryptographic camera attestation, which is **out of scope for V1.0**.
 `IRLUME_CAMERA_PIN="vid:pid"` and `IRLUME_CAMERA_REQUIRE_FIXED=1` add descriptor
 and removability pinning per host.
 
-## Liveness: algorithmic, no trained weights
+## Liveness: algorithmic single-frame gate (no trained weights)
+
+The default gate uses no trained weights. (The opt-in passive-blink stage
+below, [ADR-0002](adr/0002-challenge-response-liveness.md), does run a trained
+model, MediaPipe FaceMesh, for eye landmarks; it is a landmarker, not a spoof
+classifier, and is Apache-2.0, so the clean-BOM claim holds.)
 
 Physically-grounded cues, hard gate (any failure rejects):
 
@@ -94,8 +99,11 @@ reflects 850 nm (defeating `face_in_ir`) and a large flat print mimics the
 brightness-ratio depth cue (banner depth 1.02–1.58 *overlaps and exceeds* genuine
 1.37–1.40, so no threshold separates them). Screen replays and matte-paper prints
 were still fully rejected. This is a demonstrated instance of the accepted
-IR-approximating-spoof residual risk, and the mitigation is
-**challenge-response / temporal liveness** (a static print cannot blink or move).
+IR-approximating-spoof residual risk. The mitigation, **passive-blink
+challenge-response** (a static print cannot blink), is implemented and
+validated ([ADR-0002](adr/0002-challenge-response-liveness.md); measured APCER
+0% / BPCER 0%) but ships **opt-in and off by default**, so the default posture
+still carries this gap until a user enables the blink challenge.
 Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/2026-06-30-ir-liveness-selftest.md).
 
 ## Storage
@@ -107,10 +115,12 @@ systemd's PCR-11 signature where a UKI publishes one (Tier 1; kernel updates
 need no re-seal), `PolicyAuthorizeNV` against a provisioned systemd-pcrlock NV
 index (Tier 2; after a firmware or Secure Boot update the admin re-runs
 `systemd-pcrlock make-policy` and the seal keeps working), or a literal
-`PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change requires a re-arm). Each
-candidate is round-trip verified at seal time, so a policy that cannot unseal
-on the current boot never holds the secret. Never store a recoverable face
-image; decrypted template plaintext and keys are zeroized.
+`PolicyPCR` over PCR 7 (Tier 3; a Secure Boot change requires a re-arm). The
+higher tiers (signed and pcrlock) are round-trip verified at seal time, so a
+policy that cannot unseal on the current boot is never trusted; the literal
+PCR-7 fallback binds to PCR values just read from the live TPM, so it unseals
+on the current boot by construction. Never store a recoverable face image;
+decrypted template plaintext and keys are zeroized.
 
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
 releases the sealed login password on *root peer + login-service-class*, without

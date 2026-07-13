@@ -67,8 +67,8 @@ strip = true
 
 # archledger/rust-tss-esapi @ irlume-patches: a stable tss-esapi RELEASE plus the
 # minimal patches irlume needs. Today that is (1) Context::policy_authorize_nv
-# (TPM2_PolicyAuthorizeNV), required by the Tier-2 systemd-pcrlock seal (see
-# crates/irlume-core/src/tpm_pcrlock.rs), and (2) the upstream PR #530 fix that
+# (TPM2_PolicyAuthorizeNV), required by the Tier-2 systemd-pcrlock seal implemented
+# in crates/irlume-core/src/tpm.rs (design notes in tpm_pcrlock.rs), and (2) the upstream PR #530 fix that
 # flushes the session handle when tr_sess_set_attributes fails inside
 # execute_with_nullauth_session (a 7.7.0 failure path would otherwise leave a
 # loaded session on the TPM; irlume calls that helper on every seal/unseal).

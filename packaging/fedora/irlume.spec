@@ -134,7 +134,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
-* Sat Jul 12 2026 archledger <archledger236@gmail.com> - 0.1.5-1
+* Sun Jul 12 2026 archledger <archledger236@gmail.com> - 0.1.5-1
 - Tier 2 TPM sealing via systemd-pcrlock: on a pcrlock-provisioned machine new
   seals bind to the pcrlock NV index, so a firmware/Secure Boot update needs one
   `make-policy` re-run instead of a re-arm. Sealing tries signed, then pcrlock,
@@ -153,7 +153,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
   installed package version; universal .deb for Ubuntu derivatives; Arch makepkg
   git-lfs fix; deterministic PPA orig; declared MSRV raised to Rust 1.88.
 
-* Mon Jul 07 2026 archledger <archledger236@gmail.com> - 0.1.3-1
+* Tue Jul 07 2026 archledger <archledger236@gmail.com> - 0.1.3-1
 - Every major login manager profiled for on-demand face auth (GDM/SDDM/LightDM/
   greetd/COSMIC/Plasma Login); `irlume logs` + IRLUME_LOG=debug diagnostics.
 - Directional, per-user auto-calibrated enrollment guidance; 5 scans; frontal

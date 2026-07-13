@@ -13,7 +13,7 @@
 # Revert:       sudo bash scripts/deploy-keyring-unlock.sh --revert
 set -euo pipefail
 
-REPO="/home/wisbfime/irlume"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAM_GREETER="/etc/pam.d/plasmalogin"
 VENDOR_GREETER="/usr/lib/pam.d/plasmalogin"
 MARKER="# irlume: face-unlock wiring — delete this file to restore the vendor copy"

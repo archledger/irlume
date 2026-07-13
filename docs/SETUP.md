@@ -116,7 +116,7 @@ the plan and writes nothing.
 <!-- mirrors the `login enable` plan output in crates/irlume-cli/src/pamwire.rs; keep in sync -->
 ```
   login manager: plasmalogin   ·   method: auto   ·   IR/Secure tier
-  plan → face login: on   face lock: on   fingerprint keyring: —
+  plan → face login: on   face lock: on   fingerprint keyring: n/a
   face trigger: on-demand; leave the password empty and press Enter to use your face
   ✓ /etc/pam.d/plasmalogin: materialized override from /usr/lib/pam.d/plasmalogin
   ✓ /etc/pam.d/kde-fingerprint: wired (backup /etc/pam.d/kde-fingerprint.pre-irlume)

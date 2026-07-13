@@ -30,11 +30,14 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
 3. **Key custody: TPM-sealed, never on disk in the clear.** The AES key is a
    random 32 bytes sealed by the TPM. The stored key envelope holds only the
    TPM `public`/`private` blobs; the `private` is wrapped under the TPM's
-   Storage Root Key with a **measured-boot policy**: the strongest of a signed
-   PCR-11 policy (Tier 1), a provisioned systemd-pcrlock NV policy (Tier 2),
-   or the literal **PCR-7 (Secure Boot state)** policy (Tier 3, the default on
-   most machines). The plaintext key exists only transiently in the daemon's
-   memory (zeroized on drop).
+   Storage Root Key with a **PCR policy**: the strongest of a signed PCR-11
+   policy (Tier 1, which measures the boot chain), a provisioned systemd-pcrlock
+   NV policy (Tier 2), or the literal **PCR-7** policy (Tier 3, the default on
+   most machines). Note Tier 3 binds to the Secure Boot **state** (PCR 7), not
+   the loaded kernel/initrd, so a validly-signed but modified kernel does not
+   move it; Tiers 1 and 2 are the ones that bind boot-component measurements.
+   The plaintext key exists only transiently in the daemon's memory (zeroized
+   on drop).
 4. **IPC: SO_PEERCRED.** The daemon releases profile data only to the target
    user or root; the sealed *login password* (keyring) only to a root peer.
    *Tested:* a CLI peer asking for another user's profiles → **"not
@@ -56,8 +59,9 @@ So the realistic attacks and their outcomes:
 | Attacker capability | Outcome |
 |---|---|
 | Normal user account on the box | Can't read either file (0600 root) |
-| Steals the disk / backup image | Ciphertext only; key won't unseal on any other TPM → **no data** |
-| Steals disk AND has the physical machine, no root | Must defeat the TPM's measured-boot policy + get root to run the daemon path |
+| Steals the disk / backup image (**TPM host**) | Ciphertext only; key won't unseal on any other TPM → **no data** |
+| Steals the disk / backup image (**no-TPM host**) | Templates are root-only but **plaintext** (see "Degraded hosts" below): recoverable 512-D embeddings, not an image |
+| Steals disk AND has the physical machine, no root | Must defeat the TPM's PCR policy + get root to run the daemon path |
 | Root on the live original machine | Game over: root can ask the daemon to unseal (true of any at-rest scheme; root is the trust boundary) |
 | Recovers only the embedding plaintext (somehow) | Gets a 512-float vector, not a photo; can't replay it past IR liveness |
 

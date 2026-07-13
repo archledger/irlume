@@ -22,7 +22,7 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
 [![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](#-faq)
 
-[Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#️-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
+[Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
 
 <br>
 
@@ -66,7 +66,7 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 ## 📦 Install
 
 > **v0.1.5.** Works end-to-end on real hardware across all three families. Not
-> yet certified (no iBeta lab pass); see [Honest limitations](#️-honest-limitations).
+> yet certified (no iBeta lab pass); see [Honest limitations](#-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM; the distros below are
 packaged and tested. A **TPM 2.0** is strongly recommended (encrypted templates,

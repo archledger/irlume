@@ -5,8 +5,8 @@
 The two untrusted clients, `pam_irlume.so` and the `irlume` CLI, reach the
 privileged daemon through a single `SO_PEERCRED`-checked Unix socket. Everything
 sensitive (the camera, IR emitter, ONNX models, enrolled templates, and the TPM)
-lives only inside `irlumed`, which is single-threaded because the camera is one
-shared resource:
+lives only inside `irlumed`, which serially handles one request at a time (the camera is one
+shared resource; RGB and IR capture within a request run concurrently):
 
 ```mermaid
 flowchart LR

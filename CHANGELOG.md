@@ -47,6 +47,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- TUI: the Activity-history scroll (PgUp/PgDn) now works during a running
+  operation and mid-enrollment, and the Welcome screen's `[i]` identify key
+  works in the default view; both were previously swallowed by the panel's
+  key handling.
 - A pcrlock policy that covers zero PCRs is refused at seal and unseal time;
   binding a secret to it would give no measured-boot protection.
 

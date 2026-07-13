@@ -432,7 +432,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
                 method.as_str()
             ),
         }
-        let onoff = |b: bool| if b { "on" } else { "—" };
+        let onoff = |b: bool| if b { "on" } else { "off" };
         println!(
             "  plan → face login: {}   face lock: {}   fingerprint keyring: {}",
             onoff(want_face_login),
@@ -563,7 +563,7 @@ fn wire_service(
             let (base, _) = unwire_lines(&read(vendor)?);
             let (wired, _) = wire(&base);
             let body = format!(
-                "{CREATED_PREFIX}{vendor} — delete this file to restore the vendor copy\n{wired}"
+                "{CREATED_PREFIX}{vendor}; delete this file to restore the vendor copy\n{wired}"
             );
             if etc.exists() && read(s.etc).ok().as_deref() == Some(body.as_str()) {
                 return Ok(format!("· {}: already correctly wired", s.etc));

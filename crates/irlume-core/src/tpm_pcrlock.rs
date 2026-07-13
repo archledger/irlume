@@ -62,7 +62,7 @@
 //!      unseals).
 //!   2. nvName = 0x000B ‖ SHA256(marshal(TPMS_NV_PUBLIC_with_WRITTEN)).
 //!   3. authPolicy = SHA256( zero32 ‖ TPM_CC_PolicyAuthorizeNV(0x00000192, 4B BE)
-//!      ‖ nvName ).  This is the WHOLE policy — NO PolicyPCR term (PolicyAuthorizeNV
+//!      ‖ nvName ).  This is the WHOLE policy; NO PolicyPCR term (PolicyAuthorizeNV
 //!      resets the running digest, discarding any prior PCR work).
 //!   4. Esys_Create under SRK: inPublic.authPolicy = authPolicy, policy-only
 //!      (clear userWithAuth), sensitive = secret. Store public/private in the
@@ -89,7 +89,7 @@
 //! STATUS: implemented in [`crate::tpm`] (`seal_pcrlock`/`unseal_pcrlock`),
 //! co-located with the shared TPM session helpers it reuses. The wrapper
 //! `Context::policy_authorize_nv` (absent from released tss-esapi) is supplied
-//! by the fork archledger/rust-tss-esapi @ policy-authorize-nv, pinned via the
+//! by the fork archledger/rust-tss-esapi @ irlume-patches, pinned via the
 //! workspace `[patch.crates-io]`. The super-PCR composition was derived and the
 //! full seal/unseal round-trip validated against a provisioned pcrlock NV index
 //! on real hardware (single-value PCRs 13/15 as one PolicyPCR; multi-value PCRs

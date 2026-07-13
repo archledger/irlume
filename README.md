@@ -354,6 +354,28 @@ so irlume's seal keeps matching it. Your typed password opens everything in the
 meantime, so nothing locks you out.
 </details>
 
+<details>
+<summary><b>How fast is a face login, and why is the blink challenge slower?</b></summary>
+
+A normal face login takes about **2.5 seconds** on an integrated IR camera
+(measured on an ASUS Zenbook, CPU inference). Most of that is opening the
+camera and letting auto-exposure settle, not the neural networks. The greeter
+and lock screen pre-warm the camera on the unlock signal, so a real unlock
+feels quicker than a cold `irlume identify`.
+
+The **opt-in blink challenge** (`irlume profiles challenge on`) is a deterrent
+against a glossy print or vinyl that mimics infrared depth: it watches for a
+natural blink, which a static image cannot do. Detecting a blink is inherently
+temporal, so it captures a roughly 5-second infrared sequence, and the login
+takes about **10 seconds** (measured across six runs, glasses on and off). That
+is the trade: the challenge closes a spoof gap the default single-frame gate
+cannot, at about four times the latency.
+
+It is off by default. Turn it on with `irlume profiles challenge on` if you
+want the extra deterrent, or leave it off for the ~2.5-second login; the
+default IR-structure gate already rejects photos, screens, and video replays.
+</details>
+
 ## 🛠️ Status
 
 **v0.1.5: working, validated on real hardware** across Fedora (full IR Secure tier,

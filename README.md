@@ -26,9 +26,9 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 
 <br>
 
-<img src="docs/assets/irlume-demo.gif" alt="irlume demo: dnf install, guided face enrollment, and wiring the login stack from the TUI" width="800">
+<img src="docs/assets/irlume-demo.gif" alt="irlume demo: one-line install, guided face enrollment in the TUI, wiring the greeter and lock screen, and opt-in face-sudo" width="720">
 
-<sub>From <code>dnf install</code> to a wired face login: guided enrollment, TPM keyring unlock, recovery passphrase, and greeter/lock-screen wiring, all in the TUI.</sub>
+<sub>From a one-line install to a wired face login: guided face enrollment in the TUI, greeter and lock-screen wiring, and opt-in face-<code>sudo</code>.</sub>
 
 </div>
 

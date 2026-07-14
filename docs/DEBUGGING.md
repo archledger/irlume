@@ -143,5 +143,23 @@ the daemon); they measure, and hold no privileged path:
 | `normprobe` / `meshprobe` | embedding-norm and FaceMesh probes |
 | `padcapture` / `padreport` | presentation-attack (spoof) capture + report (see [PAD_SELFTEST.md](PAD_SELFTEST.md)) |
 
+### Measuring capture overlap
+
+The daemon logs per-side capture timings when tracing is on. To measure what
+the concurrent RGB+IR capture saves on your hardware:
+
+```bash
+sudo irlume logs debug on
+# run a few verifies (lock and unlock, or: irlume identify)
+journalctl -u irlumed --since -10min > /tmp/irlume.log
+scripts/timing-report.py /tmp/irlume.log
+sudo irlume logs debug off
+```
+
+The report prints per-side capture times and the average overlapped cost (max
+of each rgb+ir pair) against the sequential cost (sum). On the ASUS Zenbook
+reference hardware the overlap cuts the capture stage from about 1.46s to
+about 1.0s per verify.
+
 Reproducing the published accuracy/anti-spoof claims end-to-end is covered in
 [VERIFY.md](VERIFY.md).

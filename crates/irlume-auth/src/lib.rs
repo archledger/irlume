@@ -82,6 +82,97 @@ pub struct IdentifyOutcome {
 /// brightness, signed pitch).
 type Scan = (Vec<f32>, Option<Vec<f32>>, f32, f32, f32);
 
+/// Calibration-aware IR match result (see [`ir_match_in`]).
+struct IrMatch {
+    best: f32,
+    best_who: String,
+    n_templates: usize,
+    /// Best per-profile calibrated-centroid score, only from profiles with a
+    /// fitted calibration under a raw pipeline: (score, profile name).
+    centroid: Option<(f32, String)>,
+}
+
+/// IR matching across profiles, calibration-aware. Per profile: when a
+/// fitted calibration exists (and no global adapter is loaded), both the
+/// probe and that profile's templates are calibrated before scoring, and the
+/// calibrated template CENTROID is scored too — the mean-template protocol
+/// the 2026-07-15 prototype validated at the BASE threshold (a single mean
+/// template carries no best-of-N FAR inflation).
+fn ir_match_in(
+    space: &str,
+    adapter_loaded: bool,
+    enr: &irlume_core::storage::Enrollment,
+    probe: &[f32],
+) -> IrMatch {
+    let mut m = IrMatch {
+        best: f32::NEG_INFINITY,
+        best_who: String::new(),
+        n_templates: 0,
+        centroid: None,
+    };
+    for p in &enr.profiles {
+        let tmpls: Vec<&[f32]> = p
+            .scans
+            .iter()
+            .filter_map(|s| {
+                let ir = s.ir.as_ref()?;
+                if ir.len() != probe.len() {
+                    return None;
+                }
+                match &s.ir_space {
+                    Some(sp) if sp != space => None,
+                    _ => Some(ir.as_slice()),
+                }
+            })
+            .collect();
+        if tmpls.is_empty() {
+            continue;
+        }
+        m.n_templates += tmpls.len();
+        let calib = if adapter_loaded {
+            None
+        } else {
+            p.ir_calib.as_ref()
+        };
+        let cprobe = calib.and_then(|c| c.apply(probe));
+        if let (Some(c), Some(cprobe)) = (calib, &cprobe) {
+            let mut centroid = vec![0.0f32; probe.len()];
+            let mut used = 0usize;
+            for t in &tmpls {
+                let Some(ct) = c.apply(t) else { continue };
+                let s = align::cosine(cprobe, &ct);
+                if s > m.best {
+                    m.best = s;
+                    m.best_who = p.name.clone();
+                }
+                for (a, b) in centroid.iter_mut().zip(&ct) {
+                    *a += b;
+                }
+                used += 1;
+            }
+            if used > 0 {
+                let norm = centroid.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-9;
+                for v in centroid.iter_mut() {
+                    *v /= norm;
+                }
+                let cs = align::cosine(cprobe, &centroid);
+                if m.centroid.as_ref().is_none_or(|(s, _)| cs > *s) {
+                    m.centroid = Some((cs, p.name.clone()));
+                }
+            }
+        } else {
+            for t in &tmpls {
+                let s = align::cosine(probe, t);
+                if s > m.best {
+                    m.best = s;
+                    m.best_who = p.name.clone();
+                }
+            }
+        }
+    }
+    m
+}
+
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         Ok(Self {
@@ -163,6 +254,43 @@ impl Engine {
     /// check in `ir_scans_for` quarantines templates either way).
     pub fn ir_dim(&self) -> usize {
         irlume_vision::EMBED_DIM
+    }
+
+    /// Fit (or refresh) a profile's per-enrollment IR calibration (ADR-0004)
+    /// from its own scan pairs. Raw space only: with a global adapter loaded
+    /// the stored IR embeddings are adapter-space, and the calibration stays
+    /// `None` (matching then behaves exactly as before the feature).
+    fn refit_profile_calib(&self, prof: &mut irlume_core::storage::FaceProfile) {
+        if self.ir_adapter.is_some() {
+            return;
+        }
+        let dim = self.ir_dim();
+        let (mut ir_rows, mut rgb_rows) = (Vec::new(), Vec::new());
+        for s in &prof.scans {
+            let Some(ir) = &s.ir else { continue };
+            if ir.len() != dim || s.rgb.len() != dim {
+                continue;
+            }
+            if matches!(&s.ir_space, Some(sp) if sp != &self.ir_space) {
+                continue;
+            }
+            ir_rows.push(ir.clone());
+            rgb_rows.push(s.rgb.clone());
+        }
+        prof.ir_calib = irlume_core::calib::fit(&ir_rows, &rgb_rows);
+        if let Some(c) = &prof.ir_calib {
+            irlume_common::dlog!(
+                "calib: fitted '{}' from {} scan pairs",
+                prof.name,
+                c.fitted_pairs
+            );
+        }
+    }
+
+    /// Method wrapper over [`ir_match_in`], bound to the engine's space and
+    /// adapter state.
+    fn ir_match(&self, enr: &irlume_core::storage::Enrollment, probe: &[f32]) -> IrMatch {
+        ir_match_in(&self.ir_space, self.ir_adapter.is_some(), enr, probe)
     }
 
     /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
@@ -717,9 +845,9 @@ impl Engine {
             // cross-spectrum liveness gate + per-user IR floor already passed above.
             // This is the bright→RGB / dark→IR / dim→FUSE story.
             if let Some(ir_probe) = &a.ir_embedding {
-                let ir_scans = enr.ir_scans_for(&self.ir_space, ir_probe.len());
-                if !ir_scans.is_empty() {
-                    let (ir_score, ir_who) = best(ir_probe, &ir_scans);
+                let m = self.ir_match(&enr, ir_probe);
+                if m.n_templates > 0 {
+                    let (ir_score, ir_who) = (m.best, m.best_who.clone());
                     // (a) calibrated quality-weighted fusion: the dim/mixed-light path.
                     let f = irlume_core::fusion::fuse(
                         irlume_core::fusion::rgb_genuine_prob(score),
@@ -742,7 +870,7 @@ impl Engine {
                     } else {
                         irlume_core::IR_MATCH_THRESHOLD
                     };
-                    let ir_thr = irlume_core::scaled_threshold(ir_base, ir_scans.len())
+                    let ir_thr = irlume_core::scaled_threshold(ir_base, m.n_templates)
                         + irlume_core::IR_FALLBACK_MARGIN;
                     irlume_common::dlog!(
                         "match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})",
@@ -751,6 +879,18 @@ impl Engine {
                     if ir_score >= ir_thr {
                         return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: ir_score,
                             reason: format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})") });
+                    }
+                    // (c) calibrated-centroid fallback (ADR-0004): the mean-
+                    // template score carries no best-of-N FAR inflation, so it
+                    // uses the base threshold scaled only by profile count.
+                    if let Some((cs, cwho)) = &m.centroid {
+                        let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len())
+                            + irlume_core::IR_FALLBACK_MARGIN;
+                        irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
+                        if *cs >= cthr {
+                            return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: *cs,
+                                reason: format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})") });
+                        }
                     }
                 }
             }
@@ -768,8 +908,8 @@ impl Engine {
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
         // recognition (Windows-Hello-style dark operation) across all profiles.
         if let Some(probe) = a.ir_embedding {
-            let scans = enr.ir_scans_for(&self.ir_space, probe.len());
-            if scans.is_empty() {
+            let m = self.ir_match(&enr, &probe);
+            if m.n_templates == 0 {
                 let reason = if enr.ir_scans().is_empty() {
                     "dark, but no IR scans enrolled; re-enroll to enable dark unlock"
                 } else {
@@ -799,25 +939,50 @@ impl Engine {
             } else {
                 irlume_core::IR_MATCH_THRESHOLD
             };
-            let ir_thr = irlume_core::scaled_threshold(ir_base, scans.len());
-            let (score, who) = best(&probe, &scans);
+            let ir_thr = irlume_core::scaled_threshold(ir_base, m.n_templates);
+            let (score, who) = (m.best, m.best_who.clone());
             irlume_common::dlog!(
-                "match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={})",
-                scans.len(),
-                self.ir_adapter.is_some()
+                "match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={}, calib_centroid={:?})",
+                m.n_templates,
+                self.ir_adapter.is_some(),
+                m.centroid.as_ref().map(|(s, _)| *s)
             );
-            let granted = score >= ir_thr;
+            // Grant on best-of-N at the scaled threshold, or on the
+            // calibrated centroid at the base threshold (no best-of-N FAR
+            // inflation; the prototype-validated mean-template protocol).
+            if score >= ir_thr {
+                return self.challenge_if_required(
+                    &enr,
+                    Outcome {
+                        granted: true,
+                        live: true,
+                        score,
+                        reason: format!("match: {who} (ir/dark)"),
+                    },
+                );
+            }
+            if let Some((cs, cwho)) = &m.centroid {
+                let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len());
+                irlume_common::dlog!("match(ir/dark centroid): {cs:.3} vs thr {cthr:.3}");
+                if *cs >= cthr {
+                    return self.challenge_if_required(
+                        &enr,
+                        Outcome {
+                            granted: true,
+                            live: true,
+                            score: *cs,
+                            reason: format!("match: {cwho} (ir/dark, calibrated centroid)"),
+                        },
+                    );
+                }
+            }
             return self.challenge_if_required(
                 &enr,
                 Outcome {
-                    granted,
+                    granted: false,
                     live: true,
                     score,
-                    reason: if granted {
-                        format!("match: {who} (ir/dark)")
-                    } else {
-                        "below threshold (ir)".into()
-                    },
+                    reason: "below threshold (ir)".into(),
                 },
             );
         }
@@ -1063,6 +1228,7 @@ impl Engine {
             }
         }
         let mut prof = FaceProfile {
+            ir_calib: None,
             name: name.clone(),
             scans: Vec::new(),
         };
@@ -1080,6 +1246,7 @@ impl Engine {
             });
         }
         let n = prof.scans.len();
+        self.refit_profile_calib(&mut prof);
         enr.profiles.push(prof);
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
@@ -1175,6 +1342,7 @@ impl Engine {
             ir_brightness: b,
             pitch,
         });
+        self.refit_profile_calib(&mut enr.profiles[idx]);
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
         }
@@ -1564,6 +1732,93 @@ mod tests {
     use super::*;
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
 
+    fn unit(mut v: Vec<f32>) -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt() + 1e-9;
+        v.iter_mut().for_each(|x| *x /= n);
+        v
+    }
+
+    /// Profile whose scans carry paired RGB/IR embeddings shaped like real
+    /// enrollment data: one identity base pattern, small per-scan noise, and
+    /// a consistent spectral-shift direction between the two domains. The
+    /// fitted calibration's job is to remove that shift.
+    fn calibrated_profile(dim: usize) -> (FaceProfile, Vec<f32>) {
+        let mk = |i: usize, spectral: f32| -> Vec<f32> {
+            unit(
+                (0..dim)
+                    .map(|j| {
+                        let base = (j as f32 * 0.7).sin();
+                        let noise = 0.05 * (i as f32 * 1.3 + j as f32).sin();
+                        let shift = spectral * (j as f32 * 0.9).cos();
+                        base + noise + shift
+                    })
+                    .collect(),
+            )
+        };
+        let ir_rows: Vec<Vec<f32>> = (0..5).map(|i| mk(i, 0.4)).collect();
+        let rgb_rows: Vec<Vec<f32>> = (0..5).map(|i| mk(i, -0.4)).collect();
+        let calib = irlume_core::calib::fit(&ir_rows, &rgb_rows);
+        assert!(calib.is_some());
+        let scans = ir_rows
+            .iter()
+            .zip(&rgb_rows)
+            .map(|(ir, rgb)| FaceScan {
+                name: "s".into(),
+                rgb: rgb.clone(),
+                ir: Some(ir.clone()),
+                ir_space: Some("raw".into()),
+                ir_depth: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            })
+            .collect();
+        // an unseen genuine IR probe: same identity base, fresh noise
+        let probe = mk(6, 0.4);
+        (
+            FaceProfile {
+                name: "p".into(),
+                scans,
+                ir_calib: calib,
+            },
+            probe,
+        )
+    }
+
+    #[test]
+    fn ir_match_uses_calibration_and_scores_centroid() {
+        let (prof, probe) = calibrated_profile(16);
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        let raw = ir_match_in("raw", false, &enr, &probe);
+        assert_eq!(raw.n_templates, 5);
+        let (cs, who) = raw.centroid.as_ref().expect("centroid expected");
+        assert_eq!(who, "p");
+        assert!(cs.is_finite() && raw.best.is_finite());
+        // Calibrated genuine matching must stay strong (efficacy across
+        // conditions is proven in calib.rs and the offline prototype; here
+        // probe and templates share a condition, so raw is already high and
+        // the wiring must not degrade it).
+        assert!(raw.best > 0.8, "calibrated best degraded: {}", raw.best);
+        assert!(*cs > 0.8, "centroid degraded: {cs}");
+        // With the adapter loaded the calibration must be ignored entirely.
+        let with_adapter = ir_match_in("raw", true, &enr, &probe);
+        assert!(with_adapter.centroid.is_none());
+        assert!(with_adapter.best.is_finite());
+    }
+
+    #[test]
+    fn ir_match_skips_foreign_space_templates() {
+        let (mut prof, probe) = calibrated_profile(16);
+        for s in &mut prof.scans {
+            s.ir_space = Some("adapter:deadbeef0123".into());
+        }
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        let m = ir_match_in("raw", false, &enr, &probe);
+        assert_eq!(m.n_templates, 0);
+        assert!(m.centroid.is_none());
+    }
+
     fn scan(v: Vec<f32>) -> FaceScan {
         FaceScan {
             name: "s".into(),
@@ -1678,10 +1933,12 @@ mod tests {
             camera_binding: None,
             profiles: vec![
                 FaceProfile {
+                    ir_calib: None,
                     name: "Face Profile 1".into(),
                     scans: vec![scan(face1.clone())],
                 },
                 FaceProfile {
+                    ir_calib: None,
                     name: "Face Profile 2".into(),
                     scans: vec![scan(face2.clone())],
                 },

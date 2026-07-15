@@ -14,6 +14,7 @@
 //! released only on a successful live+match, not the template itself.
 
 pub mod biopolicy;
+pub mod calib;
 pub mod crypto;
 pub mod envelope;
 pub mod fusion;

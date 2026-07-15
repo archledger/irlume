@@ -53,7 +53,9 @@ const SC_SETTINGS: usize = 9;
 const SC_DONE: usize = 10;
 const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
 const MAX_PROFILES: usize = 3;
-const ENROLL_SCANS: usize = 5;
+const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
+/// Scans captured per improve-recognition round (add to an existing profile).
+const ADD_SCANS: usize = irlume_core::storage::IMPROVE_SCANS;
 const GOOD_STREAK: u32 = 3;
 
 #[derive(Clone, Copy)]
@@ -1120,7 +1122,7 @@ impl App {
             return;
         }
         let (profile, target) = match &add {
-            Some(name) => (name.clone(), 1),
+            Some(name) => (name.clone(), ADD_SCANS),
             None => (self.next_profile_name(), ENROLL_SCANS),
         };
         let user = self.user.clone();

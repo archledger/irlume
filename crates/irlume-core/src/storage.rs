@@ -14,11 +14,21 @@ use zeroize::Zeroizing;
 /// Max face profiles per account (e.g. self / self-with-glasses / a trusted
 /// person). A 4th requires deleting one.
 pub const MAX_PROFILES: usize = 3;
-/// Max scans per profile. Recognition gains plateau past a few; more inflates
-/// the false-accept surface (mitigated by [`crate::scaled_threshold`]).
-pub const MAX_SCANS_PER_PROFILE: usize = 5;
-/// Scans captured by a fresh enrollment to bootstrap solid recognition.
-pub const DEFAULT_ENROLL_SCANS: usize = 5;
+/// Max scans per profile: one fresh enrollment plus four improve-recognition
+/// rounds ([`DEFAULT_ENROLL_SCANS`] + 4 x [`IMPROVE_SCANS`]). Raised from 5:
+/// scans now also feed the per-profile IR calibration fit (ADR-0004). The cap
+/// is set where the 2026-07-15 enrollment-size sweep plateaued: calibrated
+/// FRR at the production threshold improves steeply from 5 scans (25%) to 15
+/// (17%) and flattens by 30 (16%), while past ~30 the fit's growing rank
+/// starts to nudge impostor scores upward (FAR@0.40 0.14%→0.42% by 50) for
+/// zero FRR gain. Best-of-N FAR inflation stays bounded by
+/// [`crate::scaled_threshold`] (+0.074 at 30, under the +0.10 cap).
+pub const MAX_SCANS_PER_PROFILE: usize = 30;
+/// Scans captured by a fresh enrollment to bootstrap solid recognition and a
+/// usable first calibration fit.
+pub const DEFAULT_ENROLL_SCANS: usize = 10;
+/// Scans added per improve-recognition round.
+pub const IMPROVE_SCANS: usize = 5;
 
 /// One quality-gated capture under a profile. `rgb` is a 512-D L2-normalized
 /// AuraFace embedding; `ir` is the IR-face embedding for dark operation.
@@ -53,6 +63,12 @@ pub struct FaceScan {
 pub struct FaceProfile {
     pub name: String,
     pub scans: Vec<FaceScan>,
+    /// Per-profile IR calibration (ADR-0004), fitted from this profile's own
+    /// scan pairs at enroll/add-scan time. Only fitted and applied when no
+    /// global IR adapter is loaded (raw embedding space); `None` otherwise
+    /// and on profiles from before the feature.
+    #[serde(default)]
+    pub ir_calib: Option<crate::calib::IrCalibration>,
 }
 
 /// The physical camera(s) an enrollment was captured on, for anti-swap binding:
@@ -279,6 +295,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
     Enrollment {
         user: old.user,
         profiles: vec![FaceProfile {
+            ir_calib: None,
             name: "Face Profile 1".into(),
             scans,
         }],
@@ -492,6 +509,7 @@ mod tests {
         Enrollment {
             user: "u".into(),
             profiles: vec![FaceProfile {
+                ir_calib: None,
                 name: "Face Profile 1".into(),
                 scans: vec![FaceScan {
                     name: "Face Scan 1".into(),
@@ -571,6 +589,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         // One calibrated scan -> not enough.
         e.profiles.push(FaceProfile {
+            ir_calib: None,
             name: "p".into(),
             scans: vec![scan_with_pitch(0.60)],
         });
@@ -589,6 +608,7 @@ mod tests {
         // One IR scan -> not enough to characterise the user's rig.
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            ir_calib: None,
             name: "p".into(),
             scans: vec![scan_with_ir(1.5, 100.0)],
         });
@@ -617,6 +637,7 @@ mod tests {
     fn ir_scans_for_filters_space_and_dimension() {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            ir_calib: None,
             name: "p".into(),
             scans: vec![
                 scan_in_space("legacy-untagged", 4, None),
@@ -645,6 +666,7 @@ mod tests {
     fn retag_untagged_ir_stamps_only_matching_legacy_scans() {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            ir_calib: None,
             name: "p".into(),
             scans: vec![
                 scan_in_space("legacy", 4, None),          // stamped
@@ -677,6 +699,7 @@ mod tests {
         // RGB-only scans (no IR) must not count toward the floor.
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            ir_calib: None,
             name: "p".into(),
             scans: vec![
                 FaceScan {
@@ -699,6 +722,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         assert_eq!(e.next_profile_name(), "Face Profile 1");
         e.profiles.push(FaceProfile {
+            ir_calib: None,
             name: "Face Profile 1".into(),
             scans: vec![],
         });

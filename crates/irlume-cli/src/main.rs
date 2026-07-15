@@ -49,6 +49,7 @@ const DEV_CMDS: &[&str] = &[
     "padcapture",
     "padreport",
     "verify",
+    "enrolldev",
     "suncal",
 ];
 
@@ -89,6 +90,7 @@ fn main() -> std::process::ExitCode {
         (Some("enroll"), _) => enroll(&args),
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
+        (Some("enrolldev"), _) => enrolldev(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
         (Some("recovery"), sub) => recovery::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
@@ -546,6 +548,38 @@ pub(crate) fn user_arg(args: &[String]) -> String {
 
 /// Build an Engine: optional --rgb/--ir device overrides, and auto-load the IR
 /// adapter from models/ir_adapter.onnx (or --adapter PATH) if present.
+/// `irlume enrolldev --user U --det <yunet.onnx> --model <glintr100.onnx>
+///   [--name N] [--scans K] [--adapter P] [--rgb ..] [--ir ..]`
+///
+/// Direct-mode enrollment (no daemon), the enroll-side companion to `verify`:
+/// drives `Engine::enroll_profile` against the current `IRLUME_STATE_DIR`, so
+/// matching-path changes (e.g. the ADR-0004 per-enrollment calibration) can
+/// be exercised end-to-end in an isolated state dir without touching the
+/// installed daemon or production enrollments. `--adapter /nonexistent`
+/// forces the raw-IR pipeline, which is where the calibration activates.
+fn enrolldev(args: &[String]) -> std::process::ExitCode {
+    let (Some(det), Some(model)) = (flag(args, "--det"), flag(args, "--model")) else {
+        eprintln!("usage: irlume enrolldev --user U --det <yunet.onnx> --model <glintr100.onnx> [--name N] [--scans K] [--adapter P] [--rgb ..] [--ir ..]");
+        return std::process::ExitCode::from(2);
+    };
+    let user = user_arg(args);
+    let name = flag(args, "--name").map(String::from);
+    let want = flag(args, "--scans")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
+    eprintln!("[enrolldev] '{user}': {want} scans into IRLUME_STATE_DIR; stay in frame…");
+    match engine(det, model, args).and_then(|mut e| e.enroll_profile(&user, name, want)) {
+        Ok((profile, n)) => {
+            println!("[enrolldev] enrolled '{profile}' ({n} scans)");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("enrolldev error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
     let e = match (flag(args, "--rgb"), flag(args, "--ir")) {

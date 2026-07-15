@@ -14,6 +14,7 @@ Environment="IRLUME_DET_MODEL=/usr/share/irlume/models/face_detection_yunet_2023
 Environment="IRLUME_MODEL=/usr/share/irlume/models/glintr100.onnx"
 Environment="IRLUME_IR_ADAPTER=/usr/share/irlume/models/ir_adapter.onnx"
 Environment="IRLUME_MESH_MODEL=/usr/share/irlume/models/face_landmark.onnx"
+Environment="IRLUME_BLAZE_MODEL=/usr/share/irlume/models/blaze_face_short_range.onnx"
 Environment="IRLUME_SOCKET=/run/irlume.sock"
 # State dir is per-user under $HOME/.local/share/irlume; the daemon resolves
 # the target user per request, so no global STATE_DIR is set here.

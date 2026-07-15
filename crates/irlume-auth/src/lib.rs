@@ -31,6 +31,11 @@ pub struct Engine {
     /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
     /// the opt-in passive-liveness gate (it can't run without landmarks).
     mesh: Option<irlume_vision::FaceMesh>,
+    /// Optional BlazeFace short-range RESCUE detector: runs only when YuNet
+    /// finds no face (saturated outdoor backgrounds; 2026-07-15 bench: 96.9%
+    /// vs YuNet's 76.9% on the sunlight walking bursts). Needs `mesh` to
+    /// refine its coarse box into alignment landmarks.
+    blaze: Option<irlume_vision::BlazeRescue>,
     gate: LivenessGate,
     rgb_dev: String,
     ir_dev: String,
@@ -181,6 +186,7 @@ impl Engine {
             ir_adapter: None,
             ir_space: "raw".into(),
             mesh: None,
+            blaze: None,
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
@@ -301,6 +307,54 @@ impl Engine {
             self.mesh = Some(irlume_vision::FaceMesh::load_from_file(path)?);
         }
         Ok(self)
+    }
+
+    /// Load the BlazeFace short-range rescue detector (improves detection on
+    /// saturated outdoor frames). No-op if the file is absent.
+    pub fn with_blaze_rescue(mut self, path: &str) -> irlume_common::Result<Self> {
+        if std::path::Path::new(path).exists() {
+            self.blaze = Some(irlume_vision::BlazeRescue::load_from_file(path)?);
+        }
+        Ok(self)
+    }
+
+    pub fn has_blaze_rescue(&self) -> bool {
+        self.blaze.is_some()
+    }
+
+    /// Detection rescue (cascade stage 2): when YuNet returns no face, try
+    /// BlazeFace and refine its coarse box into the 5 alignment landmarks
+    /// with FaceMesh (BlazeFace has no mouth corners and its eyes measured
+    /// 0.087 NME vs YuNet's 0.053 — never align from its own keypoints).
+    /// Returns a Detection shaped exactly like YuNet's, or None when either
+    /// optional model is absent or no face clears the threshold.
+    fn rescue_detect(&mut self, view: &align::RgbView<'_>, tag: &str) -> Option<Detection> {
+        let blaze = self.blaze.as_mut()?;
+        let mesh = self.mesh.as_mut()?;
+        let (bbox, score) = blaze.detect_top(view).ok().flatten()?;
+        let lm = mesh.landmarks(view, &bbox, 0.25).ok()?;
+        if lm.len() < irlume_vision::MESH_N {
+            return None;
+        }
+        let center = |idx: &[usize; 6]| {
+            let (mut x, mut y) = (0.0f32, 0.0f32);
+            for &i in idx {
+                x += lm[i].0;
+                y += lm[i].1;
+            }
+            (x / 6.0, y / 6.0)
+        };
+        let e1 = center(&irlume_vision::EAR_LEFT);
+        let e2 = center(&irlume_vision::EAR_RIGHT);
+        let (le, re) = if e1.0 <= e2.0 { (e1, e2) } else { (e2, e1) };
+        let (m1, m2) = (lm[61], lm[291]);
+        let (ml, mr) = if m1.0 <= m2.0 { (m1, m2) } else { (m2, m1) };
+        irlume_common::dlog!("detect({tag}): blaze rescue fired (score {score:.2})");
+        Some(Detection {
+            bbox,
+            score,
+            landmarks: [le, re, lm[1], ml, mr],
+        })
     }
 
     pub fn has_mesh(&self) -> bool {
@@ -473,6 +527,16 @@ impl Engine {
             rgb_faces.len(),
             rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
+        if rgb_top.is_none() {
+            rgb_top = self.rescue_detect(
+                &align::RgbView {
+                    data: &rgb.data,
+                    width: rgb.width,
+                    height: rgb.height,
+                },
+                "rgb",
+            );
+        }
 
         // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
         // above already returned, so reaching here with `None` is unreachable,
@@ -492,7 +556,7 @@ impl Engine {
             height: ir.height,
         };
         let ir_faces = self.det.detect(&ir_view)?;
-        let ir_top = ir_faces
+        let mut ir_top = ir_faces
             .iter()
             .max_by(|a, b| a.score.total_cmp(&b.score))
             .cloned();
@@ -503,6 +567,14 @@ impl Engine {
             ir_faces.len(),
             ir_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
+        if ir_top.is_none() {
+            let iv = align::RgbView {
+                data: &ir_grey_rgb,
+                width: ir.width,
+                height: ir.height,
+            };
+            ir_top = self.rescue_detect(&iv, "ir");
+        }
 
         // Cross-spectrum self-heal for overlapped-capture RGB dimming. Some
         // Hello modules (measured: NexiGo N930W) starve the RGB stream when

@@ -41,6 +41,8 @@ override_dh_auto_install:
 		debian/irlume/usr/share/irlume/models/face_detection_yunet_2023mar.onnx
 	install -D -m0644 models/face_landmark.onnx \
 		debian/irlume/usr/share/irlume/models/face_landmark.onnx
+	install -D -m0644 models/blaze_face_short_range.onnx \
+		debian/irlume/usr/share/irlume/models/blaze_face_short_range.onnx
 	install -D -m0644 models/ir_adapter.onnx \
 		debian/irlume/usr/share/irlume/models/ir_adapter.onnx
 	mkdir -p debian/irlume/opt/irlume/onnxruntime

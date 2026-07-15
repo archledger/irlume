@@ -336,18 +336,37 @@ mod onnx {
     /// validated empirically (that's the open question the diagnostic answers).
     pub struct FaceMesh {
         session: Session,
+        /// Square input side, read from the model: 192 for the legacy
+        /// face_landmark, 256 for the face_landmarker-generation mesh.
+        input: u32,
     }
 
-    /// FaceMesh square input side.
+    /// Legacy FaceMesh square input side (fallback when the model does not
+    /// declare static input dims).
     pub const MESH_INPUT: u32 = 192;
-    /// Number of dense landmarks.
+    /// Number of dense landmarks in the legacy topology. The newer mesh emits
+    /// 478 (the same 468 plus 10 iris points); both are accepted and the
+    /// shared indices (EAR rings, nose, mouth corners) are identical.
     pub const MESH_N: usize = 468;
+    /// Landmark count of the face_landmarker-generation mesh.
+    pub const MESH_N_IRIS: usize = 478;
 
     impl FaceMesh {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
-            Ok(Self {
-                session: build(model)?,
-            })
+            let session = build(model)?;
+            // NHWC [1, side, side, 3]: take the declared H when static.
+            let input = session
+                .inputs()
+                .first()
+                .and_then(|i| match i.dtype() {
+                    ort::value::ValueType::Tensor { shape, .. } => {
+                        shape.get(1).copied().filter(|&d| d > 0)
+                    }
+                    _ => None,
+                })
+                .map(|d| d as u32)
+                .unwrap_or(MESH_INPUT);
+            Ok(Self { session, input })
         }
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
@@ -369,7 +388,7 @@ mod onnx {
             let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * margin);
             let (x0, y0) = (cx - half, cy - half);
             let side = 2.0 * half;
-            let n = MESH_INPUT as usize;
+            let n = self.input as usize;
             // NHWC, normalized to [0,1] (MediaPipe face_landmark expects [0,1]; flip
             // to (px/127.5−1) if landmarks come out garbage; the first thing to try).
             let mut data = vec![0.0f32; n * n * 3];
@@ -384,23 +403,26 @@ mod onnx {
                     data[i + 2] = p[2] / 255.0;
                 }
             }
-            let s = MESH_INPUT as i64;
+            let s = self.input as i64;
             let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
-            // Find the 468×3 landmark tensor by length (order-agnostic).
+            // Find the landmark tensor by length (order-agnostic): 468x3
+            // legacy or 478x3 iris-generation.
             let mut lm_raw: Option<Vec<f32>> = None;
             for i in 0..outputs.len() {
                 let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
-                if raw.len() == MESH_N * 3 {
+                if raw.len() == MESH_N * 3 || raw.len() == MESH_N_IRIS * 3 {
                     lm_raw = Some(raw.to_vec());
                 }
             }
-            let raw = lm_raw.ok_or_else(|| err(format!("no {MESH_N}-landmark output")))?;
-            // Map input-space (0..192) coords back to the frame crop.
-            let mut out = Vec::with_capacity(MESH_N);
-            for k in 0..MESH_N {
-                let lx = raw[3 * k] / MESH_INPUT as f32 * side + x0;
-                let ly = raw[3 * k + 1] / MESH_INPUT as f32 * side + y0;
+            let raw =
+                lm_raw.ok_or_else(|| err(format!("no {MESH_N}/{MESH_N_IRIS}-landmark output")))?;
+            let count = raw.len() / 3;
+            // Map input-space (0..side) coords back to the frame crop.
+            let mut out = Vec::with_capacity(count);
+            for k in 0..count {
+                let lx = raw[3 * k] / self.input as f32 * side + x0;
+                let ly = raw[3 * k + 1] / self.input as f32 * side + y0;
                 out.push((lx, ly));
             }
             Ok(out)
@@ -504,6 +526,129 @@ mod onnx {
         }
     }
 
+    /// BlazeFace short-range (Apache-2.0, Google MediaPipe): RESCUE detector
+    /// for frames YuNet loses. Benchmarked 2026-07-15 on the sunlight field
+    /// bursts: 96.9% detection on saturated outdoor-walking frames where
+    /// YuNet manages 76.9% — but only 40% on shaded faces where YuNet holds
+    /// 99%, and its eye keypoints are coarser (NME 0.087 vs 0.053). It
+    /// therefore NEVER replaces YuNet: it runs only when YuNet returns no
+    /// face, and its box must be refined by FaceMesh before alignment.
+    ///
+    /// Contract (decode parity-tested against the official MediaPipe
+    /// runtime: 0.94 mean IoU, eyes within ~5px): input 128x128x3 RGB NHWC
+    /// in [-1,1] from a zero-padded square letterbox; outputs 896 SSD
+    /// anchors x 16 regressors (cx,cy,w,h + 6 keypoints, all /128 relative
+    /// to anchor centers) + 896 logits (sigmoid, clipped +/-100). Anchors:
+    /// 16x16 cells x2 (stride 8) then 8x8 x6 (stride 16), sizes 1.0.
+    pub struct BlazeRescue {
+        session: Session,
+        anchors: Vec<(f32, f32)>,
+    }
+
+    /// BlazeFace square input side.
+    pub const BLAZE_INPUT: usize = 128;
+    /// Rescue-path detection threshold (same operating point as the bench).
+    pub const BLAZE_SCORE_THRESHOLD: f32 = 0.5;
+
+    fn blaze_anchors() -> Vec<(f32, f32)> {
+        let mut a = Vec::with_capacity(896);
+        for (cells, per_cell) in [(16usize, 2usize), (8, 6)] {
+            for r in 0..cells {
+                for c in 0..cells {
+                    for _ in 0..per_cell {
+                        a.push((
+                            (c as f32 + 0.5) / cells as f32,
+                            (r as f32 + 0.5) / cells as f32,
+                        ));
+                    }
+                }
+            }
+        }
+        a
+    }
+
+    impl BlazeRescue {
+        pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            Ok(Self {
+                session: build(model)?,
+                anchors: blaze_anchors(),
+            })
+        }
+        pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
+            let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            Self::load_from_memory(&bytes)
+        }
+
+        /// Top-scoring face, or `None` below threshold. Returns the bbox in
+        /// frame pixels (x1,y1,x2,y2) and the score. No keypoints: they are
+        /// too coarse for alignment; refine with [`FaceMesh::landmarks`].
+        pub fn detect_top(
+            &mut self,
+            frame: &align::RgbView,
+        ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
+            let side = frame.width.max(frame.height) as f32;
+            let n = BLAZE_INPUT;
+            let mut data = vec![0.0f32; n * n * 3];
+            for oy in 0..n {
+                for ox in 0..n {
+                    let sx = (ox as f32 + 0.5) / n as f32 * side;
+                    let sy = (oy as f32 + 0.5) / n as f32 * side;
+                    // Zero-pad outside the frame (letterbox), matching the
+                    // parity reference exactly.
+                    if sx >= frame.width as f32 || sy >= frame.height as f32 {
+                        continue;
+                    }
+                    let p = frame.sample_bilinear(sx, sy);
+                    let i = (oy * n + ox) * 3;
+                    data[i] = (p[0] - 127.5) / 127.5;
+                    data[i + 1] = (p[1] - 127.5) / 127.5;
+                    data[i + 2] = (p[2] - 127.5) / 127.5;
+                }
+            }
+            let s = n as i64;
+            let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
+            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            // Identify the two heads by length (order-agnostic).
+            let (mut reg, mut cls): (Option<Vec<f32>>, Option<Vec<f32>>) = (None, None);
+            for i in 0..outputs.len() {
+                let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
+                match raw.len() {
+                    l if l == 896 * 16 => reg = Some(raw.to_vec()),
+                    896 => cls = Some(raw.to_vec()),
+                    _ => {}
+                }
+            }
+            let (Some(reg), Some(cls)) = (reg, cls) else {
+                return Err(err("blaze: unexpected output tensors"));
+            };
+            let (mut best_i, mut best_s) = (0usize, f32::NEG_INFINITY);
+            for (i, &logit) in cls.iter().enumerate() {
+                let sc = 1.0 / (1.0 + (-logit.clamp(-100.0, 100.0)).exp());
+                if sc > best_s {
+                    best_s = sc;
+                    best_i = i;
+                }
+            }
+            if best_s < BLAZE_SCORE_THRESHOLD {
+                return Ok(None);
+            }
+            let r = &reg[best_i * 16..best_i * 16 + 16];
+            let (ax, ay) = self.anchors[best_i];
+            let scale = BLAZE_INPUT as f32;
+            let (cx, cy) = (ax + r[0] / scale, ay + r[1] / scale);
+            let (bw, bh) = (r[2] / scale, r[3] / scale);
+            Ok(Some((
+                [
+                    (cx - bw / 2.0) * side,
+                    (cy - bh / 2.0) * side,
+                    (cx + bw / 2.0) * side,
+                    (cy + bh / 2.0) * side,
+                ],
+                best_s,
+            )))
+        }
+    }
+
     /// Resize+letterbox an RGB frame into a BGR, raw 0–255, NCHW input tensor for
     /// YuNet (top-left aligned; remainder zero-padded).
     fn letterbox_bgr(frame: &align::RgbView, scale: f32, size: usize) -> Vec<f32> {
@@ -555,8 +700,8 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    eye_ear, selftest_alignment_identity, Adapter, Detector, Embedder, FaceMesh, EAR_LEFT,
-    EAR_RIGHT, MESH_INPUT, MESH_N,
+    eye_ear, selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh,
+    BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 #[cfg(all(test, feature = "onnx"))]

@@ -15,7 +15,8 @@ After changing any shipped model, regenerate it and commit both:
 |---|---|---|---|---|
 | `face_detection_yunet_2023mar.onnx` | detection | [OpenCV Zoo](https://github.com/opencv/opencv_zoo) | **MIT** | bbox + 5 landmarks; int8 variant also fine |
 | `glintr100.onnx` | recognition | [fal/AuraFace-v1](https://huggingface.co/fal/AuraFace-v1) | **Apache-2.0** | 512-D ArcFace; use ONLY this file from the repo |
-| `face_landmark.onnx` | liveness (EAR) | Google MediaPipe FaceMesh (`face_landmark.tflite`) | **Apache-2.0** | 468 landmarks; input `[1,192,192,3]` RGB → `1404` + face flag. Eye-contour EAR for passive blink liveness. See note below. |
+| `face_landmark.onnx` | liveness (EAR) + rescue alignment | Google MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite` from `face_landmarker.task`) | **Apache-2.0** | 478 landmarks (468 + iris); input `[1,256,256,3]` RGB → `1434` + face flag. Replaced the legacy 192px/468pt FaceMesh 2026-07-15 (12% better eye accuracy on CBSR, NME 0.0345 vs 0.0392); the loader auto-detects either generation, legacy banked as `.legacy-192`. |
+| `blaze_face_short_range.onnx` | detection rescue | Google MediaPipe BlazeFace short-range (`blaze_face_short_range.tflite`) | **Apache-2.0** | Cascade stage 2: runs only when YuNet finds no face. 2026-07-15 bench: 96.9% vs YuNet's 76.9% on saturated outdoor frames, but 40% on shaded faces where YuNet holds 99% — never a YuNet replacement. Box refined by FaceMesh before alignment. |
 | `ir_adapter.onnx` | recognition (IR domain) | self-trained residual adapter (512→512), trained on the CBSR NIR (OTCBVS dataset 07) and Oulu-CASIA NIR academic datasets | **research-only taint — see note below** | boosts IR-frame match scores toward the RGB enrollment |
 
 ### ir_adapter.onnx: training-data correction (2026-07-14)

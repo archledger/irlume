@@ -74,7 +74,7 @@ install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
 install -Dm0755 target/release/irlume  %{buildroot}%{_bindir}/irlume
 install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/pam_irlume.so
 # Bundled models (Git LFS) → /usr/share/irlume/models
-for m in glintr100 face_detection_yunet_2023mar face_landmark ir_adapter; do
+for m in glintr100 face_detection_yunet_2023mar face_landmark ir_adapter blaze_face_short_range; do
     install -Dm0644 models/$m.onnx %{buildroot}%{_datadir}/%{name}/models/$m.onnx
 done
 install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlumed.service

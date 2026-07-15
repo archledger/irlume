@@ -71,10 +71,14 @@ fn main() {
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
     let adapter = env_or("IRLUME_IR_ADAPTER", "/etc/irlume/ir_adapter.onnx");
     let mesh = env_or("IRLUME_MESH_MODEL", "/etc/irlume/face_landmark.onnx");
+    let blaze = env_or(
+        "IRLUME_BLAZE_MODEL",
+        "/etc/irlume/blaze_face_short_range.onnx",
+    );
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
-    verify_models(&[&det, &model, &adapter, &mesh]);
+    verify_models(&[&det, &model, &adapter, &mesh, &blaze]);
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
     // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
     let (rgb_dev, ir_dev) = irlume_auth::select_pair();
@@ -96,6 +100,7 @@ fn main() {
         .map(|e| e.with_devices(&rgb_dev, &ir_dev))
         .and_then(|e| e.with_ir_adapter(&adapter))
         .and_then(|e| e.with_mesh(&mesh))
+        .and_then(|e| e.with_blaze_rescue(&blaze))
     {
         Ok(e) => {
             eprintln!(
@@ -109,6 +114,14 @@ fn main() {
             eprintln!(
                 "irlumed: FaceMesh (passive liveness) {}",
                 if e.has_mesh() { "loaded" } else { "absent" }
+            );
+            eprintln!(
+                "irlumed: BlazeFace rescue detector {}",
+                if e.has_blaze_rescue() {
+                    "loaded"
+                } else {
+                    "absent"
+                }
             );
             e
         }

@@ -596,6 +596,11 @@ fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlu
     if e.has_mesh() {
         eprintln!("[engine] FaceMesh loaded ({mesh}); passive EAR liveness available");
     }
+    let blaze = flag(args, "--blaze").unwrap_or("models/blaze_face_short_range.onnx");
+    let e = e.with_blaze_rescue(blaze)?;
+    if e.has_blaze_rescue() {
+        eprintln!("[engine] BlazeFace rescue loaded ({blaze}); detection cascade active");
+    }
     Ok(e)
 }
 

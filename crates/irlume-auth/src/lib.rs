@@ -87,19 +87,41 @@ pub struct IdentifyOutcome {
 /// brightness, signed pitch).
 type Scan = (Vec<f32>, Option<Vec<f32>>, f32, f32, f32);
 
-/// Presence grace window after the consent gesture, milliseconds. The user
-/// pressed Enter (usually already in frame), so this is a "keep looking" window
-/// that tolerates walking up / settling before it gives up to the password
-/// (~15s, roughly 10 capture attempts at ~1.1-1.5s each). It retries ONLY
-/// presence failures (no matcher ran), so a longer window costs no false-accept
-/// resistance. Override with `IRLUME_GRACE_MS` (0 = legacy one-shot).
+/// Presence grace window after the consent gesture, milliseconds, for the
+/// login and lock-screen path. The user pressed Enter (usually already in
+/// frame), so this is a "keep looking" window that tolerates walking up /
+/// settling before it gives up to the password (~15s, roughly 10 capture
+/// attempts at ~1.1-1.5s each). It retries ONLY presence failures (no matcher
+/// ran), so a longer window costs no false-accept resistance. Override with
+/// `IRLUME_GRACE_MS` (0 = legacy one-shot).
 pub const GRACE_WINDOW_MS: u64 = 15000;
+/// Shorter window for `sudo` (and `su`): at a terminal the user is already
+/// looking at the screen, so a match lands on the first attempt; if they look
+/// away they want a quick drop to the password prompt, not a long freeze.
+pub const SUDO_GRACE_WINDOW_MS: u64 = 5000;
 
-fn grace_window_ms() -> u64 {
-    std::env::var("IRLUME_GRACE_MS")
+/// True for the sudo/su family of PAM services, which take the shorter window.
+fn is_sudo_like(service: &str) -> bool {
+    matches!(
+        service,
+        "sudo" | "sudo-i" | "su" | "su-l" | "runuser" | "runuser-l"
+    )
+}
+
+/// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
+/// (testing); otherwise sudo/su get the short window and every login/lock
+/// service (and an unknown/absent service) gets the full login window.
+fn grace_window_ms(service: Option<&str>) -> u64 {
+    if let Some(v) = std::env::var("IRLUME_GRACE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(GRACE_WINDOW_MS)
+    {
+        return v;
+    }
+    match service {
+        Some(s) if is_sudo_like(s) => SUDO_GRACE_WINDOW_MS,
+        _ => GRACE_WINDOW_MS,
+    }
 }
 
 /// Presence-class failure: the attempt never reached a match verdict because
@@ -840,8 +862,16 @@ impl Engine {
     /// was reached). A real match verdict below threshold never retries (each
     /// extra matcher attempt multiplies FAR), and a Spoof verdict never
     /// retries (no free attack retries). See [`presence_retryable`].
-    pub fn authenticate(&mut self, user: &str) -> irlume_common::Result<Outcome> {
-        let window = grace_window_ms();
+    ///
+    /// `service` (the PAM service name) selects the window: `sudo`/`su` get the
+    /// shorter [`SUDO_GRACE_WINDOW_MS`]; login and lock services (and `None`)
+    /// get the full [`GRACE_WINDOW_MS`]. `IRLUME_GRACE_MS` overrides both.
+    pub fn authenticate(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+    ) -> irlume_common::Result<Outcome> {
+        let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
         let mut attempt = 0u32;
         loop {
@@ -1957,6 +1987,18 @@ mod tests {
             score: 0.0,
             reason: reason.into(),
         }
+    }
+
+    #[test]
+    fn grace_window_shorter_for_sudo_than_login() {
+        // Env override off for this check (the test process shouldn't set it).
+        assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
+        assert_eq!(grace_window_ms(Some("su")), SUDO_GRACE_WINDOW_MS);
+        // Login/lock services and an unknown/absent service get the full window.
+        assert_eq!(grace_window_ms(Some("plasmalogin")), GRACE_WINDOW_MS);
+        assert_eq!(grace_window_ms(Some("kde")), GRACE_WINDOW_MS);
+        assert_eq!(grace_window_ms(Some("gdm-password")), GRACE_WINDOW_MS);
+        assert_eq!(grace_window_ms(None), GRACE_WINDOW_MS);
     }
 
     #[test]

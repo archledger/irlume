@@ -361,7 +361,7 @@ fn verify(args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     };
     let user = user_arg(args);
-    match engine(det, model, args).and_then(|mut e| e.authenticate(&user)) {
+    match engine(det, model, args).and_then(|mut e| e.authenticate(&user, None)) {
         Ok(o) => {
             println!(
                 "[verify] live={} score {:.3} -> {} ({})",

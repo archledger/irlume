@@ -453,7 +453,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            match engine.authenticate(&user) {
+            match engine.authenticate(&user, service.as_deref()) {
                 Ok(o) => {
                     if convenience || irlume_common::dbglog::on() {
                         // Denied score + reason measurements quantized/redacted
@@ -660,7 +660,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     ));
                 }
             }
-            do_unseal_password(&user, engine)
+            do_unseal_password(&user, service.as_deref(), engine)
         }
         Request::UnsealKeyring { user, service } => {
             // Fingerprint keyring unlock. pam_fprintd has ALREADY authenticated
@@ -1089,7 +1089,11 @@ fn deny_reason(r: &str) -> String {
     out
 }
 
-fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response {
+fn do_unseal_password(
+    user: &str,
+    service: Option<&str>,
+    engine: &mut irlume_auth::Engine,
+) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
@@ -1097,7 +1101,7 @@ fn do_unseal_password(user: &str, engine: &mut irlume_auth::Engine) -> Response 
             "no sealed password for '{user}': run `irlume keyring arm`"
         ));
     }
-    let outcome = match engine.authenticate(user) {
+    let outcome = match engine.authenticate(user, service) {
         Ok(o) => o,
         Err(e) => {
             // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it

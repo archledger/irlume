@@ -65,6 +65,15 @@ when isolating a camera problem.
 The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
 
+Authentication also has a presence grace window: after the consent gesture,
+capture attempts repeat for up to ~15 seconds while no usable face is in frame,
+so walking up or settling into position still works (`grace:` debug lines show
+the attempts). Only presence-class failures retry (no face, off-angle, or the
+transient "RGB face / no IR face" a user makes while settling); a
+below-threshold match or a real spoof verdict settles immediately.
+`IRLUME_GRACE_MS` on the daemon tunes the window; `0` restores the old
+one-shot behavior.
+
 **Security note: treat tracing as a diagnostic session, not a resident
 setting.** While tracing is on, *denied* attempts log their exact match score
 next to the threshold. To anyone who can read the system journal (root or the

@@ -87,6 +87,44 @@ pub struct IdentifyOutcome {
 /// brightness, signed pitch).
 type Scan = (Vec<f32>, Option<Vec<f32>>, f32, f32, f32);
 
+/// Presence grace window after the consent gesture, milliseconds. The user
+/// pressed Enter (usually already in frame), so this is a "keep looking" window
+/// that tolerates walking up / settling before it gives up to the password
+/// (~15s, roughly 10 capture attempts at ~1.1-1.5s each). It retries ONLY
+/// presence failures (no matcher ran), so a longer window costs no false-accept
+/// resistance. Override with `IRLUME_GRACE_MS` (0 = legacy one-shot).
+pub const GRACE_WINDOW_MS: u64 = 15000;
+
+fn grace_window_ms() -> u64 {
+    std::env::var("IRLUME_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GRACE_WINDOW_MS)
+}
+
+/// Presence-class failure: the attempt never reached a match verdict because
+/// no usable face was in frame (absent, off-angle, or missing in one
+/// spectrum). These are the ONLY outcomes the grace window may retry: they
+/// are FAR-neutral (no matcher ran) and give an attacker nothing.
+///
+/// The `no face in IR` Spoof is included deliberately. It fires when RGB sees a
+/// face but IR does not: BOTH a screen/print attack (no 850nm return) AND a
+/// genuine user mid-settle (IR field/timing hasn't caught them yet). Retrying
+/// is safe against the attack: a real screen never grows an IR face, so it
+/// keeps producing this Spoof until the window expires and the denial stands;
+/// a genuine user's IR catches up within a retry or two. Live-found
+/// 2026-07-15: without this, settling into frame can be denied on the
+/// transient mismatch. Other Spoof reasons (flat/depth/2D) are NOT retried,
+/// and a below-threshold MATCH is never retried (that would multiply FAR).
+fn presence_retryable(o: &Outcome) -> bool {
+    !o.granted
+        && !o.live
+        && (o.reason.starts_with("no face:")
+            || o.reason.starts_with("liveness Uncertain:")
+            || o.reason.starts_with("dark liveness Uncertain:")
+            || o.reason.starts_with("liveness Spoof: no face in IR"))
+}
+
 /// Calibration-aware IR match result (see [`ir_match_in`]).
 struct IrMatch {
     best: f32,
@@ -791,7 +829,41 @@ impl Engine {
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
     /// then 1:N cosine match against every scan in every enrolled face profile
     /// (any enrolled face unlocks). Threshold scales with the total scan count.
+    /// Consent-gesture authenticate with a presence GRACE WINDOW. The gesture
+    /// (blank password + Enter) already granted camera consent, so instead of
+    /// failing instantly when the user is not yet in frame (leaning over the
+    /// keyboard they just pressed), capture attempts repeat until a face is
+    /// assessed or [`GRACE_WINDOW_MS`] elapses.
+    ///
+    /// SECURITY INVARIANT: only PRESENCE-class failures retry (no face found,
+    /// liveness Uncertain framing rejections — cases where no match verdict
+    /// was reached). A real match verdict below threshold never retries (each
+    /// extra matcher attempt multiplies FAR), and a Spoof verdict never
+    /// retries (no free attack retries). See [`presence_retryable`].
     pub fn authenticate(&mut self, user: &str) -> irlume_common::Result<Outcome> {
+        let window = grace_window_ms();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let out = self.authenticate_once(user)?;
+            if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
+                if attempt > 1 {
+                    irlume_common::dlog!(
+                        "grace: settled after {attempt} attempts ({}ms window)",
+                        window
+                    );
+                }
+                return Ok(out);
+            }
+            irlume_common::dlog!(
+                "grace: attempt {attempt} found no usable face ({}); retrying within window",
+                out.reason
+            );
+        }
+    }
+
+    fn authenticate_once(&mut self, user: &str) -> irlume_common::Result<Outcome> {
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
@@ -1876,6 +1948,70 @@ mod tests {
         let with_adapter = ir_match_in("raw", true, &enr, &probe);
         assert!(with_adapter.centroid.is_none());
         assert!(with_adapter.best.is_finite());
+    }
+
+    fn denied(reason: &str, live: bool) -> Outcome {
+        Outcome {
+            granted: false,
+            live,
+            score: 0.0,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn grace_retries_only_presence_failures() {
+        use irlume_liveness::Verdict;
+        // Retryable: the user simply was not usably in frame yet. The strings
+        // are built exactly as the authenticate path builds them.
+        assert!(presence_retryable(&denied(
+            "no face: no face in RGB",
+            false
+        )));
+        assert!(presence_retryable(&denied(
+            &format!("liveness {:?}: not facing the camera", Verdict::Uncertain),
+            false
+        )));
+        assert!(presence_retryable(&denied(
+            &format!("dark liveness {:?}: one-sided", Verdict::Uncertain),
+            false
+        )));
+        // Retryable: the RGB-yes/IR-no transient a genuine user produces while
+        // settling into frame (safe: a real screen never grows an IR face).
+        assert!(presence_retryable(&denied(
+            &format!(
+                "liveness {:?}: no face in IR: a real face reflects 850nm",
+                Verdict::Spoof
+            ),
+            false
+        )));
+        // NEVER retryable: a real spoof verdict (flat/2D — free attack retries)...
+        assert!(!presence_retryable(&denied(
+            &format!("liveness {:?}: flat 2D surface", Verdict::Spoof),
+            false
+        )));
+        assert!(!presence_retryable(&denied(
+            &format!("dark liveness {:?}: flat", Verdict::Spoof),
+            false
+        )));
+        // ...a real match verdict below threshold (FAR multiplication)...
+        assert!(!presence_retryable(&denied(
+            "below threshold (rgb 0.23, fusion+ir-fallback miss)",
+            true
+        )));
+        assert!(!presence_retryable(&denied("below threshold (ir)", true)));
+        // ...pre-camera refusals and grants.
+        assert!(!presence_retryable(&denied("'u' is not enrolled", false)));
+        assert!(!presence_retryable(&denied(
+            "face disabled (fingerprint mode)",
+            false
+        )));
+        assert!(!presence_retryable(&Outcome {
+            granted: true,
+            live: true,
+            score: 0.9,
+            reason: "match: p (rgb)".into(),
+        }));
     }
 
     #[test]

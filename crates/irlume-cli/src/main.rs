@@ -1557,6 +1557,67 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         }
     };
 
+    // Luma at (x, y) for 3-channel RGB or 1-channel grey data.
+    let luma = |data: &[u8], w: u32, ch: usize, x: u32, y: u32| -> f32 {
+        let i = ((y * w + x) as usize) * ch;
+        if ch == 3 {
+            0.299 * data[i] as f32 + 0.587 * data[i + 1] as f32 + 0.114 * data[i + 2] as f32
+        } else {
+            data[i] as f32
+        }
+    };
+
+    // Fraction of pixels at/above 250 (near clipping) across the whole frame:
+    // the saturated-background signature that blinds detection outdoors.
+    let sat_pct = |data: &[u8], w: u32, h: u32, ch: usize| -> f32 {
+        let (mut sat, mut cnt) = (0u64, 0u64);
+        for y in 0..h {
+            for x in 0..w {
+                if luma(data, w, ch, x, y) >= 250.0 {
+                    sat += 1;
+                }
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            0.0
+        } else {
+            sat as f32 / cnt as f32
+        }
+    };
+
+    // Sharpness: variance of the 3x3 Laplacian inside the face bbox (the
+    // standard blur/focus measure; low = defocused or motion-smeared sample).
+    let laplacian_var_bbox = |data: &[u8], w: u32, h: u32, ch: usize, bbox: &[f32; 4]| -> f32 {
+        let (x1, y1) = (bbox[0].max(1.0) as u32, bbox[1].max(1.0) as u32);
+        let (x2, y2) = (
+            (bbox[2] as u32).min(w.saturating_sub(1)),
+            (bbox[3] as u32).min(h.saturating_sub(1)),
+        );
+        if x2 <= x1 || y2 <= y1 {
+            return 0.0;
+        }
+        let (mut sum, mut sum2, mut cnt) = (0.0f64, 0.0f64, 0u64);
+        for y in y1..y2 {
+            for x in x1..x2 {
+                let lap = 4.0 * luma(data, w, ch, x, y)
+                    - luma(data, w, ch, x - 1, y)
+                    - luma(data, w, ch, x + 1, y)
+                    - luma(data, w, ch, x, y - 1)
+                    - luma(data, w, ch, x, y + 1);
+                sum += lap as f64;
+                sum2 += (lap * lap) as f64;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            0.0
+        } else {
+            let mean = sum / cnt as f64;
+            (sum2 / cnt as f64 - mean * mean) as f32
+        }
+    };
+
     let run = || -> irlume_common::Result<usize> {
         // Enrolled templates are encrypted at rest (TPM-sealed key, root-only), so a
         // user-space run can't decrypt them. That's fine: we always dump the raw
@@ -1602,6 +1663,7 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         );
         println!("[calcapture] sit naturally in frame; vary pose slightly between samples.");
         let mut written = 0usize;
+        let t0 = std::time::Instant::now();
         for idx in 0..n {
             // RGB (median-denoised, matches the auth path) + IR (brightest-of-burst).
             let rgbf = irlume_camera::capture_rgb_denoised(rgb_dev)?;
@@ -1630,6 +1692,28 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             let mut rec = serde_json::Map::new();
             rec.insert("idx".into(), idx.into());
             rec.insert("tag".into(), tag.clone().into());
+            // Wall clock since the first sample: real capture cadence (the
+            // per-sample rate is camera-I/O-bound and varies with USB load).
+            rec.insert(
+                "elapsed_ms".into(),
+                json_f32(t0.elapsed().as_secs_f32() * 1000.0),
+            );
+            // Whole-frame saturation: fraction of pixels at/above 250. High
+            // values are the outdoor failure signature (saturated background
+            // blinding the detector), worth stratifying training data by.
+            rec.insert(
+                "rgb_sat_pct".into(),
+                json_f32(sat_pct(&rgbf.data, rgbf.width, rgbf.height, 3)),
+            );
+            rec.insert(
+                "ir_sat_pct".into(),
+                json_f32(sat_pct(&irf.data, irf.width, irf.height, 1)),
+            );
+            // Capture resolution per modality: the driver may deliver a
+            // different mode than requested, and detection/sharpness numbers
+            // only compare across samples of the same resolution.
+            rec.insert("rgb_res".into(), vec![rgbf.width, rgbf.height].into());
+            rec.insert("ir_res".into(), vec![irf.width, irf.height].into());
 
             let (mut rgb_cos, mut rgb_bri) = (f32::NAN, 0.0f32);
             if let Some(t) = &rgb_top {
@@ -1642,6 +1726,16 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 rec.insert("rgb_face_score".into(), json_f32(t.score));
                 rec.insert("rgb_cos".into(), json_f32(rgb_cos));
                 rec.insert("rgb_brightness".into(), json_f32(rgb_bri));
+                rec.insert(
+                    "rgb_sharpness".into(),
+                    json_f32(laplacian_var_bbox(
+                        &rgbf.data,
+                        rgbf.width,
+                        rgbf.height,
+                        3,
+                        &t.bbox,
+                    )),
+                );
                 rec.insert("rgb_emb".into(), serde_json::to_value(e.to_vec()).unwrap());
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
@@ -1666,6 +1760,12 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 rec.insert("ir_face_score".into(), json_f32(t.score));
                 rec.insert("ir_cos_v1".into(), json_f32(ir_cos));
                 rec.insert("ir_brightness".into(), json_f32(ir_bri));
+                rec.insert(
+                    "ir_sharpness".into(),
+                    json_f32(laplacian_var_bbox(
+                        &irf.data, irf.width, irf.height, 1, &t.bbox,
+                    )),
+                );
                 rec.insert("ir_depth".into(), json_f32(ir_depth));
                 rec.insert("ir_glint".into(), json_f32(ir_glint));
                 rec.insert(

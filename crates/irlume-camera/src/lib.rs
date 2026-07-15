@@ -789,10 +789,25 @@ pub mod ir_probe {
         c / b
     }
 
-    /// Capture `n` raw IR frames (GREY 8-bit) with the emitter enabled, without
-    /// the brightest-frame reduction `capture_ir` does. Used to inspect the
-    /// strobe pattern and prototype subtraction.
+    /// [`capture_raw_burst_timed`] without the timing column, for callers that
+    /// only need the frames.
     pub fn capture_raw_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
+        Ok(capture_raw_burst_timed(device, n)?
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect())
+    }
+
+    /// Capture `n` raw IR frames (GREY 8-bit) with the emitter enabled, without
+    /// the brightest-frame reduction `capture_ir` does, each stamped with
+    /// milliseconds since the first dequeue (real delivered frame rate and
+    /// strobe cadence; the driver's nominal fps is not the delivered fps under
+    /// USB contention). Used to inspect the strobe pattern, prototype
+    /// subtraction, and audit capture timing offline.
+    pub fn capture_raw_burst_timed(
+        device: &str,
+        n: usize,
+    ) -> irlume_common::Result<Vec<(Frame, f64)>> {
         verify_pinned(device)?;
         if privacy_engaged(device) {
             return Err(Error::Hardware(format!(
@@ -808,14 +823,18 @@ pub mod ir_probe {
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         ir_emitter::enable(dev.handle().fd(), &card);
         let mut out = Vec::with_capacity(n);
+        let t0 = std::time::Instant::now();
         for _ in 0..n {
             let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-            out.push(Frame {
-                width: w,
-                height: h,
-                spectrum: Spectrum::Ir,
-                data: buf.to_vec(),
-            });
+            out.push((
+                Frame {
+                    width: w,
+                    height: h,
+                    spectrum: Spectrum::Ir,
+                    data: buf.to_vec(),
+                },
+                t0.elapsed().as_secs_f64() * 1000.0,
+            ));
         }
         Ok(out)
     }

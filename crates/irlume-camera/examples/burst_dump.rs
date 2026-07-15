@@ -16,20 +16,31 @@ fn main() {
     let n: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(36);
 
     std::fs::create_dir_all(&out).expect("create out dir");
-    let frames = ir_probe::capture_raw_burst(&dev, n).expect("capture");
+    let frames = ir_probe::capture_raw_burst_timed(&dev, n).expect("capture");
+    // means.txt columns: index, frame mean, ms since first dequeue. The third
+    // column is capture-time-only data (real delivered fps, strobe cadence);
+    // everything else about a frame can be recomputed offline from the PGM.
     let mut index = std::fs::File::create(format!("{out}/means.txt")).expect("index");
-    for (i, f) in frames.iter().enumerate() {
+    for (i, (f, ms)) in frames.iter().enumerate() {
         let mean = ir_probe::mean(&f.data);
-        writeln!(index, "{i:02} {mean:.1}").unwrap();
+        writeln!(index, "{i:02} {mean:.1} {ms:.1}").unwrap();
         let mut pgm = std::fs::File::create(format!("{out}/frame{i:02}.pgm")).expect("frame file");
         write!(pgm, "P5\n{} {}\n255\n", f.width, f.height).unwrap();
         pgm.write_all(&f.data).unwrap();
     }
+    let span_ms = frames.last().map(|(_, ms)| *ms).unwrap_or(0.0);
+    let fps = if span_ms > 0.0 {
+        (frames.len().saturating_sub(1)) as f64 / (span_ms / 1000.0)
+    } else {
+        0.0
+    };
     println!(
-        "{}: wrote {} frames ({}x{})",
+        "{}: wrote {} frames ({}x{}) in {:.0} ms ({:.1} fps delivered)",
         out,
         frames.len(),
-        frames[0].width,
-        frames[0].height
+        frames[0].0.width,
+        frames[0].0.height,
+        span_ms,
+        fps
     );
 }

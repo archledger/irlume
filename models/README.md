@@ -16,7 +16,26 @@ After changing any shipped model, regenerate it and commit both:
 | `face_detection_yunet_2023mar.onnx` | detection | [OpenCV Zoo](https://github.com/opencv/opencv_zoo) | **MIT** | bbox + 5 landmarks; int8 variant also fine |
 | `glintr100.onnx` | recognition | [fal/AuraFace-v1](https://huggingface.co/fal/AuraFace-v1) | **Apache-2.0** | 512-D ArcFace; use ONLY this file from the repo |
 | `face_landmark.onnx` | liveness (EAR) | Google MediaPipe FaceMesh (`face_landmark.tflite`) | **Apache-2.0** | 468 landmarks; input `[1,192,192,3]` RGB → `1404` + face flag. Eye-contour EAR for passive blink liveness. See note below. |
-| `ir_adapter.onnx` | recognition (IR domain) | self-trained residual adapter (512→512), trained on the author's own IR captures | **GPL-3.0-or-later** (project) | boosts IR-frame match scores toward the RGB enrollment; no third-party training data |
+| `ir_adapter.onnx` | recognition (IR domain) | self-trained residual adapter (512→512), trained on the CBSR NIR (OTCBVS dataset 07) and Oulu-CASIA NIR academic datasets | **research-only taint — see note below** | boosts IR-frame match scores toward the RGB enrollment |
+
+### ir_adapter.onnx: training-data correction (2026-07-14)
+
+Earlier revisions of this file claimed the IR adapter was trained on the
+author's own captures with no third-party training data. That was wrong.
+Both shipped adapter versions (`ir_adapter.onnx` and the banked
+`ir_adapter.onnx.v1-256`) were trained on AuraFace embeddings of two
+academic NIR datasets: CBSR NIR (OTCBVS benchmark dataset 07, education
+and research use only) and Oulu-CASIA NIR (academic release). By the same
+standard this project applies to third-party weights (see the Silent-Face
+note below), that restricts the adapter to non-commercial research use,
+even though the code that trained it is ours. The rest of the model table
+is unaffected.
+
+Planned replacement: an adapter trained only on self-captured, consented
+data, plus a dual-spectrum enrollment path that stores an IR template at
+enroll time and needs no adapter at all. Until then, commercial
+redistribution should either omit `ir_adapter.onnx` or contact the dataset
+providers for licensing.
 
 ### MediaPipe FaceMesh: license-verified (unlike Silent-Face)
 

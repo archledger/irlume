@@ -206,7 +206,7 @@ GPLv3-compatible, so the whole thing is bundleable:
 | Recognition | **AuraFace** *(512-D ArcFace)* | Apache-2.0 |
 | IR liveness gate | self-built, algorithmic *(no weights)* | n/a |
 | Passive blink liveness | **MediaPipe FaceMesh** → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
-| IR domain adapter | self-trained *(author's own IR captures)* | GPL-3.0 |
+| IR domain adapter | self-trained on academic NIR datasets *(CBSR, Oulu-CASIA — research-only; replacement planned, see [models/README.md](models/README.md))* | research-only |
 
 More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Cross-distro notes](docs/cross-distro/).
 

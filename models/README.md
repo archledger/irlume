@@ -31,11 +31,13 @@ note below), that restricts the adapter to non-commercial research use,
 even though the code that trained it is ours. The rest of the model table
 is unaffected.
 
-Planned replacement: an adapter trained only on self-captured, consented
-data, plus a dual-spectrum enrollment path that stores an IR template at
-enroll time and needs no adapter at all. Until then, commercial
-redistribution should either omit `ir_adapter.onnx` or contact the dataset
-providers for licensing.
+Resolution decided 2026-07-15, see
+[ADR-0004](../docs/adr/0004-per-enrollment-ir-adapter.md): the adapter will
+be removed from packaging (raw IR matching against the enrolled IR
+templates costs at most 0.07 EER points on unseen data) and replaced by
+per-enrollment on-device calibration fitted from each user's own scans.
+Until the removal release, commercial redistribution should either omit
+`ir_adapter.onnx` or contact the dataset providers for licensing.
 
 ### MediaPipe FaceMesh: license-verified (unlike Silent-Face)
 

@@ -601,6 +601,7 @@ dependencies = [
  "ratatui",
  "rpassword",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

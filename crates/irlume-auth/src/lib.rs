@@ -1415,7 +1415,7 @@ fn colliding_profile(
 /// profile opts into the require-eyes-open gate.
 const EYE_OPEN_PEAK_MIN: f32 = 200.0;
 
-fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks5) -> bool {
+pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks5) -> bool {
     let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     eye_open_at(grey, w, h, lm[0], r) && eye_open_at(grey, w, h, lm[1], r)

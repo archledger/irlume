@@ -42,6 +42,17 @@ pub enum Spectrum {
     Ir,
 }
 
+/// Burst statistics from an IR capture: the per-frame mean extremes. When the
+/// emitter strobes, `ambient_mean` (the darkest frame of the burst) is the
+/// scene's ambient IR level with the emitter off, and `lit_mean -
+/// ambient_mean` is the strobe gap; on a steady emitter the two converge.
+#[derive(Clone, Copy, Debug)]
+pub struct IrCaptureStats {
+    pub lit_mean: f32,
+    pub ambient_mean: f32,
+    pub burst_frames: usize,
+}
+
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
 pub const DEFAULT_IR_DEVICE: &str = "/dev/video2";
 const RGB_W: u32 = 640;
@@ -564,6 +575,13 @@ const SUBTRACT_MIN_RESULT: f64 = 12.0;
 /// it often fires when the stream opens, otherwise it needs a UVC-XU write (TODO,
 /// see `IR_EMITTER_NEXIGO_N930W`).
 pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
+    Ok(capture_ir_with_stats(device)?.0)
+}
+
+/// [`capture_ir`] plus the burst statistics the plain call discards. The
+/// darkest burst frame's mean is a free per-capture ambient-IR reading (the
+/// input the ambient-relative gates key on), only available at capture time.
+pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCaptureStats)> {
     verify_pinned(device)?;
     if privacy_engaged(device) {
         return Err(Error::Hardware(format!(
@@ -702,12 +720,19 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
         );
     }
     let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
-    Ok(Frame {
-        width: w,
-        height: h,
-        spectrum: Spectrum::Ir,
-        data: grey,
-    })
+    Ok((
+        Frame {
+            width: w,
+            height: h,
+            spectrum: Spectrum::Ir,
+            data: grey,
+        },
+        IrCaptureStats {
+            lit_mean: bmax as f32,
+            ambient_mean: bmin as f32,
+            burst_frames: IR_BURST,
+        },
+    ))
 }
 
 /// Ambient-subtraction helpers (Windows-Hello-style illuminated minus ambient).

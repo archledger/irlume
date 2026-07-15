@@ -1618,6 +1618,32 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         }
     };
 
+    // Face contrast: p90 - p10 luma spread inside the bbox. A dim-but-usable
+    // face keeps its spread; a flat backlit face (the "IR face too dark"
+    // failure axis) loses it, which mean brightness alone cannot show.
+    let contrast_bbox = |data: &[u8], w: u32, h: u32, ch: usize, bbox: &[f32; 4]| -> f32 {
+        let (x1, y1) = (bbox[0].max(0.0) as u32, bbox[1].max(0.0) as u32);
+        let (x2, y2) = ((bbox[2] as u32).min(w), (bbox[3] as u32).min(h));
+        if x2 <= x1 || y2 <= y1 {
+            return 0.0;
+        }
+        let mut v: Vec<f32> = (y1..y2)
+            .flat_map(|y| (x1..x2).map(move |x| (x, y)))
+            .map(|(x, y)| luma(data, w, ch, x, y))
+            .collect();
+        v.sort_by(f32::total_cmp);
+        v[(v.len() - 1) * 9 / 10] - v[(v.len() - 1) / 10]
+    };
+
+    // 5-point landmarks flattened to [x0,y0,...,x4,y4] + inter-ocular pixel
+    // distance (the distance-to-camera proxy; landmarks 0,1 are the eyes).
+    let lm_flat = |lm: &irlume_vision::Landmarks5| -> Vec<f32> {
+        lm.iter().flat_map(|&(x, y)| [x, y]).collect()
+    };
+    let iod_px = |lm: &irlume_vision::Landmarks5| -> f32 {
+        ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt()
+    };
+
     let run = || -> irlume_common::Result<usize> {
         // Enrolled templates are encrypted at rest (TPM-sealed key, root-only), so a
         // user-space run can't decrypt them. That's fine: we always dump the raw
@@ -1662,6 +1688,66 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             if adapter.is_some() { "yes" } else { "no" }
         );
         println!("[calcapture] sit naturally in frame; vary pose slightly between samples.");
+
+        // Session header (first line): hardware + model provenance, so the
+        // dataset self-documents which sensor and which recognizer produced
+        // the embeddings. Loaders that want samples skip records without
+        // embedding fields. sha256 prefixes match the space-tagging scheme.
+        let file_sha12 = |p: &str| -> serde_json::Value {
+            match std::fs::read(p) {
+                Ok(b) => {
+                    let d = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&b));
+                    d[..12].to_string().into()
+                }
+                Err(_) => serde_json::Value::Null,
+            }
+        };
+        let epoch = || -> f64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0)
+        };
+        let mut hdr = serde_json::Map::new();
+        hdr.insert("session".into(), true.into());
+        hdr.insert("user".into(), user.clone().into());
+        hdr.insert("tag".into(), tag.clone().into());
+        hdr.insert("n".into(), n.into());
+        hdr.insert(
+            "host".into(),
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+                .into(),
+        );
+        hdr.insert(
+            "rgb_camera".into(),
+            irlume_camera::device_identity(rgb_dev)
+                .unwrap_or_else(|| rgb_dev.to_string())
+                .into(),
+        );
+        hdr.insert(
+            "ir_camera".into(),
+            irlume_camera::device_identity(ir_dev)
+                .unwrap_or_else(|| ir_dev.to_string())
+                .into(),
+        );
+        hdr.insert(
+            "irlume_version".into(),
+            env!("CARGO_PKG_VERSION").to_string().into(),
+        );
+        hdr.insert("det_sha256".into(), file_sha12(det_path));
+        hdr.insert("model_sha256".into(), file_sha12(model));
+        hdr.insert(
+            "adapter_sha256".into(),
+            flag(args, "--adapter")
+                .map(file_sha12)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        hdr.insert("ts_unix".into(), epoch().into());
+        writeln!(f, "{}", serde_json::Value::Object(hdr))
+            .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+
         let mut written = 0usize;
         let t0 = std::time::Instant::now();
         for idx in 0..n {
@@ -1677,7 +1763,7 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 .into_iter()
                 .max_by(|a, b| a.score.total_cmp(&b.score));
 
-            let irf = irlume_camera::capture_ir(ir_dev)?;
+            let (irf, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
             let ir_rgb = irlume_camera::grey_to_rgb(&irf.data);
             let iv = irlume_vision::align::RgbView {
                 data: &ir_rgb,
@@ -1714,6 +1800,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             // only compare across samples of the same resolution.
             rec.insert("rgb_res".into(), vec![rgbf.width, rgbf.height].into());
             rec.insert("ir_res".into(), vec![irf.width, irf.height].into());
+            rec.insert("ts_unix".into(), epoch().into());
+            // Per-capture ambient IR from the burst's darkest (emitter-off)
+            // frame, and the strobe gap: the ambient-relative gate's inputs,
+            // only observable at capture time.
+            rec.insert("ir_ambient".into(), json_f32(ir_stats.ambient_mean));
+            rec.insert(
+                "ir_strobe_gap".into(),
+                json_f32(ir_stats.lit_mean - ir_stats.ambient_mean),
+            );
 
             let (mut rgb_cos, mut rgb_bri) = (f32::NAN, 0.0f32);
             if let Some(t) = &rgb_top {
@@ -1736,6 +1831,25 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                         &t.bbox,
                     )),
                 );
+                rec.insert(
+                    "rgb_contrast".into(),
+                    json_f32(contrast_bbox(
+                        &rgbf.data,
+                        rgbf.width,
+                        rgbf.height,
+                        3,
+                        &t.bbox,
+                    )),
+                );
+                rec.insert(
+                    "rgb_bbox".into(),
+                    serde_json::to_value(t.bbox.to_vec()).unwrap(),
+                );
+                rec.insert(
+                    "rgb_landmarks".into(),
+                    serde_json::to_value(lm_flat(&t.landmarks)).unwrap(),
+                );
+                rec.insert("rgb_iod_px".into(), json_f32(iod_px(&t.landmarks)));
                 rec.insert("rgb_emb".into(), serde_json::to_value(e.to_vec()).unwrap());
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
@@ -1765,6 +1879,24 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                     json_f32(laplacian_var_bbox(
                         &irf.data, irf.width, irf.height, 1, &t.bbox,
                     )),
+                );
+                rec.insert(
+                    "ir_contrast".into(),
+                    json_f32(contrast_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox)),
+                );
+                rec.insert(
+                    "ir_bbox".into(),
+                    serde_json::to_value(t.bbox.to_vec()).unwrap(),
+                );
+                rec.insert(
+                    "ir_landmarks".into(),
+                    serde_json::to_value(lm_flat(&t.landmarks)).unwrap(),
+                );
+                rec.insert("ir_iod_px".into(), json_f32(iod_px(&t.landmarks)));
+                rec.insert(
+                    "ir_eyes_open".into(),
+                    irlume_auth::both_eyes_open(&irf.data, irf.width, irf.height, &t.landmarks)
+                        .into(),
                 );
                 rec.insert("ir_depth".into(), json_f32(ir_depth));
                 rec.insert("ir_glint".into(), json_f32(ir_glint));

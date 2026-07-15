@@ -9,6 +9,7 @@ license.workspace = true
 # the security-critical pipeline lives in exactly one place.
 
 [dependencies]
+sha2.workspace = true
 irlume-common.workspace = true
 irlume-camera.workspace = true
 irlume-vision.workspace = true

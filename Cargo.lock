@@ -572,6 +572,7 @@ dependencies = [
  "irlume-core",
  "irlume-liveness",
  "irlume-vision",
+ "sha2",
 ]
 
 [[package]]

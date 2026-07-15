@@ -28,6 +28,13 @@ pub struct FaceScan {
     pub rgb: Vec<f32>,
     #[serde(default)]
     pub ir: Option<Vec<f32>>,
+    /// Embedding space `ir` lives in: `"raw"` (no adapter) or
+    /// `"adapter:<sha256 prefix>"` of the adapter that produced it. Templates
+    /// only match probes from the same space, so swapping or removing the
+    /// adapter can never silently score against stale-space templates.
+    /// `None` = scan predates space tagging; grandfathered as compatible.
+    #[serde(default)]
+    pub ir_space: Option<String>,
     /// Per-scan IR liveness calibration (center/edge depth, face brightness).
     #[serde(default)]
     pub ir_depth: f32,
@@ -118,6 +125,49 @@ impl Enrollment {
                 })
             })
             .collect()
+    }
+
+    /// IR templates compatible with the live pipeline: same embedding space
+    /// (untagged legacy scans are grandfathered) and same dimensionality as
+    /// the probe. A v1 256-D or foreign-adapter template never reaches the
+    /// cosine matcher, where it would score garbage instead of failing loud.
+    pub fn ir_scans_for(&self, space: &str, dim: usize) -> Vec<(&str, &str, &[f32])> {
+        self.profiles
+            .iter()
+            .flat_map(|p| {
+                p.scans.iter().filter_map(move |s| {
+                    let ir = s.ir.as_ref()?;
+                    if ir.len() != dim {
+                        return None;
+                    }
+                    match &s.ir_space {
+                        Some(sp) if sp != space => None,
+                        _ => Some((p.name.as_str(), s.name.as_str(), ir.as_slice())),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Stamp untagged IR scans with the space of the pipeline they were
+    /// captured under (only scans matching the live pipeline's embedding
+    /// dimension). Called by the daemon at startup while the pipeline is
+    /// unchanged, so that a FUTURE adapter swap/removal finds every scan
+    /// explicitly tagged and can fail loud ("re-enroll") instead of scoring
+    /// across spaces. Idempotent; returns how many scans were stamped.
+    pub fn retag_untagged_ir(&mut self, space: &str, dim: usize) -> usize {
+        let mut n = 0;
+        for p in &mut self.profiles {
+            for s in &mut p.scans {
+                if let Some(ir) = &s.ir {
+                    if s.ir_space.is_none() && ir.len() == dim {
+                        s.ir_space = Some(space.into());
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
     }
 
     /// Per-user IR-liveness floor `(depth_ratio, brightness)` derived from the
@@ -219,6 +269,8 @@ fn migrate(old: LegacyProfile) -> Enrollment {
             name: format!("Face Scan {}", i + 1),
             rgb: t.clone(),
             ir: old.ir_templates.get(i).cloned(),
+            ir_space: None, // legacy scans predate space tagging
+
             ir_depth: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
             ir_brightness: old.ir_brightness_samples.get(i).copied().unwrap_or(0.0),
             pitch: 0.0, // legacy scans predate pitch calibration
@@ -445,6 +497,7 @@ mod tests {
                     name: "Face Scan 1".into(),
                     rgb: vec![0.1, 0.2, 0.3, 0.4],
                     ir: Some(vec![0.5, 0.6]),
+                    ir_space: None,
                     ir_depth: 1.4,
                     ir_brightness: 90.0,
                     pitch: 0.52,
@@ -494,6 +547,7 @@ mod tests {
             name: "s".into(),
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; 4]),
+            ir_space: None,
             ir_depth: depth,
             ir_brightness: bright,
             pitch: 0.0,
@@ -505,6 +559,7 @@ mod tests {
             name: "s".into(),
             rgb: vec![0.1; 4],
             ir: None,
+            ir_space: None,
             ir_depth: 0.0,
             ir_brightness: 0.0,
             pitch,
@@ -546,6 +601,77 @@ mod tests {
         assert!((depth_floor - 1.2 * 0.75).abs() < 1e-5);
     }
 
+    fn scan_in_space(name: &str, dim: usize, space: Option<&str>) -> FaceScan {
+        FaceScan {
+            name: name.into(),
+            rgb: vec![0.1; 4],
+            ir: Some(vec![0.2; dim]),
+            ir_space: space.map(Into::into),
+            ir_depth: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        }
+    }
+
+    #[test]
+    fn ir_scans_for_filters_space_and_dimension() {
+        let mut e = Enrollment::new("u");
+        e.profiles.push(FaceProfile {
+            name: "p".into(),
+            scans: vec![
+                scan_in_space("legacy-untagged", 4, None),
+                scan_in_space("raw", 4, Some("raw")),
+                scan_in_space("v3", 4, Some("adapter:abc123")),
+                scan_in_space("v1-256", 2, None), // stale dim: never matches a 4-D probe
+            ],
+        });
+        // Raw pipeline: legacy grandfathered + raw-tagged; v3-tagged excluded.
+        let raw: Vec<_> = e.ir_scans_for("raw", 4).iter().map(|s| s.1).collect();
+        assert_eq!(raw, vec!["legacy-untagged", "raw"]);
+        // Adapter pipeline: legacy grandfathered + matching adapter; raw excluded.
+        let v3: Vec<_> = e
+            .ir_scans_for("adapter:abc123", 4)
+            .iter()
+            .map(|s| s.1)
+            .collect();
+        assert_eq!(v3, vec!["legacy-untagged", "v3"]);
+        // A different adapter build sees only the grandfathered scan.
+        assert_eq!(e.ir_scans_for("adapter:zzz999", 4).len(), 1);
+        // The unfiltered accessor still reports every IR-bearing scan.
+        assert_eq!(e.ir_scans().len(), 4);
+    }
+
+    #[test]
+    fn retag_untagged_ir_stamps_only_matching_legacy_scans() {
+        let mut e = Enrollment::new("u");
+        e.profiles.push(FaceProfile {
+            name: "p".into(),
+            scans: vec![
+                scan_in_space("legacy", 4, None),          // stamped
+                scan_in_space("tagged", 4, Some("other")), // left alone
+                scan_in_space("stale-dim", 2, None),       // wrong dim: left alone
+            ],
+        });
+        assert_eq!(e.retag_untagged_ir("adapter:abc123", 4), 1);
+        assert_eq!(
+            e.profiles[0].scans[0].ir_space.as_deref(),
+            Some("adapter:abc123")
+        );
+        assert_eq!(e.profiles[0].scans[1].ir_space.as_deref(), Some("other"));
+        assert!(e.profiles[0].scans[2].ir_space.is_none());
+        // Idempotent: nothing left to stamp.
+        assert_eq!(e.retag_untagged_ir("adapter:abc123", 4), 0);
+    }
+
+    #[test]
+    fn scan_json_without_ir_space_loads_as_untagged() {
+        // Enrollments written before space tagging must load unchanged.
+        let json = r#"{"name":"s","rgb":[0.1],"ir":[0.2]}"#;
+        let s: FaceScan = serde_json::from_str(json).unwrap();
+        assert!(s.ir_space.is_none());
+        assert_eq!(s.ir.as_ref().unwrap().len(), 1);
+    }
+
     #[test]
     fn ir_calibration_ignores_scans_without_ir() {
         // RGB-only scans (no IR) must not count toward the floor.
@@ -557,6 +683,7 @@ mod tests {
                     name: "a".into(),
                     rgb: vec![0.1; 4],
                     ir: None,
+                    ir_space: None,
                     ir_depth: 0.0,
                     ir_brightness: 0.0,
                     pitch: 0.0,

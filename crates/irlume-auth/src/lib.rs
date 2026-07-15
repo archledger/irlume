@@ -22,6 +22,11 @@ pub struct Engine {
     emb: Embedder,
     /// Optional IR domain-adaptation MLP (applied to IR embeddings in the dark).
     ir_adapter: Option<Adapter>,
+    /// Embedding space IR probes (and new IR scans) live in: `"raw"` without an
+    /// adapter, else `"adapter:<sha256 prefix>"` of the loaded adapter file.
+    /// Stored on every new scan and matched against at verify, so an adapter
+    /// swap/removal degrades to "re-enroll" instead of scoring across spaces.
+    ir_space: String,
     /// Optional MediaPipe FaceMesh: dense landmarks for the passive EAR blink
     /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
     /// the opt-in passive-liveness gate (it can't run without landmarks).
@@ -83,6 +88,7 @@ impl Engine {
             det: Detector::load_from_file(det_path)?,
             emb: Embedder::load_from_file(model_path)?,
             ir_adapter: None,
+            ir_space: "raw".into(),
             mesh: None,
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
@@ -134,12 +140,29 @@ impl Engine {
     pub fn with_ir_adapter(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
             self.ir_adapter = Some(Adapter::load_from_file(path)?);
+            let bytes = std::fs::read(path)
+                .map_err(|e| irlume_common::Error::Io(format!("{path}: {e}")))?;
+            let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+            self.ir_space = format!("adapter:{}", &digest[..12]);
         }
         Ok(self)
     }
 
     pub fn has_ir_adapter(&self) -> bool {
         self.ir_adapter.is_some()
+    }
+
+    /// The IR embedding space this engine produces and matches in.
+    pub fn ir_space(&self) -> &str {
+        &self.ir_space
+    }
+
+    /// Dimensionality of the IR embeddings this engine emits. The recognizer
+    /// emits 512-D and the deployed adapter contract is 512→512; an adapter
+    /// with a different output width must change this too (the per-scan dim
+    /// check in `ir_scans_for` quarantines templates either way).
+    pub fn ir_dim(&self) -> usize {
+        irlume_vision::EMBED_DIM
     }
 
     /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
@@ -694,7 +717,7 @@ impl Engine {
             // cross-spectrum liveness gate + per-user IR floor already passed above.
             // This is the bright→RGB / dark→IR / dim→FUSE story.
             if let Some(ir_probe) = &a.ir_embedding {
-                let ir_scans = enr.ir_scans();
+                let ir_scans = enr.ir_scans_for(&self.ir_space, ir_probe.len());
                 if !ir_scans.is_empty() {
                     let (ir_score, ir_who) = best(ir_probe, &ir_scans);
                     // (a) calibrated quality-weighted fusion: the dim/mixed-light path.
@@ -745,14 +768,19 @@ impl Engine {
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
         // recognition (Windows-Hello-style dark operation) across all profiles.
         if let Some(probe) = a.ir_embedding {
-            let scans = enr.ir_scans();
+            let scans = enr.ir_scans_for(&self.ir_space, probe.len());
             if scans.is_empty() {
+                let reason = if enr.ir_scans().is_empty() {
+                    "dark, but no IR scans enrolled; re-enroll to enable dark unlock"
+                } else {
+                    "dark, but the enrolled IR scans are from a different IR \
+                     pipeline (adapter changed); re-enroll to refresh dark unlock"
+                };
                 return Ok(Outcome {
                     granted: false,
                     live: false,
                     score: 0.0,
-                    reason: "dark, but no IR scans enrolled; re-enroll to enable dark unlock"
-                        .into(),
+                    reason: reason.into(),
                 });
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
@@ -1040,10 +1068,12 @@ impl Engine {
         };
         for (rgb, ir, d, b, pitch) in captured {
             let sname = prof.next_scan_name();
+            let ir_space = ir.as_ref().map(|_| self.ir_space.clone());
             prof.scans.push(FaceScan {
                 name: sname,
                 rgb,
                 ir,
+                ir_space,
                 ir_depth: d,
                 ir_brightness: b,
                 pitch,
@@ -1135,10 +1165,12 @@ impl Engine {
             )));
         }
         let sname = enr.profiles[idx].next_scan_name();
+        let ir_space = ir.as_ref().map(|_| self.ir_space.clone());
         enr.profiles[idx].scans.push(FaceScan {
             name: sname.clone(),
             rgb,
             ir,
+            ir_space,
             ir_depth: d,
             ir_brightness: b,
             pitch,
@@ -1537,6 +1569,7 @@ mod tests {
             name: "s".into(),
             rgb: v,
             ir: None,
+            ir_space: None,
             ir_depth: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,

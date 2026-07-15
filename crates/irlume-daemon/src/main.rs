@@ -118,6 +118,25 @@ fn main() {
         }
     };
 
+    // One-time inoculation: stamp legacy (untagged) IR scans with the current
+    // embedding space while it is still the space they were captured under.
+    // A later adapter swap/removal then degrades to a clear "re-enroll" for
+    // dark unlock instead of silently scoring across embedding spaces.
+    for user in irlume_core::storage::list_users() {
+        if let Ok(Some(mut enr)) = irlume_core::storage::load(&user) {
+            let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
+            if n > 0 {
+                match irlume_core::storage::save(&enr) {
+                    Ok(()) => eprintln!(
+                        "irlumed: tagged {n} legacy IR scan(s) for '{user}' as '{}'",
+                        engine.ir_space()
+                    ),
+                    Err(e) => eprintln!("irlumed: could not retag IR scans for '{user}': {e}"),
+                }
+            }
+        }
+    }
+
     let _ = std::fs::remove_file(&socket);
     let listener = match UnixListener::bind(&socket) {
         Ok(l) => l,

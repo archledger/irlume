@@ -1,3 +1,14 @@
+irlume (0.2.1) unstable; urgency=medium
+
+  * `irlume enroll` now completes the 0.2.0 upgrade in one step.
+
+    On 0.2.0, running the documented remedy refused with "this face is already
+    enrolled" because enroll only created new profiles. It now adds the fresh
+    scans to the profile your face matches (sized to the free scan slots) and
+    dark/dim login works again immediately afterward.
+
+ -- archledger <archledger236@gmail.com>  Wed, 16 Jul 2026 00:00:00 +0000
+
 irlume (0.2.0) unstable; urgency=medium
 
   * BREAKING: re-enroll needed for dark/dim (IR) face login.

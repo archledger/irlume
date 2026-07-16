@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.2.0
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -141,6 +141,15 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Wed Jul 16 2026 archledger <archledger236@gmail.com> - 0.2.1-1
+- irlume enroll now merges into the profile the captured face already matches,
+  adding the scans instead of refusing with "this face is already enrolled".
+  This makes plain `irlume enroll` the working upgrade remedy the 0.2.0 notes
+  promised for restoring dark/dim login.
+- The enroll capture is sized to the matched profile's free scan slots: a
+  profile with 5 slots left gets a 5-scan top-up instead of a 10-scan session
+  that discards half, and a full profile is refused after one probe scan.
+
 * Tue Jul 15 2026 archledger <archledger236@gmail.com> - 0.2.0-1
 - BREAKING: re-enroll needed for dark/dim (IR) login. The IR adapter was
   removed (its training data was research-only), so IR templates enrolled under

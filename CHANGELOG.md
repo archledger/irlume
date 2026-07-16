@@ -3,7 +3,7 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.1] - 2026-07-16
 
 ### Fixed
 
@@ -18,9 +18,8 @@ All notable changes to irlume are documented here. This project adheres to
   This also makes `irlume enroll` work as the documented 0.2.0 upgrade remedy:
   the anti-mixing guard used to refuse upgraders, whose faces still match
   their old profile through the unchanged RGB path, exactly when they needed
-  fresh current-space scans to revive dark/dim login. Until this ships, the
-  working paths on 0.2.0 are `irlume tui` (Profiles, improve) or
-  `irlume enroll --reset`.
+  fresh current-space scans to revive dark/dim login. On 0.2.0 itself, the
+  working paths are `irlume tui` (Profiles, improve) or `irlume enroll --reset`.
 - **Enroll captures only what fits.** A one-scan probe decides whether the
   face merges into an existing profile and sizes the session from the free
   slots: a profile with 5 slots left gets a 5-scan top-up instead of a 10-scan

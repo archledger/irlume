@@ -65,7 +65,7 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 
 ## 📦 Install
 
-> **v0.2.0.** Works end-to-end on real hardware across all three families. Not
+> **v0.2.1.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass); see [Honest limitations](#-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM; the distros below are
@@ -378,7 +378,7 @@ default IR-structure gate already rejects photos, screens, and video replays.
 
 ## 🛠️ Status
 
-**v0.2.0: working, validated on real hardware** across Fedora (full IR Secure tier,
+**v0.2.1: working, validated on real hardware** across Fedora (full IR Secure tier,
 end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
 CLI/daemon on a camera-less testbed). Packaged for all three families — Fedora via Copr,
 Arch via the [AUR](https://aur.archlinux.org/packages/irlume), Ubuntu via the PPA (see
@@ -391,6 +391,10 @@ detection-rescue cascade (outdoor detection 76.9% → 98.5%), the 478-point Face
 mesh, and a presence grace window after the consent gesture. Upgrading from 0.1.x needs a
 one-time re-enroll for dark/dim login — bright-light login and the password are unaffected.
 Every accuracy figure is reproducible from [`benchmarks/`](benchmarks/).
+
+0.2.1 makes that upgrade a one-step affair: `irlume enroll` now adds the fresh scans to
+the profile your face already matches (sized to the free scan slots) instead of refusing
+with "this face is already enrolled".
 
 **Tier-2 TPM sealing via systemd-pcrlock** (since 0.1.5): on a pcrlock-provisioned machine a
 firmware or Secure Boot update needs one `systemd-pcrlock make-policy` run instead of

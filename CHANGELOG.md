@@ -7,18 +7,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
-- **`irlume enroll` now works as the documented 0.2.0 upgrade remedy.** The
-  0.2.0 notes tell upgraders to run `irlume enroll` to restore dark/dim login,
-  but the anti-mixing guard refused it ("this face is already enrolled as ..."),
-  because an upgrader's face still matches their old profile through the
-  unchanged RGB path. Enrolling a face that already owns a profile whose IR
-  templates are all unusable in the current embedding space now refreshes that
-  profile instead of refusing: the captured scans are added (up to the 30-scan
-  cap), the per-enrollment IR calibration is refitted from them, and dark/dim
-  login matches again. A duplicate of a profile with working IR templates is
-  still refused, as is a capture that matches two different profiles. Until
-  this ships, the working paths on 0.2.0 are `irlume tui` (Profiles, improve)
-  or `irlume enroll --reset`.
+- **`irlume enroll` merges into the matching profile instead of refusing.** A
+  face can never own two profiles, so when a capture matches an existing
+  profile the only thing the old refusal ("this face is already enrolled
+  as ...") accomplished was forcing the same scans through `add-scan` by hand.
+  Now the captured scans are added to the matching profile (up to the 30-scan
+  cap; a full profile still refuses), the per-enrollment IR calibration is
+  refitted, and the reply says what happened. A novel face still creates a new
+  profile, and a capture that matches two different profiles is still refused.
+  This also makes `irlume enroll` work as the documented 0.2.0 upgrade remedy:
+  the anti-mixing guard used to refuse upgraders, whose faces still match
+  their old profile through the unchanged RGB path, exactly when they needed
+  fresh current-space scans to revive dark/dim login. Until this ships, the
+  working paths on 0.2.0 are `irlume tui` (Profiles, improve) or
+  `irlume enroll --reset`.
 
 ## [0.2.0] - 2026-07-15
 

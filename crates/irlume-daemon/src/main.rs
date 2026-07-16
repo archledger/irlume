@@ -580,10 +580,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Ok(irlume_auth::EnrollOutcome::New { name, scans }) => {
                     Response::Ok(format!("enrolled '{name}' with {scans} scans"))
                 }
-                Ok(irlume_auth::EnrollOutcome::Refreshed { name, added, total }) => {
+                Ok(irlume_auth::EnrollOutcome::Merged { name, added, total }) => {
                     Response::Ok(format!(
-                        "'{name}' predates the current recognition model; added {added} fresh \
-                         scans ({total} total) so dark/dim login matches again"
+                        "this face already matches '{name}'; added the {added} fresh scans to \
+                         it ({total} total) and recognition now uses them"
                     ))
                 }
                 Err(e) => Response::Error(e.to_string()),

@@ -1347,13 +1347,12 @@ impl Engine {
         Ok(out)
     }
 
-    /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). Creates a NEW face
-    /// profile, unless the captured face already owns a profile whose IR
-    /// templates are all unusable in the engine's current embedding space (the
-    /// 0.2.0 adapter removal, a future adapter swap, or a profile that never had
-    /// IR): then the capture refreshes that profile instead, because `irlume
-    /// enroll` is the documented upgrade remedy and the RGB identity match is
-    /// space-stable. Errors if a NEW profile would exceed MAX_PROFILES.
+    /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
+    /// face already owns a profile, the scans are merged into it (a face can
+    /// never own two profiles, so that is always what the user meant — and it
+    /// is the 0.2.0 upgrade remedy, fresh scans reviving dark/dim login after
+    /// an embedding-space change). A novel face gets a NEW profile; that errors
+    /// if the account is already at MAX_PROFILES.
     pub fn enroll_profile(
         &mut self,
         user: &str,
@@ -1384,19 +1383,18 @@ impl Engine {
             )));
         }
         let rgbs: Vec<&[f32]> = captured.iter().map(|(rgb, ..)| rgb.as_slice()).collect();
-        if let Some(target) = enroll_refresh_target(&enr, &rgbs, &self.ir_space)? {
-            // Same face, no usable IR templates: refresh the existing profile
-            // with the fresh capture instead of refusing.
+        if let Some(target) = enroll_merge_target(&enr, &rgbs)? {
+            // The face already owns a profile: merge the capture into it.
             let idx = enr
                 .profiles
                 .iter()
                 .position(|p| p.name == target)
-                .expect("refresh target came from these profiles");
+                .expect("merge target came from these profiles");
             let room = MAX_SCANS_PER_PROFILE - enr.profiles[idx].scans.len();
             if room == 0 {
                 return Err(irlume_common::Error::Protocol(format!(
-                    "'{target}' needs fresh scans for the current recognition model \
-                     but is at the max {MAX_SCANS_PER_PROFILE}; delete some of its scans first"
+                    "this face is already enrolled as '{target}', which is at the max \
+                     {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
                 )));
             }
             let added = want.min(room);
@@ -1416,7 +1414,7 @@ impl Engine {
             self.refit_profile_calib(&mut enr.profiles[idx]);
             let total = enr.profiles[idx].scans.len();
             storage::save(&enr)?;
-            return Ok(EnrollOutcome::Refreshed {
+            return Ok(EnrollOutcome::Merged {
                 name: target,
                 added,
                 total,
@@ -1758,79 +1756,46 @@ fn luma_in_bbox(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
 pub enum EnrollOutcome {
     /// A new face profile was created.
     New { name: String, scans: usize },
-    /// The captured face already owned `name`, but none of that profile's IR
-    /// templates were usable in the current embedding space (adapter removed or
-    /// swapped since enrollment, or the profile never had IR). The capture was
-    /// added to it — `added` new scans, `total` scans now — and the
-    /// per-enrollment calibration was refitted.
-    Refreshed {
+    /// The captured face already owned `name`, so the capture was added to that
+    /// profile instead — `added` new scans, `total` scans now — and the
+    /// per-enrollment calibration was refitted. This is what makes `irlume
+    /// enroll` idempotent for the same person: a face can never own two
+    /// profiles, so merging is always what the user meant. It is also the
+    /// 0.2.0 upgrade remedy (fresh current-space scans revive dark/dim login
+    /// after an embedding-space change strands the old IR templates).
+    Merged {
         name: String,
         added: usize,
         total: usize,
     },
 }
 
-/// Decide what an enroll capture's collision with existing profiles means.
-/// `Ok(None)`: novel face, create the new profile. `Ok(Some(name))`: the face
-/// already owns `name` and none of its IR templates are usable in `space` —
-/// reroute the capture into that profile (the 0.2.0 upgrade path, where the
-/// adapter removal stranded every 0.1.x IR template). `Err`: the anti-mixing
-/// refusal — the face is already enrolled with working templates, or the
-/// capture matched two different profiles.
-fn enroll_refresh_target(
+/// Decide what an enroll capture means. `Ok(None)`: novel face, create the new
+/// profile. `Ok(Some(name))`: the face already owns `name`; merge the capture
+/// into that profile (a face can never own two profiles, so refusing would
+/// only force the user to redo this by hand via add-scan). `Err`: the capture
+/// matched two different profiles (two people in frame across the scans).
+fn enroll_merge_target(
     enr: &irlume_core::storage::Enrollment,
     captured_rgb: &[&[f32]],
-    space: &str,
 ) -> irlume_common::Result<Option<String>> {
-    use irlume_core::storage::MAX_SCANS_PER_PROFILE;
-    let mut hit: Option<(String, f32)> = None;
+    let mut hit: Option<String> = None;
     for rgb in captured_rgb {
-        let Some((other, score)) = colliding_profile(enr, rgb, None) else {
+        let Some((other, _score)) = colliding_profile(enr, rgb, None) else {
             continue;
         };
         match &hit {
-            Some((first, _)) if *first != other => {
+            Some(first) if *first != other => {
                 return Err(irlume_common::Error::Protocol(format!(
                     "the captured scans match two different profiles ('{first}' and '{other}'); \
                      re-run enrollment with one person in frame"
                 )));
             }
             Some(_) => {}
-            None => hit = Some((other, score)),
+            None => hit = Some(other),
         }
     }
-    let Some((other, score)) = hit else {
-        return Ok(None);
-    };
-    // Usable = an IR template that matching would actually score: untagged
-    // (legacy, grandfathered) or tagged with the current space.
-    let usable_ir = enr
-        .profiles
-        .iter()
-        .find(|p| p.name == other)
-        .is_some_and(|p| {
-            p.scans
-                .iter()
-                .any(|s| s.ir.is_some() && s.ir_space.as_deref().is_none_or(|sp| sp == space))
-        });
-    if usable_ir {
-        let cnt = enr
-            .profiles
-            .iter()
-            .find(|p| p.name == other)
-            .map_or(0, |p| p.scans.len());
-        let hint = if cnt < MAX_SCANS_PER_PROFILE {
-            format!(
-                "add scans to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE}) instead of a new profile"
-            )
-        } else {
-            format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
-        };
-        return Err(irlume_common::Error::Protocol(format!(
-            "this face is already enrolled as '{other}' (match {score:.2}); {hint}"
-        )));
-    }
-    Ok(Some(other))
+    Ok(hit)
 }
 
 /// Best-matching OTHER profile for `probe` (excluding `exclude`), if it reaches
@@ -2313,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn enroll_refresh_target_dispositions() {
+    fn enroll_merge_target_dispositions() {
         let face1 = vec![1.0, 0.0, 0.0];
         let face2 = vec![0.0, 1.0, 0.0];
         let novel = vec![0.0, 0.0, 1.0];
@@ -2334,40 +2299,35 @@ mod tests {
 
         // Novel face: no collision, create the new profile.
         let enr = enr_with(vec![ir_scan(face1.clone(), Some("raw"))]);
-        assert_eq!(enroll_refresh_target(&enr, &[&novel], "raw").unwrap(), None);
+        assert_eq!(enroll_merge_target(&enr, &[&novel]).unwrap(), None);
 
-        // Same face, IR templates usable in the current space: anti-mixing refusal.
-        let err = enroll_refresh_target(&enr, &[&face1], "raw").unwrap_err();
-        assert!(err.to_string().contains("already enrolled as 'P1'"));
-
-        // Untagged legacy IR is grandfathered as usable: still refused.
+        // Same face merges into its profile regardless of IR-template state:
+        // healthy current-space templates...
+        assert_eq!(
+            enroll_merge_target(&enr, &[&face1]).unwrap(),
+            Some("P1".into())
+        );
+        // ...untagged legacy templates...
         let enr = enr_with(vec![ir_scan(face1.clone(), None)]);
-        assert!(enroll_refresh_target(&enr, &[&face1], "raw").is_err());
-
-        // The 0.2.0 upgrade case: every IR template tagged to a removed adapter
-        // space -> reroute the capture into the profile.
+        assert_eq!(
+            enroll_merge_target(&enr, &[&face1]).unwrap(),
+            Some("P1".into())
+        );
+        // ...templates stranded by an adapter removal (the 0.2.0 upgrade case)...
         let enr = enr_with(vec![
             ir_scan(face1.clone(), Some("adapter:deadbeef0123")),
             ir_scan(face1.clone(), Some("adapter:deadbeef0123")),
         ]);
         assert_eq!(
-            enroll_refresh_target(&enr, &[&face1], "raw").unwrap(),
+            enroll_merge_target(&enr, &[&face1]).unwrap(),
             Some("P1".into())
         );
-
-        // A profile that never had IR scans also gets refreshed, not refused.
+        // ...or a profile that never had IR scans at all.
         let enr = enr_with(vec![scan(face1.clone())]);
         assert_eq!(
-            enroll_refresh_target(&enr, &[&face1], "raw").unwrap(),
+            enroll_merge_target(&enr, &[&face1]).unwrap(),
             Some("P1".into())
         );
-
-        // One usable-space scan among stale ones keeps the profile usable.
-        let enr = enr_with(vec![
-            ir_scan(face1.clone(), Some("adapter:deadbeef0123")),
-            ir_scan(face1.clone(), Some("raw")),
-        ]);
-        assert!(enroll_refresh_target(&enr, &[&face1], "raw").is_err());
 
         // Captures matching two different profiles: refused outright.
         let mut enr = enr_with(vec![ir_scan(face1.clone(), Some("adapter:deadbeef0123"))]);
@@ -2376,7 +2336,7 @@ mod tests {
             name: "P2".into(),
             scans: vec![ir_scan(face2.clone(), Some("adapter:deadbeef0123"))],
         });
-        let err = enroll_refresh_target(&enr, &[&face1, &face2], "raw").unwrap_err();
+        let err = enroll_merge_target(&enr, &[&face1, &face2]).unwrap_err();
         assert!(err.to_string().contains("two different profiles"));
     }
 }

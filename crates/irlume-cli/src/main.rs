@@ -574,8 +574,8 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
             println!("[enrolldev] enrolled '{name}' ({scans} scans)");
             std::process::ExitCode::SUCCESS
         }
-        Ok(irlume_auth::EnrollOutcome::Refreshed { name, added, total }) => {
-            println!("[enrolldev] refreshed '{name}' (+{added} scans, {total} total)");
+        Ok(irlume_auth::EnrollOutcome::Merged { name, added, total }) => {
+            println!("[enrolldev] merged into '{name}' (+{added} scans, {total} total)");
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {

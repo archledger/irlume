@@ -43,7 +43,7 @@ package() {
   install -Dm0755 "\$startdir/release/irlumed" "\$pkgdir/usr/bin/irlumed"
   install -Dm0755 "\$startdir/release/irlume"  "\$pkgdir/usr/bin/irlume"
   install -Dm0644 "\$startdir/release/libpam_irlume.so" "\$pkgdir/usr/lib/security/pam_irlume.so"
-  for m in glintr100 face_detection_yunet_2023mar face_landmark ir_adapter; do
+  for m in glintr100 face_detection_yunet_2023mar face_landmark; do
     install -Dm0644 "\$startdir/models/\$m.onnx" "\$pkgdir/usr/share/irlume/models/\$m.onnx"
   done
   install -Dm0644 "\$startdir/systemd/irlumed.service" "\$pkgdir/usr/lib/systemd/system/irlumed.service"

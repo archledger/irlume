@@ -45,8 +45,6 @@ contents:
     dst: /usr/share/irlume/models/face_detection_yunet_2023mar.onnx
   - src: ../../models/face_landmark.onnx
     dst: /usr/share/irlume/models/face_landmark.onnx
-  - src: ../../models/ir_adapter.onnx
-    dst: /usr/share/irlume/models/ir_adapter.onnx
   - src: ../../models/blaze_face_short_range.onnx
     dst: /usr/share/irlume/models/blaze_face_short_range.onnx
   # Bundled onnxruntime (>=1.24) staged by build-deb.sh

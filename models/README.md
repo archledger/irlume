@@ -9,7 +9,7 @@ self-contained, no runtime download or fetch step. After cloning, run
 `SHA256SUMS` holds the release checksums; the daemon embeds it at build time
 and warns at startup when a loaded model doesn't match (see ../SECURITY.md).
 After changing any shipped model, regenerate it and commit both:
-`cd models && sha256sum face_detection_yunet_2023mar.onnx face_landmark.onnx glintr100.onnx ir_adapter.onnx blaze_face_short_range.onnx > SHA256SUMS`.
+`cd models && sha256sum face_detection_yunet_2023mar.onnx face_landmark.onnx glintr100.onnx blaze_face_short_range.onnx > SHA256SUMS`.
 
 | File | Stage | Source | License | Notes |
 |---|---|---|---|---|
@@ -17,30 +17,32 @@ After changing any shipped model, regenerate it and commit both:
 | `glintr100.onnx` | recognition | [fal/AuraFace-v1](https://huggingface.co/fal/AuraFace-v1) | **Apache-2.0** | 512-D ArcFace; use ONLY this file from the repo |
 | `face_landmark.onnx` | liveness (EAR) + rescue alignment | Google MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite` from `face_landmarker.task`) | **Apache-2.0** | 478 landmarks (468 + iris); input `[1,256,256,3]` RGB → `1434` + face flag. Replaced the legacy 192px/468pt FaceMesh 2026-07-15 (measured 28% better eye accuracy on CBSR ground truth, NME 0.0378 → 0.0273 through the YuNet-crop pipeline); the loader auto-detects either generation, legacy banked as `.legacy-192`. |
 | `blaze_face_short_range.onnx` | detection rescue | Google MediaPipe BlazeFace short-range (`blaze_face_short_range.tflite`) | **Apache-2.0** | Cascade stage 2: runs only when YuNet finds no face. 2026-07-15 bench: on saturated outdoor-walking frames the cascade (YuNet→BlazeFace) detects 98.5% vs YuNet-alone's 76.9%; BlazeFace-alone weakens to 40% on shaded faces where YuNet holds 99%, so it is a rescue, never a YuNet replacement. Box refined by FaceMesh before alignment. |
-| `ir_adapter.onnx` | recognition (IR domain) | self-trained residual adapter (512→512), trained on the CBSR NIR (OTCBVS dataset 07) and Oulu-CASIA NIR academic datasets | **research-only taint — see note below** | boosts IR-frame match scores toward the RGB enrollment |
 
-### ir_adapter.onnx: training-data correction (2026-07-14)
+Every file above is MIT or Apache-2.0 with first-party or commercially
+warrantable training data, so the shipped stack carries no non-commercial or
+research-only restriction.
 
-Earlier revisions of this file claimed the IR adapter was trained on the
-author's own captures with no third-party training data. That was wrong.
-Both shipped adapter versions (`ir_adapter.onnx` and the banked
-`ir_adapter.onnx.v1-256`) were trained on AuraFace embeddings of two
-academic NIR datasets: CBSR NIR (OTCBVS benchmark dataset 07, education
-and research use only) and Oulu-CASIA NIR (academic release). By the same
-standard this project applies to third-party weights (see the Silent-Face
-note below), that restricts the adapter to non-commercial research use,
-even though the code that trained it is ours. The rest of the model table
-is unaffected.
+### ir_adapter.onnx: removed (2026-07-15)
 
-Resolution decided 2026-07-15, see
-[ADR-0004](../docs/adr/0004-per-enrollment-ir-adapter.md): the replacement,
-per-enrollment on-device calibration fitted from each user's own scans, is
-**implemented** (`../crates/irlume-core/src/calib.rs`, active whenever no
-global adapter is loaded); the remaining step is dropping `ir_adapter.onnx`
-from packaging (raw IR matching against the enrolled IR templates costs at
-most 0.07 EER points on unseen data). Until that removal release, commercial
-redistribution should either omit `ir_adapter.onnx` or contact the dataset
-providers for licensing.
+A former `ir_adapter.onnx` (a 512→512 residual MLP over IR embeddings) was
+**retired and removed from the repo and every package** on 2026-07-15. Both
+versions that ever shipped were trained on AuraFace embeddings of two academic
+NIR datasets, CBSR NIR (OTCBVS benchmark dataset 07) and Oulu-CASIA NIR, whose
+grants cover education and research only. By the same standard this project
+applies to third-party weights (see the Silent-Face note below), that
+restricted the adapter to non-commercial research use, which conflicts with the
+commercial freedom GPLv3 promises downstream.
+
+Its replacement is per-enrollment on-device calibration fitted from each user's
+own scans (`../crates/irlume-core/src/calib.rs`), which carries no third-party
+data. See [ADR-0004](../docs/adr/0004-per-enrollment-ir-adapter.md) for the
+decision and the measurement: the global adapter improved recognition for the
+handful of identities it was trained on but slightly *worsened* every unseen
+face (Tufts NIR-NIR 1.43% → 1.53% EER), so raw AuraFace plus per-enrollment
+calibration is the better default as well as the clean one. Existing
+enrollments made against the old adapter are tagged with its embedding space
+and must be re-enrolled after upgrading; the daemon refuses a space mismatch
+rather than matching across it.
 
 ### MediaPipe FaceMesh: license-verified (unlike Silent-Face)
 

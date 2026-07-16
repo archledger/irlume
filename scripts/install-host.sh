@@ -38,7 +38,6 @@ ExecStart=/usr/local/bin/irlumed
 Environment="ORT_DYLIB_PATH=$ORT"
 Environment="IRLUME_DET_MODEL=$REPO/models/face_detection_yunet_2023mar.onnx"
 Environment="IRLUME_MODEL=$REPO/models/glintr100.onnx"
-Environment="IRLUME_IR_ADAPTER=$REPO/models/ir_adapter.onnx"
 Environment="IRLUME_MESH_MODEL=$REPO/models/face_landmark.onnx"
 Environment="IRLUME_SOCKET=/run/irlume.sock"
 Environment="IRLUME_STATE_DIR=$STATE_HOME/.local/share/irlume"

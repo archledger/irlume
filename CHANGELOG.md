@@ -21,7 +21,7 @@ All notable changes to irlume are documented here. This project adheres to
   fitted on-device from each user's own consented scans, pulling IR embeddings
   toward their RGB space; it activates whenever no global adapter is loaded and
   ships no weights (no license surface). Replaces the research-only-trained
-  `ir_adapter.onnx`, whose removal from packaging is the remaining step.
+  `ir_adapter.onnx` (now removed, see below).
 - **Presence grace window after the consent gesture.** After the blank-Enter
   gesture, capture retries while no usable face is in frame so walking up or
   settling still authenticates: ~15s for login/lock, ~5s for `sudo`/`su`
@@ -29,6 +29,31 @@ All notable changes to irlume are documented here. This project adheres to
   below-threshold match (FAR-neutral by construction).
 - **IR-template embedding-space tagging** so a future adapter swap/removal fails
   loud ("re-enroll") instead of scoring across embedding spaces.
+
+### Removed
+
+- **`ir_adapter.onnx` dropped from the repo and every package (ADR-0004).** Both
+  versions that ever shipped were trained on the CBSR NIR (OTCBVS dataset 07) and
+  Oulu-CASIA NIR academic datasets, whose licenses cover research/education only;
+  bundling them conflicted with the commercial freedom GPLv3 grants downstream, so
+  the shipped stack is now MIT/Apache-2.0 only. The default IR path is raw AuraFace
+  plus the per-enrollment calibration above, which the ADR's own measurements show
+  is also the better default (the global adapter slightly *worsened* every unseen
+  identity). The optional `--adapter` / `IRLUME_IR_ADAPTER` hook remains for a
+  user-supplied clean-licensed adapter. **Upgrade note:** an enrollment made
+  against the old adapter is tagged with its embedding space and must be
+  re-enrolled after updating; the daemon refuses to match across spaces.
+
+### Changed
+
+- Enabled the cargo-deny license gate (`check licenses` in CI) with a curated
+  permissive + GPL-compatible allowlist; no non-commercial or AGPL/SSPL license
+  is permitted in the dependency tree.
+- Dropped the unused `ndarray` dependency (the `ort` bridge only used the tuple
+  tensor API), trimming the build; reduced per-match string allocation in the
+  argmax path. No auth-decision, threshold, or model change.
+- Added a Microsoft trademark disclaimer for the descriptive "Windows Hello"
+  references.
 
 ## [0.1.5] - 2026-07-12
 

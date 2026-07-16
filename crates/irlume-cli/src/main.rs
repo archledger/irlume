@@ -546,8 +546,9 @@ pub(crate) fn user_arg(args: &[String]) -> String {
         })
 }
 
-/// Build an Engine: optional --rgb/--ir device overrides, and auto-load the IR
-/// adapter from models/ir_adapter.onnx (or --adapter PATH) if present.
+/// Build an Engine: optional --rgb/--ir device overrides, and load an IR
+/// adapter from --adapter PATH if one is supplied (none ships by default since
+/// ADR-0004; the default IR path is raw AuraFace + per-enrollment calibration).
 /// `irlume enrolldev --user U --det <yunet.onnx> --model <glintr100.onnx>
 ///   [--name N] [--scans K] [--adapter P] [--rgb ..] [--ir ..]`
 ///
@@ -586,7 +587,7 @@ fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlu
         (Some(r), Some(i)) => e.with_devices(r, i),
         _ => e,
     };
-    let adapter = flag(args, "--adapter").unwrap_or("models/ir_adapter.onnx");
+    let adapter = flag(args, "--adapter").unwrap_or("");
     let e = e.with_ir_adapter(adapter)?;
     if e.has_ir_adapter() {
         eprintln!("[engine] IR adapter loaded ({adapter}); dark mode uses adapted recognition");

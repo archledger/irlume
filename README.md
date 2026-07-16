@@ -207,7 +207,7 @@ GPLv3-compatible, so the whole thing is bundleable:
 | Recognition | **AuraFace** *(512-D ArcFace)* | Apache-2.0 |
 | IR liveness gate | self-built, algorithmic *(no weights)* | n/a |
 | Passive blink liveness + rescue alignment | **MediaPipe FaceMesh** *(478-pt)* → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
-| IR domain adapter | self-trained on academic NIR datasets *(CBSR, Oulu-CASIA — research-only; per-enrollment calibration replacement built, see [models/README.md](models/README.md))* | research-only |
+| IR domain match | raw AuraFace + **per-enrollment on-device calibration** *(fitted from your own scans; no third-party data — [ADR-0004](docs/adr/0004-per-enrollment-ir-adapter.md))* | n/a |
 
 More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Cross-distro notes](docs/cross-distro/).
 
@@ -416,6 +416,8 @@ The TPM and camera code builds on:
 - **[ort](https://github.com/pykeio/ort)** binds Microsoft's ONNX Runtime, which irlume loads at runtime for every model above.
 
 Prior art that shaped the design: **Windows Hello** for the infrared, dual-sensor credential model, and [Howdy](https://github.com/boltgolt/howdy) and [visage](https://github.com/sovren-software/visage) as the existing Linux face-unlock projects (see the [comparison](#-comparison-windows-hello-howdy-visage)). irlume is the from-scratch successor to the author's earlier linhello.
+
+*Windows and Windows Hello are trademarks of Microsoft Corporation. irlume is an independent project, not affiliated with, sponsored by, or endorsed by Microsoft; the marks are used only to describe compatibility and prior art.*
 
 ## 🤝 Contributing & license
 

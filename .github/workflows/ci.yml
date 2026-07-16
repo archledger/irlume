@@ -63,10 +63,10 @@ jobs:
         run: cargo test --workspace --locked
 
   deny:
-    name: cargo-deny (advisories · duplicate versions)
+    name: cargo-deny (advisories · licenses · duplicate versions)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories bans
+          command: check advisories bans licenses

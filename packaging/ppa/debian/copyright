@@ -21,11 +21,6 @@ Files: models/face_landmark.onnx
 Copyright: Google (MediaPipe Face Mesh conversion)
 License: Apache-2.0
 
-Files: models/ir_adapter.onnx
-Copyright: 2026 archledger
-License: GPL-3.0+
-Comment: Self-trained IR embedding adapter (residZero v3).
-
 Files: ort-prebuilt/*
 Copyright: Microsoft Corporation
 License: MIT

@@ -1,5 +1,27 @@
-# cargo-deny configuration; CI runs `cargo deny check advisories bans`.
-# The license check is not enabled yet (needs a curated allowlist first).
+# cargo-deny configuration; CI runs `cargo deny check advisories bans licenses`.
+
+[licenses]
+# Every dependency license must be on this list or the build fails. All entries
+# are OSI-permissive or GPL-compatible; GPL-3.0 is present because irlume itself
+# is GPL-3.0-or-later and the pamsm PAM binding is GPL-3.0-only. No non-commercial
+# or network-copyleft (AGPL/SSPL/Commons-Clause) license is allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "0BSD",
+    "LGPL-2.1-or-later",
+    "GPL-3.0",         # deprecated SPDX form declared by pamsm 0.5.5
+    "GPL-3.0-or-later", # irlume's own crates
+]
+# Do not fail when an allowed license happens to be unused after a dep bump.
+unused-allowed-license = "allow"
 
 [advisories]
 version = 2
@@ -17,6 +39,5 @@ ignore = [
 ]
 
 [bans]
-# Duplicate crate versions cost compile time and binary size but are not
-# errors; ort pins its own ndarray 0.17 while the workspace uses 0.16.
+# Duplicate crate versions cost compile time and binary size but are not errors.
 multiple-versions = "warn"

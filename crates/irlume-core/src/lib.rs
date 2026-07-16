@@ -50,15 +50,14 @@ pub const RGB_MATCH_THRESHOLD: f32 = 0.55;
 /// not speculation). Live genuine IR ~0.65 sits in the overlap zone.
 pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 
-/// Match threshold for ADAPTED IR embeddings (when the IR adapter is loaded).
-/// The adapter (models/ir_adapter.onnx) is the v3 residZero CLIP-adapter (512→512,
-/// out = x + 0.6·A(x)) trained on CBSR+Oulu COMBINED. Validated on the real ASUS
-/// sensor (irlume-caldata) against v1: no regression (EER 0.36%=0.36%, FAR@.40=0,
-/// FRR@.40 1.09%) and strictly better on the hard conditions (backlight/dark/motion)
-/// plus FRR@FAR1e-3 halved. Academic CBSR+Oulu puts FAR≈1e-3 at 0.354 and FAR≈1e-4
-/// at 0.410, so 0.40 remains the deployment default (FAR ~1e-4). MUST be re-validated
-/// on the live camera at re-enroll (re-enroll required when the adapter changes:
-/// v3 is a different, 512-D cosine space from v1's 256-D).
+/// Match threshold for ADAPTED IR embeddings (when an IR adapter is loaded).
+/// No adapter ships by default (retired 2026-07-15, ADR-0004: its training data
+/// was research-only, and it worsened unseen identities); the default IR path is
+/// raw AuraFace plus per-enrollment calibration. This threshold applies only when
+/// a user supplies their own 512→512 adapter via `--adapter` / `IRLUME_IR_ADAPTER`.
+/// 0.40 corresponds to FAR ~1e-4 on the CBSR+Oulu academic distribution (FAR≈1e-3
+/// at 0.354, FAR≈1e-4 at 0.410) and MUST be re-validated on the live camera at
+/// re-enroll, since a different adapter is a different cosine space.
 pub const IR_ADAPTED_MATCH_THRESHOLD: f32 = 0.40;
 
 /// Extra margin added to the IR threshold when IR is used as a DIM-LIGHT FALLBACK

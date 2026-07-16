@@ -65,7 +65,7 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 
 ## 📦 Install
 
-> **v0.1.5.** Works end-to-end on real hardware across all three families. Not
+> **v0.2.0.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass); see [Honest limitations](#-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM; the distros below are
@@ -118,9 +118,8 @@ sudo apt install irlume
 <td>
 
 ```sh
-# prebuilt from Releases
-sudo pacman -U \
-  ./irlume-*.pkg.tar.zst
+# AUR
+yay -S irlume
 ```
 
 </td>
@@ -379,11 +378,21 @@ default IR-structure gate already rejects photos, screens, and video replays.
 
 ## 🛠️ Status
 
-**v0.1.5: working, validated on real hardware** across Fedora (full IR Secure tier,
+**v0.2.0: working, validated on real hardware** across Fedora (full IR Secure tier,
 end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
-CLI/daemon on a camera-less testbed). Packaged for all three families (see [Install](#-install)).
+CLI/daemon on a camera-less testbed). Packaged for all three families — Fedora via Copr,
+Arch via the [AUR](https://aur.archlinux.org/packages/irlume), Ubuntu via the PPA (see
+[Install](#-install)).
 
-0.1.5 adds **Tier-2 TPM sealing via systemd-pcrlock**: on a pcrlock-provisioned machine a
+0.2.0 removes the last non-permissive model, the research-only-trained IR adapter, so the
+**entire shipped model stack is now MIT/Apache-2.0**; the default IR path is raw AuraFace
+plus per-enrollment on-device calibration (no bundled weights). It also adds a BlazeFace
+detection-rescue cascade (outdoor detection 76.9% → 98.5%), the 478-point FaceLandmarker
+mesh, and a presence grace window after the consent gesture. Upgrading from 0.1.x needs a
+one-time re-enroll for dark/dim login — bright-light login and the password are unaffected.
+Every accuracy figure is reproducible from [`benchmarks/`](benchmarks/).
+
+**Tier-2 TPM sealing via systemd-pcrlock** (since 0.1.5): on a pcrlock-provisioned machine a
 firmware or Secure Boot update needs one `systemd-pcrlock make-policy` run instead of
 re-arming the keyring, and the sealed password keeps releasing. Sealing picks the best
 policy the machine supports (signed PCR, then pcrlock, then a literal PCR-7 seal) and

@@ -1,0 +1,135 @@
+{
+  "ort": "1.27.0",
+  "cuda": true,
+  "cbsr_nir": {
+    "detection": {
+      "images": 3940,
+      "detect_rate": 1.0,
+      "gt_eyes_in_box_rate": 1.0,
+      "gt_align_fallbacks": 0,
+      "eye_nme_mean": 0.05295662727480854,
+      "eye_nme_p95": 0.09428756614418426
+    },
+    "auraface": {
+      "verification": {
+        "eer": 0.007666666666666688,
+        "auc": 0.999496888888889,
+        "tar@far0.01": 0.993,
+        "tar@far0.001": 0.983,
+        "pairs_used": 6000
+      },
+      "rank1_ident": {
+        "acc": 1.0,
+        "probes": 2364,
+        "gallery_ids": 197
+      }
+    },
+    "buffalo_w600k_r50": {
+      "verification": {
+        "eer": 0.00033333333333331494,
+        "auc": 0.9999943333333334,
+        "tar@far0.01": 0.9996666666666667,
+        "tar@far0.001": 0.9996666666666667,
+        "pairs_used": 6000
+      },
+      "rank1_ident": {
+        "acc": 1.0,
+        "probes": 2364,
+        "gallery_ids": 197
+      }
+    },
+    "auraface+ir_adapter_v3": {
+      "verification": {
+        "eer": 0.003666666666666687,
+        "auc": 0.9999094444444445,
+        "tar@far0.01": 0.9976666666666667,
+        "tar@far0.001": 0.995,
+        "pairs_used": 6000
+      },
+      "rank1_ident": {
+        "acc": 1.0,
+        "probes": 2364,
+        "gallery_ids": 197
+      }
+    }
+  },
+  "tufts": {
+    "detection": {
+      "rgb": {
+        "images": 3234,
+        "detected": 3234,
+        "detect_rate": 1.0
+      },
+      "nir": {
+        "images": 3234,
+        "detected": 3211,
+        "detect_rate": 0.9928880643166358
+      }
+    },
+    "nir_nir": {
+      "auraface": {
+        "eer": 0.014333333333333321,
+        "auc": 0.998733888888889,
+        "tar@far0.01": 0.9833333333333333,
+        "tar@far0.001": 0.9363333333333334,
+        "pairs_used": 6000
+      },
+      "buffalo_w600k_r50": {
+        "eer": 0.00033333333333331494,
+        "auc": 0.999999888888889,
+        "tar@far0.01": 1.0,
+        "tar@far0.001": 1.0,
+        "pairs_used": 6000
+      },
+      "auraface+ir_adapter_v3": {
+        "eer": 0.01533333333333332,
+        "auc": 0.9988076666666668,
+        "tar@far0.01": 0.981,
+        "tar@far0.001": 0.9483333333333334,
+        "pairs_used": 6000
+      }
+    },
+    "rgb_rgb": {
+      "auraface": {
+        "eer": 0.004000000000000002,
+        "auc": 0.9998743333333334,
+        "tar@far0.01": 0.9983333333333333,
+        "tar@far0.001": 0.984,
+        "pairs_used": 6000
+      },
+      "buffalo_w600k_r50": {
+        "eer": 0.00033333333333331494,
+        "auc": 0.9999994444444446,
+        "tar@far0.01": 1.0,
+        "tar@far0.001": 0.9996666666666667,
+        "pairs_used": 6000
+      }
+    },
+    "cross_spectral_rgb_enroll_nir_verify": {
+      "auraface": {
+        "eer": 0.009031454375583938,
+        "auc": 0.9996804914126067,
+        "tar@far0.01": 0.9915914045468701,
+        "tar@far0.001": 0.9744627841793834,
+        "genuine": 3211,
+        "impostor": 32110
+      },
+      "buffalo_w600k_r50": {
+        "eer": 0.0,
+        "auc": 1.0,
+        "tar@far0.01": 1.0,
+        "tar@far0.001": 1.0,
+        "genuine": 3211,
+        "impostor": 32110
+      },
+      "auraface+ir_adapter_v3": {
+        "eer": 0.008782310806602286,
+        "auc": 0.9996134045990499,
+        "tar@far0.01": 0.9915914045468701,
+        "tar@far0.001": 0.9753970725630645,
+        "genuine": 3211,
+        "impostor": 32110
+      }
+    }
+  }
+}

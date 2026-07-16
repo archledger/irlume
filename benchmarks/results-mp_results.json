@@ -1,0 +1,164 @@
+{
+  "detectors": {
+    "yunet": {
+      "cbsr": {
+        "rate": 1.0,
+        "eye_nme": 0.05295662726635672,
+        "ms": 6.714787661880349
+      },
+      "tufts_nir": {
+        "rate": 0.9928880643166358
+      },
+      "tufts_rgb": {
+        "rate": 1.0
+      },
+      "outdoor-walking": {
+        "rate": 0.7692307692307693,
+        "n": 65
+      },
+      "car-tint-sun": {
+        "rate": 1.0,
+        "n": 260
+      },
+      "shade-frontal": {
+        "rate": 0.9915966386554622,
+        "n": 119
+      },
+      "desk-daylight": {
+        "rate": 1.0,
+        "n": 108
+      },
+      "dark-burst": {
+        "rate": 1.0,
+        "n": 18
+      }
+    },
+    "blaze_short": {
+      "cbsr": {
+        "rate": 1.0,
+        "eye_nme": 0.08691295842063178,
+        "ms": 2.2189470005430265
+      },
+      "tufts_nir": {
+        "rate": 0.9712430426716141
+      },
+      "tufts_rgb": {
+        "rate": 0.9839208410636983
+      },
+      "outdoor-walking": {
+        "rate": 0.9692307692307692,
+        "n": 65
+      },
+      "car-tint-sun": {
+        "rate": 1.0,
+        "n": 260
+      },
+      "shade-frontal": {
+        "rate": 0.40336134453781514,
+        "n": 119
+      },
+      "desk-daylight": {
+        "rate": 1.0,
+        "n": 108
+      },
+      "dark-burst": {
+        "rate": 1.0,
+        "n": 18
+      }
+    },
+    "blaze_full": {
+      "cbsr": {
+        "rate": 0.999746192893401,
+        "eye_nme": 0.06750983198881602,
+        "ms": 4.926237044464454
+      },
+      "tufts_nir": {
+        "rate": 0.01422387136672851
+      },
+      "tufts_rgb": {
+        "rate": 0.05071119356833643
+      },
+      "outdoor-walking": {
+        "rate": 0.5692307692307692,
+        "n": 65
+      },
+      "car-tint-sun": {
+        "rate": 1.0,
+        "n": 260
+      },
+      "shade-frontal": {
+        "rate": 0.7563025210084033,
+        "n": 119
+      },
+      "desk-daylight": {
+        "rate": 1.0,
+        "n": 108
+      },
+      "dark-burst": {
+        "rate": 1.0,
+        "n": 18
+      }
+    },
+    "blaze_sparse": {
+      "cbsr": {
+        "rate": 1.0,
+        "eye_nme": 0.06173120082015684,
+        "ms": 4.804068752981103
+      },
+      "tufts_nir": {
+        "rate": 0.1341991341991342
+      },
+      "tufts_rgb": {
+        "rate": 0.23067408781694496
+      },
+      "outdoor-walking": {
+        "rate": 0.6307692307692307,
+        "n": 65
+      },
+      "car-tint-sun": {
+        "rate": 1.0,
+        "n": 260
+      },
+      "shade-frontal": {
+        "rate": 0.6722689075630253,
+        "n": 119
+      },
+      "desk-daylight": {
+        "rate": 1.0,
+        "n": 108
+      },
+      "dark-burst": {
+        "rate": 1.0,
+        "n": 18
+      }
+    }
+  },
+  "landmarkers": {
+    "facemesh_old": {
+      "eye_nme": 0.039228770787161575,
+      "detected": 985,
+      "of": 985,
+      "ms": 9.718257117913657,
+      "jitter_px": 5.3323798179626465
+    },
+    "landmarker_task": {
+      "eye_nme": 0.034476111627652926,
+      "detected": 985,
+      "of": 985,
+      "ms": 10.726179480304479,
+      "jitter_px": 5.149856764746833
+    }
+  },
+  "blendshapes_eyeblink": {
+    "dark-burst": {
+      "mean": 0.46932149595684475,
+      "max": 0.6875198483467102,
+      "n": 18
+    },
+    "desk-daylight": {
+      "mean": 0.38509973386923474,
+      "max": 0.7599883675575256,
+      "n": 18
+    }
+  }
+}

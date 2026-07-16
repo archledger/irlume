@@ -1,0 +1,14 @@
+[ WARN:0@0.079] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+/home/archledger/bench/bench_cascade.py:114: RuntimeWarning: overflow encountered in exp
+  scores = 1.0 / (1.0 + np.exp(-np.clip(cls[0, :, 0], -100, 100)))
+[cascade] cbsr: yunet 1.000 blaze 1.000 CASCADE 1.000 (n=3940)
+[cascade] tufts_nir: yunet 0.993 blaze 0.968 CASCADE 0.998 (n=3234)
+[cascade] tufts_rgb: yunet 1.000 blaze 0.985 CASCADE 1.000 (n=3234)
+[cascade] dark-burst: yunet 1.000 blaze 1.000 CASCADE 1.000 (n=18)
+[cascade] outdoor-walking: yunet 0.769 blaze 0.985 CASCADE 0.985 (n=65)
+[cascade] car-tint-sun: yunet 1.000 blaze 1.000 CASCADE 1.000 (n=260)
+[cascade] shade-frontal: yunet 0.992 blaze 0.403 CASCADE 0.992 (n=119)
+[cascade] desk-daylight: yunet 1.000 blaze 1.000 CASCADE 1.000 (n=108)
+[mesh] old_192: eye_nme 0.0378 EAR 0.247±0.032 (open eyes, n=985)
+[mesh] new_256: eye_nme 0.0273 EAR 0.252±0.050 (open eyes, n=985)
+wrote bench_cascade.json

@@ -1,0 +1,66 @@
+{
+  "cascade": {
+    "cbsr": {
+      "yunet": 1.0,
+      "blaze_onnx": 1.0,
+      "cascade": 1.0,
+      "n": 3940
+    },
+    "tufts_nir": {
+      "yunet": 0.9928880643166358,
+      "blaze_onnx": 0.9684601113172542,
+      "cascade": 0.9975262832405689,
+      "n": 3234
+    },
+    "tufts_rgb": {
+      "yunet": 1.0,
+      "blaze_onnx": 0.9854669140383426,
+      "cascade": 1.0,
+      "n": 3234
+    },
+    "dark-burst": {
+      "yunet": 1.0,
+      "blaze_onnx": 1.0,
+      "cascade": 1.0,
+      "n": 18
+    },
+    "outdoor-walking": {
+      "yunet": 0.7692307692307693,
+      "blaze_onnx": 0.9846153846153847,
+      "cascade": 0.9846153846153847,
+      "n": 65
+    },
+    "car-tint-sun": {
+      "yunet": 1.0,
+      "blaze_onnx": 1.0,
+      "cascade": 1.0,
+      "n": 260
+    },
+    "shade-frontal": {
+      "yunet": 0.9915966386554622,
+      "blaze_onnx": 0.40336134453781514,
+      "cascade": 0.9915966386554622,
+      "n": 119
+    },
+    "desk-daylight": {
+      "yunet": 1.0,
+      "blaze_onnx": 1.0,
+      "cascade": 1.0,
+      "n": 108
+    }
+  },
+  "mesh": {
+    "old_192": {
+      "eye_nme": 0.03778018504498324,
+      "ear_mean": 0.24720087342893177,
+      "ear_std": 0.03200179331699158,
+      "n": 985
+    },
+    "new_256": {
+      "eye_nme": 0.02734383027791403,
+      "ear_mean": 0.2523288628018443,
+      "ear_std": 0.05037111031814412,
+      "n": 985
+    }
+  }
+}

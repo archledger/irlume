@@ -1,0 +1,17 @@
+{
+  "lfw_cascade": {
+    "auraface": {
+      "eer": 0.013666666666666692,
+      "auc": 0.9960184444444445,
+      "tar@far0.01": 0.9863333333333333,
+      "tar@far0.001": 0.978,
+      "acc10fold": 0.9903333333333333,
+      "acc_std": 0.0037859388972001974,
+      "pairs_used": 6000,
+      "pairs_skipped_nodet": 0
+    }
+  },
+  "yunet_hits": 7701,
+  "blaze_rescues": 0,
+  "total_images": 7701
+}

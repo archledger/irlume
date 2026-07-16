@@ -133,8 +133,23 @@ hour on a CPU; `--max-images N` bounds it for a quick look, at the cost of a
 noisier estimate. `FAIRNESS.md` has the full protocol and the per-group
 FairFace table.
 
+## 6. The model-accuracy numbers · benchmarks/
+
+**Claim:** the recognition, detection-cascade, and landmark figures in the
+README, [`models/README.md`](../models/README.md), the CHANGELOG, and the release
+notes (LFW 99.03%, the IR-adapter overfit that justified its removal, the
+cascade's 76.9% → 98.5% outdoor rescue, the 478-point mesh's 28% eye-NME gain).
+
+The scripts that produced every one of these live in
+[`../benchmarks/`](../benchmarks/), and the raw result files are committed beside
+them (`results-*.json` / `.log`) — read them directly, or reproduce from scratch
+on the public datasets (LFW, CBSR NIR, Oulu-CASIA NIR, Tufts Face). Datasets,
+exact protocols, the runtime, and the honest caveats (small outdoor sample;
+InsightFace's non-commercial recognizer beats the permissive one irlume ships)
+are all in [`../benchmarks/README.md`](../benchmarks/README.md).
+
 ---
 
-**A note on effort.** Some of these reproductions are easy (1–3) and some take
+**A note on effort.** Some of these reproductions are easy (1–3, 6) and some take
 real effort (4–5). The point is that every claim *can* be checked, against code
 and data that are in this repo.

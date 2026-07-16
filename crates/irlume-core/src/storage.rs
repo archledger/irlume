@@ -180,6 +180,21 @@ impl Enrollment {
             .count()
     }
 
+    /// IR scans matching that dark/dim login CAN score: tagged with the live
+    /// space, or untagged (grandfathered, see [`Enrollment::retag_untagged_ir`]).
+    /// The complement of [`Enrollment::stale_ir_scans`]. Used to decide whether
+    /// stale scans are an outage (none usable: dark login is broken, tell the
+    /// user to re-enroll) or leftovers (fresh scans exist alongside them, dark
+    /// login works, stay quiet).
+    pub fn usable_ir_scans(&self, live_space: &str) -> usize {
+        self.profiles
+            .iter()
+            .flat_map(|p| &p.scans)
+            .filter(|s| s.ir.is_some())
+            .filter(|s| s.ir_space.as_deref().is_none_or(|sp| sp == live_space))
+            .count()
+    }
+
     /// Stamp untagged IR scans with the space of the pipeline they were
     /// captured under (only scans matching the live pipeline's embedding
     /// dimension). Called by the daemon at startup while the pipeline is
@@ -744,5 +759,41 @@ mod tests {
         assert_eq!(e.next_profile_name(), "Face Profile 2");
         let p = &e.profiles[0];
         assert_eq!(p.next_scan_name(), "Face Scan 1");
+    }
+
+    #[test]
+    fn stale_and_usable_ir_counts_partition_the_scans() {
+        let ir_scan = |name: &str, space: Option<&str>| FaceScan {
+            name: name.into(),
+            rgb: vec![0.0; 4],
+            ir: Some(vec![0.0; 4]),
+            ir_space: space.map(String::from),
+            ir_depth: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        };
+        let mut e = Enrollment::new("u");
+        e.profiles.push(FaceProfile {
+            ir_calib: None,
+            name: "P".into(),
+            scans: vec![
+                ir_scan("adapter-era", Some("adapter:deadbeef0123")),
+                ir_scan("fresh", Some("raw")),
+                ir_scan("legacy-untagged", None),
+            ],
+        });
+        // The upgrade-outage notice keys off this split: stale>0 AND usable==0.
+        assert_eq!(e.stale_ir_scans("raw"), 1);
+        assert_eq!(e.usable_ir_scans("raw"), 2); // tagged-current + grandfathered
+                                                 // Post-0.2.0, pre-re-enroll: everything stale, nothing usable -> notice.
+        e.profiles[0].scans.retain(|s| s.name == "adapter-era");
+        assert_eq!(e.stale_ir_scans("raw"), 1);
+        assert_eq!(e.usable_ir_scans("raw"), 0);
+        // An RGB-only scan (no ir) counts for neither side.
+        e.profiles[0].scans.push(FaceScan {
+            ir: None,
+            ..ir_scan("rgb-only", None)
+        });
+        assert_eq!(e.usable_ir_scans("raw"), 0);
     }
 }

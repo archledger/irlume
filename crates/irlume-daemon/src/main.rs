@@ -161,8 +161,12 @@ fn main() {
             // in a foreign embedding space and cannot match. Bright-light RGB
             // login still works; dark/dim login needs a re-enroll. Surfaced here
             // (journal, and `irlume logs`) because the daemon restarts on upgrade.
+            // Only an OUTAGE gets the notice: once the user re-enrolls, the fresh
+            // usable scans coexist with the stale ones (whose RGB templates still
+            // help), and nagging them to re-run the remedy they already ran is
+            // noise on every restart.
             let stale = enr.stale_ir_scans(engine.ir_space());
-            if stale > 0 {
+            if stale > 0 && enr.usable_ir_scans(engine.ir_space()) == 0 {
                 eprintln!(
                     "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
                      removed IR adapter and no longer match. Bright-light face login still works; \

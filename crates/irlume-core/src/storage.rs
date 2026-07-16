@@ -165,6 +165,21 @@ impl Enrollment {
             .collect()
     }
 
+    /// IR scans that were enrolled in a DIFFERENT embedding space than the live
+    /// pipeline (e.g. under an IR adapter that is no longer loaded). These are
+    /// skipped by [`Enrollment::ir_scans_for`], so dark/dim login cannot match
+    /// them: the user must re-enroll. Untagged legacy scans are grandfathered
+    /// (they are retagged to the live space by [`Enrollment::retag_untagged_ir`]),
+    /// so this counts only genuinely foreign-tagged scans. Call AFTER retagging.
+    pub fn stale_ir_scans(&self, live_space: &str) -> usize {
+        self.profiles
+            .iter()
+            .flat_map(|p| &p.scans)
+            .filter(|s| s.ir.is_some())
+            .filter(|s| matches!(&s.ir_space, Some(sp) if sp != live_space))
+            .count()
+    }
+
     /// Stamp untagged IR scans with the space of the pipeline they were
     /// captured under (only scans matching the live pipeline's embedding
     /// dimension). Called by the daemon at startup while the pipeline is

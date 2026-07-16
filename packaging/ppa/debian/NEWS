@@ -1,0 +1,18 @@
+irlume (0.2.0) unstable; urgency=medium
+
+  * BREAKING: re-enroll needed for dark/dim (IR) face login.
+
+    This release removes the IR adapter (its training data was research-only,
+    which conflicted with the project's clean, commercially-usable model stack).
+    Face profiles enrolled under 0.1.x hold IR templates in the old adapter's
+    embedding space, which the new default pipeline no longer matches.
+
+    Bright-light (RGB) face login keeps working, and any mismatch falls back to
+    your password as usual, but dark/dim (IR) login stops until you re-enroll:
+
+        irlume enroll
+
+    No data is lost and nothing else is required. The default IR path is now raw
+    AuraFace plus per-enrollment on-device calibration, with no bundled weights.
+
+ -- archledger <archledger236@gmail.com>  Tue, 15 Jul 2026 00:00:00 +0000

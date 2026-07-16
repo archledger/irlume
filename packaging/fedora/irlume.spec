@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.1.5
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -97,6 +97,13 @@ if [ $1 -eq 1 ]; then
     systemctl start irlumed.service &>/dev/null || :
 fi
 # PAM wiring is opt-in (irlume login enable) — never auto-wire auth on install.
+# Upgrade from a version that shipped the IR adapter (< 0.2.0): dark/dim IR
+# login needs a re-enroll (RGB login keeps working). Bright-line the notice.
+if [ $1 -gt 1 ]; then
+    echo "irlume: this upgrade removed the IR adapter. If you enrolled before 0.2.0," >&2
+    echo "irlume: dark/dim face login needs a re-enroll: run 'irlume enroll'." >&2
+    echo "irlume: bright-light login keeps working; your password is unaffected." >&2
+fi
 
 %preun
 %systemd_preun irlumed.service
@@ -134,6 +141,18 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Jul 15 2026 archledger <archledger236@gmail.com> - 0.2.0-1
+- BREAKING: re-enroll needed for dark/dim (IR) login. The IR adapter was
+  removed (its training data was research-only), so IR templates enrolled under
+  0.1.x no longer match. Bright-light (RGB) login keeps working and the password
+  is unaffected; run `irlume enroll` to restore dark/dim login.
+- Removed the research-only-trained ir_adapter.onnx; the default IR path is raw
+  AuraFace plus per-enrollment on-device calibration (no bundled weights).
+- Detection cascade: BlazeFace short-range rescue on a YuNet miss (saturated
+  outdoor frames), FaceMesh upgraded to the 478-point FaceLandmarker mesh.
+- Presence grace window after the consent gesture (15s login/lock, 5s sudo/su),
+  retrying only presence-class failures.
+- cargo-deny license gate enabled; dead ndarray dependency dropped.
 * Sun Jul 12 2026 archledger <archledger236@gmail.com> - 0.1.5-1
 - Tier 2 TPM sealing via systemd-pcrlock: on a pcrlock-provisioned machine new
   seals bind to the pcrlock NV index, so a firmware/Secure Boot update needs one

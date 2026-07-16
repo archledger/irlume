@@ -3,7 +3,14 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-15
+
+> **⚠ Breaking — re-enroll needed for dark/dim login.** This release removes the
+> IR adapter (see Removed). Face profiles enrolled under 0.1.x have IR templates
+> in the old adapter's embedding space, which no longer matches. **Bright-light
+> (RGB) face login keeps working**, and any mismatch falls back to your password
+> as usual, but **dark/dim (IR) login stops until you re-enroll**: run
+> `irlume enroll`. Nothing else is required and no data is lost.
 
 ### Added
 

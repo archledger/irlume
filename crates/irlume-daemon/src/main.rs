@@ -156,6 +156,19 @@ fn main() {
                     Err(e) => eprintln!("irlumed: could not retag IR scans for '{user}': {e}"),
                 }
             }
+            // Upgrade notice: IR scans enrolled under a now-absent adapter (e.g.
+            // 0.1.x -> 0.2.0, where the research-only IR adapter was removed) are
+            // in a foreign embedding space and cannot match. Bright-light RGB
+            // login still works; dark/dim login needs a re-enroll. Surfaced here
+            // (journal, and `irlume logs`) because the daemon restarts on upgrade.
+            let stale = enr.stale_ir_scans(engine.ir_space());
+            if stale > 0 {
+                eprintln!(
+                    "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
+                     removed IR adapter and no longer match. Bright-light face login still works; \
+                     dark/dim login needs a re-enroll: run `irlume enroll`."
+                );
+            }
         }
     }
 

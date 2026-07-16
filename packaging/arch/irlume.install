@@ -15,6 +15,16 @@ EOF
 post_upgrade() {
     systemctl daemon-reload
     systemctl try-restart irlumed.service 2>/dev/null || true
+    # 0.1.x -> 0.2.0 removed the IR adapter; IR templates enrolled before 0.2.0
+    # no longer match. Bright-light (RGB) login still works; the password is
+    # unaffected. Compare the just-installed version against the old one.
+    if [ "$(vercmp "$2" 0.2.0)" -lt 0 ]; then
+        cat <<'EOF'
+irlume 0.2.0: the IR adapter was removed. If you enrolled before 0.2.0,
+dark/dim face login needs a re-enroll:  irlume enroll
+Bright-light login keeps working and your password is unaffected.
+EOF
+    fi
 }
 
 pre_remove() {

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the irlume .deb: cargo build, pull LFS models, stage the bundled
-# onnxruntime (>=1.24, absent from the Debian/Ubuntu archive), then nfpm pkg.
+# onnxruntime (>=1.24; Ubuntu's archive first gained onnxruntime in 26.04 at
+# 1.23.2, below irlume's floor, and older LTSs have none), then nfpm pkg.
 #   bash packaging/debian/build-deb.sh
 set -euo pipefail
 

@@ -242,6 +242,16 @@ The current gaps:
   and the [PAD self-test results](docs/pad-results/).
 - **RGB-only laptops get the Convenience tier:** face unlocks the *screen only*,
   never `sudo`, login, or the keyring (those keep the password). By design.
+- **Bright IR behind you defeats the depth check.** The anti-spoof gate reads 3D
+  shape from the IR emitter's light; when the scene's own infrared floods it, no
+  shape signal is left, and a genuine face is rejected to the password. Measured
+  in a 430-sample field session (2026-07-16, cloudy-bright sky): reliable below
+  ambient ~120 on the 0-255 IR scale (indoors, inside vehicles, shade — a closed
+  car with 20% tint passed 99/99), marginal to ~170, and 0/129 genuine samples
+  passed above ~170 (open sky or sun behind the user; the emitter's contribution
+  fell to noise and 46-82% of the IR frame was saturated). irlume can't tell sky
+  from a bright lamp — both are just infrared — so the rejection names the
+  condition and the fix: turn away from the light, or type the password.
 - **Not lab-certified.** We self-test against ISO/IEC 30107-3; there's no paid iBeta
   pass. Demographic FMR tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
 

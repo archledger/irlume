@@ -476,6 +476,7 @@ impl Engine {
             ir_eye_glint: 0.0,
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
+            ir_ambient: 0.0, // RGB-only path: no IR burst to measure
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
@@ -534,7 +535,7 @@ impl Engine {
                 (rgb, rgb_ms, Ok(None), 0)
             } else {
                 let t = std::time::Instant::now();
-                let ir = irlume_camera::capture_ir(&self.ir_dev);
+                let ir = irlume_camera::capture_ir_with_stats(&self.ir_dev);
                 (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
             }
         } else {
@@ -542,7 +543,10 @@ impl Engine {
                 let ir_dev = self.ir_dev.clone();
                 let ir_thread = s.spawn(move || {
                     let t = std::time::Instant::now();
-                    (irlume_camera::capture_ir(&ir_dev), t.elapsed().as_millis())
+                    (
+                        irlume_camera::capture_ir_with_stats(&ir_dev),
+                        t.elapsed().as_millis(),
+                    )
                 });
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
@@ -601,12 +605,12 @@ impl Engine {
         // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
         // above already returned, so reaching here with `None` is unreachable,
         // but capture alone rather than unwrap to stay panic-free.
-        let ir = match ir_res {
+        let (ir, ir_stats) = match ir_res {
             Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir(&self.ir_dev)?,
+            Ok(None) => irlume_camera::capture_ir_with_stats(&self.ir_dev)?,
             Err(e) => {
                 irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir(&self.ir_dev)?
+                irlume_camera::capture_ir_with_stats(&self.ir_dev)?
             }
         };
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
@@ -696,6 +700,7 @@ impl Engine {
                 .unwrap_or(0.0),
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
+            ir_ambient: ir_stats.ambient_mean,
             rgb_face_brightness: 0.0, // IR path doesn't use the RGB-PAD cues
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -704,9 +709,9 @@ impl Engine {
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
-            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} yaw_asym={:.2} pitch={:.2}",
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2}",
             signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
-            signals.head_yaw_asym, signals.head_pitch_frac);
+            signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac);
 
         // Rebuild the view against the final RGB frame (it may have been
         // recaptured by the cross-spectrum self-heal above).
@@ -1098,8 +1103,9 @@ impl Engine {
                 });
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
-            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2}",
-                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint);
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} ambient={:.0}",
+                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint,
+                a.signals.ir_ambient);
             if verdict != Verdict::Live {
                 return Ok(Outcome {
                     granted: false,

@@ -1290,6 +1290,7 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             ir_eye_glint,
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
+            ir_ambient: 0.0, // dev gate probe: single frame, no burst stats
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,

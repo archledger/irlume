@@ -55,6 +55,11 @@ pub struct Signals {
     /// High-frequency spectral peakiness of the RGB face region (2D-FFT moiré /
     /// pixel-grid cue); RGB-only screen-replay deterrent. Unused on the IR path.
     pub rgb_moire_score: f32,
+    /// Ambient IR level (0–255): mean of the darkest (unlit) frame in the IR
+    /// capture burst, i.e. the scene's own infrared with the emitter off. 0.0 =
+    /// not measured (RGB-only path, older callers); the flood rewording below
+    /// then never triggers. See [`IR_AMBIENT_FLOOD`].
+    pub ir_ambient: f32,
 }
 
 impl Default for Signals {
@@ -70,6 +75,7 @@ impl Default for Signals {
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
+            ir_ambient: 0.0, // not measured
         }
     }
 }
@@ -138,6 +144,28 @@ pub const MIN_FACE_SCORE: f32 = 0.6;
 /// 2026-06-26: a real lit face measured 1.36; a flat spoof is ~1.0. Kept lenient
 /// at 1.03 to avoid false-rejects across poses; tighten with flat-IR-spoof data.
 pub const DEPTH_MIN_RATIO: f32 = 1.03;
+
+/// Ambient IR (see [`Signals::ir_ambient`]) above which the brightness and
+/// depth cues are physically starved rather than measuring a spoof: the scene's
+/// own infrared swamps the emitter, so the strobe adds almost nothing to read
+/// shape or skin reflectance from. Measured 2026-07-16 (430-sample field
+/// session, ~/irlume-suncal/SESSION-2026-07-16.md): genuine faces pass depth
+/// reliably below ambient ~120, marginally to ~170, and 0/129 samples passed
+/// above ~170 (emitter-over-ambient gap collapsed to 4–9, IR frame 46–82%
+/// saturated). The verdict stays Spoof (fail closed); only the REASON changes,
+/// from "looks 2D" (which reads as an accusation) to what is actually wrong
+/// and what to do about it. The sensor cannot tell WHAT the source is (open
+/// sky, sun, and strong lamps look identical in IR), so the message names
+/// examples, not a diagnosis.
+pub const IR_AMBIENT_FLOOD: f32 = 170.0;
+
+/// The actionable rejection for ambient-flooded IR scenes.
+fn flood_reason(ambient: f32) -> String {
+    format!(
+        "too much IR light behind you (ambient {ambient:.0}: open sky, sun, or bright \
+         lamps wash out the emitter); turn away from the light or use your password"
+    )
+}
 /// Eye IR peak above this counts as a corneal glint (supporting cue).
 pub const GLINT_MIN: f32 = 180.0;
 /// Head-orientation gate (Windows-Hello-style ±15° frontality), approximated
@@ -218,27 +246,29 @@ impl LivenessGate {
         // IR skin reflectance: the face region must be brightly lit.
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
-            return (
-                Verdict::Spoof,
-                cues,
+            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+                flood_reason(s.ir_ambient)
+            } else {
                 format!(
                     "IR face too dark ({:.0}); not reflecting IR like skin",
                     s.ir_face_brightness
-                ),
-            );
+                )
+            };
+            return (Verdict::Spoof, cues, reason);
         }
 
         // Anti-flat: a real 3D face shows center-vs-edge IR falloff.
         cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
         if !cues.depth_ok {
-            return (
-                Verdict::Spoof,
-                cues,
+            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+                flood_reason(s.ir_ambient)
+            } else {
                 format!(
                     "IR too flat (center/edge {:.2}); looks 2D, not a 3D face",
                     s.ir_center_edge_ratio
-                ),
-            );
+                )
+            };
+            return (Verdict::Spoof, cues, reason);
         }
 
         // Corneal glint: supporting only; logged, never decisive on its own.
@@ -324,19 +354,21 @@ impl LivenessGate {
         let _ = ir;
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
-            return (
-                Verdict::Spoof,
-                cues,
-                format!("IR face too dark ({:.0})", s.ir_face_brightness),
-            );
+            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+                flood_reason(s.ir_ambient)
+            } else {
+                format!("IR face too dark ({:.0})", s.ir_face_brightness)
+            };
+            return (Verdict::Spoof, cues, reason);
         }
         cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
         if !cues.depth_ok {
-            return (
-                Verdict::Spoof,
-                cues,
-                format!("IR too flat (center/edge {:.2})", s.ir_center_edge_ratio),
-            );
+            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+                flood_reason(s.ir_ambient)
+            } else {
+                format!("IR too flat (center/edge {:.2})", s.ir_center_edge_ratio)
+            };
+            return (Verdict::Spoof, cues, reason);
         }
         cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
         (
@@ -779,6 +811,42 @@ mod tests {
         let mut s = live_signals();
         s.ir_center_edge_ratio = 1.0; // uniform => flat
         assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Spoof);
+    }
+
+    #[test]
+    fn ambient_flood_rewords_but_still_denies() {
+        // Flat under flood ambient: still Spoof (fail closed), but the reason
+        // says what is wrong (too much IR behind the user) instead of accusing
+        // a genuine face of being a photo. Both starved cues get the wording.
+        let mut s = live_signals();
+        s.ir_center_edge_ratio = 0.85; // outdoor-flat (2026-07-16 field data)
+        s.ir_ambient = 190.0;
+        let (v, _, reason) = LivenessGate::new().evaluate(&s);
+        assert_eq!(v, Verdict::Spoof);
+        assert!(reason.contains("too much IR light behind you"), "{reason}");
+
+        let mut s = live_signals();
+        s.ir_face_brightness = 20.0; // starved by subtraction/backlight
+        s.ir_ambient = 190.0;
+        let (v, _, reason) = LivenessGate::new().evaluate(&s);
+        assert_eq!(v, Verdict::Spoof);
+        assert!(reason.contains("too much IR light behind you"), "{reason}");
+
+        // Same cues indoors (low ambient): the specific accusations remain,
+        // and the ir-only/dark path rewords the same way under flood.
+        let mut s = live_signals();
+        s.ir_center_edge_ratio = 0.85;
+        s.ir_ambient = 60.0;
+        let (_, _, reason) = LivenessGate::new().evaluate(&s);
+        assert!(reason.contains("IR too flat"), "{reason}");
+
+        let mut s = live_signals();
+        s.rgb_face = None;
+        s.ir_center_edge_ratio = 0.85;
+        s.ir_ambient = 200.0;
+        let (v, _, reason) = LivenessGate::new().evaluate_ir_only(&s);
+        assert_eq!(v, Verdict::Spoof);
+        assert!(reason.contains("too much IR light behind you"), "{reason}");
     }
 
     #[test]

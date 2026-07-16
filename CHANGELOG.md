@@ -3,6 +3,26 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Ambient-flooded IR scenes get an actionable rejection.** When the scene's
+  own infrared is strong enough to starve the anti-spoof depth and reflectance
+  cues (measured threshold: ambient 170 on the 0-255 scale; above it, 0/129
+  genuine samples passed in the 2026-07-16 field session), the denial now says
+  "too much IR light behind you (open sky, sun, or bright lamps); turn away
+  from the light or use your password" instead of "looks 2D, not a 3D face".
+  Same fail-closed verdict, honest reason. The sensor cannot tell what the
+  source is, so the message names examples rather than guessing. The measured
+  ambient level also joins the liveness debug traces.
+- The daemon startup notice about stale IR templates fires only when dark/dim
+  login is actually broken (no usable current-space templates), not forever
+  after a completed re-enroll.
+- README documents the measured outdoor operating envelope; packaging comments
+  record the verified distro onnxruntime versions (Fedora and Ubuntu are all
+  below irlume's 1.24 floor, so the bundle stays).
+
 ## [0.2.1] - 2026-07-16
 
 ### Fixed

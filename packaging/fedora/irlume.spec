@@ -9,9 +9,12 @@ License:        GPL-3.0-or-later
 URL:            https://github.com/archledger/irlume
 # Packit fills VCS source from the signed tag; models come via Git LFS.
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
-# Bundled onnxruntime runtime (MIT). Fedora ships 1.22 but irlume needs the
-# api-24 ABI (>=1.24), so we vendor the upstream Linux build instead of
-# depending on an external Copr. Packit/Copr fetch remote sources (net-on).
+# Bundled onnxruntime runtime (MIT). irlume needs the api-24 ABI (>=1.24);
+# Fedora's own onnxruntime is below that in every release we build for
+# (verified 2026-07-16: f43 1.20.1, f44 1.22.2; rawhide's 1.26 is the first
+# to clear the floor), so we vendor the upstream Linux build. Revisit
+# unbundling when the floor is met across our chroots. Packit/Copr fetch
+# remote sources (net-on).
 Source1:        https://github.com/microsoft/onnxruntime/releases/download/v%{ort_ver}/onnxruntime-linux-x64-%{ort_ver}.tgz
 
 BuildRequires:  cargo

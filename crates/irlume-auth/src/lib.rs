@@ -1373,15 +1373,53 @@ impl Engine {
                 )));
             }
         }
-        // First enroll: no neutral yet → capture_scans falls back to the global
-        // default band; the scans' pitches become this user's neutral for next time.
-        let captured = self.capture_scans(want, enr.pitch_neutral())?;
-        if captured.len() < want {
+        // Probe scan first: it decides whether this face merges into an existing
+        // profile, and therefore how many scans to capture at all. A profile
+        // with 5 free slots gets a 5-scan top-up instead of a 10-scan session
+        // that discards half, and a full profile is refused after one scan
+        // instead of ten. (First enroll: no neutral yet → capture_scans falls
+        // back to the global default band; the scans' pitches become this
+        // user's neutral for next time.)
+        let probe = self
+            .capture_scans(1, enr.pitch_neutral())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                irlume_common::Error::Protocol(
+                    "no live scan captured; check lighting and framing".into(),
+                )
+            })?;
+        let goal = match enroll_merge_target(&enr, &[probe.0.as_slice()])? {
+            Some(target) => {
+                let have = enr
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == target)
+                    .map_or(0, |p| p.scans.len());
+                let room = MAX_SCANS_PER_PROFILE - have;
+                if room == 0 {
+                    return Err(irlume_common::Error::Protocol(format!(
+                        "this face is already enrolled as '{target}', which is at the max \
+                         {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
+                    )));
+                }
+                want.min(room)
+            }
+            None => want,
+        };
+        let mut captured = vec![probe];
+        if goal > 1 {
+            captured.extend(self.capture_scans(goal - 1, enr.pitch_neutral())?);
+        }
+        if captured.len() < goal {
             return Err(irlume_common::Error::Protocol(format!(
-                "only {} live scans (need {want}); check lighting and framing",
+                "only {} live scans (need {goal}); check lighting and framing",
                 captured.len()
             )));
         }
+        // Final disposition over the whole capture: catches a second person
+        // drifting into frame after the probe, and a borderline probe that only
+        // crosses the identity threshold on a later scan.
         let rgbs: Vec<&[f32]> = captured.iter().map(|(rgb, ..)| rgb.as_slice()).collect();
         if let Some(target) = enroll_merge_target(&enr, &rgbs)? {
             // The face already owns a profile: merge the capture into it.
@@ -1397,7 +1435,7 @@ impl Engine {
                      {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
                 )));
             }
-            let added = want.min(room);
+            let added = captured.len().min(room);
             for (rgb, ir, d, b, pitch) in captured.into_iter().take(room) {
                 let sname = enr.profiles[idx].next_scan_name();
                 let ir_space = ir.as_ref().map(|_| self.ir_space.clone());

@@ -21,6 +21,11 @@ All notable changes to irlume are documented here. This project adheres to
   fresh current-space scans to revive dark/dim login. Until this ships, the
   working paths on 0.2.0 are `irlume tui` (Profiles, improve) or
   `irlume enroll --reset`.
+- **Enroll captures only what fits.** A one-scan probe decides whether the
+  face merges into an existing profile and sizes the session from the free
+  slots: a profile with 5 slots left gets a 5-scan top-up instead of a 10-scan
+  session that discards half, and a full profile (30 scans) is refused after
+  one scan instead of ten. A new face still gets the normal 10.
 
 ## [0.2.0] - 2026-07-15
 

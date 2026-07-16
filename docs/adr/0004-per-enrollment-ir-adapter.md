@@ -1,8 +1,10 @@
 # ADR-0004: Retire the shipped IR adapter; adapt per enrollment on-device
 
-**Status:** Accepted. Direction set 2026-07-15; the removal ships in the
-release after the space-tagging groundwork (`e6c23f5`), the per-enrollment
-calibration is future work validated in principle but not yet built.
+**Status:** Accepted and IMPLEMENTED. Direction set 2026-07-15; the
+per-enrollment calibration is built and live (`crates/irlume-core/src/calib.rs`,
+fitted at enroll, applied at match whenever no global adapter is loaded). The
+one remaining step is dropping `ir_adapter.onnx` from packaging, which ships in
+the release after the space-tagging groundwork (`e6c23f5`).
 **Date:** 2026-07-15
 
 ## Context

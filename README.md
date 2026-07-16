@@ -203,10 +203,11 @@ GPLv3-compatible, so the whole thing is bundleable:
 | Stage | Model | License |
 |---|---|:---:|
 | Detection | **YuNet** | MIT |
+| Detection rescue | **BlazeFace short-range** *(fires only on a YuNet miss)* | Apache-2.0 |
 | Recognition | **AuraFace** *(512-D ArcFace)* | Apache-2.0 |
 | IR liveness gate | self-built, algorithmic *(no weights)* | n/a |
-| Passive blink liveness | **MediaPipe FaceMesh** → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
-| IR domain adapter | self-trained on academic NIR datasets *(CBSR, Oulu-CASIA — research-only; replacement planned, see [models/README.md](models/README.md))* | research-only |
+| Passive blink liveness + rescue alignment | **MediaPipe FaceMesh** *(478-pt)* → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
+| IR domain adapter | self-trained on academic NIR datasets *(CBSR, Oulu-CASIA — research-only; per-enrollment calibration replacement built, see [models/README.md](models/README.md))* | research-only |
 
 More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Cross-distro notes](docs/cross-distro/).
 

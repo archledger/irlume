@@ -3,6 +3,33 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Detection cascade: BlazeFace short-range rescue.** YuNet stays the primary
+  detector; when it finds no face (measured on saturated outdoor-walking frames:
+  76.9% detected), a BlazeFace short-range pass runs and FaceMesh refines its
+  box into the 5 alignment points. The cascade detects 98.5% of those frames
+  while never firing when YuNet succeeds, so easy detection is unchanged (LFW:
+  0 rescues, identical accuracy). Both models are Apache-2.0.
+- **FaceMesh upgraded to the 478-point FaceLandmarker mesh** (256px), converted
+  from Google's Apache-2.0 `face_landmarker.task`. Measured 28% better eye
+  accuracy on CBSR ground truth (NME 0.0378 → 0.0273). The loader auto-detects
+  the input size and accepts either the 468 or 478 generation.
+- **Per-enrollment IR calibration (ADR-0004).** A ridge-regularized linear map
+  fitted on-device from each user's own consented scans, pulling IR embeddings
+  toward their RGB space; it activates whenever no global adapter is loaded and
+  ships no weights (no license surface). Replaces the research-only-trained
+  `ir_adapter.onnx`, whose removal from packaging is the remaining step.
+- **Presence grace window after the consent gesture.** After the blank-Enter
+  gesture, capture retries while no usable face is in frame so walking up or
+  settling still authenticates: ~15s for login/lock, ~5s for `sudo`/`su`
+  (`IRLUME_GRACE_MS` overrides). Only presence-class failures retry — never a
+  below-threshold match (FAR-neutral by construction).
+- **IR-template embedding-space tagging** so a future adapter swap/removal fails
+  loud ("re-enroll") instead of scoring across embedding spaces.
+
 ## [0.1.5] - 2026-07-12
 
 ### Added

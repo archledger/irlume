@@ -8,9 +8,10 @@
 *.template
 
 # Model weights are ALL bundled in-repo via Git LFS (see .gitattributes +
-# models/README.md) so a clone/package is self-contained. The one exception:
-# the superseded v1 adapter backup, kept locally for revert, never shipped.
+# models/README.md) so a clone/package is self-contained. The exceptions:
+# superseded model backups, kept locally for revert, never shipped.
 models/ir_adapter.onnx.v1-256
+models/face_landmark.onnx.legacy-192
 .deb-staging
 irlume_*.deb
 .arch-build

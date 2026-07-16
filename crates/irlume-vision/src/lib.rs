@@ -328,11 +328,14 @@ mod onnx {
         }
     }
 
-    /// MediaPipe FaceMesh (`face_landmark.onnx`, Apache-2.0): 468 dense facial
-    /// landmarks. irlume uses it ONLY for passive blink liveness (eye-aspect-ratio,
-    /// ADR-0002), never recognition. Input is NHWC `[1,192,192,3]` (unlike the
-    /// NCHW recognizer); output `conv2d_21` is 468×3 landmarks in the 192×192 input
-    /// space, plus a face-probability flag. RGB-trained; IR-grey performance is
+    /// MediaPipe FaceMesh (`face_landmark.onnx`, Apache-2.0): dense facial
+    /// landmarks. Used for passive blink liveness (eye-aspect-ratio, ADR-0002)
+    /// and to refine a BlazeFace rescue box into 5 alignment points, never
+    /// recognition. The shipped model is the 478-point (468 + iris)
+    /// FaceLandmarker mesh at NHWC `[1,256,256,3]` (unlike the NCHW recognizer);
+    /// the loader reads the input side from the model and accepts either
+    /// generation (468 legacy or 478), returning landmarks in the input space
+    /// plus a face-probability flag. RGB-trained; IR-grey performance is
     /// validated empirically (that's the open question the diagnostic answers).
     pub struct FaceMesh {
         session: Session,

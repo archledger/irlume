@@ -570,8 +570,12 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
         .unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
     eprintln!("[enrolldev] '{user}': {want} scans into IRLUME_STATE_DIR; stay in frame…");
     match engine(det, model, args).and_then(|mut e| e.enroll_profile(&user, name, want)) {
-        Ok((profile, n)) => {
-            println!("[enrolldev] enrolled '{profile}' ({n} scans)");
+        Ok(irlume_auth::EnrollOutcome::New { name, scans }) => {
+            println!("[enrolldev] enrolled '{name}' ({scans} scans)");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(irlume_auth::EnrollOutcome::Refreshed { name, added, total }) => {
+            println!("[enrolldev] refreshed '{name}' (+{added} scans, {total} total)");
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {

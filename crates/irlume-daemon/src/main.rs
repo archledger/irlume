@@ -166,7 +166,8 @@ fn main() {
                 eprintln!(
                     "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
                      removed IR adapter and no longer match. Bright-light face login still works; \
-                     dark/dim login needs a re-enroll: run `irlume enroll`."
+                     run `irlume enroll` to capture fresh scans into your existing profile and \
+                     restore dark/dim login."
                 );
             }
         }
@@ -576,7 +577,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => eprintln!("irlumed: IR emitter auto-setup skipped: {e}"),
             }
             match engine.enroll_profile(&user, profile, want) {
-                Ok((name, n)) => Response::Ok(format!("enrolled '{name}' with {n} scans")),
+                Ok(irlume_auth::EnrollOutcome::New { name, scans }) => {
+                    Response::Ok(format!("enrolled '{name}' with {scans} scans"))
+                }
+                Ok(irlume_auth::EnrollOutcome::Refreshed { name, added, total }) => {
+                    Response::Ok(format!(
+                        "'{name}' predates the current recognition model; added {added} fresh \
+                         scans ({total} total) so dark/dim login matches again"
+                    ))
+                }
                 Err(e) => Response::Error(e.to_string()),
             }
         }

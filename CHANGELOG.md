@@ -3,6 +3,23 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`irlume enroll` now works as the documented 0.2.0 upgrade remedy.** The
+  0.2.0 notes tell upgraders to run `irlume enroll` to restore dark/dim login,
+  but the anti-mixing guard refused it ("this face is already enrolled as ..."),
+  because an upgrader's face still matches their old profile through the
+  unchanged RGB path. Enrolling a face that already owns a profile whose IR
+  templates are all unusable in the current embedding space now refreshes that
+  profile instead of refusing: the captured scans are added (up to the 30-scan
+  cap), the per-enrollment IR calibration is refitted from them, and dark/dim
+  login matches again. A duplicate of a profile with working IR templates is
+  still refused, as is a capture that matches two different profiles. Until
+  this ships, the working paths on 0.2.0 are `irlume tui` (Profiles, improve)
+  or `irlume enroll --reset`.
+
 ## [0.2.0] - 2026-07-15
 
 > **⚠ Breaking — re-enroll needed for dark/dim login.** This release removes the

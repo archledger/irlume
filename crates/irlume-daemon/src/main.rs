@@ -78,7 +78,16 @@ fn main() {
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
-    verify_models(&[&det, &model, &adapter, &mesh, &blaze]);
+    // det/model/mesh/blaze ship with every package, so a missing one is a broken
+    // install (IRLUME_MODELS_STRICT rightly refuses). The IR adapter is optional
+    // (none ships since ADR-0004; user supplies their own via IRLUME_IR_ADAPTER),
+    // so only verify it when it is actually present — otherwise strict mode would
+    // refuse to start on a normal install that never had an adapter.
+    let mut to_verify: Vec<&str> = vec![&det, &model, &mesh, &blaze];
+    if std::path::Path::new(&adapter).exists() {
+        to_verify.push(&adapter);
+    }
+    verify_models(&to_verify);
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
     // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
     let (rgb_dev, ir_dev) = irlume_auth::select_pair();

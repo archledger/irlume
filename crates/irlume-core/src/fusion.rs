@@ -8,13 +8,26 @@
 //! top of the existing single-modality thresholds; it never relaxes them.
 //!
 //! Constants fit offline (scripts/calibrate.py): RGB Platt on LFW genuine/impostor
-//! cosines; IR Platt on CBSR+Oulu NIR run through the DEPLOYED v3 residZero adapter.
-//! Re-fit when the recognizer or IR adapter changes, and ideally refine on real captures.
+//! cosines; IR Platt on CBSR+Oulu NIR.
+//!
+//! CALIBRATION CAVEAT (ADR-0004): the IR Platt (`IR_PLATT_A/B`) was fit on IR
+//! cosines produced by the former v3 IR adapter, which no longer ships. The
+//! default IR path now scores raw-AuraFace (per-enrollment-calibrated) cosines,
+//! a different distribution, so these constants are retained as a CONSERVATIVE
+//! PRIOR pending a raw-space re-fit, not a validated fit. This is bounded, not
+//! dangerous: fusion only ADDS dim-light rescues on top of the single-modality
+//! thresholds (never relaxes them), the sigmoid midpoint (cos ≈ 0.405) still
+//! sits between raw genuine and impostor IR cosines, and a grant additionally
+//! requires the RGB side plus the conservative 0.50 fused bar. TODO: re-fit
+//! `IR_PLATT_A/B` against raw/calibrated-space IR captures and re-validate the
+//! dim-light rescue operating point.
 
 /// RGB Platt: `p = sigmoid(a*cos + b)`. Fit on LFW (genuine cos μ0.565 / impostor μ0.062).
 pub const RGB_PLATT_A: f32 = 24.4708;
 pub const RGB_PLATT_B: f32 = -8.1873;
-/// IR Platt (adapted-IR space). Fit on CBSR+Oulu via v3 residZero adapter (genuine μ0.783 / impostor μ0.033).
+/// IR Platt. Fit on CBSR+Oulu (former adapter space, genuine μ0.783 / impostor
+/// μ0.033); a conservative prior for the current raw path pending re-fit (see
+/// the module-level CALIBRATION CAVEAT).
 pub const IR_PLATT_A: f32 = 40.0120;
 pub const IR_PLATT_B: f32 = -16.2221;
 
@@ -38,7 +51,8 @@ pub fn sigmoid(x: f32) -> f32 {
 pub fn rgb_genuine_prob(cos: f32) -> f32 {
     sigmoid(RGB_PLATT_A * cos + RGB_PLATT_B)
 }
-/// Calibrated genuine-probability for an (adapted) IR cosine.
+/// Calibrated genuine-probability for an IR cosine (conservative prior; see the
+/// module-level CALIBRATION CAVEAT).
 pub fn ir_genuine_prob(cos: f32) -> f32 {
     sigmoid(IR_PLATT_A * cos + IR_PLATT_B)
 }

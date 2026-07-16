@@ -291,12 +291,13 @@ mod onnx {
         }
     }
 
-    /// IR embedding adapter (512→512): the v3 residZero CLIP-adapter (out = x +
-    /// 0.6·A(x), A zero-init) trained on NIR faces (CBSR+Oulu COMBINED, multi-sensor)
-    /// that tightens IR genuine/impostor separation and generalizes across NIR
-    /// cameras. Real-ASUS-validated vs the prior v1 (512→256) adapter: no regression
-    /// and better on hard conditions (backlight/dark/motion), FRR@FAR1e-3 halved.
-    /// Applied to AuraFace IR embeddings in the dark path. Output is L2-normalized.
+    /// Optional IR embedding adapter (512→512) applied to AuraFace IR embeddings
+    /// in the dark path; output is L2-normalized. NONE ships by default since
+    /// ADR-0004 (the former CBSR+Oulu-trained adapter carried research-only
+    /// training data and worsened unseen identities); the default IR path is raw
+    /// AuraFace + per-enrollment calibration. This loads only when a user supplies
+    /// their own adapter via `--adapter` / `IRLUME_IR_ADAPTER`, and a residual
+    /// form (out = x + k·A(x)) is the expected shape.
     pub struct Adapter {
         session: Session,
     }

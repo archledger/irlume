@@ -946,16 +946,16 @@ impl Engine {
 
         // best match over a labeled set of templates -> (score, profile name).
         let best = |probe: &[f32], scans: &[(&str, &str, &[f32])]| -> (f32, String) {
-            scans
+            // Fold over borrowed names and allocate only the winner's String, not
+            // one per template. `>` keeps the first template on a tie (unchanged).
+            let (score, who) = scans
                 .iter()
-                .map(|(prof, _scan, t)| (align::cosine(probe, t), prof.to_string()))
-                .fold((f32::NEG_INFINITY, String::new()), |acc, x| {
-                    if x.0 > acc.0 {
-                        x
-                    } else {
-                        acc
-                    }
-                })
+                .map(|(prof, _scan, t)| (align::cosine(probe, t), *prof))
+                .fold(
+                    (f32::NEG_INFINITY, ""),
+                    |acc, x| if x.0 > acc.0 { x } else { acc },
+                );
+            (score, who.to_string())
         };
 
         // Primary path: a visible-light (RGB) face -> full cross-spectrum gate +
@@ -1233,16 +1233,13 @@ impl Engine {
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = scans
                 .iter()
-                .map(|(prof, _scan, t)| (align::cosine(&probe, t), prof.to_string()))
-                .fold((f32::NEG_INFINITY, String::new()), |acc, x| {
-                    if x.0 > acc.0 {
-                        x
-                    } else {
-                        acc
-                    }
-                });
+                .map(|(prof, _scan, t)| (align::cosine(&probe, t), *prof))
+                .fold(
+                    (f32::NEG_INFINITY, ""),
+                    |acc, x| if x.0 > acc.0 { x } else { acc },
+                );
             if score >= thr && best.as_ref().is_none_or(|b| score > b.0) {
-                best = Some((score, user.clone(), who));
+                best = Some((score, user.clone(), who.to_string()));
             }
         }
         match best {

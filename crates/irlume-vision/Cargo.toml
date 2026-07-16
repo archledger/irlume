@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["onnx"]
 # ONNX inference (AuraFace embedder, YuNet detector). Off => align/cosine only.
-onnx = ["dep:ort", "dep:ndarray"]
+onnx = ["dep:ort"]
 # Hardware-acceleration execution providers, selected at compile time (cf. howrs).
 # Default build = CPU. The heavy math runs inside ONNX Runtime, already SIMD +
 # multi-threaded; these pick the EP. Our own glue loops vectorize via target-cpu
@@ -22,5 +22,4 @@ irlume-common.workspace = true
 irlume-camera.workspace = true
 thiserror.workspace = true
 ort = { workspace = true, optional = true }
-ndarray = { workspace = true, optional = true }
 rustfft.workspace = true

@@ -245,16 +245,29 @@ fn stdin_is_tty() -> bool {
 }
 
 /// One doctor line: which third-party model is enabled and whether its file
-/// still matches the pin (unprivileged read of the file; the settings key may
-/// be unreadable to a normal user, in which case the daemon log is the truth).
+/// still matches the pin. settings.conf is root-only, so an unprivileged
+/// caller cannot read the enabled key; the weights file (0644) is readable,
+/// so installed-but-unconfirmable gets reported instead of a false "none".
 pub fn doctor_line() -> String {
-    match enabled_name() {
-        Some(name) => match thirdparty::by_name(&name) {
+    if let Some(name) = enabled_name() {
+        return match thirdparty::by_name(&name) {
             Some(m) => format!("{name} enabled ({}; deny-only cue)", file_state(m)),
             None => format!(
                 "{name} set in settings.conf but NOT in the catalog (ignored by the daemon)"
             ),
-        },
-        None => "none (default; see `irlume models`)".into(),
+        };
     }
+    if !is_root() {
+        if let Some(m) = thirdparty::CATALOG
+            .iter()
+            .find(|m| thirdparty::model_path(m).exists())
+        {
+            return format!(
+                "'{}' weights installed ({}); enabled state is root-only, check with                  `sudo irlume doctor` or the daemon startup log",
+                m.name,
+                file_state(m)
+            );
+        }
+    }
+    "none (default; see `irlume models`)".into()
 }

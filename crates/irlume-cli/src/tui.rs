@@ -2259,6 +2259,24 @@ impl App {
                     Style::new().dim(),
                 )),
                 Line::raw(""),
+                section("Third-party liveness models"),
+                Line::from(vec![
+                    Span::raw("  state  "),
+                    Span::styled(crate::models::doctor_line(), Style::new().dim()),
+                ]),
+                Line::from(Span::styled(
+                    "  Opt-in, measured, deny-only extra anti-spoof cue; fetched from the",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  publisher, checksum-pinned, never shipped by irlume.",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  Manage (root): sudo irlume models [enable <name>|disable]",
+                    Style::new().dim(),
+                )),
+                Line::raw(""),
                 section("Match thresholds (read-only)"),
                 Line::from(Span::styled(
                     "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",

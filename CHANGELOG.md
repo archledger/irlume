@@ -26,6 +26,15 @@ All notable changes to irlume are documented here. This project adheres to
   subtraction path with its gates (previously only in this changelog);
   ADR-0001 gains the acceptance bar for a future learned PAD model, including
   the model-inversion criterion raised in issue #4.
+- Every operator-facing knob is now documented: SETUP.md gains a configuration
+  reference (the four `/etc/irlume` + `/var/lib/irlume` config files, camera
+  selection precedence, and the daemon environment variables from
+  `IRLUME_MODELS_STRICT` through the TPM overrides), DEVELOPMENT.md lists the
+  sandbox path overrides and the eight cargo example harnesses, and
+  DEBUGGING.md covers the per-camera liveness tuning thresholds. `irlume
+  set-cameras` appears in `irlume help` (it was the TUI picker's hidden
+  backing command, but it is also the only scriptable way to persist a camera
+  pair).
 
 ## [0.2.1] - 2026-07-16
 

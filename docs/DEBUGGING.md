@@ -139,6 +139,22 @@ Expected on-demand matrix (all live-validated):
   /org/freedesktop/secrets/collection/kdewallet org.freedesktop.Secret.Collection Locked`
   (`b false` = unlocked).
 
+## Per-camera cue tuning
+
+The liveness cues carry per-camera-calibrated thresholds (set on the ASUS and
+NexiGo reference hardware). A camera with a different frame rate, noise floor,
+or bbox jitter can override them on the daemon unit without a rebuild:
+
+| Variable | Cue | Default |
+|---|---|---|
+| `IRLUME_RGB_MOIRE_MAX` | screen-replay moiré ceiling (also listed in [SETUP.md](SETUP.md)) | 28 |
+| `IRLUME_BLINK_MOTION_MAX` | median head-motion ceiling above which no EAR dip is trusted as a blink | 0.02 |
+| `IRLUME_BLINK_CONTRAST_DROP` | minimum eye-region contrast drop for a dip to count | 1.15 |
+| `IRLUME_BLINK_CONTRAST_MOTION_FLOOR` | motion level above which the contrast check engages | 0.015 |
+
+`IRLUME_DEBUG_IR` (any value) additionally logs the IR burst's
+ambient-subtraction decisions frame by frame.
+
 ## Developer / benchmark tools
 
 Gated behind `IRLUME_DEV=1` because they open the camera directly (bypassing

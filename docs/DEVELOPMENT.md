@@ -124,6 +124,40 @@ cargo run -p irlume-cli -- doctor   # platform / TPM / camera / model check
 Developer-only benchmark and capture subcommands are gated behind `IRLUME_DEV=1`
 (e.g. `IRLUME_DEV=1 cargo run -p irlume-cli -- selftest align --model models/glintr100.onnx`).
 
+## Sandbox environment overrides
+
+Every path a privileged component touches can be redirected, so tests and a
+throwaway dev daemon never write to the real system:
+
+| Variable | Redirects | Default |
+|---|---|---|
+| `IRLUME_SOCKET` | the daemon socket (daemon and all clients read it) | `/run/irlume.sock` |
+| `IRLUME_STATE_DIR` | enrollment profiles (JSON, 0600) | `$HOME/.local/share/irlume` for dev builds, `/var/lib/irlume` in production |
+| `IRLUME_CONFIG_DIR` | the `key=value` config root | `/etc/irlume` |
+| `IRLUME_KEYRING_DIR` | sealed-password envelopes | `/var/lib/irlume/keyring` |
+| `IRLUME_TEMPLATE_KEY_DIR` | template encryption keys | `/var/lib/irlume/template-keys` |
+| `IRLUME_RECOVERY_DIR` | recovery-passphrase envelopes | `/var/lib/irlume/recovery` |
+| `IRLUME_PCR_SIGNATURE` / `IRLUME_PCR_PUBKEY` | the pcrlock signature JSON / public-key PEM | discovered on the system paths |
+| `IRLUME_SELINUX_PP` | the compiled SELinux module `irlume login` loads (source builds have no packaged `.pp`) | packaged path |
+
+## Example binaries
+
+Measurement harnesses live as cargo examples; run with
+`cargo run -p <crate> --example <name>`, e.g.
+`cargo run -p irlume-camera --example burst_dump`. Like the `IRLUME_DEV=1`
+CLI tools, they open the camera directly and hold no privileged path.
+
+| Example (crate) | What it measures |
+|---|---|
+| `burst_dump` (irlume-camera) | dumps a raw IR strobe burst as PGM frames + a means index, for offline depth/subtraction tuning |
+| `rgb_burst_dump` (irlume-camera) | the RGB companion (PPM), for detection-floor and fusion analysis |
+| `ambient_ab` (irlume-camera) | A/B harness for ambient subtraction under a real ambient-IR or spoof condition |
+| `ir_strobe_probe` (irlume-camera) | prints per-frame burst brightness: does this module strobe the emitter or hold it steady? |
+| `capture_bench` (irlume-camera) | sequential vs concurrent RGB+IR capture timing and brightness distributions |
+| `concurrency_probe` (irlume-camera) | whether the module starves when RGB and IR stream at the same time |
+| `assess_probe` (irlume-auth) | drives the real liveness assessment N times and reports verdicts + RGB self-heal firing |
+| `embed_parity` (irlume-auth) | whether concurrent-load RGB dimming shifts the face embedding enough to hurt recognition |
+
 ## What the dev shell can't do: real-hardware testing
 
 The build shell compiles and runs the code, but the security-critical paths

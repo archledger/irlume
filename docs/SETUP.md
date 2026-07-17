@@ -200,6 +200,56 @@ sudo irlume ir-setup
 
 ---
 
+## Configuration reference
+
+Nothing here is required for a normal install; the TUI and the setup flow
+write these files for you. They exist so a headless or scripted setup can do
+the same thing, and so you know what state irlume keeps where.
+
+### Files
+
+All are root-owned `key=value` files (`#` comments allowed). Secrets never
+live in them; sealed envelopes are stored separately (see
+[SECURITY_AT_REST.md](SECURITY_AT_REST.md)).
+
+| File | Holds | Written by |
+|---|---|---|
+| `/etc/irlume/settings.conf` | `enforce_biopolicy=1` opts into operation-class gating | TUI Settings |
+| `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
+| `/etc/irlume/method` | one line: the active auth method | `irlume fingerprint enable/disable` |
+| `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter (optional second line: a brightness-boost control) | `irlume ir-setup` / enrollment auto-setup |
+
+Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env
+pair (both set), then `cameras.conf`, then auto-detection, then the compiled
+defaults (`/dev/video0`+`/dev/video2`).
+
+### Daemon environment variables
+
+Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
+`Environment=` lines in the drop-in).
+
+| Variable | Effect | Default |
+|---|---|---|
+| `IRLUME_MODELS_STRICT` | refuse to start when a model file is missing or fails the checksum manifest, instead of warning | warn and continue |
+| `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
+| `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` |
+| `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |
+| `IRLUME_RGB_DEVICE` / `IRLUME_IR_DEVICE` | camera-pair override; both must be set | auto |
+| `IRLUME_IR_EMITTER` | emitter control override: `off`, or `unit:selector:b,b,..` (decimal or `0x` hex bytes); bypasses `ir_emitter.conf` | conf, else known-module table |
+| `IRLUME_IR_EMITTER_CONF` | alternate path for `ir_emitter.conf` | `/var/lib/irlume/ir_emitter.conf` |
+| `IRLUME_RGB_MOIRE_MAX` | per-camera ceiling for the screen-replay moiré cue | 28 |
+| `IRLUME_IR_AMBIENT_SUBTRACT` | `1` enables experimental lit-minus-ambient IR subtraction; changes the IR frames the matcher sees, so re-enroll after toggling (see [ARCHITECTURE.md](ARCHITECTURE.md)) | off |
+| `IRLUME_TCTI` | TPM transport | `device:/dev/tpmrm0` |
+| `IRLUME_PCRS` | comma-separated PCR list the sealed password binds to | `7` |
+| `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user | `0x81010002` |
+| `IRLUME_METHOD_CONF` | alternate path for the method file | `/etc/irlume/method` |
+
+Liveness-cue tuning knobs (blink thresholds, IR capture debug) are in
+[DEBUGGING.md](DEBUGGING.md); development sandbox overrides (state/config/socket
+paths) are in [DEVELOPMENT.md](DEVELOPMENT.md).
+
+---
+
 ## Verify
 
 ```sh

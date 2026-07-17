@@ -282,7 +282,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 /// (integrated linux-enable-ir-emitter). `--dry-run` only lists XU controls.
 /// `irlume set-cameras <rgb> <ir>`: persist the active RGB+IR pair. Root only
 /// (the daemon writes /etc/irlume/cameras.conf); the TUI camera picker runs this
-/// via sudo. Not shown in help; it's the picker's backing command.
+/// via sudo, and headless setups call it directly.
 fn set_cameras(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let (Some(rgb), Some(ir)) = (args.get(1), args.get(2)) else {

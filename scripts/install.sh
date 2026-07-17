@@ -33,10 +33,22 @@ set -eu
 
 REPO="archledger/irlume"
 RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
-# The irlume release signing key (also signs the git tags). Pinned here so a
-# compromised release cannot swap the checksums without also forging a
-# signature from this exact key.
+# The irlume release signing key (also signs the git tags). Pinned here, full
+# key included, so a compromised release cannot swap the checksums without also
+# forging a signature from this exact key. Embedding the key (instead of a
+# keyserver fetch) keeps verification working offline-of-keyservers and never
+# touches the user's own keyring: it is imported into a throwaway GNUPGHOME.
 KEY_FP="F35053398E3C80FE20891B82C10B8492BD7F30C6"
+KEY_ASC='-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEakb95BYJKwYBBAHaRw8BAQdAdjfw/0t9/UGFY1GvBHAyZAhz7IHF03DhtA2S
+UYW/UbO0JGFyY2hsZWRnZXIgPGFyY2hsZWRnZXIyMzZAZ21haWwuY29tPoiZBBMW
+CgBBFiEE81BTOY48gP4giRuCwQuEkr1/MMYFAmpG/eQCGwMFCQPCZwAFCwkIBwIC
+IgIGFQoJCAsCBBYCAwECHgcCF4AACgkQwQuEkr1/MMbFLwD/dg3YhbBk4SFKVTeh
+OVaN4hHNC2WQGSEIxmgWcw+bvokBAKprgT0zy7fyVzO3Za4V8BGaSWypCWCLA4Uv
+PLCYfTcC
+=PsGk
+-----END PGP PUBLIC KEY BLOCK-----'
 
 say()  { printf '\033[1;34m[irlume]\033[0m %s\n' "$1" >&2; }
 warn() { printf '\033[1;33m[irlume]\033[0m %s\n' "$1" >&2; }
@@ -67,10 +79,13 @@ fetch_sums() {
     || die "could not fetch SHA256SUMS from the latest release."
   if command -v gpg >/dev/null 2>&1 \
      && curl -fsSL "${RELEASE_BASE}/SHA256SUMS.asc" -o "${d}/SHA256SUMS.asc" 2>/dev/null; then
-    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$KEY_FP" >/dev/null 2>&1 \
-      || gpg --list-keys "$KEY_FP" >/dev/null 2>&1 \
-      || { warn "could not fetch the irlume signing key; relying on HTTPS + SHA256 only."; return 0; }
-    if gpg --batch --status-fd 1 --verify "${d}/SHA256SUMS.asc" "${d}/SHA256SUMS" 2>/dev/null \
+    # Throwaway keyring holding only the pinned key: nothing else can sign,
+    # and the user's own keyring is never read or written.
+    kh="${d}/gnupg"
+    mkdir -p "$kh" && chmod 700 "$kh"
+    printf '%s\n' "$KEY_ASC" | GNUPGHOME="$kh" gpg --batch --import >/dev/null 2>&1 \
+      || { warn "could not import the pinned irlume key; relying on HTTPS + SHA256 only."; return 0; }
+    if GNUPGHOME="$kh" gpg --batch --status-fd 1 --verify "${d}/SHA256SUMS.asc" "${d}/SHA256SUMS" 2>/dev/null \
          | grep -q "VALIDSIG ${KEY_FP}"; then
       say "SHA256SUMS GPG signature verified against the pinned irlume key."
     else

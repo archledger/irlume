@@ -60,6 +60,33 @@ flowchart LR
 4. On any failure/timeout: `granted: false` (or an error) → PAM falls through
    to password (mandatory non-biometric fallback, per NIST SP 800-63B-4).
 
+## Model stack
+
+Four ONNX models ship with every package, loaded once by `irlumed` at startup
+and checksum-verified against a built-in manifest (a mismatch warns;
+`IRLUME_MODELS_STRICT=1` refuses to start instead). All inference is local;
+nothing is downloaded at runtime.
+
+| Model | Pipeline stage | What it does | License |
+|---|---|---|---|
+| YuNet (`face_detection_yunet_2023mar.onnx`) | detection | finds the face in both the RGB and IR frames: bbox + 5 landmarks | MIT |
+| BlazeFace short-range (`blaze_face_short_range.onnx`) | detection rescue | cascade stage 2, runs only when YuNet finds nothing (saturated or backlit frames); its coarse box is refined by FaceMesh before use | Apache-2.0 |
+| MediaPipe FaceLandmarker mesh (`face_landmark.onnx`) | liveness + rescue alignment | 478 dense landmarks; drives the blink/EAR challenge gate and turns rescue boxes into alignment points. Never used for recognition | Apache-2.0 |
+| AuraFace (`glintr100.onnx`) | recognition | 512-D ArcFace-style embedding of the aligned 112×112 face; matching is cosine similarity against the enrolled templates | Apache-2.0 |
+
+Two things are deliberately *not* learned models. The liveness gate is IR
+physics (cross-spectrum co-location, depth gradient, corneal glint, moiré),
+and the matcher is a fixed cosine threshold; both are plain, auditable
+algorithms. Per-user IR calibration is fitted on-device from the user's own
+enrollment scans ([ADR-0004](adr/0004-per-enrollment-ir-adapter.md); it
+replaced a retired, dataset-trained IR adapter). No learned anti-spoof model
+ships; the acceptance bar one would have to clear is in
+[ADR-0001](adr/0001-liveness-pad-strategy.md).
+
+Per-model provenance, license verification notes, and the models this project
+refuses to bundle are documented in [`models/README.md`](../models/README.md);
+demographic-fairness measurements are in [FAIRNESS.md](FAIRNESS.md).
+
 ## IR capture: strobe and ambient subtraction
 
 The 850 nm emitter strobes rather than holding steady, so `irlumed` captures an

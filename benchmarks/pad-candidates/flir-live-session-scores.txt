@@ -1,0 +1,38 @@
+LIVE FLIR SESSION 2026-07-17, car at home parking lot, real IR camera (/dev/video2), landmark_dump capture.
+Scoring: exact ModelScope preprocessing, softmax over raw logits (verified logits: sum -0.022 != 1).
+
+genuine run 0 (ambient 101-180): 36/36 live, median p_fake 0.0049, 0 flagged. Clean ABOVE amb 170.
+genuine run 1 (amb ~84):  0/36 flagged, median 0.0587
+genuine run 2 (amb ~80):  2/36 flagged (frame33+35, BOTH ambient=80, p_fake 0.569/0.568), median 0.1059
+genuine run 3 (amb ~80):  0/36 flagged, median 0.0968
+
+AGGREGATE: 144 genuine frames, 2 flagged (1.4%), both at ambient 80 = the dim-strobe-phase
+regime found independently in the offline eval (rejections at amb ~82). Lit-phase-only
+wiring eliminates this class. No dark-phase skips outdoors (daylight floods IR).
+Phone-IR attack: pending (expected: no face in IR, physics). Vinyl banner: pending, decisive.
+phone-ir attack run: 36/36 frames NO FACE IN IR (phone screen emits no 850nm; attack never
+reaches the model = non-response for the species, not a FLIR win; strobe visible in ambient
+alternation 82/119). Confirms live what the June self-test showed at the gate level.
+
+--- EVENING SESSION, home: VINYL BANNER vs FLIR (NexiGo HelloCam N930W, IR /dev/video6) ---
+banner run 1: 14/15 flagged, median 0.9997 (1 accepted frame = AE-settling, amb 126, start of burst)
+banner runs 2-4 (varied angle/distance): 18/18, 18/18, 18/18 flagged, medians 0.9982/1.0000/1.0000
+BANNER AGGREGATE: 68/69 detected frames flagged = frame APCER ~1.4% (95% CI upper ~7.8%)
+  vs irlume physics gate on this species (2026-06-30, Zenbook): APCER 98.6%.
+genuine control same camera, same room (couch, dim room): 0/17 + 0/18 flagged, median 0.0000 both.
+SAME-CAMERA SEPARATION: genuine 0.0000 vs banner ~0.9997.
+
+mn3 indoor note: dim living room = RGB frame mean 39.7, no face detectable in RGB at all.
+RGB PAD cue only ever consulted when RGB path active (lit), so dark-blindness costs nothing;
+lit-room genuine control still owed.
+
+FLIR VERDICT: qualifies as the opt-in menu's first candidate. Catches the open banner breach
+(~1.4% vs 98.6%), clean genuine on 2 cameras (Zenbook 144 frames / 2 dim-phase flags;
+NexiGo 35 frames / 0 flags), MIT license, 1.3MB, ~1.2ms CPU.
+Caveat: banner tested via NexiGo only; a Zenbook-camera banner session would complete the matrix.
+
+ZENBOOK-CAMERA BANNER RUNS (matrix completion; same camera as June 98.6%-APCER breach):
+runs 1-3 (varied position): 18/18, 18/18, 18/18 flagged, medians 0.9991/0.9998/1.0000.
+CROSS-CAMERA BANNER AGGREGATE: 122/123 frames flagged (~0.8% frame APCER), the 1 accept
+being the NexiGo AE-settling frame. FLIR matrix COMPLETE: catches the breach species on
+both the attack-validated camera (Zenbook) and an independent USB Hello cam (NexiGo).

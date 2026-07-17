@@ -42,6 +42,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Third-party PAD candidate evaluation (issue #4 follow-through):
+  `docs/pad-results/2026-07-17-third-party-pad-candidates.md` measures the two
+  externally-trained liveness models that carry real weight licenses on real
+  deployment hardware. The MIT-licensed DAMO FLIR IR model catches the
+  vinyl-print species that defeats the algorithmic gate (122/123 frames across
+  two cameras vs the gate's 98.6% APCER) with a clean genuine side; Intel's
+  CelebA-Spoof-trained `anti-spoof-mn3` saturates at "spoof" for genuine users
+  under indoor lighting and is not listed. Eval scripts and score summaries in
+  `benchmarks/pad-candidates/`.
 - `docs/STANDARDS.md`: maps the biometric standards that apply to a device
   login system (ISO/IEC 30107-3, 19795-1, 24745, the Windows Hello bar,
   Android's biometric classes) onto irlume's committed evidence, states what

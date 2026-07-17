@@ -1,0 +1,54 @@
+anti-spoof-mn3 (Intel OMZ, Apache-2.0, sha256 c4c99af04603b62d7e44f6f4daeb33e0daeccc696008c0b1d62f6f5cebbb3262)
+Sessions 2026-07-17, Zenbook UX5406S RGB camera (1080p MJPG), car interior 20% tint windows up.
+Scoring: model output IS probabilities (sums to 1; softmax baked into the ONNX). First-pass
+numbers double-softmaxed by mistake (compressed 0.73-pin artifact); corrected here. p_spoof = output[1].
+Preprocessing: YuNet bbox crop -> 128x128 RGB -> (x-mean)/scale per Intel OMZ README. Threshold 0.4.
+
+CONFIRMATION BATTERY (corrected scale):
+genuine-car (15 frames, static subject):    median 0.9586, min 0.6270, flagged 15/15
+phone-replay-car (13, STATIC photo on phone):  median 0.9995, flagged 13/13
+phone-replay-car-2 (15, static photo):         median 0.9992, flagged 15/15
+camera sun burst (6, genuine):                 median 0.9918, flagged 6/6
+camera backlit burst (6, genuine):             median 0.9997, flagged 6/6
+LFW control, 491-image spread, same code path: median 0.0018, flagged 23/491 (4.7%)
+
+Confounds eliminated:
+- crop margin swept 1.0/1.3/1.6/2.0x: genuine-car WORSENS with margin (0.959 -> 0.9995);
+  LFW also degrades (0.0018 -> 0.163) => tight crop correct, crop policy not the cause.
+- resolution swept 1080p/640x360/320x180: genuine-car worsens when downscaled
+  (0.954 -> 0.995) => resolution not the cause.
+- pipeline: LFW behaves (median 0.0018 live) => code path not the cause.
+
+VERDICT (confirmed across 3 genuine conditions, 27/27 genuine frames flagged as spoof at
+0.95-0.9997): mn3 assigns near-certain "spoof" to everything this camera produces.
+CelebA-Spoof domain gap on deployment hardware; disqualified for the opt-in menu.
+Attack frames also ~0.999, meaningless given genuine saturation.
+
+--- REVISION, same day, live confirmation sessions (user-run, real camera) ---
+4x live-genuine runs (alternating glasses ON/OFF): medians 0.1971 / 0.0208 / 0.0065 / 0.0531,
+flagged 5/15, 6/15, 0/15, 3/15. One run FULLY CLEAN. Within-run pattern: clean opening
+frames, flagged tail in 3 of 4 runs (mid-capture pose/light change suspected).
+3x live-phone-attack runs (static photo on phone): medians 0.9979 / 0.9975 / 0.9988,
+flagged 37/37 of detected frames. One additional run: phone not detected at all (glare/angle).
+
+Diagnostics: failing-morning vs passing-afternoon genuine sets match on frame mean
+(163 vs 155), face-crop mean (168 vs 170), and color cast (R/B 0.96 vs 0.93) =>
+the discriminating variable is spatial (sun angle / shadowing / glare), unidentified.
+Protocol note: live-genuine runs 1-3 frames overwritten by run 4 (helper reused the
+dir; fixed with timestamped dirs). Scores preserved in session transcript.
+
+VERDICT REVISED: "disqualified" was premature, drawn from adverse-light samples only.
+mn3 is CONDITION-SENSITIVE on this camera: perfect attack separation in benign light
+(genuine 0.007-0.20 vs attack 0.997+), heavy genuine false-fires under the earlier
+harsh/adverse conditions. Back on the opt-in candidate list for deny-only wiring
+(false-fire cost = retry, never a security hole). Decisive remaining tests: home
+indoor genuine (the dominant real auth condition), print attack species, and a
+systematic sun-condition map.
+
+--- FINAL: lit-room genuine control (home living room, lights on, evening) ---
+15/15 flagged SPOOF, median 0.9975. Same saturation as the harsh-morning car captures.
+CONDITION MAP COMPLETE: benign outdoor daylight = perfect separation (genuine 0.007-0.20,
+attacks 0.997+); harsh sun = genuine-saturated; INDOOR ARTIFICIAL LIGHT (primary auth
+condition) = genuine-saturated at 0.9975; dark = RGB-blind. VERDICT: NOT LISTED - a
+deny-only cue that false-fires ~100% in the primary lit-indoor condition is unusable.
+(Differs from the morning's premature disqualification: this one is condition-mapped.)

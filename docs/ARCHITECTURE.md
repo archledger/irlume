@@ -79,10 +79,10 @@ flowchart LR
     cap(["RGB + IR<br/>frames"])
     subgraph models["learned models: perception only"]
         direction LR
-        yunet["YuNet<br/>detection · MIT"]
-        blaze["BlazeFace<br/>rescue · Apache-2.0"]
-        mesh["FaceMesh<br/>478 landmarks · Apache-2.0"]
-        aura["AuraFace<br/>512-D embedding · Apache-2.0"]
+        yunet["YuNet<br/>detection"]
+        blaze["BlazeFace<br/>rescue"]
+        mesh["FaceMesh<br/>478 landmarks"]
+        aura["AuraFace<br/>512-D embedding"]
     end
     live{{"liveness gate<br/>IR physics + blink/EAR<br/>algorithmic"}}
     match{{"matcher<br/>cosine vs enrolled templates<br/>algorithmic"}}

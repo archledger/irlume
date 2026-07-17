@@ -1,5 +1,15 @@
 # Architecture
 
+- [Privilege separation](#privilege-separation) — who is trusted, and the one
+  socket everything crosses
+- [Authentication flow](#authentication-flow) — what happens on a login attempt
+- [Model stack](#model-stack) — the four ONNX models, and what is deliberately
+  not a model
+- [IR capture: strobe and ambient subtraction](#ir-capture-strobe-and-ambient-subtraction)
+- [Face login → keyring unlock](#face-login--keyring-unlock) — the
+  TPM-sealed-password path
+- [Why these choices](#why-these-choices)
+
 ## Privilege separation
 
 The two untrusted clients, `pam_irlume.so` and the `irlume` CLI, reach the

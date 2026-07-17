@@ -205,8 +205,11 @@ def pgm(path):
         f.readline()  # maxval
         return np.frombuffer(f.read(), np.uint8).reshape(h, w)
 
-frame = pgm("out/frame00.pgm")
-points = list(csv.DictReader(open("out/frame00.landmarks.csv")))
+# first frame with a detection (whether frame 00 has one depends on the
+# strobe phase it landed on), via index.txt's score column
+n = next(l.split()[0] for l in open("out/index.txt") if l.split()[3] != "-")
+frame = pgm(f"out/frame{n}.pgm")
+points = list(csv.DictReader(open(f"out/frame{n}.landmarks.csv")))
 ```
 
 The MediaPipe canonical face-landmark map names each index (nose tip, eye

@@ -74,6 +74,38 @@ nothing is downloaded at runtime.
 | MediaPipe FaceLandmarker mesh (`face_landmark.onnx`) | liveness + rescue alignment | 478 dense landmarks; drives the blink/EAR challenge gate and turns rescue boxes into alignment points. Never used for recognition | Apache-2.0 |
 | AuraFace (`glintr100.onnx`) | recognition | 512-D ArcFace-style embedding of the aligned 112×112 face; matching is cosine similarity against the enrolled templates | Apache-2.0 |
 
+```mermaid
+flowchart LR
+    cap(["RGB + IR<br/>frames"])
+    subgraph models["learned models: perception only"]
+        direction LR
+        yunet["YuNet<br/>detection · MIT"]
+        blaze["BlazeFace<br/>rescue · Apache-2.0"]
+        mesh["FaceMesh<br/>478 landmarks · Apache-2.0"]
+        aura["AuraFace<br/>512-D embedding · Apache-2.0"]
+    end
+    live{{"liveness gate<br/>IR physics + blink/EAR<br/>algorithmic"}}
+    match{{"matcher<br/>cosine vs enrolled templates<br/>algorithmic"}}
+    out(["grant / deny"])
+    cap --> yunet
+    yunet -->|"bbox + 5 points → align 112×112"| aura
+    yunet -.->|"no face"| blaze
+    blaze -.->|"coarse box"| mesh
+    mesh -.->|"refined 5 points"| aura
+    mesh -->|"blink / EAR"| live
+    cap --> live
+    live ==>|"hard gate"| match
+    aura --> match
+    match --> out
+    classDef base fill:#ffffff,stroke:#d2d2d7,stroke-width:1px,color:#1d1d1f;
+    classDef gate fill:#ffffff,stroke:#34c759,stroke-width:1.5px,color:#1d1d1f;
+    class cap,yunet,blaze,mesh,aura,out base;
+    class live,match gate;
+    style models fill:#f7f7f9,stroke:#e5e5ea,color:#6e6e73;
+    linkStyle default stroke:#b0b0b8,stroke-width:1.5px;
+    linkStyle 7 stroke:#34c759,stroke-width:3px;
+```
+
 Two things are deliberately *not* learned models. The liveness gate is IR
 physics (cross-spectrum co-location, depth gradient, corneal glint, moiré),
 and the matcher is a fixed cosine threshold; both are plain, auditable

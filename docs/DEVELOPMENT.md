@@ -193,7 +193,9 @@ V4L2 device that lists a `GREY` format (`v4l2-ctl -d /dev/videoN
 
 On a strobing emitter, alternate frames are emitter-off (near-black indoors,
 ambient-lit outdoors) and normally carry no CSV; the lit/dark pairing in
-`index.txt` is the ambient-subtraction signal. Reading the output in Python:
+`index.txt` is the ambient-subtraction signal. The first few lit frames can
+come out overexposed (frame mean around 200+) with no detection while the
+camera's auto-exposure settles; that is normal, later frames recover. Reading the output in Python:
 
 ```python
 import numpy as np, csv

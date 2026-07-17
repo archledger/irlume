@@ -81,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/inst
 
 Detects your distro and installs from the **signed Copr repo** (Fedora), the
 **PPA** (Ubuntu LTS), the **AUR** (Arch), or a **checksum-verified** release
-`.deb` (Debian, Ubuntu derivatives). It installs a package only and wires nothing into your
+`.deb` (Debian 12+, Ubuntu derivatives). It installs a package only and wires nothing into your
 login, and it stops without changing anything if irlume is already installed
 (use `irlume update` to upgrade). Prefer to read it before running it?
 
@@ -93,7 +93,7 @@ less install.sh && sh install.sh
 Or install manually with your package manager:
 
 <table>
-<tr><th>Fedora</th><th>Ubuntu</th><th>Arch</th><th>Debian</th></tr>
+<tr><th>Fedora</th><th>Ubuntu</th><th>Arch</th><th>Debian 12+</th></tr>
 <tr valign="top">
 <td>
 
@@ -139,7 +139,10 @@ Fedora and current-LTS Ubuntu update with the system (`dnf upgrade` /
 `apt upgrade`). The [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
 carries the **current Ubuntu LTS only**; on an older LTS or a derivative (Mint,
 Pop!_OS, Zorin, elementary) use the universal Debian `.deb` from
-[Releases](https://github.com/archledger/irlume/releases). `irlume update`
+[Releases](https://github.com/archledger/irlume/releases); it needs glibc
+2.35 or newer (Debian 12+, Ubuntu 22.04+, and their derivatives all qualify)
+and refuses to install on anything older.
+`irlume update`
 handles every case: it detects how irlume was installed and updates the same way.
 
 Then, once:

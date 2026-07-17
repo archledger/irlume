@@ -25,12 +25,12 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
   `/usr/share/irlume/onnxruntime` + `ORT_DYLIB_PATH` drop-in); PAM to
   `/usr/lib64/security`; SELinux subpackage. Update path: `dnf upgrade` / Copr,
   driven by `irlume update`.
-- **Arch**: primary channel is a **prebuilt `.pkg.tar.zst` on GitHub Releases**
-  (`arch/build-pkg.sh` produces it from the local build), installed with
-  `sudo pacman -U`. AUR account registration is disabled upstream at the moment,
-  so `arch/PKGBUILD` (builds from the release tag) is kept for source builds and
-  will become the update path once AUR sign-ups reopen. Depends on `onnxruntime`
+- **Arch**: primary channel is the **AUR**
+  ([aur.archlinux.org/packages/irlume](https://aur.archlinux.org/packages/irlume),
+  builds the signed release tag); `arch/PKGBUILD` here is its source of truth
+  and also serves local source builds (`makepkg -si`). Depends on `onnxruntime`
   (system pkg is current), `tpm2-tss`, `pam`; PAM to `/usr/lib/security`.
+  Update path: `yay -Syu` / `paru -Syu`, driven by `irlume update`.
 - **Ubuntu** ([`ppa:archledger/irlume`](https://launchpad.net/~archledger/+archive/ubuntu/irlume)):
   source package built on Launchpad from a self-contained orig tarball
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled
@@ -38,7 +38,10 @@ checkout must `git lfs pull` first so the real weights (not pointers) are staged
   plain `apt upgrade`.
 - **Debian** (and Ubuntu series the PPA doesn't cover), `debian/` via nfpm or
   dpkg-buildpackage: **bundles onnxruntime** (the archive ships 1.22; irlume
-  needs ≥1.24); ships the AppArmor profile; PAM to the multiarch dir. Update
+  needs ≥1.24); ships the AppArmor profile; PAM to the multiarch dir. The
+  universal `.deb` is built on debian:12 (`debian/build-deb-container.sh`) and
+  declares `libc6 (>= 2.35)`, the measured floor of its binaries, so it covers
+  Debian 12+ and Ubuntu 22.04+ and refuses cleanly on anything older. Update
   path: a `.deb` from GitHub Releases via `irlume update`.
 
 ## onnxruntime ≥ 1.24 (the api-24 pin)

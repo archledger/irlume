@@ -21,6 +21,11 @@ homepage: https://github.com/archledger/irlume
 license: GPL-3.0-or-later
 
 depends:
+  # The binaries reference GLIBC_2.35 symbols at most (built on debian:12,
+  # measured with objdump), so dpkg refuses on anything older instead of
+  # installing binaries that die at runtime with a GLIBC version error.
+  # build-deb.sh asserts the binaries' real floor stays within this declaration.
+  - libc6 (>= 2.35)
   - libpam0g
   - libtss2-esys-3.0.2-0 | libtss2-esys-3.0.2-0t64
   # tctildr is the TCTI loader the binary links directly; it is NOT pulled in

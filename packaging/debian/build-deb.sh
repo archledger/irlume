@@ -17,6 +17,21 @@ git lfs pull
 
 cargo build --release --locked
 
+# The libc6 floor declared in nfpm.yaml must cover what the binaries really
+# require. Building on a newer base silently raises the requirement (the .deb
+# then installs fine and every binary dies with "GLIBC_x.y not found"), so
+# fail the build instead of shipping that.
+declared="$(sed -n 's/^  - libc6 (>= \(.*\))$/\1/p' "$REPO/packaging/debian/nfpm.yaml")"
+[ -n "$declared" ] || { echo "nfpm.yaml no longer declares a libc6 floor"; exit 1; }
+actual="$(objdump -T target/release/irlume target/release/irlumed target/release/libpam_irlume.so \
+  | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)"
+if [ "$(printf '%s\n%s\n' "$actual" "$declared" | sort -V | tail -n1)" != "$declared" ]; then
+  echo "binaries need glibc $actual but nfpm.yaml declares libc6 (>= $declared);"
+  echo "either build on an older base or raise the declared floor."
+  exit 1
+fi
+echo "glibc floor ok: binaries need $actual, package declares >= $declared"
+
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 # Bundle onnxruntime.
 curl -fsSL -o "$STAGE/ort.tgz" \

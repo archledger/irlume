@@ -429,7 +429,8 @@ irlume relies on models and code from other projects. The bundled models:
 
 - **[YuNet](https://github.com/opencv/opencv_zoo)** (OpenCV Zoo, MIT) detects faces in both the RGB and IR streams.
 - **[AuraFace](https://huggingface.co/fal/AuraFace-v1)** by fal (Apache-2.0) is the 512-D ArcFace recognizer; irlume ships only its `glintr100.onnx`.
-- **[MediaPipe FaceMesh](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** (Google, Apache-2.0) supplies the eye landmarks for the opt-in blink liveness.
+- **[MediaPipe FaceLandmarker mesh](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** (Google, Apache-2.0) supplies the 478 dense landmarks behind the opt-in blink liveness and refines rescue detections into alignment points.
+- **[MediaPipe BlazeFace short-range](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)** (Google, Apache-2.0) is the detection-rescue stage: it runs only when YuNet finds no face, such as sun-saturated frames.
 
 The TPM and camera code builds on:
 

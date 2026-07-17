@@ -5,6 +5,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Arch update and install paths point at the AUR.** `irlume update` on a
+  pacman install and the one-step `install.sh` both still referenced a
+  `.pkg.tar.zst` release asset that stopped shipping after 0.1.x, so each
+  ended at a missing download. Both now use the AUR package (live since
+  0.2.0): the installer runs `yay`/`paru` when present and prints the
+  `makepkg` steps otherwise, and `irlume update` shows the helper and
+  helper-less routes.
+
 ### Added
 
 - `landmark_dump` example (issue #4): captures a raw IR strobe burst and

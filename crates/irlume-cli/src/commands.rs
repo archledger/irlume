@@ -101,24 +101,17 @@ pub fn update(args: &[String]) -> ExitCode {
             recommend_channel(&origin);
         }
         InstallOrigin::ArchPkg => {
-            // AUR registration is currently disabled upstream, so the Arch
-            // channel is the prebuilt package on GitHub Releases (pacman -U).
-            // The PKGBUILD remains for source builds and will become the
-            // update path again once AUR sign-ups reopen.
-            let ver = latest
-                .as_deref()
-                .unwrap_or("vVERSION")
-                .trim_start_matches('v');
-            let (_, pkg_arch, _) = arch_names();
+            // The AUR package (aur.archlinux.org/packages/irlume, live since
+            // 0.2.0) is the Arch channel; it builds from the signed release
+            // tag. pacman cannot tell an AUR-helper install from a local
+            // makepkg, so show both routes.
+            println!("  Update from the AUR (builds the signed release tag):");
+            println!("    yay -Syu irlume        # or: paru -Syu irlume");
+            println!("  Without an AUR helper:");
             println!(
-                "  Update the way it was installed (the prebuilt package from the release page):"
+                "    git clone https://aur.archlinux.org/irlume.git && cd irlume && makepkg -si"
             );
-            release_asset_steps(
-                ver,
-                &format!("irlume-{ver}-1-{pkg_arch}.pkg.tar.zst"),
-                "sudo pacman -U",
-            );
-            println!("  (or build from source: makepkg -si  in packaging/arch/)");
+            println!("  (local/source builds: makepkg -si  in packaging/arch/)");
         }
         InstallOrigin::Source => {
             println!("  Source install. Update the checkout at the tag:");
@@ -144,7 +137,7 @@ pub enum InstallOrigin {
     Ppa,
     /// dpkg-owned with no PPA source behind it (release-asset .deb).
     LocalDeb,
-    /// pacman-owned (release-asset package or makepkg).
+    /// pacman-owned (AUR or local makepkg).
     ArchPkg,
     /// Not owned by any package manager (source / dev install).
     Source,
@@ -160,7 +153,7 @@ impl InstallOrigin {
             InstallOrigin::LocalRpm(repo) => format!("RPM from repo `{repo}` (not the Copr)"),
             InstallOrigin::Ppa => "Launchpad PPA (ppa:archledger/irlume)".into(),
             InstallOrigin::LocalDeb => "local .deb (GitHub release asset)".into(),
-            InstallOrigin::ArchPkg => "pacman package (release asset / makepkg)".into(),
+            InstallOrigin::ArchPkg => "pacman package (AUR / makepkg)".into(),
             InstallOrigin::Source => "source / dev install (no package manager owns it)".into(),
         }
     }

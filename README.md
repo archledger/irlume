@@ -79,9 +79,9 @@ keyring unlock) but not required. Any camera works; it just sets your tier:
 curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/install.sh | sh
 ```
 
-Detects your distro and installs from the **signed Copr repo** (Fedora) or
-**PPA** (Ubuntu LTS), or a **checksum-verified** release package (Arch, Debian,
-Ubuntu derivatives). It installs a package only and wires nothing into your
+Detects your distro and installs from the **signed Copr repo** (Fedora), the
+**PPA** (Ubuntu LTS), the **AUR** (Arch), or a **checksum-verified** release
+`.deb` (Debian, Ubuntu derivatives). It installs a package only and wires nothing into your
 login, and it stops without changing anything if irlume is already installed
 (use `irlume update` to upgrade). Prefer to read it before running it?
 

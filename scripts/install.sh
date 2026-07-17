@@ -8,8 +8,8 @@
 #   Ubuntu (current LTS)  : add the signed PPA, then apt install irlume.
 #   Debian / Ubuntu deriv : download the universal .deb from the latest GitHub
 #                           release, verify it, then install.
-#   Arch                  : download the .pkg.tar.zst from the latest release,
-#                           verify it, then pacman -U.
+#   Arch                  : install from the AUR (yay/paru when present;
+#                           otherwise prints the makepkg steps and stops).
 #
 # Integrity:
 #   - The repo paths (Fedora Copr, Ubuntu PPA) are cryptographically verified by
@@ -161,10 +161,26 @@ main() {
         $SUDO dnf -y install irlume
         ;;
       *" arch "*|*" archlinux "*)
-        say "Arch: installing the package from the latest release."
-        pkg="$(fetch_verified '.pkg.tar.zst')"
-        $SUDO pacman -U --noconfirm "$pkg"
-        rm -rf "$(dirname "$pkg")"
+        say "Arch: irlume ships via the AUR (it builds the signed release tag)."
+        if [ "$(id -u)" -eq 0 ]; then
+          # AUR helpers and makepkg refuse to run as root by design.
+          say "AUR builds cannot run as root. As your normal user, run:"
+          say "  yay -S irlume    (or: paru -S irlume)"
+          say "  or, without a helper:"
+          say "  git clone https://aur.archlinux.org/irlume.git && cd irlume && makepkg -si"
+          say "Nothing was changed."
+          exit 0
+        fi
+        if command -v yay >/dev/null 2>&1; then
+          yay -S --noconfirm irlume
+        elif command -v paru >/dev/null 2>&1; then
+          paru -S --noconfirm irlume
+        else
+          say "No AUR helper found. Run:"
+          say "  git clone https://aur.archlinux.org/irlume.git && cd irlume && makepkg -si"
+          say "Nothing was changed."
+          exit 0
+        fi
         ;;
       *" debian "*|*" ubuntu "*)
         say "Debian/Ubuntu-derivative: installing the checksum-verified universal .deb."

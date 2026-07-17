@@ -111,6 +111,39 @@ tar xzf onnxruntime-linux-x64-1.24.4.tgz
 export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so"
 ```
 
+## Option C: Container (Podman/Docker)
+
+A throwaway distro container gives you a clean-room build without touching
+the host. This path was validated end-to-end (fresh clone, build, live
+camera capture) on `ubuntu:26.04`, `archlinux`, and `fedora:44` images.
+Mount your checkout and install that distro's Option B package list inside:
+
+```sh
+podman run --rm -it -v "$PWD":/work -w /work fedora:44
+# inside: the Fedora package list from Option B, then build as usual
+```
+
+On Ubuntu images use rustup (Option B's note applies); on Arch the system
+`onnxruntime-cpu` covers the runtime, elsewhere use the tarball recipe above.
+
+To run the camera examples inside the container, pass the IR node through:
+
+```sh
+podman run --rm -it \
+  --device /dev/video2 --group-add keep-groups --security-opt label=disable \
+  -v "$PWD":/work -w /work fedora:44
+```
+
+`--group-add keep-groups` carries the host ACL that grants your user the
+camera into the container; `--security-opt label=disable` lifts SELinux
+confinement, which otherwise blocks the v4l device on SELinux hosts. Both
+weaken the container's isolation; use them for local testing only, never for
+a container that runs untrusted code.
+
+A container tests no more of the stack than the Nix shell does: TPM sealing,
+PAM wiring, greeter/lock integration, and SELinux policy still need the
+real-hardware path below.
+
 ## Build, lint, test, run
 
 ```sh

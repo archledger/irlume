@@ -1,11 +1,15 @@
 # Developing irlume
 
-This guide gets you from a fresh clone to a working build. There are two paths:
+This guide gets you from a fresh clone to a working build. There are three
+paths:
 
 - **[Nix](#option-a-nix-recommended)**: one command, identical on every
   distro, nothing installed globally. Recommended.
 - **[Manual, per distro](#option-b-manual-per-distro)**: install the build
   dependencies yourself with `dnf` / `apt` / `pacman`.
+- **[Container](#option-c-container-podmandocker)**: a throwaway distro
+  container as a clean-room build/test environment, with optional camera
+  passthrough.
 
 For *what* you're building (the daemon/PAM/CLI split and the model pipeline),
 read [`ARCHITECTURE.md`](ARCHITECTURE.md). For the contribution rules (DCO,
@@ -119,9 +123,15 @@ camera capture) on `ubuntu:26.04`, `archlinux`, and `fedora:44` images.
 Mount your checkout and install that distro's Option B package list inside:
 
 ```sh
-podman run --rm -it -v "$PWD":/work -w /work fedora:44
+podman run --rm -it -v "$PWD":/work:Z -w /work fedora:44
 # inside: the Fedora package list from Option B, then build as usual
 ```
+
+The `:Z` matters on SELinux hosts (Fedora among them): it relabels the
+checkout so the container may read and write it; without it the mount is
+permission-denied. Inside the container, set `CARGO_TARGET_DIR=/work/target-container`
+(or similar) so container-built artifacts, linked against the container's
+glibc, don't overwrite your host `target/`.
 
 On Ubuntu images use rustup (Option B's note applies); on Arch the system
 `onnxruntime-cpu` covers the runtime, elsewhere use the tarball recipe above.

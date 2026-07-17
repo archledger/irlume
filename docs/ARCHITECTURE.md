@@ -60,6 +60,34 @@ flowchart LR
 4. On any failure/timeout: `granted: false` (or an error) → PAM falls through
    to password (mandatory non-biometric fallback, per NIST SP 800-63B-4).
 
+## IR capture: strobe and ambient subtraction
+
+The 850 nm emitter strobes rather than holding steady, so `irlumed` captures an
+IR burst and keeps the brightest frame (the lit strobe phase). The frames around
+it are emitter-off exposures holding only ambient IR, and they are not simply
+discarded: with `IRLUME_IR_AMBIENT_SUBTRACT=1` the daemon subtracts the
+off-frame adjacent to the lit one, isolating the emitter's own reflected light.
+This is the same illuminated/ambient pairing Windows Hello uses.
+
+Subtraction is experimental and off by default. Its job is exposure robustness
+under strong ambient IR (sunlight), not spoof detection; the depth and glint
+cues in the liveness gate carry that. Field captures set the gates it runs
+behind (`crates/irlume-camera/src/lib.rs`):
+
+- The strobe gap (lit mean minus off mean) must exceed the sensor noise floor
+  (`STROBE_MIN_GAP = 8`). Under saturating ambient the gap collapses to single
+  digits and there is nothing real to subtract.
+- The off-frame mean must reach `LOW_AMBIENT_SKIP = 5`; indoors the off-frame
+  is near zero and subtraction would only inject sensor noise.
+- The subtracted frame must keep a mean of `SUBTRACT_MIN_RESULT = 12`, or the
+  raw lit frame is kept, so subtracting a bright pedestal can never hand a
+  blank image downstream.
+
+Above `IR_AMBIENT_FLOOD = 170` mean ambient (8-bit, `irlume-liveness`) the
+sensor saturates and no capture strategy recovers the signal; the liveness gate
+still denies, with a message telling the user to turn away from the light or
+use their password.
+
 ## Face login → keyring unlock
 
 irlume's headline feature is Windows-Hello-style keyring unlock: log in with your

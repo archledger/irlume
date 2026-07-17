@@ -88,3 +88,25 @@ motion/blink verification defeats this class without rPPG. The `require-eyes-ope
 IR-glint eyes scaffolding is the starting point. Reason (1) of this ADR (the rPPG
 latency paradox) still stands; reason (2) does not, so temporal liveness should be
 reconsidered, not for heart-rate rPPG, but for **static-artifact motion challenge**.
+
+## Update (2026-07-16): acceptance bar for a learned PAD model
+
+Issue #4 asked whether algorithmic-only PAD is permanent policy. It is not. The
+bar is the clean-BOM standard the rest of the model stack already meets (YuNet,
+BlazeFace, FaceMesh, and AuraFace are all learned models). A learned PAD model
+is acceptable when all four criteria hold:
+
+1. **Permissive license** on weights and inference code, compatible with
+   GPL-3.0 redistribution.
+2. **Training-data provenance:** licensed or consented data, not scraped. This
+   is the criterion CelebA-Spoof-trained models (MiniFASNet / Silent-Face)
+   fail.
+3. **Reproducible training:** the pipeline from dataset to weights can be
+   re-run, so the shipped weights are auditable rather than opaque.
+4. **Inversion-risk assessment:** a model trained on real face/IR data can leak
+   that data through model inversion, which conflicts with the
+   raw-frames-never-leave-the-daemon stance. A spoof/live texture classifier
+   trained on consented captures carries less identity information than a
+   recognition model, but a candidate still owes an explicit assessment.
+
+Criterion 4 was contributed by issue #4.

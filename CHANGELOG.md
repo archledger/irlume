@@ -22,6 +22,10 @@ All notable changes to irlume are documented here. This project adheres to
 - README documents the measured outdoor operating envelope; packaging comments
   record the verified distro onnxruntime versions (Fedora and Ubuntu are all
   below irlume's 1.24 floor, so the bundle stays).
+- ARCHITECTURE.md documents the IR strobe capture and the opt-in ambient
+  subtraction path with its gates (previously only in this changelog);
+  ADR-0001 gains the acceptance bar for a future learned PAD model, including
+  the model-inversion criterion raised in issue #4.
 
 ## [0.2.1] - 2026-07-16
 

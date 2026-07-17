@@ -36,6 +36,11 @@ pub struct Engine {
     /// vs YuNet's 76.9% on the sunlight walking bursts). Needs `mesh` to
     /// refine its coarse box into alignment landmarks.
     blaze: Option<irlume_vision::BlazeRescue>,
+    /// Optional third-party PAD cue (opt-in via `irlume models`, catalog in
+    /// `irlume_common::thirdparty`): (classifier, threshold, catalog name).
+    /// Consulted DENY-ONLY on the lit IR strobe frame; it may downgrade a
+    /// Live verdict to Spoof, never the reverse (see `thirdparty_downgrades`).
+    tp_pad: Option<(irlume_vision::PadIr, f32, String)>,
     gate: LivenessGate,
     rgb_dev: String,
     ir_dev: String,
@@ -63,6 +68,10 @@ pub struct Assessment {
     /// Both eyes read open (IR corneal-glint heuristic). Used only when a profile
     /// opts into the require-eyes-open gate. `false` if eyes couldn't be verified.
     pub eyes_open: bool,
+    /// P(fake) from the opt-in third-party PAD cue, when one is loaded and an
+    /// IR face was present. Deny-only: consulted by both the cross-spectrum
+    /// verdict (in `assess_full`) and the dark path.
+    pub thirdparty_fake: Option<f32>,
 }
 
 /// The authentication decision for a user.
@@ -238,6 +247,15 @@ fn ir_match_in(
     m
 }
 
+/// Deny-only rule for the opt-in third-party PAD cue: fires (downgrades to
+/// Spoof) ONLY when the built-in gate already said Live AND the cue's P(fake)
+/// clears the threshold. A non-Live verdict is never touched, and an absent
+/// score never fires, so the cue cannot rescue an attack or mask a gate
+/// rejection; enabling it can only tighten.
+pub fn thirdparty_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f32) -> bool {
+    verdict == Verdict::Live && p_fake.is_some_and(|p| p >= threshold)
+}
+
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         Ok(Self {
@@ -247,6 +265,7 @@ impl Engine {
             ir_space: "raw".into(),
             mesh: None,
             blaze: None,
+            tp_pad: None,
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
@@ -382,6 +401,34 @@ impl Engine {
         self.blaze.is_some()
     }
 
+    /// Load an opt-in third-party PAD classifier (deny-only cue on the lit IR
+    /// frame). No-op if the file is absent, so a deleted model degrades to the
+    /// built-in gate, never to a startup failure.
+    pub fn with_thirdparty_pad(
+        mut self,
+        path: &str,
+        threshold: f32,
+        name: &str,
+    ) -> irlume_common::Result<Self> {
+        if std::path::Path::new(path).exists() {
+            self.tp_pad = Some((
+                irlume_vision::PadIr::load_from_file(path)?,
+                threshold,
+                name.to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    pub fn has_thirdparty_pad(&self) -> bool {
+        self.tp_pad.is_some()
+    }
+
+    /// Catalog name of the loaded third-party PAD cue, if any.
+    pub fn thirdparty_pad_name(&self) -> Option<&str> {
+        self.tp_pad.as_ref().map(|(_, _, n)| n.as_str())
+    }
+
     /// Detection rescue (cascade stage 2): when YuNet returns no face, try
     /// BlazeFace and refine its coarse box into the 5 alignment landmarks
     /// with FaceMesh (BlazeFace has no mouth corners and its eyes measured
@@ -504,6 +551,7 @@ impl Engine {
             ir_depth: 0.0,
             ir_brightness: 0.0,
             eyes_open: false,
+            thirdparty_fake: None,
         })
     }
 
@@ -712,6 +760,36 @@ impl Engine {
             "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2}",
             signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
             signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac);
+        // Opt-in third-party PAD cue: score whenever an IR face is present (the
+        // `ir` frame is the brightest strobe phase, i.e. the LIT frame, which is
+        // the regime the cue was measured in), so the dark path can consult the
+        // result too. DENY-ONLY: it can downgrade Live to Spoof and nothing else.
+        let thirdparty_fake = match (self.tp_pad.as_mut(), ir_top.as_ref()) {
+            (Some((pad, _, _)), Some(f)) => match pad.p_fake(&ir_view, &f.bbox) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    irlume_common::dlog!("thirdparty-pad: inference failed ({e}); cue skipped");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let (verdict, reason) = if let Some((_, thr, name)) = self.tp_pad.as_ref() {
+            if thirdparty_downgrades(verdict, thirdparty_fake, *thr) {
+                let pf = thirdparty_fake.unwrap_or(1.0);
+                irlume_common::dlog!(
+                    "thirdparty-pad('{name}'): p_fake {pf:.3} >= {thr:.2}; downgrading Live to Spoof"
+                );
+                (
+                    Verdict::Spoof,
+                    format!("third-party PAD cue '{name}' flags a spoof; use your password"),
+                )
+            } else {
+                (verdict, reason)
+            }
+        } else {
+            (verdict, reason)
+        };
 
         // Rebuild the view against the final RGB frame (it may have been
         // recaptured by the cross-spectrum self-heal above).
@@ -756,6 +834,7 @@ impl Engine {
             ir_depth,
             ir_brightness,
             eyes_open,
+            thirdparty_fake,
         })
     }
 
@@ -1113,6 +1192,25 @@ impl Engine {
                     score: 0.0,
                     reason: format!("dark liveness {verdict:?}: {reason}"),
                 });
+            }
+            // Opt-in third-party PAD cue, deny-only (scored in assess_full on
+            // the lit IR frame; the dark path re-derives its own gate verdict,
+            // so it must consult the cue explicitly too).
+            if let Some((_, thr, name)) = self.tp_pad.as_ref() {
+                if thirdparty_downgrades(verdict, a.thirdparty_fake, *thr) {
+                    let pf = a.thirdparty_fake.unwrap_or(1.0);
+                    irlume_common::dlog!(
+                        "thirdparty-pad('{name}'): dark path p_fake {pf:.3} >= {thr:.2}; denying"
+                    );
+                    return Ok(Outcome {
+                        granted: false,
+                        live: false,
+                        score: 0.0,
+                        reason: format!(
+                            "dark liveness: third-party PAD cue '{name}' flags a spoof; use your password"
+                        ),
+                    });
+                }
             }
             let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
@@ -2382,5 +2480,31 @@ mod tests {
         });
         let err = enroll_merge_target(&enr, &[&face1, &face2]).unwrap_err();
         assert!(err.to_string().contains("two different profiles"));
+    }
+}
+
+#[cfg(test)]
+mod thirdparty_cue_tests {
+    use super::thirdparty_downgrades;
+    use irlume_liveness::Verdict;
+
+    #[test]
+    fn fires_only_on_live_plus_confident_fake() {
+        assert!(thirdparty_downgrades(Verdict::Live, Some(0.9), 0.5));
+        assert!(thirdparty_downgrades(Verdict::Live, Some(0.5), 0.5)); // at threshold
+        assert!(!thirdparty_downgrades(Verdict::Live, Some(0.49), 0.5));
+        assert!(!thirdparty_downgrades(Verdict::Live, None, 0.5));
+    }
+
+    #[test]
+    fn never_touches_a_non_live_verdict() {
+        // The deny-only property: a gate rejection or non-response stands even
+        // if the cue is confident the presentation is genuine or a spoof; the
+        // cue can tighten the gate, never loosen or reshape it.
+        for v in [Verdict::Spoof, Verdict::Uncertain] {
+            for p in [None, Some(0.0), Some(0.49), Some(0.5), Some(1.0)] {
+                assert!(!thirdparty_downgrades(v, p, 0.5));
+            }
+        }
     }
 }

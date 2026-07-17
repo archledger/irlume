@@ -1238,6 +1238,8 @@ SYSTEM INTEGRATION
                         needed; enroll auto-runs it when IR frames are dark)
   set-cameras <rgb> <ir>          persist the RGB+IR camera pair (sudo; the TUI
                         camera picker runs this for you)
+  models [enable|disable]         opt-in third-party liveness models: measured,
+                        checksum-pinned, deny-only; fetched, never shipped
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   version                         print the installed irlume version

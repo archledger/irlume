@@ -674,6 +674,109 @@ mod onnx {
         t
     }
 
+    /// Third-party PAD classifier (opt-in; see `irlume_common::thirdparty`).
+    /// Built for the DAMO FLIR IR liveness model: 112x112x3, (px-127.5)/128,
+    /// NCHW, two output LOGITS where softmax index 0 is P(fake). Preprocessing
+    /// replicates ModelScope's `FaceLivenessIrPipeline.align_face_padding`
+    /// exactly (validated against 1,175 field frames + the live sessions in
+    /// docs/pad-results/2026-07-17-third-party-pad-candidates.md): expand the
+    /// detection bbox by 16/112 per side, clamp to the frame, square the crop
+    /// about its center, fill out-of-crop with 127 gray, resize to 128, take
+    /// the center 112.
+    pub struct PadIr {
+        session: Session,
+    }
+
+    impl PadIr {
+        pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            Ok(Self {
+                session: build(model)?,
+            })
+        }
+        pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
+            let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            Self::load_from_memory(&bytes)
+        }
+
+        /// P(fake) for the face at `bbox` (frame pixel coords, [x1,y1,x2,y2]).
+        pub fn p_fake(
+            &mut self,
+            frame: &align::RgbView,
+            bbox: &[f32; 4],
+        ) -> irlume_common::Result<f32> {
+            const PAD: i64 = 16;
+            let (fw, fh) = (frame.width as i64, frame.height as i64);
+            let mut b = [
+                bbox[0] as i64,
+                bbox[1] as i64,
+                bbox[2] as i64,
+                bbox[3] as i64,
+            ];
+            let px = (b[2] - b[0] + 1) * PAD / 112;
+            let py = (b[3] - b[1] + 1) * PAD / 112;
+            b = [
+                (b[0] - px).max(0),
+                (b[1] - py).max(0),
+                (b[2] + px).min(fw - 1),
+                (b[3] + py).min(fh - 1),
+            ];
+            let (ph, pw) = (b[3] - b[1] + 1, b[2] - b[0] + 1);
+            let dst_size = if pw > ph {
+                let off = (pw - ph) / 2;
+                b[1] = (b[1] - off).max(0);
+                b[3] = (b[1] + pw - 1).min(fh - 1);
+                pw
+            } else {
+                let off = (ph - pw) / 2;
+                b[0] = (b[0] - off).max(0);
+                b[2] = (b[0] + ph - 1).min(fw - 1);
+                ph
+            } as f32;
+            // Crop offsets center the (possibly clamped) region in the square.
+            let xo = (dst_size as i64 - (b[2] - b[0] + 1)) / 2;
+            let yo = (dst_size as i64 - (b[3] - b[1] + 1)) / 2;
+            // Sample the 112 center of the virtual 128 square directly:
+            // dst pixel (ox,oy) in 0..112 maps to square coord via the cv2
+            // INTER_LINEAR convention, offset by the 8px center-crop margin.
+            let scale = dst_size / 128.0;
+            let mut t = vec![0.0f32; 3 * 112 * 112];
+            let plane = 112 * 112;
+            for oy in 0..112usize {
+                for ox in 0..112usize {
+                    let sqx = ((ox + 8) as f32 + 0.5) * scale - 0.5;
+                    let sqy = ((oy + 8) as f32 + 0.5) * scale - 0.5;
+                    // Square coords -> frame coords (127 gray outside the crop).
+                    let fx = sqx - xo as f32 + b[0] as f32;
+                    let fy = sqy - yo as f32 + b[1] as f32;
+                    let p = if fx < b[0] as f32 - 0.5
+                        || fy < b[1] as f32 - 0.5
+                        || fx > b[2] as f32 + 0.5
+                        || fy > b[3] as f32 + 0.5
+                    {
+                        [127.0, 127.0, 127.0]
+                    } else {
+                        frame.sample_bilinear(fx, fy)
+                    };
+                    let o = oy * 112 + ox;
+                    // Grayscale IR: channels are equal, order irrelevant.
+                    t[o] = (p[0] - 127.5) * 0.007_812_5;
+                    t[plane + o] = (p[1] - 127.5) * 0.007_812_5;
+                    t[2 * plane + o] = (p[2] - 127.5) * 0.007_812_5;
+                }
+            }
+            let tensor = Tensor::from_array(([1i64, 3, 112, 112], t)).map_err(err)?;
+            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+            if raw.len() < 2 {
+                return Err(err("PAD model: expected 2 output logits"));
+            }
+            let (a, b2) = (raw[0], raw[1]);
+            let m = a.max(b2);
+            let (ea, eb) = ((a - m).exp(), (b2 - m).exp());
+            Ok(ea / (ea + eb)) // softmax index 0 = P(fake)
+        }
+    }
+
     /// Phase-1 gate: embed the SAME aligned chip twice; cosine MUST be ~= 1.0.
     /// Validates that the ONNX path is deterministic and the preprocessing is
     /// wired correctly before any matching logic is trusted. Returns (passed,
@@ -705,7 +808,7 @@ mod onnx {
 #[cfg(feature = "onnx")]
 pub use onnx::{
     eye_ear, selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh,
-    BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 #[cfg(all(test, feature = "onnx"))]

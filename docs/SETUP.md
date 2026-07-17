@@ -198,6 +198,27 @@ sudo irlume ir-setup
 
 (IR cameras only; on an RGB webcam it exits without touching anything.)
 
+## Optional third-party liveness models
+
+irlume's anti-spoof gate is algorithmic by default. `irlume models` lists
+externally-trained models irlume can fetch onto your machine as an extra,
+deny-only liveness cue: one that can reject a presentation but can never
+approve one the built-in gate rejected. These models carry a real license on
+their weights but fail the shipped-stack provenance bar (ADR-0001), so irlume
+does not ship or mirror them; enabling downloads them once from the publisher,
+pinned by checksum, after you confirm the license and provenance on screen.
+Each catalog entry was measured on real hardware first
+([docs/pad-results/](pad-results/)).
+
+```sh
+irlume models                     # what exists, what it measured, what's enabled
+sudo irlume models enable flir    # fetch + verify + enable (typed confirmation)
+sudo irlume models disable        # delete the weights, back to the shipped stack
+```
+
+`irlume doctor` names the enabled model; the daemon refuses weights whose
+checksum stops matching and falls back to the built-in gate alone.
+
 ---
 
 ## Configuration reference
@@ -214,7 +235,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `enforce_biopolicy=1` opts into operation-class gating | TUI Settings |
+| `/etc/irlume/settings.conf` | `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in model | TUI Settings; `sudo irlume models enable/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter (optional second line: a brightness-boost control) | `irlume ir-setup` / enrollment auto-setup |

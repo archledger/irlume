@@ -105,12 +105,56 @@ fn main() {
             ),
         }
     }
+    // Opt-in third-party PAD cue (`irlume models`): enabled via settings.conf,
+    // weights fetched by the CLI to the state dir. Unlike the shipped models'
+    // warn-first verification, a third-party file MUST match its catalog pin:
+    // on any mismatch the cue is skipped (the built-in gate alone is the safe
+    // default), never trusted. Env override for sandboxes.
+    let tp_pad: Option<(String, f32, String)> = std::env::var("IRLUME_THIRDPARTY_PAD")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            irlume_common::config::read_kv("settings.conf", irlume_common::thirdparty::SETTINGS_KEY)
+        })
+        .and_then(|name| {
+            let Some(entry) = irlume_common::thirdparty::by_name(name.trim()) else {
+                eprintln!("irlumed: WARNING: third_party_pad='{name}' is not in the catalog; ignoring");
+                return None;
+            };
+            let path = irlume_common::thirdparty::model_path(entry);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "irlumed: WARNING: third-party PAD '{name}' enabled but {} unreadable ({e});                          cue disabled (run `sudo irlume models enable {name}` to re-fetch)",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            use sha2::Digest;
+            let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+            if digest != entry.sha256 {
+                eprintln!(
+                    "irlumed: WARNING: third-party PAD '{name}' checksum mismatch (sha256 {digest}); cue DISABLED, refusing to load unpinned weights"
+                );
+                return None;
+            }
+            Some((
+                path.to_string_lossy().into_owned(),
+                entry.threshold,
+                entry.name.to_string(),
+            ))
+        });
     let mut engine = match irlume_auth::Engine::load(&det, &model)
         .map(|e| e.with_devices(&rgb_dev, &ir_dev))
         .and_then(|e| e.with_ir_adapter(&adapter))
         .and_then(|e| e.with_mesh(&mesh))
         .and_then(|e| e.with_blaze_rescue(&blaze))
-    {
+        .and_then(|e| match &tp_pad {
+            Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
+            None => Ok(e),
+        }) {
         Ok(e) => {
             eprintln!(
                 "irlumed: IR adapter {}",
@@ -132,6 +176,12 @@ fn main() {
                     "absent"
                 }
             );
+            match e.thirdparty_pad_name() {
+                Some(n) => eprintln!(
+                    "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
+                ),
+                None => eprintln!("irlumed: third-party PAD cue: none (default)"),
+            }
             e
         }
         Err(e) => {

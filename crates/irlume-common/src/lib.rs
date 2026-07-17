@@ -13,6 +13,7 @@ pub mod dbglog;
 pub mod memlock;
 pub mod platform;
 pub mod secureboot;
+pub mod thirdparty;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;

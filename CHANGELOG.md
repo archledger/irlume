@@ -42,6 +42,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`irlume models`: opt-in third-party liveness models** (the runtime shape
+  of the issue #4 `nonfree-pad` idea). The catalog lists externally-trained
+  models with real weight licenses that fail the shipped-stack provenance bar;
+  irlume never ships or mirrors them. `sudo irlume models enable flir` shows
+  the license, the provenance status, and the measured numbers, requires the
+  model name typed back plus a y/N, downloads once from the publisher's
+  origin, verifies the pinned sha256, and restarts the daemon; `disable`
+  deletes the weights and reverts to the shipped stack. The daemon wires an
+  enabled model as a deny-only cue on the lit IR frame: it can turn a Live
+  verdict into Spoof, never anything else (unit-tested invariant), and it
+  refuses weights whose checksum stops matching. First entry: the MIT-licensed
+  DAMO FLIR IR model, which closes the vinyl-print gap above. `irlume doctor`
+  reports the enabled model.
 - Third-party PAD candidate evaluation (issue #4 follow-through):
   `docs/pad-results/2026-07-17-third-party-pad-candidates.md` measures the two
   externally-trained liveness models that carry real weight licenses on real

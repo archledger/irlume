@@ -19,6 +19,7 @@
 mod commands;
 mod fingerprint;
 mod logs;
+mod models;
 mod pad;
 mod pamwire;
 mod recovery;
@@ -96,6 +97,7 @@ fn main() -> std::process::ExitCode {
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
+        (Some("models"), sub) => models::run(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
@@ -2182,6 +2184,7 @@ fn doctor() -> std::process::ExitCode {
             ort
         }
     );
+    println!("[doctor] third-party PAD model: {}", models::doctor_line());
 
     // --- companion factors / data-at-rest ----------------------------------
     let fp = match irlume_fingerprint::device_name() {

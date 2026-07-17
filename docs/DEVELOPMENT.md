@@ -157,6 +157,13 @@ CLI tools, they open the camera directly and hold no privileged path.
 | `concurrency_probe` (irlume-camera) | whether the module starves when RGB and IR stream at the same time |
 | `assess_probe` (irlume-auth) | drives the real liveness assessment N times and reports verdicts + RGB self-heal firing |
 | `embed_parity` (irlume-auth) | whether concurrent-load RGB dimming shifts the face embedding enough to hurt recognition |
+| `landmark_dump` (irlume-auth) | IR strobe burst + per-frame FaceMesh coordinates and the IR brightness at each landmark, for landmark-relief prototyping |
+
+The `irlume-auth` examples load ONNX models, so they need `ORT_DYLIB_PATH`
+set (see the ONNX runtime section above; on an installed Fedora/RPM box,
+`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` works). Without it the
+process hangs instead of erroring — an upstream `ort` bug where building the
+load-failure message re-enters the API lock being initialized.
 
 ## What the dev shell can't do: real-hardware testing
 

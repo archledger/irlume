@@ -5,6 +5,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `landmark_dump` example (issue #4): captures a raw IR strobe burst and
+  writes, per frame, the PGM plus a CSV of all 478 FaceMesh landmark
+  coordinates and the IR brightness (3x3 patch mean) at each — the input a
+  landmark-anchored relief prototype needs without writing capture/detect/mesh
+  glue. Coordinates print at full f32 precision so offline re-sampling from
+  the CSV reproduces the tool's own brightness values exactly (verified: 8604
+  landmarks across 18 live frames, worst delta 0.0044 from decimal printing).
+
 ### Changed
 
 - **Ambient-flooded IR scenes get an actionable rejection.** When the scene's

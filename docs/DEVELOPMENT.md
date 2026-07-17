@@ -161,9 +161,57 @@ CLI tools, they open the camera directly and hold no privileged path.
 
 The `irlume-auth` examples load ONNX models, so they need `ORT_DYLIB_PATH`
 set (see the ONNX runtime section above; on an installed Fedora/RPM box,
-`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` works). Without it the
+`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` works, on a Debian/PPA
+box `/opt/irlume/onnxruntime/lib/libonnxruntime.so.1.24.4`). Without it the
 process hangs instead of erroring — an upstream `ort` bug where building the
 load-failure message re-enters the API lock being initialized.
+
+### Using landmark_dump
+
+```sh
+git lfs pull                                     # real model weights
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so # see above
+cargo run --release -p irlume-auth --example landmark_dump -- \
+  models/face_detection_yunet_2023mar.onnx models/face_landmark.onnx \
+  out/ /dev/video2 36
+```
+
+Look at the camera; a 36-frame burst takes about 2.5 s. The IR node is the
+V4L2 device that lists a `GREY` format (`v4l2-ctl -d /dev/videoN
+--list-formats`). `out/` then holds:
+
+- `frameNN.pgm` — the raw IR frame. PGM is plain grayscale: a `P5` text
+  header (width, height, 255) followed by one byte per pixel. Any image
+  viewer opens it and numpy reads it without a decoder.
+- `frameNN.landmarks.csv` — `idx,x,y,brightness` for the 478 FaceMesh
+  points, written only for frames where a face was detected. `brightness`
+  is the mean of the 3x3 pixel patch centered on the landmark; coordinates
+  carry full f32 precision, so re-sampling the PGM at `(x, y)` reproduces
+  the CSV value exactly.
+- `index.txt` — one line per frame: index, frame mean, ms since the first
+  frame, detection score and bbox (`- -` when no face).
+
+On a strobing emitter, alternate frames are emitter-off (near-black indoors,
+ambient-lit outdoors) and normally carry no CSV; the lit/dark pairing in
+`index.txt` is the ambient-subtraction signal. Reading the output in Python:
+
+```python
+import numpy as np, csv
+
+def pgm(path):
+    with open(path, "rb") as f:
+        assert f.readline().strip() == b"P5"
+        w, h = map(int, f.readline().split())
+        f.readline()  # maxval
+        return np.frombuffer(f.read(), np.uint8).reshape(h, w)
+
+frame = pgm("out/frame00.pgm")
+points = list(csv.DictReader(open("out/frame00.landmarks.csv")))
+```
+
+The MediaPipe canonical face-landmark map names each index (nose tip, eye
+rings, cheek centers); irlume's own eye rings are `EAR_LEFT` / `EAR_RIGHT`
+in `crates/irlume-vision/src/lib.rs`.
 
 ## What the dev shell can't do: real-hardware testing
 

@@ -42,6 +42,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `docs/STANDARDS.md`: maps the biometric standards that apply to a device
+  login system (ISO/IEC 30107-3, 19795-1, 24745, the Windows Hello bar,
+  Android's biometric classes) onto irlume's committed evidence, states what
+  is not claimed under each (no certification, no Hello-bar FAR, no 3D-mask
+  resistance), and points every number at the artifact and reproduction path
+  behind it.
 - `landmark_dump` example (issue #4): captures a raw IR strobe burst and
   writes, per frame, the PGM plus a CSV of all 478 FaceMesh landmark
   coordinates and the IR brightness (3x3 patch mean) at each — the input a

@@ -212,7 +212,7 @@ GPLv3-compatible, so the whole thing is bundleable:
 | Passive blink liveness + rescue alignment | **MediaPipe FaceMesh** *(478-pt)* → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
 | IR domain match | raw AuraFace + **per-enrollment on-device calibration** *(fitted from your own scans; no third-party data — [ADR-0004](docs/adr/0004-per-enrollment-ir-adapter.md))* | n/a |
 
-More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Cross-distro notes](docs/cross-distro/).
+More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Standards mapping](docs/STANDARDS.md) · [Cross-distro notes](docs/cross-distro/).
 
 ## 🔐 Your face never leaves as an image
 

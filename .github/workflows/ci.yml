@@ -27,7 +27,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit SHA (the tag in the comment is what it
+      # was) so a moved tag cannot change what runs. Dependabot bumps these.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           lfs: true # pull the ONNX model weights (Git LFS)
 
@@ -38,11 +40,14 @@ jobs:
             build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # 1.88.0
         with:
+          # Pinned to a SHA, the action can't read the version from the tag, so
+          # name the toolchain explicitly (it is a required input then).
+          toolchain: "1.88.0"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
@@ -68,8 +73,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories bans licenses
 
@@ -82,10 +87,10 @@ jobs:
       # (flake structure, the package derivation, the NixOS module, the dev
       # shell); it never reads the ONNX model contents, so the LFS pointer
       # files left by a plain checkout are enough and the job stays fast.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Nix with flakes
-        uses: cachix/install-nix-action@v30
+        uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes

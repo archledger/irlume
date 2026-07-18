@@ -11,14 +11,17 @@
 //!   3. disarm every enrolled user's TPM keyring seal
 //!   4. wipe enrolled templates, sealed secrets, third-party models, and config
 //!
-//! Only then is removing the package safe. This command does not run the
-//! package manager itself; it prints the exact command for how irlume was
-//! installed. The same teardown backs the TUI's uninstall entry, which puts its
-//! own double-confirmation in front of it.
+//! Only then does it remove irlume itself: the package through its manager (so
+//! the package database stays consistent), or the hand-placed files for a
+//! source install. It deletes the binary running this command last of all,
+//! which is fine on Linux (the inode survives until the process exits). The
+//! same teardown-then-remove backs the TUI's uninstall entry, which puts its
+//! own double-confirmation in front of it and exits once it returns.
 
 use crate::commands::{install_origin, InstallOrigin};
 use crate::pamwire;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 /// What the teardown actually did, so the CLI and the TUI can report it the
@@ -48,7 +51,7 @@ pub fn run(args: &[String]) -> ExitCode {
         println!("  3. disarm the keyring seal, then delete every enrolled face,");
         println!("     sealed password, third-party model, and config file");
     }
-    println!("It does not remove the package; it prints that command at the end.");
+    println!("  4. remove irlume itself (the package, or the installed files)");
     println!();
 
     if !assume_yes {
@@ -101,10 +104,92 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     );
 
+    // Now actually remove irlume: the package via its manager, or the
+    // hand-placed files for a source install. Done last, because it deletes the
+    // binary running this very command (fine on Linux: the inode survives until
+    // this process exits).
     println!();
-    println!("Teardown done. To remove the package itself:");
-    println!("  {}", removal_hint(&install_origin()));
+    let origin = install_origin();
+    match remove_irlume(&origin) {
+        Ok(what) => {
+            println!("[uninstall] {what}");
+            println!("[uninstall] irlume is removed. This is the last thing it will do.");
+        }
+        Err(e) => {
+            println!("[uninstall] could not finish removal automatically: {e}");
+            println!("[uninstall] the teardown above is done; remove the package by hand:");
+            println!("  {}", removal_hint(&origin));
+        }
+    }
     ExitCode::SUCCESS
+}
+
+/// Remove irlume itself. Package installs go through the package manager (so the
+/// package database stays consistent); a source install has its hand-placed
+/// files deleted directly. `--yes`/confirmation already happened in `run`.
+fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
+    match origin {
+        InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
+            run_pkg("dnf", &["remove", "-y", "irlume"])
+        }
+        InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
+            run_pkg("apt-get", &["remove", "-y", "irlume"])
+        }
+        InstallOrigin::ArchPkg => run_pkg("pacman", &["-R", "--noconfirm", "irlume"]),
+        InstallOrigin::Source => remove_source_files(),
+    }
+}
+
+/// Run a package-manager removal; map a non-zero exit to a readable error.
+fn run_pkg(bin: &str, args: &[&str]) -> Result<String, String> {
+    println!("[uninstall] removing the package: {bin} {}", args.join(" "));
+    match Command::new(bin).args(args).status() {
+        Ok(s) if s.success() => Ok(format!("removed the {bin} package")),
+        Ok(s) => Err(format!("{bin} exited with {s}")),
+        Err(e) => Err(format!("could not run {bin} ({e})")),
+    }
+}
+
+/// Delete the files a source install placed: the two binaries (this one and its
+/// sibling irlumed), the PAM module, the systemd unit + drop-ins, and the model
+/// tree. The state/config dirs are already gone from the teardown. Best-effort;
+/// reports the count removed.
+fn remove_source_files() -> Result<String, String> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+
+    // The running binary and irlumed next to it.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            targets.push(dir.join("irlumed"));
+        }
+        targets.push(exe);
+    }
+    // The PAM module, wherever the loader keeps modules on this distro.
+    for d in [
+        "/usr/lib/security",
+        "/usr/lib64/security",
+        "/lib/security",
+        "/lib/x86_64-linux-gnu/security",
+    ] {
+        targets.push(PathBuf::from(d).join("pam_irlume.so"));
+    }
+    // The systemd unit and any drop-ins.
+    targets.push(PathBuf::from("/etc/systemd/system/irlumed.service"));
+    let _ = std::fs::remove_dir_all("/etc/systemd/system/irlumed.service.d");
+    // The model tree (the two common source-install prefixes).
+    for d in ["/usr/share/irlume", "/usr/local/share/irlume"] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let removed = targets
+        .iter()
+        .filter(|p| p.exists() && std::fs::remove_file(p).is_ok())
+        .count();
+    let _ = systemctl(&["daemon-reload"]);
+    if removed == 0 {
+        return Err("found no source-installed files to remove (already gone?)".into());
+    }
+    Ok(format!("removed {removed} source-installed file(s)"))
 }
 
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI

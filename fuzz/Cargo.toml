@@ -1,0 +1,55 @@
+# cargo-fuzz harness for irlume's untrusted-input parsers.
+#
+# irlumed runs as root and reads three kinds of attacker-reachable input: the
+# IPC request line on /run/irlume.sock (any local process can write it), the
+# sealed envelope on disk, and the systemd PCR-signature file. A panic or
+# memory error in any of those parsers is a local denial of service against a
+# root daemon, so each gets a target here.
+#
+# This is its own workspace (the empty [workspace] table below) so the stable
+# MSRV build of the main workspace never pulls in libfuzzer-sys, which needs
+# nightly. Run with: cargo +nightly fuzz run <target>
+[package]
+name = "irlume-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+irlume-common = { path = "../crates/irlume-common" }
+irlume-core = { path = "../crates/irlume-core" }
+
+# Detach from the parent workspace so `cargo build` at the repo root ignores it.
+# Because it is its own workspace it does not inherit the root's [patch], so
+# repeat the tss-esapi fork pin here; without it irlume-core resolves the
+# unpatched crates.io release and fails to compile.
+[workspace]
+
+[patch.crates-io]
+tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "irlume-patches" }
+
+[[bin]]
+name = "ipc_request"
+path = "fuzz_targets/ipc_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcr_signature"
+path = "fuzz_targets/pcr_signature.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_envelope"
+path = "fuzz_targets/sealed_envelope.rs"
+test = false
+doc = false
+bench = false

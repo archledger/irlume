@@ -101,3 +101,52 @@ jobs:
       # locally and the RPM/deb CI, so keep this eval-only and quick.
       - name: nix flake check
         run: nix flake check --no-build --show-trace
+
+  fuzz:
+    name: fuzz (untrusted-input parsers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev libtss2-dev
+
+      - name: Install nightly Rust (cargo-fuzz needs it)
+        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # nightly
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Seed each corpus from the checked-in seeds (the generated corpus is not
+      # committed), then fuzz for a bounded time. Replaying the seeds is a
+      # regression gate: an input that once crashed a parser fails CI forever.
+      # A crash exits non-zero and fails the job; the input is uploaded below.
+      - name: Fuzz the IPC, envelope, and PCR-signature parsers
+        working-directory: fuzz
+        run: |
+          for t in ipc_request pcr_signature sealed_envelope; do
+            echo "::group::fuzz $t"
+            mkdir -p "corpus/$t"
+            cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true
+            cargo +nightly fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore

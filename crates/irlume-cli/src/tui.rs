@@ -1588,13 +1588,20 @@ impl App {
             return;
         }
         // Merge confirm: scan 1 of a "new profile" enroll matched an existing
-        // identity. [y] adds the rest of the scans to that profile; any other
-        // key cancels and removes the one scan already merged in.
-        if let Some(mc) = self.enroll_merge.take() {
-            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                self.confirm_enroll_merge(mc);
-            } else {
-                self.cancel_enroll_merge(mc);
+        // identity. [y] adds the rest of the scans to that profile, [n]/Esc
+        // cancels (removing the one merged scan). Any other key is ignored so a
+        // stray keypress can't silently cancel the enroll.
+        if self.enroll_merge.is_some() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let mc = self.enroll_merge.take().unwrap();
+                    self.confirm_enroll_merge(mc);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    let mc = self.enroll_merge.take().unwrap();
+                    self.cancel_enroll_merge(mc);
+                }
+                _ => {} // ignore stray keys; the modal stays up
             }
             return;
         }
@@ -2112,16 +2119,14 @@ impl App {
             };
             self.modal(f, title, hint);
         } else if let Some(mc) = &self.enroll_merge {
-            let title = format!(
-                "This face is already enrolled as '{}'. A face can only own one \
-                 profile, so glasses/lighting variants are added as scans to it.",
+            // Keep the message in the wrapping body, not the border title (which
+            // is a single line clamped to the box width and would truncate).
+            let body = format!(
+                "This face is already enrolled as '{}' (a face owns one profile). \
+                 Add these scans to it?   [y] add   ·   [n] cancel",
                 mc.profile
             );
-            self.modal(
-                f,
-                &title,
-                "[y] add these scans to it    [any other key] cancel",
-            );
+            self.modal(f, "Already enrolled", &body);
         }
     }
 

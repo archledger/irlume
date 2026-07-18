@@ -145,6 +145,9 @@ and refuses to install on anything older.
 `irlume update`
 handles every case: it detects how irlume was installed and updates the same way.
 
+On NixOS, add `nixosModules.irlume` from this flake instead; it runs the daemon
+and wires the PAM stacks declaratively. See [docs/NIXOS.md](docs/NIXOS.md).
+
 Then, once:
 
 ```sh

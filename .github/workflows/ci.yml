@@ -25,8 +25,11 @@ jobs:
   check:
     name: fmt · clippy · build · test
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit SHA (the tag in the comment is what it
+      # was) so a moved tag cannot change what runs. Dependabot bumps these.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           lfs: true # pull the ONNX model weights (Git LFS)
 
@@ -37,11 +40,14 @@ jobs:
             build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # 1.88.0
         with:
+          # Pinned to a SHA, the action can't read the version from the tag, so
+          # name the toolchain explicitly (it is a required input then).
+          toolchain: "1.88.0"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
@@ -65,8 +71,85 @@ jobs:
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories bans licenses
+
+  nix:
+    name: nix flake check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # No lfs: true here. flake check --no-build only evaluates the outputs
+      # (flake structure, the package derivation, the NixOS module, the dev
+      # shell); it never reads the ONNX model contents, so the LFS pointer
+      # files left by a plain checkout are enough and the job stays fast.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Nix with flakes
+        uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Evaluates packages.default, nixosModules.irlume, and the dev shell.
+      # Catches eval and type errors in flake.nix and nix/*.nix before merge;
+      # the full source build (packages.default) is covered by `nix build`
+      # locally and the RPM/deb CI, so keep this eval-only and quick.
+      - name: nix flake check
+        run: nix flake check --no-build --show-trace
+
+  fuzz:
+    name: fuzz (untrusted-input parsers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev libtss2-dev
+
+      - name: Install nightly Rust (cargo-fuzz needs it)
+        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # nightly
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+
+      # Build cargo-fuzz with nightly: it (via cargo-platform) needs a rustc
+      # newer than the pinned 1.88, and nightly is the toolchain the targets
+      # build under anyway.
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      # Seed each corpus from the checked-in seeds (the generated corpus is not
+      # committed), then fuzz for a bounded time. Replaying the seeds is a
+      # regression gate: an input that once crashed a parser fails CI forever.
+      # A crash exits non-zero and fails the job; the input is uploaded below.
+      - name: Fuzz the IPC, envelope, and PCR-signature parsers
+        working-directory: fuzz
+        run: |
+          for t in ipc_request pcr_signature sealed_envelope; do
+            echo "::group::fuzz $t"
+            mkdir -p "corpus/$t"
+            cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true
+            cargo +nightly fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore

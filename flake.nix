@@ -7,7 +7,7 @@
   # Every input below is version-locked by flake.lock, so every contributor
   # and CI get byte-identical tooling regardless of which distro they run.
   # See docs/DEVELOPMENT.md for the walkthrough (and the non-Nix path).
-  description = "irlume — reproducible Rust dev environment (face auth for Linux)";
+  description = "irlume: reproducible Rust dev environment (face auth for Linux)";
 
   inputs = {
     # The package set. flake.lock pins it to an exact commit on first use;
@@ -24,7 +24,15 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # System-independent outputs (the NixOS module) merged with the per-system
+    # ones (dev shell, package) below.
+    {
+      # nixosModules.irlume: the daemon, camera access, and the empirically
+      # derived per-greeter PAM wiring. See nix/module.nix and docs/NIXOS.md.
+      nixosModules.irlume = import ./nix/module.nix;
+      nixosModules.default = self.nixosModules.irlume;
+    }
+    // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -59,6 +67,65 @@
           '';
         };
       in {
+        # `nix build` / `nix run .#irlume`: build irlume from source. The model
+        # weights (Git LFS) install into the result; the NixOS module points the
+        # daemon at them. `src = self` uses the flake's own tree.
+        packages.default = pkgs.callPackage ./nix/package.nix { src = self; };
+        packages.irlume = self.packages.${system}.default;
+
+        # `nix flake check` runs these. The module's per-greeter PAM control
+        # flags are its whole reason to exist, so instantiate it in a throwaway
+        # nixosSystem and assert the decision table. The asserts fire at eval
+        # time, so this guards against a regression even under `--no-build`
+        # (what CI runs); the derivation itself is trivial to build.
+        checks.irlume-module =
+          let
+            sys = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                ./nix/module.nix
+                {
+                  # A minimal config so the module system evaluates; none of it
+                  # is booted, it only has to type-check.
+                  boot.loader.grub.enable = false;
+                  fileSystems."/" = {
+                    device = "/dev/sda1";
+                    fsType = "ext4";
+                  };
+                  system.stateVersion = "25.11";
+                  services.irlume = {
+                    enable = true;
+                    pam.services = {
+                      sddm = { }; # graphical login
+                      "gdm-password" = { }; # GNOME login
+                      greetd = { }; # text-mode login
+                      ly = { }; # text-mode login
+                      kde = { }; # lock screen
+                      swaylock = { }; # lock screen
+                      hyprlock = { }; # lock screen
+                    };
+                  };
+                }
+              ];
+            };
+            pam = sys.config.security.pam.services;
+            authCtl = svc: pam.${svc}.rules.auth.irlume.control;
+            login = "[success=1 default=ignore]";
+          in
+          # Login greeters keep the keyring in the stack; lock screens grant
+          # outright; text-mode greeters force pam_kwallet to run.
+          assert authCtl "sddm" == login;
+          assert authCtl "gdm-password" == login;
+          assert authCtl "greetd" == login;
+          assert authCtl "ly" == login;
+          assert pam.greetd.kwallet.forceRun;
+          assert pam.ly.kwallet.forceRun;
+          assert authCtl "kde" == "sufficient";
+          assert authCtl "swaylock" == "sufficient";
+          assert authCtl "hyprlock" == "sufficient";
+          assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
+          pkgs.runCommand "irlume-module-checks-ok" { } "echo 'irlume module PAM decision table verified' > $out";
+
         devShells.default = pkgs.mkShell {
           # Tools that run at build time (compilers, generators).
           nativeBuildInputs = [
@@ -68,8 +135,8 @@
           ];
           # Libraries the build links against (added to PKG_CONFIG_PATH + linker).
           buildInputs = [
-            pkgs.tpm2-tss     # TPM 2.0 stack — the tss-esapi crate links tss2-*
-            pkgs.linux-pam    # libpam — the pamsm crate links it
+            pkgs.tpm2-tss     # TPM 2.0 stack; the tss-esapi crate links tss2-*
+            pkgs.linux-pam    # libpam; the pamsm crate links it
           ];
 
           # bindgen (pulled in transitively by v4l2-sys-mit) dlopens libclang

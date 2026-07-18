@@ -1,0 +1,59 @@
+# OpenSSF Scorecard: continuous supply-chain security posture.
+#
+# irlume authenticates a login and can grant sudo, so a compromise of the
+# build or release path is a compromise of every install. Scorecard scores that
+# path on every push to main and weekly: are actions pinned to a SHA, is the
+# GITHUB_TOKEN read-only, does any workflow run untrusted code with write
+# access, are releases signed, is there a security policy. Findings land in the
+# repository Security tab (code scanning), so a regression shows up as an alert.
+#
+# This complements, not duplicates, the other checks: CodeQL finds bugs in the
+# code, cargo-deny finds vulnerable dependencies, Scorecard watches the
+# supply-chain and workflow configuration itself.
+name: Scorecard
+
+on:
+  # Re-score when branch protection changes, weekly, and on push to main.
+  branch_protection_rule:
+  schedule:
+    - cron: "18 4 * * 1" # Mondays, 04:18 UTC
+  push:
+    branches: [main]
+
+# Read-only by default; the job below widens only what it needs.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      security-events: write # upload the SARIF result to code scanning
+      id-token: write # sign the result for the public Scorecard API
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish to the public OpenSSF API so the score is verifiable and the
+          # badge works. The repo is already public; this adds no exposure.
+          publish_results: true
+
+      # Keep the raw SARIF as an artifact for inspection outside code scanning.
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3
+        with:
+          sarif_file: results.sarif

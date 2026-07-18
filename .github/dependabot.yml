@@ -1,0 +1,36 @@
+# Automated dependency-update PRs.
+#
+# cargo-deny (CI) already fails the build on a known advisory; that is
+# detection. This file is remediation: Dependabot opens the PR that actually
+# bumps the version. The two are complementary.
+#
+# Noise control: this repo has ~200 crates.io dependencies, so minor and patch
+# bumps are collapsed into one grouped PR per ecosystem per week. Major bumps
+# come as their own PR because they can break the build. Dependabot does not
+# touch the two git-sourced crates (the tss-esapi fork); those are bumped by
+# hand when the fork moves.
+version: 2
+updates:
+  # GitHub Actions used by .github/workflows/ci.yml. These change rarely and
+  # every bump is worth seeing (a moved tag is a supply-chain event).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # Rust crates from crates.io (Cargo.lock).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"

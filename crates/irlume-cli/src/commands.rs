@@ -1242,6 +1242,8 @@ SYSTEM INTEGRATION
                         checksum-pinned, deny-only; fetched, never shipped
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
+  uninstall [--keep-data]         un-wire PAM, stop the daemon, wipe enrolled
+                        data, then show the package-removal command (sudo)
   version                         print the installed irlume version
 
   (developer/benchmark tools are hidden; set IRLUME_DEV=1 to enable them)

@@ -108,6 +108,10 @@ enum Suspend {
     /// View the face-auth journal (`sudo irlume logs`); the daemon's lines live
     /// in the system journal, so it runs under sudo to guarantee they show.
     Logs,
+    /// Full teardown: un-wire PAM, stop the daemon, wipe data. Root op, so it
+    /// suspends to `sudo irlume uninstall --yes` (the TUI already double-
+    /// confirmed, so --yes skips the CLI's own prompts).
+    Uninstall,
 }
 
 /// Severity of a Repair-tab diagnostic.
@@ -234,6 +238,10 @@ struct App {
     fp: FpInfo,
     recovery: Option<RecoveryInfo>,
     suspend: Option<Suspend>,
+    /// Uninstall confirmation stage: 0 = not confirming, 1 = first prompt shown,
+    /// 2 = second prompt shown. Two Y presses are required before the teardown
+    /// runs, so a stray key can't remove irlume.
+    uninstall_stage: u8,
     /// Enrollment intent parked while the daemon fix runs; resumed (once) as
     /// soon as the daemon answers after the suspended sudo step.
     resume_enroll: Option<ResumeEnroll>,
@@ -328,6 +336,7 @@ impl App {
             fp: FpInfo::default(),
             recovery: None,
             suspend: None,
+            uninstall_stage: 0,
             resume_enroll: None,
             identify_result: None,
             selftest_result: None,
@@ -1354,6 +1363,13 @@ impl App {
             ),
             Suspend::IrSetup => self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
+            // The TUI already double-confirmed, so pass --yes; the CLI still
+            // does the teardown (un-wire PAM, stop daemon, wipe data) as root
+            // and prints the package-removal command.
+            Suspend::Uninstall => {
+                self.sudo_step("uninstall irlume", &["irlume", "uninstall", "--yes"]);
+                self.quit = true; // irlume is being removed; leave the TUI after
+            }
             // enable + restart: `enable` makes the unit survive reboots (fresh
             // installs ship disabled under distro preset policy) and `restart`
             // also revives an enabled-but-wedged daemon; either alone misses a case.
@@ -1447,6 +1463,26 @@ impl App {
             }
             return;
         }
+        // Uninstall double-confirm: two Y presses, any other key cancels. Held
+        // ahead of the general match so nothing else swallows the keystrokes.
+        if self.uninstall_stage > 0 {
+            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                if self.uninstall_stage == 1 {
+                    self.uninstall_stage = 2; // ask a second time
+                } else {
+                    self.uninstall_stage = 0;
+                    self.log(
+                        '→',
+                        "uninstall confirmed; suspending to `sudo irlume uninstall`",
+                    );
+                    self.suspend = Some(Suspend::Uninstall);
+                }
+            } else {
+                self.uninstall_stage = 0;
+                self.log('·', "uninstall cancelled");
+            }
+            return;
+        }
         if let Some((_, req)) = &self.confirm {
             if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 let req = req.clone();
@@ -1533,6 +1569,13 @@ impl App {
             (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) => {
                 self.log('·', "refreshing status…");
                 self.refresh();
+            }
+            // Welcome: start the uninstall double-confirm (capital U, so a
+            // stray lower-case key can't begin it). The two Y presses run in
+            // on_key's uninstall_stage block above.
+            (SC_WELCOME, KeyCode::Char('U')) => {
+                self.uninstall_stage = 1;
+                self.log('·', "uninstall: press Y to confirm (you'll be asked twice)");
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
             // Gate on the CAMERA, not tab visibility: Identify is an
@@ -1952,6 +1995,20 @@ impl App {
             self.modal(f, prompt, &format!("{shown}▏"));
         } else if let Some((what, _)) = &self.confirm {
             self.modal(f, what, "[y] confirm    [any other key] cancel");
+        } else if self.uninstall_stage > 0 {
+            let (title, hint) = if self.uninstall_stage == 1 {
+                (
+                    "Uninstall irlume? It un-wires PAM, stops the daemon, and DELETES \
+                     every enrolled face and sealed secret.",
+                    "[y] continue    [any other key] cancel",
+                )
+            } else {
+                (
+                    "Are you sure? This cannot be undone.",
+                    "[y] uninstall now    [any other key] cancel",
+                )
+            };
+            self.modal(f, title, hint);
         }
     }
 
@@ -3163,7 +3220,12 @@ impl App {
             return;
         }
         let actions: &[(&str, &str)] = match self.screen {
-            SC_WELCOME => &[("e", "enroll"), ("i", "identify"), ("r", "refresh")],
+            SC_WELCOME => &[
+                ("e", "enroll"),
+                ("i", "identify"),
+                ("r", "refresh"),
+                ("U", "uninstall"),
+            ],
             SC_REPAIR => &[
                 ("f", "fix"),
                 ("r", "re-check"),

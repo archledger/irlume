@@ -25,6 +25,7 @@ mod pamwire;
 mod recovery;
 mod suncal;
 mod tui;
+mod uninstall;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
@@ -101,6 +102,7 @@ fn main() -> std::process::ExitCode {
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
+        (Some("uninstall"), _) => uninstall::run(&args),
         (Some("version"), _) | (Some("--version"), _) | (Some("-V"), _) => {
             println!("irlume {}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS

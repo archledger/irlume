@@ -27,8 +27,9 @@ in the footer.
 
 1. **Welcome**: press `[e]` to enroll right away, or `Tab` to walk the steps.
 2. **Profiles**: `[e]` enrolls a face. Look at the camera; it guides your
-   framing and captures three scans automatically. Wear glasses sometimes?
-   Enroll a second profile for that look.
+   framing and captures three scans automatically. Wear glasses sometimes? Add
+   a scan with Improve Recognition (`[a]`) while wearing them, on the same
+   profile; a face can only own one profile.
 3. **Keyring** *(recommended; IR camera + TPM)*: arm TPM keyring unlock so a
    face login opens your wallet with no prompt. You'll enter your login password
    once; it is sealed in the TPM, never stored in plaintext. Skip it and your
@@ -90,9 +91,11 @@ Look at the camera. It captures three scans and saves a profile:
 [enroll] enrolled 'Face Profile 1' with 3 scans
 ```
 
-Options: `--name "Glasses"` names the profile, `--scans K` sets the scan count,
-`--reset` wipes existing profiles first. Enroll a second named profile for a
-different look (glasses on/off). On a machine with a TPM, the templates are now
+Options: `--name "Alex"` names the profile, `--scans K` sets the scan count,
+`--reset` wipes existing profiles first. Name a separate profile for a
+*different person* you trust (up to three); for your own glasses/lighting
+variants, add scans to your own profile instead. On a machine with a TPM, the
+templates are now
 **encrypted at rest** automatically.
 
 Confirm the match:

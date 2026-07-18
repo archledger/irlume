@@ -154,8 +154,22 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         scans,
         reset,
     }) {
-        Ok(Response::Ok(msg)) => {
-            println!("[enroll] {msg}");
+        Ok(Response::Enrolled {
+            profile,
+            created,
+            added,
+            total,
+            ..
+        }) => {
+            if created {
+                println!("[enroll] enrolled '{profile}' with {total} scans");
+            } else {
+                println!(
+                    "[enroll] this face is already enrolled as '{profile}'; added {added} scans \
+                     to it ({total} total). A face can only own one profile; to strengthen \
+                     recognition use `irlume profiles add-scan --profile '{profile}'`."
+                );
+            }
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
@@ -578,7 +592,9 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
             println!("[enrolldev] enrolled '{name}' ({scans} scans)");
             std::process::ExitCode::SUCCESS
         }
-        Ok(irlume_auth::EnrollOutcome::Merged { name, added, total }) => {
+        Ok(irlume_auth::EnrollOutcome::Merged {
+            name, added, total, ..
+        }) => {
             println!("[enrolldev] merged into '{name}' (+{added} scans, {total} total)");
             std::process::ExitCode::SUCCESS
         }
@@ -1537,7 +1553,7 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
                 scores[0], impostor_max, mid
             );
         } else {
-            println!("  ⚠ overlap: genuine min {:.3} ≤ impostor max; needs better alignment/lighting or per-profile (e.g. glasses) enrollment",
+            println!("  ⚠ overlap: genuine min {:.3} ≤ impostor max; needs better alignment/lighting or more varied scans (e.g. glasses, angles) on the profile",
                 scores[0]);
         }
         Ok(())

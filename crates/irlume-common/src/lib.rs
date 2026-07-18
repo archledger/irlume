@@ -303,6 +303,19 @@ pub enum Response {
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
+    /// Result of an Enroll capture, carrying the profile the scans actually
+    /// landed on. `created` distinguishes a brand-new profile from a merge into
+    /// an existing identity (the engine auto-merges a face that already owns a
+    /// profile). `added_scans` names the scans this call appended, so a caller
+    /// that wants to undo a merge (e.g. the TUI on a declined confirm) can
+    /// delete exactly them. See EnrollOutcome.
+    Enrolled {
+        profile: String,
+        created: bool,
+        added: usize,
+        total: usize,
+        added_scans: Vec<String>,
+    },
     SelfTest {
         passed: bool,
         detail: String,
@@ -389,3 +402,55 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrolled_response_round_trips() {
+        // The daemon serializes Response over the socket and the TUI/CLI
+        // deserialize it; the enroll merge fix depends on this variant carrying
+        // the resolved profile + the merged scan names intact.
+        for r in [
+            Response::Enrolled {
+                profile: "Face Profile 1".into(),
+                created: true,
+                added: 3,
+                total: 3,
+                added_scans: vec![],
+            },
+            Response::Enrolled {
+                profile: "Face Profile 1".into(),
+                created: false,
+                added: 1,
+                total: 8,
+                added_scans: vec!["scan8".into()],
+            },
+        ] {
+            let wire = serde_json::to_string(&r).unwrap();
+            let back: Response = serde_json::from_str(&wire).unwrap();
+            match (r, back) {
+                (
+                    Response::Enrolled {
+                        profile: p1,
+                        created: c1,
+                        added: a1,
+                        total: t1,
+                        added_scans: s1,
+                    },
+                    Response::Enrolled {
+                        profile: p2,
+                        created: c2,
+                        added: a2,
+                        total: t2,
+                        added_scans: s2,
+                    },
+                ) => {
+                    assert_eq!((p1, c1, a1, t1, s1), (p2, c2, a2, t2, s2));
+                }
+                _ => panic!("Enrolled did not round-trip to Enrolled"),
+            }
+        }
+    }
+}

@@ -11,8 +11,10 @@ use std::fs;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
-/// Max face profiles per account (e.g. self / self-with-glasses / a trusted
-/// person). A 4th requires deleting one.
+/// Max face profiles per account, one per person (e.g. self / a partner / a
+/// trusted person). A face can only own one profile, so appearance variants
+/// (glasses, lighting) are extra scans on that person's profile, not new
+/// profiles. A 4th person requires deleting one.
 pub const MAX_PROFILES: usize = 3;
 /// Max scans per profile: one fresh enrollment plus four improve-recognition
 /// rounds ([`DEFAULT_ENROLL_SCANS`] + 4 x [`IMPROVE_SCANS`]). Raised from 5:

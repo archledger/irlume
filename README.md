@@ -323,12 +323,14 @@ every one is runnable.
 <details>
 <summary><b>Glasses, beards, outdoors: when should I re-enroll?</b></summary>
 
-One enrollment usually lasts. Add to it when reality changes, the same way
-Windows Hello recommends: **wear glasses sometimes?** Enroll a second profile
-named `glasses` (TUI Profiles → `[e]`) so both looks match. **Major appearance
-change** (shaved beard, new heavy frames)? Add a scan (`[a]`) rather than
-starting over. **Recognition flaky in bright sunlight?** Strong ambient IR can
-wash out the emitter's illumination; add a scan captured in that environment.
+One enrollment usually lasts. A profile is one identity, and a face can only
+own one profile, so different looks of the same person are extra **scans** on
+that profile, not a second profile. **Wear glasses sometimes?** Add a scan with
+Improve Recognition (TUI Profiles → `[a]`, or `irlume profiles add-scan`) while
+wearing them. **Major appearance change** (shaved beard, new heavy frames)? Same
+thing, add a scan rather than starting over. **Recognition flaky in bright
+sunlight?** Strong ambient IR can wash out the emitter's illumination; add a
+scan captured in that environment.
 Profiles are per-user and deletable any time.
 </details>
 

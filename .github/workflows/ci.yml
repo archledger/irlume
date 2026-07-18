@@ -25,6 +25,7 @@ jobs:
   check:
     name: fmt · clippy · build · test
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,8 +66,33 @@ jobs:
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses
+
+  nix:
+    name: nix flake check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # No lfs: true here. flake check --no-build only evaluates the outputs
+      # (flake structure, the package derivation, the NixOS module, the dev
+      # shell); it never reads the ONNX model contents, so the LFS pointer
+      # files left by a plain checkout are enough and the job stays fast.
+      - uses: actions/checkout@v4
+
+      - name: Install Nix with flakes
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Evaluates packages.default, nixosModules.irlume, and the dev shell.
+      # Catches eval and type errors in flake.nix and nix/*.nix before merge;
+      # the full source build (packages.default) is covered by `nix build`
+      # locally and the RPM/deb CI, so keep this eval-only and quick.
+      - name: nix flake check
+        run: nix flake check --no-build --show-trace

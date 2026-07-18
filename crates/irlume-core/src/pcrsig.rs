@@ -146,6 +146,14 @@ pub fn signed_pcrs(bank: &str) -> Option<Vec<u32>> {
 }
 
 fn from_hex(s: &str) -> Result<Vec<u8>> {
+    // The byte-indexed slicing below (`&s[i..i + 2]`) is only safe on ASCII:
+    // a multibyte UTF-8 character would let `s.len()` pass the even-length
+    // check yet make the slice split a char boundary and panic. Hex digits are
+    // ASCII by definition, so reject anything else first. A tampered `.pcrsig`
+    // that put a multibyte char in a hex field used to crash the daemon here.
+    if !s.is_ascii() {
+        return Err(Error::Protocol("non-hex characters in hex string".into()));
+    }
     if !s.len().is_multiple_of(2) {
         return Err(Error::Protocol("odd-length hex string".into()));
     }
@@ -196,6 +204,15 @@ mod tests {
     #[test]
     fn rejects_bad_hex() {
         let bad = r#"{"sha256":[{"pcrs":[11],"pkfp":"a","pol":"xyz","sig":"AA=="}]}"#;
+        assert!(parse_signatures(bad, "sha256").is_err());
+    }
+
+    #[test]
+    fn multibyte_char_in_hex_field_errors_not_panics() {
+        // A `pol` of even BYTE length but containing a 2-byte UTF-8 char used to
+        // panic in from_hex (byte-slicing across a char boundary). Found by the
+        // pcr_signature fuzz target. It must return an error, not crash.
+        let bad = "{\"sha256\":[{\"pcrs\":[7],\"pkfp\":\"7682\",\"pol\":\"2\u{01f0}bfca5\",\"sig\":\"\"}]}";
         assert!(parse_signatures(bad, "sha256").is_err());
     }
 }

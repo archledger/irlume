@@ -129,8 +129,6 @@ enum Fix {
     None,
     /// Show the user an exact command to run.
     Manual(String),
-    /// Auto-fixable by the daemon (no root): an id dispatched in `apply_fix`.
-    Daemon(&'static str),
     /// Needs root: suspend the TUI and run via sudo (`apply_fix` → Suspend).
     Root(&'static str),
 }
@@ -650,7 +648,7 @@ impl App {
                     "IR emitter",
                     Sev::Warn,
                     "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Daemon("ir-emitter"),
+                    Fix::Root("ir-setup"),
                 ));
             }
         } else {
@@ -742,7 +740,7 @@ impl App {
                     "IR emitter",
                     Sev::Warn,
                     "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Daemon("ir-emitter"),
+                    Fix::Root("ir-setup"),
                 ));
             }
         }
@@ -1054,12 +1052,9 @@ impl App {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
             // Emitter setup writes the persisted UVC control, a root op now.
-            Fix::Daemon("ir-emitter") => {
+            Fix::Root("ir-setup") => {
                 self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
-            }
-            Fix::Daemon(id) => {
-                self.set_error(format!("no handler for fix '{id}'; please report this"))
             }
             Fix::Root("restart-daemon") => {
                 self.log(
@@ -1834,7 +1829,7 @@ impl App {
             // setup mile must not require leaving the TUI for a manual command.
             (SC_PAM, KeyCode::Char('w')) | (SC_DONE, KeyCode::Char('w')) => {
                 self.log('→', "sudo irlume login enable --apply: wires the greeter + lock screen for your method");
-                self.log('·', "at the login/lock screen: leave the password empty and press Enter to use your face");
+                self.log('·', "leave the password empty and press Enter to use your face (login needs the IR/secure tier; an RGB-only camera unlocks the lock screen only)");
                 self.log('·', "face-sudo is opt-in; add it later with: sudo irlume login enable --with-sudo --apply");
                 self.suspend = Some(Suspend::LoginEnable);
             }
@@ -2217,16 +2212,16 @@ impl App {
                 }
                 SC_IDENTIFY => "A 'does it recognize me?' test. Press [i] and look at the camera.",
                 SC_KEYRING => {
-                    "Let your face open your password wallet: press [a], type your password."
+                    "Let your login open your password wallet: press [a], type your password."
                 }
-                SC_RECOVERY => "Set a backup passphrase so you're never locked out; press [s].",
+                SC_RECOVERY => "Set a backup passphrase so a broken TPM seal never forces a re-enroll; press [s].",
                 SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
                 SC_PAM => "Turn on face login for your screen: press [w] (asks for your password).",
                 SC_SETTINGS => {
-                    "Optional stricter checks: highlight one and press [enter] to toggle."
+                    "Press [enter] to toggle the eyes-open check; other settings are root or read-only."
                 }
                 SC_DONE => {
-                    "All set! Green = done; anything left shows its key. Press [q] to close."
+                    "Green = done; anything left shows its key. Press [q] to close."
                 }
                 _ => "",
             }
@@ -2927,7 +2922,6 @@ impl App {
                 let tag = match &c.fix {
                     Fix::None => "",
                     Fix::Manual(_) => " · manual",
-                    Fix::Daemon(_) => " · [f] auto-fix",
                     Fix::Root(_) => " · [f] fix (sudo)",
                 };
                 ListItem::new(Line::from(vec![
@@ -2985,7 +2979,6 @@ impl App {
                 }
                 Fix::None => "no action needed".to_string(),
                 Fix::Manual(cmd) => format!("manual: {cmd}"),
-                Fix::Daemon(_) => "press [f]: irlume fixes this via the daemon".to_string(),
                 Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
             };
             lines.push(Line::from(vec![
@@ -3181,7 +3174,7 @@ impl App {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "  at the greeter/lock: leave the password empty, press Enter; face fires only then",
+            "  empty password + Enter fires face (greeter login = IR/secure tier; RGB-only = lock screen only)",
             Style::new().dim(),
         )));
         lines.push(Line::from(vec![
@@ -3532,7 +3525,7 @@ fn map_sealed(resp: Response) -> (bool, String) {
     match resp {
         Response::PasswordSealed => (
             true,
-            "keyring armed; face login will open your wallet".into(),
+            "keyring armed; unlocking your session will open your wallet".into(),
         ),
         Response::Error(e) => (false, format!("arm failed: {e}")),
         o => (false, format!("arm failed: {o:?}")),

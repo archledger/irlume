@@ -1549,36 +1549,47 @@ impl App {
             }
             return;
         }
-        // Uninstall double-confirm: two Y presses, any other key cancels. Held
-        // ahead of the general match so nothing else swallows the keystrokes.
+        // Uninstall double-confirm: [y] advances/confirms, [n]/Esc cancels, any
+        // other key is ignored so a stray keypress can't act. Held ahead of the
+        // general match so nothing else swallows the keystrokes.
         if self.uninstall_stage > 0 {
-            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                if self.uninstall_stage == 1 {
-                    self.uninstall_stage = 2; // ask a second time
-                } else {
-                    self.uninstall_stage = 0;
-                    self.log(
-                        '→',
-                        "uninstall confirmed; suspending to `sudo irlume uninstall`",
-                    );
-                    self.suspend = Some(Suspend::Uninstall);
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if self.uninstall_stage == 1 {
+                        self.uninstall_stage = 2; // ask a second time
+                    } else {
+                        self.uninstall_stage = 0;
+                        self.log(
+                            '→',
+                            "uninstall confirmed; suspending to `sudo irlume uninstall`",
+                        );
+                        self.suspend = Some(Suspend::Uninstall);
+                    }
                 }
-            } else {
-                self.uninstall_stage = 0;
-                self.log('·', "uninstall cancelled");
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.uninstall_stage = 0;
+                    self.log('·', "uninstall cancelled");
+                }
+                _ => {} // ignore stray keys
             }
             return;
         }
-        if let Some((_, req)) = &self.confirm {
-            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                let req = req.clone();
-                self.confirm = None;
-                // Async so the UI keeps animating; poll() logs the result (✓/error
-                // banner) and refreshes. map_confirm handles both the Ok acks
-                // (delete, recovery-forget) and PasswordForgotten (keyring-forget).
-                self.start_async("(confirmed)", OpTag::Generic, req, map_confirm);
-            } else {
-                self.confirm = None;
+        // Generic confirm (delete scan/profile, recovery-forget, keyring-forget):
+        // [y] confirms, [n]/Esc cancels, any other key is ignored so a stray
+        // keypress can't confirm OR cancel a destructive action.
+        if self.confirm.is_some() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let (_, req) = self.confirm.take().unwrap();
+                    // Async so the UI keeps animating; poll() logs the result
+                    // (✓/error banner) and refreshes. map_confirm handles the Ok
+                    // acks (delete, recovery-forget) and PasswordForgotten.
+                    self.start_async("(confirmed)", OpTag::Generic, req, map_confirm);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm = None;
+                }
+                _ => {} // ignore stray keys
             }
             return;
         }
@@ -2098,18 +2109,18 @@ impl App {
             };
             self.modal(f, prompt, &format!("{shown}▏"));
         } else if let Some((what, _)) = &self.confirm {
-            self.modal(f, what, "[y] confirm    [any other key] cancel");
+            self.modal(f, what, "[y] confirm    [n] cancel");
         } else if self.uninstall_stage > 0 {
             let (title, hint) = if self.uninstall_stage == 1 {
                 (
                     "Uninstall irlume? It un-wires PAM, stops the daemon, and DELETES \
                      every enrolled face and sealed secret.",
-                    "[y] continue    [any other key] cancel",
+                    "[y] continue    [n] cancel",
                 )
             } else {
                 (
                     "Are you sure? This cannot be undone.",
-                    "[y] uninstall now    [any other key] cancel",
+                    "[y] uninstall now    [n] cancel",
                 )
             };
             self.modal(f, title, hint);

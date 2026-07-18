@@ -133,8 +133,10 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ./package.nix { };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
+      # Pass src explicitly: callPackage would otherwise fill the `src` argument
+      # from pkgs (where `src` is a renamed alias) instead of the file default.
+      default = pkgs.callPackage ./package.nix { src = lib.cleanSource ../.; };
+      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { src = lib.cleanSource ../.; }";
       description = "The irlume package providing irlumed, the PAM module, and the model weights.";
     };
 

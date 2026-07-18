@@ -156,4 +156,29 @@ mod tests {
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn third_party_pad_enable_then_disable_round_trips() {
+        // The models feature persists its enabled state as this key: a model
+        // name means enabled, an empty value means disabled. Locks in that
+        // `write_kv(key, "")` reads back as None (not Some("")), which is what
+        // `irlume models disable` and the daemon's enabled_name() rely on.
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("irlume-tp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let key = crate::thirdparty::SETTINGS_KEY;
+        assert_eq!(read_kv("settings.conf", key), None); // absent = disabled
+
+        write_kv("settings.conf", key, "flir").unwrap(); // enable
+        assert_eq!(read_kv("settings.conf", key).as_deref(), Some("flir"));
+
+        write_kv("settings.conf", key, "").unwrap(); // disable
+        assert_eq!(read_kv("settings.conf", key), None);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

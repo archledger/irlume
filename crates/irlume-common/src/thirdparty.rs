@@ -15,7 +15,7 @@
 //! wires any entry here as a DENY-ONLY cue: it may reject a presentation, it
 //! can never approve one the built-in gate rejected.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `settings.conf` key naming the enabled model (absent/empty = disabled).
 pub const SETTINGS_KEY: &str = "third_party_pad";
@@ -76,6 +76,41 @@ pub fn model_path(m: &ThirdPartyModel) -> PathBuf {
     dir().join(m.file)
 }
 
+/// Lowercase hex SHA-256 of `bytes`. The one place the checksum is computed, so
+/// the CLI's enable/verify path and the daemon's load guard agree byte for byte.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Whether a fetched weight file is present and matches its pinned checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightState {
+    /// No file at the expected path (not fetched, or disabled and deleted).
+    Absent,
+    /// File present and its SHA-256 matches the catalog pin.
+    ChecksumOk,
+    /// File present but its SHA-256 does not match; the daemon refuses to load
+    /// it and the CLI reports tampering.
+    ChecksumMismatch,
+}
+
+/// [`WeightState`] for a catalog entry at its on-disk path.
+pub fn weight_state(m: &ThirdPartyModel) -> WeightState {
+    weight_state_at(&model_path(m), m.sha256)
+}
+
+/// [`WeightState`] for an explicit path against an expected hex SHA-256. Split
+/// out from [`weight_state`] so the check is testable without touching the
+/// state dir.
+pub fn weight_state_at(path: &Path, expected_sha256: &str) -> WeightState {
+    match std::fs::read(path) {
+        Ok(bytes) if sha256_hex(&bytes) == expected_sha256 => WeightState::ChecksumOk,
+        Ok(_) => WeightState::ChecksumMismatch,
+        Err(_) => WeightState::Absent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +145,44 @@ mod tests {
     fn lookup_by_name() {
         assert!(by_name("flir").is_some());
         assert!(by_name("nope").is_none());
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        // NIST FIPS 180-4 examples.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn weight_state_reports_present_matching_and_tampered() {
+        let tmp = std::env::temp_dir().join(format!("irlume-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let file = tmp.join("w.onnx");
+        let good = b"pretend these are model weights";
+        let good_sha = sha256_hex(good);
+
+        // Absent: nothing on disk yet.
+        assert_eq!(weight_state_at(&file, &good_sha), WeightState::Absent);
+
+        // Present and matching the pin.
+        std::fs::write(&file, good).unwrap();
+        assert_eq!(weight_state_at(&file, &good_sha), WeightState::ChecksumOk);
+
+        // Present but the pin no longer matches (a swapped / tampered file):
+        // the daemon must refuse it, so this stays distinct from ChecksumOk.
+        std::fs::write(&file, b"different bytes entirely").unwrap();
+        assert_eq!(
+            weight_state_at(&file, &good_sha),
+            WeightState::ChecksumMismatch
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

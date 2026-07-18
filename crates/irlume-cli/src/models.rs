@@ -38,17 +38,11 @@ fn enabled_name() -> Option<String> {
 }
 
 fn file_state(m: &ThirdPartyModel) -> &'static str {
-    let path = thirdparty::model_path(m);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            use sha2::Digest;
-            if format!("{:x}", sha2::Sha256::digest(&bytes)) == m.sha256 {
-                "weights present, checksum ok"
-            } else {
-                "weights present but CHECKSUM MISMATCH (daemon will refuse them)"
-            }
-        }
-        Err(_) => "weights not fetched",
+    use thirdparty::WeightState::*;
+    match thirdparty::weight_state(m) {
+        ChecksumOk => "weights present, checksum ok",
+        ChecksumMismatch => "weights present but CHECKSUM MISMATCH (daemon will refuse them)",
+        Absent => "weights not fetched",
     }
 }
 
@@ -164,8 +158,7 @@ fn enable(name: Option<&str>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    use sha2::Digest;
-    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let digest = thirdparty::sha256_hex(&bytes);
     if digest != m.sha256 {
         let _ = std::fs::remove_file(&tmp);
         eprintln!("[models] CHECKSUM MISMATCH: got sha256 {digest}");

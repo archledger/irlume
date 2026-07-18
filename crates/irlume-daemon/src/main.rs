@@ -132,8 +132,7 @@ fn main() {
                     return None;
                 }
             };
-            use sha2::Digest;
-            let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let digest = irlume_common::thirdparty::sha256_hex(&bytes);
             if digest != entry.sha256 {
                 eprintln!(
                     "irlumed: WARNING: third-party PAD '{name}' checksum mismatch (sha256 {digest}); cue DISABLED, refusing to load unpinned weights"

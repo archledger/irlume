@@ -27,7 +27,8 @@ const ONDEMAND_HINT: &str = "leave the password empty and press Enter to use you
 
 // Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
 const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
-/// The Debian/Ubuntu greeter face line, for the `@include common-auth` layout (a
+/// The greeter/locker face line for any INCLUDE layout: Debian/Ubuntu
+/// `@include common-auth` and Arch `auth include system-login` alike (a
 /// `success=N` jump can't skip an include expansion, so this can't be the jump
 /// form). Always `sufficient`: the same control works for EVERY DM's locker
 /// (GDM and cosmic alike short-circuit on a warm unlock). Cold-login keyring
@@ -37,7 +38,7 @@ const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume
 /// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (empty-Enter). `kr`
 /// adds the keyring-continue arg: true for greeters (cold login unlocks the
 /// keyring), false for a separate warm lock service (keyring already open).
-fn debian_greeter_line(mode: &str, kr: bool) -> String {
+fn include_greeter_line(mode: &str, kr: bool) -> String {
     let kr_arg = if kr { " kr" } else { "" };
     format!("auth       sufficient   pam_irlume.so unseal {mode}{kr_arg}")
 }
@@ -97,7 +98,10 @@ const GREETERS: &[Svc] = &[
 // releases no credential.
 const LOCKSCREEN: Svc = Svc {
     etc: "/etc/pam.d/kde",
-    vendor: None,
+    // Arch/Plasma ships the locker service only in the vendor dir; materialize
+    // an /etc override from it (like plasmalogin) instead of skipping the lock
+    // screen because /etc/pam.d/kde doesn't exist yet.
+    vendor: Some("/usr/lib/pam.d/kde"),
 };
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
 /// distinct from `gdm-password` (password/face). It runs pam_fprintd then
@@ -655,6 +659,26 @@ fn content_has_module(c: &str) -> bool {
 
 /// `<kind>` is `auth`/`session`; matches a `(substack|include) (password-auth|
 /// system-auth)` line, the shared substack the success=1 jump skips.
+/// An `auth`-phase line whose password path is an `include` a `success=N` jump
+/// can't skip: Debian's `@include common-auth`/`login`, or Arch's
+/// `auth include system-login`/`system-local-login`/`system-auth`. These need
+/// the `sufficient` (module IGNOREs on cold login) form, NOT the jump form. A
+/// Fedora `substack` is atomic for jump counting, so it deliberately does not
+/// match here and keeps the jump stanza.
+fn is_include_auth_layout(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("@include common-auth") || t.starts_with("@include login") {
+        return true;
+    }
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    toks.first() == Some(&"auth")
+        && toks.get(1) == Some(&"include")
+        && matches!(
+            toks.get(2),
+            Some(&"system-login") | Some(&"system-local-login") | Some(&"system-auth")
+        )
+}
+
 fn is_passwd_substack(line: &str, kind: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with('#') {
@@ -704,15 +728,12 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
     // its own keyring modules after; inserting the face line before that include
     // works identically (face IGNORE on cold login → the include's pam_unix +
     // greetd's pam_gnome_keyring run with the unsealed AUTHTOK → keyring unlocks).
-    if let Some(inc_at) = lines.iter().position(|l| {
-        let t = l.trim_start();
-        t.starts_with("@include common-auth") || t.starts_with("@include login")
-    }) {
+    if let Some(inc_at) = lines.iter().position(|l| is_include_auth_layout(l)) {
         let mut out = Vec::with_capacity(lines.len() + 4);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
                 if face {
-                    out.push(debian_greeter_line(
+                    out.push(include_greeter_line(
                         if ondemand { "ondemand" } else { "facefirst" },
                         true,
                     ));
@@ -806,15 +827,15 @@ fn wire_lock(content: &str) -> (String, bool) {
         return (content.to_string(), false);
     }
     let lines: Vec<&str> = content.lines().collect();
-    // Debian `@include common-auth` layout → face-first `sufficient` before it.
-    if let Some(inc_at) = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with("@include common-auth"))
-    {
+    // Include layout (Debian `@include common-auth`, Arch `auth include
+    // system-local-login`) → face-first `sufficient` before it. A warm lock so
+    // no keyring-continue arg; on face success the module returns SUCCESS and
+    // `sufficient` grants the unlock.
+    if let Some(inc_at) = lines.iter().position(|l| is_include_auth_layout(l)) {
         let mut out = Vec::with_capacity(lines.len() + 1);
         for (i, l) in lines.iter().enumerate() {
             if i == inc_at {
-                out.push(debian_greeter_line("ondemand", false));
+                out.push(include_greeter_line("ondemand", false));
             }
             out.push((*l).to_string());
         }
@@ -1148,17 +1169,50 @@ mod tests {
     }
 
     #[test]
-    fn debian_greeter_line_is_sufficient_plus_kr() {
+    fn include_greeter_line_is_sufficient_plus_kr() {
         // Uniform `sufficient` for every DM; the module's `kr` arg (not the
         // control) drives cold-login keyring-continue. Greeters carry `kr`.
-        let greeter = debian_greeter_line("ondemand", true);
+        let greeter = include_greeter_line("ondemand", true);
         assert!(greeter.contains("sufficient"));
         assert!(greeter.contains("pam_irlume.so unseal ondemand kr"));
         assert!(!greeter.contains("success=ok"));
         // A separate warm lock service short-circuits without `kr`.
-        let lock = debian_greeter_line("ondemand", false);
+        let lock = include_greeter_line("ondemand", false);
         assert!(lock.contains("sufficient") && lock.ends_with("unseal ondemand"));
         assert!(!lock.contains(" kr"));
+    }
+
+    #[test]
+    fn arch_include_layout_uses_sufficient_not_jump() {
+        // Arch greeters/lockers use `auth include system-login`/`system-local-login`,
+        // an inline include a `success=N` jump can't skip. Both must get the
+        // `sufficient` form, not the [success=1] jump that lands mid-include at
+        // pam_unix (the bug that made face login/unlock still ask for a password).
+        let arch_greeter = "#%PAM-1.0\nauth       include     system-login\naccount    include     system-login\npassword   include     system-login\nsession    include     system-login\n";
+        let (g, changed) = wire_greeter_impl(arch_greeter, true, false, true);
+        assert!(changed);
+        assert!(g.contains("sufficient   pam_irlume.so unseal ondemand kr"));
+        assert!(!g.contains("[success=1 default=ignore]   pam_irlume.so unseal"));
+        // The face line lands BEFORE the auth include, not after it.
+        let face_at = g.find("pam_irlume.so unseal").unwrap();
+        let inc_at = g.find("auth       include     system-login").unwrap();
+        assert!(face_at < inc_at);
+
+        let arch_lock = "#%PAM-1.0\nauth       include     system-local-login\naccount    include     system-local-login\n";
+        let (l, changed) = wire_lock(arch_lock);
+        assert!(changed);
+        assert!(l.contains("sufficient   pam_irlume.so unseal ondemand"));
+        assert!(!l.contains(" kr")); // warm lock: no keyring-continue
+        assert!(!l.contains("[success=1"));
+    }
+
+    #[test]
+    fn fedora_substack_still_uses_the_jump_form() {
+        // Regression guard: a Fedora `substack` is atomic for jump counting, so
+        // it must keep the [success=1] jump, not switch to sufficient.
+        let fedora = "#%PAM-1.0\nauth       substack     password-auth\nauth       optional     pam_permit.so\n";
+        let (l, _) = wire_lock(fedora);
+        assert!(l.contains("[success=1 default=ignore]   pam_irlume.so unseal ondemand"));
     }
 
     #[test]

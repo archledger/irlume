@@ -105,6 +105,23 @@ fn main() {
             ),
         }
     }
+    // Self-heal the IR emitter at startup, not just on enroll. The emitter is a
+    // camera hardware state that resets on a USB/power cycle or a daemon
+    // restart; if the working control was never persisted, the first auth after
+    // a restart gets a dark IR frame and fails (exactly the "worked at enroll,
+    // failed at the lock screen" case). ensure_ir_emitter fires the known
+    // control (env/conf/table) and, only if IR is still dark, runs auto-setup
+    // and persists what it finds to ir_emitter.conf — so every later capture,
+    // and every later boot, applies it. No-op on RGB-only hardware; best-effort.
+    if std::path::Path::new(&ir_dev).exists() {
+        match irlume_auth::ensure_ir_emitter(&ir_dev) {
+            Ok(true) => eprintln!("irlumed: IR emitter ready"),
+            Ok(false) => eprintln!(
+                "irlumed: IR still dark after emitter auto-setup (dark-mode unlock may be unavailable)"
+            ),
+            Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
+        }
+    }
     // Opt-in third-party PAD cue (`irlume models`): enabled via settings.conf,
     // weights fetched by the CLI to the state dir. Unlike the shipped models'
     // warn-first verification, a third-party file MUST match its catalog pin:

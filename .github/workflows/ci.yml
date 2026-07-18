@@ -124,8 +124,11 @@ jobs:
         with:
           workspaces: fuzz
 
+      # Build cargo-fuzz with nightly: it (via cargo-platform) needs a rustc
+      # newer than the pinned 1.88, and nightly is the toolchain the targets
+      # build under anyway.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --locked
 
       # Seed each corpus from the checked-in seeds (the generated corpus is not
       # committed), then fuzz for a bounded time. Replaying the seeds is a

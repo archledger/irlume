@@ -21,6 +21,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Branch protection on `main` requires these four job names as status checks:
+#   "fmt · clippy · build · test", "cargo-deny (advisories · licenses ·
+#   duplicate versions)", "nix flake check", "fuzz (untrusted-input parsers)".
+# Renaming a job below without updating the protection rule leaves a PR waiting
+# on a check that never reports, so it can never merge. Change both together.
 jobs:
   check:
     name: fmt · clippy · build · test

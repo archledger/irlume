@@ -1866,9 +1866,14 @@ impl App {
             return;
         }
         if self.profiles.len() >= MAX_PROFILES {
+            // A new PERSON can't be added at the cap. Refreshing your OWN face
+            // (the merge path) is what [a] Improve Recognition does, so point
+            // there instead of only "delete one".
             self.log(
                 '✗',
-                format!("at the max {MAX_PROFILES} profiles; delete one first"),
+                format!(
+                    "at the max {MAX_PROFILES} profiles (people). To refresh your own face, use [a] Improve Recognition; to add a different person, delete a profile first."
+                ),
             );
         } else {
             self.input = Some((
@@ -2096,9 +2101,13 @@ impl App {
             } else {
                 buf.clone()
             };
-            self.modal(f, prompt, &format!("{shown}▏"));
+            // Prompt in the wrapping body (a long name/prompt would truncate as a
+            // border title); the typed field on its own line below it.
+            self.modal(f, "Input", &format!("{prompt}\n{shown}▏"));
         } else if let Some((what, _)) = &self.confirm {
-            self.modal(f, what, "[y] confirm    [n] cancel");
+            // Question in the body so a long target name isn't clipped by the
+            // single-line border title.
+            self.modal(f, "Confirm", &format!("{what}\n[y] yes    [n] no"));
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
@@ -3376,12 +3385,17 @@ impl App {
 
     fn modal(&self, f: &mut Frame, title: &str, body: &str) {
         let area = f.area();
-        let w = area.width.saturating_sub(8).clamp(24, 72);
+        let w = area.width.saturating_sub(4).clamp(20, 72).min(area.width);
+        // Grow the box to fit the wrapped body so a long message never clips,
+        // on any terminal width; borders + 1-col horizontal padding = 4 chars.
+        let inner = (w as usize).saturating_sub(4).max(1);
+        let lines = wrapped_line_count(body, inner) as u16;
+        let h = (lines + 2).clamp(3, area.height);
         let rect = Rect {
             x: area.width.saturating_sub(w) / 2,
-            y: area.height.saturating_sub(5) / 2,
+            y: area.height.saturating_sub(h) / 2,
             width: w,
-            height: 5.min(area.height),
+            height: h,
         };
         f.render_widget(Clear, rect);
         let blk = Block::bordered()
@@ -3390,12 +3404,40 @@ impl App {
             .border_style(Style::new().fg(ACCENT))
             .padding(ratatui::widgets::Padding::horizontal(1));
         f.render_widget(
-            Paragraph::new(Line::from(body.to_string()))
+            Paragraph::new(body.to_string())
                 .block(blk)
                 .wrap(Wrap { trim: true }),
             rect,
         );
     }
+}
+
+/// Approximate ratatui's word-wrap line count for `text` at `width` columns, so
+/// `modal()` can size its height to fit. Off-by-one on a word longer than the
+/// width is harmless (the height is clamped to the frame).
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    // Count each explicit line (split on '\n'), word-wrapped to `width`.
+    text.split('\n')
+        .map(|line| {
+            let mut lines = 1usize;
+            let mut col = 0usize;
+            for word in line.split_whitespace() {
+                let wlen = word.chars().count();
+                if col == 0 {
+                    col = wlen;
+                } else if col + 1 + wlen <= width {
+                    col += 1 + wlen;
+                } else {
+                    lines += 1;
+                    col = wlen;
+                }
+            }
+            lines
+        })
+        .sum()
 }
 
 fn quality_bar(q: u8) -> String {
@@ -3535,6 +3577,10 @@ fn map_settings(resp: Response) -> (bool, String) {
                 }
             ),
         ),
+        // The daemon's SetRequire* handlers go through mutate_enrollment, which
+        // acks with Ok(msg), not Enrollment. Without this arm every toggle fell
+        // to the "unexpected" fallback and raised a spurious error modal.
+        Response::Ok(m) => (true, m),
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),
     }

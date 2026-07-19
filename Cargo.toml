@@ -71,18 +71,19 @@ strip = true
 # minimal patches irlume needs. Today that is (1) Context::policy_authorize_nv
 # (TPM2_PolicyAuthorizeNV), required by the Tier-2 systemd-pcrlock seal implemented
 # in crates/irlume-core/src/tpm.rs (design notes in tpm_pcrlock.rs), and (2) the upstream PR #530 fix that
-# flushes the session handle when tr_sess_set_attributes fails inside
-# execute_with_nullauth_session (a 7.7.0 failure path would otherwise leave a
-# loaded session on the TPM; irlume calls that helper on every seal/unseal).
+# flushes the session handle when tr_sess_set_attributes fails. That fix covers
+# three call sites: execute_with_nullauth_session (which irlume calls on every
+# seal/unseal) plus the AK helpers load_ak and create_ak_2; a 7.7.0 failure path
+# would otherwise leave a loaded session on the TPM.
 # Cargo.lock pins an exact commit, so this is a frozen dependency: it never
 # moves under a user, only when we bump it.
 #
 # Why the fork exists: upstream wrote this method (parallaxsecond PR #486, merged
 # to main 2024-01-23) but never backported it to a 7.x release, so 7.6.0/7.7.0 both
 # ship `// Missing function: PolicyAuthorizeNV`. It only lands in 8.0, whose stable
-# release has been the open tracking issue #495 since Feb 2024 (2.5+ years, only
-# alphas out, a large breaking change set pending). So "just wait for a release" is
-# not a near-term option; we maintain the fork branch instead.
+# release is the open tracking issue #495 (opened Feb 2024, still only alphas out,
+# latest 8.0.0-alpha.2 in Feb 2026, a large breaking change set pending). So "just
+# wait for a release" is not a near-term option; we maintain the fork branch instead.
 #
 # Branch model: our fork's `main` mirrors upstream `main` for reference only. The
 # `irlume-patches` branch sits on a STABLE release tag (currently v7.7.0) + our
@@ -91,7 +92,10 @@ strip = true
 # signature already matches upstream's (`auth_handle: NvAuth`), so adopting a
 # released crate that carries the method upstream would be a call-site no-op; the
 # only fork-local delta is the 7.7.0-flavoured body (Error::from_tss_rc /
-# optional_session_1 vs 8.0's ReturnCode / required_session_1). Only move to a
-# plain crates.io release after that release exists AND passes the HW round-trip.
+# optional_session_1 vs 8.0's ReturnCode / required_session_1). optional_session_1
+# is deliberate: it matches every 7.7.0 policy command except policy_signed and
+# policy_secret, so it is the consistent choice on this base. Upstream flipped all
+# policy commands to required_session_1 only as an 8.0 break (PR #624). Only move to
+# a plain crates.io release after that release exists AND passes the HW round-trip.
 [patch.crates-io]
 tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "irlume-patches" }

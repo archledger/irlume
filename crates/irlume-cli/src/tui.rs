@@ -74,6 +74,9 @@ enum Pending {
     KeyringPw(Option<String>),
     RecoveryPw(Option<String>),
     RecoveryRestorePw,
+    // Uninstall challenge: the user must type the exact word to remove irlume,
+    // so it can never be triggered by an accidental keypress.
+    UninstallConfirm,
 }
 
 impl Pending {
@@ -129,8 +132,6 @@ enum Fix {
     None,
     /// Show the user an exact command to run.
     Manual(String),
-    /// Auto-fixable by the daemon (no root): an id dispatched in `apply_fix`.
-    Daemon(&'static str),
     /// Needs root: suspend the TUI and run via sudo (`apply_fix` → Suspend).
     Root(&'static str),
 }
@@ -258,10 +259,6 @@ struct App {
     fp: FpInfo,
     recovery: Option<RecoveryInfo>,
     suspend: Option<Suspend>,
-    /// Uninstall confirmation stage: 0 = not confirming, 1 = first prompt shown,
-    /// 2 = second prompt shown. Two Y presses are required before the teardown
-    /// runs, so a stray key can't remove irlume.
-    uninstall_stage: u8,
     /// Enrollment intent parked while the daemon fix runs; resumed (once) as
     /// soon as the daemon answers after the suspended sudo step.
     resume_enroll: Option<ResumeEnroll>,
@@ -357,7 +354,6 @@ impl App {
             fp: FpInfo::default(),
             recovery: None,
             suspend: None,
-            uninstall_stage: 0,
             resume_enroll: None,
             identify_result: None,
             selftest_result: None,
@@ -650,7 +646,7 @@ impl App {
                     "IR emitter",
                     Sev::Warn,
                     "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Daemon("ir-emitter"),
+                    Fix::Root("ir-setup"),
                 ));
             }
         } else {
@@ -742,7 +738,7 @@ impl App {
                     "IR emitter",
                     Sev::Warn,
                     "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Daemon("ir-emitter"),
+                    Fix::Root("ir-setup"),
                 ));
             }
         }
@@ -1054,12 +1050,9 @@ impl App {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
             // Emitter setup writes the persisted UVC control, a root op now.
-            Fix::Daemon("ir-emitter") => {
+            Fix::Root("ir-setup") => {
                 self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
-            }
-            Fix::Daemon(id) => {
-                self.set_error(format!("no handler for fix '{id}'; please report this"))
             }
             Fix::Root("restart-daemon") => {
                 self.log(
@@ -1554,36 +1547,22 @@ impl App {
             }
             return;
         }
-        // Uninstall double-confirm: two Y presses, any other key cancels. Held
-        // ahead of the general match so nothing else swallows the keystrokes.
-        if self.uninstall_stage > 0 {
-            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                if self.uninstall_stage == 1 {
-                    self.uninstall_stage = 2; // ask a second time
-                } else {
-                    self.uninstall_stage = 0;
-                    self.log(
-                        '→',
-                        "uninstall confirmed; suspending to `sudo irlume uninstall`",
-                    );
-                    self.suspend = Some(Suspend::Uninstall);
+        // Generic confirm (delete scan/profile, recovery-forget, keyring-forget):
+        // [y] confirms, [n]/Esc cancels, any other key is ignored so a stray
+        // keypress can't confirm OR cancel a destructive action.
+        if self.confirm.is_some() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let (_, req) = self.confirm.take().unwrap();
+                    // Async so the UI keeps animating; poll() logs the result
+                    // (✓/error banner) and refreshes. map_confirm handles the Ok
+                    // acks (delete, recovery-forget) and PasswordForgotten.
+                    self.start_async("(confirmed)", OpTag::Generic, req, map_confirm);
                 }
-            } else {
-                self.uninstall_stage = 0;
-                self.log('·', "uninstall cancelled");
-            }
-            return;
-        }
-        if let Some((_, req)) = &self.confirm {
-            if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                let req = req.clone();
-                self.confirm = None;
-                // Async so the UI keeps animating; poll() logs the result (✓/error
-                // banner) and refreshes. map_confirm handles both the Ok acks
-                // (delete, recovery-forget) and PasswordForgotten (keyring-forget).
-                self.start_async("(confirmed)", OpTag::Generic, req, map_confirm);
-            } else {
-                self.confirm = None;
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm = None;
+                }
+                _ => {} // ignore stray keys
             }
             return;
         }
@@ -1679,12 +1658,15 @@ impl App {
                 self.log('·', "refreshing status…");
                 self.refresh();
             }
-            // Welcome: start the uninstall double-confirm (capital U, so a
-            // stray lower-case key can't begin it). The two Y presses run in
-            // on_key's uninstall_stage block above.
+            // Welcome: start the uninstall challenge (capital U, so a stray
+            // lower-case key can't begin it). The user must TYPE the word to
+            // proceed, so it can never be triggered by accident.
             (SC_WELCOME, KeyCode::Char('U')) => {
-                self.uninstall_stage = 1;
-                self.log('·', "uninstall: press Y to confirm (you'll be asked twice)");
+                self.input = Some((
+                    "Type  uninstall  to remove irlume (Esc cancels)".into(),
+                    String::new(),
+                    Pending::UninstallConfirm,
+                ));
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
             // Gate on the CAMERA, not tab visibility: Identify is an
@@ -1834,7 +1816,7 @@ impl App {
             // setup mile must not require leaving the TUI for a manual command.
             (SC_PAM, KeyCode::Char('w')) | (SC_DONE, KeyCode::Char('w')) => {
                 self.log('→', "sudo irlume login enable --apply: wires the greeter + lock screen for your method");
-                self.log('·', "at the login/lock screen: leave the password empty and press Enter to use your face");
+                self.log('·', "leave the password empty and press Enter to use your face (login needs the IR/secure tier; an RGB-only camera unlocks the lock screen only)");
                 self.log('·', "face-sudo is opt-in; add it later with: sudo irlume login enable --with-sudo --apply");
                 self.suspend = Some(Suspend::LoginEnable);
             }
@@ -1964,6 +1946,19 @@ impl App {
         };
         let v = buf.trim().to_string();
         match pending {
+            // The uninstall challenge: only the exact word proceeds; anything
+            // else (including empty / Esc, which submits nothing) cancels.
+            Pending::UninstallConfirm => {
+                if v == "uninstall" {
+                    self.log(
+                        '→',
+                        "uninstall confirmed; suspending to `sudo irlume uninstall`",
+                    );
+                    self.suspend = Some(Suspend::Uninstall);
+                } else {
+                    self.log('·', "uninstall cancelled (word did not match)");
+                }
+            }
             Pending::EnrollName => {
                 if !v.is_empty() && self.profiles.iter().any(|p| p.name == v) {
                     self.log('✗', format!("a profile named '{v}' already exists"));
@@ -2103,21 +2098,7 @@ impl App {
             };
             self.modal(f, prompt, &format!("{shown}▏"));
         } else if let Some((what, _)) = &self.confirm {
-            self.modal(f, what, "[y] confirm    [any other key] cancel");
-        } else if self.uninstall_stage > 0 {
-            let (title, hint) = if self.uninstall_stage == 1 {
-                (
-                    "Uninstall irlume? It un-wires PAM, stops the daemon, and DELETES \
-                     every enrolled face and sealed secret.",
-                    "[y] continue    [any other key] cancel",
-                )
-            } else {
-                (
-                    "Are you sure? This cannot be undone.",
-                    "[y] uninstall now    [any other key] cancel",
-                )
-            };
-            self.modal(f, title, hint);
+            self.modal(f, what, "[y] confirm    [n] cancel");
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
@@ -2217,16 +2198,16 @@ impl App {
                 }
                 SC_IDENTIFY => "A 'does it recognize me?' test. Press [i] and look at the camera.",
                 SC_KEYRING => {
-                    "Let your face open your password wallet: press [a], type your password."
+                    "Let your login open your password wallet: press [a], type your password."
                 }
-                SC_RECOVERY => "Set a backup passphrase so you're never locked out; press [s].",
+                SC_RECOVERY => "Set a backup passphrase so a broken TPM seal never forces a re-enroll; press [s].",
                 SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
                 SC_PAM => "Turn on face login for your screen: press [w] (asks for your password).",
                 SC_SETTINGS => {
-                    "Optional stricter checks: highlight one and press [enter] to toggle."
+                    "Press [enter] to toggle the eyes-open check; other settings are root or read-only."
                 }
                 SC_DONE => {
-                    "All set! Green = done; anything left shows its key. Press [q] to close."
+                    "Green = done; anything left shows its key. Press [q] to close."
                 }
                 _ => "",
             }
@@ -2927,7 +2908,6 @@ impl App {
                 let tag = match &c.fix {
                     Fix::None => "",
                     Fix::Manual(_) => " · manual",
-                    Fix::Daemon(_) => " · [f] auto-fix",
                     Fix::Root(_) => " · [f] fix (sudo)",
                 };
                 ListItem::new(Line::from(vec![
@@ -2985,7 +2965,6 @@ impl App {
                 }
                 Fix::None => "no action needed".to_string(),
                 Fix::Manual(cmd) => format!("manual: {cmd}"),
-                Fix::Daemon(_) => "press [f]: irlume fixes this via the daemon".to_string(),
                 Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
             };
             lines.push(Line::from(vec![
@@ -3181,7 +3160,7 @@ impl App {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "  at the greeter/lock: leave the password empty, press Enter; face fires only then",
+            "  empty password + Enter fires face (greeter login = IR/secure tier; RGB-only = lock screen only)",
             Style::new().dim(),
         )));
         lines.push(Line::from(vec![
@@ -3367,8 +3346,8 @@ impl App {
             _ => &[("r", "refresh")],
         };
         let mut spans = vec![
-            key("Tab"),
-            Span::styled(" next  ", Style::new().dim()),
+            key("Tab / ← →"),
+            Span::styled(" switch tab  ", Style::new().dim()),
             key("↑↓"),
             Span::styled(" select  ", Style::new().dim()),
             key("v"),
@@ -3532,7 +3511,7 @@ fn map_sealed(resp: Response) -> (bool, String) {
     match resp {
         Response::PasswordSealed => (
             true,
-            "keyring armed; face login will open your wallet".into(),
+            "keyring armed; unlocking your session will open your wallet".into(),
         ),
         Response::Error(e) => (false, format!("arm failed: {e}")),
         o => (false, format!("arm failed: {o:?}")),

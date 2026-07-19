@@ -69,10 +69,11 @@ enum Pending {
     RenameProfile(String),
     RenameScan(String, String),
     // Masked password/passphrase entry, handled in-TUI (sent to the root daemon
-    // over the socket; no sudo, no screen teardown). The `Option<String>` holds
-    // the first entry while confirming (double-entry catches typos).
-    KeyringPw(Option<String>),
-    RecoveryPw(Option<String>),
+    // over the socket; no sudo, no screen teardown). The first entry is held in
+    // a Zeroizing<String> across the double-entry confirm so it is wiped from
+    // memory on drop, not left in swappable heap.
+    KeyringPw(Option<zeroize::Zeroizing<String>>),
+    RecoveryPw(Option<zeroize::Zeroizing<String>>),
     RecoveryRestorePw,
     // Uninstall challenge: the user must type the exact word to remove irlume,
     // so it can never be triggered by an accidental keypress.
@@ -561,8 +562,13 @@ impl App {
     /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
     fn refresh(&mut self) {
         self.refresh_light();
+        // Re-derive hardware capabilities so a camera or reader hot-plugged
+        // after launch reveals its tabs (caps/fp_present drive `visible` and the
+        // Welcome gates, and were otherwise frozen at startup).
+        self.caps = irlume_camera::capabilities();
+        self.fp_present = irlume_fingerprint::available();
         self.fp = FpInfo {
-            available: irlume_fingerprint::available(),
+            available: self.fp_present,
             device: irlume_fingerprint::device_name(),
             enrolled: irlume_fingerprint::enrolled_fingers(&self.user),
             method: irlume_core::policy::method().as_str().to_string(),
@@ -1494,6 +1500,12 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // A raised error banner says "press any key to dismiss", so it takes the
+        // next key BEFORE anything else (including the activity scroll below).
+        if self.error.is_some() {
+            self.error = None;
+            return;
+        }
         // Activity history scroll works in every state except text entry:
         // mid-enroll and mid-op, when lines stream fastest, is exactly when
         // the user wants to read back. Handled before the state gates below
@@ -1520,11 +1532,6 @@ impl App {
             }
             return;
         }
-        // A raised error banner swallows the next key (dismiss it).
-        if self.error.is_some() {
-            self.error = None;
-            return;
-        }
         if self.op.is_some() {
             // An op (Identify / IR self-test) otherwise eats every key until the
             // worker returns, up to the 120s daemon budget. Keep a quit escape
@@ -1535,9 +1542,16 @@ impl App {
             }
             return;
         }
-        if let Some((_, buf, _)) = self.input.as_mut() {
+        if let Some((_, buf, pending)) = self.input.as_mut() {
             match code {
-                KeyCode::Esc => self.input = None,
+                KeyCode::Esc => {
+                    // Wipe a half-typed password/passphrase on cancel.
+                    if pending.masked() {
+                        use zeroize::Zeroize;
+                        buf.zeroize();
+                    }
+                    self.input = None;
+                }
                 KeyCode::Enter => self.submit_input(),
                 KeyCode::Backspace => {
                     buf.pop();
@@ -1949,12 +1963,15 @@ impl App {
         let Some((_, buf, pending)) = self.input.take() else {
             return;
         };
-        let v = buf.trim().to_string();
+        // Wrap the raw buffer so it (a password on the secret paths) is zeroized
+        // on drop, not left in swappable heap. The trimmed copy is computed only
+        // in the non-secret arms so a password never leaves a plain-String copy.
+        let buf = zeroize::Zeroizing::new(buf);
         match pending {
             // The uninstall challenge: only the exact word proceeds; anything
             // else (including empty / Esc, which submits nothing) cancels.
             Pending::UninstallConfirm => {
-                if v == "uninstall" {
+                if buf.trim() == "uninstall" {
                     self.log(
                         '→',
                         "uninstall confirmed; suspending to `sudo irlume uninstall`",
@@ -1965,6 +1982,7 @@ impl App {
                 }
             }
             Pending::EnrollName => {
+                let v = buf.trim().to_string();
                 if !v.is_empty() && self.profiles.iter().any(|p| p.name == v) {
                     self.log('✗', format!("a profile named '{v}' already exists"));
                     return;
@@ -1980,13 +1998,13 @@ impl App {
             Pending::RenameProfile(old) => self.rename(Request::RenameProfile {
                 user: self.user.clone(),
                 profile: old,
-                new_name: v,
+                new_name: buf.trim().to_string(),
             }),
             Pending::RenameScan(p, s) => self.rename(Request::RenameScan {
                 user: self.user.clone(),
                 profile: p,
                 scan: s,
-                new_name: v,
+                new_name: buf.trim().to_string(),
             }),
             // Passwords: use the RAW buffer (never trim). Double-entry to confirm.
             Pending::KeyringPw(None) => {
@@ -1997,17 +2015,17 @@ impl App {
                 self.input = Some((
                     "Confirm login password (••):".into(),
                     String::new(),
-                    Pending::KeyringPw(Some(buf)),
+                    Pending::KeyringPw(Some(zeroize::Zeroizing::new((*buf).clone()))),
                 ));
             }
             Pending::KeyringPw(Some(first)) => {
-                if buf != first {
+                if *buf != *first {
                     self.set_error("passwords don't match; aborted (nothing sealed)");
                     return;
                 }
                 let req = Request::SealPassword {
                     user: self.user.clone(),
-                    password: irlume_common::SecretBytes::new(buf.into_bytes()),
+                    password: irlume_common::SecretBytes::new(buf.as_bytes().to_vec()),
                 };
                 // Async: the TPM seal is the slowest daemon op; don't freeze the frame.
                 self.start_async("SealPassword", OpTag::Generic, req, map_sealed);
@@ -2020,17 +2038,17 @@ impl App {
                 self.input = Some((
                     "Confirm recovery passphrase (••):".into(),
                     String::new(),
-                    Pending::RecoveryPw(Some(buf)),
+                    Pending::RecoveryPw(Some(zeroize::Zeroizing::new((*buf).clone()))),
                 ));
             }
             Pending::RecoveryPw(Some(first)) => {
-                if buf != first {
+                if *buf != *first {
                     self.set_error("passphrases don't match; aborted");
                     return;
                 }
                 let req = Request::RecoverySetup {
                     user: self.user.clone(),
-                    passphrase: irlume_common::SecretBytes::new(buf.into_bytes()),
+                    passphrase: irlume_common::SecretBytes::new(buf.as_bytes().to_vec()),
                 };
                 self.start_async("RecoverySetup", OpTag::Generic, req, map_ok);
             }
@@ -2041,7 +2059,7 @@ impl App {
                 }
                 let req = Request::RecoveryRestore {
                     user: self.user.clone(),
-                    passphrase: irlume_common::SecretBytes::new(buf.into_bytes()),
+                    passphrase: irlume_common::SecretBytes::new(buf.as_bytes().to_vec()),
                 };
                 self.start_async("RecoveryRestore", OpTag::Generic, req, map_ok);
             }
@@ -3318,6 +3336,19 @@ impl App {
             let spans = vec![
                 key("esc"),
                 Span::styled(" cancel enrollment", Style::new().dim()),
+            ];
+            let blk = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().dim());
+            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
+            return;
+        }
+        // A running op (Identify / IR self-test) also swallows every key but
+        // q/Esc, so don't advertise the live nav/action keys during it.
+        if self.op.is_some() {
+            let spans = vec![
+                key("q / esc"),
+                Span::styled(" cancel · working…", Style::new().dim()),
             ];
             let blk = Block::bordered()
                 .border_type(BorderType::Rounded)

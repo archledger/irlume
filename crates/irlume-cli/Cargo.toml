@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 sha2.workspace = true
+zeroize.workspace = true
 irlume-common.workspace = true
 irlume-vision.workspace = true
 irlume-camera.workspace = true

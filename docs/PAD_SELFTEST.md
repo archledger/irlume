@@ -5,7 +5,7 @@ gate (`irlume_liveness::LivenessGate`)
 
 This document defines how irlume's presentation-attack-detection (PAD) gate is
 self-tested against the methodology of **ISO/IEC 30107-3** (*Biometric presentation
-attack detection — Part 3: Testing and reporting*). It is the reference the
+attack detection, Part 3: Testing and reporting*). It is the reference the
 `CONTRIBUTING.md` mandate points at ("Liveness/PAD changes should come with a
 self-test against the relevant ISO/IEC 30107-3 attack class") and the concrete
 form of the "self-test against ISO/IEC 30107-3 attack classes" milestone named in
@@ -223,7 +223,7 @@ can be inspected to tune the exact constant responsible.
 
 ## 8. References
 
-- ISO/IEC 30107-3:2023, *Biometric presentation attack detection — Part 3: Testing
+- ISO/IEC 30107-3:2023, *Biometric presentation attack detection, Part 3: Testing
   and reporting* (APCER / BPCER / non-response definitions).
 - iBeta / ISO 30107-3 PAD test methodology (protocol shape: 150 PA + ~50 BF per PAI
   species; Level 1 = 2D, Level 2 = 3D).

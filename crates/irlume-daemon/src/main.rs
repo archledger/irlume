@@ -81,7 +81,7 @@ fn main() {
     // det/model/mesh/blaze ship with every package, so a missing one is a broken
     // install (IRLUME_MODELS_STRICT rightly refuses). The IR adapter is optional
     // (none ships since ADR-0004; user supplies their own via IRLUME_IR_ADAPTER),
-    // so only verify it when it is actually present — otherwise strict mode would
+    // so only verify it when it is actually present; otherwise strict mode would
     // refuse to start on a normal install that never had an adapter.
     let mut to_verify: Vec<&str> = vec![&det, &model, &mesh, &blaze];
     if std::path::Path::new(&adapter).exists() {
@@ -111,7 +111,7 @@ fn main() {
     // a restart gets a dark IR frame and fails (exactly the "worked at enroll,
     // failed at the lock screen" case). ensure_ir_emitter fires the known
     // control (env/conf/table) and, only if IR is still dark, runs auto-setup
-    // and persists what it finds to ir_emitter.conf — so every later capture,
+    // and persists what it finds to ir_emitter.conf, so every later capture,
     // and every later boot, applies it. No-op on RGB-only hardware; best-effort.
     if std::path::Path::new(&ir_dev).exists() {
         match irlume_auth::ensure_ir_emitter(&ir_dev) {

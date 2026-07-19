@@ -29,7 +29,7 @@ command -v podman >/dev/null || { echo "need podman"; exit 1; }
 # Models must be real weights, not LFS pointer stubs (bundled into the .deb).
 for m in "$REPO"/models/*.onnx; do
     if [ "$(stat -c%s "$m")" -lt 1000000 ] && grep -q git-lfs "$m" 2>/dev/null; then
-        echo "$m is an LFS pointer — run: git lfs pull"; exit 1
+        echo "$m is an LFS pointer; run: git lfs pull"; exit 1
     fi
 done
 

@@ -533,7 +533,7 @@ mod onnx {
     /// BlazeFace short-range (Apache-2.0, Google MediaPipe): RESCUE detector
     /// for frames YuNet loses. Benchmarked 2026-07-15 on the sunlight field
     /// bursts: 96.9% detection on saturated outdoor-walking frames where
-    /// YuNet manages 76.9% — but only 40% on shaded faces where YuNet holds
+    /// YuNet manages 76.9%, but only 40% on shaded faces where YuNet holds
     /// 99%, and its eye keypoints are coarser (NME 0.087 vs 0.053). It
     /// therefore NEVER replaces YuNet: it runs only when YuNet returns no
     /// face, and its box must be refined by FaceMesh before alignment.

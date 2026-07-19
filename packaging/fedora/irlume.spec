@@ -37,19 +37,19 @@ Requires:       pam
 Requires:       tpm2-tss
 Recommends:     fprintd
 # Fedora enforces SELinux by default and the greeter can't reach the daemon
-# without the policy module — pull the subpackage in by default (weak dep, so
+# without the policy module; pull the subpackage in by default (weak dep, so
 # SELinux-disabled installs can still skip it).
 Recommends:     %{name}-selinux = %{version}-%{release}
 %{?systemd_requires}
 
 %description
 irlume authenticates you to Linux by your face with whatever camera the
-machine has: an infrared (Windows Hello) camera enables the secure tier —
-login, sudo, and TPM-sealed keyring unlock with algorithmic IR liveness —
+machine has: an infrared (Windows Hello) camera enables the secure tier
+(login, sudo, and TPM-sealed keyring unlock with algorithmic IR liveness)
 while a regular RGB webcam enables convenient screen unlock, and a
 fingerprint reader can join as a companion factor. A thin PAM module talks
 to a privileged daemon that owns the camera and runs a clean-license model
-stack (YuNet + AuraFace). Password is always the fallback — no lockout.
+stack (YuNet + AuraFace). Password is always the fallback; no lockout.
 
 %package selinux
 Summary:        SELinux policy module for irlume
@@ -87,7 +87,7 @@ install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
 cp -a onnxruntime-linux-x64-%{ort_ver}/lib/libonnxruntime.so* %{buildroot}%{_datadir}/%{name}/onnxruntime/lib/
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
-# Preset: the daemon is enabled on install (see %%post) — it only serves a local
+# Preset: the daemon is enabled on install (see %%post); it only serves a local
 # socket and auth stays opt-in, so "installed" should mean "works".
 install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-irlume.preset
 
@@ -99,7 +99,7 @@ install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-i
 if [ $1 -eq 1 ]; then
     systemctl start irlumed.service &>/dev/null || :
 fi
-# PAM wiring is opt-in (irlume login enable) — never auto-wire auth on install.
+# PAM wiring is opt-in (irlume login enable); never auto-wire auth on install.
 # Upgrade from a version that shipped the IR adapter (< 0.2.0): dark/dim IR
 # login needs a re-enroll (RGB login keeps working). Bright-line the notice.
 if [ $1 -gt 1 ]; then
@@ -117,7 +117,7 @@ fi
 %post selinux
 semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
 # The daemon (started by the main package's %%post, same transaction) bound its
-# socket before the policy existed — restart so the socket gets its label and
+# socket before the policy existed; restart so the socket gets its label and
 # the confined greeter can actually connect. The restorecon is the backstop:
 # with rpm's SELinux plugin the policy commit can land after the restarted
 # daemon's bind, leaving the socket var_run_t (observed live on fc44); the

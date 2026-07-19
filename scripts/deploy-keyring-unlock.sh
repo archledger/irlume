@@ -7,7 +7,7 @@
 # FAIL-SAFE BY DESIGN: every face line is `[success=1 default=ignore]` or
 # `sufficient`, so if the daemon/TPM/face/camera ever fails, login, lock, and
 # wallet all fall through to the password exactly as today. The password is
-# always the floor — this cannot lock you out.
+# always the floor; this cannot lock you out.
 #
 # Run as root:  sudo bash scripts/deploy-keyring-unlock.sh
 # Revert:       sudo bash scripts/deploy-keyring-unlock.sh --revert
@@ -16,7 +16,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAM_GREETER="/etc/pam.d/plasmalogin"
 VENDOR_GREETER="/usr/lib/pam.d/plasmalogin"
-MARKER="# irlume: face-unlock wiring — delete this file to restore the vendor copy"
+MARKER="# irlume: face-unlock wiring; delete this file to restore the vendor copy"
 
 # KDE lock screen rides the non-interactive `kde-fingerprint` parallel stack
 # (kscreenlocker starts it the moment the screen appears) so face unlock needs
@@ -35,7 +35,7 @@ if [[ "${1:-}" == "--revert" ]]; then
         rm -f "$PAM_GREETER"
         echo "[revert] removed $PAM_GREETER (vendor $VENDOR_GREETER is authoritative again)"
     else
-        echo "[revert] no irlume-managed $PAM_GREETER found — nothing to undo"
+        echo "[revert] no irlume-managed $PAM_GREETER found; nothing to undo"
     fi
     echo "[revert] unwiring lock screen ($PAM_LOCK)"
     if [[ -f "$LOCK_BACKUP" ]]; then
@@ -45,7 +45,7 @@ if [[ "${1:-}" == "--revert" ]]; then
         grep -v "pam_irlume.so" "$PAM_LOCK" > "${PAM_LOCK}.tmp" && mv "${PAM_LOCK}.tmp" "$PAM_LOCK"
         echo "[revert] stripped pam_irlume line from $PAM_LOCK"
     else
-        echo "[revert] no irlume line in $PAM_LOCK — nothing to undo"
+        echo "[revert] no irlume line in $PAM_LOCK; nothing to undo"
     fi
     echo "[revert] removing SELinux module"
     semodule -r irlume 2>/dev/null && echo "[revert] removed SELinux module 'irlume'" || echo "[revert] no SELinux module 'irlume'"
@@ -81,7 +81,7 @@ echo "    socket label: $(ls -Z /run/irlume.sock 2>/dev/null | awk '{print $1}')
 
 echo "=== 4/5 wire plasmalogin greeter (face → KWallet unlock) ==="
 if [[ -f "$PAM_GREETER" ]] && grep -q "pam_irlume.so unseal" "$PAM_GREETER"; then
-    echo "    already wired — skipping"
+    echo "    already wired; skipping"
 else
     {
         echo "$MARKER"
@@ -123,9 +123,9 @@ fi
 
 echo "=== 5/5 wire KDE lock screen (kde-fingerprint, continuous-scan) ==="
 if [[ ! -f "$PAM_LOCK" ]]; then
-    echo "    $PAM_LOCK not present — skipping (no kscreenlocker fingerprint stack)"
+    echo "    $PAM_LOCK not present; skipping (no kscreenlocker fingerprint stack)"
 elif grep -q "pam_irlume.so" "$PAM_LOCK"; then
-    echo "    already wired — skipping"
+    echo "    already wired; skipping"
 else
     [[ -f "$LOCK_BACKUP" ]] || cp -a "$PAM_LOCK" "$LOCK_BACKUP"
     # Insert our line before the first auth directive (linhello pattern).
@@ -142,7 +142,7 @@ echo
 echo "=== DONE. Next (you, interactively): ==="
 echo "  1. Arm your REAL login password:   irlume keyring arm   (skip if already armed)"
 echo "  2. Confirm:                         irlume keyring status"
-echo "  3. Lock the screen (Super+L), wait, look at the camera — it should unlock."
+echo "  3. Lock the screen (Super+L), wait, look at the camera; it should unlock."
 echo "  4. Log out, then face-login and check the wallet opens with NO password prompt."
 echo "  5. Reboot and repeat 4 (the real cold-boot test)."
 echo

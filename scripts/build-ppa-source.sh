@@ -10,7 +10,7 @@
 # The PPA targets ONLY the current Ubuntu LTS (its cargo is new enough for our
 # ort/edition-2024 deps). Older LTSs like noble (24.04, cargo 1.75) can't build
 # irlume at all, so their derivatives (Mint, Pop!_OS, Zorin, elementary) use the
-# universal .deb from the GitHub release instead — built on the oldest supported
+# universal .deb from the GitHub release instead; built on the oldest supported
 # base + rustup in a container (see the noble-container build). Build + upload
 # just the current series:
 #   SERIES=resolute bash scripts/build-ppa-source.sh
@@ -70,11 +70,11 @@ if [ "${SKIP_BUILD_CHECK:-0}" != "1" ]; then
     rm -rf "$TREE/.cargo-home-check" "$TREE/target"
 fi
 
-echo "==> creating orig tarball (deterministic — same bytes for every series)"
+echo "==> creating orig tarball (deterministic, same bytes for every series)"
 cd "$BUILDROOT"
 rm -f "irlume_${VERSION}.orig.tar.gz"
 # If more than one Ubuntu series is ever uploaded for the same upstream version,
-# Launchpad keeps one orig tarball per version — a second upload with a different
+# Launchpad keeps one orig tarball per version; a second upload with a different
 # checksum is rejected ("already exists with different contents"). So
 # pack reproducibly: fixed mtime/owner, sorted names, gzip without a timestamp,
 # so every series build yields a byte-identical orig. mtime = the release tag's

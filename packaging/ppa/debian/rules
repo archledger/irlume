@@ -14,7 +14,7 @@ override_dh_auto_build:
 	# --offline: use only the vendored crates (Launchpad builders have no net).
 	# NB: the PPA targets only the current Ubuntu LTS, whose cargo reads the
 	# format-v4 lock fine. (Older LTSs like noble ship cargo 1.75, which can't
-	# parse v4 AND can't compile our ort/edition-2024 deps anyway — those users
+	# parse v4 AND can't compile our ort/edition-2024 deps anyway; those users
 	# get the universal .deb from the GitHub release, not the PPA.)
 	cargo build --release --frozen --offline
 
@@ -26,7 +26,7 @@ override_dh_auto_clean:
 
 # dh_clean's default cruft sweep deletes *.orig / *~ recursively, which
 # nukes vendored files (vendor/*/Cargo.toml.orig) that cargo's checksum
-# manifests require — cargo --frozen then fails on the builder.
+# manifests require; cargo --frozen then fails on the builder.
 override_dh_clean:
 	dh_clean -Xvendor/
 

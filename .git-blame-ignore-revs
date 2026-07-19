@@ -1,4 +1,4 @@
-# Commits that ONLY reformat code (no logic changes) — skipped by `git blame`
+# Commits that ONLY reformat code (no logic changes), skipped by `git blame`
 # so blame points at the real author of each line, not the formatting sweep.
 #
 # Enable locally once:

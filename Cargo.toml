@@ -1,4 +1,4 @@
-# irlume — Linux face authentication (PAM), successor to linhello.
+# irlume: Linux face authentication (PAM), successor to linhello.
 # irlume = IR (infrared) + lume (illumination).
 [workspace]
 resolver = "2"
@@ -27,7 +27,7 @@ repository = "https://github.com/archledger/irlume"
 authors = ["archledger <archledger236@gmail.com>"]
 
 # Shared dependency versions. Heavy/native deps are listed but commented so the
-# scaffold compiles offline as pure stubs — uncomment per crate as you implement.
+# scaffold compiles offline as pure stubs; uncomment per crate as you implement.
 [workspace.dependencies]
 irlume-common   = { path = "crates/irlume-common" }
 irlume-camera   = { path = "crates/irlume-camera" }

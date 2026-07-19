@@ -169,7 +169,7 @@ struct IrMatch {
 /// IR matching across profiles, calibration-aware. Per profile: when a
 /// fitted calibration exists (and no global adapter is loaded), both the
 /// probe and that profile's templates are calibrated before scoring, and the
-/// calibrated template CENTROID is scored too — the mean-template protocol
+/// calibrated template CENTROID is scored too, the mean-template protocol
 /// the 2026-07-15 prototype validated at the BASE threshold (a single mean
 /// template carries no best-of-N FAR inflation).
 fn ir_match_in(
@@ -432,7 +432,7 @@ impl Engine {
     /// Detection rescue (cascade stage 2): when YuNet returns no face, try
     /// BlazeFace and refine its coarse box into the 5 alignment landmarks
     /// with FaceMesh (BlazeFace has no mouth corners and its eyes measured
-    /// 0.087 NME vs YuNet's 0.053 — never align from its own keypoints).
+    /// 0.087 NME vs YuNet's 0.053; never align from its own keypoints).
     /// Returns a Detection shaped exactly like YuNet's, or None when either
     /// optional model is absent or no face clears the threshold.
     fn rescue_detect(&mut self, view: &align::RgbView<'_>, tag: &str) -> Option<Detection> {
@@ -942,7 +942,7 @@ impl Engine {
     /// assessed or [`GRACE_WINDOW_MS`] elapses.
     ///
     /// SECURITY INVARIANT: only PRESENCE-class failures retry (no face found,
-    /// liveness Uncertain framing rejections — cases where no match verdict
+    /// liveness Uncertain framing rejections, cases where no match verdict
     /// was reached). A real match verdict below threshold never retries (each
     /// extra matcher attempt multiplies FAR), and a Spoof verdict never
     /// retries (no free attack retries). See [`presence_retryable`].
@@ -1453,7 +1453,7 @@ impl Engine {
 
     /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
     /// face already owns a profile, the scans are merged into it (a face can
-    /// never own two profiles, so that is always what the user meant — and it
+    /// never own two profiles, so that is always what the user meant, and it
     /// is the 0.2.0 upgrade remedy, fresh scans reviving dark/dim login after
     /// an embedding-space change). A novel face gets a NEW profile; that errors
     /// if the account is already at MAX_PROFILES.
@@ -1902,7 +1902,7 @@ pub enum EnrollOutcome {
     /// A new face profile was created.
     New { name: String, scans: usize },
     /// The captured face already owned `name`, so the capture was added to that
-    /// profile instead — `added` new scans, `total` scans now — and the
+    /// profile instead (`added` new scans, `total` scans now) and the
     /// per-enrollment calibration was refitted. This is what makes `irlume
     /// enroll` idempotent for the same person: a face can never own two
     /// profiles, so merging is always what the user meant. It is also the
@@ -2248,7 +2248,7 @@ mod tests {
             ),
             false
         )));
-        // NEVER retryable: a real spoof verdict (flat/2D — free attack retries)...
+        // NEVER retryable: a real spoof verdict (flat/2D, free attack retries)...
         assert!(!presence_retryable(&denied(
             &format!("liveness {:?}: flat 2D surface", Verdict::Spoof),
             false

@@ -74,6 +74,9 @@ enum Pending {
     KeyringPw(Option<String>),
     RecoveryPw(Option<String>),
     RecoveryRestorePw,
+    // Uninstall challenge: the user must type the exact word to remove irlume,
+    // so it can never be triggered by an accidental keypress.
+    UninstallConfirm,
 }
 
 impl Pending {
@@ -256,10 +259,6 @@ struct App {
     fp: FpInfo,
     recovery: Option<RecoveryInfo>,
     suspend: Option<Suspend>,
-    /// Uninstall confirmation stage: 0 = not confirming, 1 = first prompt shown,
-    /// 2 = second prompt shown. Two Y presses are required before the teardown
-    /// runs, so a stray key can't remove irlume.
-    uninstall_stage: u8,
     /// Enrollment intent parked while the daemon fix runs; resumed (once) as
     /// soon as the daemon answers after the suspended sudo step.
     resume_enroll: Option<ResumeEnroll>,
@@ -355,7 +354,6 @@ impl App {
             fp: FpInfo::default(),
             recovery: None,
             suspend: None,
-            uninstall_stage: 0,
             resume_enroll: None,
             identify_result: None,
             selftest_result: None,
@@ -1549,31 +1547,6 @@ impl App {
             }
             return;
         }
-        // Uninstall double-confirm: [y] advances/confirms, [n]/Esc cancels, any
-        // other key is ignored so a stray keypress can't act. Held ahead of the
-        // general match so nothing else swallows the keystrokes.
-        if self.uninstall_stage > 0 {
-            match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if self.uninstall_stage == 1 {
-                        self.uninstall_stage = 2; // ask a second time
-                    } else {
-                        self.uninstall_stage = 0;
-                        self.log(
-                            '→',
-                            "uninstall confirmed; suspending to `sudo irlume uninstall`",
-                        );
-                        self.suspend = Some(Suspend::Uninstall);
-                    }
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.uninstall_stage = 0;
-                    self.log('·', "uninstall cancelled");
-                }
-                _ => {} // ignore stray keys
-            }
-            return;
-        }
         // Generic confirm (delete scan/profile, recovery-forget, keyring-forget):
         // [y] confirms, [n]/Esc cancels, any other key is ignored so a stray
         // keypress can't confirm OR cancel a destructive action.
@@ -1685,12 +1658,15 @@ impl App {
                 self.log('·', "refreshing status…");
                 self.refresh();
             }
-            // Welcome: start the uninstall double-confirm (capital U, so a
-            // stray lower-case key can't begin it). The two Y presses run in
-            // on_key's uninstall_stage block above.
+            // Welcome: start the uninstall challenge (capital U, so a stray
+            // lower-case key can't begin it). The user must TYPE the word to
+            // proceed, so it can never be triggered by accident.
             (SC_WELCOME, KeyCode::Char('U')) => {
-                self.uninstall_stage = 1;
-                self.log('·', "uninstall: press Y to confirm (you'll be asked twice)");
+                self.input = Some((
+                    "Type  uninstall  to remove irlume (Esc cancels)".into(),
+                    String::new(),
+                    Pending::UninstallConfirm,
+                ));
             }
             // Welcome quick-launch: jump to Profiles and start enrollment.
             // Gate on the CAMERA, not tab visibility: Identify is an
@@ -1970,6 +1946,19 @@ impl App {
         };
         let v = buf.trim().to_string();
         match pending {
+            // The uninstall challenge: only the exact word proceeds; anything
+            // else (including empty / Esc, which submits nothing) cancels.
+            Pending::UninstallConfirm => {
+                if v == "uninstall" {
+                    self.log(
+                        '→',
+                        "uninstall confirmed; suspending to `sudo irlume uninstall`",
+                    );
+                    self.suspend = Some(Suspend::Uninstall);
+                } else {
+                    self.log('·', "uninstall cancelled (word did not match)");
+                }
+            }
             Pending::EnrollName => {
                 if !v.is_empty() && self.profiles.iter().any(|p| p.name == v) {
                     self.log('✗', format!("a profile named '{v}' already exists"));
@@ -2110,20 +2099,6 @@ impl App {
             self.modal(f, prompt, &format!("{shown}▏"));
         } else if let Some((what, _)) = &self.confirm {
             self.modal(f, what, "[y] confirm    [n] cancel");
-        } else if self.uninstall_stage > 0 {
-            let (title, hint) = if self.uninstall_stage == 1 {
-                (
-                    "Uninstall irlume? It un-wires PAM, stops the daemon, and DELETES \
-                     every enrolled face and sealed secret.",
-                    "[y] continue    [n] cancel",
-                )
-            } else {
-                (
-                    "Are you sure? This cannot be undone.",
-                    "[y] uninstall now    [n] cancel",
-                )
-            };
-            self.modal(f, title, hint);
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).

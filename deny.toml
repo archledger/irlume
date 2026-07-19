@@ -32,10 +32,6 @@ ignore = [
     # pcrsig.rs); no private-key operations run, so the side channel has no
     # secret to leak here. Re-check when rsa publishes a fixed version.
     "RUSTSEC-2023-0071",
-    # RUSTSEC-2024-0436: `paste` is unmaintained (not a vulnerability). It is
-    # a compile-time proc-macro pulled in by ratatui 0.29 for the TUI; no
-    # paste code exists at runtime. Drop this when ratatui replaces it.
-    "RUSTSEC-2024-0436",
 ]
 
 [bans]

@@ -392,6 +392,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "zeroize",
 ]
@@ -1170,7 +1171,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi"
 version = "7.7.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#1c3f982df6fbf484d30fe9f3e33a9a5ee9bcaa4f"
+source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
 dependencies = [
  "bitfield",
  "enumflags2",
@@ -1192,7 +1193,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi-sys"
 version = "0.6.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#1c3f982df6fbf484d30fe9f3e33a9a5ee9bcaa4f"
+source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
 dependencies = [
  "pkg-config",
  "target-lexicon",

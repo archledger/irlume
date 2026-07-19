@@ -3346,8 +3346,8 @@ impl App {
             _ => &[("r", "refresh")],
         };
         let mut spans = vec![
-            key("Tab"),
-            Span::styled(" next  ", Style::new().dim()),
+            key("Tab / ← →"),
+            Span::styled(" switch tab  ", Style::new().dim()),
             key("↑↓"),
             Span::styled(" select  ", Style::new().dim()),
             key("v"),

@@ -3535,6 +3535,10 @@ fn map_settings(resp: Response) -> (bool, String) {
                 }
             ),
         ),
+        // The daemon's SetRequire* handlers go through mutate_enrollment, which
+        // acks with Ok(msg), not Enrollment. Without this arm every toggle fell
+        // to the "unexpected" fallback and raised a spurious error modal.
+        Response::Ok(m) => (true, m),
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),
     }

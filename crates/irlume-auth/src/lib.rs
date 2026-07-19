@@ -1540,8 +1540,10 @@ impl Engine {
                 )));
             }
             let added = captured.len().min(room);
+            let mut added_scans = Vec::with_capacity(added);
             for (rgb, ir, d, b, pitch) in captured.into_iter().take(room) {
                 let sname = enr.profiles[idx].next_scan_name();
+                added_scans.push(sname.clone());
                 let ir_space = ir.as_ref().map(|_| self.ir_space.clone());
                 enr.profiles[idx].scans.push(FaceScan {
                     name: sname,
@@ -1560,6 +1562,7 @@ impl Engine {
                 name: target,
                 added,
                 total,
+                added_scans,
             });
         }
         if enr.profiles.len() >= MAX_PROFILES {
@@ -1909,6 +1912,10 @@ pub enum EnrollOutcome {
         name: String,
         added: usize,
         total: usize,
+        /// Names of the scans this capture appended, so a caller can undo the
+        /// merge by deleting exactly them (the TUI does this on a declined
+        /// "add to the existing profile?" confirm).
+        added_scans: Vec<String>,
     },
 }
 

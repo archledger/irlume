@@ -647,15 +647,25 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => eprintln!("irlumed: IR emitter auto-setup skipped: {e}"),
             }
             match engine.enroll_profile(&user, profile, want) {
-                Ok(irlume_auth::EnrollOutcome::New { name, scans }) => {
-                    Response::Ok(format!("enrolled '{name}' with {scans} scans"))
-                }
-                Ok(irlume_auth::EnrollOutcome::Merged { name, added, total }) => {
-                    Response::Ok(format!(
-                        "this face already matches '{name}'; added the {added} fresh scans to \
-                         it ({total} total) and recognition now uses them"
-                    ))
-                }
+                Ok(irlume_auth::EnrollOutcome::New { name, scans }) => Response::Enrolled {
+                    profile: name,
+                    created: true,
+                    added: scans,
+                    total: scans,
+                    added_scans: Vec::new(),
+                },
+                Ok(irlume_auth::EnrollOutcome::Merged {
+                    name,
+                    added,
+                    total,
+                    added_scans,
+                }) => Response::Enrolled {
+                    profile: name,
+                    created: false,
+                    added,
+                    total,
+                    added_scans,
+                },
                 Err(e) => Response::Error(e.to_string()),
             }
         }

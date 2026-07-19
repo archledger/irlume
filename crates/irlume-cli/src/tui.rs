@@ -198,6 +198,24 @@ enum WMsg {
     Captured(usize, usize),
     Done,
     Err(String),
+    /// Scan 1 of a "new profile" enroll matched an existing identity, so the
+    /// daemon merged it into `profile` instead. The worker ends here and hands
+    /// off to the UI, which confirms with the user before adding the rest.
+    /// `added_scans` are the scan(s) already appended (undo target on decline).
+    MergePrompt {
+        profile: String,
+        total: usize,
+        added_scans: Vec<String>,
+    },
+}
+
+/// A pending "this face is already enrolled as X; add these scans to it?"
+/// confirmation, raised when scan 1 of a new-profile enroll merged. `remaining`
+/// is how many more scans to capture on confirm (capped at the 30-scan budget).
+struct MergeConfirm {
+    profile: String,
+    added_scans: Vec<String>,
+    remaining: usize,
 }
 
 struct EnrollUi {
@@ -235,6 +253,8 @@ struct App {
     confirm: Option<(String, Request)>,
     op: Option<Op>,
     enroll: Option<EnrollUi>,
+    /// A pending merge confirmation (scan 1 matched an existing profile).
+    enroll_merge: Option<MergeConfirm>,
     fp: FpInfo,
     recovery: Option<RecoveryInfo>,
     suspend: Option<Suspend>,
@@ -333,6 +353,7 @@ impl App {
             confirm: None,
             op: None,
             enroll: None,
+            enroll_merge: None,
             fp: FpInfo::default(),
             recovery: None,
             suspend: None,
@@ -1154,6 +1175,56 @@ impl App {
         });
     }
 
+    /// User confirmed the merge: keep the scan already added and, if the profile
+    /// still has room and more scans were requested, capture the rest via
+    /// AddScan targeting the resolved profile (never a new merge).
+    fn confirm_enroll_merge(&mut self, mc: MergeConfirm) {
+        self.log(
+            '·',
+            format!("adding these scans to '{}' (already your face)", mc.profile),
+        );
+        if mc.remaining == 0 {
+            self.log('✓', format!("scan added to '{}'", mc.profile));
+            self.refresh();
+            return;
+        }
+        let user = self.user.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (st, pn) = (stop.clone(), mc.profile.clone());
+        let add = Some(mc.profile.clone());
+        std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
+        self.enroll = Some(EnrollUi {
+            rx,
+            stop,
+            profile: mc.profile,
+            last: None,
+            count: None,
+            captured: 0,
+            target: mc.remaining,
+        });
+    }
+
+    /// User declined the merge: remove the scan(s) scan 1 already added, so the
+    /// cancel leaves the existing profile exactly as it was.
+    fn cancel_enroll_merge(&mut self, mc: MergeConfirm) {
+        for scan in &mc.added_scans {
+            let _ = crate::daemon_request(&Request::DeleteScan {
+                user: self.user.clone(),
+                profile: mc.profile.clone(),
+                scan: scan.clone(),
+            });
+        }
+        self.log(
+            '·',
+            format!(
+                "cancelled; '{}' is unchanged (a face can only own one profile)",
+                mc.profile
+            ),
+        );
+        self.refresh();
+    }
+
     fn poll(&mut self) {
         if let Some(op) = &self.op {
             if let Ok((ok, msg)) = op.rx.try_recv() {
@@ -1179,11 +1250,13 @@ impl App {
             }
         }
         if let Some(e) = &self.enroll {
+            let target = e.target;
             let mut msgs = Vec::new();
             while let Ok(m) = e.rx.try_recv() {
                 msgs.push(m);
             }
             let mut finished = false;
+            let mut merge: Option<MergeConfirm> = None;
             for m in msgs {
                 match m {
                     WMsg::Cue(r) => {
@@ -1213,10 +1286,28 @@ impl App {
                         self.set_error(format!("Enrollment failed: {e}"));
                         finished = true;
                     }
+                    WMsg::MergePrompt {
+                        profile,
+                        total,
+                        added_scans,
+                    } => {
+                        // The rest of the requested scans, capped at the profile's
+                        // remaining 30-scan budget (scan 1 already merged in).
+                        let remaining = target
+                            .saturating_sub(1)
+                            .min(irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(total));
+                        merge = Some(MergeConfirm {
+                            profile,
+                            added_scans,
+                            remaining,
+                        });
+                        finished = true; // the worker has ended; the modal takes over
+                    }
                 }
             }
             if finished {
                 self.enroll = None;
+                self.enroll_merge = merge;
                 self.refresh();
             }
         }
@@ -1493,6 +1584,24 @@ impl App {
                 self.start_async("(confirmed)", OpTag::Generic, req, map_confirm);
             } else {
                 self.confirm = None;
+            }
+            return;
+        }
+        // Merge confirm: scan 1 of a "new profile" enroll matched an existing
+        // identity. [y] adds the rest of the scans to that profile, [n]/Esc
+        // cancels (removing the one merged scan). Any other key is ignored so a
+        // stray keypress can't silently cancel the enroll.
+        if self.enroll_merge.is_some() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let mc = self.enroll_merge.take().unwrap();
+                    self.confirm_enroll_merge(mc);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    let mc = self.enroll_merge.take().unwrap();
+                    self.cancel_enroll_merge(mc);
+                }
+                _ => {} // ignore stray keys; the modal stays up
             }
             return;
         }
@@ -2009,6 +2118,15 @@ impl App {
                 )
             };
             self.modal(f, title, hint);
+        } else if let Some(mc) = &self.enroll_merge {
+            // Keep the message in the wrapping body, not the border title (which
+            // is a single line clamped to the box width and would truncate).
+            let body = format!(
+                "This face is already enrolled as '{}' (a face owns one profile). \
+                 Add these scans to it?   [y] add   ·   [n] cancel",
+                mc.profile
+            );
+            self.modal(f, "Already enrolled", &body);
         }
     }
 
@@ -2252,7 +2370,7 @@ impl App {
         let mut items = items;
         items.push(ListItem::new(Line::raw("")));
         items.push(ListItem::new(Line::from(Span::styled(
-            "  Tips: wear glasses sometimes? Enroll a second profile named 'glasses' ([e]).",
+            "  Tips: look different sometimes (glasses, low light)? Add scans to your profile with Improve Recognition ([a]); same identity, not a second profile.",
             Style::new().dim(),
         ))));
         items.push(ListItem::new(Line::from(Span::styled(
@@ -3537,7 +3655,26 @@ fn enroll_worker(
                 }
             };
             match crate::daemon_request(&req) {
-                Ok(Response::Ok(_)) => {
+                // Scan 1 of a new-profile enroll matched an existing identity:
+                // the daemon merged it. Hand off to the UI to confirm before
+                // adding the rest; the worker ends here (the UI spawns a
+                // continuation on confirm, or undoes the scan on decline).
+                Ok(Response::Enrolled {
+                    created: false,
+                    profile: resolved,
+                    total,
+                    added_scans,
+                    ..
+                }) => {
+                    let _ = send(WMsg::MergePrompt {
+                        profile: resolved,
+                        total,
+                        added_scans,
+                    });
+                    return;
+                }
+                // A brand-new profile (created) or an AddScan success.
+                Ok(Response::Enrolled { .. }) | Ok(Response::Ok(_)) => {
                     if !send(WMsg::Captured(i + 1, target)) {
                         return;
                     }

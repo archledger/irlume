@@ -1175,7 +1175,21 @@ fn run_enroll(user: &str, reset: bool) {
         scans: None,
         reset,
     }) {
-        Ok(Response::Ok(msg)) => println!("  {msg} {OK}"),
+        Ok(Response::Enrolled {
+            profile,
+            created,
+            total,
+            ..
+        }) => {
+            if created {
+                println!("  enrolled '{profile}' with {total} scans {OK}");
+            } else {
+                println!(
+                    "  this face is already enrolled as '{profile}'; added scans to it \
+                     ({total} total) {OK}"
+                );
+            }
+        }
         r => eprintln!("  enroll failed: {r:?}"),
     }
 }

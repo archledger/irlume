@@ -206,7 +206,7 @@ The `irlume-auth` examples load ONNX models, so they need `ORT_DYLIB_PATH`
 set (see the ONNX runtime section above; on an installed Fedora/RPM box,
 `/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` works, on a Debian/PPA
 box `/opt/irlume/onnxruntime/lib/libonnxruntime.so.1.24.4`). Without it the
-process hangs instead of erroring — an upstream `ort` bug where building the
+process hangs instead of erroring: an upstream `ort` bug where building the
 load-failure message re-enters the API lock being initialized.
 
 ### Using landmark_dump
@@ -223,15 +223,15 @@ Look at the camera; a 36-frame burst takes about 2.5 s. The IR node is the
 V4L2 device that lists a `GREY` format (`v4l2-ctl -d /dev/videoN
 --list-formats`). `out/` then holds:
 
-- `frameNN.pgm` — the raw IR frame. PGM is plain grayscale: a `P5` text
+- `frameNN.pgm`: the raw IR frame. PGM is plain grayscale: a `P5` text
   header (width, height, 255) followed by one byte per pixel. Any image
   viewer opens it and numpy reads it without a decoder.
-- `frameNN.landmarks.csv` — `idx,x,y,brightness` for the 478 FaceMesh
+- `frameNN.landmarks.csv`: `idx,x,y,brightness` for the 478 FaceMesh
   points, written only for frames where a face was detected. `brightness`
   is the mean of the 3x3 pixel patch centered on the landmark; coordinates
   carry full f32 precision, so re-sampling the PGM at `(x, y)` reproduces
   the CSV value exactly.
-- `index.txt` — one line per frame: index, frame mean, ms since the first
+- `index.txt`: one line per frame: index, frame mean, ms since the first
   frame, detection score and bbox (`- -` when no face).
 
 On a strobing emitter, alternate frames are emitter-off (near-black indoors,

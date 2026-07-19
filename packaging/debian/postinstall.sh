@@ -16,5 +16,5 @@ irlume installed. Next steps:
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
 (enrollment auto-enables the 850nm IR emitter when IR frames are black;
  manual fallback for IR cameras: sudo irlume ir-setup)
-Password is always the fallback — no lockout.
+Password is always the fallback; no lockout.
 EOF

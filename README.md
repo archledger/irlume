@@ -40,7 +40,7 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 |---|---|
 | 🌑 **Works in the dark** | Active **infrared** recognition (Windows-Hello cameras); no ambient light needed. |
 | 🔒 **Unlocks everything** | Login greeter, lock screen, and `sudo` (opt-in via `login enable --with-sudo`), with the password always as fallback (**no lockout, ever**). |
-| 🙋 **On-demand, by consent** | The camera fires only when you ask: leave the password field **empty and press Enter**. Typing a password never starts a scan. A **grace window** after the gesture (~15 s at login/lock, ~5 s for `sudo`) keeps retrying while you settle into frame — but never retries a failed match. Wiring is tailored per login manager (GDM · SDDM · Plasma Login · LightDM · greetd · COSMIC). |
+| 🙋 **On-demand, by consent** | The camera fires only when you ask: leave the password field **empty and press Enter**. Typing a password never starts a scan. A **grace window** after the gesture (~15 s at login/lock, ~5 s for `sudo`) keeps retrying while you settle into frame, but never retries a failed match. Wiring is tailored per login manager (GDM · SDDM · Plasma Login · LightDM · greetd · COSMIC). |
 | 🗝️ **Opens your keyring** | On IR hardware a face match **TPM-unseals your login password** so the wallet unlocks at login, like Hello. |
 | 👁️ **Real liveness** | Algorithmic IR anti-spoof gate + **opt-in passive blink** detection (no prompt, no action). |
 | 🧬 **No face images stored** | Stores **512-D embeddings, never images**; on TPM hardware they're **AES-256-GCM encrypted** under a **TPM-sealed** key (without a TPM: root-only files, and the TUI says so). |
@@ -213,7 +213,7 @@ GPLv3-compatible, so the whole thing is bundleable:
 | Recognition | **AuraFace** *(512-D ArcFace)* | Apache-2.0 |
 | IR liveness gate | self-built, algorithmic *(no weights)* | n/a |
 | Passive blink liveness + rescue alignment | **MediaPipe FaceMesh** *(478-pt)* → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
-| IR domain match | raw AuraFace + **per-enrollment on-device calibration** *(fitted from your own scans; no third-party data — [ADR-0004](docs/adr/0004-per-enrollment-ir-adapter.md))* | n/a |
+| IR domain match | raw AuraFace + **per-enrollment on-device calibration** *(fitted from your own scans; no third-party data, [ADR-0004](docs/adr/0004-per-enrollment-ir-adapter.md))* | n/a |
 
 More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Standards mapping](docs/STANDARDS.md) · [Cross-distro notes](docs/cross-distro/).
 
@@ -253,11 +253,11 @@ The current gaps:
   shape from the IR emitter's light; when the scene's own infrared floods it, no
   shape signal is left, and a genuine face is rejected to the password. Measured
   in a 430-sample field session (2026-07-16, cloudy-bright sky): reliable below
-  ambient ~120 on the 0-255 IR scale (indoors, inside vehicles, shade — a closed
+  ambient ~120 on the 0-255 IR scale (indoors, inside vehicles, shade, a closed
   car with 20% tint passed 99/99), marginal to ~170, and 0/129 genuine samples
   passed above ~170 (open sky or sun behind the user; the emitter's contribution
   fell to noise and 46-82% of the IR frame was saturated). irlume can't tell sky
-  from a bright lamp — both are just infrared — so the rejection names the
+  from a bright lamp (both are just infrared), so the rejection names the
   condition and the fix: turn away from the light, or type the password.
 - **Not lab-certified.** We self-test against ISO/IEC 30107-3; there's no paid iBeta
   pass. Demographic FMR tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
@@ -416,7 +416,7 @@ path.
 plus per-enrollment on-device calibration (no bundled weights). It also adds a BlazeFace
 detection-rescue cascade (outdoor detection 76.9% → 98.5%), the 478-point FaceLandmarker
 mesh, and a presence grace window after the consent gesture. Upgrading from 0.1.x needs a
-one-time re-enroll for dark/dim login — bright-light login and the password are unaffected.
+one-time re-enroll for dark/dim login; bright-light login and the password are unaffected.
 Every accuracy figure is reproducible from [`benchmarks/`](benchmarks/).
 
 0.2.1 makes that upgrade a one-step affair: `irlume enroll` now adds the fresh scans to

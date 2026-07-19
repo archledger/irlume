@@ -162,7 +162,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [0.2.0] - 2026-07-15
 
-> **⚠ Breaking — re-enroll needed for dark/dim login.** This release removes the
+> **⚠ Breaking: re-enroll needed for dark/dim login.** This release removes the
 > IR adapter (see Removed). Face profiles enrolled under 0.1.x have IR templates
 > in the old adapter's embedding space, which no longer matches. **Bright-light
 > (RGB) face login keeps working**, and any mismatch falls back to your password
@@ -189,7 +189,7 @@ All notable changes to irlume are documented here. This project adheres to
 - **Presence grace window after the consent gesture.** After the blank-Enter
   gesture, capture retries while no usable face is in frame so walking up or
   settling still authenticates: ~15s for login/lock, ~5s for `sudo`/`su`
-  (`IRLUME_GRACE_MS` overrides). Only presence-class failures retry — never a
+  (`IRLUME_GRACE_MS` overrides). Only presence-class failures retry, never a
   below-threshold match (FAR-neutral by construction).
 - **IR-template embedding-space tagging** so a future adapter swap/removal fails
   loud ("re-enroll") instead of scoring across embedding spaces.

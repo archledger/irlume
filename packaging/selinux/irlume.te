@@ -2,13 +2,13 @@ policy_module(irlume, 1.0.0)
 
 ########################################
 #
-# irlume — let confined login/display-manager domains reach the irlumed socket.
+# irlume: let confined login/display-manager domains reach the irlumed socket.
 #
 # irlumed runs as `unconfined_service_t` (a plain systemd service with no
 # custom domain) and binds /run/irlume.sock. The display manager / greeter
 # (plasmalogin, gdm, sddm) runs CONFINED as `xdm_t`, so on a real graphical
 # login SELinux denies it write/connect access to the socket and pam_irlume
-# silently falls through to the password — face login never engages.
+# silently falls through to the password; face login never engages.
 #
 #   avc: denied { write } ... comm="plasmalogin-hel" name="irlume.sock"
 #        scontext=...:xdm_t tcontext=...:var_run_t tclass=sock_file

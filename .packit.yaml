@@ -1,5 +1,5 @@
 # Packit: build irlume RPMs in Copr from signed GitHub tags (the linhello
-# pipeline). Models are Git LFS — Copr's srpm build must pull them.
+# pipeline). Models are Git LFS; Copr's srpm build must pull them.
 specfile_path: packaging/fedora/irlume.spec
 upstream_package_name: irlume
 downstream_package_name: irlume
@@ -20,12 +20,12 @@ jobs:
     owner: archledger
     project: irlume
     # Packit submits builds with networking OFF regardless of the Copr
-    # project's own enable_net setting — cargo needs crates.io in %build.
+    # project's own enable_net setting; cargo needs crates.io in %build.
     enable_net: true
     targets:
       - fedora-stable
       - fedora-rawhide
-    # onnxruntime is bundled in the RPM (Source1) — no external Copr needed.
+    # onnxruntime is bundled in the RPM (Source1); no external Copr needed.
 
   - job: copr_build
     trigger: pull_request

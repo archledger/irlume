@@ -142,7 +142,7 @@ cascade's 76.9% → 98.5% outdoor rescue, the 478-point mesh's 28% eye-NME gain)
 
 The scripts that produced every one of these live in
 [`../benchmarks/`](../benchmarks/), and the raw result files are committed beside
-them (`results-*.json` / `.log`) — read them directly, or reproduce from scratch
+them (`results-*.json` / `.log`); read them directly, or reproduce from scratch
 on the public datasets (LFW, CBSR NIR, Oulu-CASIA NIR, Tufts Face). Datasets,
 exact protocols, the runtime, and the honest caveats (small outdoor sample;
 InsightFace's non-commercial recognizer beats the permissive one irlume ships)

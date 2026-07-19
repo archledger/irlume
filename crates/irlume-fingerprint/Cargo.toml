@@ -7,5 +7,5 @@ license.workspace = true
 
 [dependencies]
 # Detection/enroll-orchestration only: drives fprintd's CLI tools via
-# std::process. No deps — verification is done by pam_fprintd in the PAM stack,
+# std::process. No deps; verification is done by pam_fprintd in the PAM stack,
 # not here, so irlume never claims the sensor and coexists with the greeter.

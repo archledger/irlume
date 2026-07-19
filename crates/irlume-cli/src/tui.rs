@@ -228,6 +228,11 @@ struct EnrollUi {
     count: Option<u8>,
     captured: usize,
     target: usize,
+    /// Scans already on the profile from this enroll session before the worker
+    /// started (e.g. the one scan a merge added), so the on-screen "scan X/Y"
+    /// stays continuous across the merge-confirm continuation instead of
+    /// restarting at 0.
+    base: usize,
 }
 
 struct Op {
@@ -250,6 +255,9 @@ struct App {
     /// Whether the bound PCRs drifted since sealing (`KeyringInfo`).
     keyring_drift: Option<bool>,
     nodes: Vec<(String, irlume_camera::Role)>,
+    /// Cached camera pairs, refreshed on the slow timer so the Cameras tab and
+    /// move_sel don't re-probe the hardware on every keystroke and frame.
+    pairs: Vec<irlume_camera::CameraPair>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
     confirm: Option<(String, Request)>,
@@ -346,6 +354,7 @@ impl App {
             keyring_policy: None,
             keyring_drift: None,
             nodes: irlume_camera::discover_nodes(),
+            pairs: irlume_camera::list_pairs(),
             activity: Vec::new(),
             input: None,
             confirm: None,
@@ -468,89 +477,99 @@ impl App {
     /// nodes only; all sub-millisecond, no subprocess spawns. Keeps the panel
     /// live without periodic UI hitches. SILENT (no Activity spam).
     fn refresh_light(&mut self) {
-        self.daemon_up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
-        self.health = match crate::daemon_request(&Request::Health) {
-            Ok(Response::Health {
-                tier,
-                rgb_dev,
-                ir_dev,
-                mesh,
-                adapter,
-                version,
-            }) => Some(HealthInfo {
-                tier,
-                rgb_dev,
-                ir_dev,
-                mesh,
-                adapter,
-                version,
-            }),
-            _ => None, // older daemon / daemon down → Repair falls back to local probes
-        };
-        match crate::daemon_request(&Request::ListProfiles {
-            user: self.user.clone(),
-        }) {
-            Ok(Response::Enrollment {
-                profiles,
-                require_eyes_open,
-                require_challenge,
-            }) => {
-                self.profiles = profiles;
-                self.eyes_open = require_eyes_open;
-                self.challenge = require_challenge;
-                self.enroll_error = None;
+        // Short-budget poll: if the daemon isn't answering (down, or busy
+        // mid-capture and not accepting), fail fast and skip the rest of the
+        // reads rather than stalling the UI thread on each one. Next tick retries.
+        self.daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
+        if self.daemon_up {
+            self.health = match crate::daemon_poll(&Request::Health) {
+                Ok(Response::Health {
+                    tier,
+                    rgb_dev,
+                    ir_dev,
+                    mesh,
+                    adapter,
+                    version,
+                }) => Some(HealthInfo {
+                    tier,
+                    rgb_dev,
+                    ir_dev,
+                    mesh,
+                    adapter,
+                    version,
+                }),
+                _ => None, // older daemon / daemon down → Repair falls back to local probes
+            };
+            match crate::daemon_poll(&Request::ListProfiles {
+                user: self.user.clone(),
+            }) {
+                Ok(Response::Enrollment {
+                    profiles,
+                    require_eyes_open,
+                    require_challenge,
+                }) => {
+                    self.profiles = profiles;
+                    self.eyes_open = require_eyes_open;
+                    self.challenge = require_challenge;
+                    self.enroll_error = None;
+                }
+                // A corrupt/unreadable enrollment (or a missing template key for an
+                // encrypted file) surfaces as an Error, not empty; don't silently
+                // show "no face enrolled"; capture it so Repair can flag+fix it.
+                Ok(Response::Error(e)) => self.enroll_error = Some(e),
+                _ => {}
             }
-            // A corrupt/unreadable enrollment (or a missing template key for an
-            // encrypted file) surfaces as an Error, not empty; don't silently
-            // show "no face enrolled"; capture it so Repair can flag+fix it.
-            Ok(Response::Error(e)) => self.enroll_error = Some(e),
-            _ => {}
-        }
-        // KeyringInfo adds the seal tier and PCR drift; an older daemon
-        // answers it with an error, so fall back to the plain armed bit.
-        match crate::daemon_request(&Request::KeyringInfo {
-            user: self.user.clone(),
-        }) {
-            Ok(Response::KeyringInfo {
-                armed,
-                policy,
-                drifted,
-                ..
-            }) => {
-                self.keyring_armed = Some(armed);
-                self.keyring_policy = policy;
-                self.keyring_drift = drifted;
+            // KeyringInfo adds the seal tier and PCR drift; an older daemon
+            // answers it with an error, so fall back to the plain armed bit.
+            match crate::daemon_poll(&Request::KeyringInfo {
+                user: self.user.clone(),
+            }) {
+                Ok(Response::KeyringInfo {
+                    armed,
+                    policy,
+                    drifted,
+                    ..
+                }) => {
+                    self.keyring_armed = Some(armed);
+                    self.keyring_policy = policy;
+                    self.keyring_drift = drifted;
+                }
+                _ => {
+                    self.keyring_armed = match crate::daemon_poll(&Request::HasSealedPassword {
+                        user: self.user.clone(),
+                    }) {
+                        Ok(Response::HasPassword(b)) => Some(b),
+                        _ => self.keyring_armed,
+                    };
+                    self.keyring_policy = None;
+                    self.keyring_drift = None;
+                }
             }
-            _ => {
-                self.keyring_armed = match crate::daemon_request(&Request::HasSealedPassword {
-                    user: self.user.clone(),
-                }) {
-                    Ok(Response::HasPassword(b)) => Some(b),
-                    _ => self.keyring_armed,
-                };
-                self.keyring_policy = None;
-                self.keyring_drift = None;
-            }
-        }
-        if let Ok(Response::RecoveryStatus {
-            encrypted,
-            recovery_set,
-            tpm_present,
-        }) = crate::daemon_request(&Request::RecoveryStatus {
-            user: self.user.clone(),
-        }) {
-            self.recovery = Some(RecoveryInfo {
+            if let Ok(Response::RecoveryStatus {
                 encrypted,
                 recovery_set,
                 tpm_present,
-            });
+            }) = crate::daemon_poll(&Request::RecoveryStatus {
+                user: self.user.clone(),
+            }) {
+                self.recovery = Some(RecoveryInfo {
+                    encrypted,
+                    recovery_set,
+                    tpm_present,
+                });
+            }
+        } else {
+            // Daemon down/unresponsive: show the down state; local probes below
+            // still run so Repair can diagnose.
+            self.health = None;
         }
         self.nodes = irlume_camera::discover_nodes();
+        self.pairs = irlume_camera::list_pairs();
         let max = self.rows().len().max(1);
         if self.sel >= max {
             self.sel = max - 1;
         }
-        let pairs = irlume_camera::list_pairs().len().max(1);
+        let pairs = self.pairs.len().max(1);
         if self.cam_sel >= pairs {
             self.cam_sel = pairs - 1;
         }
@@ -1171,6 +1190,7 @@ impl App {
             count: None,
             captured: 0,
             target,
+            base: 0,
         });
     }
 
@@ -1192,6 +1212,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (st, pn) = (stop.clone(), mc.profile.clone());
         let add = Some(mc.profile.clone());
+        let base = mc.added_scans.len(); // the merged scan(s), for a continuous count
         std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
         self.enroll = Some(EnrollUi {
             rx,
@@ -1201,27 +1222,38 @@ impl App {
             count: None,
             captured: 0,
             target: mc.remaining,
+            base,
         });
     }
 
     /// User declined the merge: remove the scan(s) scan 1 already added, so the
     /// cancel leaves the existing profile exactly as it was.
     fn cancel_enroll_merge(&mut self, mc: MergeConfirm) {
-        for scan in &mc.added_scans {
-            let _ = crate::daemon_request(&Request::DeleteScan {
-                user: self.user.clone(),
-                profile: mc.profile.clone(),
-                scan: scan.clone(),
-            });
-        }
         self.log(
             '·',
             format!(
-                "cancelled; '{}' is unchanged (a face can only own one profile)",
+                "cancelled; removing the scan added to '{}' (a face can only own one profile)",
                 mc.profile
             ),
         );
-        self.refresh();
+        // The split-protocol merge added exactly one scan (scan 1 was Enroll
+        // scans:1). Undo it async so a slow/wedged daemon can't hitch the UI,
+        // and so a delete failure surfaces instead of being silently ignored
+        // (which would leave the scan on the profile).
+        if let Some(scan) = mc.added_scans.into_iter().next() {
+            self.start_async(
+                "(undo merge)",
+                OpTag::Generic,
+                Request::DeleteScan {
+                    user: self.user.clone(),
+                    profile: mc.profile,
+                    scan,
+                },
+                map_confirm,
+            );
+        } else {
+            self.refresh();
+        }
     }
 
     fn poll(&mut self) {
@@ -1270,11 +1302,12 @@ impl App {
                         }
                     }
                     WMsg::Captured(n, t) => {
+                        let base = self.enroll.as_ref().map(|e| e.base).unwrap_or(0);
                         if let Some(e) = &mut self.enroll {
                             e.captured = n;
                             e.count = None;
                         }
-                        self.log('✓', format!("captured scan {n}/{t}"));
+                        self.log('✓', format!("captured scan {}/{}", n + base, t + base));
                     }
                     WMsg::Done => {
                         self.log('✓', "enrollment complete");
@@ -1653,7 +1686,7 @@ impl App {
     fn move_sel(&mut self, d: i32) {
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
-            SC_CAMERAS => irlume_camera::list_pairs().len(),
+            SC_CAMERAS => self.pairs.len(),
             _ => self.rows().len(),
         };
         let n = len.max(1) as i32;
@@ -1711,16 +1744,23 @@ impl App {
             // Cameras: switch the active pair; persists to /etc, so it's a root
             // op that suspends to `sudo irlume set-cameras`.
             (SC_CAMERAS, KeyCode::Enter) => {
-                let pairs = irlume_camera::list_pairs();
-                if let Some(p) = pairs.get(self.cam_sel) {
-                    self.log(
-                        '→',
-                        format!(
-                            "sudo irlume set-cameras {} {} (you'll be asked for your password)",
-                            p.rgb, p.ir
-                        ),
-                    );
-                    self.suspend = Some(Suspend::SetCameras(p.rgb.clone(), p.ir.clone()));
+                // Use the cached pairs (clone the selected one so self stays
+                // free for the log/suspend below).
+                match self.pairs.get(self.cam_sel).cloned() {
+                    Some(p) => {
+                        self.log(
+                            '→',
+                            format!(
+                                "sudo irlume set-cameras {} {} (you'll be asked for your password)",
+                                p.rgb, p.ir
+                            ),
+                        );
+                        self.suspend = Some(Suspend::SetCameras(p.rgb.clone(), p.ir.clone()));
+                    }
+                    None => self.log(
+                        '·',
+                        "no paired Hello camera to switch to (an RGB-only device has no pair)",
+                    ),
                 }
             }
             // Repair: re-run checks, fix the selected issue, or run a live IR test.
@@ -1764,11 +1804,10 @@ impl App {
             ),
             // Profiles.
             (SC_PROFILES, KeyCode::Char('e')) => self.begin_enroll(),
-            (SC_PROFILES, KeyCode::Char('a')) => {
-                if let Some(p) = self.sel_profile() {
-                    self.start_enroll(Some(p));
-                }
-            }
+            (SC_PROFILES, KeyCode::Char('a')) => match self.sel_profile() {
+                Some(p) => self.start_enroll(Some(p)),
+                None => self.log('·', "select a profile first (↑↓), then [a] to add scans"),
+            },
             (SC_PROFILES, KeyCode::Char('r')) => self.begin_rename(),
             (SC_PROFILES, KeyCode::Char('d')) => self.begin_delete(),
             // Identify: 1:N who-is-this.
@@ -2092,6 +2131,7 @@ impl App {
             count: None,
             captured: 0,
             target: ENROLL_SCANS,
+            base: 0,
         });
     }
 
@@ -2298,7 +2338,9 @@ impl App {
             Line::from(Span::styled(
                 format!(
                     "Enrolling '{}' (scan {}/{})",
-                    e.profile, e.captured, e.target
+                    e.profile,
+                    e.captured + e.base,
+                    e.target + e.base
                 ),
                 Style::new().add_modifier(Modifier::BOLD),
             )),
@@ -2475,7 +2517,7 @@ impl App {
         let [list_area, info_area] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).areas(area);
         let (argb, air) = irlume_camera::select_pair(); // currently active pair
-        let pairs = irlume_camera::list_pairs();
+        let pairs = &self.pairs;
 
         // ---- selectable list of trusted (physical) Hello camera pairs ----
         // No pair ≠ no camera: an RGB-only device still serves the convenience

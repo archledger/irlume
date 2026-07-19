@@ -136,8 +136,9 @@ fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
         InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
             run_pkg("dnf", &["remove", "-y", "irlume"])
         }
+        // purge, not remove, so any packaged conffiles go too (nothing left).
         InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
-            run_pkg("apt-get", &["remove", "-y", "irlume"])
+            run_pkg("apt-get", &["purge", "-y", "irlume"])
         }
         InstallOrigin::ArchPkg => run_pkg("pacman", &["-R", "--noconfirm", "irlume"]),
         InstallOrigin::Source => remove_source_files(),
@@ -209,10 +210,21 @@ fn clean_residuals(origin: &InstallOrigin) {
         let _ = std::fs::remove_dir_all(d);
     }
     // The install channel the installer added, so nothing on the box still
-    // points at irlume. (A source install added no repo.)
+    // points at irlume. (A source install and an AUR/pacman install add no
+    // repo; the Fedora Copr repo and the Ubuntu PPA do.)
     match origin {
         InstallOrigin::Copr => remove_repo_files("/etc/yum.repos.d"),
-        InstallOrigin::Ppa => remove_repo_files("/etc/apt/sources.list.d"),
+        InstallOrigin::Ppa => {
+            // The PPA leaves both a sources file and a signing key.
+            remove_repo_files("/etc/apt/sources.list.d");
+            for d in [
+                "/etc/apt/trusted.gpg.d",
+                "/etc/apt/keyrings",
+                "/usr/share/keyrings",
+            ] {
+                remove_repo_files(d);
+            }
+        }
         _ => {}
     }
 }

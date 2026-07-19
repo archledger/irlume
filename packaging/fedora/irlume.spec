@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.2.1
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -144,6 +144,25 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sun Jul 19 2026 archledger <archledger236@gmail.com> - 0.3.0-1
+- New: `irlume uninstall` (CLI and TUI) removes irlume the way it was installed,
+  un-wiring PAM and stopping the daemon first so a box is never left locked out,
+  then removing the package (dnf/apt/pacman/source) and cleaning residual repo
+  and drop-in files. The TUI asks for a typed-word confirmation.
+- New: opt-in third-party liveness models via `irlume models`, fetched from the
+  publisher on the operator's machine, SHA-256 pinned, never shipped or warranted;
+  wired deny-only. See ADR-0001 criterion 4 and docs/pad-results.
+- New: NixOS module (`nixosModules.irlume`) with per-greeter PAM wiring.
+- Merge-aware enrollment reaches the TUI: enrolling a face already known adds the
+  scans to that profile instead of creating a duplicate; one face is one profile.
+- Fixed: on Arch the IR emitter self-heals at daemon startup, and the PAM
+  include-layout wiring is corrected.
+- Fixed: the PCR-signature parser rejects non-ASCII hex instead of panicking
+  (root-daemon hardening, found by fuzzing).
+- A batch of TUI fixes from a full micro-audit: deliberate y/n confirmations,
+  correct merge-prompt rendering, a static footer with a scrollable activity
+  panel, and scroll-handling fixes.
+
 * Wed Jul 16 2026 archledger <archledger236@gmail.com> - 0.2.1-1
 - irlume enroll now merges into the profile the captured face already matches,
   adding the scans instead of refusing with "this face is already enrolled".

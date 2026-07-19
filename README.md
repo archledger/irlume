@@ -65,7 +65,7 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 
 ## 📦 Install
 
-> **v0.2.1.** Works end-to-end on real hardware across all three families. Not
+> **v0.3.0.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass); see [Honest limitations](#-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM; the distros below are
@@ -397,11 +397,19 @@ default IR-structure gate already rejects photos, screens, and video replays.
 
 ## 🛠️ Status
 
-**v0.2.1: working, validated on real hardware** across Fedora (full IR Secure tier,
+**v0.3.0: working, validated on real hardware** across Fedora (full IR Secure tier,
 end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
-CLI/daemon on a camera-less testbed). Packaged for all three families — Fedora via Copr,
+CLI/daemon on a camera-less testbed). Packaged for all three families: Fedora via Copr,
 Arch via the [AUR](https://aur.archlinux.org/packages/irlume), Ubuntu via the PPA (see
 [Install](#-install)).
+
+0.3.0 adds `irlume uninstall`, which removes irlume the way it was installed and un-wires
+PAM first so a box is never left locked out; opt-in third-party liveness models via `irlume
+models` (fetched from the publisher, SHA-256 pinned, never shipped, wired deny-only); a
+NixOS module (`nixosModules.irlume`); and merge-aware enrollment in the TUI, so enrolling a
+known face adds scans to that profile instead of making a duplicate. It also carries a batch
+of TUI fixes from a full micro-audit and a fuzz-found parser hardening in the PCR-signature
+path.
 
 0.2.0 removes the last non-permissive model, the research-only-trained IR adapter, so the
 **entire shipped model stack is now MIT/Apache-2.0**; the default IR path is raw AuraFace

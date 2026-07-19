@@ -16,3 +16,4 @@ models/face_landmark.onnx.legacy-192
 irlume_*.deb
 .arch-build
 irlume-*.pkg.tar.zst
+result

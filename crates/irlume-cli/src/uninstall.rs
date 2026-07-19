@@ -110,10 +110,14 @@ pub fn run(args: &[String]) -> ExitCode {
     // this process exits).
     println!();
     let origin = install_origin();
-    match remove_irlume(&origin) {
+    let removed = remove_irlume(&origin);
+    // Clean the leftovers a package `remove` doesn't (drop-in, empty dirs, repo)
+    // regardless of whether the package removal itself succeeded.
+    clean_residuals(&origin);
+    match removed {
         Ok(what) => {
             println!("[uninstall] {what}");
-            println!("[uninstall] irlume is removed. This is the last thing it will do.");
+            println!("[uninstall] irlume is removed, with no repo, drop-in, or data left behind.");
         }
         Err(e) => {
             println!("[uninstall] could not finish removal automatically: {e}");
@@ -132,8 +136,9 @@ fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
         InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
             run_pkg("dnf", &["remove", "-y", "irlume"])
         }
+        // purge, not remove, so any packaged conffiles go too (nothing left).
         InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
-            run_pkg("apt-get", &["remove", "-y", "irlume"])
+            run_pkg("apt-get", &["purge", "-y", "irlume"])
         }
         InstallOrigin::ArchPkg => run_pkg("pacman", &["-R", "--noconfirm", "irlume"]),
         InstallOrigin::Source => remove_source_files(),
@@ -190,6 +195,54 @@ fn remove_source_files() -> Result<String, String> {
         return Err("found no source-installed files to remove (already gone?)".into());
     }
     Ok(format!("removed {removed} source-installed file(s)"))
+}
+
+/// Remove irlume artifacts a package `remove` leaves behind, so "uninstall"
+/// leaves nothing: the admin-created `logs debug on` systemd drop-in (not
+/// package-owned), empty share dirs a package manager can leave, and the
+/// install channel (repo) the installer added. Runs for every install method.
+fn clean_residuals(origin: &InstallOrigin) {
+    // `irlume logs debug on` drops this in; it survives a package remove.
+    let _ = std::fs::remove_dir_all("/etc/systemd/system/irlumed.service.d");
+    let _ = systemctl(&["daemon-reload"]);
+    // Empty model/onnxruntime dirs a package remove can leave behind.
+    for d in ["/usr/share/irlume", "/usr/local/share/irlume"] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    // The install channel the installer added, so nothing on the box still
+    // points at irlume. (A source install and an AUR/pacman install add no
+    // repo; the Fedora Copr repo and the Ubuntu PPA do.)
+    match origin {
+        InstallOrigin::Copr => remove_repo_files("/etc/yum.repos.d"),
+        InstallOrigin::Ppa => {
+            // The PPA leaves both a sources file and a signing key.
+            remove_repo_files("/etc/apt/sources.list.d");
+            for d in [
+                "/etc/apt/trusted.gpg.d",
+                "/etc/apt/keyrings",
+                "/usr/share/keyrings",
+            ] {
+                remove_repo_files(d);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Delete files under `dir` whose name mentions irlume: the Copr `.repo` or the
+/// PPA `.list` the installer added.
+fn remove_repo_files(dir: &str) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("irlume")
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI

@@ -548,6 +548,12 @@ pub(crate) fn daemon_request(
     )
 }
 
+/// A short-budget status poll (TUI periodic refresh): a busy/wedged daemon fails
+/// fast instead of stalling the UI for the full connect/read budget.
+pub(crate) fn daemon_poll(req: &irlume_common::Request) -> Result<irlume_common::Response, String> {
+    irlume_common::client::request_poll(req).map_err(|e| e.to_string())
+}
+
 pub(crate) fn user_arg(args: &[String]) -> String {
     flag(args, "--user")
         .map(str::to_string)

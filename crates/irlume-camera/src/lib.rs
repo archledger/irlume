@@ -399,6 +399,7 @@ pub fn capabilities() -> Caps {
 }
 
 /// A physical Hello camera exposing both an RGB and an IR node.
+#[derive(Clone)]
 pub struct CameraPair {
     pub rgb: String,
     pub ir: String,

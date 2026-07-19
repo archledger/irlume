@@ -19,6 +19,10 @@ use zeroize::Zeroize;
 /// Bounded wait for the initial connect (distinct from the read timeout, which
 /// must be long enough for a camera capture).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Short budgets for the TUI status poll, so a wedged daemon doesn't freeze the
+/// UI: fail fast and let the next tick retry.
+const POLL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
+const POLL_RW_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Default read/write timeout for management requests.
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -34,10 +38,25 @@ pub fn request(req: &Request) -> io::Result<Response> {
     request_with_timeout(req, DEFAULT_RW_TIMEOUT)
 }
 
+/// A short-budget poll: used by the TUI's periodic status refresh so a busy or
+/// wedged daemon (mid-capture, not accepting) fails fast instead of stalling the
+/// UI thread for the full connect/read budget on every probe.
+pub fn request_poll(req: &Request) -> io::Result<Response> {
+    request_with_timeouts(req, POLL_CONNECT_TIMEOUT, POLL_RW_TIMEOUT)
+}
+
 /// Send `req`, allowing `rw_timeout` for the reply (e.g. a longer budget for an
 /// unseal that does a full camera capture + liveness + match first).
 pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<Response> {
-    let stream = connect_with_timeout(&socket_path(), CONNECT_TIMEOUT).map_err(|e| {
+    request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
+}
+
+fn request_with_timeouts(
+    req: &Request,
+    connect_timeout: Duration,
+    rw_timeout: Duration,
+) -> io::Result<Response> {
+    let stream = connect_with_timeout(&socket_path(), connect_timeout).map_err(|e| {
         // A missing socket / nobody listening is the #1 first-run failure
         // (fresh package install, unit disabled by distro preset policy), so
         // name the daemon and the exact command instead of "os error 2".

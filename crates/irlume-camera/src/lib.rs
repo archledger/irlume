@@ -1470,14 +1470,13 @@ mod tests {
     fn select_pair_env_override_wins() {
         // The explicit env pair short-circuits discovery entirely (no device
         // scan), so this is deterministic on any machine.
-        std::env::set_var("IRLUME_RGB_DEVICE", "/dev/irlume-test-rgb");
-        std::env::set_var("IRLUME_IR_DEVICE", "/dev/irlume-test-ir");
+        let _lock = env_lock();
+        let _r = EnvGuard::set("IRLUME_RGB_DEVICE", "/dev/irlume-test-rgb");
+        let _i = EnvGuard::set("IRLUME_IR_DEVICE", "/dev/irlume-test-ir");
         assert_eq!(
             select_pair(),
             ("/dev/irlume-test-rgb".into(), "/dev/irlume-test-ir".into())
         );
-        std::env::remove_var("IRLUME_RGB_DEVICE");
-        std::env::remove_var("IRLUME_IR_DEVICE");
     }
 
     #[test]
@@ -1509,12 +1508,120 @@ mod tests {
     // Env-gated: CI loads v4l2loopback, feeds the nodes with ffmpeg test
     // patterns (YUYV 640x480 / GREY 640x400), and exports the two vars.
     // Without them the tests return immediately (and are #[ignore]d anyway).
+    // A THIRD node, IRLUME_TEST_SPARE_DEVICE, has NO CI-side feeder: tests
+    // that need a specific pattern (static for the frozen-stream detector,
+    // alternating for strobe pairing) spawn their own ffmpeg against it and
+    // kill the child on drop. Spare-node tests own that node exclusively;
+    // CI runs the gated suite with --test-threads=1.
 
     fn loopback_pair() -> Option<(String, String)> {
         Some((
             std::env::var("IRLUME_TEST_RGB_DEVICE").ok()?,
             std::env::var("IRLUME_TEST_IR_DEVICE").ok()?,
         ))
+    }
+
+    fn spare_device() -> Option<String> {
+        std::env::var("IRLUME_TEST_SPARE_DEVICE").ok()
+    }
+
+    /// Serializes tests that mutate process-global env vars (cargo runs tests
+    /// on threads, and setters would otherwise race readers in other tests).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII env-var override: restores the previous value (or absence) on
+    /// drop, so a panicking assertion cannot leak state into later tests.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Extend the exact-path virtual-camera escape with `device` for the
+    /// test's lifetime (`verify_pinned` refuses loopback nodes otherwise),
+    /// preserving whatever allowlist the harness already exported. Caller
+    /// must hold `env_lock`.
+    fn allow_virtual(device: &str) -> EnvGuard {
+        const KEY: &str = "IRLUME_TEST_ALLOW_VIRTUAL_CAMERA";
+        let val = match std::env::var(KEY) {
+            Ok(p) if !p.trim().is_empty() => format!("{p},{device}"),
+            _ => device.to_string(),
+        };
+        EnvGuard::set(KEY, &val)
+    }
+
+    /// A self-managed ffmpeg feed into the spare loopback node. Killed and
+    /// reaped on drop, so even a panicking test never leaks a feeder into the
+    /// next spare-node scenario.
+    struct FfmpegFeeder(std::process::Child);
+
+    impl FfmpegFeeder {
+        /// Feed `device` GREY frames from a lavfi source description (the IR
+        /// node format). ffmpeg exists wherever the loopback env is set (a
+        /// harness guarantee; the CI-fed nodes use the same binary).
+        fn spawn(device: &str, lavfi: &str) -> Self {
+            let child = std::process::Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-re",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    lavfi,
+                    "-pix_fmt",
+                    "gray",
+                    "-f",
+                    "v4l2",
+                    device,
+                ])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ffmpeg feeder");
+            let mut feeder = FfmpegFeeder(child);
+            // Let it attach to the node, and fail loudly if it exited (bad
+            // filter graph / device): a capture against an unfed loopback
+            // node blocks indefinitely, which would present as a test hang.
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Some(status) = feeder.0.try_wait().expect("poll feeder") {
+                    panic!("ffmpeg feeder exited early ({status}); lavfi source: {lavfi}");
+                }
+            }
+            feeder
+        }
+    }
+
+    impl Drop for FfmpegFeeder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[test]
@@ -1603,9 +1710,9 @@ mod tests {
 
     #[test]
     fn virtual_camera_escape_is_exact_path_only() {
-        // Distinct env vars from select_pair_env_override_wins, so no race.
         // The escape must match the exact device path, nothing looser.
-        std::env::set_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/null, /dev/zero");
+        let _lock = env_lock();
+        let _esc = EnvGuard::set("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/null, /dev/zero");
         assert!(
             verify_pinned("/dev/null").is_ok(),
             "an exactly-listed existing node passes the escape"
@@ -1620,6 +1727,295 @@ mod tests {
             verify_pinned("/dev/null").is_err(),
             "a prefix must not satisfy the exact-path escape"
         );
-        std::env::remove_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA");
+    }
+
+    #[test]
+    fn select_pair_persisted_conf_and_discovery_fallback() {
+        let _lock = env_lock();
+        let _rgb_env = EnvGuard::unset("IRLUME_RGB_DEVICE");
+        let _ir_env = EnvGuard::unset("IRLUME_IR_DEVICE");
+        let dir = std::env::temp_dir().join(format!("irlume-selpair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _conf = EnvGuard::set("IRLUME_CONFIG_DIR", dir.to_str().unwrap());
+
+        // With no env override, no persisted pair and no discoverable Hello
+        // pair, the compiled defaults come back. Loopback nodes can never form
+        // a pair (no USB descriptors in sysfs), so this holds on CI; a dev box
+        // with a real Hello camera legitimately discovers its own pair
+        // instead, so the fallback asserts are skipped there.
+        if list_pairs().is_empty() {
+            assert_eq!(
+                select_pair(),
+                (
+                    DEFAULT_RGB_DEVICE.to_string(),
+                    DEFAULT_IR_DEVICE.to_string()
+                )
+            );
+        }
+
+        // A persisted pair whose nodes are GONE (stale cameras.conf after a
+        // USB re-shuffle) is ignored rather than trusted.
+        std::fs::write(
+            dir.join("cameras.conf"),
+            "rgb=/dev/irlume-gone0\nir=/dev/irlume-gone1\n",
+        )
+        .unwrap();
+        if list_pairs().is_empty() {
+            assert_eq!(
+                select_pair(),
+                (
+                    DEFAULT_RGB_DEVICE.to_string(),
+                    DEFAULT_IR_DEVICE.to_string()
+                )
+            );
+        }
+
+        // A persisted pair whose nodes EXIST wins over discovery and defaults.
+        // /dev/null and /dev/zero exist everywhere; select_pair checks only
+        // existence here (classification happened when the pair was written).
+        std::fs::write(dir.join("cameras.conf"), "rgb=/dev/null\nir=/dev/zero\n").unwrap();
+        assert_eq!(
+            select_pair(),
+            ("/dev/null".to_string(), "/dev/zero".to_string())
+        );
+
+        // A blank env override must not shadow the persisted pair...
+        {
+            let _r = EnvGuard::set("IRLUME_RGB_DEVICE", "");
+            let _i = EnvGuard::set("IRLUME_IR_DEVICE", "  ");
+            assert_eq!(
+                select_pair(),
+                ("/dev/null".to_string(), "/dev/zero".to_string())
+            );
+        }
+        // ...but a real one beats it, without an existence check (explicit
+        // operator intent).
+        let _r = EnvGuard::set("IRLUME_RGB_DEVICE", "/dev/irlume-env-rgb");
+        let _i = EnvGuard::set("IRLUME_IR_DEVICE", "/dev/irlume-env-ir");
+        assert_eq!(
+            select_pair(),
+            (
+                "/dev/irlume-env-rgb".to_string(),
+                "/dev/irlume-env-ir".to_string()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_raw_bursts_report_shape_and_monotonic_timing() {
+        let Some((_, ir)) = loopback_pair() else {
+            return;
+        };
+        let timed = ir_probe::capture_raw_burst_timed(&ir, 5).expect("timed burst");
+        assert_eq!(timed.len(), 5);
+        let mut prev = -1.0f64;
+        for (f, ms) in &timed {
+            assert_eq!((f.width, f.height), (IR_W, IR_H));
+            assert_eq!(f.spectrum, Spectrum::Ir);
+            assert!(f.data.len() >= (IR_W * IR_H) as usize);
+            assert!(ms.is_finite() && *ms >= 0.0, "bad timestamp {ms}");
+            assert!(
+                *ms >= prev,
+                "timestamps must be monotonic: {ms} after {prev}"
+            );
+            prev = *ms;
+        }
+        // Five distinct frames from a paced live feed cannot all be dequeued
+        // at one instant: the window must have real width.
+        assert!(
+            timed.last().unwrap().1 > timed.first().unwrap().1,
+            "a live feed must spread dequeues over time"
+        );
+
+        // The untimed variant is the same capture minus the timing column.
+        let frames = ir_probe::capture_raw_burst(&ir, 3).expect("raw burst");
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_eq!((f.width, f.height), (IR_W, IR_H));
+            assert_eq!(f.spectrum, Spectrum::Ir);
+            assert!(f.data.len() >= (IR_W * IR_H) as usize);
+        }
+        // n = 0 is a valid degenerate request: open, arm, deliver nothing.
+        assert!(ir_probe::capture_raw_burst(&ir, 0)
+            .expect("empty burst")
+            .is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_ir_stats_flag_off_returns_the_raw_brightest_frame() {
+        let _lock = env_lock();
+        let Some((_, ir)) = loopback_pair() else {
+            return;
+        };
+        let _sub = EnvGuard::unset("IRLUME_IR_AMBIENT_SUBTRACT");
+        let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
+        // Stats contract: per-frame mean extremes over the fixed-size burst,
+        // byte-ranged, min <= max. None of it depends on an emitter: a
+        // loopback node has no UVC extension unit, so ir_emitter::enable finds
+        // no control and returns false, and the burst statistics are computed
+        // regardless.
+        assert_eq!(stats.burst_frames, IR_BURST);
+        assert!(stats.ambient_mean >= 0.0 && stats.lit_mean <= 255.0);
+        assert!(
+            stats.ambient_mean <= stats.lit_mean,
+            "ambient (burst min {}) must not exceed lit (burst max {})",
+            stats.ambient_mean,
+            stats.lit_mean
+        );
+        // With the subtraction flag unset, the ambient-pairing block is dead
+        // code and the returned frame IS the brightest raw burst frame: its
+        // recomputed mean equals lit_mean (only f32 rounding apart). A
+        // refactor that subtracts by default, or picks any frame other than
+        // the max-mean one, breaks this.
+        let mean = ir_probe::mean(&frame.data);
+        assert!(
+            (mean - stats.lit_mean as f64).abs() < 0.01,
+            "returned frame mean {mean:.3} != lit_mean {}",
+            stats.lit_mean
+        );
+    }
+
+    #[test]
+    #[ignore = "needs an unfed v4l2loopback node; set IRLUME_TEST_SPARE_DEVICE (CI does this)"]
+    fn loopback_frozen_static_feed_starves_the_sequence_window() {
+        // A bit-identical feed simulates the stalled-sensor failure the
+        // detector was built for (streams observed locking to a constant
+        // mid-grey). Expected arithmetic, from capture_ir_sequence: the first
+        // frame is accepted (no previous signature), every repeat is frozen,
+        // two frozen frames trigger a stream restart (budget 4), and each
+        // restart clears last_sig so exactly one more frame is accepted. A
+        // 6-sample window on a fully static feed therefore returns Ok with
+        // exactly 1 + 4 = 5 frames: a SHORT window, never an error.
+        let _lock = env_lock();
+        let Some(spare) = spare_device() else {
+            return;
+        };
+        let _sub = EnvGuard::unset("IRLUME_IR_AMBIENT_SUBTRACT");
+        let _esc = allow_virtual(&spare);
+        let _feeder = FfmpegFeeder::spawn(&spare, "color=c=gray:size=640x400:rate=15");
+
+        // The single-shot path has no frozen gate: a static feed still yields
+        // a frame (this also blocks until the feeder's frames actually flow).
+        let (frame, _) = capture_ir_with_stats(&spare).expect("static feed single capture");
+        let mean = ir_probe::mean(&frame.data);
+        assert!(
+            (10.0..245.0).contains(&mean),
+            "harness: the static gray feed must sit inside the frozen \
+             detector's normal-exposure band, got mean {mean:.1}"
+        );
+
+        let seq = capture_ir_sequence(&spare, 6, 1).expect("sequence returns Ok, not Err");
+        assert_eq!(
+            seq.len(),
+            5,
+            "static feed: 1 initial accept + 1 per stream restart (budget 4)"
+        );
+        for f in &seq {
+            assert_eq!((f.width, f.height), (IR_W, IR_H));
+            assert_eq!(f.spectrum, Spectrum::Ir);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an unfed v4l2loopback node; set IRLUME_TEST_SPARE_DEVICE (CI does this)"]
+    fn loopback_ambient_subtract_pairs_strobe_frames() {
+        // Simulated strobing emitter: frames alternate dark/lit (luma 40/200
+        // before any range conversion), the exact lit/off adjacency the opt-in
+        // ambient subtraction pairs up.
+        let _lock = env_lock();
+        let Some(spare) = spare_device() else {
+            return;
+        };
+        let _esc = allow_virtual(&spare);
+        let _sub = EnvGuard::set("IRLUME_IR_AMBIENT_SUBTRACT", "1");
+        let _feeder = FfmpegFeeder::spawn(
+            &spare,
+            "color=c=black:size=640x400:rate=15,geq=lum='40+160*mod(N,2)'",
+        );
+        let (frame, stats) = capture_ir_with_stats(&spare).expect("strobed capture");
+        // Harness sanity, asserted so a drifting feed fails loudly instead of
+        // silently testing the wrong branch: the alternation must present a
+        // real strobe gap above the low-ambient floor.
+        let (lit, amb) = (stats.lit_mean as f64, stats.ambient_mean as f64);
+        assert!(
+            lit - amb > STROBE_MIN_GAP,
+            "harness: strobe gap {:.1} too small to reach the subtract branch",
+            lit - amb
+        );
+        assert!(
+            amb >= LOW_AMBIENT_SKIP,
+            "harness: ambient {amb:.1} under the skip floor"
+        );
+        // Contract: the returned frame is lit-minus-ambient, not the raw lit
+        // frame. The synthetic frames are uniform, so the subtracted mean
+        // equals lit_mean - ambient_mean (driver padding bytes are constant
+        // and cancel; no pixel clamps because lit > ambient everywhere).
+        let mean = ir_probe::mean(&frame.data);
+        assert!(
+            (mean - (lit - amb)).abs() < 2.0,
+            "subtracted frame mean {mean:.1} != lit-ambient {:.1}",
+            lit - amb
+        );
+        assert!(
+            mean < lit - STROBE_MIN_GAP,
+            "frame mean {mean:.1} still at the raw lit level {lit:.1}; subtraction was not applied"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_busy_error_names_a_holding_process() {
+        let Some((_, ir)) = loopback_pair() else {
+            return;
+        };
+        // Hold the node open ourselves so /proc provably contains at least one
+        // holder this uid can see (the CI feeder also holds it; whichever the
+        // scan finds first is fine). Read-only open, no streaming: nothing on
+        // /dev/video0..9 is touched.
+        let _held = std::fs::File::open(&ir).expect("open the fed IR node read-only");
+        let msg = map_io(&ir, std::io::Error::from_raw_os_error(16)).to_string();
+        assert!(msg.contains("camera busy"), "{msg}");
+        assert!(
+            msg.contains("in use by"),
+            "expected the named-holder arm, got: {msg}"
+        );
+        assert!(msg.contains("pid "), "holder must carry a pid: {msg}");
+        assert!(
+            !msg.contains("another app is using it"),
+            "anonymous fallback used despite a live holder: {msg}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_nodes_classify_by_fed_format_with_no_identity_or_privacy() {
+        let Some((rgb, ir)) = loopback_pair() else {
+            return;
+        };
+        // Classification keys purely on the advertised FourCC: the YUYV-fed
+        // node is an RGB camera, the GREY-fed node its IR companion.
+        assert_eq!(classify(&rgb), Role::Rgb);
+        assert_eq!(classify(&ir), Role::Ir);
+        // Loopback nodes expose no V4L2_CID_PRIVACY control; the shutter check
+        // degrades to "not engaged" instead of blocking capture.
+        assert!(!privacy_engaged(&rgb));
+        assert!(!privacy_engaged(&ir));
+        // No USB descriptors anywhere up the sysfs chain: no stable identity
+        // to bind an enrollment to.
+        assert_eq!(device_identity(&rgb), None);
+        assert_eq!(device_identity(&ir), None);
+        // And WITHOUT the exact-path escape, the anti-injection pin refuses a
+        // virtual node outright: the very attack the escape documents.
+        let _lock = env_lock();
+        let _esc = EnvGuard::unset("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA");
+        let err = verify_pinned(&ir).unwrap_err().to_string();
+        assert!(
+            err.contains("refusing"),
+            "virtual node must be refused: {err}"
+        );
     }
 }

@@ -8,7 +8,11 @@ license.workspace = true
 name = "pam_irlume"
 # PAM modules are C-ABI shared objects loaded by libpam into the host
 # (login/sudo/sshd/display-manager). Produces pam_irlume.so.
-crate-type = ["cdylib"]
+# "lib" is additionally listed so `cargo test -p irlume-pam` builds the cdylib
+# too (cargo skips a cdylib-only lib target when compiling tests; with both
+# types the one rustc invocation emits both), which the pam_wrapper
+# integration tests (tests/pamwrap.rs) load through a real PAM stack.
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 irlume-common.workspace = true

@@ -169,11 +169,9 @@ fn set_0600(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // The override env vars are process-global; serialize the tests that mutate
-    // them so parallel `cargo test` runs don't clobber each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // The override env vars are process-global; the crate-wide lock stops
+    // cross-module races too (keyring tests mutate their own override).
+    use crate::testenv::ENV_LOCK;
 
     #[test]
     fn paths_under_override_dirs() {
@@ -212,7 +210,7 @@ mod tests {
     /// Full TPM-backed lifecycle: seal a key, recovery-wrap it, simulate a PCR
     /// move by forgetting the seal, then restore from the passphrase.
     #[test]
-    #[ignore = "requires real TPM (/dev/tpmrm0)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_key_and_recovery_lifecycle() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/tmp/irlume-tk-rt");

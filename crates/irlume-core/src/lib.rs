@@ -115,3 +115,12 @@ mod tests {
         assert!(scaled_threshold(0.55, 100_000) <= 0.55 + TEMPLATE_SCALE_MAX_BUMP + 1e-6);
     }
 }
+
+/// One crate-wide lock for tests that mutate process-global environment
+/// variables (IRLUME_KEYRING_DIR, IRLUME_TEMPLATE_KEY_DIR, ...): env is shared
+/// across the whole test binary, so per-module locks cannot stop cross-module
+/// races when the parallel runner interleaves them.
+#[cfg(test)]
+pub(crate) mod testenv {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

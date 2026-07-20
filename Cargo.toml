@@ -43,11 +43,11 @@ thiserror  = "2"
 zeroize    = { version = "1", features = ["derive"] }
 tss-esapi  = "7.5"      # TPM 2.0 seal/unseal of the keyring secret
 base64     = "0.22"     # envelope blob encoding
-sha2       = "0.10"     # PolicyAuthorize digest math (signed-PCR path)
+sha2       = "0.11"     # PolicyAuthorize digest math (signed-PCR path)
 rsa        = { version = "0.9", features = ["sha2"] }  # parse systemd PCR-signing pubkey
 aes-gcm    = "0.11"     # AES-256-GCM for template-at-rest encryption
 argon2     = "0.5"      # Argon2id KDF for the recovery passphrase
-rand       = "0.8"      # CSPRNG for template keys, nonces, recovery salts
+rand       = "0.10"      # CSPRNG for template keys, nonces, recovery salts
 libc       = "0.2"      # mlock/madvise (memlock), NSS getpwnam_r, SO_PEERCRED
 rustfft    = "6"        # 2D FFT for the RGB-only moiré/screen-replay PAD cue
 

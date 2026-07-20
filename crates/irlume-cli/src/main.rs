@@ -1767,7 +1767,7 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         let file_sha12 = |p: &str| -> serde_json::Value {
             match std::fs::read(p) {
                 Ok(b) => {
-                    let d = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&b));
+                    let d = irlume_common::thirdparty::sha256_hex(&b);
                     d[..12].to_string().into()
                 }
                 Err(_) => serde_json::Value::Null,

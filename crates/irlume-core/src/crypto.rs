@@ -11,7 +11,7 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use irlume_common::{Error, Result};
-use rand::RngCore;
+use rand::Rng;
 use zeroize::Zeroizing;
 
 pub const KEY_LEN: usize = 32;
@@ -22,7 +22,7 @@ const TAG_LEN: usize = 16;
 /// A fresh random 256-bit key, zeroized on drop.
 pub fn generate_key() -> Zeroizing<Vec<u8>> {
     let mut key = Zeroizing::new(vec![0u8; KEY_LEN]);
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     irlume_common::memlock::lock_slice(&key);
     key
 }
@@ -39,7 +39,7 @@ pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         Aes256Gcm::new_from_slice(key).map_err(|e| Error::Tpm(format!("aes init: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from(nonce_bytes);
 
     let ct = cipher

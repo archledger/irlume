@@ -40,10 +40,10 @@ pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| Error::Tpm(format!("aes encrypt: {e}")))?;
 
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
@@ -66,13 +66,16 @@ pub fn decrypt(key: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         return Err(Error::Policy("encrypted blob too short".into()));
     }
     let (nonce_bytes, ct) = blob.split_at(NONCE_LEN);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    // Length is guaranteed by the split above; try_from replaces the
+    // deprecated from_slice in aes-gcm 0.11.
+    let nonce = Nonce::try_from(nonce_bytes)
+        .map_err(|_| Error::Policy("encrypted blob has malformed nonce".into()))?;
 
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| Error::Tpm(format!("aes init: {e}")))?;
 
     let plain = cipher
-        .decrypt(nonce, ct)
+        .decrypt(&nonce, ct)
         .map_err(|_| Error::Policy("decryption failed (wrong key or tampered data)".into()))?;
     irlume_common::memlock::lock_slice(&plain);
     Ok(Zeroizing::new(plain))

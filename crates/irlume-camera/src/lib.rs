@@ -866,6 +866,23 @@ pub mod ir_probe {
     }
 }
 
+/// Sparse content signature for the frozen-stream detector: up to 64 bytes
+/// sampled at a fixed stride across the frame. Verbatim extraction from
+/// [`capture_ir_sequence`] (the former `sig_of` closure) so the pure logic is
+/// unit-testable without a camera; zero behavior change.
+pub(crate) fn frame_signature(data: &[u8]) -> Vec<u8> {
+    let stride = (data.len() / 64).max(1);
+    data.iter().step_by(stride).take(64).copied().collect()
+}
+
+/// Frozen-stream predicate: BIT-IDENTICAL consecutive signatures on a frame
+/// whose mean sits in the normal exposure band (saturated / near-black frames
+/// are optical states, not a stall). Verbatim extraction of the `frozen`
+/// expression in [`capture_ir_sequence`] as a test seam; zero behavior change.
+pub(crate) fn frame_frozen(best_mean: f64, sig: &[u8], last_sig: Option<&[u8]>) -> bool {
+    (10.0..245.0).contains(&best_mean) && last_sig == Some(sig)
+}
+
 /// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for
 /// temporal liveness (the blink challenge). Unlike [`capture_ir`], the eyes-closed
 /// dip of a blink must survive, so this returns every sample rather than only the
@@ -907,10 +924,7 @@ pub fn capture_ir_sequence(
     // repeats exactly. Saturated and near-black frames are excluded from the
     // check: those are optical states (exposure blow-out / emitter-off phase),
     // not a stall, and restarting mid-settle only prolongs the settle.
-    let sig_of = |data: &[u8]| -> Vec<u8> {
-        let stride = (data.len() / 64).max(1);
-        data.iter().step_by(stride).take(64).copied().collect()
-    };
+    // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
     let mut frames = Vec::with_capacity(samples);
     // Attempt budget: enough spare frames to ride out the ~1 s dark-start
     // exposure settle and a stream restart without starving the window, while
@@ -941,9 +955,8 @@ pub fn capture_ir_sequence(
             }
         }
         let Some(data) = best else { continue };
-        let sig = sig_of(&data);
-        let frozen =
-            (10.0..245.0).contains(&best_mean) && last_sig.as_deref() == Some(sig.as_slice());
+        let sig = frame_signature(&data);
+        let frozen = frame_frozen(best_mean, &sig, last_sig.as_deref());
         last_sig = Some(sig);
         if frozen {
             dead_run += 1;
@@ -1176,6 +1189,288 @@ mod tests {
         assert!(!is_physical_camera_path(
             "/sys/devices/virtual/video4linux/video0"
         ));
+    }
+
+    #[test]
+    fn yuyv_full_and_zero_luma_hit_the_clamps() {
+        // Y=255 neutral chroma -> white (clamped at 255); Y=0 -> black.
+        let white = yuyv_to_rgb(&[255, 128, 255, 128], 2, 1);
+        assert_eq!(white, vec![255; 6]);
+        let black = yuyv_to_rgb(&[0, 128, 0, 128], 2, 1);
+        assert_eq!(black, vec![0; 6]);
+    }
+
+    #[test]
+    fn yuyv_chroma_maps_to_the_right_channels() {
+        // High U (blue-difference) with neutral V: blue saturates, red stays at
+        // luma, green dips below it (BT.601: b=y+1.772u, g=y-0.344u).
+        let rgb = yuyv_to_rgb(&[128, 255, 128, 128], 2, 1);
+        let (r, g, b) = (rgb[0], rgb[1], rgb[2]);
+        assert_eq!(b, 255);
+        assert_eq!(r, 128);
+        assert!(g < 128, "green must dip under +U, got {g}");
+        // High V (red-difference): red saturates, blue stays at luma.
+        let rgb = yuyv_to_rgb(&[128, 128, 128, 255], 2, 1);
+        assert_eq!(rgb[0], 255);
+        assert_eq!(rgb[2], 128);
+    }
+
+    #[test]
+    fn yuyv_short_buffer_converts_what_exists_and_zero_fills() {
+        // 4x2 frame needs 16 YUYV bytes; give only 4 (one pixel pair). The
+        // output is still full-sized, with the missing pixels left black.
+        let rgb = yuyv_to_rgb(&[128, 128, 128, 128], 4, 2);
+        assert_eq!(rgb.len(), 4 * 2 * 3);
+        assert!(rgb[..6].iter().all(|&c| (c as i32 - 128).abs() <= 1));
+        assert!(rgb[6..].iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn yuyv_odd_pixel_count_drops_the_unpaired_tail() {
+        // 3x1: pairs = 3/2 = 1, so pixels 0-1 convert and pixel 2 stays black
+        // even though input bytes for it exist.
+        let rgb = yuyv_to_rgb(&[128, 128, 128, 128, 128, 128], 3, 1);
+        assert_eq!(rgb.len(), 9);
+        assert!(rgb[..6].iter().all(|&c| (c as i32 - 128).abs() <= 1));
+        assert_eq!(&rgb[6..], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn grey_to_rgb_replicates_each_sample() {
+        assert_eq!(
+            grey_to_rgb(&[0, 128, 255]),
+            vec![0, 0, 0, 128, 128, 128, 255, 255, 255]
+        );
+        assert!(grey_to_rgb(&[]).is_empty());
+    }
+
+    #[test]
+    fn median_frame_even_burst_takes_upper_middle_and_min_length() {
+        // Even burst: sorted [1,2,3,4] -> index 4/2 = 2 -> 3 (upper middle).
+        let frames = vec![frame(&[1]), frame(&[4]), frame(&[2]), frame(&[3])];
+        assert_eq!(median_frame(frames).data, vec![3]);
+        // Mixed-length burst: output truncates to the shortest frame, and the
+        // dimensions/spectrum come from the first frame.
+        let frames = vec![frame(&[9, 9, 9]), frame(&[5, 5]), frame(&[7, 7, 7])];
+        let m = median_frame(frames);
+        assert_eq!(m.data, vec![7, 7]);
+        assert_eq!((m.width, m.height, m.spectrum), (3, 1, Spectrum::Rgb));
+    }
+
+    #[test]
+    fn ir_mean_handles_empty_and_averages() {
+        assert_eq!(ir_probe::mean(&[]), 0.0);
+        assert_eq!(ir_probe::mean(&[0, 255]), 127.5);
+        assert_eq!(ir_probe::mean(&[10, 10, 10]), 10.0);
+    }
+
+    #[test]
+    fn center_border_ratio_separates_lit_subject_from_flat_scene() {
+        let (w, h) = (8u32, 8u32);
+        // Emitter-lit subject: center 4x4 at 200, border at 50 -> ratio 4.
+        let mut lit = vec![50u8; (w * h) as usize];
+        for y in 2..6 {
+            for x in 2..6 {
+                lit[(y * w + x) as usize] = 200;
+            }
+        }
+        assert!((ir_probe::center_border_ratio(&lit, w, h) - 4.0).abs() < 1e-9);
+        // Uniform scene -> ~1 (no subject emphasis).
+        let flat = vec![100u8; (w * h) as usize];
+        assert!((ir_probe::center_border_ratio(&flat, w, h) - 1.0).abs() < 1e-9);
+        // Degenerate inputs: short buffer, tiny dims, all-black border.
+        assert_eq!(ir_probe::center_border_ratio(&[1, 2, 3], w, h), 0.0);
+        assert_eq!(ir_probe::center_border_ratio(&flat, 2, 2), 0.0);
+        assert_eq!(ir_probe::center_border_ratio(&[0u8; 64], 8, 8), 0.0);
+    }
+
+    #[test]
+    fn frame_signature_is_sparse_and_content_sensitive() {
+        // Short frames: the whole content is the signature.
+        assert_eq!(frame_signature(&[1, 2, 3]), vec![1, 2, 3]);
+        // Long frames: capped at 64 sampled bytes.
+        let long = vec![7u8; 640 * 400];
+        let sig = frame_signature(&long);
+        assert_eq!(sig.len(), 64);
+        assert!(sig.iter().all(|&b| b == 7));
+        // Identical content -> identical signature; a change at a sampled
+        // position (index 0 is always sampled) -> different signature.
+        let mut changed = long.clone();
+        changed[0] = 8;
+        assert_eq!(frame_signature(&long), sig);
+        assert_ne!(frame_signature(&changed), sig);
+    }
+
+    #[test]
+    fn frozen_detector_fires_only_on_repeated_normal_exposure_frames() {
+        let sig = frame_signature(&[99u8; 1024]);
+        // First frame of a window (no previous signature): never frozen.
+        assert!(!frame_frozen(99.0, &sig, None));
+        // Bit-identical consecutive mid-grey frames: frozen.
+        assert!(frame_frozen(99.0, &sig, Some(&sig)));
+        // Same signature but saturated / near-black mean: optical state, not a
+        // stall (exposure blow-out or the emitter-off strobe phase).
+        assert!(!frame_frozen(250.0, &sig, Some(&sig)));
+        assert!(!frame_frozen(245.0, &sig, Some(&sig)));
+        assert!(!frame_frozen(5.0, &sig, Some(&sig)));
+        // Boundary means inside the band still count.
+        assert!(frame_frozen(10.0, &sig, Some(&sig)));
+        // Different content -> live stream.
+        let other = frame_signature(&[98u8; 1024]);
+        assert!(!frame_frozen(99.0, &sig, Some(&other)));
+    }
+
+    #[test]
+    fn map_io_translates_busy_permission_and_generic_errors() {
+        // EBUSY (16) on a device nothing holds: generic busy guidance.
+        let e = map_io(
+            "/dev/irlume-test-missing",
+            std::io::Error::from_raw_os_error(16),
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("camera busy"), "{msg}");
+        assert!(msg.contains("another app is using it"), "{msg}");
+        // Permission denied: the video-group hint.
+        let e = map_io(
+            "/dev/irlume-test-missing",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(e.to_string().contains("'video' group"), "{e}");
+        // Anything else: device-prefixed passthrough.
+        let e = map_io(
+            "/dev/irlume-test-missing",
+            std::io::Error::from_raw_os_error(5),
+        );
+        assert!(
+            e.to_string()
+                .starts_with("hardware: /dev/irlume-test-missing:"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn camera_holder_finds_our_own_open_file() {
+        // Hold a file open ourselves; the /proc scan must name this process.
+        let dir = std::env::temp_dir().join(format!("irlume-cam-holder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("held");
+        std::fs::write(&path, b"x").unwrap();
+        let _held = std::fs::File::open(&path).unwrap();
+        let who = camera_holder(path.to_str().unwrap()).expect("holder found");
+        assert!(
+            who.contains(&format!("pid {}", std::process::id())),
+            "unexpected holder: {who}"
+        );
+        // Nothing holds a nonexistent path.
+        assert_eq!(camera_holder("/dev/irlume-test-missing"), None);
+        drop(_held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_pinned_rejects_missing_and_non_sysfs_devices() {
+        // No node at all: the plain no-camera error, not the injection one.
+        let e = verify_pinned("/dev/irlume-test-missing").unwrap_err();
+        assert!(e.to_string().contains("no camera found"), "{e}");
+        // An existing node with no video4linux sysfs entry (a non-camera): the
+        // anti-injection refusal.
+        let e = verify_pinned("/dev/null").unwrap_err();
+        assert!(e.to_string().contains("no physical device in sysfs"), "{e}");
+    }
+
+    #[test]
+    fn capture_entrypoints_refuse_a_missing_device_before_any_io() {
+        // Every capture path front-doors through verify_pinned, so a missing
+        // node fails fast with the same actionable error and no V4L2 calls.
+        for r in [
+            capture_rgb("/dev/irlume-test-missing")
+                .err()
+                .map(|e| e.to_string()),
+            capture_ir("/dev/irlume-test-missing")
+                .err()
+                .map(|e| e.to_string()),
+            capture_ir_sequence("/dev/irlume-test-missing", 1, 1)
+                .err()
+                .map(|e| e.to_string()),
+            ir_probe::capture_raw_burst("/dev/irlume-test-missing", 1)
+                .err()
+                .map(|e| e.to_string()),
+            setup_ir_emitter("/dev/irlume-test-missing")
+                .err()
+                .map(|e| e.to_string()),
+            list_ir_controls("/dev/irlume-test-missing")
+                .err()
+                .map(|e| e.to_string()),
+        ] {
+            let msg = r.expect("must fail without a device");
+            assert!(msg.contains("no camera found"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn device_identity_absent_for_non_usb_nodes() {
+        assert_eq!(device_identity("/dev/null"), None);
+        assert_eq!(device_identity("/dev/irlume-test-missing"), None);
+    }
+
+    #[test]
+    fn classify_unreadable_or_non_video_nodes_as_other() {
+        assert_eq!(classify("/dev/irlume-test-missing"), Role::Other);
+        // /dev/null opens but answers no V4L2 format ioctls.
+        assert_eq!(classify("/dev/null"), Role::Other);
+    }
+
+    #[test]
+    fn find_attr_dir_walks_up_only_inside_sysfs() {
+        let dir = std::env::temp_dir().join(format!("irlume-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let leaf = dir.join("iface");
+        std::fs::create_dir_all(&leaf).unwrap();
+        // Attribute in the start dir itself: found immediately.
+        std::fs::write(leaf.join("idVendor"), "3277").unwrap();
+        assert_eq!(find_attr_dir(&leaf, "idVendor"), Some(leaf.clone()));
+        // Attribute only above a non-/sys/devices start: the walk refuses to
+        // escape sysfs and gives up (anti-confusion guard).
+        std::fs::write(dir.join("removable"), "fixed").unwrap();
+        assert_eq!(find_attr_dir(&leaf, "removable"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_vidpid_formats_descriptor_files() {
+        let dir = std::env::temp_dir().join(format!("irlume-vidpid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing descriptors -> None.
+        assert_eq!(read_vidpid(&dir), None);
+        std::fs::write(dir.join("idVendor"), "3277\n").unwrap();
+        assert_eq!(read_vidpid(&dir), None); // product still missing
+        std::fs::write(dir.join("idProduct"), "0059\n").unwrap();
+        assert_eq!(read_vidpid(&dir), Some("3277:0059".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_pair_env_override_wins() {
+        // The explicit env pair short-circuits discovery entirely (no device
+        // scan), so this is deterministic on any machine.
+        std::env::set_var("IRLUME_RGB_DEVICE", "/dev/irlume-test-rgb");
+        std::env::set_var("IRLUME_IR_DEVICE", "/dev/irlume-test-ir");
+        assert_eq!(
+            select_pair(),
+            ("/dev/irlume-test-rgb".into(), "/dev/irlume-test-ir".into())
+        );
+        std::env::remove_var("IRLUME_RGB_DEVICE");
+        std::env::remove_var("IRLUME_IR_DEVICE");
+    }
+
+    #[test]
+    fn privacy_engaged_is_false_without_a_camera() {
+        // Missing node or a non-V4L2 node: the check degrades to "not engaged"
+        // (the capture path then surfaces the real error).
+        assert!(!privacy_engaged("/dev/irlume-test-missing"));
+        assert!(!privacy_engaged("/dev/null"));
     }
 
     #[test]

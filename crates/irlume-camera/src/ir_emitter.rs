@@ -170,12 +170,18 @@ fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> bo
     unsafe { libc::ioctl(fd, uvcioc_ctrl_query(), &mut q as *mut UvcXuControlQuery) >= 0 }
 }
 
+/// GET_LEN bounds check: a plausible XU control reports 1..=64 payload bytes;
+/// anything else (0 from a phantom control, or an absurd length) is rejected.
+/// Verbatim extraction from [`get_len`] as a test seam; zero behavior change.
+fn valid_ctrl_len(len: usize) -> Option<usize> {
+    (1..=64).contains(&len).then_some(len)
+}
+
 /// Length of XU control (unit, selector) if it exists, via `GET_LEN`. Read-only.
 fn get_len(fd: c_int, unit: u8, selector: u8) -> Option<usize> {
     let mut buf = [0u8; 2];
     if xu_query(fd, unit, selector, UVC_GET_LEN, &mut buf) {
-        let len = u16::from_le_bytes(buf) as usize;
-        (1..=64).contains(&len).then_some(len)
+        valid_ctrl_len(u16::from_le_bytes(buf) as usize)
     } else {
         None
     }
@@ -404,5 +410,220 @@ mod tests {
         let c = candidate_payloads(9);
         assert!(c.iter().all(|p| p.len() == 9));
         assert!(c.contains(&vec![1, 3, 2, 0, 0, 0, 0, 0, 0]));
+    }
+
+    /// Serializes access to the process env vars these tests flip
+    /// (`IRLUME_IR_EMITTER`, `IRLUME_IR_EMITTER_CONF`); cargo runs tests on
+    /// parallel threads sharing one environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// An fd that is open but is not a UVC device, so every XU ioctl fails
+    /// (ENOTTY): exercises the query-failure paths without touching a camera.
+    fn non_uvc_fd() -> std::fs::File {
+        std::fs::File::open("/dev/null").expect("open /dev/null")
+    }
+
+    #[test]
+    fn parse_control_accepts_decimal_and_hex() {
+        assert_eq!(
+            parse_control("14:6:1,3,2"),
+            Some(EmitterControl {
+                unit: 14,
+                selector: 6,
+                payload: vec![1, 3, 2],
+            })
+        );
+        assert_eq!(
+            parse_control(" 0x0E:0X06:0x01,255 "),
+            Some(EmitterControl {
+                unit: 14,
+                selector: 6,
+                payload: vec![1, 255],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_control_rejects_garbage() {
+        // Empty / non-numeric / missing fields.
+        assert_eq!(parse_control(""), None);
+        assert_eq!(parse_control("   "), None);
+        assert_eq!(parse_control("abc"), None);
+        assert_eq!(parse_control("1:2"), None); // no payload section
+        assert_eq!(parse_control("1:2:"), None); // empty payload
+        assert_eq!(parse_control("x:2:1"), None); // bad unit
+        assert_eq!(parse_control("1:y:1"), None); // bad selector
+                                                  // Out-of-range unit/selector (u8 overflow) fail the whole parse.
+        assert_eq!(parse_control("256:1:1"), None);
+        assert_eq!(parse_control("1:300:1"), None);
+        // A payload of only invalid bytes is empty -> rejected...
+        assert_eq!(parse_control("1:2:300"), None);
+        // ...while invalid bytes among valid ones are dropped (filter_map).
+        assert_eq!(
+            parse_control("1:2:1,300,2").map(|c| c.payload),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn known_control_table_matches_verified_cards() {
+        // ASUS built-in Hello module: XU unit 14, selector 6.
+        let asus = known_control("USB Camera: ASUS FHD webcam").expect("ASUS entry");
+        assert_eq!((asus.unit, asus.selector), (14, 6));
+        assert_eq!(asus.payload, vec![1, 3, 2, 0, 0, 0, 0, 0, 0]);
+        // NexiGo HelloCam N930W: unit 4, same selector/payload.
+        let nexigo = known_control("NexiGo HelloCam N930W IR").expect("N930W entry");
+        assert_eq!((nexigo.unit, nexigo.selector), (4, 6));
+        assert_eq!(nexigo.payload, vec![1, 3, 2, 0, 0, 0, 0, 0, 0]);
+        // Unlisted cameras get no hard-coded control (auto-setup territory).
+        assert_eq!(known_control("Logitech Brio"), None);
+        assert_eq!(known_control(""), None);
+    }
+
+    #[test]
+    fn valid_ctrl_len_bounds() {
+        // GET_LEN plausibility: 1..=64 accepted, 0 and oversize rejected.
+        assert_eq!(valid_ctrl_len(0), None);
+        assert_eq!(valid_ctrl_len(1), Some(1));
+        assert_eq!(valid_ctrl_len(9), Some(9));
+        assert_eq!(valid_ctrl_len(64), Some(64));
+        assert_eq!(valid_ctrl_len(65), None);
+        assert_eq!(valid_ctrl_len(usize::MAX), None);
+    }
+
+    #[test]
+    fn conf_roundtrip_with_and_without_boost() {
+        let _g = env_guard();
+        let dir = std::env::temp_dir().join(format!("irlume-emitter-conf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("ir_emitter.conf");
+        std::env::set_var("IRLUME_IR_EMITTER_CONF", &conf);
+
+        let emitter = EmitterControl {
+            unit: 4,
+            selector: 6,
+            payload: vec![1, 3, 2],
+        };
+        let boost = EmitterControl {
+            unit: 4,
+            selector: 9,
+            payload: vec![255, 255],
+        };
+        // Emitter alone: one line, no boost on load.
+        save_conf(&emitter).unwrap();
+        assert_eq!(load_conf(), Some(emitter.clone()));
+        assert_eq!(load_boost(), None);
+        // Emitter + boost: two lines, both load back exactly.
+        save_conf_full(&emitter, Some(&boost)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "4:6:1,3,2\n4:9:255,255"
+        );
+        assert_eq!(load_conf(), Some(emitter));
+        assert_eq!(load_boost(), Some(boost));
+        // Missing conf: both loaders return None.
+        std::fs::remove_file(&conf).unwrap();
+        assert_eq!(load_conf(), None);
+        assert_eq!(load_boost(), None);
+
+        std::env::remove_var("IRLUME_IR_EMITTER_CONF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enable_honors_off_env_and_config_precedence() {
+        let _g = env_guard();
+        let dir = std::env::temp_dir().join(format!("irlume-emitter-en-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Point the conf away from any real /var/lib/irlume install.
+        std::env::set_var("IRLUME_IR_EMITTER_CONF", dir.join("none.conf"));
+        let f = non_uvc_fd();
+        use std::os::fd::AsRawFd;
+        let fd = f.as_raw_fd();
+
+        // `off`/`none` disable before any control lookup or ioctl.
+        std::env::set_var("IRLUME_IR_EMITTER", "off");
+        assert!(!enable(fd, "ASUS"));
+        std::env::set_var("IRLUME_IR_EMITTER", "none");
+        assert!(!enable(fd, "ASUS"));
+        // A valid env control is parsed, but SET_CUR on a non-UVC fd fails.
+        std::env::set_var("IRLUME_IR_EMITTER", "14:6:1,3,2");
+        assert!(!enable(fd, "whatever"));
+        std::env::remove_var("IRLUME_IR_EMITTER");
+        // No env, no conf, unknown card: no control at all.
+        assert!(!enable(fd, "Some Unknown Cam"));
+        // No env, no conf, known card: the table entry is used (ioctl still fails).
+        assert!(!enable(fd, "ASUS"));
+        // No env, conf present: the persisted control is used (ioctl still fails).
+        save_conf(&EmitterControl {
+            unit: 1,
+            selector: 2,
+            payload: vec![7],
+        })
+        .unwrap();
+        assert!(!enable(fd, "Some Unknown Cam"));
+
+        std::env::remove_var("IRLUME_IR_EMITTER_CONF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boost_candidates_sized_and_swept_low_to_high_magnitudes() {
+        let c = boost_candidates(4);
+        assert!(c.iter().all(|p| p.len() == 4));
+        assert!(c.contains(&vec![0xFF; 4]));
+        assert!(c.contains(&vec![0x80; 4]));
+        assert!(c.contains(&vec![0xFF, 0, 0, 0]));
+        assert!(c.contains(&vec![0xFF, 0xFF, 0, 0]));
+        // Degenerate size 1: full(0xFF) and low_bytes collapse; dedup shrinks.
+        let one = boost_candidates(1);
+        assert!(one.iter().all(|p| p.len() == 1));
+        assert!(one.contains(&vec![0xFF]));
+    }
+
+    #[test]
+    fn candidate_payloads_truncate_to_small_controls() {
+        // A 1-byte control still gets the leading bytes of each pattern.
+        let one = candidate_payloads(1);
+        assert!(one.iter().all(|p| p.len() == 1));
+        assert!(one.contains(&vec![1]));
+        assert!(one.contains(&vec![3]));
+        assert!(one.contains(&vec![0]));
+    }
+
+    #[test]
+    fn discovery_on_a_non_uvc_fd_finds_nothing_and_stays_safe() {
+        let f = non_uvc_fd();
+        use std::os::fd::AsRawFd;
+        let fd = f.as_raw_fd();
+        // Every GET_LEN fails -> no controls enumerated.
+        assert!(list_controls(fd).is_empty());
+        // Autoconfigure: baseline measured exactly once, sweep finds nothing.
+        let mut calls = 0u32;
+        let mut measure = || {
+            calls += 1;
+            0.0f32
+        };
+        assert_eq!(autoconfigure(fd, &mut measure), None);
+        assert_eq!(calls, 1, "only the emitter-off baseline is measured");
+        // Boost discovery: emitter-on base measured once, nothing found.
+        let emitter = EmitterControl {
+            unit: 14,
+            selector: 6,
+            payload: vec![1, 3, 2],
+        };
+        let mut calls = 0u32;
+        let mut measure = || {
+            calls += 1;
+            0.0f32
+        };
+        assert_eq!(discover_boost(fd, &emitter, &mut measure), None);
+        assert_eq!(calls, 1, "only the emitter-alone base is measured");
     }
 }

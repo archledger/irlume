@@ -811,6 +811,268 @@ pub use onnx::{
     PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
+/// Model-backed pipeline tests: run the REAL shipped ONNX models (Git LFS,
+/// under `models/` at the repo root) on synthetic frames, asserting output
+/// dimensions, value ranges, and determinism. Session creation is expensive, so
+/// each model is built once per test binary and shared behind a `OnceLock`.
+#[cfg(all(test, feature = "onnx"))]
+mod model_tests {
+    use super::*;
+    use crate::align;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn model_path(name: &str) -> String {
+        format!("{}/../../models/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Point `ort` (load-dynamic) at the packaged onnxruntime when the test env
+    /// doesn't already provide `ORT_DYLIB_PATH`.
+    fn ort_init() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+                return;
+            }
+            for cand in [
+                "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+                "/usr/lib64/libonnxruntime.so",
+                "/usr/lib/libonnxruntime.so",
+                "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+            ] {
+                if std::path::Path::new(cand).exists() {
+                    std::env::set_var("ORT_DYLIB_PATH", cand);
+                    return;
+                }
+            }
+        });
+    }
+
+    fn embedder() -> MutexGuard<'static, Embedder> {
+        static S: OnceLock<Mutex<Embedder>> = OnceLock::new();
+        S.get_or_init(|| {
+            ort_init();
+            Mutex::new(Embedder::load_from_file(&model_path("glintr100.onnx")).expect("embedder"))
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn detector() -> MutexGuard<'static, Detector> {
+        static S: OnceLock<Mutex<Detector>> = OnceLock::new();
+        S.get_or_init(|| {
+            ort_init();
+            Mutex::new(
+                Detector::load_from_file(&model_path("face_detection_yunet_2023mar.onnx"))
+                    .expect("detector"),
+            )
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn facemesh() -> MutexGuard<'static, FaceMesh> {
+        static S: OnceLock<Mutex<FaceMesh>> = OnceLock::new();
+        S.get_or_init(|| {
+            ort_init();
+            Mutex::new(FaceMesh::load_from_file(&model_path("face_landmark.onnx")).expect("mesh"))
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn blaze() -> MutexGuard<'static, BlazeRescue> {
+        static S: OnceLock<Mutex<BlazeRescue>> = OnceLock::new();
+        S.get_or_init(|| {
+            ort_init();
+            Mutex::new(
+                BlazeRescue::load_from_file(&model_path("blaze_face_short_range.onnx"))
+                    .expect("blaze"),
+            )
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Deterministic pseudo-textured 112x112 chip (the embedder's input shape).
+    fn chip(seed: usize) -> Vec<u8> {
+        let n = (align::OUT_SIZE * align::OUT_SIZE) as usize * 3;
+        (0..n)
+            .map(|i| ((i * 37 + seed * 101 + 11) % 256) as u8)
+            .collect()
+    }
+
+    /// Deterministic gradient frame of arbitrary size.
+    fn gradient_frame(w: u32, h: u32) -> Vec<u8> {
+        let mut data = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                data[i] = (x * 255 / w.max(1)) as u8;
+                data[i + 1] = (y * 255 / h.max(1)) as u8;
+                data[i + 2] = ((x + y) % 256) as u8;
+            }
+        }
+        data
+    }
+
+    fn l2(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn embed_is_512d_unit_norm_and_deterministic() {
+        let mut e = embedder();
+        let c = chip(1);
+        let a = e.embed(&c).expect("embed");
+        let b = e.embed(&c).expect("embed again");
+        // Contract: 512-D (by type), L2-normalized, bitwise-stable inference.
+        assert!((l2(&a) - 1.0).abs() < 1e-4, "norm {}", l2(&a));
+        assert!(
+            align::cosine(&a, &b) > 0.9999,
+            "non-deterministic embedding"
+        );
+        // A different input must land somewhere else on the hypersphere.
+        let other = e.embed(&chip(2)).expect("embed other");
+        assert!(
+            align::cosine(&a, &other) < 0.999,
+            "distinct chips collapsed to one embedding: {}",
+            align::cosine(&a, &other)
+        );
+    }
+
+    #[test]
+    fn embed_with_norm_returns_positive_quality_norm() {
+        let mut e = embedder();
+        let (emb, norm) = e.embed_with_norm(&chip(3)).expect("embed_with_norm");
+        assert!(
+            norm > 0.0,
+            "pre-normalization norm must be positive: {norm}"
+        );
+        assert!((l2(&emb) - 1.0).abs() < 1e-4);
+        // The returned embedding is the plain embed() of the same chip.
+        let plain = e.embed(&chip(3)).expect("embed");
+        assert!(align::cosine(&emb, &plain) > 0.9999);
+    }
+
+    #[test]
+    fn embed_tta_is_normalized_deterministic_and_near_plain() {
+        let mut e = embedder();
+        let c = chip(4);
+        let t1 = e.embed_tta(&c).expect("tta");
+        let t2 = e.embed_tta(&c).expect("tta again");
+        assert!((l2(&t1) - 1.0).abs() < 1e-4);
+        assert!(align::cosine(&t1, &t2) > 0.9999);
+        // The flip-average stays close to the un-augmented embedding (it is an
+        // average containing it), but is not bit-identical.
+        let plain = e.embed(&c).expect("embed");
+        let cos = align::cosine(&t1, &plain);
+        assert!(cos > 0.5, "tta drifted implausibly far: {cos}");
+    }
+
+    #[test]
+    fn alignment_identity_selftest_passes_on_the_real_model() {
+        let mut e = embedder();
+        let (passed, detail) = selftest_alignment_identity(&mut e);
+        assert!(passed, "{detail}");
+    }
+
+    #[test]
+    fn detector_finds_no_face_in_synthetic_frames_and_is_deterministic() {
+        let mut d = detector();
+        let (w, h) = (640u32, 480u32);
+        let grad = gradient_frame(w, h);
+        let view = align::RgbView {
+            data: &grad,
+            width: w,
+            height: h,
+        };
+        let dets = d.detect(&view).expect("detect");
+        assert!(
+            dets.is_empty(),
+            "a faceless gradient must yield no detections, got {}",
+            dets.len()
+        );
+        // Full pipeline determinism (letterbox -> session -> decode -> NMS).
+        assert_eq!(d.detect(&view).expect("detect again").len(), 0);
+        // Flat mid-grey behaves the same.
+        let flat = vec![128u8; (w * h * 3) as usize];
+        let view = align::RgbView {
+            data: &flat,
+            width: w,
+            height: h,
+        };
+        assert!(d.detect(&view).expect("detect flat").is_empty());
+    }
+
+    #[test]
+    fn facemesh_emits_full_point_set_in_crop_space() {
+        let mut m = facemesh();
+        let (w, h) = (256u32, 256u32);
+        let frame = gradient_frame(w, h);
+        let view = align::RgbView {
+            data: &frame,
+            width: w,
+            height: h,
+        };
+        let bbox = [64.0, 64.0, 192.0, 192.0];
+        let lm = m.landmarks(&view, &bbox, 0.25).expect("landmarks");
+        // Either mesh generation is acceptable; the EAR/mouth indices used by
+        // the blink gate exist in both.
+        assert!(
+            lm.len() == MESH_N || lm.len() == MESH_N_IRIS,
+            "unexpected landmark count {}",
+            lm.len()
+        );
+        // Points come back mapped to the frame-space crop: finite, and within
+        // the expanded crop square plus slack (the model may overshoot a bit on
+        // a faceless input, but not by orders of magnitude).
+        for &(x, y) in &lm {
+            assert!(x.is_finite() && y.is_finite());
+            assert!((-256.0..512.0).contains(&x), "x out of range: {x}");
+            assert!((-256.0..512.0).contains(&y), "y out of range: {y}");
+        }
+        // Determinism: same crop, same points.
+        let again = m.landmarks(&view, &bbox, 0.25).expect("landmarks again");
+        assert_eq!(lm, again);
+    }
+
+    #[test]
+    fn blaze_rescue_is_deterministic_and_unconfident_on_synthetic_frames() {
+        let mut b = blaze();
+        let (w, h) = (640u32, 400u32);
+        let frame = gradient_frame(w, h);
+        let view = align::RgbView {
+            data: &frame,
+            width: w,
+            height: h,
+        };
+        let r1 = b.detect_top(&view).expect("blaze");
+        let r2 = b.detect_top(&view).expect("blaze again");
+        // Determinism of the full decode (letterbox, sigmoid, anchor mapping).
+        match (&r1, &r2) {
+            (None, None) => {}
+            (Some((bb1, s1)), Some((bb2, s2))) => {
+                assert_eq!(bb1, bb2);
+                assert_eq!(s1, s2);
+            }
+            _ => panic!("blaze non-deterministic on identical input"),
+        }
+        // A faceless gradient must not produce a confident face.
+        assert!(
+            r1.is_none(),
+            "blaze hallucinated a face on a gradient: {r1:?}"
+        );
+        // Flat grey likewise.
+        let flat = vec![127u8; (w * h * 3) as usize];
+        let view = align::RgbView {
+            data: &flat,
+            width: w,
+            height: h,
+        };
+        assert!(b.detect_top(&view).expect("blaze flat").is_none());
+    }
+}
+
 #[cfg(all(test, feature = "onnx"))]
 mod ear_tests {
     use super::{eye_ear, EAR_LEFT};

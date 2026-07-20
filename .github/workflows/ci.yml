@@ -140,6 +140,7 @@ jobs:
         run: |
           cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           cargo test -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          cargo test -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
 
       - name: test (PAM FFI, against pam_wrapper)
         run: cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
@@ -276,6 +277,7 @@ jobs:
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
           cargo llvm-cov report --summary-only --fail-under-lines 79
 

@@ -167,6 +167,21 @@ cargo run -p irlume-cli -- doctor   # platform / TPM / camera / model check
 Developer-only benchmark and capture subcommands are gated behind `IRLUME_DEV=1`
 (e.g. `IRLUME_DEV=1 cargo run -p irlume-cli -- selftest align --model models/glintr100.onnx`).
 
+The TPM-gated tests (marked `#[ignore]`) run against a software TPM, no
+hardware or root needed; CI does exactly this:
+
+```sh
+swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
+  --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
+  --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
+IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib -- --ignored \
+  seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle
+```
+
+`IRLUME_TCTI` is the production TCTI override; the remaining ignored tests
+(pcrlock, durability, fault-injection) are campaign tools that need a
+provisioned host and stay manual.
+
 ## Sandbox environment overrides
 
 Every path a privileged component touches can be redirected, so tests and a

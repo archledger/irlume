@@ -88,6 +88,22 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+      # The TPM-gated tests run against a software TPM: same TSS stack, no
+      # hardware. IRLUME_TCTI is the production env override; swtpm state is
+      # throwaway per run.
+      - name: Start swtpm (software TPM)
+        run: |
+          sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
+          mkdir -p /tmp/swtpm
+          swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
+            --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
+
+      - name: test (TPM-gated, against swtpm)
+        run: |
+          IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle
+
   # Build + test on current stable, because that is what the packaging lanes
   # and most from-source users compile with. fmt/clippy stay on the MSRV job
   # only, so new-stable lint churn never blocks a PR. Not a required check.
@@ -177,8 +193,20 @@ jobs:
           tar xzf "onnxruntime-linux-x64-${ver}.tgz"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
-      - name: Coverage (fail under the ratchet floor)
-        run: cargo llvm-cov --workspace --locked --summary-only --fail-under-lines 66
+      - name: Start swtpm (software TPM)
+        run: |
+          sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
+          mkdir -p /tmp/swtpm
+          swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
+            --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
+
+      - name: Coverage incl. TPM-gated tests (fail under the ratchet floor)
+        run: |
+          cargo llvm-cov --no-report --workspace --locked
+          IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle
+          cargo llvm-cov report --summary-only --fail-under-lines 67
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)

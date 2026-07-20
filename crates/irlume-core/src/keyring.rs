@@ -128,6 +128,7 @@ mod tests {
 
     #[test]
     fn envelope_path_under_keyring_dir() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         std::env::set_var("IRLUME_KEYRING_DIR", "/tmp/irlume-kr-test");
         assert_eq!(
             envelope_path("alice"),
@@ -139,8 +140,9 @@ mod tests {
     /// Full arm → unseal round-trip through the keyring layer on the real TPM.
     /// Ignored: needs /dev/tpmrm0.
     #[test]
-    #[ignore = "requires real TPM (/dev/tpmrm0)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn arm_and_unseal_roundtrip() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = "/tmp/irlume-kr-rt";
         std::env::set_var("IRLUME_KEYRING_DIR", dir);
         let _ = std::fs::remove_dir_all(dir);
@@ -160,8 +162,9 @@ mod tests {
     /// hits the same reseal path. (Callers gate this on a verified password via
     /// the PAM session phase; see the SAFETY CONTRACT on `reseal_password`.)
     #[test]
-    #[ignore = "requires real TPM (/dev/tpmrm0)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn reseal_only_when_stale() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = "/tmp/irlume-kr-reseal";
         std::env::set_var("IRLUME_KEYRING_DIR", dir);
         let _ = std::fs::remove_dir_all(dir);

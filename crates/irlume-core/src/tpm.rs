@@ -1182,7 +1182,7 @@ mod tests {
     /// Real seal→unseal round-trip on the host TPM. Ignored by default: needs
     /// /dev/tpmrm0 and write access (run as root or a tss-group member).
     #[test]
-    #[ignore = "requires real TPM (/dev/tpmrm0); run as root"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
     fn seal_unseal_roundtrip_real_tpm() {
         let secret = b"irlume-keyring-secret-roundtrip!";
         let env = seal_with_pcrs(secret, &[7]).expect("seal");

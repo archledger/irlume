@@ -72,6 +72,10 @@
         # daemon at them. `src = self` uses the flake's own tree.
         packages.default = pkgs.callPackage ./nix/package.nix { src = self; };
         packages.irlume = self.packages.${system}.default;
+        # Exposed so CI can realize this fixed-output fetch and catch a stale
+        # hash; nix/module.nix carries the same URL+hash pair (keep them in
+        # step when bumping ortVersion).
+        packages.onnxruntime-bin = onnxruntime-bin;
 
         # `nix flake check` runs these. The module's per-greeter PAM control
         # flags are its whole reason to exist, so instantiate it in a throwaway

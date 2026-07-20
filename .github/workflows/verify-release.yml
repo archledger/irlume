@@ -1,0 +1,50 @@
+# Release assets are built and GPG-signed on the maintainer's machines, not
+# in CI. This job is the independent check that what actually landed on the
+# release is internally consistent: the signature verifies against the
+# committed release key, the checksums match, every asset is covered by
+# SHA256SUMS, and the .deb is structurally sound. It runs when a release is
+# published or its assets are edited.
+name: Verify release assets
+
+on:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
+
+      - name: Verify signature, checksums, and coverage
+        working-directory: assets
+        run: |
+          # The release public key is committed, not fetched from a keyserver:
+          # a keyserver lookup could be poisoned, the repo copy is reviewed.
+          gpg --import ../.github/release-signing-key.asc
+          gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS \
+            | grep -q "VALIDSIG F35053398E3C80FE20891B82C10B8492BD7F30C6" \
+            || { echo "signature is not from the release key"; exit 1; }
+          sha256sum --check --strict SHA256SUMS
+          # Every asset except the sums pair must be listed in SHA256SUMS.
+          for f in *; do
+            case "$f" in SHA256SUMS|SHA256SUMS.asc) continue;; esac
+            grep -q "  $f\$" SHA256SUMS || { echo "asset not covered by SHA256SUMS: $f"; exit 1; }
+          done
+
+      - name: Sanity-check the .deb
+        working-directory: assets
+        run: |
+          dpkg-deb --info irlume_*.deb
+          dpkg-deb --contents irlume_*.deb >/dev/null

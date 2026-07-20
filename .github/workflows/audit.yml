@@ -1,0 +1,26 @@
+# Daily RustSec advisory scan against the pinned Cargo.lock.
+#
+# The cargo-deny job in ci.yml gates every push and PR, but a new advisory
+# published between pushes would otherwise sit unnoticed until the next
+# commit. A failed scheduled run emails the maintainer.
+name: Scheduled advisory audit
+
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories

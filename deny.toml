@@ -37,3 +37,11 @@ ignore = [
 [bans]
 # Duplicate crate versions cost compile time and binary size but are not errors.
 multiple-versions = "warn"
+
+[sources]
+# The workspace intentionally has exactly one git dependency: the tss-esapi
+# fork. Any other git or non-crates.io source appearing in the tree should
+# fail CI until it is reviewed and listed here.
+unknown-git = "deny"
+unknown-registry = "deny"
+allow-git = ["https://github.com/archledger/rust-tss-esapi"]

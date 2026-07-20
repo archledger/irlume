@@ -23,9 +23,11 @@ updates:
     commit-message:
       prefix: "ci"
 
-  # Rust crates from crates.io (Cargo.lock).
+  # Rust crates from crates.io. Two lockfiles: the main workspace and the
+  # detached cargo-fuzz workspace (fuzz/Cargo.lock), which cargo-deny at the
+  # repo root never audits, so it must not rot silently either.
   - package-ecosystem: cargo
-    directory: "/"
+    directories: ["/", "/fuzz"]
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

@@ -1268,7 +1268,10 @@ SYSTEM INTEGRATION
 
 #[cfg(test)]
 mod origin_tests {
-    use super::{is_copr_repo, ubuntu_codename};
+    use super::{
+        gz_lists_irlume, installed_version, is_copr_repo, ppa_serves, ubuntu_codename,
+        InstallOrigin,
+    };
 
     #[test]
     fn copr_from_repo_matches_only_our_project() {
@@ -1294,5 +1297,135 @@ mod origin_tests {
         // Debian proper: PPAs don't apply.
         let debian = "ID=debian\nVERSION_CODENAME=trixie\n";
         assert_eq!(ubuntu_codename(debian), None);
+    }
+
+    /// gzip-compress `data` with the system gzip (the same tool the probe
+    /// decompresses with, so the round trip is faithful).
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("gzip")
+            .arg("-c")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(data).unwrap();
+        child.wait_with_output().unwrap().stdout
+    }
+
+    // Regression: e429106. ppa_serves probed the lingering dists Release file,
+    // which returns 200 long after a series' packages are deleted; the probe
+    // must key on an actual `Package: irlume` entry in the Packages index.
+    #[test]
+    fn gz_lists_irlume_needs_an_actual_package_entry() {
+        assert!(gz_lists_irlume(&gzip_bytes(
+            b"Package: irlume\nVersion: 0.2.1\nArchitecture: amd64\n"
+        )));
+        assert!(
+            !gz_lists_irlume(&gzip_bytes(b"")),
+            "an empty index is not served"
+        );
+        assert!(!gz_lists_irlume(&gzip_bytes(
+            b"Package: linhello\nVersion: 1.0\n"
+        )));
+        // A partial-name line must not count either (exact-line match).
+        assert!(!gz_lists_irlume(&gzip_bytes(b"Package: irlume-selinux\n")));
+        assert!(!gz_lists_irlume(b"definitely not gzip data"));
+    }
+
+    /// Drop a fake executable `name` into `dir` (a `#!/bin/sh` script).
+    fn fake_tool(dir: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Regression: 0a7ab5c + e429106 + ee54b23. One test so the PATH override
+    // is mutated in a single place: (a) installed_version must report the
+    // package manager's version, not this binary's compile-time one, on an
+    // overlaid install; (b) ppa_serves must be true only when the Packages
+    // index lists irlume, false on an empty index or HTTP 404; (c) a network
+    // failure must be None (unknown), never "not served".
+    #[test]
+    fn update_probes_query_the_package_manager_and_the_ppa_index() {
+        let dir = std::env::temp_dir().join(format!("irlume-cli-faketools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        fake_tool(&dir, "rpm", "printf '9.9.9'");
+        fake_tool(
+            &dir,
+            "curl",
+            r#"case "$FAKE_CURL_MODE" in
+  serves) printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; exit 0 ;;
+  empty) printf '' | gzip -c; exit 0 ;;
+  http404) exit 22 ;;
+  *) exit 7 ;;
+esac"#,
+        );
+        let old_path = std::env::var("PATH").unwrap();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+
+        // (a) 0a7ab5c: the rpm-owned origins ask rpm, and its answer wins over
+        // the running binary's own version.
+        assert_eq!(installed_version(&InstallOrigin::Copr), "9.9.9");
+        assert_ne!(env!("CARGO_PKG_VERSION"), "9.9.9");
+        assert_eq!(
+            installed_version(&InstallOrigin::LocalRpm(String::new())),
+            "9.9.9"
+        );
+        // Source installs have no owning package; the binary's version is the
+        // documented fallback.
+        assert_eq!(
+            installed_version(&InstallOrigin::Source),
+            env!("CARGO_PKG_VERSION")
+        );
+
+        // (b) e429106: an index that lists irlume is served; a 200 with an
+        // empty index (the lingering-Release case) is NOT.
+        std::env::set_var("FAKE_CURL_MODE", "serves");
+        assert_eq!(ppa_serves("resolute"), Some(true));
+        std::env::set_var("FAKE_CURL_MODE", "empty");
+        assert_eq!(ppa_serves("noble"), Some(false));
+        // (b) a genuine HTTP 404 (curl -f exit 22) is "not served".
+        std::env::set_var("FAKE_CURL_MODE", "http404");
+        assert_eq!(ppa_serves("trusty"), Some(false));
+        // (c) ee54b23: offline / connect failure is unknown, never false.
+        std::env::set_var("FAKE_CURL_MODE", "offline");
+        assert_eq!(ppa_serves("resolute"), None);
+
+        std::env::remove_var("FAKE_CURL_MODE");
+        std::env::set_var("PATH", old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: 40f0a4d. The pacman update arm pointed at the retired
+    // irlume-VERSION-1-arch.pkg.tar.zst release asset, which no release since
+    // 0.1.x attaches; the Arch channel is the AUR. The arm is println-only, so
+    // this pins the source text: the needles are assembled at runtime so the
+    // test's own source never satisfies (or trips) the checks.
+    #[test]
+    fn pacman_update_path_points_at_the_aur_not_the_retired_asset() {
+        let src = include_str!("commands.rs");
+        let aur_clone = format!("{}{}", "aur.archlinux.org/", "irlume.git");
+        assert!(
+            src.contains(&aur_clone),
+            "the AUR clone URL must be offered"
+        );
+        let aur_helper = format!("{} {}", "yay", "-Syu irlume");
+        assert!(
+            src.contains(&aur_helper),
+            "the AUR helper route must be offered"
+        );
+        let retired_asset = format!("irlume-{}-1-{}", "{ver}", "{pkg_arch}");
+        assert!(
+            !src.contains(&retired_asset),
+            "the retired .pkg.tar.zst release asset must not be referenced"
+        );
+        let pacman_u = format!("{} {}", "pacman", "-U");
+        assert!(
+            !src.contains(&pacman_u),
+            "no pacman local-file install of a downloaded asset"
+        );
     }
 }

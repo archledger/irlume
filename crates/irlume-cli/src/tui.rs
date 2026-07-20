@@ -3799,14 +3799,14 @@ fn enroll_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
+    /// PATH) so they can't race each other under the parallel test runner.
+    /// One binary-wide lock: main.rs and commands.rs tests use the same one,
+    /// so env mutations can never race across test modules.
+    use crate::testenv::ENV_LOCK;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
-    /// PATH) so they can't race each other under the parallel test runner.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A bare App for tests: no hardware probes, no daemon socket, no terminal.
     /// Mirrors `App::new()` but every probe-derived field is inert.

@@ -237,6 +237,21 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     if !std::path::Path::new(device).exists() {
         return Err(Error::Hardware(format!("{device}: no camera found")));
     }
+    // TEST ESCAPE: a comma-separated allowlist of exact device paths that may
+    // bypass the physical-device pin. Exists only for the virtual-camera test
+    // harness (v4l2loopback nodes have no physical bus by definition). The
+    // daemon's environment is root-controlled via its systemd unit, so an
+    // unprivileged local user cannot set this for the auth path; every use is
+    // logged loudly. See docs/THREAT_MODEL.md (camera injection).
+    if let Ok(allow) = std::env::var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA") {
+        if allow.split(',').any(|d| d.trim() == device) {
+            eprintln!(
+                "irlume: WARNING: {device} accepted without a physical-device pin \
+                 (IRLUME_TEST_ALLOW_VIRTUAL_CAMERA)"
+            );
+            return Ok(());
+        }
+    }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");
     let real = std::fs::canonicalize(&link).map_err(|_| {
@@ -1571,5 +1586,27 @@ mod tests {
             caps.rgb,
             "a YUYV-fed loopback node must classify as a usable RGB camera"
         );
+    }
+
+    #[test]
+    fn virtual_camera_escape_is_exact_path_only() {
+        // Distinct env vars from select_pair_env_override_wins, so no race.
+        // The escape must match the exact device path, nothing looser.
+        std::env::set_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/null, /dev/zero");
+        assert!(
+            verify_pinned("/dev/null").is_ok(),
+            "an exactly-listed existing node passes the escape"
+        );
+        let err = verify_pinned("/dev/urandom").unwrap_err().to_string();
+        assert!(
+            err.contains("refusing"),
+            "an unlisted node must still hit the physical-device pin, got: {err}"
+        );
+        std::env::set_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/nul");
+        assert!(
+            verify_pinned("/dev/null").is_err(),
+            "a prefix must not satisfy the exact-path escape"
+        );
+        std::env::remove_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA");
     }
 }

@@ -5239,6 +5239,12 @@ mod tests {
         );
         wait_op_done(&mut app);
         app.error = None;
+        // wait_op_done pumps poll(), which re-derives hardware capabilities
+        // from the real /dev nodes; on a camera-less host (CI) the visible
+        // screen set shrinks and the current screen gets clamped away from
+        // Recovery. Pin it back so the restore keys land where a user on a
+        // stable machine would be.
+        app.screen = SC_RECOVERY;
         // Restore: empty aborts, non-empty fires RecoveryRestore.
         app.on_key(KeyCode::Char('t'));
         app.on_key(KeyCode::Enter);

@@ -27,7 +27,7 @@ in the footer.
 
 1. **Welcome**: press `[e]` to enroll right away, or `Tab` to walk the steps.
 2. **Profiles**: `[e]` enrolls a face. Look at the camera; it guides your
-   framing and captures three scans automatically. Wear glasses sometimes? Add
+   framing and captures ten scans automatically. Wear glasses sometimes? Add
    a scan with Improve Recognition (`[a]`) while wearing them, on the same
    profile; a face can only own one profile.
 3. **Keyring** *(recommended; IR camera + TPM)*: arm TPM keyring unlock so a
@@ -83,12 +83,12 @@ irlume status for 'you'
 irlume enroll
 ```
 
-Look at the camera. It captures three scans and saves a profile:
+Look at the camera. It captures ten scans and saves a profile:
 
 <!-- mirrors the enroll output in crates/irlume-cli/src/main.rs; keep in sync -->
 ```
 [enroll] 'you': capturing a new face profile; stay in frame, look at the camera…
-[enroll] enrolled 'Face Profile 1' with 3 scans
+[enroll] enrolled 'Face Profile 1' with 10 scans
 ```
 
 Options: `--name "Alex"` names the profile, `--scans K` sets the scan count,
@@ -286,8 +286,8 @@ A fully set-up secure-tier machine reads:
 irlume status for 'you'
   daemon        : running ✅
   auth method   : Auto
-  enrollment    : 1 profile(s), 3 scan(s) ✅
-                  - Face Profile 1 (3 scan(s))
+  enrollment    : 1 profile(s), 10 scan(s) ✅
+                  - Face Profile 1 (10 scan(s))
   keyring unlock: armed ✅
   templates     : encrypted at rest ✅
   recovery pass : set ✅

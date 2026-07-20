@@ -83,7 +83,7 @@ All notable changes to irlume are documented here. This project adheres to
   reference (the four `/etc/irlume` + `/var/lib/irlume` config files, camera
   selection precedence, and the daemon environment variables from
   `IRLUME_MODELS_STRICT` through the TPM overrides), DEVELOPMENT.md lists the
-  sandbox path overrides and the eight cargo example harnesses, and
+  sandbox path overrides and the nine cargo example harnesses, and
   DEBUGGING.md covers the per-camera liveness tuning thresholds. `irlume
   set-cameras` appears in `irlume help` (it was the TUI picker's hidden
   backing command, but it is also the only scriptable way to persist a camera
@@ -470,6 +470,10 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[0.3.0]: https://github.com/archledger/irlume/releases/tag/v0.3.0
+[0.2.1]: https://github.com/archledger/irlume/releases/tag/v0.2.1
+[0.2.0]: https://github.com/archledger/irlume/releases/tag/v0.2.0
+[0.1.5]: https://github.com/archledger/irlume/releases/tag/v0.1.5
 [0.1.4]: https://github.com/archledger/irlume/releases/tag/v0.1.4
 [0.1.3]: https://github.com/archledger/irlume/releases/tag/v0.1.3
 [0.1.2]: https://github.com/archledger/irlume/releases/tag/v0.1.2

@@ -8,7 +8,7 @@ abstract: >-
   a live infrared face match. Templates are stored as 512-D embeddings,
   encrypted at rest under a TPM-sealed key; anti-spoofing is algorithmic
   (infrared face detection, reflectance, depth, and glint) with no third-party
-  anti-spoof weights.
+  anti-spoof weights in the default stack.
 type: software
 authors:
   - name: archledger
@@ -17,8 +17,8 @@ authors:
 repository-code: "https://github.com/archledger/irlume"
 url: "https://github.com/archledger/irlume"
 license: GPL-3.0-or-later
-version: 0.1.5
-date-released: 2026-07-12
+version: 0.3.0
+date-released: 2026-07-19
 keywords:
   - face-authentication
   - infrared

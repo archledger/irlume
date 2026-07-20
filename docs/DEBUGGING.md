@@ -45,9 +45,9 @@ A granted IR-path attempt looks like:
 ```
 irlume[debug]: assess: rgb 1280x720 in 412ms, faces=1 top-det=0.93
 irlume[debug]: assess: ir 640x360 in 388ms, faces=1 top-det=0.91
-irlume[debug]: liveness(cross-spectrum): Live (…); ir_bright=142 ir_depth=1.31 glint=0.42 yaw_asym=0.08 pitch=0.51
+irlume[debug]: liveness(cross-spectrum): Live (…); ir_bright=142 ir_depth=1.31 glint=0.42 ambient=41 yaw_asym=0.08 pitch=0.51
 irlume[debug]: gate(per-user depth floor): live 1.31 vs floor 1.12
-irlume[debug]: match(rgb): best 0.912 vs thr 0.400 (3 scans, best profile 'Face Profile 1')
+irlume[debug]: match(rgb): best 0.912 vs thr 0.574 (3 scans, best profile 'Face Profile 1')
 irlume[debug]: verify 'x' total 1843ms
 ```
 

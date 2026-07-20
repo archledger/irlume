@@ -131,9 +131,10 @@ SUDO_USER.
 - **Arch**: AUR `PKGBUILD` (build from the release tag; `-bin` variant
   optional later). Self-updating binaries fight pacman's model, so let the
   AUR helper own updates; `irlume update` on Arch = "check + print the AUR
-  command". *(Superseded: AUR sign-ups are disabled upstream; the shipped
-  channel is a prebuilt `.pkg.tar.zst` on GitHub Releases via `pacman -U`;
-  the PKGBUILD remains for source builds.)*
+  command". *(Superseded twice: a prebuilt `.pkg.tar.zst` on GitHub Releases
+  carried 0.1.x; since 0.2.0 the shipped channel is the
+  [AUR package](https://aur.archlinux.org/packages/irlume), with the PKGBUILD
+  as its source of truth.)*
 - **Ubuntu/Debian**: no PPA needed initially; host a signed apt repo (e.g.
   GitHub Pages/Releases) or ship a .deb from GitHub Releases with
   `irlume update` handling check+download+apt-install. Must solve

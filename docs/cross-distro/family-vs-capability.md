@@ -21,7 +21,7 @@ that family. irlume already branches on `platform::distro_family()` here:
 | Default LSM policy shipped | SELinux module | AppArmor profile | (none) |
 | PAM module dir (packaging) | `/usr/lib64/security` | `/usr/lib/x86_64-linux-gnu/security` | `/usr/lib/security` |
 | onnxruntime sourcing (packaging) | bundled in the RPM | bundled in the .deb | system pkg |
-| Package format | rpm/Copr | .deb (GitHub Releases) | prebuilt .pkg.tar.zst (AUR pending) |
+| Package format | rpm/Copr | PPA, or .deb (GitHub Releases) | AUR package |
 
 ## Capability-determined (use runtime detection, NOT family)
 

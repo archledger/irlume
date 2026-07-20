@@ -68,6 +68,10 @@ possible.
 - **Fix target:** 30 days for Critical/High severity.
 - **Disclosure:** coordinated, with a 90-day window. Reporters are credited in
   the release notes (opt-in).
+- **CVE IDs:** requested through GitHub Security Advisories (GitHub is a CVE
+  Numbering Authority for repository vulnerabilities), so a confirmed
+  vulnerability gets a CVE and a published advisory alongside the fix release,
+  and the fix is named in that release's notes.
 
 ## Scope
 

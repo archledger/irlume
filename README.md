@@ -20,6 +20,7 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 ![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu-2ea44f)
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/archledger/irlume/badge)](https://scorecard.dev/viewer/?uri=github.com/archledger/irlume)
 [![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](#-faq)
 
 [Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
@@ -379,9 +380,10 @@ meantime, so nothing locks you out.
 
 A normal face login takes about **2.5 seconds** on an integrated IR camera
 (measured on an ASUS Zenbook, CPU inference). Most of that is opening the
-camera and letting auto-exposure settle, not the neural networks. The greeter
-and lock screen pre-warm the camera on the unlock signal, so a real unlock
-feels quicker than a cold `irlume identify`.
+camera and letting auto-exposure settle, not the neural networks. The RGB and
+IR captures run in parallel, which cuts the capture stage by about a third;
+[docs/DEBUGGING.md](docs/DEBUGGING.md) shows how to time every stage on your
+own hardware.
 
 The **opt-in blink challenge** (`irlume profiles challenge on`) is a deterrent
 against a glossy print or vinyl that mimics infrared depth: it watches for a

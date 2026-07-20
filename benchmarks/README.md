@@ -25,7 +25,7 @@ it. CPU runs give the same accuracy (only latency differs).
 
 | Name | What | Source | Terms |
 |---|---|---|---|
-| LFW | 13k in-the-wild RGB faces, standard 6000-pair verification protocol | [vis-www.cs.umass.edu/lfw](http://vis-www.cs.umass.edu/lfw/) (also on Kaggle) | research use, free download |
+| LFW | 13k in-the-wild RGB faces, standard 6000-pair verification protocol | [Kaggle `jessicali9530/lfw-dataset`](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset); the original UMass page (vis-www.cs.umass.edu/lfw) no longer resolves | research use, free download |
 | CBSR NIR | CASIA near-infrared faces (OTCBVS benchmark dataset 07) | [OTCBVS](http://vcipl-okstate.org/pbvs/bench/) | research/education only |
 | Oulu-CASIA NIR | near-infrared faces, multiple illuminations | Oulu-CASIA NIR-VIS academic release | research only |
 | Tufts Face | paired RGB + NIR (thermal/near-IR), many subjects | [tdface.ece.tufts.edu](http://tdface.ece.tufts.edu/) | research use |

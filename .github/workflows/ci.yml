@@ -178,7 +178,7 @@ jobs:
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: Coverage (fail under the ratchet floor)
-        run: cargo llvm-cov --workspace --locked --summary-only --fail-under-lines 25
+        run: cargo llvm-cov --workspace --locked --summary-only --fail-under-lines 33
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)

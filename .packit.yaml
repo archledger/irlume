@@ -27,10 +27,12 @@ jobs:
       - fedora-rawhide
     # onnxruntime is bundled in the RPM (Source1); no external Copr needed.
 
+  # PR builds go to Packit's throwaway sandbox project
+  # (packit/archledger-irlume-<PR>), NOT the production Copr: their
+  # timestamped Release field outranks real releases, so a PR rpm in the
+  # release repo becomes what `dnf install irlume` serves to everyone.
   - job: copr_build
     trigger: pull_request
-    owner: archledger
-    project: irlume
     enable_net: true
     targets:
       - fedora-stable

@@ -1,0 +1,49 @@
+# Monthly flake.lock refresh. Nothing else updates the nix inputs (Dependabot
+# has no nix support), so without this the pinned nixpkgs ages silently.
+#
+# The update runs `nix flake check` plus the fixed-output-derivation build
+# BEFORE opening the PR, so the PR arrives pre-validated in this workflow's
+# log. Note: PRs opened with the workflow token do not trigger the CI
+# workflow; close and reopen the PR (one click) to run the required checks
+# before merging.
+name: Update flake.lock
+
+on:
+  schedule:
+    - cron: "15 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Nix with flakes
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Update flake.lock and validate before proposing
+        run: |
+          nix flake update
+          nix flake check --no-build --show-trace
+          nix build --no-link .#default.cargoDeps .#onnxruntime-bin
+
+      - name: Open the update PR
+        uses: DeterminateSystems/update-flake-lock@834c491b2ece4de0bbd00d85214bb5e83b4da5c6 # v28
+        with:
+          pr-title: "deps: update flake.lock"
+          pr-body: |
+            Monthly nix input refresh. `nix flake check` and the
+            fixed-output-derivation builds passed in the generating
+            workflow run before this PR was opened. Close and reopen
+            this PR to trigger the required CI checks.
+          branch: deps/update-flake-lock
+          commit-msg: "deps: update flake.lock"

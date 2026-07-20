@@ -210,3 +210,43 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_uid_matches_the_real_euid() {
+        // The /proc/self/status parse must yield the kernel's effective uid.
+        assert_eq!(effective_uid(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn require_root_gates_on_the_effective_uid() {
+        // Consistent with effective_uid: only uid 0 clears the gate.
+        if effective_uid() == 0 {
+            assert!(require_root("enable"));
+        } else {
+            assert!(!require_root("enable"));
+        }
+    }
+
+    #[test]
+    fn run_cmd_maps_spawn_and_exit_outcomes_to_a_bool() {
+        // Zero exit → true, non-zero → false, un-spawnable → false. Uses the
+        // harmless true/false shells, never a real authselect/pam-auth-update.
+        assert!(run_cmd("true", &[]));
+        assert!(!run_cmd("false", &[]));
+        assert!(!run_cmd("irlume-no-such-command-xyz", &["arg"]));
+    }
+
+    #[test]
+    fn enroll_one_refuses_without_fprintd_or_a_reader() {
+        // When the tooling or the sensor is missing, enrollment bails early with
+        // false and never drives hardware. On a box that has both, this branch
+        // isn't reachable without a live sensor, so it is skipped.
+        if !fp::fprintd_present() || !fp::reader_present() {
+            assert!(!enroll_one("irlume-nonexistent-test-user"));
+        }
+    }
+}

@@ -75,4 +75,68 @@ mod tests {
         assert!(Method::Fingerprint.face_disabled());
         assert!(!Method::Auto.face_disabled());
     }
+
+    #[test]
+    fn parse_handles_aliases_and_whitespace_and_case() {
+        // Every accepted fingerprint spelling, plus surrounding whitespace and
+        // mixed case, must resolve to Fingerprint.
+        for s in ["finger", "  Fingerprint\n", "FP", "\tfp "] {
+            assert_eq!(Method::parse(s), Method::Fingerprint, "{s:?}");
+        }
+        assert_eq!(Method::parse("  FACE  "), Method::Face);
+        // Only Fingerprint disables face; Face behaves like Auto for the daemon.
+        assert!(!Method::Face.face_disabled());
+    }
+
+    #[test]
+    fn path_honours_env_override() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", "/tmp/irlume-method-override");
+        assert_eq!(path(), PathBuf::from("/tmp/irlume-method-override"));
+        std::env::remove_var("IRLUME_METHOD_CONF");
+        assert_eq!(path(), PathBuf::from("/etc/irlume/method"));
+    }
+
+    #[test]
+    fn method_reads_file_and_defaults_when_absent() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("irlume-policy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("method");
+        std::env::set_var("IRLUME_METHOD_CONF", &f);
+
+        // Absent/unreadable file -> Auto.
+        assert_eq!(method(), Method::Auto);
+
+        std::fs::write(&f, "fingerprint\n").unwrap();
+        assert_eq!(method(), Method::Fingerprint);
+        std::fs::write(&f, "face").unwrap();
+        assert_eq!(method(), Method::Face);
+
+        std::env::remove_var("IRLUME_METHOD_CONF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_method_persists_creates_parent_and_roundtrips() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("irlume-policy-set-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Nested path: set_method must create the missing parent directory.
+        let f = dir.join("nested/method");
+        std::env::set_var("IRLUME_METHOD_CONF", &f);
+
+        set_method(Method::Fingerprint).unwrap();
+        assert!(f.exists());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "fingerprint");
+        assert_eq!(method(), Method::Fingerprint);
+
+        set_method(Method::Auto).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "auto");
+        assert_eq!(method(), Method::Auto);
+
+        std::env::remove_var("IRLUME_METHOD_CONF");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

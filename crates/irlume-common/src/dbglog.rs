@@ -25,3 +25,58 @@ macro_rules! dlog {
         if $crate::dbglog::on() { eprintln!("irlume[debug]: {}", format_args!($($t)*)); }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // on() caches its answer in a OnceLock for the process lifetime, so each
+    // IRLUME_LOG value gets its own re-exec'd child process; asserting in-process
+    // would only ever see whatever value froze first.
+    #[test]
+    fn irlume_log_values_toggle_tracing_per_process() {
+        if let Ok(expect) = std::env::var("IRLUME_TEST_DBGLOG_EXPECT") {
+            assert_eq!(
+                on(),
+                expect == "1",
+                "IRLUME_LOG={:?}",
+                std::env::var("IRLUME_LOG")
+            );
+            // The answer is frozen after first use, whatever the env does next.
+            std::env::set_var("IRLUME_LOG", "debug");
+            assert_eq!(on(), expect == "1");
+            // The macro must compile and run in both states without output
+            // side effects we could crash on.
+            crate::dlog!("probe {}", 42);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let run = |log: Option<&str>, expect: &str| {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "dbglog::tests::irlume_log_values_toggle_tracing_per_process",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("IRLUME_TEST_DBGLOG_EXPECT", expect)
+            .env_remove("IRLUME_LOG");
+            if let Some(v) = log {
+                cmd.env("IRLUME_LOG", v);
+            }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "IRLUME_LOG={log:?} expect={expect}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        };
+        // The three documented enabling values.
+        for v in ["debug", "trace", "1"] {
+            run(Some(v), "1");
+        }
+        // Unset, and set to something unrecognized: off.
+        run(None, "0");
+        run(Some("verbose"), "0");
+        run(Some(""), "0");
+    }
+}

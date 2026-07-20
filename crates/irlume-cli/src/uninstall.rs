@@ -348,4 +348,36 @@ mod tests {
         );
         assert!(removal_hint(&InstallOrigin::Source).contains("source install"));
     }
+
+    // The repo-residual cleaner backs both the Copr and the PPA teardown; it
+    // must take everything the installers drop (repo file, sources file,
+    // signing keys, any capitalisation) and nothing else in the directory.
+    #[test]
+    fn remove_repo_files_deletes_only_irlume_named_entries() {
+        let dir = std::env::temp_dir().join(format!("irlume-repo-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = [
+            "_copr:copr.fedorainfracloud.org:archledger:irlume.repo",
+            "archledger-ubuntu-irlume-resolute.sources",
+            "IRLUME-2026.gpg",
+        ];
+        let theirs = ["fedora.repo", "docker.list", "archledger-other.gpg"];
+        for f in ours.iter().chain(theirs.iter()) {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        remove_repo_files(dir.to_str().unwrap());
+        for f in ours {
+            assert!(!dir.join(f).exists(), "{f} should have been removed");
+        }
+        for f in theirs {
+            assert!(dir.join(f).exists(), "{f} must be left alone");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_repo_files_tolerates_a_missing_directory() {
+        remove_repo_files("/nonexistent/irlume-repo-dir");
+    }
 }

@@ -196,3 +196,76 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     );
     ExitCode::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("irlume-suncal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn pgm_bytes(w: u32, h: u32, fill: u8) -> Vec<u8> {
+        let mut v = format!("P5\n{w} {h}\n255\n").into_bytes();
+        v.extend(vec![fill; (w * h) as usize]);
+        v
+    }
+
+    #[test]
+    fn read_pgm_parses_a_binary_p5_file() {
+        let d = tmp("pgm-ok");
+        let p = d.join("f.pgm");
+        let mut bytes = pgm_bytes(4, 2, 9);
+        bytes.extend([77, 77]); // trailing junk after the pixel block
+        std::fs::write(&p, &bytes).unwrap();
+        let (w, h, px) = read_pgm(&p).expect("valid P5");
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(
+            px,
+            vec![9u8; 8],
+            "exactly w*h pixels, trailing bytes dropped"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_pgm_rejects_wrong_magic_and_short_pixel_data() {
+        let d = tmp("pgm-bad");
+        let p6 = d.join("p6.pgm");
+        std::fs::write(&p6, b"P6\n2 2\n255\n0123").unwrap();
+        assert!(read_pgm(&p6).is_none(), "P6 (color PPM) is not P5");
+
+        let short = d.join("short.pgm");
+        std::fs::write(&short, b"P5\n4 4\n255\nab").unwrap(); // 2 of 16 pixels
+        assert!(read_pgm(&short).is_none(), "truncated pixel block");
+
+        assert!(read_pgm(&d.join("absent.pgm")).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_burst_orders_frames_and_ignores_non_frame_files() {
+        let d = tmp("burst");
+        // Written out of order; the loader must sort by name.
+        std::fs::write(d.join("frame01.pgm"), pgm_bytes(3, 2, 1)).unwrap();
+        std::fs::write(d.join("frame00.pgm"), pgm_bytes(3, 2, 0)).unwrap();
+        std::fs::write(d.join("rgb00.ppm"), b"P6 junk").unwrap();
+        std::fs::write(d.join("notes.txt"), b"not a frame").unwrap();
+        let (w, h, frames) = load_burst(&d).expect("burst loads");
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(frames.len(), 2, "only frameNN.pgm files count");
+        assert_eq!(frames[0], vec![0u8; 6], "frame00 first");
+        assert_eq!(frames[1], vec![1u8; 6], "frame01 second");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_burst_of_an_empty_dir_is_none() {
+        let d = tmp("burst-empty");
+        assert!(load_burst(&d).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

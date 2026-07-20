@@ -130,4 +130,98 @@ mod tests {
         }
         assert!(moire_score(&g) > 50.0);
     }
+
+    #[test]
+    fn short_buffer_scores_zero() {
+        assert_eq!(moire_score(&[128u8; N * N - 1]), 0.0);
+        assert_eq!(moire_score(&[]), 0.0);
+    }
+
+    #[test]
+    fn all_black_crop_scores_zero() {
+        // Zero-mean, zero-energy input: the sum==0 guard, not a division blowup.
+        assert_eq!(moire_score(&vec![0u8; N * N]), 0.0);
+    }
+
+    #[test]
+    fn periodic_stripes_outscore_broadband_texture() {
+        // Skin-analog per the module contract: BROADBAND, non-periodic texture
+        // (deterministic pseudo-noise) whose spectrum falls off smoothly.
+        let mut noise = vec![0u8; N * N];
+        let mut s = 0x2545_F491u32;
+        for p in noise.iter_mut() {
+            // xorshift32: deterministic, aperiodic over this length.
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *p = (s >> 24) as u8;
+        }
+        // Display-like periodicity: vertical stripes of period 4 (frequency
+        // 0.25, well inside the analyzed band).
+        let mut stripes = vec![0u8; N * N];
+        for y in 0..N {
+            for x in 0..N {
+                stripes[y * N + x] = if (x / 2) % 2 == 0 { 40 } else { 220 };
+            }
+        }
+        let (s_noise, s_stripes) = (moire_score(&noise), moire_score(&stripes));
+        assert!(
+            s_stripes > 10.0 * s_noise.max(1.0),
+            "stripes {s_stripes} vs broadband {s_noise}: periodicity must dominate"
+        );
+        // A slow one-axis gradient (smooth shading) also stays well under the
+        // stripe score, though windowing leakage keeps it above pure noise.
+        let mut smooth = vec![0u8; N * N];
+        for y in 0..N {
+            for x in 0..N {
+                smooth[y * N + x] = (x * 255 / N) as u8;
+            }
+        }
+        let s_smooth = moire_score(&smooth);
+        assert!(
+            s_stripes > 2.0 * s_smooth,
+            "stripes {s_stripes} vs gradient {s_smooth}"
+        );
+    }
+
+    #[test]
+    fn face_gray_n_converts_luma_and_resamples() {
+        // A 4x4 pure-red frame: BT.601 luma of (255,0,0) is 76.
+        let (w, h) = (4u32, 4u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        for px in rgb.chunks_mut(3) {
+            px[0] = 255;
+        }
+        let g = face_gray_n(&rgb, w, h, &[0.0, 0.0, 4.0, 4.0]);
+        assert_eq!(g.len(), N * N);
+        assert!(g.iter().all(|&p| p == 76), "expected uniform luma 76");
+    }
+
+    #[test]
+    fn face_gray_n_nearest_resample_preserves_grid_extremes() {
+        // A 2x2 black/white checker upsampled 64x: nearest sampling must keep
+        // pure 0/255 (bilinear would smear them, killing the FFT peak).
+        let (w, h) = (2u32, 2u32);
+        let rgb = [
+            0u8, 0, 0, 255, 255, 255, //
+            255, 255, 255, 0, 0, 0,
+        ];
+        let g = face_gray_n(&rgb, w, h, &[0.0, 0.0, 2.0, 2.0]);
+        assert!(g.iter().all(|&p| p == 0 || p == 255));
+        assert!(g.contains(&0) && g.contains(&255));
+    }
+
+    #[test]
+    fn face_gray_n_clamps_out_of_frame_bboxes() {
+        // A bbox hanging off every edge is clamped into the frame; the crop
+        // still fills the full analysis grid from real pixels.
+        let (w, h) = (8u32, 8u32);
+        let rgb = vec![200u8; (w * h * 3) as usize];
+        let g = face_gray_n(&rgb, w, h, &[-50.0, -50.0, 500.0, 500.0]);
+        assert_eq!(g.len(), N * N);
+        assert!(g.iter().all(|&p| p == 200));
+        // Degenerate inverted/zero-area bbox: clamped to at least one pixel.
+        let g = face_gray_n(&rgb, w, h, &[7.9, 7.9, 7.9, 7.9]);
+        assert!(g.iter().all(|&p| p == 200));
+    }
 }

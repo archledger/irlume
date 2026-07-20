@@ -3901,6 +3901,91 @@ mod tests {
         out
     }
 
+    /// Hold ENV_LOCK and point IRLUME_SOCKET at a nonexistent path for the
+    /// guard's lifetime. Every test that can trigger a daemon request (directly
+    /// or on a worker thread) must hold one: a dev box may be running a REAL
+    /// irlumed, and e.g. Request::Identify would fire its camera.
+    struct DeadSocket {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old: Option<std::ffi::OsString>,
+    }
+
+    fn dead_socket() -> DeadSocket {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", "/nonexistent/irlume-test.sock");
+        DeadSocket { _lock: lock, old }
+    }
+
+    impl Drop for DeadSocket {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("IRLUME_SOCKET", v),
+                None => std::env::remove_var("IRLUME_SOCKET"),
+            }
+        }
+    }
+
+    /// Drive poll() until the async op finishes (its worker thread answers with
+    /// the dead-socket connect error). Must be called while a DeadSocket guard
+    /// is held so the worker cannot race onto a real socket.
+    fn wait_op_done(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.op.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.op.is_none(), "async op never finished");
+    }
+
+    /// Drive poll() until the guided-enroll worker ends (dead socket → Err).
+    fn wait_enroll_done(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.enroll.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.enroll.is_none(), "enroll worker never finished");
+    }
+
+    /// Render the full frame at 120x50 and return the flattened text.
+    fn draw_text(app: &App) -> String {
+        let mut term = Terminal::new(TestBackend::new(120, 50)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        rendered(&term)
+    }
+
+    fn profile(name: &str, scans: &[&str]) -> ProfileSummary {
+        ProfileSummary {
+            name: name.into(),
+            scans: scans.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn check_row(label: &str, sev: Sev, fix: Fix) -> Check {
+        Check {
+            label: label.into(),
+            sev,
+            detail: format!("{label} detail"),
+            fix,
+        }
+    }
+
+    fn good_report(guidance: &str) -> PositionReport {
+        PositionReport {
+            face: true,
+            face_frac: 0.3,
+            centered: true,
+            yaw_asym: 0.1,
+            pitch_frac: 0.5,
+            brightness: 120.0,
+            ir_ok: true,
+            quality: 85,
+            well_framed: true,
+            guidance: guidance.into(),
+        }
+    }
+
     // Regression: f00f316. The daemon acks SetRequireEyesOpen with
     // Response::Ok (via mutate_enrollment), not Response::Enrollment; before
     // the fix map_settings routed Ok to the "unexpected" fallback and every
@@ -4281,5 +4366,1774 @@ mod tests {
             app.error.is_some(),
             "the failure must raise the error banner"
         );
+    }
+
+    // ---- pure helpers -----------------------------------------------------
+
+    #[test]
+    fn quality_bar_fills_proportionally() {
+        assert_eq!(quality_bar(0), "[░░░░░░░░░░]   0%");
+        assert_eq!(quality_bar(50), "[█████░░░░░]  50%");
+        assert_eq!(quality_bar(100), "[██████████] 100%");
+    }
+
+    #[test]
+    fn map_ok_routes_ack_error_and_unexpected() {
+        assert_eq!(map_ok(Response::Ok("done".into())), (true, "done".into()));
+        assert_eq!(
+            map_ok(Response::Error("boom".into())),
+            (false, "boom".into())
+        );
+        let (ok, msg) = map_ok(Response::Pong);
+        assert!(!ok);
+        assert!(msg.contains("unexpected"), "got: {msg}");
+    }
+
+    #[test]
+    fn map_identify_formats_match_and_both_miss_reasons() {
+        let (ok, msg) = map_identify(Response::Identified {
+            user: Some("alice".into()),
+            profile: Some("Face Profile 1".into()),
+            score: 0.8125,
+            live: true,
+            reason: String::new(),
+        });
+        assert!(ok);
+        assert_eq!(msg, "alice · Face Profile 1 · score 0.812");
+        let (ok, msg) = map_identify(Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: true,
+            reason: "below threshold".into(),
+        });
+        assert!(!ok);
+        assert_eq!(msg, "live face, no enrolled match (below threshold)");
+        let (ok, msg) = map_identify(Response::Identified {
+            user: None,
+            profile: None,
+            score: 0.0,
+            live: false,
+            reason: "flat depth".into(),
+        });
+        assert!(!ok);
+        assert_eq!(msg, "no live face (flat depth)");
+        assert!(!map_identify(Response::Error("e".into())).0);
+    }
+
+    #[test]
+    fn map_selftest_passes_through_verdict() {
+        assert_eq!(
+            map_selftest(Response::SelfTest {
+                passed: true,
+                detail: "depth 0.7".into()
+            }),
+            (true, "depth 0.7".into())
+        );
+        assert_eq!(
+            map_selftest(Response::SelfTest {
+                passed: false,
+                detail: "too flat".into()
+            }),
+            (false, "too flat".into())
+        );
+    }
+
+    #[test]
+    fn map_confirm_accepts_ok_and_password_forgotten() {
+        assert!(map_confirm(Response::Ok("deleted".into())).0);
+        let (ok, msg) = map_confirm(Response::PasswordForgotten);
+        assert!(ok);
+        assert!(msg.contains("disarmed"), "got: {msg}");
+        assert!(!map_confirm(Response::Error("e".into())).0);
+    }
+
+    #[test]
+    fn map_sealed_reports_armed_and_prefixes_failures() {
+        let (ok, msg) = map_sealed(Response::PasswordSealed);
+        assert!(ok);
+        assert!(msg.contains("keyring armed"), "got: {msg}");
+        let (ok, msg) = map_sealed(Response::Error("tpm gone".into()));
+        assert!(!ok);
+        assert_eq!(msg, "arm failed: tpm gone");
+    }
+
+    #[test]
+    fn recommended_covers_every_hardware_tier() {
+        let mut app = test_app();
+        let cases = [
+            (true, true, true, "Face (IR)"),
+            (false, true, true, "Fingerprint (secure), or Face (RGB)"),
+            (false, true, false, "Face (RGB) · convenience"),
+            (false, false, true, "Fingerprint"),
+            (false, false, false, "Password only"),
+        ];
+        for (ir_pair, rgb, fp, want) in cases {
+            app.caps = irlume_camera::Caps { ir_pair, rgb };
+            app.fp_present = fp;
+            let got = app.recommended();
+            assert!(
+                got.starts_with(want),
+                "caps ir={ir_pair} rgb={rgb} fp={fp}: got '{got}', want prefix '{want}'"
+            );
+        }
+    }
+
+    #[test]
+    fn next_profile_name_skips_taken_names() {
+        let mut app = test_app();
+        assert_eq!(app.next_profile_name(), "Face Profile 1");
+        app.profiles = vec![profile("Face Profile 1", &[])];
+        assert_eq!(app.next_profile_name(), "Face Profile 2");
+        app.profiles = vec![
+            profile("Face Profile 1", &[]),
+            profile("Face Profile 2", &[]),
+            profile("Face Profile 3", &[]),
+        ];
+        assert_eq!(app.next_profile_name(), "Face Profile 4");
+    }
+
+    #[test]
+    fn rows_interleave_profiles_and_scans_and_sel_profile_resolves_owner() {
+        let mut app = test_app();
+        app.profiles = vec![profile("a", &["s1", "s2"]), profile("b", &["t1"])];
+        let rows = app.rows();
+        assert_eq!(rows.len(), 5, "2 profiles + 3 scans");
+        assert!(matches!(rows[0], Row::Profile(0)));
+        assert!(matches!(rows[1], Row::Scan(0, 0)));
+        assert!(matches!(rows[2], Row::Scan(0, 1)));
+        assert!(matches!(rows[3], Row::Profile(1)));
+        assert!(matches!(rows[4], Row::Scan(1, 0)));
+        app.sel = 2; // scan s2 → owner is profile 'a'
+        assert_eq!(app.sel_profile().as_deref(), Some("a"));
+        app.sel = 3;
+        assert_eq!(app.sel_profile().as_deref(), Some("b"));
+        app.sel = 99;
+        assert_eq!(app.sel_profile(), None);
+    }
+
+    // ---- tab visibility & navigation --------------------------------------
+
+    #[test]
+    fn compute_visible_matches_hardware_tiers() {
+        let none = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: false,
+        };
+        let rgb = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: true,
+        };
+        let ir = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        // No biometric hardware: only the always-on steps.
+        assert_eq!(
+            App::compute_visible(&none, false, false, false, &[]),
+            vec![SC_WELCOME, SC_PAM, SC_DONE]
+        );
+        // RGB-only adds the face path (Profiles + Recovery), not Keyring.
+        assert_eq!(
+            App::compute_visible(&rgb, false, false, false, &[]),
+            vec![SC_WELCOME, SC_PROFILES, SC_RECOVERY, SC_PAM, SC_DONE]
+        );
+        // An IR pair earns the Keyring step.
+        assert_eq!(
+            App::compute_visible(&ir, false, false, false, &[]),
+            vec![
+                SC_WELCOME,
+                SC_PROFILES,
+                SC_KEYRING,
+                SC_RECOVERY,
+                SC_PAM,
+                SC_DONE
+            ]
+        );
+        // A fingerprint-only box gets Keyring + Fingerprint, no face tabs.
+        assert_eq!(
+            App::compute_visible(&none, true, false, false, &[]),
+            vec![SC_WELCOME, SC_KEYRING, SC_FINGERPRINT, SC_PAM, SC_DONE]
+        );
+        // Advanced view on full hardware shows every screen.
+        assert_eq!(
+            App::compute_visible(&ir, true, true, false, &[]),
+            (0..SCREENS.len()).collect::<Vec<_>>()
+        );
+        // Repair earns its tab when the daemon is down…
+        assert_eq!(
+            App::compute_visible(&none, false, false, true, &[]),
+            vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_DONE]
+        );
+        // …or when any check fails, but not for a mere warning.
+        let fail = [check_row("x", Sev::Fail, Fix::None)];
+        assert!(App::compute_visible(&none, false, false, false, &fail).contains(&SC_REPAIR));
+        let warn = [check_row("x", Sev::Warn, Fix::None)];
+        assert!(!App::compute_visible(&none, false, false, false, &warn).contains(&SC_REPAIR));
+    }
+
+    #[test]
+    fn tab_steps_wrap_and_walk_only_visible_screens() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: true,
+        };
+        app.daemon_up = true; // healthy: Repair earns no tab
+        app.recompute_visible(); // Welcome, Profiles, Recovery, PAM, Done
+        assert_eq!(app.screen, SC_WELCOME);
+        app.sel = 3;
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen, SC_PROFILES, "Tab skips the hidden Repair tab");
+        assert_eq!(app.sel, 0, "changing tab resets the selection");
+        app.on_key(KeyCode::Right);
+        assert_eq!(app.screen, SC_RECOVERY, "Cameras/Identify stay hidden");
+        app.on_key(KeyCode::BackTab);
+        app.on_key(KeyCode::Left);
+        assert_eq!(app.screen, SC_WELCOME);
+        app.on_key(KeyCode::BackTab);
+        assert_eq!(app.screen, SC_DONE, "BackTab from the first step wraps");
+        app.on_key(KeyCode::Tab);
+        assert_eq!(app.screen, SC_WELCOME, "Tab from the last step wraps");
+    }
+
+    #[test]
+    fn recompute_visible_snaps_to_nearest_surviving_screen() {
+        let mut app = test_app();
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_SETTINGS;
+        app.advanced = false;
+        app.recompute_visible();
+        assert_eq!(
+            app.screen, SC_PAM,
+            "leaving advanced view must land on the nearest visible step"
+        );
+    }
+
+    #[test]
+    fn move_sel_wraps_within_each_screens_list() {
+        let mut app = test_app();
+        app.profiles = vec![profile("a", &["s1", "s2"])]; // 3 rows
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.sel, 2, "Up from the top wraps to the last row");
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.sel, 0, "j from the bottom wraps to the top");
+        app.on_key(KeyCode::Char('k'));
+        assert_eq!(app.sel, 2);
+        app.screen = SC_REPAIR;
+        app.repair = vec![
+            check_row("a", Sev::Ok, Fix::None),
+            check_row("b", Sev::Fail, Fix::None),
+        ];
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.repair_sel, 1, "Repair has its own selection");
+        assert_eq!(app.sel, 2, "the profile selection must not move");
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.repair_sel, 0);
+        app.screen = SC_CAMERAS;
+        app.pairs = vec![
+            irlume_camera::CameraPair {
+                rgb: "/dev/video0".into(),
+                ir: "/dev/video2".into(),
+                id: None,
+                fixed: true,
+            },
+            irlume_camera::CameraPair {
+                rgb: "/dev/video4".into(),
+                ir: "/dev/video6".into(),
+                id: None,
+                fixed: false,
+            },
+        ];
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.cam_sel, 1, "Cameras has its own selection");
+    }
+
+    // ---- key routing / actions --------------------------------------------
+
+    #[test]
+    fn quit_keys_work_everywhere_but_stray_keys_do_not() {
+        let mut app = test_app();
+        app.on_key(KeyCode::Char('q'));
+        assert!(app.quit);
+        let mut app = test_app();
+        app.on_key(KeyCode::Esc);
+        assert!(app.quit);
+        // During a running op only q/Esc get through; the rest are swallowed.
+        let mut app = test_app();
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        app.on_key(KeyCode::Tab);
+        app.on_key(KeyCode::Char('e'));
+        assert_eq!(app.screen, SC_WELCOME, "nav keys are dead during an op");
+        assert!(!app.quit);
+        app.on_key(KeyCode::Char('q'));
+        assert!(app.quit, "q must stay a live escape hatch during an op");
+    }
+
+    #[test]
+    fn welcome_refresh_key_logs_and_reprobes() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.on_key(KeyCode::Char('r'));
+        assert!(
+            app.activity.iter().any(|(_, m)| m.contains("refreshing")),
+            "[r] must announce the refresh in Activity"
+        );
+        assert!(!app.daemon_up, "the dead socket means daemon down");
+    }
+
+    #[test]
+    fn welcome_enroll_and_identify_without_camera_explain_instead_of_noop() {
+        let mut app = test_app(); // caps: no camera
+        app.on_key(KeyCode::Char('e'));
+        assert!(app.input.is_none(), "no name prompt without a camera");
+        let (_, msg) = app.activity.last().expect("a guidance line is logged");
+        assert!(msg.contains("no camera"), "got: {msg}");
+        let before = app.activity.len();
+        app.on_key(KeyCode::Char('i'));
+        assert!(app.op.is_none(), "identify must not start without a camera");
+        assert_eq!(app.activity.len(), before + 1);
+    }
+
+    #[test]
+    fn welcome_enroll_with_camera_jumps_to_profiles_and_prompts_for_name() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.on_key(KeyCode::Char('e'));
+        assert_eq!(app.screen, SC_PROFILES);
+        match &app.input {
+            Some((prompt, _, Pending::EnrollName)) => {
+                assert!(prompt.contains("New profile name"), "got: {prompt}")
+            }
+            other => panic!("expected the enroll-name prompt, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn welcome_identify_stays_put_in_essential_view_and_jumps_in_advanced() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: true,
+        };
+        app.recompute_visible();
+        app.on_key(KeyCode::Char('i'));
+        assert_eq!(
+            app.screen, SC_WELCOME,
+            "essential view has no Identify tab; stay put"
+        );
+        assert!(app.op.is_some(), "the 1:N identify op must still start");
+        wait_op_done(&mut app);
+        let (ok, _) = app
+            .identify_result
+            .as_ref()
+            .expect("the op result must land on the Identify card");
+        assert!(!ok, "a dead socket cannot identify anyone");
+        assert!(
+            app.error.is_none(),
+            "an identify miss shows on the card, not the error modal"
+        );
+        // Advanced view: the tab exists, so [i] jumps there. (The refresh at op
+        // completion re-derived caps from real hardware; pin them back so this
+        // half is deterministic on camera-less machines too.)
+        app.caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: true,
+        };
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        app.on_key(KeyCode::Char('i'));
+        assert_eq!(app.screen, SC_IDENTIFY);
+        wait_op_done(&mut app);
+    }
+
+    #[test]
+    fn daemon_gate_parks_the_enroll_intent_and_routes_to_repair() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = false;
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('e'));
+        assert_eq!(app.screen, SC_REPAIR, "a down daemon routes to Repair");
+        assert_eq!(app.repair_sel, 0, "the Daemon row is selected");
+        assert!(matches!(app.resume_enroll, Some(ResumeEnroll::New)));
+        assert!(matches!(app.suspend, Some(Suspend::RestartDaemon)));
+        assert!(
+            app.input.is_none(),
+            "no name prompt while the daemon is down"
+        );
+        // The add-scan path parks its own intent.
+        let mut app = test_app();
+        app.daemon_up = false;
+        app.profiles = vec![profile("p1", &[])];
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('a'));
+        assert!(matches!(app.resume_enroll, Some(ResumeEnroll::Add(ref p)) if p == "p1"));
+    }
+
+    #[test]
+    fn profiles_add_scan_without_profiles_hints_instead_of_starting() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('a'));
+        assert!(app.enroll.is_none());
+        let (_, msg) = app.activity.last().expect("a hint is logged");
+        assert!(msg.contains("select a profile first"), "got: {msg}");
+    }
+
+    #[test]
+    fn profiles_add_scan_starts_improve_round_on_selected_profile() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.profiles = vec![profile("p1", &["s1"])];
+        app.screen = SC_PROFILES;
+        app.sel = 1; // the scan row still resolves to its owning profile
+        app.on_key(KeyCode::Char('a'));
+        {
+            let e = app.enroll.as_ref().expect("an improve round must start");
+            assert_eq!(e.profile, "p1");
+            assert_eq!(e.target, ADD_SCANS, "improve rounds capture ADD_SCANS");
+        }
+        wait_enroll_done(&mut app);
+        let err = app.error.as_ref().expect("dead socket fails the capture");
+        assert!(err.contains("Enrollment failed"), "got: {err}");
+    }
+
+    #[test]
+    fn profiles_rename_and_delete_target_the_selected_row() {
+        let mut app = test_app();
+        app.profiles = vec![profile("p1", &["s1", "s2"])];
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('r'));
+        match &app.input {
+            Some((prompt, _, Pending::RenameProfile(old))) => {
+                assert!(prompt.contains("Rename profile 'p1'"), "got: {prompt}");
+                assert_eq!(old, "p1");
+            }
+            _ => panic!("expected the rename-profile prompt"),
+        }
+        app.input = None;
+        app.sel = 2; // second scan
+        app.on_key(KeyCode::Char('r'));
+        match &app.input {
+            Some((prompt, _, Pending::RenameScan(p, s))) => {
+                assert!(prompt.contains("Rename scan 's2'"), "got: {prompt}");
+                assert_eq!((p.as_str(), s.as_str()), ("p1", "s2"));
+            }
+            _ => panic!("expected the rename-scan prompt"),
+        }
+        app.input = None;
+        app.sel = 0;
+        app.on_key(KeyCode::Char('d'));
+        match &app.confirm {
+            Some((q, Request::DeleteProfile { user, profile })) => {
+                assert!(q.contains("Delete profile 'p1'"), "got: {q}");
+                assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
+            }
+            _ => panic!("expected the delete-profile confirm"),
+        }
+        app.confirm = None;
+        app.sel = 1;
+        app.on_key(KeyCode::Char('d'));
+        match &app.confirm {
+            Some((q, Request::DeleteScan { profile, scan, .. })) => {
+                assert!(q.contains("Delete scan 's1' from 'p1'"), "got: {q}");
+                assert_eq!((profile.as_str(), scan.as_str()), ("p1", "s1"));
+            }
+            _ => panic!("expected the delete-scan confirm"),
+        }
+    }
+
+    #[test]
+    fn keyring_and_recovery_keys_open_masked_prompts_and_confirms() {
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.on_key(KeyCode::Char('a'));
+        match &app.input {
+            Some((_, _, p @ Pending::KeyringPw(None))) => {
+                assert!(p.masked(), "a password prompt must render masked")
+            }
+            _ => panic!("expected the keyring password prompt"),
+        }
+        app.input = None;
+        app.on_key(KeyCode::Char('f'));
+        match &app.confirm {
+            Some((q, Request::ForgetPassword { user })) => {
+                assert!(q.contains("Erase the TPM-sealed"), "got: {q}");
+                assert_eq!(user, "testuser");
+            }
+            _ => panic!("expected the keyring-forget confirm"),
+        }
+        app.confirm = None;
+        app.screen = SC_RECOVERY;
+        app.on_key(KeyCode::Char('s'));
+        assert!(matches!(app.input, Some((_, _, Pending::RecoveryPw(None)))));
+        app.input = None;
+        app.on_key(KeyCode::Char('t'));
+        match &app.input {
+            Some((_, _, p @ Pending::RecoveryRestorePw)) => assert!(p.masked()),
+            _ => panic!("expected the recovery-restore prompt"),
+        }
+        app.input = None;
+        app.on_key(KeyCode::Char('f'));
+        assert!(matches!(
+            app.confirm,
+            Some((_, Request::RecoveryForget { .. }))
+        ));
+    }
+
+    #[test]
+    fn fingerprint_add_requires_a_reader() {
+        let mut app = test_app();
+        app.screen = SC_FINGERPRINT;
+        app.on_key(KeyCode::Char('a'));
+        assert!(app.suspend.is_none());
+        let (_, msg) = app.activity.last().expect("the refusal is logged");
+        assert!(msg.contains("no fingerprint reader"), "got: {msg}");
+        app.fp.available = true;
+        app.on_key(KeyCode::Char('a'));
+        assert!(matches!(app.suspend, Some(Suspend::FingerprintAdd)));
+    }
+
+    #[test]
+    fn login_wiring_keys_suspend_to_the_right_flows() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char('w'));
+        assert!(matches!(app.suspend, Some(Suspend::LoginEnable)));
+        assert!(
+            app.activity
+                .iter()
+                .any(|(_, m)| m.contains("login enable --apply")),
+            "the exact sudo command must be announced"
+        );
+        app.suspend = None;
+        app.on_key(KeyCode::Char('s'));
+        assert!(matches!(app.suspend, Some(Suspend::LoginStatus)));
+        // The Done dashboard offers the same last-mile wire.
+        let mut app = test_app();
+        app.screen = SC_DONE;
+        app.on_key(KeyCode::Char('w'));
+        assert!(matches!(app.suspend, Some(Suspend::LoginEnable)));
+    }
+
+    #[test]
+    fn cameras_enter_switches_only_when_a_pair_exists() {
+        let mut app = test_app();
+        app.screen = SC_CAMERAS;
+        app.on_key(KeyCode::Enter);
+        assert!(app.suspend.is_none());
+        let (_, msg) = app.activity.last().expect("the no-pair case is explained");
+        assert!(msg.contains("no paired Hello camera"), "got: {msg}");
+        app.pairs = vec![irlume_camera::CameraPair {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+            id: Some("abcd:1234".into()),
+            fixed: true,
+        }];
+        app.cam_sel = 0;
+        app.on_key(KeyCode::Enter);
+        assert!(matches!(
+            app.suspend,
+            Some(Suspend::SetCameras(ref r, ref i)) if r == "/dev/video0" && i == "/dev/video2"
+        ));
+    }
+
+    #[test]
+    fn cameras_emitter_keys_route_setup_and_probe() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_CAMERAS;
+        app.on_key(KeyCode::Char('s'));
+        assert!(matches!(app.suspend, Some(Suspend::IrSetup)));
+        app.suspend = None;
+        app.on_key(KeyCode::Char('p'));
+        assert!(app.op.is_some(), "[p] starts the read-only emitter probe");
+        wait_op_done(&mut app);
+    }
+
+    #[test]
+    fn settings_enter_toggles_eyes_open_via_the_daemon() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.on_key(KeyCode::Enter);
+        assert_eq!(
+            app.op.as_ref().map(|o| o.label.as_str()),
+            Some("toggle require-eyes-open")
+        );
+        wait_op_done(&mut app);
+        assert!(
+            app.error.is_some(),
+            "a failed toggle must raise the error banner, not vanish"
+        );
+    }
+
+    #[test]
+    fn repair_ir_selftest_lands_on_the_card_without_the_error_modal() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.on_key(KeyCode::Char('l'));
+        assert!(app.op.is_some());
+        wait_op_done(&mut app);
+        let (ok, _) = app
+            .selftest_result
+            .as_ref()
+            .expect("the self-test verdict must land on the Repair card");
+        assert!(!ok);
+        assert!(
+            app.error.is_none(),
+            "a self-test miss is a card result, not an error modal"
+        );
+    }
+
+    #[test]
+    fn apply_fix_routes_every_fix_kind() {
+        let mut app = test_app();
+        app.repair = vec![
+            check_row("ok", Sev::Ok, Fix::None),
+            check_row("man", Sev::Warn, Fix::Manual("run `foo --bar`".into())),
+            check_row("emitter", Sev::Warn, Fix::Root("ir-setup")),
+            check_row("daemon", Sev::Fail, Fix::Root("restart-daemon")),
+            check_row("reader", Sev::Fail, Fix::Root("restart-fprintd")),
+            check_row("wiring", Sev::Fail, Fix::Root("login-enable")),
+            check_row("finger", Sev::Fail, Fix::Root("fingerprint-add")),
+            check_row("selinux", Sev::Fail, Fix::Root("selinux-load")),
+            check_row("bogus", Sev::Fail, Fix::Root("no-such-fix")),
+        ];
+        app.apply_fix(0);
+        assert!(app.suspend.is_none());
+        assert!(app.activity.last().unwrap().1.contains("nothing to fix"));
+        app.apply_fix(1);
+        assert!(app.suspend.is_none());
+        assert!(
+            app.activity.last().unwrap().1.contains("run `foo --bar`"),
+            "a manual fix must echo the exact command"
+        );
+        let suspended_by = |app: &mut App, idx: usize| {
+            app.suspend = None;
+            app.apply_fix(idx);
+            app.suspend.take()
+        };
+        assert!(matches!(suspended_by(&mut app, 2), Some(Suspend::IrSetup)));
+        assert!(matches!(
+            suspended_by(&mut app, 3),
+            Some(Suspend::RestartDaemon)
+        ));
+        assert!(matches!(
+            suspended_by(&mut app, 4),
+            Some(Suspend::RestartFprintd)
+        ));
+        assert!(matches!(
+            suspended_by(&mut app, 5),
+            Some(Suspend::LoginEnable)
+        ));
+        assert!(matches!(
+            suspended_by(&mut app, 6),
+            Some(Suspend::FingerprintAdd)
+        ));
+        assert!(matches!(
+            suspended_by(&mut app, 7),
+            Some(Suspend::SelinuxLoad)
+        ));
+        app.suspend = None;
+        app.apply_fix(8);
+        assert!(app.suspend.is_none());
+        let err = app.error.as_ref().expect("an unknown fix id must surface");
+        assert!(err.contains("no-such-fix"), "got: {err}");
+        // Out of range: a no-op, not a panic.
+        app.error = None;
+        let before = app.activity.len();
+        app.apply_fix(99);
+        assert_eq!(app.activity.len(), before);
+    }
+
+    // ---- text entry & submit ----------------------------------------------
+
+    #[test]
+    fn input_editing_appends_backspaces_and_esc_cancels() {
+        let mut app = test_app();
+        app.input = Some((
+            "Rename profile 'x' to:".into(),
+            String::new(),
+            Pending::RenameProfile("x".into()),
+        ));
+        for c in "abc".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Backspace);
+        assert_eq!(app.input.as_ref().unwrap().1, "ab");
+        // Nav keys must type into the buffer path, not switch tabs.
+        assert_eq!(app.screen, SC_WELCOME);
+        app.on_key(KeyCode::Esc);
+        assert!(app.input.is_none(), "Esc cancels text entry");
+        assert!(!app.quit, "Esc in a prompt must not quit the TUI");
+    }
+
+    #[test]
+    fn rename_submit_starts_the_async_rename_op() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.input = Some((
+            "Rename profile 'old' to:".into(),
+            "new name".into(),
+            Pending::RenameProfile("old".into()),
+        ));
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_none(), "Enter consumes the prompt");
+        assert_eq!(app.op.as_ref().map(|o| o.label.as_str()), Some("Rename"));
+        wait_op_done(&mut app);
+        assert!(
+            app.error.is_some(),
+            "a rename the daemon never acked must surface"
+        );
+    }
+
+    #[test]
+    fn enroll_name_duplicate_is_rejected_before_capture() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.profiles = vec![profile("dup", &[])];
+        app.input = Some((
+            "New profile name (blank = default):".into(),
+            "dup".into(),
+            Pending::EnrollName,
+        ));
+        app.on_key(KeyCode::Enter);
+        assert!(app.enroll.is_none(), "a duplicate name must not enroll");
+        let (_, msg) = app.activity.last().unwrap();
+        assert!(msg.contains("already exists"), "got: {msg}");
+    }
+
+    #[test]
+    fn enroll_name_blank_uses_the_default_and_starts_the_worker() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.input = Some((
+            "New profile name (blank = default):".into(),
+            String::new(),
+            Pending::EnrollName,
+        ));
+        app.on_key(KeyCode::Enter);
+        {
+            let e = app.enroll.as_ref().expect("a blank name starts the enroll");
+            assert_eq!(e.profile, "Face Profile 1");
+            assert_eq!(e.target, ENROLL_SCANS);
+        }
+        wait_enroll_done(&mut app);
+        let err = app.error.as_ref().expect("the dead socket fails the scan");
+        assert!(err.contains("Enrollment failed"), "got: {err}");
+    }
+
+    #[test]
+    fn enroll_name_submit_while_daemon_down_parks_the_named_intent() {
+        let mut app = test_app();
+        app.daemon_up = false;
+        app.input = Some((
+            "New profile name (blank = default):".into(),
+            "zed".into(),
+            Pending::EnrollName,
+        ));
+        app.on_key(KeyCode::Enter);
+        assert!(app.enroll.is_none());
+        assert!(
+            matches!(app.resume_enroll, Some(ResumeEnroll::Named(ref n)) if n == "zed"),
+            "the typed name must survive the daemon fix"
+        );
+        assert!(matches!(app.suspend, Some(Suspend::RestartDaemon)));
+    }
+
+    #[test]
+    fn keyring_password_double_entry_gates_the_seal() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        // Empty first entry aborts.
+        app.on_key(KeyCode::Char('a'));
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_none());
+        let err = app.error.take().expect("empty password must abort loudly");
+        assert!(err.contains("empty password"), "got: {err}");
+        // Mismatched confirmation aborts without sealing.
+        app.on_key(KeyCode::Char('a'));
+        for c in "pw1".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        match &app.input {
+            Some((prompt, buf, Pending::KeyringPw(Some(first)))) => {
+                assert!(prompt.contains("Confirm"), "got: {prompt}");
+                assert!(buf.is_empty(), "the confirm entry starts blank");
+                assert_eq!(&***first, "pw1");
+            }
+            _ => panic!("expected the confirm prompt with the stashed first entry"),
+        }
+        for c in "pw2".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(app.op.is_none(), "a mismatch must never reach SealPassword");
+        let err = app.error.take().expect("the mismatch must abort loudly");
+        assert!(err.contains("don't match"), "got: {err}");
+        // Matching entries seal (async).
+        app.on_key(KeyCode::Char('a'));
+        for c in "pw".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "pw".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert_eq!(
+            app.op.as_ref().map(|o| o.label.as_str()),
+            Some("SealPassword")
+        );
+        wait_op_done(&mut app);
+        assert!(app.error.is_some(), "a failed seal must surface");
+    }
+
+    #[test]
+    fn recovery_passphrase_flows_mirror_the_keyring_gates() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        // Set: double entry, mismatch aborts.
+        app.on_key(KeyCode::Char('s'));
+        app.on_key(KeyCode::Char('a'));
+        app.on_key(KeyCode::Enter);
+        assert!(matches!(
+            app.input,
+            Some((_, _, Pending::RecoveryPw(Some(_))))
+        ));
+        app.on_key(KeyCode::Char('b'));
+        app.on_key(KeyCode::Enter);
+        assert!(app.op.is_none());
+        let err = app.error.take().expect("mismatch aborts");
+        assert!(err.contains("don't match"), "got: {err}");
+        // Set: matching entries fire RecoverySetup.
+        app.on_key(KeyCode::Char('s'));
+        app.on_key(KeyCode::Char('a'));
+        app.on_key(KeyCode::Enter);
+        app.on_key(KeyCode::Char('a'));
+        app.on_key(KeyCode::Enter);
+        assert_eq!(
+            app.op.as_ref().map(|o| o.label.as_str()),
+            Some("RecoverySetup")
+        );
+        wait_op_done(&mut app);
+        app.error = None;
+        // Restore: empty aborts, non-empty fires RecoveryRestore.
+        app.on_key(KeyCode::Char('t'));
+        app.on_key(KeyCode::Enter);
+        assert!(app.op.is_none());
+        let err = app.error.take().expect("empty restore passphrase aborts");
+        assert!(err.contains("empty passphrase"), "got: {err}");
+        app.on_key(KeyCode::Char('t'));
+        app.on_key(KeyCode::Char('x'));
+        app.on_key(KeyCode::Enter);
+        assert_eq!(
+            app.op.as_ref().map(|o| o.label.as_str()),
+            Some("RecoveryRestore")
+        );
+        wait_op_done(&mut app);
+    }
+
+    // ---- confirm & merge flows --------------------------------------------
+
+    #[test]
+    fn confirm_yes_fires_the_stored_request_async() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.confirm = Some(("Delete profile 'x'?".into(), Request::Ping));
+        app.on_key(KeyCode::Char('y'));
+        assert!(app.confirm.is_none());
+        assert!(app.op.is_some(), "[y] must run the stored request");
+        assert!(
+            app.activity.iter().any(|(_, m)| m.contains("(confirmed)")),
+            "the confirmed op must be visible in Activity"
+        );
+        wait_op_done(&mut app);
+        assert!(app.error.is_some(), "the dead-socket failure must surface");
+    }
+
+    #[test]
+    fn merge_prompt_raises_the_modal_and_caps_remaining_scans() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
+        app.enroll = Some(enroll);
+        // 28 of 30 scans already on the profile: only 2 more fit the budget.
+        tx.send(WMsg::MergePrompt {
+            profile: "Alice".into(),
+            total: 28,
+            added_scans: vec!["scan28".into()],
+        })
+        .unwrap();
+        app.poll();
+        assert!(app.enroll.is_none(), "the worker hands off to the modal");
+        let mc = app.enroll_merge.as_ref().expect("the merge modal is up");
+        assert_eq!(mc.profile, "Alice");
+        assert_eq!(
+            mc.remaining, 2,
+            "remaining = min(target-1, 30-scan budget left)"
+        );
+        // Below the budget the requested count minus the merged scan survives.
+        let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
+        app.enroll = Some(enroll);
+        app.enroll_merge = None;
+        tx.send(WMsg::MergePrompt {
+            profile: "Alice".into(),
+            total: 5,
+            added_scans: vec!["scan5".into()],
+        })
+        .unwrap();
+        app.poll();
+        assert_eq!(
+            app.enroll_merge.as_ref().unwrap().remaining,
+            ENROLL_SCANS - 1
+        );
+    }
+
+    #[test]
+    fn merge_modal_renders_the_resolved_profile() {
+        let mut app = test_app();
+        app.enroll_merge = Some(MergeConfirm {
+            profile: "Alice".into(),
+            added_scans: vec!["s".into()],
+            remaining: 4,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("Already enrolled"), "modal title missing");
+        assert!(text.contains("'Alice'"), "the owning profile must be named");
+        assert!(text.contains("[y] add"), "the confirm keys must be shown");
+    }
+
+    #[test]
+    fn merge_confirm_continues_with_the_base_offset() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.enroll_merge = Some(MergeConfirm {
+            profile: "Alice".into(),
+            added_scans: vec!["s1".into()],
+            remaining: 3,
+        });
+        app.on_key(KeyCode::Char('y'));
+        assert!(app.enroll_merge.is_none());
+        {
+            let e = app.enroll.as_ref().expect("the continuation must start");
+            assert_eq!(e.profile, "Alice");
+            assert_eq!(e.target, 3);
+            assert_eq!(e.base, 1, "the merged scan keeps the counter continuous");
+        }
+        wait_enroll_done(&mut app);
+    }
+
+    #[test]
+    fn merge_confirm_with_nothing_left_just_acknowledges() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.enroll_merge = Some(MergeConfirm {
+            profile: "Alice".into(),
+            added_scans: vec!["s1".into()],
+            remaining: 0,
+        });
+        app.on_key(KeyCode::Char('y'));
+        assert!(app.enroll.is_none(), "nothing left to capture");
+        assert!(
+            app.activity
+                .iter()
+                .any(|(_, m)| m.contains("scan added to 'Alice'")),
+            "the kept scan must be acknowledged"
+        );
+    }
+
+    #[test]
+    fn merge_decline_undoes_the_added_scan_and_stray_keys_are_ignored() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.enroll_merge = Some(MergeConfirm {
+            profile: "Alice".into(),
+            added_scans: vec!["scanZ".into()],
+            remaining: 3,
+        });
+        app.on_key(KeyCode::Char('x'));
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.enroll_merge.is_some(),
+            "a stray key must not resolve the merge modal"
+        );
+        app.on_key(KeyCode::Char('n'));
+        assert!(app.enroll_merge.is_none());
+        assert!(
+            app.op.is_some(),
+            "declining must fire the DeleteScan undo async"
+        );
+        assert!(
+            app.activity
+                .iter()
+                .any(|(_, m)| m.contains("removing the scan added to 'Alice'")),
+            "the undo must be explained in Activity"
+        );
+        wait_op_done(&mut app);
+        // With no scan recorded there is nothing to undo: no op is started.
+        let mut app = test_app();
+        app.enroll_merge = Some(MergeConfirm {
+            profile: "Alice".into(),
+            added_scans: Vec::new(),
+            remaining: 3,
+        });
+        app.on_key(KeyCode::Esc);
+        assert!(app.enroll_merge.is_none(), "Esc declines");
+        assert!(app.op.is_none());
+    }
+
+    // ---- enroll worker messages & the enroll key gate ----------------------
+
+    #[test]
+    fn poll_routes_cue_count_and_captured_to_the_enroll_ui() {
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::Count(3)).unwrap();
+        app.poll();
+        assert_eq!(app.enroll.as_ref().unwrap().count, Some(3));
+        // A fresh cue clears the countdown (the user drifted off-frame).
+        tx.send(WMsg::Cue(good_report("Hold still"))).unwrap();
+        app.poll();
+        {
+            let e = app.enroll.as_ref().unwrap();
+            assert_eq!(e.count, None, "a cue aborts the on-screen countdown");
+            assert_eq!(e.last.as_ref().unwrap().guidance, "Hold still");
+        }
+        tx.send(WMsg::Count(2)).unwrap();
+        tx.send(WMsg::Captured(1, 4)).unwrap();
+        app.poll();
+        let e = app.enroll.as_ref().unwrap();
+        assert_eq!(e.captured, 1);
+        assert_eq!(e.count, None, "a capture clears the countdown");
+        assert!(
+            app.activity.iter().any(|(_, m)| m == "captured scan 1/4"),
+            "each capture must be logged"
+        );
+    }
+
+    #[test]
+    fn poll_done_completes_the_enrollment() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::Done).unwrap();
+        app.poll();
+        assert!(app.enroll.is_none());
+        assert!(
+            app.activity
+                .iter()
+                .any(|(_, m)| m.contains("enrollment complete")),
+            "completion must be logged"
+        );
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn poll_err_strips_the_hardware_prefix_and_raises_the_banner() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::Err("hardware: camera busy".into())).unwrap();
+        app.poll();
+        assert!(app.enroll.is_none());
+        let err = app.error.as_ref().expect("a failed scan must surface");
+        assert_eq!(err, "Enrollment failed: camera busy");
+    }
+
+    #[test]
+    fn enroll_esc_cancels_and_signals_the_worker_to_stop() {
+        let mut app = test_app();
+        let (_tx, enroll) = fake_enroll(0, 4);
+        let stop = enroll.stop.clone();
+        app.enroll = Some(enroll);
+        app.on_key(KeyCode::Char('e'));
+        assert!(app.enroll.is_some(), "other keys are dead mid-capture");
+        assert!(app.input.is_none());
+        app.on_key(KeyCode::Esc);
+        assert!(app.enroll.is_none());
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "Esc must signal the worker thread to stop"
+        );
+        assert!(
+            app.activity
+                .iter()
+                .any(|(_, m)| m.contains("enrollment cancelled")),
+            "the cancel must be logged"
+        );
+    }
+
+    // ---- rendering ---------------------------------------------------------
+
+    #[test]
+    fn welcome_renders_glance_hint_and_tier_recommendation() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.recompute_visible();
+        app.daemon_up = true;
+        app.profiles = vec![profile("a", &["s1", "s2"])];
+        let text = draw_text(&app);
+        assert!(text.contains("irlume - local face authentication"));
+        assert!(text.contains("At a glance"));
+        assert!(text.contains("1 profile(s), 2 scan(s)"));
+        assert!(
+            text.contains("Face (IR)"),
+            "the IR tier must be recommended on IR hardware"
+        );
+        assert!(
+            text.contains("New here? Press [e]"),
+            "the Welcome hint line is missing"
+        );
+        assert!(text.contains("step 1/"), "the wizard position is missing");
+        // No-camera tier: the recommendation flips to password-only.
+        let app2 = test_app();
+        let text = draw_text(&app2);
+        assert!(text.contains("Password only"), "got no fallback tier");
+    }
+
+    #[test]
+    fn profiles_screen_renders_empty_state_and_scan_tree() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let text = draw_text(&app);
+        assert!(text.contains("No face profiles yet"));
+        assert!(text.contains("Press [e] to enroll"));
+        app.profiles = vec![profile("Alice", &["scan-a", "scan-b"])];
+        let text = draw_text(&app);
+        assert!(text.contains("● Alice"));
+        assert!(text.contains("(2 scans)"));
+        assert!(text.contains("↳ scan-a"), "scans render under the profile");
+        assert!(
+            text.contains("Improve Recognition"),
+            "the add-scan guidance is missing"
+        );
+    }
+
+    #[test]
+    fn keyring_screen_states_render_distinctly() {
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        // Daemon unreachable: unknown, never a fake "not armed".
+        let text = draw_text(&app);
+        assert!(text.contains("unknown (daemon unreachable)"));
+        // Not armed on a fingerprint box: names the fingerprint trigger.
+        app.keyring_armed = Some(false);
+        app.fp_present = true;
+        let text = draw_text(&app);
+        assert!(text.contains("○ not armed"));
+        assert!(text.contains("fingerprint login won't open your wallet yet"));
+        assert!(text.contains("At a fingerprint login"));
+        // Armed on IR hardware with PCR drift and a Tier-2 policy.
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.fp_present = false;
+        app.keyring_armed = Some(true);
+        app.keyring_drift = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        let text = draw_text(&app);
+        assert!(text.contains("● armed"));
+        assert!(text.contains("drifted since sealing"));
+        assert!(text.contains("pcrlock NV 0x1a2b (Tier 2)"));
+        assert!(
+            text.contains("systemd-pcrlock"),
+            "Tier 2 gets the make-policy guidance, not the re-arm warning"
+        );
+        assert!(text.contains("At a face login"));
+        // Armed on the plain PCR-7 tier: the dbx re-arm warning instead.
+        app.keyring_policy = None;
+        app.keyring_drift = None;
+        let text = draw_text(&app);
+        assert!(text.contains("PCR-7 (Secure Boot state)"));
+        assert!(text.contains("firmware/dbx update"));
+    }
+
+    #[test]
+    fn recovery_screen_states_render_distinctly() {
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        // No TPM: plaintext + the recovery-N/A line.
+        app.recovery = Some(RecoveryInfo {
+            encrypted: false,
+            recovery_set: false,
+            tpm_present: false,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("○ plaintext at rest"));
+        assert!(text.contains("No TPM on this host"));
+        // Encrypted without a backstop: the warning line.
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: false,
+            tpm_present: true,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("● encrypted"));
+        assert!(text.contains("No backstop"));
+        assert!(text.contains("[s] set passphrase"));
+        // Fully set: both badges green, no warning.
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("● set"));
+        assert!(!text.contains("No backstop"));
+    }
+
+    #[test]
+    fn fingerprint_screen_renders_reader_and_enrolled_fingers() {
+        let mut app = test_app();
+        app.screen = SC_FINGERPRINT;
+        app.fp = FpInfo {
+            available: false,
+            device: None,
+            enrolled: Vec::new(),
+            method: "face".into(),
+        };
+        let text = draw_text(&app);
+        assert!(text.contains("○ none detected"));
+        assert!(text.contains("No usable reader"));
+        app.fp = FpInfo {
+            available: true,
+            device: Some("Goodix Reader".into()),
+            enrolled: vec!["right-index-finger".into()],
+            method: "typed-method-x".into(),
+        };
+        let text = draw_text(&app);
+        assert!(text.contains("● Goodix Reader"));
+        assert!(text.contains("1 (right-index-finger)"));
+        assert!(text.contains("[a] enroll a finger"));
+        assert!(
+            text.contains("typed-method-x"),
+            "the active method value is shown"
+        );
+    }
+
+    #[test]
+    fn identify_screen_renders_hit_miss_and_idle_states() {
+        let mut app = test_app();
+        app.screen = SC_IDENTIFY;
+        let text = draw_text(&app);
+        assert!(text.contains("press [i] and look at the camera"));
+        app.identify_result = Some((true, "alice · Face Profile 1 · score 0.912".into()));
+        let text = draw_text(&app);
+        assert!(text.contains("alice · Face Profile 1 · score 0.912"));
+        assert!(
+            text.contains("result"),
+            "the hit renders in the result card"
+        );
+        app.identify_result = Some((false, "no live face (flat depth)".into()));
+        let text = draw_text(&app);
+        assert!(text.contains("✗"));
+        assert!(text.contains("no live face (flat depth)"));
+    }
+
+    #[test]
+    fn repair_screen_renders_checks_counts_and_fix_hints() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![
+            check_row("Daemon (irlumed)", Sev::Ok, Fix::None),
+            check_row(
+                "Models",
+                Sev::Warn,
+                Fix::Manual("install the package".into()),
+            ),
+            check_row("SELinux policy", Sev::Fail, Fix::Root("selinux-load")),
+        ];
+        app.repair_sel = 0;
+        let text = draw_text(&app);
+        assert!(text.contains("1 ok"));
+        assert!(text.contains("1 warn"));
+        assert!(text.contains("1 fail"));
+        assert!(text.contains("Daemon (irlumed)"));
+        assert!(
+            text.contains("· [f] fix (sudo)"),
+            "root fixes advertise [f]"
+        );
+        assert!(text.contains("· manual"), "manual fixes are tagged");
+        assert!(
+            text.contains("this row is fine"),
+            "an Ok row selected while another row fails must redirect"
+        );
+        app.repair_sel = 1;
+        let text = draw_text(&app);
+        assert!(text.contains("manual: install the package"));
+        app.repair_sel = 2;
+        let text = draw_text(&app);
+        assert!(text.contains("press [f]: irlume runs the fix with sudo"));
+        // The IR self-test card: idle prompt, then the verdict.
+        assert!(text.contains("press [l] to run the IR PAD self-test"));
+        app.selftest_result = Some((true, "PAD pass: depth 0.71".into()));
+        let text = draw_text(&app);
+        assert!(text.contains("PAD pass: depth 0.71"));
+    }
+
+    #[test]
+    fn cameras_screen_renders_pairs_and_the_no_pair_fallbacks() {
+        let mut app = test_app();
+        app.screen = SC_CAMERAS;
+        // No camera at all.
+        let text = draw_text(&app);
+        assert!(text.contains("no camera found"));
+        // RGB node only: convenience tier, and why Secure needs IR.
+        app.nodes = vec![("/dev/video9".into(), irlume_camera::Role::Rgb)];
+        let text = draw_text(&app);
+        assert!(text.contains("video9"));
+        assert!(text.contains("RGB-only, convenience tier"));
+        assert!(text.contains("no IR node"));
+        // A real Hello pair renders its nodes, kind, and USB id.
+        app.pairs = vec![irlume_camera::CameraPair {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+            id: Some("abcd:1234".into()),
+            fixed: true,
+        }];
+        let text = draw_text(&app);
+        assert!(text.contains("video0+video2"));
+        assert!(text.contains("built-in"));
+        assert!(text.contains("[abcd:1234]"));
+        assert!(text.contains("IR emitter (850nm)"));
+        assert!(text.contains("[s]"), "the emitter setup key is advertised");
+    }
+
+    #[test]
+    fn pam_screen_describes_what_each_tier_actually_does() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        let text = draw_text(&app);
+        assert!(text.contains("PAM services"));
+        assert!(
+            text.contains("tier unknown (daemon unreachable)"),
+            "no tier claim without the daemon"
+        );
+        assert!(text.contains("wire the login stack now"));
+        app.health = Some(HealthInfo {
+            tier: "convenience".into(),
+            rgb_dev: Some("/dev/video0".into()),
+            ir_dev: None,
+            mesh: false,
+            adapter: false,
+            version: "1.0".into(),
+        });
+        let text = draw_text(&app);
+        assert!(
+            text.contains("face is NOT accepted for login"),
+            "RGB-only must not promise greeter login"
+        );
+        app.health.as_mut().unwrap().tier = "secure".into();
+        let text = draw_text(&app);
+        assert!(text.contains("TPM-unseal password"));
+        assert!(text.contains("always fail-safe to the password"));
+    }
+
+    #[test]
+    fn settings_screen_renders_sections_and_the_eyes_open_state() {
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        assert!(text.contains("Require eyes open"));
+        assert!(text.contains("○ no"), "eyes-open starts off");
+        assert!(text.contains("Biopolicy operation-class gate"));
+        assert!(text.contains("Third-party liveness models"));
+        assert!(text.contains("Match thresholds (read-only)"));
+        app.eyes_open = true;
+        let text = draw_text(&app);
+        assert!(text.contains("● yes"), "the toggled state must show");
+    }
+
+    #[test]
+    fn done_screen_status_line_matches_setup_state() {
+        let mut app = test_app();
+        app.screen = SC_DONE;
+        let text = draw_text(&app);
+        assert!(text.contains("Setup dashboard"));
+        assert!(
+            text.contains("Daemon not running; see the Repair tab"),
+            "a down daemon is the first thing Done must flag"
+        );
+        app.daemon_up = true;
+        app.caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: true,
+        };
+        let text = draw_text(&app);
+        assert!(
+            text.contains("enroll a face (Welcome [e])"),
+            "an empty enrollment with a camera points at [e]"
+        );
+        app.caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: false,
+        };
+        let text = draw_text(&app);
+        assert!(text.contains("No face hardware"));
+    }
+
+    #[test]
+    fn enroll_screen_renders_progress_checklist_countdown_and_guidance() {
+        let mut app = test_app();
+        let (_tx, mut enroll) = fake_enroll(1, 4);
+        enroll.captured = 1;
+        enroll.count = Some(2);
+        enroll.last = Some(good_report("Hold still"));
+        app.enroll = Some(enroll);
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Enrolling 'p' (scan 2/5)"),
+            "progress must include the merged base offset:\n{text}"
+        );
+        assert!(text.contains("85%"), "the quality bar shows the percent");
+        assert!(text.contains("Face detected"));
+        assert!(text.contains("Well lit"));
+        assert!(
+            text.contains("capturing in 2"),
+            "the countdown overrides the guidance line"
+        );
+        assert!(text.contains("[esc] cancel"));
+        assert!(
+            text.contains("Look at the camera and hold still"),
+            "the hint line switches to capture mode"
+        );
+        // Between countdowns the daemon's guidance cue shows instead.
+        app.enroll.as_mut().unwrap().count = None;
+        let text = draw_text(&app);
+        assert!(text.contains("Hold still"));
+        assert!(!text.contains("capturing in"));
+        // Before the first cue arrives the camera-start placeholder shows.
+        app.enroll.as_mut().unwrap().last = None;
+        let text = draw_text(&app);
+        assert!(text.contains("Starting camera…"));
+    }
+
+    #[test]
+    fn error_banner_renders_over_everything_including_prompts() {
+        let mut app = test_app();
+        app.input = Some((
+            "New profile name (blank = default):".into(),
+            String::new(),
+            Pending::EnrollName,
+        ));
+        app.error = Some("camera busy".into());
+        let text = draw_text(&app);
+        assert!(text.contains("⚠ Problem"));
+        assert!(text.contains("camera busy"));
+        assert!(text.contains("[any key] dismiss"));
+        assert!(
+            !text.contains("New profile name"),
+            "the error modal must take precedence over the input prompt"
+        );
+    }
+
+    #[test]
+    fn masked_input_renders_bullets_never_the_password() {
+        let mut app = test_app();
+        app.input = Some((
+            "Login password to seal (••):".into(),
+            "hunter2".into(),
+            Pending::KeyringPw(None),
+        ));
+        let text = draw_text(&app);
+        assert!(
+            text.contains("•••••••"),
+            "7 typed chars must render as 7 bullets"
+        );
+        assert!(
+            !text.contains("hunter2"),
+            "the password must never reach the screen"
+        );
+        // A non-secret prompt renders the actual text.
+        app.input = Some((
+            "Rename profile 'x' to:".into(),
+            "visible".into(),
+            Pending::RenameProfile("x".into()),
+        ));
+        let text = draw_text(&app);
+        assert!(text.contains("visible"));
+    }
+
+    #[test]
+    fn header_counts_steps_over_visible_screens_only() {
+        let mut app = test_app(); // visible: Welcome, Login wiring, Done
+        app.screen = SC_PAM;
+        let text = draw_text(&app);
+        assert!(
+            text.contains("step 2/3: Login wiring"),
+            "the step counter must track visible tabs, got:\n{text}"
+        );
+        assert!(text.contains("testuser"), "the managed user is shown");
+    }
+
+    #[test]
+    fn footer_lists_each_screens_action_keys() {
+        let app = test_app();
+        let footer = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(200, 3)).unwrap();
+            term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+            rendered(&term)
+        };
+        let cases: [(usize, &str); 11] = [
+            (SC_WELCOME, "uninstall"),
+            (SC_REPAIR, "IR test"),
+            (SC_CAMERAS, "setup emitter"),
+            (SC_PROFILES, "add scan"),
+            (SC_IDENTIFY, "identify"),
+            (SC_KEYRING, "arm"),
+            (SC_RECOVERY, "restore"),
+            (SC_FINGERPRINT, "enroll finger"),
+            (SC_PAM, "wire login (sudo)"),
+            (SC_SETTINGS, "toggle eyes-open"),
+            (SC_DONE, "wire login"),
+        ];
+        let mut app = app;
+        for (screen, needle) in cases {
+            app.screen = screen;
+            let text = footer(&app);
+            assert!(
+                text.contains(needle),
+                "footer for {} must advertise '{needle}', got:\n{text}",
+                SCREENS[screen]
+            );
+            assert!(text.contains("switch tab"), "global nav keys always show");
+        }
+        // The [v] label flips with the view mode.
+        app.screen = SC_WELCOME;
+        assert!(footer(&app).contains("all tabs"));
+        app.advanced = true;
+        assert!(footer(&app).contains("basic"));
+        // Guided enrollment swallows everything but Esc: only that shows.
+        let (_tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        let text = footer(&app);
+        assert!(text.contains("cancel enrollment"));
+        assert!(!text.contains("switch tab"));
+    }
+
+    #[test]
+    fn activity_panel_windows_scroll_and_titles_reflect_state() {
+        let mut app = test_app();
+        for i in 0..30 {
+            app.log('·', format!("line {i}"));
+        }
+        let panel = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(80, 7)).unwrap();
+            term.draw(|f| app.draw_activity(f, f.area())).unwrap();
+            rendered(&term)
+        };
+        // Following: the newest lines fill the 5 visible rows.
+        let text = panel(&app);
+        assert!(text.contains("line 29"));
+        assert!(text.contains("line 25"));
+        assert!(!text.contains("line 24"), "older lines are scrolled out");
+        assert!(text.contains("newest last"));
+        // Scrolled to the top: the oldest lines and the history title.
+        app.act_scroll = app.act_max();
+        let text = panel(&app);
+        assert!(text.contains("line 0"));
+        assert!(text.contains("line 4"));
+        assert!(!text.contains("line 5"), "the window is 5 rows");
+        assert!(text.contains("history (25 up"));
+        // A running op puts its label in the title.
+        app.act_scroll = 0;
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        let text = panel(&app);
+        assert!(text.contains("Identify"));
+    }
+
+    // ---- log ring, scroll bounds, status poll ------------------------------
+
+    #[test]
+    fn log_ring_buffer_caps_at_200_and_keeps_the_newest() {
+        let mut app = test_app();
+        for i in 0..250 {
+            app.log('·', format!("line {i}"));
+        }
+        assert_eq!(app.activity.len(), 200);
+        assert_eq!(app.activity[0].1, "line 50", "the oldest 50 are dropped");
+        assert_eq!(app.activity[199].1, "line 249");
+    }
+
+    #[test]
+    fn log_holds_a_scrolled_view_in_place_as_lines_arrive() {
+        let mut app = test_app();
+        for i in 0..20 {
+            app.log('·', format!("line {i}"));
+        }
+        app.act_scroll = 5;
+        app.log('·', "new line");
+        assert_eq!(
+            app.act_scroll, 6,
+            "new lines must not yank a reading user to the bottom"
+        );
+        app.act_scroll = 0;
+        app.log('·', "another");
+        assert_eq!(app.act_scroll, 0, "at the bottom the view keeps following");
+    }
+
+    #[test]
+    fn scroll_keys_clamp_at_both_ends() {
+        let mut app = test_app();
+        for i in 0..30 {
+            app.log('·', format!("line {i}"));
+        }
+        app.on_key(KeyCode::Home);
+        assert_eq!(app.act_scroll, app.act_max(), "Home jumps to the oldest");
+        app.on_key(KeyCode::PageUp);
+        assert_eq!(
+            app.act_scroll,
+            app.act_max(),
+            "PgUp cannot scroll past the top"
+        );
+        app.on_key(KeyCode::End);
+        assert_eq!(app.act_scroll, 0, "End jumps back to following");
+        app.on_key(KeyCode::PageDown);
+        assert_eq!(app.act_scroll, 0, "PgDn cannot scroll below the bottom");
+    }
+
+    #[test]
+    fn refresh_light_clamps_selections_to_the_shrunken_lists() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.profiles = vec![profile("a", &["s1"])]; // 2 rows
+        app.sel = 9;
+        app.cam_sel = 9;
+        app.refresh_light();
+        assert_eq!(app.sel, 1, "sel must clamp to the last real row");
+        assert!(
+            app.cam_sel < app.pairs.len().max(1),
+            "cam_sel must clamp to the discovered pairs"
+        );
+        assert!(!app.daemon_up);
+        assert!(app.health.is_none());
+    }
+
+    // ---- run_checks with the daemon's self-report ---------------------------
+
+    #[test]
+    fn run_checks_trusts_daemon_health_over_local_probes() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: Some("/dev/video0".into()),
+            ir_dev: Some("/dev/video2".into()),
+            mesh: true,
+            adapter: true,
+            version: env!("CARGO_PKG_VERSION").into(),
+        });
+        app.run_checks();
+        let find = |label: &str| {
+            app.repair
+                .iter()
+                .find(|c| c.label == label)
+                .unwrap_or_else(|| panic!("missing check row '{label}'"))
+        };
+        // The socket is dead, so the Daemon row fails with the root fix…
+        let daemon = find("Daemon (irlumed)");
+        assert!(daemon.sev == Sev::Fail);
+        assert!(matches!(daemon.fix, Fix::Root("restart-daemon")));
+        // …but the daemon-reported model/camera state is still ground truth.
+        let ort = find("ONNX Runtime");
+        assert!(ort.sev == Sev::Ok);
+        assert!(ort.detail.contains("reported by the daemon"));
+        let models = find("Models");
+        assert!(models.detail.contains("+ IR adapter"));
+        assert!(models.detail.contains("+ FaceMesh"));
+        let cams = find("Cameras");
+        assert!(cams.sev == Sev::Ok);
+        assert!(cams.detail.contains("secure tier"));
+        assert!(
+            app.repair.iter().any(|c| c.label == "IR emitter"),
+            "an IR node earns the emitter fix row"
+        );
+        assert!(
+            !app.repair.iter().any(|c| c.label == "Daemon build"),
+            "matching daemon/CLI versions must not warn"
+        );
+        let enroll = find("Enrollment");
+        assert!(enroll.sev == Sev::Warn, "no profiles yet is a warning");
+        assert!(enroll.detail.contains("no face enrolled yet"));
+    }
+
+    #[test]
+    fn run_checks_flags_version_skew_challenge_gap_and_corrupt_enrollment() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.health = Some(HealthInfo {
+            tier: "convenience".into(),
+            rgb_dev: Some("/dev/video0".into()),
+            ir_dev: None,
+            mesh: false,
+            adapter: false,
+            version: "0.0.1-old".into(),
+        });
+        app.challenge = true;
+        app.enroll_error = Some("bad ciphertext".into());
+        app.run_checks();
+        let find = |label: &str| {
+            app.repair
+                .iter()
+                .find(|c| c.label == label)
+                .unwrap_or_else(|| panic!("missing check row '{label}'"))
+        };
+        let build = find("Daemon build");
+        assert!(build.sev == Sev::Warn);
+        assert!(
+            build.detail.contains("0.0.1-old"),
+            "names the stale version"
+        );
+        let blink = find("Blink challenge");
+        assert!(blink.sev == Sev::Fail);
+        assert!(blink.detail.contains("challenge is skipped"));
+        let enroll = find("Enrollment");
+        assert!(enroll.sev == Sev::Fail, "unreadable ≠ not enrolled");
+        assert!(enroll.detail.contains("bad ciphertext"));
+        let cams = find("Cameras");
+        assert!(cams.sev == Sev::Warn);
+        assert!(cams.detail.contains("convenience tier"));
+        assert!(
+            !app.repair.iter().any(|c| c.label == "IR emitter"),
+            "no IR node, no emitter row"
+        );
+        assert!(
+            app.repair.iter().any(|c| c.label == "RGB anti-spoof"),
+            "the convenience tier documents its moiré detector"
+        );
+        // The selection clamps when the list shrinks between runs.
+        app.repair_sel = 999;
+        app.run_checks();
+        assert!(app.repair_sel < app.repair.len());
     }
 }

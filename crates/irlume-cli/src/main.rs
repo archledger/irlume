@@ -2308,6 +2308,15 @@ fn capture(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// Serializes unit tests that mutate process-global environment variables
+/// (PATH, USER, IRLUME_CONFIG_DIR, IRLUME_STATE_DIR, ...): the same pattern as
+/// `tui::tests::ENV_LOCK` (which guards IRLUME_SOCKET), shared here so the
+/// env-mutating tests in main.rs, commands.rs, and models.rs never race.
+#[cfg(test)]
+pub(crate) mod testenv {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 /// Phase-1 make-or-break: load the recognition model and embed the same chip
 /// twice: cosine MUST be ~1.0. Proves the ONNX path is deterministic and the
 /// preprocessing is wired before any matching is trusted. Needs the AuraFace
@@ -2337,5 +2346,145 @@ fn selftest_align(args: &[String]) -> std::process::ExitCode {
             eprintln!("  (need the .onnx file and libonnxruntime.so on the system)");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_returns_the_value_following_the_name() {
+        let a = argv(&["--user", "alice", "--scans", "5"]);
+        assert_eq!(flag(&a, "--user"), Some("alice"));
+        assert_eq!(flag(&a, "--scans"), Some("5"));
+        assert_eq!(flag(&a, "--name"), None);
+    }
+
+    #[test]
+    fn flag_with_the_name_in_last_position_has_no_value() {
+        let a = argv(&["enroll", "--reset"]);
+        assert_eq!(flag(&a, "--reset"), None);
+    }
+
+    #[test]
+    fn flag_takes_the_first_occurrence() {
+        let a = argv(&["--user", "a", "--user", "b"]);
+        assert_eq!(flag(&a, "--user"), Some("a"));
+    }
+
+    #[test]
+    fn user_arg_prefers_the_explicit_flag() {
+        assert_eq!(user_arg(&argv(&["--user", "carol"])), "carol");
+    }
+
+    #[test]
+    fn user_arg_falls_back_to_env_user_when_flag_is_empty_or_absent() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if unsafe { libc::geteuid() } == 0 {
+            return; // the SUDO_USER preference only applies to root; not this run
+        }
+        let old_user = std::env::var_os("USER");
+        let old_sudo = std::env::var_os("SUDO_USER");
+        std::env::set_var("USER", "envuser");
+        // A non-root process must ignore SUDO_USER (the root-only preference).
+        std::env::set_var("SUDO_USER", "someoneelse");
+        assert_eq!(user_arg(&argv(&["--user", ""])), "envuser");
+        assert_eq!(user_arg(&[]), "envuser");
+        match old_user {
+            Some(v) => std::env::set_var("USER", v),
+            None => std::env::remove_var("USER"),
+        }
+        match old_sudo {
+            Some(v) => std::env::set_var("SUDO_USER", v),
+            None => std::env::remove_var("SUDO_USER"),
+        }
+    }
+
+    #[test]
+    fn json_f32_maps_non_finite_to_null() {
+        assert_eq!(json_f32(1.5), serde_json::json!(1.5));
+        assert_eq!(json_f32(0.0), serde_json::json!(0.0));
+        assert_eq!(json_f32(f32::NAN), serde_json::Value::Null);
+        assert_eq!(json_f32(f32::INFINITY), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn darken_chip_scales_rounds_and_clamps() {
+        assert_eq!(darken_chip(&[0, 100, 200, 255], 0.5), vec![0, 50, 100, 128]);
+        assert_eq!(darken_chip(&[200], 2.0), vec![255], "must clamp at 255");
+    }
+
+    #[test]
+    fn blur_chip_keeps_uniform_images_and_spreads_a_point() {
+        let n = 112usize;
+        let uniform = vec![7u8; n * n * 3];
+        assert_eq!(blur_chip(&uniform), uniform);
+
+        // A single bright pixel becomes the 3x3 box average around it.
+        let mut chip = vec![0u8; n * n * 3];
+        chip[(5 * n + 5) * 3] = 90;
+        let out = blur_chip(&chip);
+        assert_eq!(out[(5 * n + 5) * 3], 10, "interior: 90 / 9 neighbours");
+        assert_eq!(out[(4 * n + 4) * 3], 10, "diagonal neighbour sees it too");
+
+        // At the corner only 4 pixels are in the window.
+        let mut chip = vec![0u8; n * n * 3];
+        chip[0] = 80;
+        assert_eq!(blur_chip(&chip)[0], 20, "corner: 80 / 4 neighbours");
+    }
+
+    #[test]
+    fn collect_images_recurses_and_filters_extensions() {
+        let dir = std::env::temp_dir().join(format!("irlume-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in [
+            "a.jpg",
+            "b.PNG",
+            "c.txt",
+            "noext",
+            "sub/d.bmp",
+            "sub/e.jpeg",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let mut out = Vec::new();
+        collect_images(&dir, &mut out);
+        let mut names: Vec<String> = out
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.jpg", "b.PNG", "d.bmp", "e.jpeg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A missing directory yields nothing rather than an error.
+        let mut out = Vec::new();
+        collect_images(std::path::Path::new("/nonexistent/irlume-imgs"), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn eye_glint_takes_the_peak_near_the_eye_landmarks_only() {
+        let (w, h) = (64u32, 64u32);
+        let mut grey = vec![0u8; (w * h) as usize];
+        let landmarks: irlume_vision::Landmarks5 = [
+            (10.0, 10.0), // left eye
+            (30.0, 10.0), // right eye
+            (20.0, 20.0),
+            (12.0, 28.0),
+            (28.0, 28.0),
+        ];
+        assert_eq!(eye_glint(&grey, w, h, &landmarks), 0.0);
+        grey[(12 * w + 12) as usize] = 200; // within radius 8 of the left eye
+        grey[(60 * w + 60) as usize] = 255; // far from both eyes: must not count
+        assert_eq!(eye_glint(&grey, w, h, &landmarks), 200.0);
     }
 }

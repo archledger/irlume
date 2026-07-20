@@ -102,7 +102,7 @@ jobs:
       - name: test (TPM-gated, against swtpm)
         run: |
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib --locked -- --ignored \
-            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle --test-threads=1
 
   # Build + test on current stable, because that is what the packaging lanes
   # and most from-source users compile with. fmt/clippy stay on the MSRV job
@@ -205,7 +205,7 @@ jobs:
         run: |
           cargo llvm-cov --no-report --workspace --locked
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
-            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle --test-threads=1
           cargo llvm-cov report --summary-only --fail-under-lines 67
 
   deny:

@@ -29,6 +29,13 @@ impl DistroFamily {
 /// Detect the distro family from `/etc/os-release` (`ID` + `ID_LIKE`).
 pub fn distro_family() -> DistroFamily {
     let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    distro_family_from(&os)
+}
+
+/// Classify raw `os-release` contents. Split out of [`distro_family`] verbatim
+/// (test seam: the parse is exercised against fixture strings without touching
+/// the host's `/etc/os-release`); behavior unchanged.
+fn distro_family_from(os: &str) -> DistroFamily {
     let field = |key: &str| -> String {
         os.lines()
             .find_map(|l| l.strip_prefix(key))
@@ -146,4 +153,136 @@ fn uid_for_name(name: &str) -> Option<u32> {
         return None;
     }
     Some(pwd.pw_uid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distro_family_classifies_real_os_release_shapes() {
+        // Shapes lifted from real distro os-release files: bare vs quoted
+        // values, ID_LIKE chains, derivative IDs.
+        let cases: &[(&str, DistroFamily)] = &[
+            // Fedora: bare ID, no ID_LIKE.
+            (
+                "NAME=\"Fedora Linux\"\nVERSION=\"44 (KDE Plasma)\"\nID=fedora\nVERSION_ID=44\n",
+                DistroFamily::Fedora,
+            ),
+            // RHEL and clones: quoted ID, ID_LIKE chain back to fedora.
+            (
+                "NAME=\"Red Hat Enterprise Linux\"\nID=\"rhel\"\nID_LIKE=\"fedora\"\n",
+                DistroFamily::Fedora,
+            ),
+            (
+                "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+                DistroFamily::Fedora,
+            ),
+            (
+                "ID=\"almalinux\"\nID_LIKE=\"rhel centos fedora\"\n",
+                DistroFamily::Fedora,
+            ),
+            // Debian family: Debian itself, Ubuntu (ID_LIKE=debian), Mint
+            // (ID=linuxmint, ID_LIKE chains through ubuntu), Pop, Raspbian.
+            (
+                "PRETTY_NAME=\"Debian GNU/Linux 12\"\nID=debian\n",
+                DistroFamily::Debian,
+            ),
+            (
+                "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"26.04\"\n",
+                DistroFamily::Debian,
+            ),
+            (
+                "ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n",
+                DistroFamily::Debian,
+            ),
+            ("ID=pop\nID_LIKE=\"ubuntu debian\"\n", DistroFamily::Debian),
+            ("ID=raspbian\nID_LIKE=debian\n", DistroFamily::Debian),
+            // Arch family.
+            (
+                "NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\n",
+                DistroFamily::Arch,
+            ),
+            ("ID=manjaro\nID_LIKE=arch\n", DistroFamily::Arch),
+            ("ID=endeavouros\nID_LIKE=arch\n", DistroFamily::Arch),
+            ("ID=garuda\nID_LIKE=arch\n", DistroFamily::Arch),
+            // Unmatched distros and degenerate input fall through to Other.
+            ("NAME=NixOS\nID=nixos\n", DistroFamily::Other),
+            (
+                "ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n",
+                DistroFamily::Other,
+            ),
+            ("", DistroFamily::Other),
+            ("NAME=\"Something\"\nVERSION_ID=1\n", DistroFamily::Other),
+        ];
+        for (os, want) in cases {
+            assert_eq!(distro_family_from(os), *want, "input: {os:?}");
+        }
+    }
+
+    #[test]
+    fn distro_family_field_parsing_details() {
+        // Uppercase inside a quoted value is lowercased before matching.
+        assert_eq!(distro_family_from("ID=\"Ubuntu\"\n"), DistroFamily::Debian);
+        // Surrounding whitespace on the value is trimmed.
+        assert_eq!(distro_family_from("ID= fedora \n"), DistroFamily::Fedora);
+        // ID_LIKE alone (no ID line) still classifies.
+        assert_eq!(
+            distro_family_from("NAME=Derived\nID_LIKE=debian\n"),
+            DistroFamily::Debian
+        );
+        // `VERSION_ID=` must not be mistaken for `ID=`: a numeric VERSION_ID
+        // with an unmatched ID stays Other.
+        assert_eq!(
+            distro_family_from("VERSION_ID=12\nID=slackware\n"),
+            DistroFamily::Other
+        );
+        // Debian is checked before Fedora/Arch: a hybrid ID_LIKE mentioning
+        // both classifies as Debian (pam-auth-update wiring wins).
+        assert_eq!(
+            distro_family_from("ID=weird\nID_LIKE=\"debian fedora arch\"\n"),
+            DistroFamily::Debian
+        );
+    }
+
+    #[test]
+    fn distro_family_as_str_names_each_family() {
+        assert_eq!(DistroFamily::Debian.as_str(), "Debian-family");
+        assert_eq!(DistroFamily::Fedora.as_str(), "Fedora-family");
+        assert_eq!(DistroFamily::Arch.as_str(), "Arch-family");
+        assert_eq!(DistroFamily::Other.as_str(), "other/unknown");
+    }
+
+    #[test]
+    fn distro_family_reads_the_host_os_release() {
+        // On any Linux box /etc/os-release (or its absence) must classify
+        // without panicking, and agree with feeding the same bytes through the
+        // parse seam.
+        let host = distro_family();
+        let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        assert_eq!(host, distro_family_from(&os));
+    }
+
+    #[test]
+    fn uid_for_name_resolves_root_and_rejects_garbage() {
+        assert_eq!(uid_for_name("root"), Some(0));
+        assert_eq!(uid_for_name("no-such-user-irlume-test"), None);
+        // Interior NUL cannot become a C string; must be None, not a panic.
+        assert_eq!(uid_for_name("a\0b"), None);
+    }
+
+    #[test]
+    fn nonexistent_user_never_has_a_live_session() {
+        // Deterministic on every box: with logind present the bogus user owns
+        // no session (Some(false)); without logind the uid lookup fails and the
+        // /run/user fallback cannot fire either.
+        assert!(!user_has_live_session("no-such-user-irlume-test"));
+    }
+
+    #[test]
+    fn unknown_session_id_is_not_an_active_user_session() {
+        // `loginctl show-session` on a bogus id prints nothing usable; the
+        // parser must fail closed (false), never treat it as active.
+        assert!(!session_is_active_user("irlume-test-no-such-session"));
+    }
 }

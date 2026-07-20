@@ -106,13 +106,11 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::testenv;
 
     #[test]
     fn read_write_round_trip_preserves_comments() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -158,12 +156,112 @@ mod tests {
     }
 
     #[test]
+    fn config_path_defaults_to_etc_irlume_without_the_override() {
+        let _g = testenv::lock();
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        assert_eq!(
+            config_path("cameras.conf"),
+            PathBuf::from("/etc/irlume/cameras.conf")
+        );
+    }
+
+    #[test]
+    fn read_kv_skips_malformed_lines_and_empty_values() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        std::fs::write(
+            config_path("settings.conf"),
+            "# comment with = sign\nnot a kv line\nempty=\nreal=value\n",
+        )
+        .unwrap();
+        // A line without '=' and a commented '=' are both ignored.
+        assert_eq!(read_kv("settings.conf", "not a kv line"), None);
+        assert_eq!(read_kv("settings.conf", "# comment with "), None);
+        // `key=` (empty value) reads as absent, not Some("").
+        assert_eq!(read_kv("settings.conf", "empty"), None);
+        assert_eq!(read_kv("settings.conf", "real").as_deref(), Some("value"));
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_config_reads_as_absent_not_a_crash() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-eperm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        // A directory where a file is expected: a non-NotFound, non-EACCES read
+        // error (EISDIR). Takes the loud-warning branch and still yields None.
+        std::fs::create_dir_all(config_path("weird.conf")).unwrap();
+        assert_eq!(read_kv("weird.conf", "k"), None);
+
+        // 0600-root-style file we cannot read: the expected unprivileged EACCES
+        // is the quiet branch. Only meaningful when not running as root.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let p = config_path("locked.conf");
+            std::fs::write(&p, "k=v\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(read_kv("locked.conf", "k"), None);
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_kv_collapses_preexisting_duplicate_keys() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        // A hand-edited file can carry the same key twice; an update must
+        // leave exactly one line, holding the new value, and keep other keys.
+        std::fs::write(
+            config_path("cameras.conf"),
+            "rgb=/dev/video0\nir=/dev/video2\nrgb=/dev/video4\n",
+        )
+        .unwrap();
+        write_kv("cameras.conf", "rgb", "/dev/video8").unwrap();
+        let text = std::fs::read_to_string(config_path("cameras.conf")).unwrap();
+        assert_eq!(text.matches("rgb=").count(), 1);
+        assert!(text.contains("rgb=/dev/video8"));
+        assert_eq!(
+            read_kv("cameras.conf", "ir").as_deref(),
+            Some("/dev/video2")
+        );
+
+        // The file is (re)written 0600: these can hold device choices only the
+        // operator should edit.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(config_path("cameras.conf"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn third_party_pad_enable_then_disable_round_trips() {
         // The models feature persists its enabled state as this key: a model
         // name means enabled, an empty value means disabled. Locks in that
         // `write_kv(key, "")` reads back as None (not Some("")), which is what
         // `irlume models disable` and the daemon's enabled_name() rely on.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-tp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

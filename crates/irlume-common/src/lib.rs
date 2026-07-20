@@ -403,6 +403,23 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Test-only: every test that mutates process environment variables
+/// (IRLUME_SOCKET, IRLUME_CONFIG_DIR, IRLUME_STATE_DIR, ...) serializes on this
+/// one lock; setenv/getenv are process-global, and the test harness runs
+/// modules concurrently.
+#[cfg(test)]
+pub(crate) mod testenv {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub fn lock() -> MutexGuard<'static, ()> {
+        // A panic under the lock (failed assert) must not cascade into every
+        // later env test; the env itself is per-test state, not shared data.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +488,101 @@ mod tests {
             locked > 0,
             "a deserialized SecretBytes must be memlocked like a new()-built one"
         );
+    }
+
+    #[test]
+    fn error_display_prefixes_each_variant() {
+        // The PAM module and CLI print these verbatim; the category prefix is
+        // what tells a user (and the docs) which subsystem failed.
+        let cases: &[(Error, &str)] = &[
+            (Error::Io("socket gone".into()), "io: socket gone"),
+            (Error::Protocol("bad frame".into()), "protocol: bad frame"),
+            (
+                Error::NotAuthorized("peer uid 1000".into()),
+                "not authorized: peer uid 1000",
+            ),
+            (Error::Hardware("no camera".into()), "hardware: no camera"),
+            (Error::Tpm("unseal failed".into()), "tpm: unseal failed"),
+            (
+                Error::Policy("PCR mismatch: [7]".into()),
+                "policy: PCR mismatch: [7]",
+            ),
+        ];
+        for (e, want) in cases {
+            assert_eq!(e.to_string(), *want);
+        }
+    }
+
+    #[test]
+    fn secret_bytes_expose_len_and_redaction_invariants() {
+        let sb = SecretBytes::new(vec![1, 2, 3]);
+        assert_eq!(sb.expose(), &[1, 2, 3]);
+        assert_eq!(sb.len(), sb.expose().len());
+        assert!(!sb.is_empty());
+        // Debug must name only the length, never any content byte.
+        assert_eq!(format!("{sb:?}"), "SecretBytes([3 bytes redacted])");
+
+        // A clone exposes the same bytes but its own copy (drop-zeroize of one
+        // must not scrub the other).
+        let clone = sb.clone();
+        assert_eq!(clone.expose(), sb.expose());
+        assert_ne!(clone.expose().as_ptr(), sb.expose().as_ptr());
+
+        // Explicit zeroize empties the buffer (Vec zeroize scrubs + clears).
+        let mut z = SecretBytes::new(vec![9; 32]);
+        z.zeroize();
+        assert!(z.is_empty());
+        assert_eq!(z.len(), 0);
+
+        // Default is the empty secret.
+        let d = SecretBytes::default();
+        assert!(d.is_empty());
+        assert_eq!(format!("{d:?}"), "SecretBytes([0 bytes redacted])");
+
+        // #[serde(transparent)]: ships as a plain byte array on the wire.
+        assert_eq!(
+            serde_json::to_string(&SecretBytes::new(vec![7, 8])).unwrap(),
+            "[7,8]"
+        );
+    }
+
+    #[test]
+    fn request_wire_compat_defaults_for_older_callers() {
+        // An 0.1.x pam_irlume sends Authenticate without `service`; the field
+        // must default to None, not fail the parse (login would break).
+        let r: Request = serde_json::from_str(r#"{"Authenticate":{"user":"alice"}}"#).unwrap();
+        match r {
+            Request::Authenticate { user, service } => {
+                assert_eq!(user, "alice");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected Authenticate, got {other:?}"),
+        }
+        // Enroll without `reset` (pre-0.5 callers) defaults to false: an old
+        // client must never trigger the wipe-first path.
+        let r: Request =
+            serde_json::from_str(r#"{"Enroll":{"user":"alice","profile":null,"scans":null}}"#)
+                .unwrap();
+        match r {
+            Request::Enroll { user, reset, .. } => {
+                assert_eq!(user, "alice");
+                assert!(!reset);
+            }
+            other => panic!("expected Enroll, got {other:?}"),
+        }
+        // Response::Health from a daemon predating `version` parses with the
+        // empty-string default (the TUI shows "unknown" instead of erroring).
+        let r: Response = serde_json::from_str(
+            r#"{"Health":{"tier":"secure","rgb_dev":null,"ir_dev":null,"mesh":true,"adapter":false}}"#,
+        )
+        .unwrap();
+        match r {
+            Response::Health { version, tier, .. } => {
+                assert_eq!(version, "");
+                assert_eq!(tier, "secure");
+            }
+            other => panic!("expected Health, got {other:?}"),
+        }
     }
 
     #[test]

@@ -184,6 +184,11 @@ jobs:
     name: fuzz (untrusted-input parsers)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # Every cargo/rustc in this job (including the child rustc that
+      # cargo-fuzz spawns, which otherwise resolves the runner's default
+      # stable and rejects the -Z sanitizer flags) uses the pinned nightly.
+      RUSTUP_TOOLCHAIN: nightly-2026-07-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -209,9 +214,8 @@ jobs:
 
       # Build cargo-fuzz with nightly: it (via cargo-platform) needs a rustc
       # newer than the pinned 1.88, and nightly is the toolchain the targets
-      # build under anyway (the date-pinned nightly above is the default here,
-      # so no +toolchain prefix). Version-pinned for the same reason the
-      # nightly is date-pinned.
+      # build under anyway (RUSTUP_TOOLCHAIN above selects it for the whole
+      # job). Version-pinned for the same reason the nightly is date-pinned.
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 

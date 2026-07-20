@@ -259,7 +259,7 @@ jobs:
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
           cargo llvm-cov --no-report -p irlume-camera -p irlume-auth --locked -- --ignored loopback_ --test-threads=1
-          cargo llvm-cov report --summary-only --fail-under-lines 68
+          cargo llvm-cov report --summary-only --fail-under-lines 69
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)

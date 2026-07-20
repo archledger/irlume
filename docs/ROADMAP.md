@@ -41,7 +41,16 @@ The audit backlog, in rough order:
 
 - Test discipline toward the OpenSSF silver criteria: measure statement
   coverage (cargo-llvm-cov), and add a regression test with every bug fix
-  that can be tested without hardware.
+  that can be tested without hardware. Coverage sits at ~80%; the last few
+  points are hardware-only paths (live-face match, camera streaming, the
+  TTY main loops) plus the Tier-1 signed-PCR unseal. The signed-PCR path
+  cannot be covered against swtpm: swtpm rejects the `TPM2_PolicyAuthorize`
+  ticket that `TPM2_VerifySignature` produces for a null-hierarchy external
+  public key (checkTicket TPM_RC_VALUE), the exact key kind the signed-PCR
+  flow requires. A TPM-generated key authorizes fine on swtpm, so the
+  production code is correct; the simulator just cannot exercise this path.
+  It stays covered by the real-hardware `#[ignore]` test. Do not re-attempt
+  a swtpm signed-PCR test.
 - cargo-vet with the Mozilla and Google shared audit sets for the
   174-crate dependency tree.
 - Hardware reports: more IR camera modules, NixOS on bare metal, Fedora

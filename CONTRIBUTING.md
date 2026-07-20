@@ -25,6 +25,12 @@ you certify the DCO. That's it: no forms, no rights assignment.
 - **Keep the model BOM permissive.** Any new model must be clean at all three
   layers (code, weights, training data). No InsightFace buffalo_l/antelopev2 or
   other non-commercial weights; they conflict with GPL.
+- **Tests are required for new functionality.** Major new functionality must
+  land with automated tests for it in the same PR, added to the `cargo test`
+  suite (or, for parser-facing code, the fuzz corpus). A PR that adds
+  behavior without tests for that behavior will not be merged; the exception
+  is code that only runs against physical hardware, which gets an `#[ignore]`
+  test plus a written validation note instead.
 - **Liveness/PAD changes** should come with a self-test against the relevant
   ISO/IEC 30107-3 attack class: run `IRLUME_DEV=1 irlume padcapture` /
   `padreport` and

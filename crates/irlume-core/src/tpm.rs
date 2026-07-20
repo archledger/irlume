@@ -771,9 +771,12 @@ struct PcrlockEntry {
 }
 
 fn read_pcrlock_json() -> Result<PcrlockJson> {
-    let raw = std::fs::read(PCRLOCK_JSON).map_err(|e| {
+    // IRLUME_PCRLOCK_JSON redirects the prediction file, like the other
+    // sandbox overrides; tests provision a TPM and point this at a fixture.
+    let path = std::env::var("IRLUME_PCRLOCK_JSON").unwrap_or_else(|_| PCRLOCK_JSON.to_string());
+    let raw = std::fs::read(&path).map_err(|e| {
         Error::Policy(format!(
-            "cannot read {PCRLOCK_JSON}: {e} (run `systemd-pcrlock make-policy` first)"
+            "cannot read {path}: {e} (run `systemd-pcrlock make-policy` first)"
         ))
     })?;
     parse_pcrlock_json(&raw)
@@ -1193,6 +1196,128 @@ mod tests {
     /// Real Tier-2 pcrlock seal→unseal on the host TPM. Ignored by default: needs
     /// /dev/tpmrm0, root, and a provisioned pcrlock policy
     /// (`systemd-pcrlock make-policy`, NV index in /var/lib/systemd/pcrlock.json).
+    /// Tier-2 pcrlock seal/unseal without systemd-pcrlock: the test provisions
+    /// the NV index the way `systemd-pcrlock make-policy` does (owner-hierarchy
+    /// NV space holding the alg-tagged policy digest of the predicted PCR
+    /// state) and points IRLUME_PCRLOCK_JSON at a matching prediction. Runs
+    /// against any TPM; CI uses swtpm. Also proves the drift case: a rewritten
+    /// policy that no longer matches the live PCRs refuses the unseal.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
+    fn seal_unseal_pcrlock_roundtrip_provisioned_nv() {
+        use tss_esapi::attributes::NvIndexAttributes;
+        use tss_esapi::structures::{MaxNvBuffer, NvPublic};
+
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        const NV_INDEX: u32 = 0x0181_C0DE;
+        let secret = b"irlume-pcrlock-roundtrip-secret!";
+
+        let mut ctx = open_context().expect("tpm context");
+        // Current PCR 7 feeds both the prediction JSON and the policy digest.
+        let pcr7 = read_pcr_values(&mut ctx, &[7])
+            .expect("read pcr7")
+            .remove(0);
+        assert_eq!(pcr7.value.len(), 32, "sha256 bank expected");
+        let hex: String = pcr7.value.iter().map(|b| format!("{b:02x}")).collect();
+
+        let dir = std::env::temp_dir().join(format!("irlume-pcrlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("pcrlock.json");
+        std::fs::write(
+            &json_path,
+            format!(
+                r#"{{"pcrBank":"sha256","pcrValues":[{{"pcr":7,"values":["{hex}"]}}],"nvIndex":{NV_INDEX}}}"#
+            ),
+        )
+        .unwrap();
+        std::env::set_var("IRLUME_PCRLOCK_JSON", &json_path);
+
+        // A leftover index from an aborted run has a different name lineage;
+        // drop it before defining ours.
+        let nv_handle_t = NvIndexTpmHandle::new(NV_INDEX).unwrap();
+        if let Ok(obj) = ctx.tr_from_tpm_public(TpmHandle::NvIndex(nv_handle_t)) {
+            let _ = ctx.execute_with_nullauth_session(|ctx| {
+                ctx.nv_undefine_space(Provision::Owner, NvIndexHandle::from(obj))
+            });
+        }
+
+        // Owner-hierarchy NV space, owner read/write, 34 bytes: a 2-byte hash
+        // alg id plus the sha256 policy digest, systemd-pcrlock's layout.
+        let attrs = NvIndexAttributes::builder()
+            .with_owner_write(true)
+            .with_owner_read(true)
+            .build()
+            .unwrap();
+        let public = NvPublic::builder()
+            .with_nv_index(nv_handle_t)
+            .with_index_name_algorithm(HashingAlgorithm::Sha256)
+            .with_index_attributes(attrs)
+            .with_data_area_size(34)
+            .build()
+            .unwrap();
+        let nv = ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.nv_define_space(Provision::Owner, None, public)
+            })
+            .expect("nv define");
+
+        // The digest a session holds after PolicyPCR(sel=[7], composite): what
+        // the live unseal session presents when PolicyAuthorizeNV compares it
+        // against the NV content.
+        let composite: [u8; 32] = Sha256::digest(&pcr7.value).into();
+        let policy_digest = with_session(&mut ctx, SessionType::Trial, |ctx, session| {
+            let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+            ctx.policy_pcr(
+                policy,
+                Digest::try_from(composite.to_vec()).map_err(tpm_err)?,
+                pcr_selection(&[7])?,
+            )
+            .map_err(tpm_err)?;
+            ctx.policy_get_digest(policy).map_err(tpm_err)
+        })
+        .expect("trial policy digest");
+
+        let mut content = vec![0x00u8, 0x0B]; // TPM2_ALG_SHA256, big-endian
+        content.extend_from_slice(policy_digest.value());
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.nv_write(
+                NvAuth::Owner,
+                nv,
+                MaxNvBuffer::try_from(content).unwrap(),
+                0,
+            )
+        })
+        .expect("nv write");
+        drop(ctx);
+
+        // Round trip through the public Tier-2 entry points.
+        let env = seal_with_pcrlock(secret, NV_INDEX).expect("pcrlock seal");
+        assert!(matches!(env.policy, PolicyKind::PcrlockNv { .. }));
+        let got = unseal(&env).expect("pcrlock unseal");
+        assert_eq!(&*got, secret, "round-trip must match");
+
+        // Drift: rewrite the NV policy to one the live PCRs cannot satisfy
+        // (what a firmware change looks like) and the unseal must refuse.
+        let mut ctx = open_context().unwrap();
+        let nv = nv_index_handle(&mut ctx, NV_INDEX).unwrap();
+        let mut bogus = vec![0x00u8, 0x0B];
+        bogus.extend_from_slice(&[0xAB; 32]);
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.nv_write(NvAuth::Owner, nv, MaxNvBuffer::try_from(bogus).unwrap(), 0)
+        })
+        .unwrap();
+        drop(ctx);
+        assert!(unseal(&env).is_err(), "stale policy must not unseal");
+
+        // Cleanup: the NV space, the override, the fixture.
+        let mut ctx = open_context().unwrap();
+        let nv = nv_index_handle(&mut ctx, NV_INDEX).unwrap();
+        let _ =
+            ctx.execute_with_nullauth_session(|ctx| ctx.nv_undefine_space(Provision::Owner, nv));
+        std::env::remove_var("IRLUME_PCRLOCK_JSON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "requires real TPM + provisioned systemd-pcrlock policy; run as root"]
     fn seal_unseal_pcrlock_roundtrip_real_tpm() {

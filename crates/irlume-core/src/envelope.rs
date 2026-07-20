@@ -156,4 +156,135 @@ mod tests {
         assert_eq!(env.policy, PolicyKind::PcrLiteral);
         assert_eq!(env.pcrs, vec![7]);
     }
+
+    #[test]
+    fn describe_names_each_tier() {
+        assert_eq!(
+            PolicyKind::PcrLiteral.describe(),
+            "literal PolicyPCR (Tier 3)"
+        );
+        assert_eq!(
+            PolicyKind::Authorized {
+                pubkey_pem: "PEM".into(),
+                policy_ref: vec![0xde, 0xad],
+            }
+            .describe(),
+            "signed PolicyAuthorize (Tier 1)"
+        );
+        assert_eq!(
+            PolicyKind::PcrlockNv {
+                nv_index: 0x1c00002
+            }
+            .describe(),
+            "pcrlock NV 0x1c00002 (Tier 2)"
+        );
+    }
+
+    #[test]
+    fn authorized_variant_serde_roundtrips_and_skips_empty_policy_ref() {
+        // Non-empty policy_ref is base64-encoded and survives a round-trip.
+        let env = SealedEnvelope {
+            version: CURRENT_VERSION,
+            policy: PolicyKind::Authorized {
+                pubkey_pem: "PEM-BODY".into(),
+                policy_ref: vec![0xde, 0xad, 0xbe, 0xef],
+            },
+            pcrs: vec![11],
+            public: vec![1],
+            private: vec![2],
+            pcr_values: vec![],
+        };
+        let s = serde_json::to_string(&env).unwrap();
+        assert!(s.contains(r#""kind":"Authorized""#), "{s}");
+        let back: SealedEnvelope = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.policy, env.policy);
+
+        // Empty policy_ref must be omitted from the JSON and default back to empty.
+        let env2 = SealedEnvelope {
+            version: CURRENT_VERSION,
+            policy: PolicyKind::Authorized {
+                pubkey_pem: "P".into(),
+                policy_ref: vec![],
+            },
+            pcrs: vec![11],
+            public: vec![1],
+            private: vec![2],
+            pcr_values: vec![],
+        };
+        let s2 = serde_json::to_string(&env2).unwrap();
+        assert!(!s2.contains("policy_ref"), "{s2}");
+        let back2: SealedEnvelope = serde_json::from_str(&s2).unwrap();
+        match back2.policy {
+            PolicyKind::Authorized { policy_ref, .. } => assert!(policy_ref.is_empty()),
+            other => panic!("expected Authorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_base64_field() {
+        // The b64 field deserializer must surface a decode error rather than
+        // yielding garbage bytes.
+        let bad = r#"{"version":1,"pcrs":[7],"public":"@@@","private":"BAUG"}"#;
+        assert!(serde_json::from_str::<SealedEnvelope>(bad).is_err());
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_on_disk_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-env-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Nested path forces save() to create the missing parent directory.
+        let p = dir.join("sub/sealed.json");
+        let env = SealedEnvelope {
+            version: CURRENT_VERSION,
+            policy: PolicyKind::PcrlockNv {
+                nv_index: 0x1c00002,
+            },
+            pcrs: vec![7, 11],
+            public: vec![9, 8, 7],
+            private: vec![0],
+            pcr_values: vec![PcrValue {
+                pcr: 7,
+                value: vec![0x11; 32],
+            }],
+        };
+        env.save(&p).unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "envelope must be root-only");
+
+        let back = SealedEnvelope::load(&p).unwrap();
+        assert_eq!(back.version, CURRENT_VERSION);
+        assert_eq!(back.pcrs, vec![7, 11]);
+        assert_eq!(back.public, vec![9, 8, 7]);
+        assert_eq!(
+            back.policy,
+            PolicyKind::PcrlockNv {
+                nv_index: 0x1c00002
+            }
+        );
+        assert_eq!(back.pcr_values.len(), 1);
+        assert_eq!(back.pcr_values[0].value, vec![0x11; 32]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_errors_on_missing_and_malformed_file() {
+        let dir = std::env::temp_dir().join(format!("irlume-env-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("nope.json");
+        assert!(matches!(SealedEnvelope::load(&missing), Err(Error::Io(_))));
+
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        assert!(matches!(
+            SealedEnvelope::load(&bad),
+            Err(Error::Protocol(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

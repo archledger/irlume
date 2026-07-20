@@ -164,6 +164,7 @@ trade-off worth choosing deliberately (the password always still works).
 
 **Full step-by-step** (both the guided TUI and the individual CLI commands, with
 keyring unlock, recovery, and fingerprint): [`docs/SETUP.md`](docs/SETUP.md).
+**Every command and flag on one page:** [`docs/COMMANDS.md`](docs/COMMANDS.md).
 **Something not working, or want to audit every decision?**
 [`docs/DEBUGGING.md`](docs/DEBUGGING.md): `irlume doctor` runs the platform
 checks in one pass (TPM, Secure Boot, camera, models), `irlume logs` puts every

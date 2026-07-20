@@ -133,6 +133,53 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+  # Statement coverage with a ratchet: the build fails if line coverage drops
+  # below the floor. The floor moves up as tests are added, never down
+  # (OpenSSF silver test_statement_coverage80 is the long-term target).
+  # Not a required check.
+  coverage:
+    name: coverage (line-coverage ratchet)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Cache Git LFS objects (ONNX model weights)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+
+      - name: Pull model weights (Git LFS)
+        run: git lfs pull
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+
+      - name: Install stable Rust with llvm-tools
+        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
+        run: |
+          ver=1.24.4
+          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Coverage (fail under the ratchet floor)
+        run: cargo llvm-cov --workspace --locked --summary-only --fail-under-lines 25
+
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
     runs-on: ubuntu-24.04

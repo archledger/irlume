@@ -66,6 +66,20 @@ fn verify_models(paths: &[&str]) {
     }
 }
 
+/// The model files to checksum-verify at startup. det/model/mesh/blaze ship
+/// with every package, so a missing one is a broken install
+/// (IRLUME_MODELS_STRICT rightly refuses). The IR adapter is optional (none
+/// ships since ADR-0004; user supplies their own via IRLUME_IR_ADAPTER), so it
+/// is included only when the file actually exists; otherwise strict mode would
+/// refuse to start on a normal install that never had an adapter.
+fn models_to_verify<'a>(shipped: [&'a str; 4], adapter: &'a str) -> Vec<&'a str> {
+    let mut v: Vec<&str> = shipped.to_vec();
+    if std::path::Path::new(adapter).exists() {
+        v.push(adapter);
+    }
+    v
+}
+
 fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
@@ -78,16 +92,7 @@ fn main() {
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     eprintln!("irlumed: loading models (det={det}, model={model})…");
-    // det/model/mesh/blaze ship with every package, so a missing one is a broken
-    // install (IRLUME_MODELS_STRICT rightly refuses). The IR adapter is optional
-    // (none ships since ADR-0004; user supplies their own via IRLUME_IR_ADAPTER),
-    // so only verify it when it is actually present; otherwise strict mode would
-    // refuse to start on a normal install that never had an adapter.
-    let mut to_verify: Vec<&str> = vec![&det, &model, &mesh, &blaze];
-    if std::path::Path::new(&adapter).exists() {
-        to_verify.push(&adapter);
-    }
-    verify_models(&to_verify);
+    verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter));
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
     // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
     let (rgb_dev, ir_dev) = irlume_auth::select_pair();
@@ -576,19 +581,16 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // is enrolled. Root keeps the full cross-user search (admin/test);
             // a non-root peer is scoped to its OWN account; the score then only
             // concerns a face the caller already controls, not other users'.
-            let scoped = if peer.uid == 0 {
-                engine.identify()
-            } else {
-                match users::name_for_uid(peer.uid) {
-                    Some(name) => engine.identify_within(&name),
-                    None => Ok(irlume_auth::IdentifyOutcome {
-                        user: None,
-                        profile: None,
-                        score: 0.0,
-                        live: false,
-                        reason: "caller has no local account".into(),
-                    }),
-                }
+            let scoped = match identify_scope(peer) {
+                IdentifyScope::Full => engine.identify(),
+                IdentifyScope::SelfOnly(name) => engine.identify_within(&name),
+                IdentifyScope::NoAccount => Ok(irlume_auth::IdentifyOutcome {
+                    user: None,
+                    profile: None,
+                    score: 0.0,
+                    live: false,
+                    reason: "caller has no local account".into(),
+                }),
             };
             match scoped {
                 Ok(o) => Response::Identified {
@@ -647,25 +649,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => eprintln!("irlumed: IR emitter auto-setup skipped: {e}"),
             }
             match engine.enroll_profile(&user, profile, want) {
-                Ok(irlume_auth::EnrollOutcome::New { name, scans }) => Response::Enrolled {
-                    profile: name,
-                    created: true,
-                    added: scans,
-                    total: scans,
-                    added_scans: Vec::new(),
-                },
-                Ok(irlume_auth::EnrollOutcome::Merged {
-                    name,
-                    added,
-                    total,
-                    added_scans,
-                }) => Response::Enrolled {
-                    profile: name,
-                    created: false,
-                    added,
-                    total,
-                    added_scans,
-                },
+                Ok(outcome) => enroll_response(outcome),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -1103,6 +1087,58 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
     }
 }
 
+/// How a peer's 1:N Identify is scoped. Root keeps the full cross-user search;
+/// any other peer is confined to its own account (or to nothing at all), so
+/// the returned similarity score never concerns a face the caller does not
+/// already control.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentifyScope {
+    /// Full cross-user search (root only).
+    Full,
+    /// Scoped to the peer's own username.
+    SelfOnly(String),
+    /// The peer resolves to no local account; identify matches no one.
+    NoAccount,
+}
+
+fn identify_scope(peer: &Peer) -> IdentifyScope {
+    if peer.uid == 0 {
+        return IdentifyScope::Full;
+    }
+    match users::name_for_uid(peer.uid) {
+        Some(name) => IdentifyScope::SelfOnly(name),
+        None => IdentifyScope::NoAccount,
+    }
+}
+
+/// Map an engine enroll outcome onto the wire response. A merge into an
+/// existing profile MUST report `created: false`: the TUI's split-capture
+/// worker keys off it to stop and confirm, instead of sending the remaining
+/// AddScans to a profile that was never created.
+fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
+    match outcome {
+        irlume_auth::EnrollOutcome::New { name, scans } => Response::Enrolled {
+            profile: name,
+            created: true,
+            added: scans,
+            total: scans,
+            added_scans: Vec::new(),
+        },
+        irlume_auth::EnrollOutcome::Merged {
+            name,
+            added,
+            total,
+            added_scans,
+        } => Response::Enrolled {
+            profile: name,
+            created: false,
+            added,
+            total,
+            added_scans,
+        },
+    }
+}
+
 /// Load `user`'s enrollment, apply `f`, and save. `f` returns an Ok message or an
 /// error string. Used by the storage-only management operations.
 fn mutate_enrollment(
@@ -1331,6 +1367,143 @@ mod tests {
         };
         // uid_of relies on /etc/passwd; just exercise the root path deterministically.
         assert!(authorized_for(&root, "nonexistent-user"));
+    }
+
+    // Regression: d793a27. Request::Identify was an unauthenticated 1:N
+    // similarity oracle: any local peer got a cross-user search plus the exact
+    // score. Root keeps the full search; a non-root peer is scoped to its own
+    // account; a peer with no local account gets no search at all.
+    #[test]
+    fn identify_scope_confines_non_root_peers_to_their_own_account() {
+        let peer = |uid| Peer {
+            uid,
+            gid: uid,
+            pid: 1,
+        };
+        assert_eq!(identify_scope(&peer(0)), IdentifyScope::Full);
+        // The uid running this test resolves to a real account; its scope must
+        // be exactly that username, never Full.
+        let me = unsafe { libc::geteuid() };
+        if me != 0 {
+            let name = users::name_for_uid(me).expect("test uid has an account");
+            assert_eq!(identify_scope(&peer(me)), IdentifyScope::SelfOnly(name));
+        }
+        // A uid outside the account database is denied any scope.
+        assert_eq!(identify_scope(&peer(0xfffe_fffe)), IdentifyScope::NoAccount);
+        // Ground the reverse lookup itself (added by the same fix).
+        assert_eq!(users::name_for_uid(0).as_deref(), Some("root"));
+    }
+
+    // Regression: 834c71e. IRLUME_MODELS_STRICT=1 refused to start because the
+    // daemon still verified the OPTIONAL IR adapter at its default path even
+    // though none ships since ADR-0004. A missing adapter must be excluded
+    // from verification; a present one is still verified.
+    #[test]
+    fn missing_optional_adapter_is_not_verified() {
+        let shipped = [
+            "/etc/irlume/det.onnx",
+            "/etc/irlume/face.onnx",
+            "/etc/irlume/face_landmark.onnx",
+            "/etc/irlume/blaze_face_short_range.onnx",
+        ];
+        assert_eq!(
+            models_to_verify(shipped, "/nonexistent/irlume-test/ir_adapter.onnx"),
+            shipped.to_vec(),
+            "a missing optional adapter must not reach verify_models"
+        );
+        // An adapter that actually exists is still checked.
+        let dir =
+            std::env::temp_dir().join(format!("irlume-daemon-adapter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let adapter = dir.join("ir_adapter.onnx");
+        std::fs::write(&adapter, b"weights").unwrap();
+        let ap = adapter.to_string_lossy().into_owned();
+        let v = models_to_verify(shipped, &ap);
+        assert_eq!(v.len(), 5);
+        assert_eq!(v[4], ap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: 834c71e (companion guard). Excluding the optional adapter
+    // must not soften strict mode for the SHIPPED models: under
+    // IRLUME_MODELS_STRICT=1 an unreadable/deleted shipped model still refuses
+    // to start. verify_models exits the process, so re-exec this test binary
+    // as the child that makes the call.
+    #[test]
+    fn strict_verify_still_refuses_a_missing_shipped_model() {
+        if std::env::var("IRLUME_TEST_VERIFY_CHILD").is_ok() {
+            // Child: strict verify of an unreadable model must exit(1) here.
+            verify_models(&["/nonexistent/irlume-test/det.onnx"]);
+            return; // reaching this line means strict did NOT refuse
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "tests::strict_verify_still_refuses_a_missing_shipped_model",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("IRLUME_TEST_VERIFY_CHILD", "1")
+            .env("IRLUME_MODELS_STRICT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "strict verify of a missing shipped model must refuse to start"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("refusing to start"), "stderr was: {err}");
+    }
+
+    // Regression: 965d64e. The daemon collapsed EnrollOutcome::New and
+    // ::Merged into Response::Ok(String), so the TUI could not tell a merge
+    // from a new profile and aborted with "no face profile". The engine itself
+    // needs camera + models, so the response-construction seam is what a unit
+    // test can pin: Merged maps to Enrolled with created:false and the exact
+    // appended scan names (the undo handle), New to created:true.
+    #[test]
+    fn enroll_merge_reports_created_false_with_the_added_scans() {
+        let merged = enroll_response(irlume_auth::EnrollOutcome::Merged {
+            name: "Face Profile 1".into(),
+            added: 1,
+            total: 8,
+            added_scans: vec!["Face Scan 8".into()],
+        });
+        match merged {
+            Response::Enrolled {
+                profile,
+                created,
+                added,
+                total,
+                added_scans,
+            } => {
+                assert_eq!(profile, "Face Profile 1");
+                assert!(!created, "a merge must not claim a new profile was created");
+                assert_eq!((added, total), (1, 8));
+                assert_eq!(added_scans, vec!["Face Scan 8".to_string()]);
+            }
+            other => panic!("merge must answer Enrolled, got {other:?}"),
+        }
+        let new = enroll_response(irlume_auth::EnrollOutcome::New {
+            name: "Face Profile 2".into(),
+            scans: 3,
+        });
+        match new {
+            Response::Enrolled {
+                created,
+                added,
+                total,
+                added_scans,
+                ..
+            } => {
+                assert!(created);
+                assert_eq!((added, total), (3, 3));
+                assert!(added_scans.is_empty());
+            }
+            other => panic!("new enroll must answer Enrolled, got {other:?}"),
+        }
     }
 
     #[test]

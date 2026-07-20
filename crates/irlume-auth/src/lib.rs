@@ -75,6 +75,8 @@ pub struct Assessment {
 }
 
 /// The authentication decision for a user.
+// Debug is diagnostic-only (tests, dlog); derives add no behavior.
+#[derive(Debug)]
 pub struct Outcome {
     pub granted: bool,
     pub live: bool,
@@ -84,6 +86,8 @@ pub struct Outcome {
 
 /// The result of a 1:N identification ("who is this?"). `user`/`profile` are set
 /// only on a live, above-threshold match against some enrolled face.
+// Debug is diagnostic-only (tests, dlog); derives add no behavior.
+#[derive(Debug)]
 pub struct IdentifyOutcome {
     pub user: Option<String>,
     pub profile: Option<String>,
@@ -2127,6 +2131,15 @@ mod tests {
     use super::*;
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
 
+    /// Serializes access to process-wide env vars (`IRLUME_GRACE_MS`,
+    /// `IRLUME_STATE_DIR`, `IRLUME_METHOD_CONF`, ...) across this binary's
+    /// parallel test threads. Engine tests share it via `super::tests`.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn unit(mut v: Vec<f32>) -> Vec<f32> {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt() + 1e-9;
         v.iter_mut().for_each(|x| *x /= n);
@@ -2212,7 +2225,9 @@ mod tests {
 
     #[test]
     fn grace_window_shorter_for_sudo_than_login() {
-        // Env override off for this check (the test process shouldn't set it).
+        // Env override off for this check (guarded: another test sets it).
+        let _g = env_guard();
+        std::env::remove_var("IRLUME_GRACE_MS");
         assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
         assert_eq!(grace_window_ms(Some("su")), SUDO_GRACE_WINDOW_MS);
         // Login/lock services and an unknown/absent service get the full window.
@@ -2488,6 +2503,289 @@ mod tests {
         let err = enroll_merge_target(&enr, &[&face1, &face2]).unwrap_err();
         assert!(err.to_string().contains("two different profiles"));
     }
+
+    #[test]
+    fn grace_env_override_beats_the_service_table() {
+        let _g = env_guard();
+        // A parseable value wins for every service class.
+        std::env::set_var("IRLUME_GRACE_MS", "1234");
+        assert_eq!(grace_window_ms(Some("sudo")), 1234);
+        assert_eq!(grace_window_ms(Some("plasmalogin")), 1234);
+        assert_eq!(grace_window_ms(None), 1234);
+        // 0 = legacy one-shot.
+        std::env::set_var("IRLUME_GRACE_MS", "0");
+        assert_eq!(grace_window_ms(None), 0);
+        // Unparseable values fall back to the service table.
+        std::env::set_var("IRLUME_GRACE_MS", "abc");
+        assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
+        assert_eq!(grace_window_ms(None), GRACE_WINDOW_MS);
+        std::env::set_var("IRLUME_GRACE_MS", "");
+        assert_eq!(grace_window_ms(Some("su-l")), SUDO_GRACE_WINDOW_MS);
+        // Negative numbers don't parse as u64 either.
+        std::env::set_var("IRLUME_GRACE_MS", "-5");
+        assert_eq!(grace_window_ms(Some("runuser")), SUDO_GRACE_WINDOW_MS);
+        std::env::remove_var("IRLUME_GRACE_MS");
+    }
+
+    #[test]
+    fn pitch_band_recentres_on_a_calibrated_neutral() {
+        // Uncalibrated: the wide bootstrap band.
+        assert_eq!(pitch_band(None), (FRAME_PITCH_MIN, FRAME_PITCH_MAX));
+        // Calibrated: neutral ± PITCH_TOL, tighter than the bootstrap band.
+        let (lo, hi) = pitch_band(Some(0.62));
+        assert!((lo - (0.62 - PITCH_TOL)).abs() < 1e-6);
+        assert!((hi - (0.62 + PITCH_TOL)).abs() < 1e-6);
+        assert!(hi - lo < FRAME_PITCH_MAX - FRAME_PITCH_MIN);
+    }
+
+    #[test]
+    fn threshold_ladder_orderings_the_decision_paths_rely_on() {
+        use irlume_core::*;
+        // The adapter space uses a lower bar than raw IR (its scores are
+        // recalibrated), and the mixed-light IR fallback is stricter than the
+        // dark path by exactly the margin.
+        // Constant relations the decision paths assume; checked at compile time.
+        const { assert!(IR_ADAPTED_MATCH_THRESHOLD < IR_MATCH_THRESHOLD) };
+        const { assert!(IR_FALLBACK_MARGIN > 0.0) };
+        for n in [1usize, 5, 30, 90] {
+            let dark = scaled_threshold(IR_MATCH_THRESHOLD, n);
+            assert!(dark >= IR_MATCH_THRESHOLD);
+            assert!((dark + IR_FALLBACK_MARGIN) > dark);
+            // Scaling never exceeds base + cap.
+            assert!(dark <= IR_MATCH_THRESHOLD + TEMPLATE_SCALE_MAX_BUMP + 1e-6);
+        }
+        // More templates never lowers the bar (best-of-N FAR compensation).
+        assert!(
+            scaled_threshold(RGB_MATCH_THRESHOLD, 30) >= scaled_threshold(RGB_MATCH_THRESHOLD, 5)
+        );
+    }
+
+    #[test]
+    fn fusion_decision_table_matches_the_stage2_gate() {
+        use irlume_core::fusion::*;
+        // Both modalities strong at full quality: grant, prob = weighted mean.
+        let f = fuse(0.9, 1.0, 0.8, 1.0);
+        assert!(f.grant);
+        assert!((f.prob - 0.85).abs() < 1e-6);
+        // One modality at pure-noise probability vetoes the grant even when the
+        // other is certain (anti single-modality-spoof floor).
+        let f = fuse(0.99, 1.0, FUSION_MIN_PER_MODALITY_PROB - 0.01, 1.0);
+        assert!(!f.grant);
+        // No IR capture (weight 0) never grants, whatever the probabilities.
+        let f = fuse(0.99, 1.0, 0.99, 0.0);
+        assert!(!f.grant);
+        // Boundary: the fused probability at exactly the threshold grants (>=).
+        let f = fuse(FUSION_PROB_THRESHOLD, 1.0, FUSION_PROB_THRESHOLD, 1.0);
+        assert!(f.grant);
+        // Quality weighting: dim RGB shifts the fused prob toward IR.
+        let dim = fuse(
+            0.2,
+            rgb_quality_weight(0.0),
+            0.9,
+            ir_quality_weight(true, 120.0),
+        );
+        let lit = fuse(
+            0.2,
+            rgb_quality_weight(200.0),
+            0.9,
+            ir_quality_weight(true, 120.0),
+        );
+        assert!(dim.prob > lit.prob, "{} vs {}", dim.prob, lit.prob);
+    }
+
+    #[test]
+    fn ir_match_quarantines_wrong_dimension_templates() {
+        let (prof, probe) = calibrated_profile(16);
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        // A probe of a different width matches nothing (adapter-contract change).
+        let short_probe = vec![0.5f32; 8];
+        let m = ir_match_in("raw", false, &enr, &short_probe);
+        assert_eq!(m.n_templates, 0);
+        assert!(m.centroid.is_none());
+        assert_eq!(m.best, f32::NEG_INFINITY);
+        // The right width still matches.
+        assert_eq!(ir_match_in("raw", false, &enr, &probe).n_templates, 5);
+    }
+
+    #[test]
+    fn ir_match_grandfathers_untagged_templates_into_any_space() {
+        let (mut prof, probe) = calibrated_profile(16);
+        for s in &mut prof.scans {
+            s.ir_space = None; // pre-tagging enrollment
+        }
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        for space in ["raw", "adapter:deadbeef0123"] {
+            let m = ir_match_in(space, false, &enr, &probe);
+            assert_eq!(m.n_templates, 5, "untagged templates must match in {space}");
+        }
+    }
+
+    #[test]
+    fn ir_match_uncalibrated_profile_scores_raw_and_names_the_winner() {
+        // Two profiles without calibration: plain cosine, winner labelled.
+        let a = unit(vec![1.0, 0.0, 0.0, 0.0]);
+        let b = unit(vec![0.0, 1.0, 0.0, 0.0]);
+        let mk_prof = |name: &str, v: &[f32]| FaceProfile {
+            name: name.into(),
+            ir_calib: None,
+            scans: vec![FaceScan {
+                name: "s".into(),
+                rgb: vec![0.0; 4],
+                ir: Some(v.to_vec()),
+                ir_space: Some("raw".into()),
+                ir_depth: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            }],
+        };
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(mk_prof("A", &a));
+        enr.profiles.push(mk_prof("B", &b));
+        let m = ir_match_in("raw", false, &enr, &b);
+        assert_eq!(m.n_templates, 2);
+        assert_eq!(m.best_who, "B");
+        assert!((m.best - 1.0).abs() < 1e-5);
+        // No calibration anywhere -> no centroid protocol.
+        assert!(m.centroid.is_none());
+    }
+
+    #[test]
+    fn luma_in_bbox_means_and_clamps() {
+        // 4x4 frame: left half black, right half (100,100,100).
+        let (w, h) = (4u32, 4u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 2..w {
+                let i = ((y * w + x) * 3) as usize;
+                rgb[i] = 100;
+                rgb[i + 1] = 100;
+                rgb[i + 2] = 100;
+            }
+        }
+        // Right half only: BT.601 luma of (100,100,100) is 100.
+        assert!((luma_in_bbox(&rgb, w, h, &[2.0, 0.0, 4.0, 4.0]) - 100.0).abs() < 0.5);
+        // Whole frame: half black, half 100 -> 50.
+        assert!((luma_in_bbox(&rgb, w, h, &[0.0, 0.0, 4.0, 4.0]) - 50.0).abs() < 0.5);
+        // A bbox hanging off the frame clamps instead of reading out of bounds.
+        assert!((luma_in_bbox(&rgb, w, h, &[-10.0, -10.0, 100.0, 100.0]) - 50.0).abs() < 0.5);
+        // Zero-area region -> 0.
+        assert_eq!(luma_in_bbox(&rgb, w, h, &[1.0, 1.0, 1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn rgb_luma_stats_reports_mean_and_hot_fraction() {
+        // 2x2: three black pixels + one blown-out white one.
+        let (w, h) = (2u32, 2u32);
+        let mut rgb = vec![0u8; 12];
+        rgb[0] = 255;
+        rgb[1] = 255;
+        rgb[2] = 255;
+        let (mean, hot) = rgb_luma_stats(&rgb, w, h, &[0.0, 0.0, 2.0, 2.0]);
+        assert!((mean - 63.75).abs() < 1.0, "mean {mean}");
+        assert!((hot - 0.25).abs() < 1e-6, "hot {hot}");
+        // No blown pixels -> hot fraction 0.
+        let grey = vec![128u8; 12];
+        let (_, hot) = rgb_luma_stats(&grey, w, h, &[0.0, 0.0, 2.0, 2.0]);
+        assert_eq!(hot, 0.0);
+        // Degenerate region -> (0, 0).
+        assert_eq!(
+            rgb_luma_stats(&rgb, w, h, &[1.0, 1.0, 1.0, 1.0]),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn mean_in_bbox_averages_and_clamps() {
+        let (w, h) = (4u32, 2u32);
+        let grey = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        assert!((mean_in_bbox(&grey, w, h, &[0.0, 0.0, 4.0, 2.0]) - 45.0).abs() < 1e-4);
+        assert!((mean_in_bbox(&grey, w, h, &[0.0, 0.0, 2.0, 1.0]) - 15.0).abs() < 1e-4);
+        // Out-of-frame bbox clamps to the frame.
+        assert!((mean_in_bbox(&grey, w, h, &[-9.0, -9.0, 99.0, 99.0]) - 45.0).abs() < 1e-4);
+        assert_eq!(mean_in_bbox(&grey, w, h, &[3.0, 1.0, 3.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn center_edge_ratio_reads_depth_from_center_emphasis() {
+        let (w, h) = (40u32, 40u32);
+        let bbox = [0.0f32, 0.0, 40.0, 40.0];
+        // Emitter-lit 3D face: the center quarter markedly brighter than the rim.
+        let mut face = vec![40u8; (w * h) as usize];
+        for y in 10..30 {
+            for x in 10..30 {
+                face[(y * w + x) as usize] = 200;
+            }
+        }
+        let deep = center_edge_ratio(&face, w, h, &bbox);
+        assert!(deep > 1.5, "center-lit face must read deep, got {deep}");
+        // Flat 2D surface (screen/photo): uniform -> ratio ~1.
+        let flat = vec![120u8; (w * h) as usize];
+        let flat_r = center_edge_ratio(&flat, w, h, &bbox);
+        assert!((flat_r - 1.0).abs() < 0.05, "flat ratio {flat_r}");
+        assert!(deep > flat_r, "monotonic: 3D > 2D");
+        // Degenerate boxes and black frames return 0 (no signal, never inf).
+        assert_eq!(center_edge_ratio(&face, w, h, &[0.0, 0.0, 3.0, 3.0]), 0.0);
+        let black = vec![0u8; (w * h) as usize];
+        assert_eq!(center_edge_ratio(&black, w, h, &bbox), 0.0);
+    }
+
+    /// 64x48 IR frame with optional specular glints at the two eye landmarks.
+    fn ir_frame_with_glints(left: bool, right: bool) -> (Vec<u8>, Landmarks5) {
+        let (w, h) = (64usize, 48usize);
+        let mut grey = vec![60u8; w * h];
+        let lm: Landmarks5 = [
+            (20.0, 20.0),
+            (44.0, 20.0),
+            (32.0, 28.0),
+            (24.0, 36.0),
+            (40.0, 36.0),
+        ];
+        if left {
+            grey[20 * w + 20] = 250;
+        }
+        if right {
+            grey[20 * w + 44] = 250;
+        }
+        (grey, lm)
+    }
+
+    #[test]
+    fn eye_glint_finds_the_specular_peak() {
+        let (grey, lm) = ir_frame_with_glints(true, true);
+        assert_eq!(eye_glint(&grey, 64, 48, &lm), 250.0);
+        // No glint: the diffuse background level is the peak.
+        let (grey, lm) = ir_frame_with_glints(false, false);
+        assert_eq!(eye_glint(&grey, 64, 48, &lm), 60.0);
+        // Landmarks fully outside the frame: nothing sampled, peak 0.
+        let far: Landmarks5 = [(-500.0, -500.0); 5];
+        assert_eq!(eye_glint(&grey, 64, 48, &far), 0.0);
+    }
+
+    #[test]
+    fn both_eyes_open_requires_a_glint_at_each_eye() {
+        let (grey, lm) = ir_frame_with_glints(true, true);
+        assert!(both_eyes_open(&grey, 64, 48, &lm));
+        // One closed lid (no specular point) fails the gate, conservatively.
+        let (grey, lm) = ir_frame_with_glints(true, false);
+        assert!(!both_eyes_open(&grey, 64, 48, &lm));
+        let (grey, lm) = ir_frame_with_glints(false, false);
+        assert!(!both_eyes_open(&grey, 64, 48, &lm));
+    }
+
+    #[test]
+    fn eye_glint_contrast_collapses_without_a_specular_spike() {
+        // Sharp corneal spike on a diffuse background: high contrast.
+        let (grey, lm) = ir_frame_with_glints(true, true);
+        let sharp = eye_glint_contrast(&grey, 64, 48, &lm);
+        assert!(sharp > 100.0, "specular contrast {sharp}");
+        // Uniform lid/print: peak == mean -> contrast 0.
+        let (flat, lm) = ir_frame_with_glints(false, false);
+        let dull = eye_glint_contrast(&flat, 64, 48, &lm);
+        assert_eq!(dull, 0.0);
+        assert!(sharp > dull, "blink/liveness signal must be monotonic");
+    }
 }
 
 #[cfg(test)]
@@ -2513,5 +2811,546 @@ mod thirdparty_cue_tests {
                 assert!(!thirdparty_downgrades(v, p, 0.5));
             }
         }
+    }
+}
+
+/// Engine tests against the REAL shipped models (Git LFS under `models/`), with
+/// the camera devices pointed at nonexistent nodes so no capture can ever run:
+/// everything from the capture boundary inward errors with "no camera found",
+/// and everything decided BEFORE the camera (enrollment state, bindings,
+/// policy, builder wiring) is asserted for real. The engine is expensive to
+/// build (the 512-D recognizer session), so one instance is shared.
+#[cfg(test)]
+mod engine_tests {
+    use super::tests::env_guard;
+    use super::*;
+    use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    const NO_RGB: &str = "/dev/irlume-test-none-rgb";
+    const NO_IR: &str = "/dev/irlume-test-none-ir";
+
+    fn model_path(name: &str) -> String {
+        format!("{}/../../models/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Point `ort` (load-dynamic) at the packaged onnxruntime when the test
+    /// env doesn't already provide `ORT_DYLIB_PATH`.
+    fn ort_init() {
+        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+            return;
+        }
+        for cand in [
+            "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+            "/usr/lib64/libonnxruntime.so",
+            "/usr/lib/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+        ] {
+            if std::path::Path::new(cand).exists() {
+                std::env::set_var("ORT_DYLIB_PATH", cand);
+                return;
+            }
+        }
+    }
+
+    struct Shared {
+        engine: Engine,
+        /// `ir_space()` observed right after loading a real adapter file, for
+        /// the digest-naming assertion (the shared engine then reverts to raw).
+        adapter_space: String,
+    }
+
+    /// LOCK ORDER: every engine test takes env_guard() FIRST, then shared().
+    /// The initializer itself must NOT lock (the caller already holds the env
+    /// guard, and std Mutex is not reentrant); it only touches env vars no
+    /// other test reads (`IRLUME_FORCE_NO_IR`, `ORT_DYLIB_PATH`).
+    fn shared() -> MutexGuard<'static, Shared> {
+        static S: OnceLock<Mutex<Shared>> = OnceLock::new();
+        S.get_or_init(|| {
+            ort_init();
+            // Deterministic hardware probe on any machine: no IR pair, so the
+            // engine sits in convenience tier. Left set for the whole process.
+            std::env::set_var("IRLUME_FORCE_NO_IR", "1");
+            let e = Engine::load(
+                &model_path("face_detection_yunet_2023mar.onnx"),
+                &model_path("glintr100.onnx"),
+            )
+            .expect("engine load")
+            .with_devices(NO_RGB, NO_IR);
+            // Absent optional model files are a no-op for every builder.
+            let e = e
+                .with_ir_adapter("/nonexistent/adapter.onnx")
+                .unwrap()
+                .with_mesh("/nonexistent/mesh.onnx")
+                .unwrap()
+                .with_blaze_rescue("/nonexistent/blaze.onnx")
+                .unwrap()
+                .with_thirdparty_pad("/nonexistent/pad.onnx", 0.5, "absent")
+                .unwrap();
+            assert!(
+                !e.has_ir_adapter()
+                    && !e.has_mesh()
+                    && !e.has_blaze_rescue()
+                    && !e.has_thirdparty_pad(),
+                "absent model files must leave the engine bare"
+            );
+            assert_eq!(e.ir_space(), "raw");
+            // A present adapter file flips the IR space to its digest name. Any
+            // valid ONNX serves; `apply` is never called (BlazeFace here).
+            let blaze = model_path("blaze_face_short_range.onnx");
+            let e = e.with_ir_adapter(&blaze).unwrap();
+            assert!(e.has_ir_adapter());
+            let adapter_space = e.ir_space().to_string();
+            let mut e = e
+                .with_mesh(&model_path("face_landmark.onnx"))
+                .unwrap()
+                .with_blaze_rescue(&blaze)
+                .unwrap()
+                .with_thirdparty_pad(&blaze, 0.75, "test-pad")
+                .unwrap();
+            // Shared baseline is the raw (no-adapter) space; tests needing an
+            // adapter set one temporarily and restore.
+            e.ir_adapter = None;
+            e.ir_space = "raw".into();
+            Mutex::new(Shared {
+                engine: e,
+                adapter_space,
+            })
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Fresh state sandbox: temp IRLUME_STATE_DIR + a method conf pointing at a
+    /// missing file (=> Auto). Caller must hold the env guard.
+    fn state_sandbox(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("irlume-auth-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+        dir
+    }
+
+    fn teardown_sandbox(dir: &std::path::Path) {
+        std::env::remove_var("IRLUME_STATE_DIR");
+        std::env::remove_var("IRLUME_METHOD_CONF");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Write a PLAINTEXT enrollment (what a no-TPM host stores); never goes
+    /// through storage::save, which would touch this machine's real TPM.
+    fn write_enrollment(dir: &std::path::Path, e: &Enrollment) {
+        std::fs::write(
+            dir.join(format!("{}.json", e.user)),
+            serde_json::to_vec(e).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn unit512(seed: usize) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..512)
+            .map(|j| (j as f32 * 0.7).sin() + 0.05 * (seed as f32 * 1.3 + j as f32).sin())
+            .collect();
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt() + 1e-9;
+        v.iter_mut().for_each(|x| *x /= n);
+        v
+    }
+
+    fn scan512(seed: usize, ir: bool, space: Option<&str>) -> FaceScan {
+        FaceScan {
+            name: format!("Face Scan {seed}"),
+            rgb: unit512(seed),
+            ir: ir.then(|| unit512(seed + 100)),
+            ir_space: space.map(String::from),
+            ir_depth: 1.3,
+            ir_brightness: 90.0,
+            pitch: 0.5,
+        }
+    }
+
+    #[test]
+    fn builder_wiring_tier_and_adapter_digest_naming() {
+        let _g = env_guard();
+        let s = shared();
+        let e = &s.engine;
+        // Forced no-IR hardware: convenience tier, no dark path.
+        assert_eq!(e.tier(), Tier::Convenience);
+        assert!(!e.ir_available());
+        assert_eq!(e.rgb_device(), NO_RGB);
+        assert_eq!(e.ir_device(), NO_IR);
+        assert_eq!(e.ir_dim(), irlume_vision::EMBED_DIM);
+        assert_eq!(e.ir_space(), "raw");
+        // Loaded optional models.
+        assert!(e.has_mesh() && e.has_blaze_rescue() && e.has_thirdparty_pad());
+        assert_eq!(e.thirdparty_pad_name(), Some("test-pad"));
+        // Adapter space naming: "adapter:" + first 12 hex of the file's sha256,
+        // computed independently here from the same bytes.
+        let bytes = std::fs::read(model_path("blaze_face_short_range.onnx")).unwrap();
+        let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+        assert_eq!(s.adapter_space, format!("adapter:{}", &digest[..12]));
+    }
+
+    #[test]
+    fn set_devices_switches_the_pair_at_runtime() {
+        let _g = env_guard();
+        let mut s = shared();
+        s.engine
+            .set_devices("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        assert_eq!(s.engine.rgb_device(), "/dev/irlume-test-alt-rgb");
+        assert_eq!(s.engine.ir_device(), "/dev/irlume-test-alt-ir");
+        s.engine.set_devices(NO_RGB, NO_IR); // restore the shared baseline
+    }
+
+    #[test]
+    fn refit_profile_calib_fits_skips_and_defers_to_the_adapter() {
+        let _g = env_guard();
+        let mut s = shared();
+        // Healthy paired 512-D scans in the current space: calibration fits.
+        let mut prof = FaceProfile {
+            name: "p".into(),
+            ir_calib: None,
+            scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
+        };
+        s.engine.refit_profile_calib(&mut prof);
+        let calib = prof.ir_calib.as_ref().expect("calibration fitted");
+        assert_eq!(calib.fitted_pairs, 5);
+        // Wrong-dimension IR templates are quarantined: nothing to fit.
+        let mut bad = FaceProfile {
+            name: "bad".into(),
+            ir_calib: None,
+            scans: (0..5)
+                .map(|i| FaceScan {
+                    ir: Some(vec![0.1; 256]),
+                    ..scan512(i, true, Some("raw"))
+                })
+                .collect(),
+        };
+        s.engine.refit_profile_calib(&mut bad);
+        assert!(bad.ir_calib.is_none());
+        // Foreign-space templates (stranded by an adapter change) are skipped.
+        let mut foreign = FaceProfile {
+            name: "foreign".into(),
+            ir_calib: None,
+            scans: (0..5)
+                .map(|i| scan512(i, true, Some("adapter:deadbeef0123")))
+                .collect(),
+        };
+        s.engine.refit_profile_calib(&mut foreign);
+        assert!(foreign.ir_calib.is_none());
+        // With a global adapter loaded, refit is a no-op: an existing
+        // calibration is left untouched and none is fitted.
+        let adapter = Adapter::load_from_file(&model_path("blaze_face_short_range.onnx")).unwrap();
+        s.engine.ir_adapter = Some(adapter);
+        let before = prof.ir_calib.clone().unwrap();
+        s.engine.refit_profile_calib(&mut prof);
+        assert_eq!(
+            prof.ir_calib.as_ref().map(|c| c.fitted_pairs),
+            Some(before.fitted_pairs),
+            "adapter mode must not refit"
+        );
+        let mut fresh = FaceProfile {
+            name: "fresh".into(),
+            ir_calib: None,
+            scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
+        };
+        s.engine.refit_profile_calib(&mut fresh);
+        assert!(fresh.ir_calib.is_none(), "adapter mode must not fit anew");
+        s.engine.ir_adapter = None; // restore the shared baseline
+    }
+
+    #[test]
+    fn binding_mismatch_refuses_swapped_or_vanished_cameras() {
+        let _g = env_guard();
+        let s = shared();
+        // Nonexistent devices carry no USB identity.
+        let bind = s.engine.current_binding();
+        assert_eq!(
+            bind,
+            CameraBinding {
+                rgb: None,
+                ir: None
+            }
+        );
+        // Unbound sides are not checked (pre-binding enrollments keep working).
+        assert_eq!(s.engine.binding_mismatch(&bind), None);
+        // A bound RGB identity that no longer matches (or is gone) refuses.
+        let bind = CameraBinding {
+            rgb: Some("dead:beef".into()),
+            ir: None,
+        };
+        let msg = s.engine.binding_mismatch(&bind).expect("must refuse");
+        assert!(msg.contains("RGB device identity differs"), "{msg}");
+        // Same for a bound IR camera that is absent now.
+        let bind = CameraBinding {
+            rgb: None,
+            ir: Some("dead:beef".into()),
+        };
+        let msg = s.engine.binding_mismatch(&bind).expect("must refuse");
+        assert!(msg.contains("IR camera changed or absent"), "{msg}");
+    }
+
+    #[test]
+    fn authenticate_refuses_before_the_camera_on_state_and_policy() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("auth");
+
+        // Fingerprint mode: face declines instantly (pam_fprintd drives).
+        std::fs::write(dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", dir.join("method"));
+        let o = s.engine.authenticate("anyone", Some("sudo")).unwrap();
+        assert!(!o.granted && !o.live);
+        assert_eq!(o.reason, "face disabled (fingerprint mode)");
+        std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+
+        // Unknown user.
+        let o = s.engine.authenticate("irlume-test-ghost", None).unwrap();
+        assert!(!o.granted);
+        assert_eq!(o.reason, "'irlume-test-ghost' is not enrolled");
+
+        // Enrolled but with zero scans.
+        let mut e = Enrollment::new("irlume-test-empty");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![],
+            ir_calib: None,
+        });
+        write_enrollment(&dir, &e);
+        let o = s.engine.authenticate("irlume-test-empty", None).unwrap();
+        assert!(!o.granted);
+        assert_eq!(o.reason, "'irlume-test-empty' has no face scans enrolled");
+
+        // Camera binding mismatch: anti-swap refusal before any capture.
+        let mut e = Enrollment::new("irlume-test-bound");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+        });
+        e.camera_binding = Some(CameraBinding {
+            rgb: Some("dead:beef".into()),
+            ir: None,
+        });
+        write_enrollment(&dir, &e);
+        let o = s.engine.authenticate("irlume-test-bound", None).unwrap();
+        assert!(!o.granted && !o.live);
+        assert!(
+            o.reason.contains("camera changed since enrollment"),
+            "{}",
+            o.reason
+        );
+
+        // A healthy enrollment reaches the capture boundary, which fails hard
+        // on the nonexistent device (never a silent grant/deny).
+        let mut e = Enrollment::new("irlume-test-cam");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+        });
+        write_enrollment(&dir, &e);
+        let err = s.engine.authenticate("irlume-test-cam", None).unwrap_err();
+        assert!(err.to_string().contains("no camera found"), "{err}");
+
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn identify_respects_fingerprint_mode_and_needs_a_camera() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("identify");
+        std::fs::write(dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", dir.join("method"));
+        let o = s.engine.identify().unwrap();
+        assert!(o.user.is_none() && !o.live);
+        assert_eq!(o.reason, "face disabled (fingerprint mode)");
+        let o = s.engine.identify_within("someone").unwrap();
+        assert!(o.user.is_none());
+        assert_eq!(o.reason, "face disabled (fingerprint mode)");
+        // Back in Auto, identify needs a real capture.
+        std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+        let err = s.engine.identify().unwrap_err();
+        assert!(err.to_string().contains("no camera found"), "{err}");
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn enroll_profile_pre_camera_guards() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("enroll");
+        // Duplicate explicit profile name fails BEFORE the camera opens.
+        let mut e = Enrollment::new("irlume-test-enroll");
+        e.profiles.push(FaceProfile {
+            name: "Work Laptop".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+        });
+        write_enrollment(&dir, &e);
+        let err = s
+            .engine
+            .enroll_profile("irlume-test-enroll", Some("Work Laptop".into()), 3)
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        // A novel name proceeds to the probe capture, which needs the camera.
+        let err = s
+            .engine
+            .enroll_profile("irlume-test-enroll", Some("New Face".into()), 3)
+            .unwrap_err();
+        assert!(err.to_string().contains("no camera found"), "{err}");
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn add_scan_pre_camera_guards() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("addscan");
+        // Unknown user.
+        let err = s.engine.add_scan("irlume-test-ghost", "P1").unwrap_err();
+        assert!(err.to_string().contains("is not enrolled"), "{err}");
+        // Known user, unknown profile.
+        let mut e = Enrollment::new("irlume-test-add");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+        });
+        write_enrollment(&dir, &e);
+        let err = s.engine.add_scan("irlume-test-add", "nope").unwrap_err();
+        assert!(err.to_string().contains("no face profile 'nope'"), "{err}");
+        // Full profile: refused before any capture.
+        let mut e = Enrollment::new("irlume-test-full");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: (0..irlume_core::storage::MAX_SCANS_PER_PROFILE)
+                .map(|i| scan512(i, false, None))
+                .collect(),
+            ir_calib: None,
+        });
+        write_enrollment(&dir, &e);
+        let err = s.engine.add_scan("irlume-test-full", "P1").unwrap_err();
+        assert!(err.to_string().contains("already has the max"), "{err}");
+        // Room in the profile: proceeds to the capture boundary.
+        let err = s.engine.add_scan("irlume-test-add", "P1").unwrap_err();
+        assert!(err.to_string().contains("no camera found"), "{err}");
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn challenge_gate_only_arms_when_grant_flag_and_hardware_align() {
+        let _g = env_guard();
+        let mut s = shared();
+        let enr_flag = |flag: bool| {
+            let mut e = Enrollment::new("u");
+            e.require_challenge = flag;
+            e
+        };
+        let grant = || Outcome {
+            granted: true,
+            live: true,
+            score: 0.9,
+            reason: "match: p (rgb)".into(),
+        };
+        // A denial is never escalated into a challenge.
+        let denied = Outcome {
+            granted: false,
+            live: false,
+            score: 0.0,
+            reason: "below threshold (ir)".into(),
+        };
+        let o = s
+            .engine
+            .challenge_if_required(&enr_flag(true), denied)
+            .unwrap();
+        assert!(!o.granted);
+        // Grant without the opt-in flag: passes through untouched.
+        let o = s
+            .engine
+            .challenge_if_required(&enr_flag(false), grant())
+            .unwrap();
+        assert!(o.granted);
+        // Flag on but no IR hardware (convenience tier): the blink challenge
+        // cannot run; the grant stands.
+        assert!(!s.engine.ir_available);
+        let o = s
+            .engine
+            .challenge_if_required(&enr_flag(true), grant())
+            .unwrap();
+        assert!(o.granted);
+        // Flag on + IR + no mesh model deployed: logged skip, grant stands.
+        s.engine.ir_available = true;
+        let mesh = s.engine.mesh.take();
+        let o = s
+            .engine
+            .challenge_if_required(&enr_flag(true), grant())
+            .unwrap();
+        assert!(o.granted);
+        // Flag on + IR + mesh loaded: the passive-liveness capture actually
+        // runs, and fails hard without a camera (a grant is never released on
+        // an unverifiable challenge).
+        s.engine.mesh = mesh;
+        let err = s
+            .engine
+            .challenge_if_required(&enr_flag(true), grant())
+            .unwrap_err();
+        assert!(err.to_string().contains("no camera found"), "{err}");
+        s.engine.ir_available = false; // restore the shared baseline
+    }
+
+    #[test]
+    fn passive_liveness_without_mesh_reports_no_eyes() {
+        let _g = env_guard();
+        let mut s = shared();
+        let mesh = s.engine.mesh.take();
+        let r = s.engine.run_passive_liveness().unwrap();
+        assert_eq!(r, irlume_liveness::BlinkResult::NoEyes);
+        s.engine.mesh = mesh;
+    }
+
+    #[test]
+    fn rescue_detect_declines_faceless_frames_and_missing_models() {
+        let _g = env_guard();
+        let mut s = shared();
+        let (w, h) = (64u32, 64u32);
+        let flat = vec![127u8; (w * h * 3) as usize];
+        let view = align::RgbView {
+            data: &flat,
+            width: w,
+            height: h,
+        };
+        // Both rescue models loaded, but no face in the frame.
+        assert!(s.engine.has_blaze_rescue() && s.engine.has_mesh());
+        assert!(s.engine.rescue_detect(&view, "test").is_none());
+        // With BlazeFace missing the cascade stage is simply absent.
+        let blaze = s.engine.blaze.take();
+        assert!(s.engine.rescue_detect(&view, "test").is_none());
+        s.engine.blaze = blaze;
+        // Same when only the mesh refiner is missing.
+        let mesh = s.engine.mesh.take();
+        assert!(s.engine.rescue_detect(&view, "test").is_none());
+        s.engine.mesh = mesh;
+    }
+
+    #[test]
+    fn selftests_and_position_sample_need_a_camera() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("selftest");
+        for msg in [
+            s.engine.liveness_selftest().unwrap_err().to_string(),
+            s.engine.alignment_selftest().unwrap_err().to_string(),
+            s.engine.position_sample(None).unwrap_err().to_string(),
+            // The user-scoped variant first consults that user's pitch neutral.
+            s.engine
+                .position_sample(Some("irlume-test-ghost"))
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(msg.contains("no camera found"), "{msg}");
+        }
+        teardown_sandbox(&dir);
     }
 }

@@ -553,3 +553,143 @@ fn render_markdown(r: &metrics::PadReport, input: &str, paths: &[String]) -> Str
     o.push_str("> evaluation. See `docs/PAD_SELFTEST.md` for protocol, PAI species, and limits.\n");
     o
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use irlume_liveness::{DEPTH_MIN_RATIO, IR_FACE_MIN_BRIGHTNESS, MIN_FACE_SCORE};
+
+    /// Signals that pass every cue the attribution helper looks at.
+    fn passing_signals() -> Signals {
+        Signals {
+            ir_face: Some(FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: MIN_FACE_SCORE + 0.2,
+            }),
+            ir_face_brightness: IR_FACE_MIN_BRIGHTNESS + 20.0,
+            ir_center_edge_ratio: DEPTH_MIN_RATIO + 0.2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn verdict_str_names_every_verdict() {
+        assert_eq!(verdict_str(Verdict::Live), "Live");
+        assert_eq!(verdict_str(Verdict::Spoof), "Spoof");
+        assert_eq!(verdict_str(Verdict::Uncertain), "Uncertain");
+    }
+
+    // caught_cue replicates the gate's short-circuit order; if the gate's cue
+    // order changes, this attribution must change with it.
+    #[test]
+    fn caught_cue_full_path_attributes_in_gate_order() {
+        let mut s = passing_signals();
+        assert_eq!(caught_cue(Path::Full, &s), None);
+
+        s.ir_center_edge_ratio = DEPTH_MIN_RATIO - 0.1;
+        assert_eq!(caught_cue(Path::Full, &s), Some("depth"));
+
+        // Reflectance failure outranks the depth failure.
+        s.ir_face_brightness = IR_FACE_MIN_BRIGHTNESS - 1.0;
+        assert_eq!(caught_cue(Path::Full, &s), Some("ir_reflectance"));
+
+        // Presence outranks everything: no IR face, or one below MIN_FACE_SCORE.
+        let mut weak = passing_signals();
+        weak.ir_face.as_mut().unwrap().score = MIN_FACE_SCORE - 0.1;
+        assert_eq!(caught_cue(Path::Full, &weak), Some("face_in_ir"));
+        let mut absent = passing_signals();
+        absent.ir_face = None;
+        assert_eq!(caught_cue(Path::Full, &absent), Some("face_in_ir"));
+    }
+
+    #[test]
+    fn caught_cue_ir_only_path_skips_the_presence_cue() {
+        // The IR-only gate assumes presence (it just matched the face); its
+        // first hard cue is reflectance, even with no ir_face in the signals.
+        let mut s = passing_signals();
+        s.ir_face = None;
+        s.ir_face_brightness = IR_FACE_MIN_BRIGHTNESS - 1.0;
+        assert_eq!(caught_cue(Path::IrOnly, &s), Some("ir_reflectance"));
+
+        let mut s = passing_signals();
+        s.ir_center_edge_ratio = DEPTH_MIN_RATIO - 0.1;
+        assert_eq!(caught_cue(Path::IrOnly, &s), Some("depth"));
+        assert_eq!(caught_cue(Path::IrOnly, &passing_signals()), None);
+    }
+
+    #[test]
+    fn pct_formats_rates_and_maps_nan_to_na() {
+        assert_eq!(pct(f64::NAN), "  n/a");
+        assert_eq!(pct(0.0), "  0.0%");
+        assert_eq!(pct(0.25), " 25.0%");
+        assert_eq!(pct(1.0), "100.0%");
+    }
+
+    fn attack(species: &str, outcome: metrics::Outcome, caught: &[&str]) -> metrics::Trial {
+        metrics::Trial {
+            species: species.into(),
+            label: metrics::Label::Attack,
+            outcome,
+            caught: caught.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn bonafide(outcome: metrics::Outcome) -> metrics::Trial {
+        metrics::Trial {
+            species: "bonafide".into(),
+            label: metrics::Label::BonaFide,
+            outcome,
+            caught: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn renderers_carry_the_iso_numbers_and_cue_attribution() {
+        use metrics::Outcome::{Accepted, Rejected};
+        let trials = vec![
+            attack("print_glossy", Rejected, &["depth"]),
+            attack("print_glossy", Rejected, &["depth"]),
+            attack("print_glossy", Accepted, &[]),
+            bonafide(Accepted),
+            bonafide(Accepted),
+            bonafide(Accepted),
+            bonafide(Rejected),
+        ];
+        let r = metrics::analyze(&trials);
+
+        let h = render_human(&r, "pad.jsonl", &["full".to_string()]);
+        assert!(h.contains("gate path(s): full"), "{h}");
+        assert!(h.contains("attack presentations: 3"), "{h}");
+        assert!(h.contains("bona-fide: 4"), "{h}");
+        assert!(h.contains("print_glossy"), "{h}");
+        assert!(h.contains("33.3%"), "APCER 1 accepted of 3: {h}");
+        assert!(h.contains("depth:2"), "cue attribution: {h}");
+        assert!(h.contains("WORST-CASE APCER: print_glossy"), "{h}");
+        assert!(h.contains("25.0%"), "BPCER 1 of 4: {h}");
+        assert!(h.contains("29.2%"), "ACER = (33.3 + 25.0)/2: {h}");
+        assert!(
+            h.contains("upper CI"),
+            "the report must warn against reading 0% literally: {h}"
+        );
+
+        let m = render_markdown(&r, "pad.jsonl", &["full".to_string()]);
+        assert!(m.contains("| print_glossy | 3 | 33.3% |"), "{m}");
+        assert!(
+            m.contains("**Worst-case APCER:** **print_glossy @ 33.3%**"),
+            "{m}"
+        );
+        assert!(m.contains("**BPCER:** 25.0%"), "{m}");
+        assert!(m.contains("not a lab-accredited"), "{m}");
+    }
+
+    #[test]
+    fn render_human_flags_a_missing_bonafide_baseline() {
+        let trials = vec![attack("cutout", metrics::Outcome::Rejected, &["depth"])];
+        let r = metrics::analyze(&trials);
+        let h = render_human(&r, "pad.jsonl", &[]);
+        assert!(h.contains("gate path(s): unknown"), "{h}");
+        assert!(h.contains("no bona-fide presentations captured"), "{h}");
+        assert!(h.contains("n/a"), "BPCER with n=0 renders n/a: {h}");
+    }
+}

@@ -15,3 +15,6 @@ irlume-camera.workspace = true
 irlume-vision.workspace = true
 irlume-liveness.workspace = true
 irlume-core.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

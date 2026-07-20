@@ -40,3 +40,71 @@ pub fn lock_slice(buf: &[u8]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_and_unaligned_slices_are_handled() {
+        // Empty input is the documented no-op.
+        lock_slice(&[]);
+        // A deliberately unaligned start (offset 1 into a multi-page buffer):
+        // the alignment math must cover it without touching the contents.
+        let buf = vec![7u8; 3 * 4096];
+        lock_slice(&buf[1..2 * 4096 + 1]);
+        assert!(
+            buf.iter().all(|&b| b == 7),
+            "locking must not alter the secret"
+        );
+    }
+
+    // lock_slice is best-effort by contract: when RLIMIT_MEMLOCK forbids the
+    // lock it must WARN and return (auth still works), never abort. mlock
+    // cannot be made to fail in-process without breaking sibling tests, so
+    // re-exec this test with the limit dropped to zero in the child.
+    #[test]
+    fn mlock_refusal_warns_and_continues() {
+        if std::env::var("IRLUME_TEST_MEMLOCK_CHILD").is_ok() {
+            lock_slice(&vec![0x5a_u8; 4096]);
+            println!("survived-without-mlock");
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "memlock::tests::mlock_refusal_warns_and_continues",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("IRLUME_TEST_MEMLOCK_CHILD", "1");
+        // SAFETY: setrlimit is async-signal-safe; nothing else runs between
+        // fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                let zero = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_MEMLOCK, &zero) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "a refused mlock must not fail the caller; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("survived-without-mlock"));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("mlock failed"),
+            "the refusal must be reported (raise RLIMIT_MEMLOCK hint); stderr: {err}"
+        );
+    }
+}

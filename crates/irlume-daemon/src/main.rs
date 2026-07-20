@@ -381,24 +381,47 @@ fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Resu
     // threaded daemon (and thus ALL logins) forever.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    match read_request(&stream)? {
+        ReadOutcome::Closed => Ok(()),
+        ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
+        ReadOutcome::Req(req) => {
+            let resp = dispatch(req, &peer, engine);
+            respond(stream, &resp)
+        }
+    }
+}
+
+/// One parsed request line off the wire (see [`read_request`]).
+#[cfg_attr(test, derive(Debug))] // tests unwrap_err() around it; not needed at runtime
+enum ReadOutcome {
+    /// Peer closed without sending a line.
+    Closed,
+    /// The line did not parse; the caller answers a generic "bad request"
+    /// (never echoing the peer's raw bytes / parser internals back).
+    Bad,
+    Req(Request),
+}
+
+/// Read one request line (bounded by [`MAX_REQUEST_BYTES`]) and parse it.
+/// Extracted verbatim from [`handle`] (test seam: exercised over a socketpair
+/// without an [`irlume_auth::Engine`]); behavior unchanged.
+fn read_request(stream: &UnixStream) -> std::io::Result<ReadOutcome> {
     let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST_BYTES);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
-        return Ok(());
+        return Ok(ReadOutcome::Closed);
     }
     let req: Request = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
-        // Don't echo the peer's raw bytes / parser internals back to them.
         Err(_) => {
             line.zeroize();
-            return respond(stream, &Response::Error("bad request".into()));
+            return Ok(ReadOutcome::Bad);
         }
     };
     // The line may hold a plaintext secret (SealPassword/RecoverySetup); wipe it
     // now that it's parsed into the zeroizing SecretBytes.
     line.zeroize();
-    let resp = dispatch(req, &peer, engine);
-    respond(stream, &resp)
+    Ok(ReadOutcome::Req(req))
 }
 
 /// A username is interpolated into `<user>.json` paths (enrollment, sealed key,
@@ -1536,5 +1559,413 @@ mod tests {
             deny_reason("'ghost' is not enrolled"),
             "'ghost' is not enrolled"
         );
+    }
+
+    /// Tests that mutate process env vars serialize here (setenv/getenv are
+    /// process-global and the harness runs tests concurrently).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn deny_score_is_quantized_to_one_decimal_without_tracing() {
+        // IRLUME_LOG is unset in the test env, so the anti-oracle quantization
+        // applies: one decimal, ~-prefixed, never the 4-decimal exact score.
+        assert_eq!(deny_score(0.4321), "~0.4");
+        assert_eq!(deny_score(0.06), "~0.1"); // rounds, still one decimal
+        assert_eq!(deny_score(0.0), "~0.0");
+    }
+
+    #[test]
+    fn valid_username_rejects_traversal_and_junk() {
+        // Accepted: ordinary local, NSS, and samba-machine account shapes.
+        for ok in ["alice", "u", "user_1", "web-svc", "a.b-c", "host$", "x1.y2"] {
+            assert!(valid_username(ok), "{ok:?} must be accepted");
+        }
+        // Rejected: empty, oversized, leading '-'/'.', separators, traversal.
+        let long = "a".repeat(65);
+        for bad in [
+            "",
+            long.as_str(),
+            "-flag",
+            ".hidden",
+            "..",
+            "../root",
+            "a/b",
+            "a b",
+            "tab\tname",
+            "new\nline",
+            "nul\0byte",
+            "café",
+            "semi;colon",
+        ] {
+            assert!(!valid_username(bad), "{bad:?} must be rejected");
+        }
+        // Boundary: exactly 64 bytes is still legal.
+        assert!(valid_username(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn request_user_extracts_the_user_from_every_user_bearing_variant() {
+        use irlume_common::SecretBytes;
+        let u = || "carol".to_string();
+        let secret = || SecretBytes::new(b"pw".to_vec());
+        let carrying: Vec<Request> = vec![
+            Request::Authenticate {
+                user: u(),
+                service: Some("sudo".into()),
+            },
+            Request::Enroll {
+                user: u(),
+                profile: None,
+                scans: None,
+                reset: false,
+            },
+            Request::ListProfiles { user: u() },
+            Request::DeleteProfile {
+                user: u(),
+                profile: "p".into(),
+            },
+            Request::DeleteScan {
+                user: u(),
+                profile: "p".into(),
+                scan: "s".into(),
+            },
+            Request::RenameProfile {
+                user: u(),
+                profile: "p".into(),
+                new_name: "q".into(),
+            },
+            Request::RenameScan {
+                user: u(),
+                profile: "p".into(),
+                scan: "s".into(),
+                new_name: "t".into(),
+            },
+            Request::AddScan {
+                user: u(),
+                profile: "p".into(),
+            },
+            Request::SetRequireEyesOpen {
+                user: u(),
+                on: true,
+            },
+            Request::SetRequireChallenge {
+                user: u(),
+                on: false,
+            },
+            Request::SealPassword {
+                user: u(),
+                password: secret(),
+            },
+            Request::UnsealPassword {
+                user: u(),
+                service: None,
+            },
+            Request::UnsealKeyring {
+                user: u(),
+                service: None,
+            },
+            Request::HasSealedPassword { user: u() },
+            Request::KeyringInfo { user: u() },
+            Request::ForgetPassword { user: u() },
+            Request::ResealPassword {
+                user: u(),
+                password: secret(),
+            },
+            Request::RecoveryStatus { user: u() },
+            Request::RecoverySetup {
+                user: u(),
+                passphrase: secret(),
+            },
+            Request::RecoveryRestore {
+                user: u(),
+                passphrase: secret(),
+            },
+            Request::RecoveryForget { user: u() },
+            Request::PositionSample { user: Some(u()) },
+        ];
+        for req in &carrying {
+            assert_eq!(
+                request_user(req),
+                Some("carol"),
+                "variant must expose its user for the traversal guard: {req:?}"
+            );
+        }
+        // Variants with no user field must not invent one.
+        let userless: Vec<Request> = vec![
+            Request::Ping,
+            Request::Health,
+            Request::Identify,
+            Request::SetCameras {
+                rgb: "/dev/video0".into(),
+                ir: "/dev/video2".into(),
+            },
+            Request::SetupIrEmitter { dry_run: true },
+            Request::SelfTest {
+                kind: irlume_common::SelfTestKind::Liveness,
+            },
+            Request::PositionSample { user: None },
+        ];
+        for req in &userless {
+            assert_eq!(request_user(req), None, "no user in {req:?}");
+        }
+    }
+
+    #[test]
+    fn peer_cred_reports_our_own_identity_on_a_socketpair() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let peer = peer_cred(&a).unwrap();
+        assert_eq!(peer.uid, unsafe { libc::geteuid() });
+        assert_eq!(peer.gid, unsafe { libc::getegid() });
+        assert_eq!(peer.pid, std::process::id() as i32);
+    }
+
+    #[test]
+    fn read_request_parses_one_line_and_rejects_garbage() {
+        // A valid newline-terminated request.
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        (&theirs).write_all(b"\"Ping\"\n").unwrap();
+        match read_request(&ours).unwrap() {
+            ReadOutcome::Req(Request::Ping) => {}
+            _ => panic!("a Ping line must parse to Request::Ping"),
+        }
+        // Unparsable bytes -> Bad (generic error, never an echo).
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        (&theirs).write_all(b"{not json}\n").unwrap();
+        assert!(matches!(read_request(&ours).unwrap(), ReadOutcome::Bad));
+        // Peer closing without a byte -> Closed.
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        assert!(matches!(read_request(&ours).unwrap(), ReadOutcome::Closed));
+    }
+
+    #[test]
+    fn read_request_caps_an_oversized_payload_at_max_request_bytes() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        // 128 KiB with no newline: a slow-loris / memory-DoS shape. The writer
+        // runs on its own thread in case the kernel buffers fill up.
+        let writer = std::thread::spawn(move || {
+            let payload = vec![b'a'; 2 * MAX_REQUEST_BYTES as usize];
+            let _ = (&theirs).write_all(&payload);
+            let _ = (&theirs).write_all(b"\n\"Ping\"\n");
+        });
+        // The reader must stop at the 64 KiB cap and answer Bad; it must not
+        // buffer the whole flood or hang waiting for the newline.
+        assert!(matches!(read_request(&ours).unwrap(), ReadOutcome::Bad));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn read_request_honours_the_read_deadline_against_a_silent_peer() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        // Same mechanism handle() arms (shorter here to keep the test quick).
+        ours.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        let t = std::time::Instant::now();
+        let err = read_request(&ours).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "a silent peer must trip the deadline, got {err:?}"
+        );
+        assert!(t.elapsed() >= std::time::Duration::from_millis(250));
+        drop(theirs);
+    }
+
+    #[test]
+    fn respond_writes_one_newline_terminated_json_line() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        respond(ours, &Response::Pong).unwrap();
+        let mut line = String::new();
+        BufReader::new(&theirs).read_line(&mut line).unwrap();
+        assert!(line.ends_with('\n'));
+        assert!(matches!(
+            serde_json::from_str::<Response>(line.trim()).unwrap(),
+            Response::Pong
+        ));
+        // A secret-carrying response survives the wire intact (the zeroize of
+        // the serialization buffer must not corrupt what was already sent).
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        respond(
+            ours,
+            &Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(b"hunter2".to_vec()),
+            },
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(&theirs).read_line(&mut line).unwrap();
+        match serde_json::from_str::<Response>(line.trim()).unwrap() {
+            Response::PasswordUnsealed { secret } => {
+                assert_eq!(secret.expose(), b"hunter2")
+            }
+            other => panic!("expected PasswordUnsealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_or_prefers_the_env_var_over_the_default() {
+        let _g = env_lock();
+        std::env::remove_var("IRLUME_TEST_ENV_OR");
+        assert_eq!(
+            env_or("IRLUME_TEST_ENV_OR", "/etc/fallback"),
+            "/etc/fallback"
+        );
+        std::env::set_var("IRLUME_TEST_ENV_OR", "/tmp/override");
+        assert_eq!(
+            env_or("IRLUME_TEST_ENV_OR", "/etc/fallback"),
+            "/tmp/override"
+        );
+        std::env::remove_var("IRLUME_TEST_ENV_OR");
+    }
+
+    #[test]
+    fn biopolicy_enforced_reads_env_then_settings_conf() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-biopol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+
+        // Default: no env, no settings.conf -> off.
+        assert!(!biopolicy_enforced());
+        // settings.conf truthy value turns it on; a falsy one keeps it off.
+        std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=1\n").unwrap();
+        assert!(biopolicy_enforced());
+        std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=0\n").unwrap();
+        assert!(!biopolicy_enforced());
+        // The env var wins over the file, in both directions.
+        std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=1\n").unwrap();
+        std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "0");
+        assert!(!biopolicy_enforced());
+        std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=0\n").unwrap();
+        for truthy in ["1", "true", "yes", "on", " on "] {
+            std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", truthy);
+            assert!(biopolicy_enforced(), "{truthy:?} must enable");
+        }
+        std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_models_without_strict_warns_but_continues() {
+        // No IRLUME_MODELS_STRICT in the test env: an unknown digest and a
+        // missing file must both come back (reaching the next line at all is
+        // the contract; strict mode would have exited the process).
+        let dir = std::env::temp_dir().join(format!("irlume-vm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unknown = dir.join("custom_adapter.onnx");
+        std::fs::write(&unknown, b"self-trained weights").unwrap();
+        verify_models(&[
+            unknown.to_str().unwrap(),
+            "/nonexistent/irlume-test/missing.onnx",
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Companion to the missing-model child test: strict mode must also refuse
+    // a PRESENT model whose digest is not in the release manifest (tampering),
+    // and must ACCEPT a shipped model that matches it. verify_models exits the
+    // process, so both run as re-exec'd children.
+    #[test]
+    fn strict_verify_refuses_a_tampered_model_and_accepts_a_shipped_one() {
+        if let Ok(path) = std::env::var("IRLUME_TEST_VERIFY_TAMPER_CHILD") {
+            verify_models(&[&path]); // must exit(1) before the return
+            return;
+        }
+        if let Ok(path) = std::env::var("IRLUME_TEST_VERIFY_KNOWN_CHILD") {
+            verify_models(&[&path]); // digest is in the manifest: must survive
+            println!("known-model-accepted");
+            std::process::exit(0);
+        }
+        let exe = std::env::current_exe().unwrap();
+        let run = |var: &str, path: &str| {
+            std::process::Command::new(&exe)
+                .args([
+                    "tests::strict_verify_refuses_a_tampered_model_and_accepts_a_shipped_one",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(var, path)
+                .env("IRLUME_MODELS_STRICT", "1")
+                .output()
+                .unwrap()
+        };
+        // Tampered: on-disk bytes whose sha256 is not in models/SHA256SUMS.
+        let dir = std::env::temp_dir().join(format!("irlume-vm-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tampered = dir.join("face.onnx");
+        std::fs::write(&tampered, b"swapped weights").unwrap();
+        let out = run(
+            "IRLUME_TEST_VERIFY_TAMPER_CHILD",
+            tampered.to_str().unwrap(),
+        );
+        assert!(
+            !out.status.success(),
+            "strict mode must refuse an unmanifested model"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("refusing to start with unverified models"),
+            "stderr: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Shipped: a real release model from the repo matches its manifest
+        // digest and must start even under strict.
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/blaze_face_short_range.onnx");
+        if !shipped.exists() {
+            eprintln!("skipping known-model half: repo models/ not present");
+            return;
+        }
+        let out = run("IRLUME_TEST_VERIFY_KNOWN_CHILD", shipped.to_str().unwrap());
+        assert!(
+            out.status.success(),
+            "strict mode must accept a manifest-matching model; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("known-model-accepted"));
+    }
+
+    #[test]
+    fn mutate_enrollment_reports_a_missing_enrollment() {
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-mut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let resp = mutate_enrollment("ghost", |_| Ok("never runs".into()));
+        match resp {
+            Response::Error(msg) => assert_eq!(msg, "'ghost' is not enrolled"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_mode_applies_the_requested_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("sock-standin");
+        std::fs::write(&f, b"").unwrap();
+        set_mode(f.to_str().unwrap(), 0o660);
+        let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+        // Best-effort on a missing path: must not panic.
+        set_mode("/nonexistent/irlume-test/sock", 0o666);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

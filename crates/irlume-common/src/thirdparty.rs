@@ -166,6 +166,35 @@ mod tests {
     }
 
     #[test]
+    fn state_dir_env_override_moves_the_weights_dir() {
+        let _g = crate::testenv::lock();
+        std::env::remove_var("IRLUME_STATE_DIR");
+        assert_eq!(
+            dir(),
+            Path::new("/var/lib/irlume").join("models-thirdparty"),
+            "default weights dir must live under the system state dir"
+        );
+        let tmp = std::env::temp_dir().join(format!("irlume-tpdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &tmp);
+        assert_eq!(dir(), tmp.join(SUBDIR));
+
+        let m = by_name("flir").unwrap();
+        assert_eq!(model_path(m), tmp.join(SUBDIR).join("flir.onnx"));
+        // Nothing fetched into the sandbox dir yet: Absent through the
+        // state-dir-resolving wrapper too, not just weight_state_at.
+        assert_eq!(weight_state(m), WeightState::Absent);
+        // A fetched file that does not match the catalog pin is tampering.
+        std::fs::create_dir_all(dir()).unwrap();
+        std::fs::write(model_path(m), b"not the pinned weights").unwrap();
+        assert_eq!(weight_state(m), WeightState::ChecksumMismatch);
+
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn weight_state_reports_present_matching_and_tampered() {
         let tmp = std::env::temp_dir().join(format!("irlume-ws-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);

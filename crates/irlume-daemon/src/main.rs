@@ -1968,4 +1968,1560 @@ mod tests {
         set_mode("/nonexistent/irlume-test/sock", 0o666);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- engine-loaded dispatch arms ------------------------------------
+    //
+    // These drive dispatch() with a REAL irlume_auth::Engine (the same model
+    // files the daemon loads in production) and a constructed Peer. The
+    // engine's camera devices are nonexistent paths, so every ungated test
+    // below either refuses before any capture or fails the capture cleanly;
+    // nothing touches real hardware, /var/lib, or a real TPM. Tests that need
+    // fake hardware are env-gated: `loopback_` (v4l2loopback feeder nodes) and
+    // `tpm_` (swtpm via IRLUME_TCTI).
+
+    use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
+    use std::sync::{MutexGuard, OnceLock};
+
+    const NO_RGB: &str = "/dev/irlume-daemon-test-none-rgb";
+    const NO_IR: &str = "/dev/irlume-daemon-test-none-ir";
+    /// A uid outside any account database (same sentinel the identify-scope
+    /// test uses): authorized_for() is false for every user.
+    const NOBODY: u32 = 0xfffe_fffe;
+
+    fn peer(uid: u32) -> Peer {
+        Peer {
+            uid,
+            gid: uid,
+            pid: 1,
+        }
+    }
+
+    fn model_path(name: &str) -> String {
+        format!("{}/../../models/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Point `ort` (load-dynamic) at the packaged onnxruntime when the test
+    /// env doesn't already provide `ORT_DYLIB_PATH`. Same fallbacks as
+    /// irlume-auth's engine tests.
+    fn ort_init() {
+        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+            return;
+        }
+        for cand in [
+            "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+            "/usr/lib64/libonnxruntime.so",
+            "/usr/lib/libonnxruntime.so",
+            "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
+        ] {
+            if std::path::Path::new(cand).exists() {
+                std::env::set_var("ORT_DYLIB_PATH", cand);
+                return;
+            }
+        }
+    }
+
+    /// Process-wide shared engine, loaded once (glintr100 is big). LOCK ORDER:
+    /// every test takes env_lock() FIRST, then engine(); the initializer only
+    /// touches env vars no other daemon test reads (IRLUME_FORCE_NO_IR,
+    /// ORT_DYLIB_PATH), both left set for the whole process, so every
+    /// engine-backed test sees the same deterministic convenience (RGB-only)
+    /// hardware probe on any machine.
+    fn engine() -> MutexGuard<'static, irlume_auth::Engine> {
+        static E: OnceLock<std::sync::Mutex<irlume_auth::Engine>> = OnceLock::new();
+        E.get_or_init(|| {
+            ort_init();
+            std::env::set_var("IRLUME_FORCE_NO_IR", "1");
+            std::sync::Mutex::new(
+                irlume_auth::Engine::load(
+                    &model_path("face_detection_yunet_2023mar.onnx"),
+                    &model_path("glintr100.onnx"),
+                )
+                .expect("engine load")
+                .with_devices(NO_RGB, NO_IR),
+            )
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Isolated state/config/keyring/template-key/recovery dirs plus a method
+    /// conf pointing at a missing file (=> method Auto). Redirects every path
+    /// the dispatch arms touch, so no test can read or write this machine's
+    /// real /etc/irlume or /var/lib state. Caller must hold env_lock(); the
+    /// guard must be declared BEFORE the sandbox so Drop runs under it.
+    struct Sandbox {
+        dir: std::path::PathBuf,
+    }
+
+    fn sandbox(tag: &str) -> Sandbox {
+        let dir = std::env::temp_dir().join(format!("irlume-daemon-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_CONFIG_DIR", dir.join("config"));
+        std::env::set_var("IRLUME_KEYRING_DIR", dir.join("keyring"));
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", dir.join("template-keys"));
+        std::env::set_var("IRLUME_RECOVERY_DIR", dir.join("recovery"));
+        std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+        Sandbox { dir }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            for var in [
+                "IRLUME_STATE_DIR",
+                "IRLUME_CONFIG_DIR",
+                "IRLUME_KEYRING_DIR",
+                "IRLUME_TEMPLATE_KEY_DIR",
+                "IRLUME_RECOVERY_DIR",
+                "IRLUME_METHOD_CONF",
+            ] {
+                std::env::remove_var(var);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Write a PLAINTEXT enrollment (what a no-TPM host stores) straight into
+    /// the sandbox state dir; never through storage::save, which would seal a
+    /// template key against this machine's real TPM.
+    fn write_enrollment(dir: &std::path::Path, e: &Enrollment) {
+        std::fs::write(
+            dir.join(format!("{}.json", e.user)),
+            serde_json::to_vec(e).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn unit512(seed: usize) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..512)
+            .map(|j| (j as f32 * 0.7).sin() + 0.05 * (seed as f32 * 1.3 + j as f32).sin())
+            .collect();
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt() + 1e-9;
+        v.iter_mut().for_each(|x| *x /= n);
+        v
+    }
+
+    fn rgb_scan(name: &str, seed: usize) -> FaceScan {
+        FaceScan {
+            name: name.into(),
+            rgb: unit512(seed),
+            ir: None,
+            ir_space: None,
+            ir_depth: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        }
+    }
+
+    /// One-profile plaintext enrollment: "Face Profile 1" with the named scans.
+    fn enrollment_with(user: &str, scans: &[&str]) -> Enrollment {
+        Enrollment {
+            user: user.into(),
+            profiles: vec![FaceProfile {
+                name: "Face Profile 1".into(),
+                ir_calib: None,
+                scans: scans
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| rgb_scan(s, i + 1))
+                    .collect(),
+            }],
+            require_eyes_open: false,
+            require_challenge: false,
+            camera_binding: None,
+        }
+    }
+
+    /// Plant a bogus sealed-password envelope file. has_sealed_password() is a
+    /// pure existence check, so this drives the armed/unarmed branches without
+    /// a TPM; any arm that actually unseals it must then fail on the parse.
+    fn plant_fake_envelope(user: &str) {
+        let path = irlume_core::keyring::envelope_path(user);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a sealed envelope").unwrap();
+    }
+
+    #[test]
+    fn dispatch_rejects_an_invalid_username_before_any_arm() {
+        let _g = env_lock();
+        let mut e = engine();
+        for req in [
+            Request::ListProfiles {
+                user: "../root".into(),
+            },
+            Request::Authenticate {
+                user: "a/b".into(),
+                service: None,
+            },
+            Request::UnsealPassword {
+                user: "-flag".into(),
+                service: None,
+            },
+        ] {
+            match dispatch(req, &peer(0), &mut e) {
+                Response::Error(msg) => assert_eq!(msg, "invalid username"),
+                other => panic!("traversal username must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ping_answers_pong_through_dispatch() {
+        let _g = env_lock();
+        let mut e = engine();
+        assert!(matches!(
+            dispatch(Request::Ping, &peer(NOBODY), &mut e),
+            Response::Pong
+        ));
+    }
+
+    #[test]
+    fn health_reports_version_and_never_secure_under_forced_no_ir() {
+        let _g = env_lock();
+        let mut e = engine();
+        match dispatch(Request::Health, &peer(NOBODY), &mut e) {
+            Response::Health {
+                tier,
+                ir_dev,
+                mesh,
+                adapter,
+                version,
+                ..
+            } => {
+                // IRLUME_FORCE_NO_IR=1 (set by the shared engine init) forces
+                // ir_pair=false, so no IR node may be reported and the tier can
+                // never be "secure", whatever cameras this machine has.
+                assert_ne!(tier, "secure");
+                assert_eq!(ir_dev, None);
+                // The bare shared engine loaded no optional models.
+                assert!(!mesh && !adapter);
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("Health must answer Response::Health, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_requires_root_or_the_account_owner() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-authz");
+        let _ = &sb;
+        match dispatch(
+            Request::Authenticate {
+                user: "carol".into(),
+                service: None,
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to authenticate 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_stands_down_when_the_method_is_fingerprint() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-fp");
+        std::fs::write(sb.dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("method"));
+        match dispatch(
+            Request::Authenticate {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::AuthResult {
+                granted,
+                score,
+                live,
+                reason,
+            } => {
+                assert!(!granted && !live);
+                assert_eq!(score, 0.0);
+                assert_eq!(
+                    reason,
+                    "face auth disabled: the configured method is fingerprint"
+                );
+            }
+            other => panic!("fingerprint mode must deny via AuthResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_on_convenience_tier_is_limited_to_screen_unlock() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-conv");
+        let _ = &sb;
+        // (service, the OperationClass Debug name the deny reason must carry)
+        for (service, class) in [("sshd", "Remote"), ("sudo", "Elevation")] {
+            match dispatch(
+                Request::Authenticate {
+                    user: "carol".into(),
+                    service: Some(service.into()),
+                },
+                &peer(0),
+                &mut e,
+            ) {
+                Response::AuthResult {
+                    granted,
+                    live,
+                    reason,
+                    ..
+                } => {
+                    assert!(!granted && !live, "{service} must not grant");
+                    assert_eq!(
+                        reason,
+                        format!(
+                            "RGB-only convenience: face limited to screen unlock (not {class})"
+                        )
+                    );
+                }
+                other => panic!("convenience gate must deny {service}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn authenticate_refuses_an_unenrolled_user_before_the_camera() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-ghost");
+        let _ = &sb;
+        // "kde" classifies as ScreenUnlock, so the convenience gate passes and
+        // the engine itself answers; an unenrolled user is refused before any
+        // capture (the devices don't exist, so reaching the camera would error).
+        match dispatch(
+            Request::Authenticate {
+                user: "irlume-test-ghost".into(),
+                service: Some("kde".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::AuthResult {
+                granted,
+                live,
+                reason,
+                ..
+            } => {
+                assert!(!granted && !live);
+                assert_eq!(reason, "'irlume-test-ghost' is not enrolled");
+                // The reason must survive journal redaction unchanged (no
+                // numeric payload for a spoofer to tune against).
+                assert_eq!(deny_reason(&reason), reason);
+            }
+            other => panic!("unenrolled user must deny via AuthResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_surfaces_a_capture_error_for_an_enrolled_user() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("auth-cam");
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        match dispatch(
+            Request::Authenticate {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_answers_a_peer_without_an_account_and_needs_a_camera_for_root() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("identify");
+        let _ = &sb;
+        // A peer with no local account gets an empty identify, no capture at all.
+        match dispatch(Request::Identify, &peer(NOBODY), &mut e) {
+            Response::Identified {
+                user,
+                profile,
+                score,
+                live,
+                reason,
+            } => {
+                assert_eq!(user, None);
+                assert_eq!(profile, None);
+                assert_eq!(score, 0.0);
+                assert!(!live);
+                assert_eq!(reason, "caller has no local account");
+            }
+            other => panic!("no-account peer must get Identified, got {other:?}"),
+        }
+        // Root keeps the full 1:N search, which needs the (absent) camera.
+        match dispatch(Request::Identify, &peer(0), &mut e) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("root identify without a camera must Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_profiles_reports_the_enrollment_and_gates_on_authorization() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("list");
+        let mut enr = enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]);
+        enr.require_eyes_open = true;
+        write_enrollment(&sb.dir, &enr);
+        match dispatch(
+            Request::ListProfiles {
+                user: "carol".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Enrollment {
+                profiles,
+                require_eyes_open,
+                require_challenge,
+            } => {
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].name, "Face Profile 1");
+                assert_eq!(
+                    profiles[0].scans,
+                    vec!["Face Scan 1".to_string(), "Face Scan 2".to_string()]
+                );
+                assert!(require_eyes_open);
+                assert!(!require_challenge);
+            }
+            other => panic!("expected Response::Enrollment, got {other:?}"),
+        }
+        // An unenrolled user lists as empty rather than erroring.
+        match dispatch(
+            Request::ListProfiles {
+                user: "ghost".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Enrollment { profiles, .. } => assert!(profiles.is_empty()),
+            other => panic!("unenrolled user must list empty, got {other:?}"),
+        }
+        // A foreign peer may not even list.
+        match dispatch(
+            Request::ListProfiles {
+                user: "carol".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to list 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_mutations_error_precisely_without_rewriting_state() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("mut-err");
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]),
+        );
+        let root = peer(0);
+        // Every branch here errors BEFORE storage::save, so this runs on any
+        // host (TPM or not) without sealing anything.
+        let cases: Vec<(Request, &str)> = vec![
+            (
+                Request::DeleteProfile {
+                    user: "carol".into(),
+                    profile: "nope".into(),
+                },
+                "no face profile 'nope'",
+            ),
+            (
+                Request::DeleteScan {
+                    user: "carol".into(),
+                    profile: "nope".into(),
+                    scan: "Face Scan 1".into(),
+                },
+                "no face profile 'nope'",
+            ),
+            (
+                Request::RenameScan {
+                    user: "carol".into(),
+                    profile: "Face Profile 1".into(),
+                    scan: "Face Scan 1".into(),
+                    new_name: "Face Scan 2".into(),
+                },
+                "'Face Scan 2' already exists in 'Face Profile 1'",
+            ),
+            (
+                Request::RenameScan {
+                    user: "carol".into(),
+                    profile: "Face Profile 1".into(),
+                    scan: "missing".into(),
+                    new_name: "Front".into(),
+                },
+                "no scan 'missing' in 'Face Profile 1'",
+            ),
+            (
+                Request::DeleteProfile {
+                    user: "ghost".into(),
+                    profile: "Face Profile 1".into(),
+                },
+                "'ghost' is not enrolled",
+            ),
+        ];
+        for (req, want) in cases {
+            match dispatch(req, &root, &mut e) {
+                Response::Error(msg) => assert_eq!(msg, want),
+                other => panic!("expected Error({want}), got {other:?}"),
+            }
+        }
+        // Unauthorized peers are refused before the enrollment is even loaded.
+        match dispatch(
+            Request::DeleteProfile {
+                user: "carol".into(),
+                profile: "Face Profile 1".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to modify 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+        // The enrollment file is untouched by all of the above.
+        let enr = irlume_core::storage::load("carol").unwrap().unwrap();
+        assert_eq!(enr.profiles[0].scans.len(), 2);
+    }
+
+    #[test]
+    fn delete_scan_never_orphans_a_profile_and_deleting_the_last_profile_erases_the_file() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("del-last");
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        let root = peer(0);
+        // A profile must keep at least one scan (the deny path never saves).
+        match dispatch(
+            Request::DeleteScan {
+                user: "carol".into(),
+                profile: "Face Profile 1".into(),
+                scan: "Face Scan 1".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(
+                msg,
+                "a profile must keep at least one scan; delete the profile instead"
+            ),
+            other => panic!("last-scan delete must be refused, got {other:?}"),
+        }
+        // Deleting the only profile removes the whole enrollment file
+        // (storage::delete, not save: safe on a TPM host too).
+        match dispatch(
+            Request::DeleteProfile {
+                user: "carol".into(),
+                profile: "Face Profile 1".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert_eq!(msg, "deleted profile 'Face Profile 1'"),
+            other => panic!("sole-profile delete must succeed, got {other:?}"),
+        }
+        assert!(
+            !sb.dir.join("carol.json").exists(),
+            "an enrollment with zero profiles must not linger on disk"
+        );
+        match dispatch(
+            Request::DeleteProfile {
+                user: "carol".into(),
+                profile: "Face Profile 1".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "'carol' is not enrolled"),
+            other => panic!("second delete must report unenrolled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutations_that_rewrite_the_enrollment_roundtrip_through_dispatch() {
+        // These arms end in storage::save; on a host with /dev/tpm* that would
+        // seal a real template key, so this test only runs on no-TPM hosts
+        // (CI runners). Same convention as irlume-core's storage tests.
+        if irlume_core::template_key::tpm_available() {
+            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("mut-save");
+        let _ = &sb;
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]),
+        );
+        let root = peer(0);
+        let expect_ok = |resp: Response, want: &str| match resp {
+            Response::Ok(msg) => assert_eq!(msg, want),
+            other => panic!("expected Ok({want}), got {other:?}"),
+        };
+        expect_ok(
+            dispatch(
+                Request::DeleteScan {
+                    user: "carol".into(),
+                    profile: "Face Profile 1".into(),
+                    scan: "Face Scan 2".into(),
+                },
+                &root,
+                &mut e,
+            ),
+            "deleted scan 'Face Scan 2' from 'Face Profile 1'",
+        );
+        expect_ok(
+            dispatch(
+                Request::RenameScan {
+                    user: "carol".into(),
+                    profile: "Face Profile 1".into(),
+                    scan: "Face Scan 1".into(),
+                    new_name: "Front".into(),
+                },
+                &root,
+                &mut e,
+            ),
+            "renamed scan to 'Front'",
+        );
+        expect_ok(
+            dispatch(
+                Request::RenameProfile {
+                    user: "carol".into(),
+                    profile: "Face Profile 1".into(),
+                    new_name: "Work".into(),
+                },
+                &root,
+                &mut e,
+            ),
+            "renamed profile to 'Work'",
+        );
+        // Renaming onto an existing name collides (checked before the lookup,
+        // so even a self-rename is refused).
+        match dispatch(
+            Request::RenameProfile {
+                user: "carol".into(),
+                profile: "Work".into(),
+                new_name: "Work".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "'Work' already exists"),
+            other => panic!("rename collision must be refused, got {other:?}"),
+        }
+        expect_ok(
+            dispatch(
+                Request::SetRequireEyesOpen {
+                    user: "carol".into(),
+                    on: true,
+                },
+                &root,
+                &mut e,
+            ),
+            "require-eyes-open ENABLED",
+        );
+        expect_ok(
+            dispatch(
+                Request::SetRequireChallenge {
+                    user: "carol".into(),
+                    on: false,
+                },
+                &root,
+                &mut e,
+            ),
+            "require-challenge disabled",
+        );
+        // The saved state reflects every mutation.
+        match dispatch(
+            Request::ListProfiles {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Enrollment {
+                profiles,
+                require_eyes_open,
+                require_challenge,
+            } => {
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].name, "Work");
+                assert_eq!(profiles[0].scans, vec!["Front".to_string()]);
+                assert!(require_eyes_open);
+                assert!(!require_challenge);
+            }
+            other => panic!("expected Response::Enrollment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enroll_validates_authorization_and_duplicate_names_before_capture() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("enroll");
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        match dispatch(
+            Request::Enroll {
+                user: "carol".into(),
+                profile: None,
+                scans: None,
+                reset: false,
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to enroll 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+        // An explicit duplicate profile name fails fast, before the camera
+        // would open (the devices don't exist, so getting further would turn
+        // this into a hardware error instead).
+        match dispatch(
+            Request::Enroll {
+                user: "carol".into(),
+                profile: Some("Face Profile 1".into()),
+                scans: None,
+                reset: false,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert!(
+                    msg.contains("a face profile named 'Face Profile 1' already exists"),
+                    "{msg}"
+                );
+            }
+            other => panic!("duplicate profile name must be refused, got {other:?}"),
+        }
+        // Past validation, the capture itself fails cleanly on this hardware.
+        match dispatch(
+            Request::Enroll {
+                user: "carol".into(),
+                profile: Some("Second".into()),
+                scans: Some(1),
+                reset: false,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+        // reset:true wipes the old enrollment even though the capture then
+        // fails: the reset half of the arm ran.
+        match dispatch(
+            Request::Enroll {
+                user: "carol".into(),
+                profile: None,
+                scans: None,
+                reset: true,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+        assert!(
+            !sb.dir.join("carol.json").exists(),
+            "Enroll{{reset:true}} must delete the previous enrollment first"
+        );
+    }
+
+    #[test]
+    fn add_scan_refuses_unenrolled_users_and_full_profiles_before_capture() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("addscan");
+        match dispatch(
+            Request::AddScan {
+                user: "ghost".into(),
+                profile: "Face Profile 1".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("'ghost' is not enrolled"), "{msg}"),
+            other => panic!("unenrolled AddScan must Error, got {other:?}"),
+        }
+        // A profile at MAX_SCANS_PER_PROFILE is refused before any capture.
+        let max = irlume_core::storage::MAX_SCANS_PER_PROFILE;
+        let names: Vec<String> = (1..=max).map(|i| format!("Face Scan {i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        write_enrollment(&sb.dir, &enrollment_with("carol", &name_refs));
+        match dispatch(
+            Request::AddScan {
+                user: "carol".into(),
+                profile: "Face Profile 1".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(
+                msg.contains(&format!("already has the max {max} scans")),
+                "{msg}"
+            ),
+            other => panic!("full profile must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_password_gates_authorization_and_refuses_an_empty_secret() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("seal");
+        let _ = &sb;
+        match dispatch(
+            Request::SealPassword {
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to seal password for 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+        // The empty-password refusal fires before any TPM operation, so this
+        // is safe (and deterministic) on every host.
+        match dispatch(
+            Request::SealPassword {
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(Vec::new()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert!(msg.contains("refusing to seal an empty password"), "{msg}")
+            }
+            other => panic!("empty password must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unseal_password_arm_gates_peer_method_and_tier_before_the_face_check() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("unseal-gates");
+        // Only a root peer (the PAM stack) may even ask.
+        match dispatch(
+            Request::UnsealPassword {
+                user: "carol".into(),
+                service: None,
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("unseal_password requires root (peer uid {NOBODY})")
+                )
+            }
+            other => panic!("non-root unseal must be refused, got {other:?}"),
+        }
+        // Fingerprint mode refuses credential release outright.
+        std::fs::write(sb.dir.join("method"), "fingerprint").unwrap();
+        std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("method"));
+        match dispatch(
+            Request::UnsealPassword {
+                user: "carol".into(),
+                service: Some("plasmalogin".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    "face auth disabled: the configured method is fingerprint"
+                )
+            }
+            other => panic!("fingerprint mode must refuse unseal, got {other:?}"),
+        }
+        std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("no-method-conf"));
+        // The convenience (RGB-only) tier never releases the credential; this
+        // fires before the sealed-password lookup and the face check.
+        match dispatch(
+            Request::UnsealPassword {
+                user: "carol".into(),
+                service: Some("plasmalogin".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(
+                msg,
+                "RGB-only convenience: face cannot release the login credential"
+            ),
+            other => panic!("convenience tier must refuse unseal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_unseal_password_requires_an_armed_seal_then_a_granted_face() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("do-unseal");
+        // Nothing armed: refused before any capture or TPM traffic.
+        match do_unseal_password("carol", None, &mut e) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    "no sealed password for 'carol': run `irlume keyring arm`"
+                )
+            }
+            other => panic!("unarmed unseal must be refused, got {other:?}"),
+        }
+        // Armed (existence check only) but the user is not enrolled: the face
+        // check denies before the camera and the envelope is never opened.
+        plant_fake_envelope("carol");
+        match do_unseal_password("carol", None, &mut e) {
+            Response::Error(msg) => {
+                assert_eq!(msg, "face not granted: 'carol' is not enrolled")
+            }
+            other => panic!("unenrolled unseal must be refused, got {other:?}"),
+        }
+        // Enrolled: the capture itself fails on this hardware and maps to a
+        // clean Error (the non-drift branch: no remedy hint appended).
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        match do_unseal_password("carol", None, &mut e) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unseal_keyring_gates_peer_service_class_and_envelope_integrity() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("unseal-keyring");
+        let _ = &sb;
+        match dispatch(
+            Request::UnsealKeyring {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("unseal_keyring requires root (peer uid {NOBODY})")
+                )
+            }
+            other => panic!("non-root keyring unseal must be refused, got {other:?}"),
+        }
+        match dispatch(
+            Request::UnsealKeyring {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    "no sealed password for 'carol': run `irlume keyring arm`"
+                )
+            }
+            other => panic!("unarmed keyring unseal must be refused, got {other:?}"),
+        }
+        plant_fake_envelope("carol");
+        // Only a login / lock-screen service class may release; sudo may not.
+        match dispatch(
+            Request::UnsealKeyring {
+                user: "carol".into(),
+                service: Some("sudo".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "keyring unseal not allowed for Elevation"),
+            other => panic!("elevation keyring unseal must be refused, got {other:?}"),
+        }
+        // A corrupt envelope must surface as an Error, never a secret.
+        match dispatch(
+            Request::UnsealKeyring {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(!msg.is_empty()),
+            other => panic!("a corrupt envelope must Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_sealed_password_and_forget_roundtrip_through_dispatch() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("haspw");
+        let _ = &sb;
+        let root = peer(0);
+        match dispatch(
+            Request::HasSealedPassword {
+                user: "carol".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to query 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+        match dispatch(
+            Request::HasSealedPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::HasPassword(armed) => assert!(!armed),
+            other => panic!("expected HasPassword(false), got {other:?}"),
+        }
+        plant_fake_envelope("carol");
+        match dispatch(
+            Request::HasSealedPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::HasPassword(armed) => assert!(armed),
+            other => panic!("expected HasPassword(true), got {other:?}"),
+        }
+        match dispatch(
+            Request::ForgetPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::PasswordForgotten => {}
+            other => panic!("expected PasswordForgotten, got {other:?}"),
+        }
+        assert!(
+            !irlume_core::keyring::envelope_path("carol").exists(),
+            "ForgetPassword must remove the envelope file"
+        );
+    }
+
+    #[test]
+    fn keyring_info_reports_unarmed_and_unreadable_envelopes() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("krinfo");
+        let _ = &sb;
+        let root = peer(0);
+        match dispatch(
+            Request::KeyringInfo {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::KeyringInfo {
+                armed,
+                policy,
+                pcrs,
+                drifted,
+            } => {
+                assert!(!armed);
+                assert_eq!(policy, None);
+                assert!(pcrs.is_empty());
+                assert_eq!(drifted, None);
+            }
+            other => panic!("expected KeyringInfo, got {other:?}"),
+        }
+        // Armed but unreadable: report the armed bit alone, don't fail.
+        plant_fake_envelope("carol");
+        match dispatch(
+            Request::KeyringInfo {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::KeyringInfo { armed, policy, .. } => {
+                assert!(armed);
+                assert_eq!(policy, None);
+            }
+            other => panic!("expected KeyringInfo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reseal_password_reports_not_armed_and_refuses_an_empty_password() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("reseal");
+        let _ = &sb;
+        // Not armed short-circuits before any TPM traffic: never auto-arm.
+        match dispatch(
+            Request::ResealPassword {
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::PasswordResealed { armed, changed } => {
+                assert!(!armed && !changed, "reseal must never arm a fresh user");
+            }
+            other => panic!("expected PasswordResealed, got {other:?}"),
+        }
+        match dispatch(
+            Request::ResealPassword {
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(Vec::new()),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert!(
+                    msg.contains("refusing to reseal an empty password"),
+                    "{msg}"
+                )
+            }
+            other => panic!("empty reseal must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_arms_report_status_and_error_without_a_template_key() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("recovery");
+        let _ = &sb;
+        let root = peer(0);
+        match dispatch(
+            Request::RecoveryStatus {
+                user: "ghost".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::RecoveryStatus {
+                encrypted,
+                recovery_set,
+                ..
+            } => assert!(!encrypted && !recovery_set),
+            other => panic!("expected RecoveryStatus, got {other:?}"),
+        }
+        // No template key exists (and the user isn't enrolled, so none is
+        // minted): setup has nothing to wrap.
+        match dispatch(
+            Request::RecoverySetup {
+                user: "ghost".into(),
+                passphrase: irlume_common::SecretBytes::new(b"phrase".to_vec()),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert!(msg.contains("no template key sealed for 'ghost'"), "{msg}")
+            }
+            other => panic!("setup without a key must Error, got {other:?}"),
+        }
+        match dispatch(
+            Request::RecoveryRestore {
+                user: "ghost".into(),
+                passphrase: irlume_common::SecretBytes::new(b"phrase".to_vec()),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(
+                msg.contains("no recovery passphrase set for 'ghost'"),
+                "{msg}"
+            ),
+            other => panic!("restore without an envelope must Error, got {other:?}"),
+        }
+        match dispatch(
+            Request::RecoveryForget {
+                user: "ghost".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert_eq!(msg, "recovery passphrase erased for 'ghost'"),
+            other => panic!("forget must be idempotent Ok, got {other:?}"),
+        }
+        match dispatch(
+            Request::RecoveryStatus {
+                user: "ghost".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to query 'ghost'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_cameras_requires_root_then_repoints_and_persists() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("setcam");
+        let _ = &sb;
+        match dispatch(
+            Request::SetCameras {
+                rgb: "/dev/video0".into(),
+                ir: "/dev/video2".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("set_cameras requires root (peer uid {NOBODY})")
+                )
+            }
+            other => panic!("non-root SetCameras must be refused, got {other:?}"),
+        }
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        match dispatch(
+            Request::SetCameras {
+                rgb: rgb.into(),
+                ir: ir.into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            // The exact message proves the persist to cameras.conf succeeded
+            // (a failed persist appends a "live only" suffix).
+            Response::Ok(msg) => assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}")),
+            other => panic!("root SetCameras must succeed, got {other:?}"),
+        }
+        assert_eq!(e.rgb_device(), rgb);
+        assert_eq!(e.ir_device(), ir);
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", "rgb").as_deref(),
+            Some(rgb)
+        );
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", "ir").as_deref(),
+            Some(ir)
+        );
+        // Restore the shared engine's baseline devices.
+        e.set_devices(NO_RGB, NO_IR);
+    }
+
+    #[test]
+    fn setup_ir_emitter_gates_root_and_surfaces_a_missing_camera() {
+        let _g = env_lock();
+        let mut e = engine();
+        // Dry-run is open to any peer but needs the (absent) IR node.
+        match dispatch(
+            Request::SetupIrEmitter { dry_run: true },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("dry-run without a camera must Error, got {other:?}"),
+        }
+        // The write path is root-only.
+        match dispatch(
+            Request::SetupIrEmitter { dry_run: false },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("setup_ir_emitter requires root (peer uid {NOBODY})")
+                )
+            }
+            other => panic!("non-root setup must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selftest_and_position_sample_surface_the_missing_camera() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("selftest");
+        let _ = &sb;
+        for kind in [
+            irlume_common::SelfTestKind::Liveness,
+            irlume_common::SelfTestKind::AlignmentIdentity,
+        ] {
+            match dispatch(Request::SelfTest { kind }, &peer(0), &mut e) {
+                Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+                other => panic!("selftest without a camera must Error, got {other:?}"),
+            }
+        }
+        // A non-root peer asking to tune for another user is silently scoped
+        // to the anonymous band; either way the capture needs the camera.
+        match dispatch(
+            Request::PositionSample {
+                user: Some("root".into()),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            other => panic!("position sample without a camera must Error, got {other:?}"),
+        }
+    }
+
+    // ---- env-gated: v4l2loopback feeder nodes ---------------------------
+
+    /// Fresh engine wired to the CI loopback nodes; None when the env is
+    /// absent. The feeder holds no face, so capture arms end in clean denials.
+    fn loopback_engine() -> Option<irlume_auth::Engine> {
+        let (Ok(rgb), Ok(ir)) = (
+            std::env::var("IRLUME_TEST_RGB_DEVICE"),
+            std::env::var("IRLUME_TEST_IR_DEVICE"),
+        ) else {
+            return None;
+        };
+        ort_init();
+        Some(
+            irlume_auth::Engine::load(
+                &model_path("face_detection_yunet_2023mar.onnx"),
+                &model_path("glintr100.onnx"),
+            )
+            .expect("engine load")
+            .with_devices(&rgb, &ir),
+        )
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_authenticate_dispatches_to_a_no_face_denial() {
+        let _g = env_lock();
+        let Some(mut e) = loopback_engine() else {
+            return;
+        };
+        let sb = sandbox("lb-auth");
+        // One-shot capture instead of a grace window: a no-face run finishes
+        // in one camera round.
+        std::env::set_var("IRLUME_GRACE_MS", "0");
+        write_enrollment(&sb.dir, &enrollment_with("lbuser", &["Face Scan 1"]));
+        // "kde" is a ScreenUnlock in every tier, so the dispatch gates pass
+        // whether or not the runner's loopback nodes register as an IR pair.
+        let resp = dispatch(
+            Request::Authenticate {
+                user: "lbuser".into(),
+                service: Some("kde".into()),
+            },
+            &peer(0),
+            &mut e,
+        );
+        std::env::remove_var("IRLUME_GRACE_MS");
+        match resp {
+            Response::AuthResult {
+                granted,
+                live,
+                reason,
+                ..
+            } => {
+                assert!(!granted, "no face on the feed must never grant");
+                assert!(!live);
+                assert!(
+                    reason.to_lowercase().contains("face"),
+                    "denial should name the missing face, got: {reason}"
+                );
+            }
+            other => panic!("a faceless frame is a denial, not an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_identify_dispatches_to_a_no_match() {
+        let _g = env_lock();
+        let Some(mut e) = loopback_engine() else {
+            return;
+        };
+        let sb = sandbox("lb-identify");
+        std::env::set_var("IRLUME_GRACE_MS", "0");
+        write_enrollment(&sb.dir, &enrollment_with("lbuser", &["Face Scan 1"]));
+        // Root keeps the full 1:N search; with no face on the feed it must
+        // come back empty, not error and not name anyone.
+        let resp = dispatch(Request::Identify, &peer(0), &mut e);
+        std::env::remove_var("IRLUME_GRACE_MS");
+        match resp {
+            Response::Identified {
+                user,
+                profile,
+                live,
+                reason,
+                ..
+            } => {
+                assert_eq!(user, None, "no face must identify nobody");
+                assert_eq!(profile, None);
+                assert!(!live);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("a faceless identify is a no-match, not an error: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_enroll_reaches_capture_and_fails_the_no_face_probe_cleanly() {
+        let _g = env_lock();
+        let Some(mut e) = loopback_engine() else {
+            return;
+        };
+        let sb = sandbox("lb-enroll");
+        std::env::set_var("IRLUME_GRACE_MS", "0");
+        let resp = dispatch(
+            Request::Enroll {
+                user: "lbenroll".into(),
+                profile: None,
+                scans: Some(1),
+                reset: false,
+            },
+            &peer(0),
+            &mut e,
+        );
+        std::env::remove_var("IRLUME_GRACE_MS");
+        match resp {
+            Response::Error(msg) => assert!(
+                msg.contains("check lighting and framing"),
+                "a faceless enroll must coach, got: {msg}"
+            ),
+            other => panic!("a faceless enroll must Error, got {other:?}"),
+        }
+        assert!(
+            !sb.dir.join("lbenroll.json").exists(),
+            "a failed enroll must not leave a partial enrollment"
+        );
+    }
+
+    // ---- env-gated: swtpm ------------------------------------------------
+
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_seal_and_unseal_keyring_release_the_secret_to_root_only() {
+        // Only ever a software TPM: without the explicit TCTI this returns
+        // rather than fall back to this machine's /dev/tpmrm0.
+        if std::env::var("IRLUME_TCTI").is_err() {
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("tpm-keyring");
+        let _ = &sb;
+        let root = peer(0);
+        let secret = b"hunter2-swtpm".to_vec();
+        match dispatch(
+            Request::SealPassword {
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(secret.clone()),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::PasswordSealed => {}
+            other => panic!("sealing against swtpm must succeed, got {other:?}"),
+        }
+        match dispatch(
+            Request::HasSealedPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::HasPassword(armed) => assert!(armed),
+            other => panic!("expected HasPassword(true), got {other:?}"),
+        }
+        // A real envelope reports its policy.
+        match dispatch(
+            Request::KeyringInfo {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::KeyringInfo { armed, policy, .. } => {
+                assert!(armed);
+                assert!(
+                    policy.is_some(),
+                    "a sealed envelope must describe its policy"
+                );
+            }
+            other => panic!("expected KeyringInfo, got {other:?}"),
+        }
+        // The sealed login secret is released only to a root peer in a
+        // login / lock-screen service class.
+        match dispatch(
+            Request::UnsealKeyring {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("unseal_keyring requires root (peer uid {NOBODY})")
+                )
+            }
+            other => panic!("non-root peer must never get the secret, got {other:?}"),
+        }
+        match dispatch(
+            Request::UnsealKeyring {
+                user: "carol".into(),
+                service: Some("kde".into()),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::PasswordUnsealed { secret: got } => assert_eq!(got.expose(), secret),
+            other => panic!("root keyring unseal must release the secret, got {other:?}"),
+        }
+        match dispatch(
+            Request::ForgetPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::PasswordForgotten => {}
+            other => panic!("expected PasswordForgotten, got {other:?}"),
+        }
+        match dispatch(
+            Request::HasSealedPassword {
+                user: "carol".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::HasPassword(armed) => assert!(!armed),
+            other => panic!("expected HasPassword(false), got {other:?}"),
+        }
+    }
 }

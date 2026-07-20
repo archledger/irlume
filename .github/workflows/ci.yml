@@ -110,8 +110,15 @@ jobs:
       # fake hardware, real code.
       - name: Start virtual cameras (v4l2loopback + ffmpeg feeders)
         run: |
-          sudo apt-get install -y --no-install-recommends v4l2loopback-dkms "linux-headers-$(uname -r)" ffmpeg
-          sudo modprobe v4l2loopback devices=2 video_nr=42,43 card_label="irlume-test-rgb,irlume-test-ir" exclusive_caps=0
+          # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
+          # kernel's V4L2 API and fails to load; build upstream at a pinned
+          # commit instead. videodev (its dependency) lives in modules-extra.
+          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg
+          git clone https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
+          git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
+          make -C /tmp/v4l2loopback -j"$(nproc)"
+          sudo modprobe videodev
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=42,43 exclusive_caps=0
           sudo chmod 666 /dev/video42 /dev/video43
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video42 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video43 >/dev/null 2>&1 &
@@ -223,8 +230,15 @@ jobs:
 
       - name: Start virtual cameras (v4l2loopback + ffmpeg feeders)
         run: |
-          sudo apt-get install -y --no-install-recommends v4l2loopback-dkms "linux-headers-$(uname -r)" ffmpeg
-          sudo modprobe v4l2loopback devices=2 video_nr=42,43 card_label="irlume-test-rgb,irlume-test-ir" exclusive_caps=0
+          # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
+          # kernel's V4L2 API and fails to load; build upstream at a pinned
+          # commit instead. videodev (its dependency) lives in modules-extra.
+          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg
+          git clone https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
+          git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
+          make -C /tmp/v4l2loopback -j"$(nproc)"
+          sudo modprobe videodev
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=42,43 exclusive_caps=0
           sudo chmod 666 /dev/video42 /dev/video43
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video42 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video43 >/dev/null 2>&1 &

@@ -103,6 +103,7 @@ jobs:
         run: |
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
+          IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
 
       # Virtual cameras: v4l2loopback provides the V4L2 nodes, ffmpeg feeds
       # test patterns in the exact formats the capture paths negotiate
@@ -113,26 +114,35 @@ jobs:
           # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
           # kernel's V4L2 API and fails to load; build upstream at a pinned
           # commit instead. videodev (its dependency) lives in modules-extra.
-          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg
+          # v4l2loopback (built from a pinned upstream commit because Ubuntu's
+          # 0.12.x won't load on the runner kernel) plus pam_wrapper/pamtester
+          # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
+          # spare the camera streaming tests feed themselves.
+          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
           git clone https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
           git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
-          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=8,9 exclusive_caps=0
-          sudo chmod 666 /dev/video8 /dev/video9
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
+          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           sleep 3
 
-      - name: test (camera paths, against v4l2loopback)
+      - name: test (camera + capture paths, against v4l2loopback)
         env:
           IRLUME_TEST_RGB_DEVICE: /dev/video8
           IRLUME_TEST_IR_DEVICE: /dev/video9
+          IRLUME_TEST_SPARE_DEVICE: /dev/video10
           # Loopback nodes have no physical bus; the exact-path escape lets
-          # verify_pinned accept just these two (see THREAT_MODEL.md).
+          # verify_pinned accept just these (see THREAT_MODEL.md).
           IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
         run: |
-          cargo test -p irlume-camera -p irlume-auth --locked -- --ignored loopback_ --test-threads=1
+          cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          cargo test -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+
+      - name: test (PAM FFI, against pam_wrapper)
+        run: cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
 
   # Build + test on current stable, because that is what the packaging lanes
   # and most from-source users compile with. fmt/clippy stay on the MSRV job
@@ -236,13 +246,17 @@ jobs:
           # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
           # kernel's V4L2 API and fails to load; build upstream at a pinned
           # commit instead. videodev (its dependency) lives in modules-extra.
-          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg
+          # v4l2loopback (built from a pinned upstream commit because Ubuntu's
+          # 0.12.x won't load on the runner kernel) plus pam_wrapper/pamtester
+          # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
+          # spare the camera streaming tests feed themselves.
+          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
           git clone https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
           git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
-          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=8,9 exclusive_caps=0
-          sudo chmod 666 /dev/video8 /dev/video9
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
+          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           sleep 3
@@ -251,14 +265,18 @@ jobs:
         env:
           IRLUME_TEST_RGB_DEVICE: /dev/video8
           IRLUME_TEST_IR_DEVICE: /dev/video9
+          IRLUME_TEST_SPARE_DEVICE: /dev/video10
           # Loopback nodes have no physical bus; the exact-path escape lets
-          # verify_pinned accept just these two (see THREAT_MODEL.md).
+          # verify_pinned accept just these (see THREAT_MODEL.md).
           IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
         run: |
           cargo llvm-cov --no-report --workspace --locked
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
-          cargo llvm-cov --no-report -p irlume-camera -p irlume-auth --locked -- --ignored loopback_ --test-threads=1
+          IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
           cargo llvm-cov report --summary-only --fail-under-lines 69
 
   deny:

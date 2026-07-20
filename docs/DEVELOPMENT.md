@@ -175,12 +175,15 @@ swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
   --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
   --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
 IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib -- --ignored \
-  seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle
+  seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
+  tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
 ```
 
 `IRLUME_TCTI` is the production TCTI override; the remaining ignored tests
-(pcrlock, durability, fault-injection) are campaign tools that need a
-provisioned host and stay manual.
+(durability, fault-injection, and the host-provisioned pcrlock roundtrip)
+are campaign tools that need a provisioned host and stay manual; the
+`_provisioned_nv` pcrlock test needs no host provisioning because it defines
+the NV index itself, the same way `systemd-pcrlock make-policy` does.
 
 ## Sandbox environment overrides
 
@@ -196,6 +199,7 @@ throwaway dev daemon never write to the real system:
 | `IRLUME_TEMPLATE_KEY_DIR` | template encryption keys | `/var/lib/irlume/template-keys` |
 | `IRLUME_RECOVERY_DIR` | recovery-passphrase envelopes | `/var/lib/irlume/recovery` |
 | `IRLUME_PCR_SIGNATURE` / `IRLUME_PCR_PUBKEY` | the pcrlock signature JSON / public-key PEM | discovered on the system paths |
+| `IRLUME_PCRLOCK_JSON` | the systemd-pcrlock prediction file (Tier-2 gate) | `/var/lib/systemd/pcrlock.json` |
 | `IRLUME_SELINUX_PP` | the compiled SELinux module `irlume login` loads (source builds have no packaged `.pp`) | packaged path |
 
 ## Example binaries

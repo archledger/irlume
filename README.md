@@ -21,6 +21,7 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 ![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu-2ea44f)
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/archledger/irlume/badge)](https://scorecard.dev/viewer/?uri=github.com/archledger/irlume)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
 [![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](#-faq)
 
 [Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)

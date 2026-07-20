@@ -118,19 +118,19 @@ jobs:
           git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
-          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=42,43 exclusive_caps=0
-          sudo chmod 666 /dev/video42 /dev/video43
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video42 >/dev/null 2>&1 &
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video43 >/dev/null 2>&1 &
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=8,9 exclusive_caps=0
+          sudo chmod 666 /dev/video8 /dev/video9
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           sleep 3
 
       - name: test (camera paths, against v4l2loopback)
         env:
-          IRLUME_TEST_RGB_DEVICE: /dev/video42
-          IRLUME_TEST_IR_DEVICE: /dev/video43
+          IRLUME_TEST_RGB_DEVICE: /dev/video8
+          IRLUME_TEST_IR_DEVICE: /dev/video9
           # Loopback nodes have no physical bus; the exact-path escape lets
           # verify_pinned accept just these two (see THREAT_MODEL.md).
-          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video42,/dev/video43
+          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
         run: |
           cargo test -p irlume-camera -p irlume-auth --locked -- --ignored loopback_ --test-threads=1
 
@@ -241,19 +241,19 @@ jobs:
           git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
-          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=42,43 exclusive_caps=0
-          sudo chmod 666 /dev/video42 /dev/video43
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video42 >/dev/null 2>&1 &
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video43 >/dev/null 2>&1 &
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=2 video_nr=8,9 exclusive_caps=0
+          sudo chmod 666 /dev/video8 /dev/video9
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           sleep 3
 
       - name: Coverage incl. TPM-gated and camera tests (fail under the ratchet floor)
         env:
-          IRLUME_TEST_RGB_DEVICE: /dev/video42
-          IRLUME_TEST_IR_DEVICE: /dev/video43
+          IRLUME_TEST_RGB_DEVICE: /dev/video8
+          IRLUME_TEST_IR_DEVICE: /dev/video9
           # Loopback nodes have no physical bus; the exact-path escape lets
           # verify_pinned accept just these two (see THREAT_MODEL.md).
-          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video42,/dev/video43
+          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
         run: |
           cargo llvm-cov --no-report --workspace --locked
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \

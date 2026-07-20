@@ -1560,7 +1560,10 @@ mod tests {
         let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
         assert_eq!((frame.width, frame.height), (IR_W, IR_H));
         assert_eq!(frame.spectrum, Spectrum::Ir);
-        assert_eq!(frame.data.len(), (IR_W * IR_H) as usize);
+        // Drivers may hand back a buffer with trailing slack (v4l2loopback
+        // pads by 2 KiB); the contract is at-least-one-byte-per-pixel, and
+        // the consumers guard exactly that.
+        assert!(frame.data.len() >= (IR_W * IR_H) as usize);
         assert!(stats.burst_frames > 0, "burst must have captured frames");
         assert!(
             (0.0..=255.0).contains(&stats.lit_mean),
@@ -1571,20 +1574,30 @@ mod tests {
         let seq = capture_ir_sequence(&ir, 3, 2).expect("ir sequence");
         assert_eq!(seq.len(), 3);
         for f in &seq {
-            assert_eq!(f.data.len(), (IR_W * IR_H) as usize);
+            assert!(f.data.len() >= (IR_W * IR_H) as usize);
         }
     }
 
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
-    fn loopback_capabilities_sees_a_usable_rgb_node() {
-        let Some((_rgb, _ir)) = loopback_pair() else {
+    fn loopback_capabilities_classify_rgb_but_never_pair() {
+        // Only meaningful when the loopback nodes sit inside discover_nodes'
+        // /dev/video0..9 scan range (CI uses 8 and 9).
+        let Some((rgb, _ir)) = loopback_pair() else {
             return;
         };
+        if !(0..10).any(|n| rgb == format!("/dev/video{n}")) {
+            return;
+        }
         let caps = capabilities();
         assert!(
             caps.rgb,
-            "a YUYV-fed loopback node must classify as a usable RGB camera"
+            "a YUYV-fed loopback node classifies as a usable RGB camera"
+        );
+        assert!(
+            !caps.ir_pair,
+            "virtual nodes share no physical sysfs parent, so they must never \
+             form a Hello pair"
         );
     }
 

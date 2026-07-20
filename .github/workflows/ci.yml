@@ -277,7 +277,7 @@ jobs:
           cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
-          cargo llvm-cov report --summary-only --fail-under-lines 78
+          cargo llvm-cov report --summary-only --fail-under-lines 79
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)

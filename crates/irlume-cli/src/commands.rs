@@ -1269,8 +1269,8 @@ SYSTEM INTEGRATION
 #[cfg(test)]
 mod origin_tests {
     use super::{
-        gz_lists_irlume, installed_version, is_copr_repo, ppa_serves, ubuntu_codename,
-        InstallOrigin,
+        arch_names, gz_lists_irlume, installed_version, is_copr_repo, latest_release_tag,
+        ppa_serves, release_assets, ubuntu_codename, version_gt, InstallOrigin,
     };
 
     #[test]
@@ -1349,6 +1349,9 @@ mod origin_tests {
     // failure must be None (unknown), never "not served".
     #[test]
     fn update_probes_query_the_package_manager_and_the_ppa_index() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("irlume-cli-faketools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1395,6 +1398,76 @@ esac"#,
         assert_eq!(ppa_serves("resolute"), None);
 
         std::env::remove_var("FAKE_CURL_MODE");
+        std::env::set_var("PATH", old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn version_gt_compares_numeric_fields_and_ignores_distro_suffixes() {
+        assert!(version_gt("0.3.0", "0.2.9"));
+        assert!(version_gt("0.10.0", "0.9.9"), "numeric, not lexicographic");
+        assert!(version_gt("1.0", "0.9.9.9"));
+        assert!(version_gt("0.2.1", "0.2"), "missing fields count as 0");
+        assert!(!version_gt("0.2", "0.2.0"));
+        assert!(!version_gt("0.2.1", "0.2.1"));
+        // The real call is version_gt(release_tag, installed_version), where the
+        // installed side may carry a distro suffix (dpkg "0.2.1-0ppa1~resolute1",
+        // pacman "0.1.3-1"): a same-upstream tag must not read as newer, and the
+        // next upstream tag must.
+        assert!(!version_gt("0.2.1", "0.2.1-0ppa1~resolute1"));
+        assert!(version_gt("0.2.2", "0.2.1-0ppa1~resolute1"));
+        assert!(!version_gt("0.1.3", "0.1.3-1"));
+        assert!(version_gt("0.1.4", "0.1.3-1"));
+        // Pre-release tags compare as their base version.
+        assert!(!version_gt("1.0.0-rc1", "1.0.0"));
+        assert!(!version_gt("1.0.0", "1.0.0-rc1"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn arch_names_map_x86_64_to_the_per_ecosystem_spellings() {
+        assert_eq!(arch_names(), ("amd64", "x86_64", "amd64"));
+    }
+
+    #[test]
+    fn ubuntu_codename_falls_back_to_version_codename() {
+        // Older/derivative os-release files may lack UBUNTU_CODENAME entirely.
+        let os = "ID=ubuntu\nVERSION_CODENAME=resolute\n";
+        assert_eq!(ubuntu_codename(os).as_deref(), Some("resolute"));
+    }
+
+    // The release feed is scraped without a JSON dependency; pin what the
+    // scanner keeps (package files) and what it must skip (the release title,
+    // checksum files) plus the offline degradation to None/empty.
+    #[test]
+    fn release_feed_parsing_keeps_only_package_assets() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-cli-fakefeed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = r#"{"tag_name": "v9.9.9", "name": "irlume 9.9.9", "assets": [{"name": "irlume_9.9.9_amd64.deb"}, {"name": "irlume-9.9.9-1.fc44.x86_64.rpm"}, {"name": "irlume-9.9.9-1-x86_64.pkg.tar.zst"}, {"name": "SHA256SUMS"}]}"#;
+        fake_tool(&dir, "curl", &format!("printf '%s' '{body}'"));
+        let old_path = std::env::var("PATH").unwrap();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+
+        assert_eq!(latest_release_tag().as_deref(), Some("v9.9.9"));
+        assert_eq!(
+            release_assets(),
+            vec![
+                "irlume_9.9.9_amd64.deb".to_string(),
+                "irlume-9.9.9-1.fc44.x86_64.rpm".to_string(),
+                "irlume-9.9.9-1-x86_64.pkg.tar.zst".to_string(),
+            ],
+            "the release title and SHA256SUMS are not package assets"
+        );
+
+        // Offline (curl connect failure): unknown, never a false answer.
+        fake_tool(&dir, "curl", "exit 7");
+        assert_eq!(latest_release_tag(), None);
+        assert!(release_assets().is_empty());
+
         std::env::set_var("PATH", old_path);
         let _ = std::fs::remove_dir_all(&dir);
     }

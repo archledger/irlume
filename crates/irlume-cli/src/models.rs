@@ -264,3 +264,83 @@ pub fn doctor_line() -> String {
     }
     "none (default; see `irlume models`)".into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// doctor_line's classification: enabled name vs catalog membership vs
+    /// weight state, all against sandboxed config/state dirs.
+    #[test]
+    fn doctor_line_reports_catalog_membership_and_weight_state() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if is_root() {
+            return; // the unprivileged branches are what is under test
+        }
+        let root = std::env::temp_dir().join(format!("irlume-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        // Nothing enabled, nothing on disk.
+        assert!(
+            doctor_line().starts_with("none (default"),
+            "got: {}",
+            doctor_line()
+        );
+
+        // Weights on disk but no readable enabled key: report the file without
+        // claiming an enabled state the caller cannot confirm.
+        let m = &thirdparty::CATALOG[0];
+        std::fs::create_dir_all(thirdparty::dir()).unwrap();
+        std::fs::write(thirdparty::model_path(m), b"garbage").unwrap();
+        let line = doctor_line();
+        assert!(line.contains("weights installed"), "got: {line}");
+        assert!(line.contains("root-only"), "got: {line}");
+        std::fs::remove_file(thirdparty::model_path(m)).unwrap();
+
+        // An enabled name that is not in the catalog is called out.
+        std::fs::write(cfg.join("settings.conf"), "third_party_pad=ghost\n").unwrap();
+        assert!(
+            doctor_line().contains("NOT in the catalog"),
+            "got: {}",
+            doctor_line()
+        );
+
+        // Enabled catalog model, weights never fetched.
+        std::fs::write(
+            cfg.join("settings.conf"),
+            format!("third_party_pad={}\n", m.name),
+        )
+        .unwrap();
+        assert_eq!(
+            doctor_line(),
+            format!("{} enabled (weights not fetched; deny-only cue)", m.name)
+        );
+
+        // Enabled with weights whose checksum no longer matches the pin.
+        std::fs::write(thirdparty::model_path(m), b"garbage").unwrap();
+        assert!(
+            doctor_line().contains("CHECKSUM MISMATCH"),
+            "got: {}",
+            doctor_line()
+        );
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

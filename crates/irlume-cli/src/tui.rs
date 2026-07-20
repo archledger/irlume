@@ -3795,3 +3795,491 @@ fn enroll_worker(
     }
     let _ = send(WMsg::Done);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
+    /// PATH) so they can't race each other under the parallel test runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A bare App for tests: no hardware probes, no daemon socket, no terminal.
+    /// Mirrors `App::new()` but every probe-derived field is inert.
+    fn test_app() -> App {
+        let caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: false,
+        };
+        App {
+            user: "testuser".into(),
+            screen: SC_WELCOME,
+            sel: 0,
+            profiles: Vec::new(),
+            eyes_open: false,
+            challenge: false,
+            keyring_armed: None,
+            keyring_policy: None,
+            keyring_drift: None,
+            nodes: Vec::new(),
+            pairs: Vec::new(),
+            activity: Vec::new(),
+            input: None,
+            confirm: None,
+            op: None,
+            enroll: None,
+            enroll_merge: None,
+            fp: FpInfo::default(),
+            recovery: None,
+            suspend: None,
+            resume_enroll: None,
+            identify_result: None,
+            selftest_result: None,
+            repair: Vec::new(),
+            repair_sel: 0,
+            cam_sel: 0,
+            error: None,
+            daemon_up: false,
+            enroll_error: None,
+            health: None,
+            act_scroll: 0,
+            visible: App::compute_visible(&caps, false, false, false, &[]),
+            advanced: false,
+            caps,
+            fp_present: false,
+            spin: 0,
+            quit: false,
+        }
+    }
+
+    /// A running-op placeholder whose worker never answers (the receiver stays
+    /// empty). The sender is returned so the channel stays open for the test.
+    fn fake_op() -> (mpsc::Sender<(bool, String)>, Op) {
+        let (tx, rx) = mpsc::channel();
+        (
+            tx,
+            Op {
+                label: "Identify".into(),
+                tag: OpTag::Identify,
+                rx,
+            },
+        )
+    }
+
+    fn fake_enroll(base: usize, target: usize) -> (mpsc::Sender<WMsg>, EnrollUi) {
+        let (tx, rx) = mpsc::channel();
+        (
+            tx,
+            EnrollUi {
+                rx,
+                stop: Arc::new(AtomicBool::new(false)),
+                profile: "p".into(),
+                last: None,
+                count: None,
+                captured: 0,
+                target,
+                base,
+            },
+        )
+    }
+
+    /// Flatten a TestBackend buffer into one string (rows joined by newlines)
+    /// for substring assertions on rendered output.
+    fn rendered(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for (i, cell) in buf.content.iter().enumerate() {
+            if i > 0 && i % buf.area.width as usize == 0 {
+                out.push('\n');
+            }
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
+    // Regression: f00f316. The daemon acks SetRequireEyesOpen with
+    // Response::Ok (via mutate_enrollment), not Response::Enrollment; before
+    // the fix map_settings routed Ok to the "unexpected" fallback and every
+    // eyes-open toggle raised a false error modal.
+    #[test]
+    fn eyes_open_toggle_accepts_ok_response() {
+        let (ok, msg) = map_settings(Response::Ok("require-eyes-open ENABLED".into()));
+        assert!(ok, "Response::Ok must be a success, not an error modal");
+        assert_eq!(msg, "require-eyes-open ENABLED");
+        // The updated-Enrollment reply and genuine errors keep working.
+        let (ok, _) = map_settings(Response::Enrollment {
+            profiles: Vec::new(),
+            require_eyes_open: true,
+            require_challenge: false,
+        });
+        assert!(ok);
+        let (ok, _) = map_settings(Response::Error("boom".into()));
+        assert!(!ok);
+    }
+
+    // Regression: f00f316. modal() had a fixed height of 5, so any body longer
+    // than three wrapped lines was clipped. The wrap math must match what the
+    // renderer does: explicit newlines count, and words wrap at the width.
+    #[test]
+    fn wrapped_line_count_matches_wrap_math() {
+        assert_eq!(wrapped_line_count("short", 32), 1);
+        assert_eq!(wrapped_line_count("line one\nline two", 32), 2);
+        // Eight 4-char words at width 9: two words fit per line ("aaaa aaaa").
+        let words = ["aaaa"; 8].join(" ");
+        assert_eq!(wrapped_line_count(&words, 9), 4);
+        // Degenerate width never divides by zero.
+        assert_eq!(wrapped_line_count("anything", 0), 1);
+    }
+
+    // Regression: f00f316. A long modal body must be fully visible: the box
+    // grows to the wrapped line count instead of clipping at the old fixed
+    // height of 5 (three body rows).
+    #[test]
+    fn modal_grows_to_fit_long_body() {
+        let app = test_app();
+        let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        // ~8 wrapped lines at the modal's inner width; the last word is the
+        // sentinel that the fixed-height modal used to clip away.
+        let body = format!("{} ENDBODY", ["lorem"; 40].join(" "));
+        term.draw(|f| app.modal(f, "Confirm", &body)).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("ENDBODY"),
+            "long modal body was clipped:\n{text}"
+        );
+    }
+
+    // Regression: f00f316. The confirm question used to live in the border
+    // title, a single line clamped to the box width, so a long target name was
+    // cut off. It must render inside the wrapping body, with the deliberate
+    // [y] yes / [n] no hint from 093dc56.
+    #[test]
+    fn confirm_modal_question_wraps_in_body() {
+        let mut app = test_app();
+        let question = format!(
+            "Delete profile '{}ZZTARGETZZ' and all its scans?",
+            ["word"; 20].join(" ")
+        );
+        app.confirm = Some((question, Request::Ping));
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("ZZTARGETZZ"),
+            "end of a long confirm question was clipped:\n{text}"
+        );
+        assert!(text.contains("[y] yes"), "deliberate-confirm hint missing");
+    }
+
+    // Regression: f00f316. At MAX_PROFILES the guidance said only "delete one
+    // first"; refreshing your own face is what [a] Improve Recognition does,
+    // so the at-cap message must point there.
+    #[test]
+    fn enroll_at_cap_points_to_improve_recognition() {
+        let mut app = test_app();
+        app.daemon_up = true; // skip the daemon gate; the cap check is next
+        app.profiles = (0..MAX_PROFILES)
+            .map(|i| ProfileSummary {
+                name: format!("p{i}"),
+                scans: Vec::new(),
+            })
+            .collect();
+        app.begin_enroll();
+        assert!(app.input.is_none(), "no name prompt at the profile cap");
+        let (_, msg) = app.activity.last().expect("a cap message is logged");
+        assert!(
+            msg.contains("Improve Recognition"),
+            "at-cap guidance must name the add-scan path, got: {msg}"
+        );
+    }
+
+    // Regression: 093dc56. Destructive confirms used to cancel on ANY key
+    // other than [y]; a stray keypress must now be ignored, and only [n] or
+    // Esc may cancel.
+    #[test]
+    fn confirm_ignores_stray_keys_and_cancels_only_on_n_or_esc() {
+        let mut app = test_app();
+        app.confirm = Some(("Delete profile 'x'?".into(), Request::Ping));
+        app.on_key(KeyCode::Char('x'));
+        app.on_key(KeyCode::Char(' '));
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.confirm.is_some(),
+            "a stray key must not cancel a destructive confirm"
+        );
+        app.on_key(KeyCode::Char('n'));
+        assert!(app.confirm.is_none(), "[n] cancels");
+        app.confirm = Some(("Delete scan 's'?".into(), Request::Ping));
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none(), "Esc cancels");
+    }
+
+    // Regression: 093dc56. Uninstall must not run off keypresses alone: [U]
+    // opens a typed challenge, a wrong word cancels, and only the exact word
+    // "uninstall" reaches the sudo teardown.
+    #[test]
+    fn uninstall_requires_typed_word() {
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        app.on_key(KeyCode::Char('U'));
+        assert!(
+            matches!(app.input, Some((_, _, Pending::UninstallConfirm))),
+            "[U] must open the typed uninstall challenge"
+        );
+        for c in "yes".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_none());
+        assert!(
+            app.suspend.is_none(),
+            "a wrong word must not trigger the uninstall"
+        );
+        app.on_key(KeyCode::Char('U'));
+        for c in "uninstall".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(
+            matches!(app.suspend, Some(Suspend::Uninstall)),
+            "the exact word must proceed to the sudo teardown"
+        );
+    }
+
+    // Regression: cae2eea. The error banner says "press any key to dismiss",
+    // but PgUp/PgDn used to scroll the activity log instead of dismissing.
+    // Dismiss must take the key first; the NEXT PgUp scrolls.
+    #[test]
+    fn error_banner_dismissed_by_pgup_before_scroll() {
+        let mut app = test_app();
+        for i in 0..20 {
+            app.log('·', format!("line {i}"));
+        }
+        app.error = Some("camera busy".into());
+        app.on_key(KeyCode::PageUp);
+        assert!(app.error.is_none(), "PgUp must dismiss the banner");
+        assert_eq!(app.act_scroll, 0, "the dismissing key must not also scroll");
+        app.on_key(KeyCode::PageUp);
+        assert_eq!(app.act_scroll, 3, "with no banner up, PgUp scrolls");
+    }
+
+    // Regression: cae2eea. During a running op every key but q/Esc is
+    // swallowed, so the footer must not advertise the dead nav/action keys.
+    #[test]
+    fn footer_shows_minimal_keys_during_op() {
+        let mut app = test_app();
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+        let text = rendered(&term);
+        assert!(text.contains("working"), "op footer missing, got:\n{text}");
+        assert!(
+            !text.contains("switch tab"),
+            "footer advertises dead nav keys during an op:\n{text}"
+        );
+        // Sanity: the full footer returns once the op is gone.
+        app.op = None;
+        term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+        assert!(rendered(&term).contains("switch tab"));
+    }
+
+    // Regression: cae2eea. caps/fp_present were captured once at startup, so a
+    // camera hot-plugged after launch never revealed its tabs. refresh() must
+    // re-derive them. The seeded value is impossible for capabilities() to
+    // return (rgb is true whenever ir_pair is), so a frozen field keeps it and
+    // a re-derived one cannot.
+    #[test]
+    fn refresh_rederives_hardware_capabilities() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRLUME_SOCKET", "/nonexistent/irlume-test.sock");
+        let impossible = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: false,
+        };
+        let mut app = test_app();
+        app.caps = impossible;
+        app.refresh();
+        std::env::remove_var("IRLUME_SOCKET");
+        assert_ne!(
+            app.caps, impossible,
+            "refresh() left the startup capability snapshot in place"
+        );
+        assert!(
+            app.caps.rgb || !app.caps.ir_pair,
+            "re-derived caps must satisfy the capabilities() invariant"
+        );
+    }
+
+    // Regression: cae2eea. The double-entry password stash must be Zeroizing,
+    // not a plain String, so the first entry is wiped on drop. This is a
+    // type-level check: reverting the stash to Option<String> breaks the
+    // return type below at compile time.
+    #[test]
+    fn password_stash_is_zeroizing() {
+        fn stash(p: Pending) -> Option<zeroize::Zeroizing<String>> {
+            match p {
+                Pending::KeyringPw(s) => s,
+                Pending::RecoveryPw(s) => s,
+                _ => None,
+            }
+        }
+        let k = stash(Pending::KeyringPw(Some(zeroize::Zeroizing::new(
+            "pw".to_string(),
+        ))));
+        assert_eq!(k.as_deref().map(String::as_str), Some("pw"));
+        let r = stash(Pending::RecoveryPw(Some(zeroize::Zeroizing::new(
+            "phrase".to_string(),
+        ))));
+        assert_eq!(r.as_deref().map(String::as_str), Some("phrase"));
+    }
+
+    // Regression: 1da8bd3. refresh_light used to fire ~6 sequential daemon
+    // reads with long budgets, so a wedged daemon (accepting but never
+    // answering) froze the UI thread. The fix polls Ping first on a short
+    // budget and skips the remaining reads when it gets no answer. The fake
+    // daemon here accepts connections and never replies; only ONE connection
+    // (the Ping probe) may arrive.
+    #[test]
+    fn wedged_daemon_poll_short_circuits_after_ping() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sock =
+            std::env::temp_dir().join(format!("irlume-tui-wedge-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream); // hold the connection open, never answer
+            }
+        });
+        std::env::set_var("IRLUME_SOCKET", &sock);
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            version: "test".into(),
+        });
+        let start = std::time::Instant::now();
+        app.refresh_light();
+        std::env::remove_var("IRLUME_SOCKET");
+        let _ = std::fs::remove_file(&sock);
+        assert!(
+            !app.daemon_up,
+            "an unanswered Ping means the daemon is down"
+        );
+        assert!(app.health.is_none(), "stale health must be cleared");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "only the Ping probe may touch a wedged daemon; the rest must be skipped"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the status poll must fail fast, not sit through full read budgets"
+        );
+    }
+
+    // Regression: 1da8bd3. After a merge confirm the continuation worker
+    // restarts its own count at 1, but the profile already holds the merged
+    // scan; the on-screen counter must add the EnrollUi base offset instead of
+    // restarting at 0.
+    #[test]
+    fn merge_continuation_scan_counter_keeps_base_offset() {
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(1, 4); // one scan merged in already
+        app.enroll = Some(enroll);
+        tx.send(WMsg::Captured(1, 4)).unwrap();
+        app.poll();
+        let (_, msg) = app.activity.last().expect("a capture line is logged");
+        assert_eq!(
+            msg, "captured scan 2/5",
+            "the counter must continue past the merged scan, not restart"
+        );
+    }
+
+    // Regression: 4780805. PgUp/PgDn used to be swallowed by the op and enroll
+    // key gates; the activity panel must stay scrollable mid-op and mid-enroll,
+    // exactly when lines stream fastest.
+    #[test]
+    fn activity_scroll_reaches_panel_during_op_and_enroll() {
+        let mut app = test_app();
+        for i in 0..30 {
+            app.log('·', format!("line {i}"));
+        }
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        app.on_key(KeyCode::PageUp);
+        assert_eq!(app.act_scroll, 3, "PgUp must scroll during a running op");
+        app.on_key(KeyCode::PageDown);
+        assert_eq!(app.act_scroll, 0, "PgDn must scroll during a running op");
+        app.op = None;
+        let (_tx2, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        app.on_key(KeyCode::PageUp);
+        assert_eq!(app.act_scroll, 3, "PgUp must scroll during enrollment");
+        assert!(app.enroll.is_some(), "PgUp must not cancel the enrollment");
+    }
+
+    // Regression: f709fff. Repair "logs" was bound to [v], which the global
+    // basic/all-tabs toggle swallows in on_key before on_action ever runs, so
+    // the action was dead. The binding is [g]; [v] must keep toggling the view
+    // without opening logs.
+    #[test]
+    fn repair_logs_binding_not_swallowed_by_global_toggle() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.on_key(KeyCode::Char('v'));
+        assert!(app.advanced, "[v] is the global view toggle");
+        assert!(app.suspend.is_none(), "[v] must not open the logs view");
+        app.screen = SC_REPAIR;
+        app.on_key(KeyCode::Char('g'));
+        assert!(
+            matches!(app.suspend, Some(Suspend::Logs)),
+            "the advertised logs key must actually reach the Repair action"
+        );
+    }
+
+    // Regression: 0be786b. A cancelled or failed sudo during the enroll
+    // daemon-gate must drop the parked enrollment immediately; before the fix
+    // the resume path sat through a ~10s daemon wait for a daemon that was
+    // never started. Uses a fake `sudo` that exits 1 (the cancelled case).
+    #[test]
+    fn sudo_failure_drops_parked_enrollment() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-fake-sudo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("sudo");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = dir.into_os_string();
+        new_path.push(":");
+        new_path.push(&old_path);
+        std::env::set_var("PATH", &new_path);
+        let mut app = test_app();
+        app.resume_enroll = Some(ResumeEnroll::New);
+        app.sudo_step("start the daemon", &["systemctl", "start", "irlumed"]);
+        std::env::set_var("PATH", &old_path);
+        assert!(
+            app.resume_enroll.is_none(),
+            "a failed sudo must drop the parked enrollment immediately"
+        );
+        assert!(
+            app.error.is_some(),
+            "the failure must raise the error banner"
+        );
+    }
+}

@@ -502,10 +502,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     // A separate lock service (KDE `kde`) is a WARM screen unlock: the module
     // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
     do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
-    // face-sudo is opt-in on enable (--with-sudo), but disable must ALWAYS
-    // unwire it: "disable --apply undoes everything" is a documented promise,
-    // and a stale sudo line would point at a module the user may remove next.
-    if with_sudo || !enable {
+    if sudo_in_scope(enable, with_sudo) {
         match wire_service(
             &Svc {
                 etc: SUDO,
@@ -542,6 +539,15 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Whether this invocation touches the sudo stack. face-sudo is opt-in on
+/// enable (--with-sudo), but disable must ALWAYS unwire it: "disable --apply
+/// undoes everything" is a documented promise, and a stale sudo line would
+/// point at a module the user may remove next. Kept as a named seam (not
+/// inline in `act`) so the promise stays unit-testable.
+fn sudo_in_scope(enable: bool, with_sudo: bool) -> bool {
+    with_sudo || !enable
 }
 
 /// Wire (or unwire) one service, choosing override-materialize vs edit-in-place.
@@ -1295,6 +1301,104 @@ mod tests {
         // fully reversible.
         let (back, undone) = unwire_lines(&w);
         assert!(undone && !content_has_module(&back));
+    }
+
+    // Regression: 0956be5. `login disable --apply` without --with-sudo left
+    // /etc/pam.d/sudo wired; disable must put sudo in scope regardless of the
+    // flag, while enable keeps face-sudo opt-in.
+    #[test]
+    fn disable_always_unwires_sudo_even_without_the_flag() {
+        assert!(sudo_in_scope(false, false)); // the bug: this used to be false
+        assert!(sudo_in_scope(false, true));
+        assert!(sudo_in_scope(true, true));
+        assert!(!sudo_in_scope(true, false)); // enable stays opt-in
+    }
+
+    // Regression: 7ec33fa. Arch/Plasma ships the locker service only in
+    // /usr/lib/pam.d, and LOCKSCREEN had vendor: None, so the lock screen was
+    // skipped entirely on the Arch layout. The vendor path is what lets
+    // wire_service materialize an /etc override from the vendor copy.
+    #[test]
+    fn kde_lock_service_carries_the_arch_vendor_path() {
+        assert_eq!(LOCKSCREEN.etc, "/etc/pam.d/kde");
+        assert_eq!(LOCKSCREEN.vendor, Some("/usr/lib/pam.d/kde"));
+    }
+
+    /// Self-cleaning scratch dir for the wire_service file tests.
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let d =
+                std::env::temp_dir().join(format!("irlume-pamwire-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            TestDir(d)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `Svc.etc` is `&'static str`; leak the tempdir path to satisfy it.
+    fn leak(p: &Path) -> &'static str {
+        Box::leak(p.to_string_lossy().into_owned().into_boxed_str())
+    }
+
+    const SUDO_STOCK: &str = "#%PAM-1.0\nauth required pam_unix.so\nsession required pam_unix.so\n";
+
+    // Regression: 0be786b. disable restored the stale .pre-irlume backup,
+    // silently reverting admin PAM edits made after wiring (e.g. a faillock
+    // line added to sudo). When backup != current-minus-our-lines, the
+    // strip-in-place path must run: the foreign line survives, the irlume
+    // lines go, and the backup is kept for inspection.
+    #[test]
+    fn disable_strips_in_place_when_the_file_changed_after_wiring() {
+        let dir = TestDir::new("strip");
+        let (wired, changed) = wire_sudo(SUDO_STOCK);
+        assert!(changed);
+        let admin_line = "auth       required   pam_faillock.so preauth";
+        let current = format!("{wired}{admin_line}\n");
+        let etc = dir.0.join("sudo");
+        std::fs::write(&etc, &current).unwrap();
+        std::fs::write(dir.0.join(format!("sudo{BACKUP}")), SUDO_STOCK).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let msg = wire_service(&svc, false, true, &wire_sudo).unwrap();
+        assert!(msg.contains("stripped irlume lines"), "{msg}");
+        let after = std::fs::read_to_string(&etc).unwrap();
+        assert!(
+            after.contains(admin_line),
+            "admin's post-wiring line must survive disable, got:\n{after}"
+        );
+        assert!(!content_has_module(&after));
+        assert!(
+            dir.0.join(format!("sudo{BACKUP}")).exists(),
+            "backup must be kept for inspection"
+        );
+    }
+
+    // Companion to the strip-in-place case: when nothing changed since wiring
+    // (current minus our lines equals the backup), the backup-restore path is
+    // still the one taken and the backup is consumed.
+    #[test]
+    fn disable_restores_the_backup_when_nothing_else_changed() {
+        let dir = TestDir::new("restore");
+        let (wired, _) = wire_sudo(SUDO_STOCK);
+        let etc = dir.0.join("sudo");
+        std::fs::write(&etc, &wired).unwrap();
+        std::fs::write(dir.0.join(format!("sudo{BACKUP}")), SUDO_STOCK).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let msg = wire_service(&svc, false, true, &wire_sudo).unwrap();
+        assert!(msg.contains("restored from backup"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), SUDO_STOCK);
+        assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
     }
 
     #[test]

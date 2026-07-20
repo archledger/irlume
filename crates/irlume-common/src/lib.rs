@@ -407,6 +407,72 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use super::*;
 
+    /// The `Locked:` kB of the /proc/self/smaps mapping containing `addr`
+    /// (Linux splits a VMA on mlock, so a locked buffer's mapping reports a
+    /// nonzero value). `None` when the address isn't found.
+    fn locked_kb_of(addr: usize) -> Option<u64> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+        let mut in_range = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ') {
+                if let Some((s, e)) = range.split_once('-') {
+                    if let (Ok(s), Ok(e)) =
+                        (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16))
+                    {
+                        in_range = s <= addr && addr < e;
+                        continue;
+                    }
+                }
+            }
+            if in_range {
+                if let Some(rest) = line.strip_prefix("Locked:") {
+                    return rest.trim().trim_end_matches("kB").trim().parse().ok();
+                }
+            }
+        }
+        None
+    }
+
+    // Regression: e8e59c2. SecretBytes derived Deserialize, constructing the
+    // inner Vec directly and skipping new()'s mlock: a secret received over
+    // IPC was swappable/dumpable. Deserialization must route through new(),
+    // observable as the deserialized buffer's pages being memlocked.
+    #[test]
+    fn deserialized_secret_bytes_are_memlocked_like_new() {
+        // Big enough to own whole pages, so the smaps Locked field is
+        // unambiguous; serialized from a plain (unlocked) Vec.
+        let payload: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+        let wire = serde_json::to_string(&payload).unwrap();
+
+        // Deserialize FIRST, before anything else in this test locks pages the
+        // allocator might hand back.
+        let de: SecretBytes = serde_json::from_str(&wire).unwrap();
+        assert_eq!(de.expose(), payload.as_slice());
+        assert_eq!(de.len(), payload.len());
+        assert!(!de.is_empty());
+        // Debug stays redacted through the custom impl path.
+        assert_eq!(format!("{de:?}"), "SecretBytes([16384 bytes redacted])");
+
+        // Control: can this environment mlock at all? (RLIMIT_MEMLOCK may
+        // forbid it; lock_slice is best-effort by design, so then there is
+        // nothing observable to assert and the test stands down.)
+        let control = SecretBytes::new(vec![0x5a; 16384]);
+        let control_mid = control.expose().as_ptr() as usize + 8192;
+        match locked_kb_of(control_mid) {
+            Some(kb) if kb > 0 => {}
+            _ => {
+                eprintln!("skipping: environment cannot mlock (RLIMIT_MEMLOCK?)");
+                return;
+            }
+        }
+        let de_mid = de.expose().as_ptr() as usize + 8192;
+        let locked = locked_kb_of(de_mid).unwrap_or(0);
+        assert!(
+            locked > 0,
+            "a deserialized SecretBytes must be memlocked like a new()-built one"
+        );
+    }
+
     #[test]
     fn enrolled_response_round_trips() {
         // The daemon serializes Response over the socket and the TUI/CLI

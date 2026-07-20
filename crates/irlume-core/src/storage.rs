@@ -763,6 +763,86 @@ mod tests {
         assert_eq!(p.next_scan_name(), "Face Scan 1");
     }
 
+    // Regression: 0be786b. write_0600 is the save-path primitive that closes
+    // the world-readable window: the file must be born 0600, not chmodded
+    // after the bytes are already on disk.
+    #[test]
+    #[cfg(unix)]
+    fn write_0600_creates_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-core-w600-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.bin");
+        write_0600(&p, b"secret bytes").unwrap();
+        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "profile files must never be world-readable");
+        assert_eq!(fs::read(&p).unwrap(), b"secret bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Regression: 0be786b. save() used fs::write straight onto the profile
+    // path: a crash mid-write left a truncated profile and the umask window
+    // made it briefly world-readable. The fix writes a 0600 temp file and
+    // renames it in, so a failed save leaves the existing profile untouched
+    // and a successful one leaves no temp residue.
+    #[test]
+    #[cfg(unix)]
+    fn save_writes_temp_then_rename_and_survives_a_failed_save() {
+        use std::os::unix::fs::PermissionsExt;
+        // The no-TPM plaintext path is the one exercisable in a unit test; on
+        // a box with /dev/tpm* present, save() would try to seal a real key.
+        if crate::template_key::tpm_available() {
+            eprintln!("skipping: TPM present; save() would touch real hardware");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("irlume-core-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+
+        let mut e = sample();
+        e.user = "atomic-save-test".into();
+        save(&e).unwrap();
+        let path = profile_path(&e.user);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "a successful save must leave no temp file behind"
+        );
+        let before = fs::read(&path).unwrap();
+
+        // Simulated failure: the dir refuses new files, so the temp file
+        // cannot be created. The old in-place fs::write would still open the
+        // (writable) profile file and replace it; temp+rename must instead
+        // fail cleanly and leave the previous profile byte-for-byte intact.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::write(dir.join("probe"), b"x").is_ok() {
+            // Running with CAP_DAC_OVERRIDE (root/container): the simulation
+            // cannot bite; restore and bail rather than assert a non-failure.
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            std::env::remove_var("IRLUME_STATE_DIR");
+            let _ = fs::remove_dir_all(&dir);
+            eprintln!("skipping failure phase: dir permissions not enforced here");
+            return;
+        }
+        let mut e2 = e.clone();
+        e2.require_challenge = true;
+        assert!(
+            save(&e2).is_err(),
+            "save must fail when the temp file cannot be created"
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a failed save must not disturb the existing profile"
+        );
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn stale_and_usable_ir_counts_partition_the_scans() {
         let ir_scan = |name: &str, space: Option<&str>| FaceScan {

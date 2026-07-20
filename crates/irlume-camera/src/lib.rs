@@ -1489,4 +1489,87 @@ mod tests {
         assert_eq!(parse_pin_allowlist(""), None);
         assert_eq!(parse_pin_allowlist("  ,  "), None);
     }
+
+    // ---- v4l2loopback harness tests -----------------------------------
+    // Env-gated: CI loads v4l2loopback, feeds the nodes with ffmpeg test
+    // patterns (YUYV 640x480 / GREY 640x400), and exports the two vars.
+    // Without them the tests return immediately (and are #[ignore]d anyway).
+
+    fn loopback_pair() -> Option<(String, String)> {
+        Some((
+            std::env::var("IRLUME_TEST_RGB_DEVICE").ok()?,
+            std::env::var("IRLUME_TEST_IR_DEVICE").ok()?,
+        ))
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_rgb_burst_streams_and_converts() {
+        let Some((rgb, _)) = loopback_pair() else {
+            return;
+        };
+        let frames = capture_rgb_burst(&rgb, 3).expect("rgb burst");
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_eq!((f.width, f.height), (RGB_W, RGB_H));
+            assert_eq!(f.spectrum, Spectrum::Rgb);
+            assert_eq!(f.data.len(), (RGB_W * RGB_H * 3) as usize);
+            let (min, max) = f
+                .data
+                .iter()
+                .fold((u8::MAX, u8::MIN), |(lo, hi), &b| (lo.min(b), hi.max(b)));
+            assert!(max > min, "a test pattern must not convert to a flat frame");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_rgb_single_and_denoised_agree_on_geometry() {
+        let Some((rgb, _)) = loopback_pair() else {
+            return;
+        };
+        let one = capture_rgb(&rgb).expect("single rgb");
+        let den = capture_rgb_denoised(&rgb).expect("denoised rgb");
+        for f in [&one, &den] {
+            assert_eq!((f.width, f.height), (RGB_W, RGB_H));
+            assert_eq!(f.data.len(), (RGB_W * RGB_H * 3) as usize);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_ir_capture_with_stats_and_sequence() {
+        let Some((_, ir)) = loopback_pair() else {
+            return;
+        };
+        let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
+        assert_eq!((frame.width, frame.height), (IR_W, IR_H));
+        assert_eq!(frame.spectrum, Spectrum::Ir);
+        assert_eq!(frame.data.len(), (IR_W * IR_H) as usize);
+        assert!(stats.burst_frames > 0, "burst must have captured frames");
+        assert!(
+            (0.0..=255.0).contains(&stats.lit_mean),
+            "lit mean {} out of byte range",
+            stats.lit_mean
+        );
+
+        let seq = capture_ir_sequence(&ir, 3, 2).expect("ir sequence");
+        assert_eq!(seq.len(), 3);
+        for f in &seq {
+            assert_eq!(f.data.len(), (IR_W * IR_H) as usize);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_capabilities_sees_a_usable_rgb_node() {
+        let Some((_rgb, _ir)) = loopback_pair() else {
+            return;
+        };
+        let caps = capabilities();
+        assert!(
+            caps.rgb,
+            "a YUYV-fed loopback node must classify as a usable RGB camera"
+        );
+    }
 }

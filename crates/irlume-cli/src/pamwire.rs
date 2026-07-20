@@ -1415,4 +1415,329 @@ mod tests {
         assert!(!is_passwd_substack("auth required pam_unix.so", "auth"));
         assert!(!is_passwd_substack("# auth substack password-auth", "auth"));
     }
+
+    #[test]
+    fn dm_pam_services_maps_each_login_manager_to_its_services() {
+        // GDM (and the Debian gdm3 alias) drive a separate fingerprint service.
+        assert_eq!(
+            dm_pam_services("gdm"),
+            ("gdm-password", Some("gdm-fingerprint"))
+        );
+        assert_eq!(
+            dm_pam_services("gdm3"),
+            ("gdm-password", Some("gdm-fingerprint"))
+        );
+        // Single-greeter DMs: KDE/others put fingerprint on the lock screen, so
+        // no separate fingerprint service here.
+        assert_eq!(dm_pam_services("sddm"), ("sddm", None));
+        assert_eq!(dm_pam_services("plasmalogin"), ("plasmalogin", None));
+        assert_eq!(dm_pam_services("lightdm"), ("lightdm", None));
+        assert_eq!(dm_pam_services("greetd"), ("greetd", None));
+        assert_eq!(dm_pam_services("ly"), ("ly", None));
+        assert_eq!(dm_pam_services("cosmic-greeter"), ("cosmic-greeter", None));
+        // Anything unrecognised is named "(unknown)" with no fingerprint service.
+        assert_eq!(dm_pam_services("mystery-dm"), ("(unknown)", None));
+    }
+
+    #[test]
+    fn label_of_takes_the_basename() {
+        assert_eq!(label_of("/etc/pam.d/gdm-password"), "gdm-password");
+        assert_eq!(label_of("/etc/pam.d/kde"), "kde");
+        assert_eq!(label_of("sudo"), "sudo"); // no slash → whole string
+    }
+
+    #[test]
+    fn is_include_auth_layout_matches_only_the_inline_includes() {
+        // Debian @include forms.
+        assert!(is_include_auth_layout("@include common-auth"));
+        assert!(is_include_auth_layout("@include login"));
+        // Arch inline includes a success=N jump cannot skip.
+        assert!(is_include_auth_layout(
+            "auth       include     system-login"
+        ));
+        assert!(is_include_auth_layout("auth include system-local-login"));
+        assert!(is_include_auth_layout("auth include system-auth"));
+        // NOT an include-auth layout: a Fedora substack (atomic for jumps), a
+        // different @include, or an include of a non-login file.
+        assert!(!is_include_auth_layout(
+            "auth     substack     password-auth"
+        ));
+        assert!(!is_include_auth_layout("@include common-account"));
+        assert!(!is_include_auth_layout("auth include password-auth"));
+        assert!(!is_include_auth_layout("account include system-login"));
+    }
+
+    #[test]
+    fn is_auth_directive_recognises_auth_lines_only() {
+        assert!(is_auth_directive("auth required pam_unix.so"));
+        assert!(is_auth_directive("-auth optional pam_gnome_keyring.so")); // leading '-'
+        assert!(is_auth_directive("   auth   substack password-auth")); // leading ws
+        assert!(!is_auth_directive("# auth required pam_unix.so")); // comment
+        assert!(!is_auth_directive("account required pam_unix.so"));
+        assert!(!is_auth_directive("session optional pam_unix.so"));
+    }
+
+    // gdm-fingerprint: the keyring unseal must land right AFTER pam_fprintd's
+    // auth line and BEFORE pam_gnome_keyring's auth line, so the sealed password
+    // is set before the keyring module reads it.
+    const GDM_FP: &str = "#%PAM-1.0\nauth       required      pam_env.so\nauth       required      pam_fprintd.so\nauth       optional      pam_gnome_keyring.so\nsession    optional      pam_gnome_keyring.so auto_start\n";
+
+    #[test]
+    fn wire_fp_keyring_inserts_between_fprintd_and_the_keyring_auth_line() {
+        let (w, changed) = wire_fp_keyring(GDM_FP);
+        assert!(changed);
+        let lines: Vec<&str> = w.lines().collect();
+        let fp = lines
+            .iter()
+            .position(|l| l.contains("pam_fprintd.so"))
+            .unwrap();
+        let kr = lines
+            .iter()
+            .position(|l| l.contains("pam_irlume.so keyring"))
+            .unwrap();
+        let gk = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("auth") && l.contains("pam_gnome_keyring.so"))
+            .unwrap();
+        assert!(
+            fp < kr && kr < gk,
+            "keyring unseal must sit fprintd→keyring"
+        );
+        // Idempotent: a second pass is a no-op.
+        let (w2, c2) = wire_fp_keyring(&w);
+        assert!(!c2 && w2 == w);
+    }
+
+    #[test]
+    fn wire_fp_keyring_needs_an_fprintd_anchor() {
+        // No pam_fprintd line → nothing to anchor to → unchanged.
+        let (w, changed) = wire_fp_keyring("#%PAM-1.0\nauth required pam_unix.so\n");
+        assert!(!changed);
+        assert_eq!(w, "#%PAM-1.0\nauth required pam_unix.so\n");
+        // A commented fprintd line is not an anchor either.
+        let (_, c) = wire_fp_keyring("#%PAM-1.0\n# auth required pam_fprintd.so\n");
+        assert!(!c);
+    }
+
+    #[test]
+    fn wire_greeter_keyring_only_in_include_layout_adds_no_face_line() {
+        // face=false, keyring=true on a @include greeter: keyring + reseal ride
+        // in, but no face `unseal` line and no permit landing.
+        let (w, changed) = wire_greeter_impl(COSMIC, false, true, true);
+        assert!(changed);
+        assert!(w.contains("pam_irlume.so keyring"));
+        assert!(w.contains("pam_irlume.so reseal"));
+        assert!(!w.contains("unseal")); // no face line at all
+    }
+
+    #[test]
+    fn wire_greeter_without_any_auth_anchor_is_a_noop() {
+        // No include layout, no password substack, no auth directive → unchanged.
+        let src = "#%PAM-1.0\naccount required pam_unix.so\nsession required pam_unix.so\n";
+        let (w, changed) = wire_greeter_impl(src, true, false, false);
+        assert!(!changed);
+        assert_eq!(w, src);
+    }
+
+    #[test]
+    fn wire_single_appends_when_there_is_no_auth_directive() {
+        // A stack with no auth line: the stanza is appended at the end.
+        let (w, c) = wire_single("#%PAM-1.0\n# comment only\n", SUDO_STANZA);
+        assert!(c && content_has_module(&w));
+        assert!(w.trim_end().ends_with(SUDO_STANZA));
+    }
+
+    #[test]
+    fn wire_lock_without_an_auth_anchor_is_a_noop() {
+        let (w, c) = wire_lock("#%PAM-1.0\naccount required pam_unix.so\n");
+        assert!(!c);
+        assert_eq!(w, "#%PAM-1.0\naccount required pam_unix.so\n");
+    }
+
+    #[test]
+    fn status_report_labels_and_login_wired_agree() {
+        // The report's rows are the greeters, the fingerprint service, the lock
+        // screen, then sudo, in that order; labels come from the constant paths.
+        let rows = status_report();
+        let labels: Vec<&str> = rows.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "gdm-password",
+                "sddm",
+                "lightdm",
+                "plasmalogin",
+                "cosmic-greeter",
+                "greetd",
+                "gdm-fingerprint",
+                "kde",
+                "sudo",
+            ]
+        );
+        // login_wired is exactly "any non-sudo row is wired" (sudo excluded).
+        let any_login = rows[..rows.len() - 1].iter().any(|(_, _, w)| *w);
+        assert_eq!(login_wired(), any_login);
+    }
+
+    #[test]
+    fn effective_uid_matches_the_real_euid() {
+        assert_eq!(effective_uid(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn selinux_pp_honours_the_env_override_only_when_it_exists() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TestDir::new("selinux-pp");
+        let pp = dir.0.join("irlume.pp");
+        std::fs::write(&pp, b"module").unwrap();
+        let old = std::env::var_os("IRLUME_SELINUX_PP");
+        // An existing override path is returned verbatim.
+        std::env::set_var("IRLUME_SELINUX_PP", &pp);
+        assert_eq!(selinux_pp(), Some(pp.to_string_lossy().into_owned()));
+        // A nonexistent override is ignored (never returned) and the search
+        // falls through to the packaged/in-repo locations instead.
+        let missing = dir.0.join("missing.pp");
+        std::env::set_var("IRLUME_SELINUX_PP", &missing);
+        assert_ne!(selinux_pp().as_deref(), missing.to_str());
+        match old {
+            Some(v) => std::env::set_var("IRLUME_SELINUX_PP", v),
+            None => std::env::remove_var("IRLUME_SELINUX_PP"),
+        }
+    }
+
+    // ---- wire_service strategy matrix (override vs edit-in-place) -------------
+
+    // A vendor-shipped greeter (Fedora substack layout), the kind plasmalogin/kde
+    // materialize an /etc override from.
+    const VENDOR_GREETER: &str = "#%PAM-1.0\nauth       substack      password-auth\nauth       optional      pam_gnome_keyring.so\naccount    include       password-auth\nsession    include       password-auth\n";
+
+    #[test]
+    fn wire_service_override_materialize_idempotent_then_remove() {
+        let dir = TestDir::new("wsvc-override");
+        let vendor = dir.0.join("plasmalogin.vendor");
+        std::fs::write(&vendor, VENDOR_GREETER).unwrap();
+        let etc = dir.0.join("plasmalogin"); // no admin /etc copy yet
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: Some(leak(&vendor)),
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+
+        // First enable → materialize the override from the vendor copy.
+        let msg = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(msg.contains("materialized override from"), "{msg}");
+        assert!(etc.exists());
+        let body = std::fs::read_to_string(&etc).unwrap();
+        assert!(body.starts_with(CREATED_PREFIX));
+        assert!(file_is_created_override(&etc));
+        assert!(body.contains("pam_irlume.so unseal ondemand"));
+
+        // Re-enable with the same inputs → recognised as already correct.
+        let msg2 = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(msg2.contains("already correctly wired"), "{msg2}");
+
+        // Disable → the created override is removed and the vendor copy restored.
+        let msg3 = wire_service(&svc, false, true, &wire).unwrap();
+        assert!(msg3.contains("removed override"), "{msg3}");
+        assert!(!etc.exists());
+    }
+
+    #[test]
+    fn wire_service_override_skips_when_vendor_absent() {
+        let dir = TestDir::new("wsvc-novendor");
+        let etc = dir.0.join("plasmalogin");
+        let vendor = dir.0.join("plasmalogin.vendor"); // never created
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: Some(leak(&vendor)),
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+        let msg = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(msg.contains("not installed (skipped)"), "{msg}");
+        assert!(!etc.exists());
+    }
+
+    #[test]
+    fn wire_service_edit_skips_absent_and_anchorless_files() {
+        let wire = |c: &str| wire_greeter_impl(c, true, false, false);
+
+        // No /etc file at all → skipped.
+        let dir = TestDir::new("wsvc-absent");
+        let etc = dir.0.join("gdm-password");
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let msg = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(msg.contains("not installed (skipped)"), "{msg}");
+
+        // Present but nothing to anchor to → skipped, no backup left behind.
+        let dir2 = TestDir::new("wsvc-noanchor");
+        let etc2 = dir2.0.join("greeter");
+        std::fs::write(&etc2, "#%PAM-1.0\naccount required pam_unix.so\n").unwrap();
+        let svc2 = Svc {
+            etc: leak(&etc2),
+            vendor: None,
+        };
+        let msg2 = wire_service(&svc2, true, true, &wire).unwrap();
+        assert!(msg2.contains("no anchor to wire"), "{msg2}");
+        assert!(!dir2.0.join(format!("greeter{BACKUP}")).exists());
+    }
+
+    #[test]
+    fn wire_service_edit_enable_backs_up_then_recognises_already_wired() {
+        let dir = TestDir::new("wsvc-enable");
+        let etc = dir.0.join("gdm-password");
+        std::fs::write(&etc, GDM).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+
+        let msg = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(msg.contains("wired (backup"), "{msg}");
+        assert!(dir.0.join(format!("gdm-password{BACKUP}")).exists());
+        let after = std::fs::read_to_string(&etc).unwrap();
+        assert!(content_has_module(&after));
+
+        // Second identical enable is a recognised no-op (rebuilt from backup).
+        let msg2 = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(msg2.contains("already correctly wired"), "{msg2}");
+    }
+
+    #[test]
+    fn wire_service_edit_disable_strips_when_no_backup_exists() {
+        // Wired file, no .pre-irlume backup → strip in place (not restore).
+        let dir = TestDir::new("wsvc-strip");
+        let (wired, _) = wire_greeter_impl(GDM, true, true, false);
+        let etc = dir.0.join("gdm-password");
+        std::fs::write(&etc, &wired).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+        let msg = wire_service(&svc, false, true, &wire).unwrap();
+        assert!(msg.contains("stripped irlume lines"), "{msg}");
+        assert!(!msg.contains("backup kept")); // the no-backup phrasing
+        let after = std::fs::read_to_string(&etc).unwrap();
+        assert!(!content_has_module(&after));
+    }
+
+    #[test]
+    fn wire_service_edit_disable_reports_a_clean_file_as_not_wired() {
+        let dir = TestDir::new("wsvc-clean");
+        let etc = dir.0.join("gdm-password");
+        std::fs::write(&etc, GDM).unwrap(); // never wired
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+        let msg = wire_service(&svc, false, true, &wire).unwrap();
+        assert!(msg.contains("not wired"), "{msg}");
+    }
 }

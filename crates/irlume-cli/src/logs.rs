@@ -28,9 +28,17 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     }
 }
 
-fn view(opts: &[String]) -> ExitCode {
-    let mut cmd = Command::new("journalctl");
-    cmd.args(["--no-pager", "-g", PATTERN]);
+/// Build the full journalctl argv (program + args) from the view options, or an
+/// error message for a bad option. Extracted verbatim from `view` so the argv
+/// assembly (the whole point of the option parse) is unit-testable without
+/// execing journalctl; `view` just runs what this returns. Zero behavior change.
+fn build_view_argv(opts: &[String]) -> Result<Vec<String>, String> {
+    let mut argv = vec![
+        "journalctl".to_string(),
+        "--no-pager".to_string(),
+        "-g".to_string(),
+        PATTERN.to_string(),
+    ];
     let mut follow = false;
     let mut since = false;
     let mut it = opts.iter().map(String::as_str);
@@ -40,24 +48,40 @@ fn view(opts: &[String]) -> ExitCode {
             "--since" => match it.next() {
                 Some(v) => {
                     since = true;
-                    cmd.args(["--since", v]);
+                    argv.push("--since".to_string());
+                    argv.push(v.to_string());
                 }
                 None => {
-                    eprintln!("[logs] --since needs a value, e.g. --since \"10 min ago\"");
-                    return ExitCode::FAILURE;
+                    return Err(
+                        "[logs] --since needs a value, e.g. --since \"10 min ago\"".to_string()
+                    );
                 }
             },
             other => {
-                eprintln!("[logs] unknown option '{other}' (usage: irlume logs [-f] [--since T] [debug on|off])");
-                return ExitCode::FAILURE;
+                return Err(format!(
+                    "[logs] unknown option '{other}' (usage: irlume logs [-f] [--since T] [debug on|off])"
+                ));
             }
         }
     }
     if follow {
-        cmd.arg("-f");
+        argv.push("-f".to_string());
     } else if !since {
-        cmd.arg("-b");
+        argv.push("-b".to_string());
     } // default: this boot
+    Ok(argv)
+}
+
+fn view(opts: &[String]) -> ExitCode {
+    let argv = match build_view_argv(opts) {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
     if !is_root() {
         eprintln!("[logs] note: without root (or the systemd-journal group) the system journal may be hidden; re-run with sudo if this looks empty");
     }
@@ -139,4 +163,63 @@ fn restart_daemon() {
 
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_view_greps_the_pattern_this_boot() {
+        // No options → the fixed grep argv plus `-b` (this boot).
+        assert_eq!(
+            build_view_argv(&[]).unwrap(),
+            vec!["journalctl", "--no-pager", "-g", PATTERN, "-b"]
+        );
+    }
+
+    #[test]
+    fn follow_replaces_the_boot_filter_with_f() {
+        // -f / --follow both set follow, which suppresses -b and appends -f.
+        for flag in ["-f", "--follow"] {
+            let argv = build_view_argv(&opts(&[flag])).unwrap();
+            assert_eq!(argv.last().unwrap(), "-f");
+            assert!(!argv.contains(&"-b".to_string()));
+        }
+    }
+
+    #[test]
+    fn since_passes_its_value_through_and_drops_the_boot_filter() {
+        let argv = build_view_argv(&opts(&["--since", "10 min ago"])).unwrap();
+        // --since <value> present, in order, and no default -b when a window is given.
+        let pos = argv.iter().position(|a| a == "--since").unwrap();
+        assert_eq!(argv[pos + 1], "10 min ago");
+        assert!(!argv.contains(&"-b".to_string()));
+        assert!(!argv.contains(&"-f".to_string()));
+    }
+
+    #[test]
+    fn since_without_a_value_is_an_error() {
+        let err = build_view_argv(&opts(&["--since"])).unwrap_err();
+        assert!(err.contains("--since needs a value"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_option_names_itself_in_the_error() {
+        let err = build_view_argv(&opts(&["--bogus"])).unwrap_err();
+        assert!(err.contains("unknown option '--bogus'"), "{err}");
+    }
+
+    #[test]
+    fn follow_and_since_compose() {
+        // Both given: --since value present AND -f appended, still no -b.
+        let argv = build_view_argv(&opts(&["--since", "1h", "-f"])).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--since", "1h"]));
+        assert_eq!(argv.last().unwrap(), "-f");
+        assert!(!argv.contains(&"-b".to_string()));
+    }
 }

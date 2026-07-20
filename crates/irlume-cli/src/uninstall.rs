@@ -380,4 +380,43 @@ mod tests {
     fn remove_repo_files_tolerates_a_missing_directory() {
         remove_repo_files("/nonexistent/irlume-repo-dir");
     }
+
+    // remove_repo_files also backs the PPA teardown, which sweeps several key
+    // dirs; a nested subdir must be ignored (it only deletes files it names).
+    #[test]
+    fn remove_repo_files_ignores_subdirectories() {
+        let dir = std::env::temp_dir().join(format!("irlume-repo-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("irlume-subdir")).unwrap();
+        std::fs::write(dir.join("irlume.list"), b"x").unwrap();
+        remove_repo_files(dir.to_str().unwrap());
+        assert!(!dir.join("irlume.list").exists(), "file should be removed");
+        assert!(
+            dir.join("irlume-subdir").is_dir(),
+            "a same-named subdir must be left in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn yn_reports_yes_or_the_maybe_not_running_note() {
+        assert_eq!(yn(true), "yes");
+        assert_eq!(yn(false), "no (may not have been running)");
+    }
+
+    // run_pkg maps a package manager's exit into a readable Result: success →
+    // Ok, non-zero → Err naming the tool, spawn failure → Err. Exercised with
+    // the harmless `true`/`false` shells and a bin that does not exist (never a
+    // real package manager, which would touch the system).
+    #[test]
+    fn run_pkg_maps_exit_status_to_a_result() {
+        assert_eq!(
+            run_pkg("true", &["remove", "irlume"]).unwrap(),
+            "removed the true package"
+        );
+        let nonzero = run_pkg("false", &[]).unwrap_err();
+        assert!(nonzero.contains("false exited with"), "{nonzero}");
+        let missing = run_pkg("irlume-no-such-pkg-manager-xyz", &[]).unwrap_err();
+        assert!(missing.contains("could not run"), "{missing}");
+    }
 }

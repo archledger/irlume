@@ -237,6 +237,21 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     if !std::path::Path::new(device).exists() {
         return Err(Error::Hardware(format!("{device}: no camera found")));
     }
+    // TEST ESCAPE: a comma-separated allowlist of exact device paths that may
+    // bypass the physical-device pin. Exists only for the virtual-camera test
+    // harness (v4l2loopback nodes have no physical bus by definition). The
+    // daemon's environment is root-controlled via its systemd unit, so an
+    // unprivileged local user cannot set this for the auth path; every use is
+    // logged loudly. See docs/THREAT_MODEL.md (camera injection).
+    if let Ok(allow) = std::env::var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA") {
+        if allow.split(',').any(|d| d.trim() == device) {
+            eprintln!(
+                "irlume: WARNING: {device} accepted without a physical-device pin \
+                 (IRLUME_TEST_ALLOW_VIRTUAL_CAMERA)"
+            );
+            return Ok(());
+        }
+    }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");
     let real = std::fs::canonicalize(&link).map_err(|_| {
@@ -1488,5 +1503,123 @@ mod tests {
         // Empty / unset → no pin (physical-bus check still applies).
         assert_eq!(parse_pin_allowlist(""), None);
         assert_eq!(parse_pin_allowlist("  ,  "), None);
+    }
+
+    // ---- v4l2loopback harness tests -----------------------------------
+    // Env-gated: CI loads v4l2loopback, feeds the nodes with ffmpeg test
+    // patterns (YUYV 640x480 / GREY 640x400), and exports the two vars.
+    // Without them the tests return immediately (and are #[ignore]d anyway).
+
+    fn loopback_pair() -> Option<(String, String)> {
+        Some((
+            std::env::var("IRLUME_TEST_RGB_DEVICE").ok()?,
+            std::env::var("IRLUME_TEST_IR_DEVICE").ok()?,
+        ))
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_rgb_burst_streams_and_converts() {
+        let Some((rgb, _)) = loopback_pair() else {
+            return;
+        };
+        let frames = capture_rgb_burst(&rgb, 3).expect("rgb burst");
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_eq!((f.width, f.height), (RGB_W, RGB_H));
+            assert_eq!(f.spectrum, Spectrum::Rgb);
+            assert_eq!(f.data.len(), (RGB_W * RGB_H * 3) as usize);
+            let (min, max) = f
+                .data
+                .iter()
+                .fold((u8::MAX, u8::MIN), |(lo, hi), &b| (lo.min(b), hi.max(b)));
+            assert!(max > min, "a test pattern must not convert to a flat frame");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_rgb_single_and_denoised_agree_on_geometry() {
+        let Some((rgb, _)) = loopback_pair() else {
+            return;
+        };
+        let one = capture_rgb(&rgb).expect("single rgb");
+        let den = capture_rgb_denoised(&rgb).expect("denoised rgb");
+        for f in [&one, &den] {
+            assert_eq!((f.width, f.height), (RGB_W, RGB_H));
+            assert_eq!(f.data.len(), (RGB_W * RGB_H * 3) as usize);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_ir_capture_with_stats_and_sequence() {
+        let Some((_, ir)) = loopback_pair() else {
+            return;
+        };
+        let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
+        assert_eq!((frame.width, frame.height), (IR_W, IR_H));
+        assert_eq!(frame.spectrum, Spectrum::Ir);
+        // Drivers may hand back a buffer with trailing slack (v4l2loopback
+        // pads by 2 KiB); the contract is at-least-one-byte-per-pixel, and
+        // the consumers guard exactly that.
+        assert!(frame.data.len() >= (IR_W * IR_H) as usize);
+        assert!(stats.burst_frames > 0, "burst must have captured frames");
+        assert!(
+            (0.0..=255.0).contains(&stats.lit_mean),
+            "lit mean {} out of byte range",
+            stats.lit_mean
+        );
+
+        let seq = capture_ir_sequence(&ir, 3, 2).expect("ir sequence");
+        assert_eq!(seq.len(), 3);
+        for f in &seq {
+            assert!(f.data.len() >= (IR_W * IR_H) as usize);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_capabilities_classify_rgb_but_never_pair() {
+        // Only meaningful when the loopback nodes sit inside discover_nodes'
+        // /dev/video0..9 scan range (CI uses 8 and 9).
+        let Some((rgb, _ir)) = loopback_pair() else {
+            return;
+        };
+        if !(0..10).any(|n| rgb == format!("/dev/video{n}")) {
+            return;
+        }
+        let caps = capabilities();
+        assert!(
+            caps.rgb,
+            "a YUYV-fed loopback node classifies as a usable RGB camera"
+        );
+        assert!(
+            !caps.ir_pair,
+            "virtual nodes share no physical sysfs parent, so they must never \
+             form a Hello pair"
+        );
+    }
+
+    #[test]
+    fn virtual_camera_escape_is_exact_path_only() {
+        // Distinct env vars from select_pair_env_override_wins, so no race.
+        // The escape must match the exact device path, nothing looser.
+        std::env::set_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/null, /dev/zero");
+        assert!(
+            verify_pinned("/dev/null").is_ok(),
+            "an exactly-listed existing node passes the escape"
+        );
+        let err = verify_pinned("/dev/urandom").unwrap_err().to_string();
+        assert!(
+            err.contains("refusing"),
+            "an unlisted node must still hit the physical-device pin, got: {err}"
+        );
+        std::env::set_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA", "/dev/nul");
+        assert!(
+            verify_pinned("/dev/null").is_err(),
+            "a prefix must not satisfy the exact-path escape"
+        );
+        std::env::remove_var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA");
     }
 }

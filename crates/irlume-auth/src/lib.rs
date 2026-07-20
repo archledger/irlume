@@ -3353,4 +3353,63 @@ mod engine_tests {
         }
         teardown_sandbox(&dir);
     }
+
+    /// Full `authenticate()` through the LIVE capture pipeline, against the
+    /// v4l2loopback feeder nodes CI provides: opens both devices, runs the
+    /// parallel RGB+IR capture, detection, and the deny mapping. The ffmpeg
+    /// test pattern holds no face, so the outcome must be a clean denial,
+    /// not an error, with a face-shaped reason. Env-gated like the camera
+    /// crate's loopback tests.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_authenticate_denies_without_a_face() {
+        let (Ok(rgb), Ok(ir)) = (
+            std::env::var("IRLUME_TEST_RGB_DEVICE"),
+            std::env::var("IRLUME_TEST_IR_DEVICE"),
+        ) else {
+            return;
+        };
+        let _g = env_guard();
+        ort_init();
+        // Legacy one-shot: a single capture pass instead of a grace window,
+        // so a no-face run finishes in one camera round.
+        std::env::set_var("IRLUME_GRACE_MS", "0");
+        let dir = state_sandbox("loopback-auth");
+        write_enrollment(
+            &dir,
+            &Enrollment {
+                user: "lbuser".into(),
+                require_eyes_open: false,
+                require_challenge: false,
+                camera_binding: None,
+                profiles: vec![FaceProfile {
+                    ir_calib: None,
+                    name: "Face Profile 1".into(),
+                    scans: vec![scan512(1, false, None)],
+                }],
+            },
+        );
+
+        let mut e = Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("engine load")
+        .with_devices(&rgb, &ir);
+
+        let out = e
+            .authenticate("lbuser", None)
+            .expect("a faceless frame is a denial, not a hardware error");
+        assert!(!out.granted, "no face on the feed must never grant");
+        assert!(!out.live);
+        let reason = out.reason.to_lowercase();
+        assert!(
+            reason.contains("face"),
+            "denial should name the missing face, got: {}",
+            out.reason
+        );
+
+        std::env::remove_var("IRLUME_GRACE_MS");
+        teardown_sandbox(&dir);
+    }
 }

@@ -179,6 +179,18 @@ IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib -- 
   tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
 ```
 
+The camera-path tests (also `#[ignore]`) run against v4l2loopback virtual
+cameras fed by ffmpeg test patterns; CI does this too (Secure Boot hosts
+cannot load the unsigned module, which is why the gate is an env var):
+
+```sh
+sudo modprobe v4l2loopback devices=2 video_nr=42,43 exclusive_caps=0
+ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video42 &
+ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video43 &
+IRLUME_TEST_RGB_DEVICE=/dev/video42 IRLUME_TEST_IR_DEVICE=/dev/video43 \
+  cargo test -p irlume-camera -p irlume-auth -- --ignored loopback_ --test-threads=1
+```
+
 `IRLUME_TCTI` is the production TCTI override; the remaining ignored tests
 (durability, fault-injection, and the host-provisioned pcrlock roundtrip)
 are campaign tools that need a provisioned host and stay manual; the

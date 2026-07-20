@@ -343,4 +343,55 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// `enabled_name` reads the third-party key from settings.conf: absent file
+    /// → None, a set key → its value. `file_state` classifies the weights file
+    /// as absent vs checksum-mismatch (the on-disk states we can produce without
+    /// the real pinned bytes).
+    #[test]
+    fn enabled_name_and_file_state_read_config_and_weights() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-models-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        // No settings.conf → nothing enabled.
+        assert_eq!(enabled_name(), None);
+        let m = &thirdparty::CATALOG[0];
+
+        // The weights file is absent until fetched.
+        assert_eq!(file_state(m), "weights not fetched");
+
+        // Bytes that do not match the pinned sha256 classify as a mismatch.
+        std::fs::create_dir_all(thirdparty::dir()).unwrap();
+        std::fs::write(thirdparty::model_path(m), b"not the real weights").unwrap();
+        assert!(file_state(m).contains("CHECKSUM MISMATCH"));
+        std::fs::remove_file(thirdparty::model_path(m)).unwrap();
+
+        // A set key is read back verbatim.
+        std::fs::write(
+            cfg.join("settings.conf"),
+            format!("{}={}\n", thirdparty::SETTINGS_KEY, m.name),
+        )
+        .unwrap();
+        assert_eq!(enabled_name().as_deref(), Some(m.name));
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

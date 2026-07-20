@@ -215,4 +215,184 @@ mod tests {
         let bad = "{\"sha256\":[{\"pcrs\":[7],\"pkfp\":\"7682\",\"pol\":\"2\u{01f0}bfca5\",\"sig\":\"\"}]}";
         assert!(parse_signatures(bad, "sha256").is_err());
     }
+
+    #[test]
+    fn rejects_bad_signature_base64() {
+        // `sig` is base64-decoded; a non-base64 body must surface as a Protocol
+        // error tagged so the operator can tell it apart from a bad `pol`.
+        let bad = r#"{"sha256":[{"pcrs":[11],"pkfp":"7682","pol":"01","sig":"@@not-b64@@"}]}"#;
+        match parse_signatures(bad, "sha256") {
+            Err(Error::Protocol(m)) => assert!(m.contains("bad signature base64"), "{m}"),
+            other => panic!("expected Protocol(bad signature base64), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        match parse_signatures("{ this is not json", "sha256") {
+            Err(Error::Protocol(_)) => {}
+            other => panic!("expected Protocol on bad JSON, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_entry_missing_required_field() {
+        // `sig` omitted: serde fails the RawEntry decode -> Protocol.
+        let bad = r#"{"sha256":[{"pcrs":[11],"pkfp":"aa","pol":"01"}]}"#;
+        assert!(matches!(
+            parse_signatures(bad, "sha256"),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_odd_length_hex_pol() {
+        let bad = r#"{"sha256":[{"pcrs":[11],"pkfp":"aa","pol":"abc","sig":"AQ=="}]}"#;
+        match parse_signatures(bad, "sha256") {
+            Err(Error::Protocol(m)) => assert!(m.contains("odd-length"), "{m}"),
+            other => panic!("expected Protocol(odd-length), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_empty_pcrs_and_decodes_sig() {
+        // Empty `pcrs` is structurally valid JSON and must parse; the base64
+        // `sig` "AQ==" decodes to the single byte 0x01.
+        let j = r#"{"sha256":[{"pcrs":[],"pkfp":"aa","pol":"02","sig":"AQ=="}]}"#;
+        let sigs = parse_signatures(j, "sha256").unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].pcrs, Vec::<u32>::new());
+        assert_eq!(sigs[0].pol, vec![0x02]);
+        assert_eq!(sigs[0].sig, vec![0x01]);
+    }
+
+    // ---- filesystem/discovery paths (env-driven; serialized on ENV_LOCK) ----
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_tmp(name: &str) -> PathBuf {
+        let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "irlume-pcrsig-test-{}-{}-{}",
+            std::process::id(),
+            n,
+            name
+        ))
+    }
+
+    fn clear_pcr_env() {
+        std::env::remove_var("IRLUME_PCR_SIGNATURE");
+        std::env::remove_var("IRLUME_PCR_PUBKEY");
+    }
+
+    #[test]
+    fn discover_signature_path_env_override() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        clear_pcr_env();
+        let p = unique_tmp("sig.json");
+        std::fs::write(&p, FIXTURE).unwrap();
+        std::env::set_var("IRLUME_PCR_SIGNATURE", &p);
+        assert_eq!(discover_signature_path(), Some(p.clone()));
+
+        // Env pointing at a nonexistent file yields None (not the stale path).
+        std::env::set_var("IRLUME_PCR_SIGNATURE", "/nonexistent/irlume/none.json");
+        assert_eq!(discover_signature_path(), None);
+
+        // With the override gone, discovery walks the system dirs. Whatever it
+        // returns (if anything) must be a real, correctly-named path.
+        std::env::remove_var("IRLUME_PCR_SIGNATURE");
+        if let Some(found) = discover_signature_path() {
+            assert!(found.exists(), "discover must only return existing paths");
+            assert!(found.ends_with(SIGNATURE_FILE));
+        }
+        clear_pcr_env();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn discover_pubkey_path_env_override() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        clear_pcr_env();
+        let p = unique_tmp("pub.pem");
+        std::fs::write(&p, "PEM").unwrap();
+        std::env::set_var("IRLUME_PCR_PUBKEY", &p);
+        assert_eq!(discover_pubkey_path(), Some(p.clone()));
+
+        std::env::set_var("IRLUME_PCR_PUBKEY", "/nonexistent/irlume/none.pem");
+        assert_eq!(discover_pubkey_path(), None);
+
+        std::env::remove_var("IRLUME_PCR_PUBKEY");
+        if let Some(found) = discover_pubkey_path() {
+            assert!(found.exists());
+            assert!(found.ends_with(PUBKEY_FILE));
+        }
+        clear_pcr_env();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn signed_policy_available_needs_both_artifacts() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        clear_pcr_env();
+        let sig = unique_tmp("sig2.json");
+        let pk = unique_tmp("pub2.pem");
+        std::fs::write(&sig, FIXTURE).unwrap();
+        std::fs::write(&pk, "PEM").unwrap();
+
+        std::env::set_var("IRLUME_PCR_SIGNATURE", &sig);
+        std::env::set_var("IRLUME_PCR_PUBKEY", &pk);
+        assert!(signed_policy_available());
+
+        // Missing the pubkey -> unavailable.
+        std::env::set_var("IRLUME_PCR_PUBKEY", "/nonexistent/irlume/none.pem");
+        assert!(!signed_policy_available());
+
+        clear_pcr_env();
+        let _ = std::fs::remove_file(&sig);
+        let _ = std::fs::remove_file(&pk);
+    }
+
+    #[test]
+    fn load_pubkey_pem_reads_file_or_errors() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        clear_pcr_env();
+        let pk = unique_tmp("pub3.pem");
+        let body = "-----BEGIN PUBLIC KEY-----\nMFkw\n-----END PUBLIC KEY-----\n";
+        std::fs::write(&pk, body).unwrap();
+        std::env::set_var("IRLUME_PCR_PUBKEY", &pk);
+        assert_eq!(load_pubkey_pem().unwrap(), body);
+
+        // No discoverable key -> Policy error, not a panic.
+        std::env::set_var("IRLUME_PCR_PUBKEY", "/nonexistent/irlume/none.pem");
+        assert!(matches!(load_pubkey_pem(), Err(Error::Policy(_))));
+
+        clear_pcr_env();
+        let _ = std::fs::remove_file(&pk);
+    }
+
+    #[test]
+    fn load_signatures_and_signed_pcrs_via_file() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        clear_pcr_env();
+        let sig = unique_tmp("sig4.json");
+        std::fs::write(&sig, FIXTURE).unwrap();
+        std::env::set_var("IRLUME_PCR_SIGNATURE", &sig);
+
+        let sigs = load_signatures("sha256").unwrap();
+        assert_eq!(sigs.len(), 2);
+        assert_eq!(sigs[0].pkfp, "7682");
+
+        assert_eq!(signed_pcrs("sha256"), Some(vec![11]));
+        // A bank with no entries -> first() is None.
+        assert_eq!(signed_pcrs("sha384"), None);
+
+        // No signature file discoverable -> Policy error from load_signatures.
+        std::env::set_var("IRLUME_PCR_SIGNATURE", "/nonexistent/irlume/none.json");
+        assert!(matches!(load_signatures("sha256"), Err(Error::Policy(_))));
+        assert_eq!(signed_pcrs("sha256"), None);
+
+        clear_pcr_env();
+        let _ = std::fs::remove_file(&sig);
+    }
 }

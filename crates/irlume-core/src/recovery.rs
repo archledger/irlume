@@ -27,7 +27,7 @@ use crate::crypto;
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use irlume_common::{Error, Result};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -72,7 +72,7 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
         return Err(Error::Policy("empty recovery passphrase".into()));
     }
     let mut salt = [0u8; SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut salt);
     let dk = derive_key(passphrase, &salt, M_COST, T_COST, P_COST)?;
     let wrapped = crypto::encrypt(&dk, template_key)?;
     Ok(RecoveryEnvelope {

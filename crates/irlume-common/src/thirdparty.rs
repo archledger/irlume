@@ -80,7 +80,12 @@ pub fn model_path(m: &ThirdPartyModel) -> PathBuf {
 /// the CLI's enable/verify path and the daemon's load guard agree byte for byte.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
-    format!("{:x}", sha2::Sha256::digest(bytes))
+    // sha2 0.11's digest output no longer implements LowerHex; hex-encode
+    // the bytes directly.
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Whether a fetched weight file is present and matches its pinned checksum.

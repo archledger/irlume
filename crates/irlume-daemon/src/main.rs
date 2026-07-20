@@ -24,7 +24,6 @@ const MODEL_MANIFEST: &str = include_str!("../../../models/SHA256SUMS");
 /// adapters, and refusing to start would turn a model swap into a lockout.
 /// `IRLUME_MODELS_STRICT=1` upgrades the warning to a startup refusal.
 fn verify_models(paths: &[&str]) {
-    use sha2::Digest;
     let known: std::collections::HashSet<&str> = MODEL_MANIFEST
         .lines()
         .filter_map(|l| l.split_whitespace().next())
@@ -47,7 +46,7 @@ fn verify_models(paths: &[&str]) {
                 continue;
             }
         };
-        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let digest = irlume_common::thirdparty::sha256_hex(&bytes);
         if !known.contains(digest.as_str()) {
             eprintln!(
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"

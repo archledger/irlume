@@ -318,7 +318,7 @@ impl Engine {
             self.ir_adapter = Some(Adapter::load_from_file(path)?);
             let bytes = std::fs::read(path)
                 .map_err(|e| irlume_common::Error::Io(format!("{path}: {e}")))?;
-            let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+            let digest = irlume_common::thirdparty::sha256_hex(&bytes);
             self.ir_space = format!("adapter:{}", &digest[..12]);
         }
         Ok(self)

@@ -1,0 +1,46 @@
+name: Hardware report
+description: A camera, IR emitter, fingerprint reader, or TPM that misbehaves with irlume
+title: "[hw] "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most hardware fixes start from the same three command outputs. Filling them in
+        up front usually saves a full round-trip.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine and camera
+      description: Laptop or camera model, plus the USB ID if you know it (`lsusb | grep -i cam`)
+      placeholder: "ASUS Zenbook S 14, 04f2:b6d9"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distro and desktop
+      placeholder: "Fedora 44 KDE (Wayland)"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `irlume doctor`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: detect
+    attributes:
+      label: Output of `irlume detect` and `irlume version`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened, and what you expected
+      description: If login or enrollment failed, add the relevant lines from `irlume logs --since "10 min ago"`
+    validations:
+      required: true

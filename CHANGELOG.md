@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **`fingerprint enable` no longer disables face auth with nothing wired on
+  Arch-family distros.** On distros without authselect/pam-auth-update the
+  command printed manual wiring instructions and then recorded
+  `method=fingerprint` anyway, so the daemon stood face down while no module
+  drove the fingerprint prompt: the box silently became password-only. The
+  method now changes only after an active `pam_fprintd.so` line actually exists
+  in `/etc/pam.d`; the same check guards the authselect/pam-auth-update paths,
+  which can exit 0 without producing the line (e.g. a custom authselect profile
+  lacking the feature).
+
 - **Tier-1 signed-PCR sealing works.** irlume's strongest TPM tier (a
   `PolicyAuthorize` over systemd's PCR-signing key, the one that survives kernel
   updates without a reseal) never actually engaged. It loaded systemd's public
@@ -16,6 +26,76 @@ All notable changes to irlume are documented here. This project adheres to
   hierarchy fixes it (the key's Name, which the sealed policy commits to, is
   hierarchy-independent, so the policy is unchanged). Verified on a real
   systemd-boot host, including a Tier-1 seal that unseals after a reboot.
+
+- **The "irlumed is not running" guidance survives newer kernels.** Connecting
+  to a stale daemon socket (daemon gone, file left behind) returns
+  `ECONNRESET` instead of `ECONNREFUSED` on newer kernels (observed on
+  7.1.4-zen by the self-hosted hardware runner); the client now maps both to
+  the actionable start-the-daemon message instead of a raw errno.
+
+### Added
+
+- **Panic firewall in `pam_irlume.so`.** Every PAM entry point now runs behind
+  `catch_unwind`; a panic anywhere in the module or a dependency maps to
+  `PAM_IGNORE`, so the stack falls through to the password. Without it, a panic
+  reaching the `extern "C"` boundary aborts the calling process (sudo or the
+  greeter, since Rust 1.81), and the module's own dependency stack contains
+  reachable panics. Crashing auth modules were the dominant lockout/fail-open
+  class in the pre-2020 generation of face-PAM projects.
+- **NIST known-answer test for the template envelope.** A CAVP AES-256-GCM
+  vector (`gcmEncryptExtIV256.rsp`) is decrypted through the on-disk
+  `nonce ‖ ciphertext ‖ tag` layout in the test suite, and the 28-byte framing
+  overhead is pinned. An `aes-gcm` upgrade that changes the algorithm or the
+  blob layout now fails CI instead of silently orphaning every encrypted
+  enrollment (a sibling project nearly merged exactly that dependency bump).
+- **Hardware-report issue template.** New GitHub issue form that asks for the
+  machine/camera model, distro, and `irlume doctor` / `irlume detect` output up
+  front, so camera and emitter quirks arrive with the data a fix needs.
+- **`irlume fingerprint verify` and `irlume fingerprint reset`.** `verify` runs
+  one interactive round against the enrolled prints and is offered
+  automatically after every enrollment, catching the "enroll succeeds, verify
+  never matches" sensor failure before the user relies on it at the greeter.
+  `reset` deletes every print fprintd holds for the user (confirm-gated;
+  `--yes` for scripts; refuses to delete without a terminal) and offers a fresh
+  enrollment: the remedy for chip/host template desync after a Windows
+  dual-boot enrollment, an OS reinstall, or a BIOS fingerprint wipe.
+- **Fingerprint doctor checks.** `irlume doctor` now warns on: a stale fprintd
+  device claim (the dominant post-suspend failure; finger prompts silently stop
+  until `systemctl restart fprintd`), a vendor driver stack
+  (open-fprintd/python-validity) owning the fprint bus name instead of stock
+  fprintd, pam_faillock sharing a stack with pam_fprintd (a touch-sensor
+  misread can burn every retry in seconds and lock the account), and
+  pam_fprintd reachable from `sudo` while an SSH server runs (every remote
+  `sudo` stalls up to 30s waiting on the local reader).
+
+- **IR capture negotiates beyond native GREY.** IR nodes that expose only the
+  16-bit grey family (Y16/Y10/Y12) or only a packed colour container
+  (NV12/YUYV) now work: 16-bit frames are converted with an effective-depth
+  estimate (the V4L2 spec keeps sample data LSB-aligned and allows Y16 to
+  carry as few as 10 real bits, so a fixed top-byte take reads such sensors as
+  near-black), and NV12/YUYV nodes contribute their 8-bit luma plane. Y16-class
+  nodes also classify as IR now instead of falling to Other, which silently
+  demoted those machines to the RGB convenience tier. MJPEG-only IR nodes get
+  an error naming what the camera offers. Validated against the reference IR
+  camera (native GREY path unchanged, strobe capture intact).
+
+### Changed (fingerprint plumbing)
+
+- Every fprintd/busctl helper now runs under `LC_ALL=C`; the fprintd CLI tools
+  are gettext-localized, so on a non-English locale the status parsing silently
+  stopped working.
+- Enrollment has a 120-second completion deadline (a wedged driver otherwise
+  hangs the enroll forever), captures stderr, and maps each failure class to
+  its own actionable message: reader claimed by another session, on-sensor
+  storage full, reader disconnected mid-enroll, polkit refusal, no device.
+- Listing enrolled fingers now distinguishes "no fingers enrolled" from "the
+  listing failed" (stale claim, polkit refusal, readerless box —
+  `fprintd-list` exits 0 in all of them). Found live: over SSH, polkit refuses
+  the listing, and status/verify used to answer "no finger enrolled; run
+  irlume fingerprint add", pointing exactly the wrong way.
+- Stale-claim detection matches the D-Bus error names (never translated) in
+  addition to the C-locale phrases, and multi-reader machines now report every
+  reader's name instead of only the first.
 
 ### Changed
 

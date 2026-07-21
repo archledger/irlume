@@ -139,6 +139,36 @@ Expected on-demand matrix (all live-validated):
   /org/freedesktop/secrets/collection/kdewallet org.freedesktop.Secret.Collection Locked`
   (`b false` = unlocked).
 
+## Fingerprint reader stopped responding
+
+The most common cause is a stale fprintd device claim, and the most common
+trigger is suspend/resume: fprintd can hold the reader claimed across a sleep
+cycle, after which `pam_fprintd` fails silently and the finger prompt never
+appears again (upstream fprintd issues #192 and #216 track this). Symptoms and
+checks:
+
+- `irlume doctor` prints a stale-claim warning when it detects the wedge.
+- `irlume fingerprint status` reports the listing failure instead of
+  pretending no finger is enrolled.
+- The fix is always the same: `sudo systemctl restart fprintd`, which releases
+  the claim. Enrollment and verification work again immediately.
+
+Two related traps doctor also checks for:
+
+- **pam_faillock in the same stack as pam_fprintd** (Fedora default layout): a
+  touch-sensor misread can burn all fingerprint retries in under two seconds
+  and every one counts toward the account lockout. Recover with
+  `faillock --user <you> --reset`.
+- **pam_fprintd reachable from `sudo` plus a running SSH server:** `sudo` typed
+  inside an SSH session stalls for the full fingerprint timeout (up to 30
+  seconds) waiting on a reader the remote user cannot touch.
+
+`irlume fingerprint reset` deletes every print fprintd holds for the user and
+re-enrolls. Use it when fingers list fine but never verify: that is template
+desync between the sensor's on-chip storage and the host database, typical
+after enrolling in Windows on a dual-boot machine, reinstalling the OS, or a
+BIOS "clear fingerprints".
+
 ## Per-camera cue tuning
 
 The liveness cues carry per-camera-calibrated thresholds (set on the ASUS and

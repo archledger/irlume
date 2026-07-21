@@ -873,7 +873,9 @@ fn fingerprint_status_and_usage() {
     let (code, _, err) = run(&mut sb.cmd(&["fingerprint", "bogus"]));
     assert_eq!(code, 2);
     assert!(
-        err.contains("usage: irlume fingerprint [--user U] <status|add|enable|disable>"),
+        err.contains(
+            "usage: irlume fingerprint [--user U] <status|add|verify|reset|enable|disable>"
+        ),
         "{err}"
     );
 
@@ -881,6 +883,15 @@ fn fingerprint_status_and_usage() {
     assert_eq!(code, 0);
     assert!(out.contains("fprintd tooling"), "{out}");
     assert!(out.contains("active method"), "{out}");
+
+    // Without a reader (or without fprintd at all), verify and reset both fail
+    // cleanly instead of hanging or deleting anything. reset additionally
+    // refuses non-interactive use without --yes, so a script can never wipe
+    // prints by accident; with no reader present every path still exits 1.
+    let (code, _, err) = run(&mut sb.cmd(&["fingerprint", "verify", "--user", "tester"]));
+    assert_eq!(code, 1, "{err}");
+    let (code, _, err) = run(&mut sb.cmd(&["fingerprint", "reset", "--user", "tester"]));
+    assert_eq!(code, 1, "{err}");
 
     if !is_root() {
         let (code, _, err) = run(&mut sb.cmd(&["fingerprint", "disable"]));

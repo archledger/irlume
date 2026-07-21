@@ -1,0 +1,39 @@
+name: Bug report
+description: Something broke that is not tied to a specific camera, reader, or TPM
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For camera, IR emitter, fingerprint reader, or TPM problems, the
+        Hardware report template asks for the right details instead.
+  - type: input
+    id: version
+    attributes:
+      label: irlume version and install channel
+      description: "`irlume version`, plus how you installed (Copr, PPA, .deb, AUR, Nix, source)"
+      placeholder: "0.4.0, Fedora Copr"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distro and desktop
+      placeholder: "Fedora 44 KDE (Wayland)"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: "`irlume logs --since \"10 min ago\"` around the failure; doctor output helps too"
+      render: text
+    validations:
+      required: false

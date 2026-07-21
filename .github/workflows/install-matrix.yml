@@ -1,0 +1,116 @@
+# Weekly automation of the install matrix that release prep previously ran by
+# hand (docs/PLATFORMS.md): build the universal .deb in its debian:12 container,
+# install it on every supported Debian/Ubuntu base and smoke-test the CLI, and
+# do a full build+test pass on rolling Arch. A failed scheduled run emails the
+# maintainer; the sibling-project lesson behind it is that advertised install
+# lanes rot silently unless CI exercises them (a Nix lane elsewhere shipped
+# broken twice, found only by user bug reports).
+name: Install matrix
+
+on:
+  schedule:
+    - cron: "45 6 * * 1" # Mondays 06:45 UTC, after the advisory audit
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-deb:
+    name: build universal .deb (debian:12, podman)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Same LFS cache as ci.yml (shared key): the model weights are ~257 MB
+      # and the LFS bandwidth quota is the reason ci.yml caches them.
+      - name: Cache Git LFS objects (ONNX model weights)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+
+      - name: Pull model weights (Git LFS)
+        run: git lfs pull
+
+      - name: Build the .deb (packaging/debian/build-deb-container.sh)
+        run: bash packaging/debian/build-deb-container.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: irlume-deb
+          path: irlume_*_amd64.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  install-smoke:
+    name: install smoke (${{ matrix.image }})
+    needs: build-deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The bases the universal .deb promises to support (glibc 2.35 floor):
+        # oldest Debian, oldest supported Ubuntu LTS, current LTS bases.
+        image: ["debian:12", "debian:13", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04"]
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: irlume-deb
+
+      - name: Install on a bare image
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ./irlume_*_amd64.deb
+
+      - name: CLI smoke
+        run: |
+          irlume version
+          # detect's contract: 0 = ready, 10 = partial, 20 = absent. A bare
+          # container has no camera/TPM, so any of the three is a pass; anything
+          # else (a crash, a missing shared library) fails the lane.
+          rc=0; irlume detect || rc=$?
+          case "$rc" in 0|10|20) echo "detect exit $rc (ok)";;
+                        *) echo "unexpected detect exit $rc"; exit 1;; esac
+
+  arch-build-test:
+    name: build + test on Arch (rolling toolchain)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install toolchain and system deps
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git git-lfs rust clang pam tpm2-tss curl ca-certificates
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Cache Git LFS objects (ONNX model weights)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+
+      - name: Pull model weights (Git LFS)
+        run: git lfs pull
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
+        run: |
+          ver=1.24.4
+          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: build
+        run: cargo build --workspace --locked
+
+      - name: test
+        run: cargo test --workspace --locked

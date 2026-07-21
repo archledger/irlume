@@ -1,0 +1,90 @@
+# Nightly hardware-in-the-loop suite on the self-hosted runner (archhost:
+# real TPM at /dev/tpmrm0 via the tss group, NexiGo N930W IR camera via the
+# video group). This exists because software fakes have proven blind spots:
+# the Tier-1 signed-PCR bug passed swtpm-based CI completely and only failed
+# on a real TPM, and the camera paths excluded from coverage are exactly the
+# ones a loopback device cannot exercise.
+#
+# SECURITY: this workflow must NEVER gain a pull_request trigger. The runner
+# is a personal machine; schedule + manual dispatch from main is the entire
+# allowed surface (fork-PR approval is also set to all outside collaborators
+# repo-wide, as second line of defense).
+name: Hardware suite
+
+on:
+  schedule:
+    - cron: "0 22 * * *" # 22:00 UTC nightly; if the box is off, the job
+      # queues and runs when it wakes (or expires after 24h — an expired run
+      # just means the box was off, not a regression)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardware-suite
+  cancel-in-progress: false
+
+jobs:
+  hardware:
+    name: build · test · real-TPM · IR camera
+    runs-on: [self-hosted, tpm, ir-camera]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # No actions/cache here: on a self-hosted runner the repo's .git (with
+      # its LFS objects) persists in the runner work directory between runs,
+      # so this pull is a no-op after the first run; a round-trip to the
+      # Actions cache service would be pure overhead. Incremental build state
+      # likewise persists via the runner-level CARGO_TARGET_DIR (set in the
+      # runner's .env, outside the work dir so checkout's clean never wipes it).
+      - name: Pull model weights (Git LFS)
+        run: |
+          git lfs pull
+          # Guard against silent smudge-skip (exit 0 with pointer files left in
+          # the tree) — the failure mode of an unconfigured runner user.
+          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
+            echo "::error::model weights are LFS pointers — run 'git lfs install' for the runner user"
+            exit 1
+          fi
+
+      - name: build (system rust, rolling Arch)
+        run: cargo build --workspace --locked
+
+      - name: test (hardware-independent set)
+        run: cargo test --workspace --locked
+
+      # The same named tests ci.yml runs against swtpm, but with NO IRLUME_TCTI
+      # override, so they hit the real TPM (device:/dev/tpmrm0, the built-in
+      # default). Transient handles + round-trip verification only; validated
+      # non-destructive on this hardware during the seal-ladder campaigns.
+      - name: test (TPM-gated, against the REAL TPM)
+        run: |
+          cargo test -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
+            tpm_key_and_recovery_lifecycle --test-threads=1
+
+      # Real-camera smoke: find the IR node by the same classifier users run,
+      # then capture a strobe burst and require real frames. Skips cleanly when
+      # the camera is unplugged (it gets borrowed for the mini-PC OS bench) so
+      # a borrowed camera never reads as a red run. Frames stay on the runner
+      # and are deleted; they are never uploaded (they picture the room).
+      - name: IR camera strobe-burst capture
+        run: |
+          ir=$(./target/debug/irlume doctor 2>/dev/null | awk -F: '/: Ir$/{print $1}' | tr -d " " | head -1)
+          if [ -z "$ir" ]; then
+            echo "::notice::no IR camera present — camera stage skipped (borrowed for the OS bench?)"
+            exit 0
+          fi
+          echo "IR node: $ir"
+          out=$(mktemp -d)
+          trap 'rm -rf "$out"' EXIT
+          cargo run -q -p irlume-camera --example burst_dump -- "$out" "$ir" 6
+          frames=$(find "$out" -name "frame*.pgm" | wc -l)
+          echo "captured $frames frames"
+          test "$frames" -ge 4
+          # The strobe must actually strobe: require a real spread between the
+          # brightest (emitter-lit) and darkest frame means, the same signal
+          # capture_ir keys on. A dead emitter shows as a flat, dark burst.
+          awk '{print $2}' "$out/means.txt" | sort -n | awk 'NR==1{min=$1} END{max=$1; d=max-min; printf "mean spread: %.1f\n", d; exit (d < 5)}'

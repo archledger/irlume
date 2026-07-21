@@ -66,6 +66,11 @@ pub enum Reseal {
     /// longer unsealed (PCRs moved: dbx/Secure Boot update) or the password
     /// differed (the user changed it). This is the self-heal.
     Resealed,
+    /// The password and PCR policy were unchanged, but a stronger sealing tier
+    /// became available (e.g. signed-PCR started working), so the envelope was
+    /// re-sealed to that tier. Lets an existing arm climb to Tier 1 on the next
+    /// login with no `keyring arm` from the user.
+    Upgraded,
 }
 
 /// Self-heal: re-seal `user`'s login password against the *current* PCR policy,
@@ -98,9 +103,26 @@ pub fn reseal_password(user: &str, password: &[u8]) -> Result<Reseal> {
         return Ok(Reseal::NotArmed);
     }
     // If the current envelope still unseals to the same secret, there is nothing
-    // to do; don't churn the TPM on every single login.
+    // to reseal for correctness; don't churn the TPM on every single login.
     if let Ok(current) = unseal_password(user) {
         if current.as_slice() == password {
+            // One exception: if a strictly stronger sealing tier became
+            // available since this envelope was written (e.g. signed-PCR now
+            // works), climb to it. This is how an existing arm reaches Tier 1
+            // after a fix/config change without the user re-arming. Only fires
+            // when an upgrade is actually possible, and only adopts the new
+            // envelope if the ladder genuinely produced a stronger tier (it
+            // round-trip-verifies internally), so a machine already at its best
+            // tier writes nothing.
+            if let Ok(env) = SealedEnvelope::load(&envelope_path(user)) {
+                if tpm::stronger_tier_available_than(&env.policy) {
+                    let candidate = tpm::seal(password)?;
+                    if candidate.policy.tier_rank() > env.policy.tier_rank() {
+                        candidate.save(&envelope_path(user))?;
+                        return Ok(Reseal::Upgraded);
+                    }
+                }
+            }
             return Ok(Reseal::Unchanged);
         }
     }
@@ -153,6 +175,44 @@ mod tests {
         assert_eq!(&*got, pw);
         forget_password("tester").expect("forget");
         assert!(!has_sealed_password("tester"));
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    /// On signed-UKI hardware, an envelope armed under a weaker tier auto-upgrades
+    /// to Tier-1 on the next login-time reseal, with no `keyring arm` from the
+    /// user. This is the migration path after signed-PCR started working.
+    #[test]
+    #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot)"]
+    fn reseal_auto_upgrades_weaker_tier_to_signed() {
+        use crate::envelope::{PolicyKind, SealedEnvelope};
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = "/tmp/irlume-kr-upgrade";
+        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let _ = std::fs::remove_dir_all(dir);
+        let pw = b"correct horse battery staple";
+        // Simulate an "old" arm under the weakest tier (literal PCR 7).
+        tpm::seal_with_pcrs(pw, &[7])
+            .unwrap()
+            .save(&envelope_path("tester"))
+            .unwrap();
+        assert_eq!(
+            SealedEnvelope::load(&envelope_path("tester"))
+                .unwrap()
+                .policy
+                .tier_rank(),
+            1,
+            "precondition: sealed at Tier 3 (literal)"
+        );
+        // A login-time reseal with the same verified password upgrades the tier.
+        assert_eq!(reseal_password("tester", pw).unwrap(), Reseal::Upgraded);
+        let env = SealedEnvelope::load(&envelope_path("tester")).unwrap();
+        assert!(
+            matches!(env.policy, PolicyKind::Authorized { .. }),
+            "should climb to Tier 1, got {:?}",
+            env.policy
+        );
+        assert_eq!(&*unseal_password("tester").unwrap(), pw, "still unseals");
+        forget_password("tester").unwrap();
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 

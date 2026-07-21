@@ -50,6 +50,18 @@ pub enum PolicyKind {
 }
 
 impl PolicyKind {
+    /// Strength rank of this tier, higher is stronger: signed PolicyAuthorize
+    /// (Tier 1) > pcrlock NV (Tier 2) > literal PolicyPCR (Tier 3). Used to
+    /// decide whether a re-seal would upgrade an existing envelope. The enum
+    /// declaration order does not match tier order, so rank explicitly.
+    pub fn tier_rank(&self) -> u8 {
+        match self {
+            PolicyKind::Authorized { .. } => 3,
+            PolicyKind::PcrlockNv { .. } => 2,
+            PolicyKind::PcrLiteral => 1,
+        }
+    }
+
     /// Human-readable tier label, shared by `irlume diag`, `status`, and the
     /// TUI so every surface names the tiers the same way.
     pub fn describe(&self) -> String {
@@ -147,6 +159,21 @@ mod b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_rank_orders_signed_above_pcrlock_above_literal() {
+        let signed = PolicyKind::Authorized {
+            pubkey_pem: String::new(),
+            policy_ref: Vec::new(),
+        };
+        let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 };
+        let literal = PolicyKind::PcrLiteral;
+        assert!(signed.tier_rank() > pcrlock.tier_rank());
+        assert!(pcrlock.tier_rank() > literal.tier_rank());
+        // A re-seal must never "upgrade" from a stronger tier to a weaker one.
+        assert_eq!(signed.tier_rank(), 3);
+        assert_eq!(literal.tier_rank(), 1);
+    }
 
     #[test]
     fn envelope_roundtrips_through_json() {

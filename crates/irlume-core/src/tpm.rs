@@ -372,6 +372,25 @@ fn with_srk<T>(
 /// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
 /// up a tier when one became available, and only lands on a lower tier when
 /// the higher one genuinely does not unseal on this machine.
+/// True when this machine could seal under a strictly stronger tier than
+/// `current` right now. Used by the login-time self-heal to auto-upgrade an
+/// envelope sealed under a weaker tier (e.g. one written before signed-PCR
+/// worked) without the user re-arming, and without churning the TPM on a
+/// machine already at its best available tier. Only signals availability; the
+/// actual round-trip verification happens in [`seal`].
+pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
+    match current {
+        // Tier 1 is the strongest; nothing to upgrade to.
+        PolicyKind::Authorized { .. } => false,
+        // Tier 2 -> Tier 1 only if signed-PCR artifacts exist.
+        PolicyKind::PcrlockNv { .. } => crate::pcrsig::signed_policy_available(),
+        // Tier 3 -> a higher tier if either signed-PCR or pcrlock is available.
+        PolicyKind::PcrLiteral => {
+            crate::pcrsig::signed_policy_available() || pcrlock_provisioned().is_some()
+        }
+    }
+}
+
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
         match seal_authorized(secret) {

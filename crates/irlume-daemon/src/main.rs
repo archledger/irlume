@@ -992,10 +992,16 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         eprintln!(
                             "irlumed: ResealPassword: re-bound '{user}' to current PCRs (self-heal after PCR/password change)"
                         );
+                    } else if outcome == Reseal::Upgraded {
+                        eprintln!(
+                            "irlumed: ResealPassword: upgraded '{user}' keyring seal to a stronger TPM policy tier (no re-arm needed)"
+                        );
                     }
                     Response::PasswordResealed {
+                        // Both Resealed (self-heal) and Upgraded (tier climb)
+                        // changed the on-disk envelope.
                         armed: outcome != Reseal::NotArmed,
-                        changed: outcome == Reseal::Resealed,
+                        changed: outcome == Reseal::Resealed || outcome == Reseal::Upgraded,
                     }
                 }
                 Err(e) => Response::Error(e.to_string()),

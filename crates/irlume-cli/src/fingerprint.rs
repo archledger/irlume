@@ -65,10 +65,12 @@ fn status(user: &str) -> ExitCode {
     // The listing can fail in ways that are NOT "no fingers enrolled" (stale
     // claim, polkit refusal, readerless box); say which, or the advice below
     // points the wrong way.
-    let mut fingers = Vec::new();
-    match fp::list_fingers(user) {
+    let listing = fp::list_fingers(user);
+    let mut fingers: Vec<String> = Vec::new();
+    let mut list_error = None;
+    match &listing {
         fp::ListOutcome::Fingers(v) => {
-            fingers = v;
+            fingers = v.clone();
             if fingers.is_empty() {
                 println!("[fingerprint] enrolled       : none for '{user}'");
             } else {
@@ -84,15 +86,20 @@ fn status(user: &str) -> ExitCode {
         }
         fp::ListOutcome::Error(e) => {
             println!("[fingerprint] enrolled       : could not list — {e}");
+            list_error = Some(e.clone());
         }
     }
     println!(
         "[fingerprint] active method   : {}",
         policy::method().as_str()
     );
-    // Recommendation.
+    // Recommendation. A failed listing means we do NOT know the enrollment
+    // state; recommending `add` there sends the user the wrong way (live find:
+    // over SSH, polkit refuses the listing while fingers are enrolled fine).
     if !fp::available() {
         println!("  → no usable reader; fingerprint unavailable on this device");
+    } else if let Some(e) = list_error {
+        println!("  → fix the listing first ({e}); enrollment state is unknown until then");
     } else if fingers.is_empty() {
         println!("  → reader present but no finger enrolled: run  irlume fingerprint add");
     } else if policy::method() != Method::Fingerprint {
@@ -197,9 +204,22 @@ fn verify(user: &str) -> ExitCode {
         eprintln!("[fingerprint] no usable reader (need fprintd + a fingerprint reader)");
         return ExitCode::FAILURE;
     }
-    if !fp::has_enrollment(user) {
-        eprintln!("[fingerprint] no finger enrolled for '{user}'; run  irlume fingerprint add");
-        return ExitCode::FAILURE;
+    // Use the checked listing: a polkit/claim failure must not masquerade as
+    // "no finger enrolled" (live find: SSH sessions get polkit-refused).
+    match fp::list_fingers(user) {
+        fp::ListOutcome::Fingers(v) if v.is_empty() => {
+            eprintln!("[fingerprint] no finger enrolled for '{user}'; run  irlume fingerprint add");
+            return ExitCode::FAILURE;
+        }
+        fp::ListOutcome::Fingers(_) => {}
+        fp::ListOutcome::NoDevice => {
+            eprintln!("[fingerprint] fprintd reports no reader");
+            return ExitCode::FAILURE;
+        }
+        fp::ListOutcome::Error(e) => {
+            eprintln!("[fingerprint] cannot check enrollment: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     if verify_round(user) {
         ExitCode::SUCCESS

@@ -3,6 +3,85 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Batch from a whole-codebase, CLI/TUI, and auth-pipeline audit (PR #56). The two
+matching/liveness changes below were confirmed on the KDE lock screen (face
+grants in a bright room and in the dark) before merge.
+
+### Security
+
+- **A remote (SSH) session no longer fires the local camera.** The camera is
+  physically at the machine, so on an SSH login or an `sudo` inside an SSH
+  shell, whoever is in front of the camera (not the remote user) would satisfy
+  the face factor. The PAM module now checks `PAM_RHOST` (and the `SSH_*`
+  environment markers) up front and returns `PAM_IGNORE` for a remote
+  transaction, so the password or another factor authenticates instead. Always
+  on, independent of how the stack is wired.
+- **The consecutive-failure throttle now strikes on the attack it exists to
+  slow.** A caught spoof returns `live = false, score = 0`, so the previous
+  strike test (`live || score > 0`) never counted a rejected presentation
+  attack, only a below-threshold match of a real face. An attacker could grind
+  presentation attacks against the gate without ever tripping the cooldown. The
+  daemon now strikes whenever the outcome is a real, non-retryable rejection
+  (`!presence_retryable`), which includes hard spoof rejections; genuine
+  no-face and transient-uncertainty outcomes still never count.
+- **Stage-2 fusion weighs the RGB modality by its real brightness again.** The
+  cross-spectrum path passed a hardcoded RGB face brightness of 0 into fusion's
+  quality weight, so fusion always treated RGB as if the room were pitch-dark
+  and collapsed the fused score toward IR regardless of actual light. That
+  weakened the "an impostor must fool both modalities at once" bound in bright
+  rooms. `assess_full` now measures the real RGB face luma (as the RGB-only
+  path already did); the liveness gate is unchanged.
+- **The dark (IR-only) path enforces the per-user calibrated depth floor.** The
+  RGB path already required the live frame to clear the user's enrolled
+  3D-structure floor; the dark path used only the lenient global ratio, so a
+  curved warm spoof sitting between the two could be rejected in lit conditions
+  yet granted in the dark. The same floor now applies on both paths.
+- **Sealed key and recovery files are created at mode 0600 atomically.** They
+  were written and then `chmod`-ed, leaving a brief window where the file
+  existed under the default umask. The payload is TPM-sealed or
+  passphrase-wrapped, so the window was low-value, but the file is now opened
+  with the mode set so it is never momentarily wider.
+- **The daemon unit is sandboxed.** `irlumed.service` gains `NoNewPrivileges`,
+  `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `ProtectSystem=full`, the
+  `ProtectKernel*`/`ProtectControlGroups` set, and a `CapabilityBoundingSet`
+  scoped to `CAP_CHOWN`/`CAP_DAC_OVERRIDE`/`CAP_FOWNER` (the caps it needs to
+  own enrolled files to the user). `ProtectHome`, `PrivateDevices`, and
+  `MemoryDenyWriteExecute` are deliberately left off (per-user `$HOME` state,
+  camera and TPM access, and the ONNX runtime's JIT). Validated live: the
+  daemon starts, loads models, binds the socket, and raises no SELinux denials
+  under the restrictions.
+
+### Fixed
+
+- **The pcrlock PCR parser rejects malformed hex instead of panicking.** The
+  same class already fixed in the PCR-signature parser existed in `tpm::hex32`,
+  which sliced two bytes at a time with no guard: an odd-length or non-ASCII
+  (multi-byte) value in `pcrlock.json` panicked the root daemon. It now rejects
+  odd-length and non-ASCII input up front, mirroring `pcrsig::from_hex`.
+- **A non-finite detector score can no longer hide the real face.** A NaN
+  detection score passed the `< threshold` test (false for NaN) and then ranked
+  highest under `total_cmp`, so a single NaN cell would win the top-face pick
+  and shadow the genuine face, forcing a false reject. Non-finite scores are
+  now dropped at decode.
+- **A truncated IR frame degrades to a safe deny instead of panicking.**
+  `mean_in_bbox` indexed the frame assuming `len == width * height`; a short or
+  mismatched buffer from the camera would panic. It now length-checks once and
+  returns 0 (read as "too dark") on a short frame.
+- **`irlume doctor` reports RGB decodability the way capture actually works.**
+  Doctor counted `RGB3` and `BGR3` as decodable, but the capture path only
+  decodes `YUYV` and `NV12`, so a node advertising only those formats passed
+  doctor and then failed at capture. Doctor now matches the capture path's
+  format list.
+
+### Added
+
+- **TUI: toggle the blink challenge from the Settings screen.** The opt-in
+  passive-blink liveness gate was shown there as status only, so changing it
+  meant dropping to `irlume profiles challenge on|off`. Pressing `[c]` now
+  toggles it in place, alongside the existing `[enter]` eyes-open toggle.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added

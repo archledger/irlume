@@ -40,7 +40,14 @@ jobs:
       # likewise persists via the runner-level CARGO_TARGET_DIR (set in the
       # runner's .env, outside the work dir so checkout's clean never wipes it).
       - name: Pull model weights (Git LFS)
-        run: git lfs pull
+        run: |
+          git lfs pull
+          # Guard against silent smudge-skip (exit 0 with pointer files left in
+          # the tree) — the failure mode of an unconfigured runner user.
+          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
+            echo "::error::model weights are LFS pointers — run 'git lfs install' for the runner user"
+            exit 1
+          fi
 
       - name: build (system rust, rolling Arch)
         run: cargo build --workspace --locked

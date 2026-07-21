@@ -64,7 +64,14 @@ fn request_with_timeouts(
         // (fresh package install, unit disabled by distro preset policy), so
         // name the daemon and the exact command instead of "os error 2".
         match e.kind() {
-            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => io::Error::new(
+            // ConnectionReset included: connecting to a stale socket file
+            // (daemon gone, file left behind) yields ECONNREFUSED on most
+            // kernels but ECONNRESET on newer ones (observed on 7.1.4-zen by
+            // the self-hosted runner); both mean "nobody is listening" and
+            // deserve the same actionable guidance, not a raw errno.
+            io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset => io::Error::new(
                 e.kind(),
                 "irlumed is not running; start it with: sudo systemctl enable --now irlumed",
             ),
@@ -193,12 +200,20 @@ mod tests {
             ),
             "got: {err}"
         );
-        // A stale socket file nobody listens on: ECONNREFUSED, same guidance.
+        // A stale socket file nobody listens on: ECONNREFUSED on most kernels,
+        // ECONNRESET on newer ones (7.1.4-zen observed) — same guidance either way.
         let stale = sock("stale");
         drop(UnixListener::bind(&stale).unwrap()); // bind then close: file remains
         std::env::set_var("IRLUME_SOCKET", &stale);
         let err = request(&Request::Ping).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+            ),
+            "stale socket must read as nobody-listening, got: {:?}",
+            err.kind()
+        );
         assert!(
             err.to_string().contains("irlumed is not running"),
             "got: {err}"

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and setup help
+    url: https://github.com/archledger/irlume/discussions
+    about: Ask in Discussions; issues are for bugs, hardware reports, and feature requests.

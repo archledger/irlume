@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! The daemon must exit promptly on SIGTERM so a package-upgrade restart never
 //! stalls. irlume installs no signal handler, so SIGTERM uses the default
 //! disposition (immediate terminate); this test guards against a future change

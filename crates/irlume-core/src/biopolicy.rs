@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Tiered biometric decision policy (opt-in).
 //!
 //! Two axes decide what a face match is allowed to do:

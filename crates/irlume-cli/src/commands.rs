@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Extra operational CLI commands layered over the existing daemon protocol:
 //! observability (`status`, `detect`, `identify`), diagnostics (`diag`,
 //! `selinux`, `deps`), the safe manual re-bind (`reseal`), and the guided

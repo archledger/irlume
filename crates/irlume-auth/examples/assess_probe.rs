@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Drive the real Engine::assess (assess_full, the overlapped-capture +
 //! cross-spectrum self-heal path) N times on a given camera pair and report
 //! the liveness verdict and whether the RGB self-heal fired (from the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! System auth-method policy: which biometric modality is active. Set by
 //! `irlume fingerprint enable/disable`; read by the daemon so it can stay silent
 //! (let `pam_fprintd` drive) when the user has chosen fingerprint.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Per-distro abstraction. A minimal port of linhello's platform layer: just
 //! the distro-family detection that the fingerprint (and, later, login) wiring
 //! needs to pick the right mechanism (authselect vs pam-auth-update vs direct).

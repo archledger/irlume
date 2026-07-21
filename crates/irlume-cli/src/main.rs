@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume`: operator CLI. A thin, unprivileged client of `irlumed` (same socket
 //! protocol as the PAM module). Enrollment requests are authorized by the daemon
 //! via SO_PEERCRED, not by this binary.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Shared types: the daemon<->client IPC protocol, well-known paths, errors.
 //!
 //! Trust boundary (see docs/ARCHITECTURE.md): the thin `pam_irlume` module and the

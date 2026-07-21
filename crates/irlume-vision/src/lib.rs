@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! The ML pipeline: detect -> align -> embed. CPU-first ONNX via `ort`.
 //!
 //! Commercially-clean, GPL-3.0-compatible bill of materials (all permissive):

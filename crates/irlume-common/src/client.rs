@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Blocking client for the `irlumed` socket, shared by the CLI (user session)
 //! and the PAM module (root, inside the auth stack). One request per
 //! connection: send a newline-terminated JSON [`Request`], read a

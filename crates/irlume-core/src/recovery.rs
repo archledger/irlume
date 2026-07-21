@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Dedicated recovery passphrase for the per-user template key.
 //!
 //! This is the deliberate, manual backstop for the cases TPM-sealing cannot

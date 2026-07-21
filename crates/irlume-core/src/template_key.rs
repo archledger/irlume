@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Per-user template key: the AES-256-GCM key that [`crate::storage`] uses to
 //! encrypt enrolled face templates at rest.
 //!

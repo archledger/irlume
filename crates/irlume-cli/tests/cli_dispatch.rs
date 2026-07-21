@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Black-box tests for the `irlume` binary's dispatch / usage / error arms that
 //! `tests/cli.rs` does not already reach. These target the `ExitCode`-returning
 //! branches that a unit test cannot assert (`std::process::ExitCode` is not

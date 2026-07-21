@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Offline analysis of the sunlight/ambient burst dataset captured by the
 //! `burst_dump` example. For each burst directory it runs the real detection +
 //! depth-cue path over the brightest (lit) frame and over the ambient-subtracted

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Algorithmic IR presentation-attack detection (PAD): NO trained weights.
 //!
 //! Why no model: every public anti-spoof dataset is non-commercial, so a trained

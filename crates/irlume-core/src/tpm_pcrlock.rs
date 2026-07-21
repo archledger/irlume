@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Tier 2: bind the sealed secret to a systemd-pcrlock NV-index policy via
 //! `TPM2_PolicyAuthorizeNV`.
 //!

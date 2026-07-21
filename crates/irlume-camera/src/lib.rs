@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! V4L2 capture for the paired RGB + IR cameras, and active-IR-emitter control.
 //!
 //! Hardware model (Windows-Hello-class module): one RGB sensor (`/dev/video0`)

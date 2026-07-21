@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Illumination normalization for low-light RGB chips, applied to the aligned
 //! 112×112 chip just before embedding. Goal: make a DIM probe embed closer to a
 //! BRIGHT enrolled template (recover recognition in poor ambient light), without

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Data-gathering harness for the overlapped-capture change: runs N rounds of
 //! sequential (RGB then IR) and N rounds of concurrent (RGB+IR on two threads)
 //! capture on a given camera pair, and reports per-stream timing and mean

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! TPM-sealed login password for keyring/wallet unlock.
 //!
 //! After a face login there is no typed password for `pam_gnome_keyring` /

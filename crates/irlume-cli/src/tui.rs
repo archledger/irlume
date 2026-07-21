@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume tui`: keyboard-driven setup/management over the `irlumed` socket.
 //!
 //! Layout & feel follow linhello: a step-wizard (Tab/⇧Tab between steps, a

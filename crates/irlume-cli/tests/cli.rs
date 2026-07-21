@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Black-box tests of the `irlume` binary: argument dispatch, usage errors,
 //! exit codes, and the offline failure paths of every daemon-backed command.
 //!

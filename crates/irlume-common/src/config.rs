@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Tiny `key=value` config files under the config dir (`/etc/irlume`, override
 //! `IRLUME_CONFIG_DIR`), e.g. `cameras.conf`, `settings.conf`. Blank lines and
 //! `#` comments are ignored. These hold operator-tunable knobs the setup flow

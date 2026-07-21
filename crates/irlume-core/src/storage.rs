@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Per-user face enrollment: up to 3 named face profiles, each holding multiple
 //! named scans (Windows-Hello-style "improve recognition"). Stored as JSON under
 //! the state dir (`IRLUME_STATE_DIR`, else `$HOME/.local/share/irlume` for dev,

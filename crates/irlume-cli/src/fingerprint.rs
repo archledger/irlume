@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume fingerprint <status|add|enable|disable>`: fingerprint as a companion
 //! auth modality via stock fprintd + pam_fprintd. irlume never claims the sensor;
 //! it orchestrates enrollment (fprintd CLI) and wires pam_fprintd per distro.

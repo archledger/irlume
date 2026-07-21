@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Boot-mode and Secure Boot detection via Linux efivarfs + procfs.
 //!
 //! Best-effort and never panics: on a non-EFI system, missing efivars, or

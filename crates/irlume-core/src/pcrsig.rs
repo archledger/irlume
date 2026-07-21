@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Consume systemd's signed-PCR-policy artifacts (the Tier-1 / UKI path).
 //!
 //! When a Unified Kernel Image is built with `ukify --pcr-private-key` /

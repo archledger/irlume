@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Per-enrollment IR calibration (ADR-0004): a ridge-regularized linear map
 //! fitted on-device from one profile's own enrollment scans, pulling that
 //! person's IR embeddings toward their RGB embeddings. Replaces the shipped

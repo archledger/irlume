@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Frequency-domain screen/replay deterrent for the RGB-only (convenience) path.
 //!
 //! A camera pointed at a *display* captures the panel's regular pixel grid (and

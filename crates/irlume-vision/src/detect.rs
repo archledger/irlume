@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! YuNet face-detection decode: anchor-free, strides 8/16/32.
 //!
 //! The pure decode (priors, score, bbox/landmark recovery, NMS) lives here and

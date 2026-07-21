@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Measure whether this Hello module really starves when the RGB and IR
 //! streams run at the same time (the module doc's "never concurrently" claim).
 //!

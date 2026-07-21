@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume login <status|enable|disable>`: wire face auth into the login
 //! greeters (GDM/SDDM/LightDM/plasmalogin), the KDE lock screen, and (opt-in)
 //! sudo. The Rust replacement for scripts/deploy-keyring-unlock.sh. Ported from

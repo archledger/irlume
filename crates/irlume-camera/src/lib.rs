@@ -479,32 +479,97 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
         id: V4L2_CID_BACKLIGHT_COMPENSATION,
         value: v4l::control::Value::Integer(2),
     });
-    let fmt = Format::new(RGB_W, RGB_H, FourCC::new(b"YUYV"));
+    // Pick an uncompressed format the camera actually offers. Some webcams
+    // advertise RGB only as MJPEG (or NV12) and reject YUYV; classify() still
+    // labels them usable, so without this negotiation they would detect fine
+    // then fail at capture with a cryptic "expected YUYV". YUYV is preferred;
+    // NV12 is the common uncompressed fallback.
+    let chosen = negotiate_rgb_format(device, &dev)?;
+    let fmt = Format::new(RGB_W, RGB_H, FourCC::new(&chosen));
     let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
-    if &fmt.fourcc.repr != b"YUYV" {
+    if fmt.fourcc.repr != chosen {
         return Err(Error::Hardware(format!(
-            "{device}: driver gave {:?}, expected YUYV",
-            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("????")
+            "{device}: driver gave {}, expected {}",
+            fourcc_str(&fmt.fourcc.repr),
+            fourcc_str(&chosen)
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
 
+    warm_up_stream(device, &mut stream)?;
     for _ in 0..AE_WARMUP {
         stream.next().map_err(|e| map_io(device, e))?; // discard while AE settles
     }
     let mut frames = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        let data = match &chosen {
+            b"NV12" => nv12_to_rgb(buf, w, h),
+            _ => yuyv_to_rgb(buf, w, h),
+        };
         frames.push(Frame {
             width: w,
             height: h,
             spectrum: Spectrum::Rgb,
-            data: yuyv_to_rgb(buf, w, h),
+            data,
         });
     }
     Ok(frames)
+}
+
+/// The uncompressed RGB fourccs the capture path can decode, best first.
+const DECODABLE_RGB: [&[u8; 4]; 2] = [b"YUYV", b"NV12"];
+
+/// True when an Intel IPU6 camera stack is present. These MIPI cameras (common
+/// on 2024+ Intel laptops) expose no plain V4L2 GREY/YUYV capture node: they
+/// need the libcamera/software-ISP relay, so `discover_nodes` finds nothing and
+/// a user sees a bare "no camera". `doctor` uses this to give a real diagnosis
+/// instead. Detected by the kernel driver's presence in sysfs.
+pub fn ipu6_camera_present() -> bool {
+    std::path::Path::new("/sys/bus/pci/drivers/intel-ipu6").exists()
+        || std::path::Path::new("/sys/module/intel_ipu6").exists()
+}
+
+/// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
+pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
+    let Ok(dev) = Device::with_path(device) else {
+        return Vec::new();
+    };
+    Capture::enum_formats(&dev)
+        .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
+        .unwrap_or_default()
+}
+
+/// Choose the format to capture in: the first `DECODABLE_RGB` entry the camera
+/// advertises. If it advertises none we can decode (e.g. MJPEG-only), fail with
+/// a message that names what it offers rather than a bare "expected YUYV".
+fn negotiate_rgb_format(device: &str, dev: &Device) -> irlume_common::Result<[u8; 4]> {
+    let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
+        .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
+        .unwrap_or_default();
+    // If enumeration is unavailable, keep the historical behaviour (try YUYV).
+    if offered.is_empty() {
+        return Ok(*b"YUYV");
+    }
+    if let Some(f) = DECODABLE_RGB.iter().find(|f| offered.contains(*f)) {
+        return Ok(**f);
+    }
+    let offered_str: Vec<String> = offered.iter().map(fourcc_str).collect();
+    Err(Error::Hardware(format!(
+        "{device}: RGB camera offers only [{}]; irlume needs an uncompressed \
+         format (YUYV or NV12). MJPEG-only cameras are not supported yet.",
+        offered_str.join(", ")
+    )))
+}
+
+/// Printable fourcc (trailing spaces trimmed), for diagnostics.
+fn fourcc_str(cc: &[u8; 4]) -> String {
+    std::str::from_utf8(cc)
+        .unwrap_or("????")
+        .trim_end()
+        .to_string()
 }
 
 /// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
@@ -616,6 +681,8 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
+    // Survive the first-capture-after-resume race (uvcvideo still re-initializing).
+    warm_up_stream(device, &mut stream)?;
     // Fire the active-IR emitter on the open fd (Hello modules reset it per-open,
     // so we must do it here, while streaming, not via an external one-shot).
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
@@ -1124,6 +1191,66 @@ pub fn yuyv_to_rgb(yuyv: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgb
 }
 
+/// Convert an NV12 (4:2:0, Y plane then interleaved UV plane) buffer to
+/// interleaved RGB8 (BT.601). Each 2x2 pixel block shares one U/V pair.
+pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut rgb = vec![0u8; w * h * 3];
+    let y_plane = w * h;
+    // Guard against a short buffer: need the full Y plane plus a UV plane.
+    if nv12.len() < y_plane + (w * h / 2) {
+        return rgb;
+    }
+    for row in 0..h {
+        for col in 0..w {
+            let y = nv12[row * w + col] as f32;
+            // UV plane is half-resolution in both axes; one pair per 2x2 block.
+            let uv = y_plane + (row / 2) * w + (col / 2) * 2;
+            let u = nv12[uv] as f32 - 128.0;
+            let v = nv12[uv + 1] as f32 - 128.0;
+            let o = (row * w + col) * 3;
+            rgb[o] = (y + 1.402 * v).clamp(0.0, 255.0) as u8;
+            rgb[o + 1] = (y - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
+            rgb[o + 2] = (y + 1.772 * u).clamp(0.0, 255.0) as u8;
+        }
+    }
+    rgb
+}
+
+/// Pull and discard one frame with a short retry, so the FIRST capture after a
+/// suspend/resume (or USB re-enumeration) does not fail outright while the
+/// uvcvideo device is still coming back. The daemon opens the device per
+/// request, so there is no stale handle to recover; the only gap is that the
+/// very first `stream.next()` can return EIO/ENODEV for a few hundred ms after
+/// resume. Retry that, then let the normal AE warmup run.
+fn warm_up_stream(
+    device: &str,
+    stream: &mut v4l::io::mmap::Stream<'_>,
+) -> irlume_common::Result<()> {
+    use std::io::ErrorKind;
+    const TRIES: u32 = 8;
+    const GAP: std::time::Duration = std::time::Duration::from_millis(120);
+    for attempt in 0..TRIES {
+        match stream.next() {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if attempt + 1 < TRIES
+                    && matches!(
+                        e.kind(),
+                        ErrorKind::BrokenPipe
+                            | ErrorKind::NotConnected
+                            | ErrorKind::Other
+                            | ErrorKind::TimedOut
+                    ) =>
+            {
+                std::thread::sleep(GAP);
+            }
+            Err(e) => return Err(map_io(device, e)),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,6 +1312,24 @@ mod tests {
         for c in rgb {
             assert!((c as i32 - 128).abs() <= 1);
         }
+    }
+
+    #[test]
+    fn nv12_neutral_chroma_is_grey_and_short_buffer_is_safe() {
+        // 2x2 Y plane at 200, one neutral UV pair (128,128) -> near-grey 200.
+        let nv12 = [200u8, 200, 200, 200, 128, 128];
+        let rgb = nv12_to_rgb(&nv12, 2, 2);
+        assert_eq!(rgb.len(), 2 * 2 * 3);
+        for c in &rgb {
+            assert!((*c as i32 - 200).abs() <= 1, "neutral chroma should stay grey");
+        }
+        // Chroma carries into RGB: a red-ish V lifts R above Y and drops B.
+        let red = [128u8, 128, 128, 128, 128, 200];
+        let out = nv12_to_rgb(&red, 2, 2);
+        assert!(out[0] > out[2], "V>128 should make R exceed B");
+        // A short buffer never panics; returns a zeroed frame of the right size.
+        let short = [0u8; 3];
+        assert_eq!(nv12_to_rgb(&short, 2, 2).len(), 2 * 2 * 3);
     }
 
     #[test]

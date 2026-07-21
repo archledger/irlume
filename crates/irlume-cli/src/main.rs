@@ -2175,6 +2175,13 @@ fn doctor() -> std::process::ExitCode {
     let nodes = irlume_camera::discover_nodes();
     if nodes.is_empty() {
         println!("  (none found under /dev/video0..9)");
+        if irlume_camera::ipu6_camera_present() {
+            println!(
+                "  ⚠ an Intel IPU6 camera is present but exposes no direct V4L2 node.\n     \
+                 These MIPI cameras need the libcamera software-ISP relay; irlume\n     \
+                 cannot open them directly yet. Track: intel-ipu6 driver stack."
+            );
+        }
     }
     for (path, role) in &nodes {
         let priv_on = if irlume_camera::privacy_engaged(path) {
@@ -2183,6 +2190,25 @@ fn doctor() -> std::process::ExitCode {
             ""
         };
         println!("  {path}: {role:?}{priv_on}");
+        // An RGB node the capture path can't decode (MJPEG-only) classifies as
+        // usable but would fail at capture; warn here instead.
+        if *role == irlume_camera::Role::Rgb {
+            let fmts = irlume_camera::rgb_node_formats(path);
+            let decodable = fmts
+                .iter()
+                .any(|f| f == b"YUYV" || f == b"NV12" || f == b"RGB3" || f == b"BGR3");
+            if !fmts.is_empty() && !decodable {
+                let list: Vec<String> = fmts
+                    .iter()
+                    .map(|f| std::str::from_utf8(f).unwrap_or("????").trim_end().to_string())
+                    .collect();
+                println!(
+                    "     ⚠ offers only [{}]; irlume needs an uncompressed format\n       \
+                     (YUYV or NV12). This camera will detect but fail at capture.",
+                    list.join(", ")
+                );
+            }
+        }
     }
 
     // --- models / runtime --------------------------------------------------
@@ -2229,6 +2255,24 @@ fn doctor() -> std::process::ExitCode {
             );
         }
         _ => println!("[doctor] templates ({user}): unknown (daemon not reachable; run `irlume recovery status`)"),
+    }
+
+    // --- wiring drift ------------------------------------------------------
+    // If the user is enrolled but no greeter is wired, a distro tool most
+    // likely regenerated the PAM stacks (authselect apply on Fedora,
+    // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
+    // back to the password, so this is not a lockout, but face login silently
+    // stopped working. Surface it with the one-command fix.
+    let enrolled = matches!(
+        daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
+        Ok(irlume_common::Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()
+    );
+    if enrolled && !crate::pamwire::login_wired() {
+        println!(
+            "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
+             A system update (authselect / pam-auth-update) may have regenerated the\n     \
+             PAM stacks. Re-wire with: sudo irlume login enable --apply"
+        );
     }
 
     std::process::ExitCode::SUCCESS

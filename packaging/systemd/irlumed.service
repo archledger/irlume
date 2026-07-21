@@ -19,6 +19,11 @@ Environment="IRLUME_SOCKET=/run/irlume.sock"
 # the target user per request, so no global STATE_DIR is set here.
 Restart=on-failure
 RestartSec=2
+# The socket loop exits promptly on SIGTERM (no long-held camera handle:
+# captures open and drop the device per request). Cap the stop wait so a
+# package-upgrade restart can never stall on the default 90s if a request is
+# mid-flight.
+TimeoutStopSec=10s
 
 [Install]
 WantedBy=multi-user.target

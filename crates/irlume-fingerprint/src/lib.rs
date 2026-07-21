@@ -30,9 +30,21 @@ const ENROLL_DEADLINE: Duration = Duration::from_secs(120);
 /// Ceiling for one verify run (fprintd-verify allows up to 3 placements).
 const VERIFY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Test-only tool-directory override, so the enroll/verify/delete wrappers can
+/// run end to end against fake fprintd scripts. `cfg(test)` compiles only into
+/// this crate's own test binary: production builds (and every downstream crate)
+/// keep the absolute-paths-only resolution with no override surface.
+#[cfg(test)]
+static TOOL_DIR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 /// Resolve a tool to an absolute path under the standard system dirs, or `None`.
 /// Absolute paths only; never trust `$PATH` for an auth-critical helper.
 fn tool(name: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TOOL_DIR_OVERRIDE.lock().unwrap().clone() {
+        let p = dir.join(name);
+        return p.exists().then_some(p);
+    }
     ["/usr/bin", "/bin", "/usr/local/bin"]
         .iter()
         .map(|d| PathBuf::from(d).join(name))
@@ -656,6 +668,141 @@ mod tests {
         assert!(run.status.is_some_and(|s| s.success()));
         assert!(run.output.contains("out-line"));
         assert!(run.output.contains("err-line"));
+    }
+
+    /// Serializes the fake-tool tests (the override is process-global) and
+    /// installs executable fake fprintd/busctl scripts in a temp dir.
+    struct FakeTools {
+        dir: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    static FAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    impl FakeTools {
+        fn new(tag: &str) -> Self {
+            let guard = FAKE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir =
+                std::env::temp_dir().join(format!("irlume-fpfake-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            *TOOL_DIR_OVERRIDE.lock().unwrap() = Some(dir.clone());
+            Self { dir, _guard: guard }
+        }
+        fn script(&self, name: &str, body: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let p = self.dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    impl Drop for FakeTools {
+        fn drop(&mut self) {
+            *TOOL_DIR_OVERRIDE.lock().unwrap() = None;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn enroll_runs_end_to_end_against_fake_fprintd() {
+        let ft = FakeTools::new("enroll");
+        // Success: placement prompts stream through, completed status wins.
+        ft.script(
+            "fprintd-enroll",
+            "echo Enrolling right-index-finger\necho 'Enroll result: enroll-completed'",
+        );
+        assert_eq!(
+            enroll_finger("tester", "right-index-finger"),
+            EnrollOutcome::Enrolled
+        );
+        // Duplicate print reported by the sensor.
+        ft.script(
+            "fprintd-enroll",
+            "echo 'Enroll result: enroll-duplicate'\nexit 1",
+        );
+        assert_eq!(
+            enroll_finger("tester", "right-index-finger"),
+            EnrollOutcome::Duplicate
+        );
+        // Claim conflict lands on stderr and maps to the actionable message.
+        ft.script(
+            "fprintd-enroll",
+            "echo 'EnrollStart failed: GDBus.Error:net.reactivated.Fprint.Error.AlreadyInUse: busy' >&2\nexit 1",
+        );
+        let EnrollOutcome::Failed(msg) = enroll_finger("tester", "right-index-finger") else {
+            panic!("claim conflict must fail")
+        };
+        assert!(msg.contains("claimed"), "{msg}");
+        // Missing tool entirely.
+        let _ = std::fs::remove_file(ft.dir.join("fprintd-enroll"));
+        assert!(matches!(
+            enroll_finger("tester", "x"),
+            EnrollOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn verify_and_delete_run_end_to_end_against_fakes() {
+        let ft = FakeTools::new("verify");
+        ft.script(
+            "fprintd-verify",
+            "echo 'Verify result: verify-match (done)'",
+        );
+        assert_eq!(verify_once("tester"), VerifyOutcome::Match);
+        ft.script(
+            "fprintd-verify",
+            "echo 'Verify result: verify-no-match'\nexit 1",
+        );
+        assert_eq!(verify_once("tester"), VerifyOutcome::NoMatch);
+        ft.script(
+            "fprintd-verify",
+            "echo 'failed to claim device: busy' >&2\nexit 1",
+        );
+        assert!(matches!(verify_once("tester"), VerifyOutcome::Error(_)));
+
+        ft.script("fprintd-delete", "echo 'Fingerprints deleted'");
+        assert!(delete_all("tester").is_ok());
+        ft.script("fprintd-delete", "echo 'Not Authorized' >&2\nexit 1");
+        let err = delete_all("tester").unwrap_err();
+        assert!(err.contains("polkit"), "{err}");
+    }
+
+    #[test]
+    fn listing_and_discovery_run_end_to_end_against_fakes() {
+        let ft = FakeTools::new("list");
+        ft.script(
+            "fprintd-list",
+            "echo 'Fingerprints for user tester:'\necho ' - #0: right-index-finger'",
+        );
+        assert_eq!(
+            list_fingers("tester"),
+            ListOutcome::Fingers(vec!["right-index-finger".into()])
+        );
+        assert!(has_enrollment("tester"));
+        assert_eq!(free_finger("tester"), Some("left-index-finger"));
+        ft.script("fprintd-list", "echo 'No devices available'");
+        assert_eq!(list_fingers("tester"), ListOutcome::NoDevice);
+        ft.script(
+            "fprintd-list",
+            "echo 'failed to claim device: Error.AlreadyInUse' >&2",
+        );
+        assert!(reader_stuck("tester"));
+
+        // busctl fakes: device tree, per-device name, bus owner unit.
+        ft.script(
+            "busctl",
+            r#"case "$*" in
+  *tree*) echo '  /net/reactivated/Fprint/Device/0'; echo '  /net/reactivated/Fprint/Device/1';;
+  *get-property*) echo 's "Fake Sensors"';;
+  *status*) echo 'PID=42'; echo 'Unit=fprintd.service';;
+esac"#,
+        );
+        assert!(reader_present());
+        assert_eq!(device_name().as_deref(), Some("Fake Sensors"));
+        assert_eq!(device_names().len(), 2);
+        assert_eq!(bus_owner_unit().as_deref(), Some("fprintd.service"));
+
+        // fprintd tooling presence check through the same seam.
+        ft.script("fprintd-verify", "exit 0");
+        assert!(fprintd_present());
     }
 
     #[test]

@@ -45,6 +45,40 @@ All notable changes to irlume are documented here. This project adheres to
 - **Hardware-report issue template.** New GitHub issue form that asks for the
   machine/camera model, distro, and `irlume doctor` / `irlume detect` output up
   front, so camera and emitter quirks arrive with the data a fix needs.
+- **`irlume fingerprint verify` and `irlume fingerprint reset`.** `verify` runs
+  one interactive round against the enrolled prints and is offered
+  automatically after every enrollment, catching the "enroll succeeds, verify
+  never matches" sensor failure before the user relies on it at the greeter.
+  `reset` deletes every print fprintd holds for the user (confirm-gated;
+  `--yes` for scripts; refuses to delete without a terminal) and offers a fresh
+  enrollment: the remedy for chip/host template desync after a Windows
+  dual-boot enrollment, an OS reinstall, or a BIOS fingerprint wipe.
+- **Fingerprint doctor checks.** `irlume doctor` now warns on: a stale fprintd
+  device claim (the dominant post-suspend failure; finger prompts silently stop
+  until `systemctl restart fprintd`), a vendor driver stack
+  (open-fprintd/python-validity) owning the fprint bus name instead of stock
+  fprintd, pam_faillock sharing a stack with pam_fprintd (a touch-sensor
+  misread can burn every retry in seconds and lock the account), and
+  pam_fprintd reachable from `sudo` while an SSH server runs (every remote
+  `sudo` stalls up to 30s waiting on the local reader).
+
+### Changed (fingerprint plumbing)
+
+- Every fprintd/busctl helper now runs under `LC_ALL=C`; the fprintd CLI tools
+  are gettext-localized, so on a non-English locale the status parsing silently
+  stopped working.
+- Enrollment has a 120-second completion deadline (a wedged driver otherwise
+  hangs the enroll forever), captures stderr, and maps each failure class to
+  its own actionable message: reader claimed by another session, on-sensor
+  storage full, reader disconnected mid-enroll, polkit refusal, no device.
+- Listing enrolled fingers now distinguishes "no fingers enrolled" from "the
+  listing failed" (stale claim, polkit refusal, readerless box —
+  `fprintd-list` exits 0 in all of them). Found live: over SSH, polkit refuses
+  the listing, and status/verify used to answer "no finger enrolled; run
+  irlume fingerprint add", pointing exactly the wrong way.
+- Stale-claim detection matches the D-Bus error names (never translated) in
+  addition to the C-locale phrases, and multi-reader machines now report every
+  reader's name instead of only the first.
 
 ### Changed
 

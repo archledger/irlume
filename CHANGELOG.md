@@ -62,6 +62,17 @@ All notable changes to irlume are documented here. This project adheres to
   pam_fprintd reachable from `sudo` while an SSH server runs (every remote
   `sudo` stalls up to 30s waiting on the local reader).
 
+- **IR capture negotiates beyond native GREY.** IR nodes that expose only the
+  16-bit grey family (Y16/Y10/Y12) or only a packed colour container
+  (NV12/YUYV) now work: 16-bit frames are converted with an effective-depth
+  estimate (the V4L2 spec keeps sample data LSB-aligned and allows Y16 to
+  carry as few as 10 real bits, so a fixed top-byte take reads such sensors as
+  near-black), and NV12/YUYV nodes contribute their 8-bit luma plane. Y16-class
+  nodes also classify as IR now instead of falling to Other, which silently
+  demoted those machines to the RGB convenience tier. MJPEG-only IR nodes get
+  an error naming what the camera offers. Validated against the reference IR
+  camera (native GREY path unchanged, strobe capture intact).
+
 ### Changed (fingerprint plumbing)
 
 - Every fprintd/busctl helper now runs under `LC_ALL=C`; the fprintd CLI tools

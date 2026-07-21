@@ -78,6 +78,9 @@ pub const IR_EMITTER_NEXIGO_N930W: (u8, u8, [u8; 9]) = (4, 6, [1, 3, 2, 0, 0, 0,
 /// companion. linhello lesson: classify by advertised FourCC, never hardcode.
 const COLOUR_FOURCCS: [&[u8; 4]; 5] = [b"YUYV", b"MJPG", b"RGB3", b"BGR3", b"NV12"];
 const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
+/// 16-bit grey family (16-bit LE words, LSB-aligned data per the V4L2 spec);
+/// classification treats these as IR too, and capture decodes them to 8-bit.
+const GREY16_FOURCCS: [&[u8; 4]; 3] = [b"Y16 ", b"Y10 ", b"Y12 "];
 
 /// Map common io errors to actionable messages (linhello lesson: EBUSY/privacy
 /// are routine and need a clear cause, not a raw errno).
@@ -151,14 +154,22 @@ pub fn classify(device: &str) -> Role {
     let Ok(formats) = Capture::enum_formats(&dev) else {
         return Role::Other;
     };
+    let fourccs: Vec<[u8; 4]> = formats.iter().map(|f| f.fourcc.repr).collect();
+    role_from_formats(&fourccs)
+}
+
+/// Pure classification over a node's advertised fourccs (unit-testable without
+/// hardware). 8-bit grey and the 16-bit grey family (Y16/Y10/Y12) are both IR
+/// signatures: Y16-only IR nodes exist and previously classified as Other,
+/// silently demoting the machine to the RGB convenience tier.
+pub(crate) fn role_from_formats(fourccs: &[[u8; 4]]) -> Role {
     let mut has_colour = false;
     let mut has_grey = false;
-    for f in &formats {
-        let cc = &f.fourcc.repr;
+    for cc in fourccs {
         if COLOUR_FOURCCS.contains(&cc) {
             has_colour = true;
         }
-        if GREY_FOURCCS.contains(&cc) {
+        if GREY_FOURCCS.contains(&cc) || GREY16_FOURCCS.contains(&cc) {
             has_grey = true;
         }
     }
@@ -652,6 +663,98 @@ fn fourcc_str(cc: &[u8; 4]) -> String {
         .to_string()
 }
 
+/// How to turn a dequeued IR buffer into the 8-bit GREY frame the pipeline uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrPixel {
+    /// GREY / Y8 / Y800: already 8-bit, used as-is.
+    Grey8,
+    /// Y16 / Y10 / Y12: 16-bit little-endian words, sample data LSB-aligned
+    /// (per the V4L2 spec, which also allows Y16 to carry fewer than 16 real
+    /// bits — a 10-bit sensor delivers 0..1023 in Y16).
+    Grey16,
+    /// NV12: the leading `w*h` bytes are a plain 8-bit luma plane; an IR sensor
+    /// behind bridge firmware that only speaks NV12 is fully usable through it.
+    Nv12Luma,
+    /// YUYV: every even byte is 8-bit luma.
+    YuyvLuma,
+}
+
+/// IR format preference: native 8-bit grey, then the 16-bit grey family, then
+/// luma extraction from the packed colour containers. Field data (mined from
+/// sibling projects): IR sensors that expose ONLY MJPG or NV12 exist, and
+/// 16-bit grey IR nodes exist; a GREY-only assumption silently demotes those
+/// machines to the RGB convenience tier.
+const IR_CANDIDATES: [(&[u8; 4], IrPixel); 8] = [
+    (b"GREY", IrPixel::Grey8),
+    (b"Y8  ", IrPixel::Grey8),
+    (b"Y800", IrPixel::Grey8),
+    (b"Y16 ", IrPixel::Grey16),
+    (b"Y10 ", IrPixel::Grey16),
+    (b"Y12 ", IrPixel::Grey16),
+    (b"NV12", IrPixel::Nv12Luma),
+    (b"YUYV", IrPixel::YuyvLuma),
+];
+
+/// Negotiate an IR-decodable format on `dev`, mirroring [`negotiate_rgb_format`]:
+/// walk [`IR_CANDIDATES`] against what the driver advertises, accept the first
+/// one the driver echoes back, and fail with a message naming what it offers.
+fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(Format, IrPixel)> {
+    let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
+        .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
+        .unwrap_or_default();
+    for (cc, pix) in IR_CANDIDATES {
+        // If enumeration is unavailable, keep the historical behaviour and try
+        // each candidate blind; otherwise only ask for formats it advertises.
+        if !offered.is_empty() && !offered.contains(cc) {
+            continue;
+        }
+        let fmt = Format::new(IR_W, IR_H, FourCC::new(cc));
+        let fmt = Capture::set_format(dev, &fmt).map_err(|e| map_io(device, e))?;
+        if &fmt.fourcc.repr == cc {
+            return Ok((fmt, pix));
+        }
+    }
+    let offered_str: Vec<String> = offered.iter().map(fourcc_str).collect();
+    Err(Error::Hardware(format!(
+        "{device}: IR camera offers only [{}]; irlume decodes native grey \
+         (GREY/Y8/Y800), 16-bit grey (Y16/Y10/Y12), or a luma plane \
+         (NV12/YUYV). MJPEG-only IR nodes are not supported yet.",
+        offered_str.join(", ")
+    )))
+}
+
+/// Convert one dequeued IR buffer to the 8-bit GREY layout the pipeline uses.
+pub(crate) fn decode_ir(buf: &[u8], pix: IrPixel, w: u32, h: u32) -> Vec<u8> {
+    match pix {
+        IrPixel::Grey8 => buf.to_vec(),
+        IrPixel::Grey16 => grey16_to_8(buf),
+        IrPixel::Nv12Luma => {
+            let luma = (w as usize * h as usize).min(buf.len());
+            buf[..luma].to_vec()
+        }
+        IrPixel::YuyvLuma => buf.iter().step_by(2).copied().collect(),
+    }
+}
+
+/// 16-bit-LE grey (Y16/Y10/Y12) → 8-bit. The V4L2 spec keeps sample data
+/// LSB-aligned and lets the real precision be anything up to 16 bits, and
+/// nothing reports which; a fixed top-byte take (what a sibling project ships)
+/// reads a 10-bit-in-Y16 sensor as near-black. Instead, estimate the effective
+/// depth from the frame's own maximum and shift the whole frame uniformly:
+/// deterministic, monotone, and stable within a burst.
+pub(crate) fn grey16_to_8(buf: &[u8]) -> Vec<u8> {
+    let max: u16 = buf
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .max()
+        .unwrap_or(0);
+    let bits = 16 - max.leading_zeros();
+    let shift = bits.saturating_sub(8);
+    buf.chunks_exact(2)
+        .map(|p| (u16::from_le_bytes([p[0], p[1]]) >> shift).min(255) as u8)
+        .collect()
+}
+
 /// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
 pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
     let mut frames = capture_rgb_burst(device, 1)?;
@@ -750,14 +853,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
         )));
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-    let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
-    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
-    if &fmt.fourcc.repr != b"GREY" {
-        return Err(Error::Hardware(format!(
-            "{device}: driver gave {:?}, expected GREY",
-            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("????")
-        )));
-    }
+    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
@@ -771,6 +867,8 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     // frame, the lit strobe phase (linhello lesson). Re-fire mid-burst in case
     // the control self-clears. Keep every frame so the optional ambient
     // subtraction below can pair the lit frame with an adjacent emitter-off one.
+    // Every frame is decoded to 8-bit GREY at dequeue, so the means, the
+    // subtraction, and everything downstream see one uniform layout.
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
     let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
     for i in 0..IR_BURST {
@@ -778,8 +876,9 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
             ir_emitter::enable(dev.handle().fd(), &card);
         }
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        means.push(buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64);
-        frames.push(buf.to_vec());
+        let data = decode_ir(buf, pix, w, h);
+        means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
+        frames.push(data);
     }
     let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
     let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -904,9 +1003,9 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
 /// are diagnostics for the strobe-probe example. Kept in the crate so the
 /// example and the capture path share one implementation.
 pub mod ir_probe {
+    use super::{decode_ir, negotiate_ir_format};
     use super::{ir_emitter, map_io, privacy_engaged, verify_pinned, Error, Frame, Spectrum};
-    use super::{Capture, CaptureStream, Device, Format, FourCC, Type};
-    use super::{IR_H, IR_W};
+    use super::{CaptureStream, Device, Type};
 
     /// Mean brightness of an 8-bit greyscale buffer.
     pub fn mean(data: &[u8]) -> f64 {
@@ -1003,8 +1102,7 @@ pub mod ir_probe {
             )));
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-        let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
-        let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
+        let (fmt, pix) = negotiate_ir_format(device, &dev)?;
         let (w, h) = (fmt.width, fmt.height);
         let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
             .map_err(|e| map_io(device, e))?;
@@ -1019,7 +1117,7 @@ pub mod ir_probe {
                     width: w,
                     height: h,
                     spectrum: Spectrum::Ir,
-                    data: buf.to_vec(),
+                    data: decode_ir(buf, pix, w, h),
                 },
                 t0.elapsed().as_secs_f64() * 1000.0,
             ));
@@ -1065,14 +1163,7 @@ pub fn capture_ir_sequence(
     }
     let burst = burst.max(1);
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-    let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
-    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
-    if &fmt.fourcc.repr != b"GREY" {
-        return Err(Error::Hardware(format!(
-            "{device}: driver gave {:?}, expected GREY",
-            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("????")
-        )));
-    }
+    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = Some(
         v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
@@ -1110,10 +1201,11 @@ pub fn capture_ir_sequence(
                 .expect("IR stream present")
                 .next()
                 .map_err(|e| map_io(device, e))?;
-            let mean = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
+            let data = decode_ir(buf, pix, w, h);
+            let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
             if mean > best_mean {
                 best_mean = mean;
-                best = Some(buf.to_vec());
+                best = Some(data);
             }
         }
         let Some(data) = best else { continue };
@@ -1161,25 +1253,23 @@ pub fn capture_ir_sequence(
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-    let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
-    let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
-    if &fmt.fourcc.repr != b"GREY" {
-        return Err(Error::Hardware(format!(
-            "{device}: not an IR (GREY) capture node"
-        )));
-    }
+    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
     }
-    // Mean IR brightness over a short burst (catches a strobed emitter's lit phase).
+    // Mean IR brightness over a short burst (catches a strobed emitter's lit
+    // phase). Measured on the DECODED 8-bit frame so the brightness scale is
+    // comparable across native-grey and 16-bit/luma-extracted nodes.
     let mut measure = || -> f32 {
         let mut best = 0.0f32;
         for _ in 0..8 {
             if let Ok((buf, _)) = stream.next() {
-                let m = buf.iter().map(|&p| p as f64).sum::<f64>() / buf.len().max(1) as f64;
+                let data = decode_ir(buf, pix, w, h);
+                let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
                 best = best.max(m as f32);
             }
         }
@@ -1690,6 +1780,87 @@ mod tests {
     fn device_identity_absent_for_non_usb_nodes() {
         assert_eq!(device_identity("/dev/null"), None);
         assert_eq!(device_identity("/dev/irlume-test-missing"), None);
+    }
+
+    #[test]
+    fn role_classification_covers_the_grey16_family() {
+        use super::role_from_formats;
+        // Native 8-bit IR node.
+        assert_eq!(role_from_formats(&[*b"GREY"]), Role::Ir);
+        // 16-bit grey IR nodes previously fell to Other (convenience demotion).
+        assert_eq!(role_from_formats(&[*b"Y16 "]), Role::Ir);
+        assert_eq!(role_from_formats(&[*b"Y10 "]), Role::Ir);
+        assert_eq!(role_from_formats(&[*b"Y12 "]), Role::Ir);
+        // Colour still wins (an RGB cam also advertising grey is an RGB cam).
+        assert_eq!(role_from_formats(&[*b"YUYV", *b"GREY"]), Role::Rgb);
+        assert_eq!(role_from_formats(&[*b"NV12"]), Role::Rgb);
+        // Metadata/unknown-only nodes stay Other.
+        assert_eq!(role_from_formats(&[*b"UVCM"]), Role::Other);
+        assert_eq!(role_from_formats(&[]), Role::Other);
+    }
+
+    #[test]
+    fn grey16_conversion_estimates_effective_depth() {
+        use super::grey16_to_8;
+        // True 16-bit data: high byte survives (0xAB00 → 0xAB).
+        let full: Vec<u8> = [0xCDu16, 0xAB00, 0xFFFF]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(grey16_to_8(&full), vec![0x00, 0xAB, 0xFF]);
+        // 10-bit-in-Y16 (V4L2 allows lower precision, LSB-aligned): values
+        // 0..1023 must map onto 0..255, not collapse to near-black.
+        let ten: Vec<u8> = [0u16, 256, 512, 1023]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(grey16_to_8(&ten), vec![0, 64, 128, 255]);
+        // 8-bit-or-less data passes through unshifted.
+        let eight: Vec<u8> = [0u16, 128, 255]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(grey16_to_8(&eight), vec![0, 128, 255]);
+        // Empty and odd-length buffers do not panic; the odd byte is ignored.
+        assert!(grey16_to_8(&[]).is_empty());
+        assert_eq!(grey16_to_8(&[0x40, 0x00, 0x7F]), vec![0x40]);
+    }
+
+    #[test]
+    fn decode_ir_extracts_luma_from_packed_containers() {
+        use super::{decode_ir, IrPixel};
+        // Grey8: byte-for-byte passthrough.
+        assert_eq!(
+            decode_ir(&[1, 2, 3, 4], IrPixel::Grey8, 2, 2),
+            vec![1, 2, 3, 4]
+        );
+        // NV12 (2x2): 4 luma bytes then interleaved UV; only luma survives.
+        assert_eq!(
+            decode_ir(&[10, 20, 30, 40, 128, 128], IrPixel::Nv12Luma, 2, 2),
+            vec![10, 20, 30, 40]
+        );
+        // YUYV (2 px): Y0 U Y1 V → the even bytes.
+        assert_eq!(
+            decode_ir(&[90, 0, 91, 0], IrPixel::YuyvLuma, 2, 1),
+            vec![90, 91]
+        );
+        // Grey16 goes through the depth-estimating converter.
+        let buf: Vec<u8> = [1023u16, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(decode_ir(&buf, IrPixel::Grey16, 2, 1), vec![255, 0]);
+    }
+
+    #[test]
+    fn ir_candidates_prefer_native_grey_then_grey16_then_luma() {
+        use super::{IrPixel, IR_CANDIDATES};
+        let order: Vec<IrPixel> = IR_CANDIDATES.iter().map(|(_, p)| *p).collect();
+        let first_grey16 = order.iter().position(|p| *p == IrPixel::Grey16).unwrap();
+        let last_grey8 = order.iter().rposition(|p| *p == IrPixel::Grey8).unwrap();
+        let first_luma = order
+            .iter()
+            .position(|p| matches!(p, IrPixel::Nv12Luma | IrPixel::YuyvLuma))
+            .unwrap();
+        assert!(last_grey8 < first_grey16, "native grey must be tried first");
+        assert!(first_grey16 < first_luma, "grey16 before luma extraction");
     }
 
     #[test]

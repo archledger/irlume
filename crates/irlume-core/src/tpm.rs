@@ -810,6 +810,21 @@ fn parse_pcrlock_json(raw: &[u8]) -> Result<PcrlockJson> {
 }
 
 fn hex32(s: &str) -> Result<[u8; 32]> {
+    // Guard BEFORE the byte-indexed slice below: a multibyte UTF-8 char (with
+    // s.len() still even) or an odd length would make `s[i..i+2]` split a char
+    // boundary or run past the end and PANIC, turning a corrupt/partial
+    // pcrlock.json into a login outage instead of a clean password fallback.
+    // Same hardening as pcrsig::from_hex (a fuzzer found this class there).
+    if !s.is_ascii() {
+        return Err(Error::Policy(
+            "non-hex characters in pcrlock.json PCR value".into(),
+        ));
+    }
+    if !s.len().is_multiple_of(2) {
+        return Err(Error::Policy(
+            "odd-length hex in pcrlock.json PCR value".into(),
+        ));
+    }
     let bytes = (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
@@ -1142,6 +1157,21 @@ mod tests {
         let b = a_hash(&[0xaa; 32], &[0x01]).unwrap();
         assert_eq!(a.value().len(), 32);
         assert_ne!(a.value(), b.value());
+    }
+
+    #[test]
+    fn hex32_rejects_malformed_without_panicking() {
+        // 64 valid hex chars -> 32 bytes.
+        let good: String = "ab".repeat(32);
+        assert!(hex32(&good).is_ok());
+        // Odd length must error, not panic on the trailing slice.
+        assert!(hex32("abc").is_err());
+        // A multibyte char (even byte length) must error, not split a boundary.
+        assert!(hex32("aé").is_err());
+        // Right length, non-hex digits.
+        assert!(hex32(&"zz".repeat(32)).is_err());
+        // Valid hex but wrong byte count.
+        assert!(hex32("aabb").is_err());
     }
 
     #[test]

@@ -70,7 +70,10 @@ pub fn decode_stride(
     let mut out = Vec::new();
     for idx in 0..cls.len() {
         let score = (cls[idx].clamp(0.0, 1.0) * obj[idx].clamp(0.0, 1.0)).sqrt();
-        if score < score_thresh {
+        // A NaN score (from a NaN model logit) would pass `< thresh` (false for
+        // NaN) and then rank highest under `total_cmp`, hiding the real face and
+        // forcing a false-reject. Drop non-finite scores outright.
+        if !score.is_finite() || score < score_thresh {
             continue;
         }
         let (r, c) = ((idx / feat_w) as f32, (idx % feat_w) as f32);

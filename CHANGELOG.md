@@ -27,6 +27,12 @@ All notable changes to irlume are documented here. This project adheres to
   hierarchy-independent, so the policy is unchanged). Verified on a real
   systemd-boot host, including a Tier-1 seal that unseals after a reboot.
 
+- **The "irlumed is not running" guidance survives newer kernels.** Connecting
+  to a stale daemon socket (daemon gone, file left behind) returns
+  `ECONNRESET` instead of `ECONNREFUSED` on newer kernels (observed on
+  7.1.4-zen by the self-hosted hardware runner); the client now maps both to
+  the actionable start-the-daemon message instead of a raw errno.
+
 ### Added
 
 - **Panic firewall in `pam_irlume.so`.** Every PAM entry point now runs behind

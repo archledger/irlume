@@ -153,14 +153,42 @@ fn enable(user: &str) -> ExitCode {
                 && run_cmd("authselect", &["apply-changes"])
         }
         DistroFamily::Debian => run_cmd("pam-auth-update", &["--enable", "fprintd"]),
+        // No supported wiring tool here. Proceed only when the admin has already
+        // added the stanza: recording method=fingerprint with nothing wired
+        // disables face while no biometric drives the prompt, silently leaving
+        // the box password-only.
         DistroFamily::Arch | DistroFamily::Other => {
-            println!("[fingerprint] On this distro, add  'auth sufficient pam_fprintd.so'  above pam_unix");
-            println!("              in your login/sudo PAM stacks (e.g. /etc/pam.d/system-local-login, /etc/pam.d/sudo).");
-            true // method still recorded below; manual stanza is the user's step
+            let already = pam_fprintd_wired(std::path::Path::new(PAM_DIR));
+            if already {
+                println!(
+                    "[fingerprint] found an active pam_fprintd.so line in {PAM_DIR}; using it"
+                );
+            } else {
+                eprintln!("[fingerprint] no wiring tool on this distro; add the line yourself:");
+                eprintln!("                auth  sufficient  pam_fprintd.so");
+                eprintln!("              above pam_unix in your login/sudo PAM stacks");
+                eprintln!("              (e.g. /etc/pam.d/system-local-login, /etc/pam.d/sudo),");
+                eprintln!("              then re-run:  sudo irlume fingerprint enable");
+            }
+            already
         }
     };
     if !wired {
-        eprintln!("[fingerprint] failed to wire pam_fprintd; check the command output above");
+        eprintln!(
+            "[fingerprint] method unchanged: face (irlume) stays active until pam_fprintd is wired"
+        );
+        return ExitCode::FAILURE;
+    }
+    // Verify the line actually landed before switching the method, even on the
+    // tool paths: authselect/pam-auth-update can exit 0 without producing a
+    // pam_fprintd line (e.g. a custom authselect profile lacking the feature).
+    if !pam_fprintd_wired(std::path::Path::new(PAM_DIR)) {
+        eprintln!(
+            "[fingerprint] wiring reported success but {PAM_DIR} has no active pam_fprintd.so line"
+        );
+        eprintln!(
+            "[fingerprint] method unchanged: face (irlume) stays active until pam_fprintd is wired"
+        );
         return ExitCode::FAILURE;
     }
     if let Err(e) = policy::set_method(Method::Fingerprint) {
@@ -196,6 +224,27 @@ fn disable() -> ExitCode {
     }
     println!("[fingerprint] ✓ disabled: face (irlume) is the active method again");
     ExitCode::SUCCESS
+}
+
+/// Where PAM service files live; a const so tests can exercise the scan on a
+/// directory they control.
+const PAM_DIR: &str = "/etc/pam.d";
+
+/// True when any file in `pam_dir` carries an ACTIVE (non-comment) line
+/// referencing `pam_fprintd.so`, i.e. something will actually drive the
+/// fingerprint prompt. Unreadable dirs/files count as not wired.
+fn pam_fprintd_wired(pam_dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(pam_dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        std::fs::read_to_string(e.path()).is_ok_and(|s| {
+            s.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with('#') && t.contains("pam_fprintd.so")
+            })
+        })
+    })
 }
 
 /// Run a system command, echoing it (transparency) and reporting success.
@@ -241,6 +290,37 @@ mod tests {
         assert!(run_cmd("true", &[]));
         assert!(!run_cmd("false", &[]));
         assert!(!run_cmd("irlume-no-such-command-xyz", &["arg"]));
+    }
+
+    #[test]
+    fn pam_fprintd_wired_needs_an_active_line() {
+        let dir = std::env::temp_dir().join(format!("irlume-fpwire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty directory: nothing wired.
+        assert!(!pam_fprintd_wired(&dir));
+        // A commented-out line does not count.
+        std::fs::write(dir.join("sudo"), "#auth sufficient pam_fprintd.so\n").unwrap();
+        assert!(!pam_fprintd_wired(&dir));
+        // Unrelated modules do not count.
+        std::fs::write(dir.join("login"), "auth required pam_unix.so\n").unwrap();
+        assert!(!pam_fprintd_wired(&dir));
+        // An active line in any file does.
+        std::fs::write(
+            dir.join("system-local-login"),
+            "auth  sufficient  pam_fprintd.so\nauth required pam_unix.so\n",
+        )
+        .unwrap();
+        assert!(pam_fprintd_wired(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pam_fprintd_wired_is_false_for_a_missing_dir() {
+        // The enable path must fail closed (method unchanged) when the PAM dir
+        // cannot be read at all.
+        assert!(!pam_fprintd_wired(std::path::Path::new(
+            "/nonexistent-irlume-test-pam.d"
+        )));
     }
 
     #[test]

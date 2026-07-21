@@ -57,13 +57,18 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 
 | | Windows Hello | Howdy | `visage` | **irlume** |
 |---|:---:|:---:|:---:|:---:|
-| **Liveness / anti-spoof** | IR only *(bypassable: [CVE-2021-34466](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34466))* | ❌ none; its own README warns a *"well-printed photo of you could be enough"* | ⚠️ passive (landmark-stability; blocks photos, not video) | ✅ algorithmic IR gate **+** opt-in passive blink; self-tested vs [ISO/IEC 30107-3](docs/PAD_SELFTEST.md) |
+| **Liveness / anti-spoof** | IR only *(bypassable: [CVE-2021-34466](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34466))* | ❌ none; its own README warns a *"well-printed photo of you could be enough"* | ⚠️ passive (landmark-stability; blocks photos, not video) | ✅ algorithmic IR gate on by default (blocks screens and matte prints); **opt-in** passive blink adds a glossy-print/replay defense.<sup>†</sup> Self-tested vs [ISO/IEC 30107-3](docs/PAD_SELFTEST.md) |
 | **Camera-injection defense** | device-trust *(newer HW)* | ❌ none | ❌ none | ✅ device pinning **+** cross-spectrum RGB↔IR |
 | **Template protection** | TPM-bound enclave | ⚠️ unencrypted encodings on disk | AES-256-GCM, key in a 0600 disk file *(not TPM-sealed)* | ✅ AES-256-GCM, **TPM-sealed key** *(survives disk theft)* |
 | **Opens your keyring/wallet** | ✅ | ❌ *(keyring stays locked)* | ❌ | ✅ **TPM-unseals** it at login |
 | **Stores your face as…** | template | encoding | embedding | **embedding only, never an image** |
 | **Model licensing** | proprietary | MIT code · dlib weights | ⚠️ non-commercial weights | ✅ **permissive, bundleable** |
 | **Runs on** | Windows | Linux | Linux | **Linux: Fedora · Arch · Debian/Ubuntu** |
+
+<sup>†</sup> The default IR gate blocks screens and matte prints (0% APCER in
+self-test), but a determined life-size *glossy* print passed it at 98.6% APCER;
+the opt-in passive-blink challenge closes that at the cost of a slower login.
+Enrollment on IR hardware offers to enable it. See [Honest limitations](#-honest-limitations).
 
 ## 📦 Install
 

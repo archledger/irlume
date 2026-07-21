@@ -166,3 +166,32 @@ with a fabricated print.
   process memory, dropped after use but not explicitly wiped, inside the
   same root daemon that holds the decrypted templates anyway. Nothing
   biometric is logged.
+
+## Intent, throttling, and privilege elevation
+
+- **Face never fires passively.** The camera powers on only when the user
+  submits an empty password field and presses Enter; typing a password never
+  starts a scan. In FIDO terms, that deliberate gesture is the User Presence /
+  intent signal and the face match is User Verification. This is the same shape
+  as macOS Touch ID for `sudo`, where the deliberate fingerprint touch is both
+  the intent act and the verification. It is the specific gap that a passive
+  face-auth tool has for privilege elevation (a face silently approving `sudo`
+  just by being in frame, cf. Howdy issue #1079); irlume does not have it,
+  because presence alone triggers nothing. face-`sudo` therefore requires no
+  extra challenge beyond the gesture and the default IR liveness gate: adding
+  one would impose latency and false rejects on a factor whose fallback (the
+  password) is always one keystroke away.
+- **Consecutive-failure throttle.** After a run of failed face attempts (5 by
+  default, `IRLUME_RATE_LIMIT`), the daemon stops firing the camera on the
+  gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls
+  straight to the password; a grant resets it, and an empty frame (nobody
+  present) never counts. This satisfies the NIST SP 800-63B-4 §3.2.3 intent
+  (an attacker cannot cheaply grind presentation attacks against the gate)
+  deliberately as a *throttle*, not the standard's hard biometric-disable
+  tier: irlume's password is always the fallback and there is no account
+  lockout, so disabling face until "another factor" would only re-offer the
+  password the throttled user is already typing. State is per-user and
+  in-memory; a daemon restart clears it because the password, not a lockout,
+  is the security floor. Every mainstream authenticator (Face ID, Android,
+  Windows Hello) likewise uses ~5 failures then falls to a non-biometric
+  factor rather than locking the account.

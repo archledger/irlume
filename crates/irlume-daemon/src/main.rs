@@ -305,6 +305,93 @@ fn main() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Consecutive-failure throttle (NIST SP 800-63B-4 s3.2.3 intent).
+//
+// After a run of failed face attempts, stop firing the camera on the gesture
+// for a short cooldown and let PAM fall straight to the password. Deliberately
+// a THROTTLE, not a hard biometric-disable: irlume's password is always the
+// fallback and there is no account lockout, so the standard's disable-and-
+// offer-another-factor tier would only add friction (the "other factor" that
+// re-enables face IS the password the throttled user is already typing). Every
+// platform (Face ID, Android, Windows Hello) also uses ~5 fails then falls to a
+// non-biometric factor. State is per-user and in-memory only; a daemon restart
+// clears it (there is nothing to protect on disk since the password is the
+// floor). Tunable/testable via env; 0 strikes disables the throttle.
+// ---------------------------------------------------------------------------
+#[derive(Default)]
+struct FailState {
+    strikes: u32,
+    cooldown_until: Option<std::time::Instant>,
+}
+
+fn rate_state() -> &'static std::sync::Mutex<std::collections::HashMap<String, FailState>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, FailState>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn rate_max_strikes() -> u32 {
+    env_or("IRLUME_RATE_LIMIT", "5").parse().unwrap_or(5)
+}
+
+fn rate_cooldown() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        env_or("IRLUME_RATE_COOLDOWN_SECS", "30")
+            .parse()
+            .unwrap_or(30),
+    )
+}
+
+/// True when `user` is in a cooldown window: skip the camera and fall to the
+/// password. Clears an expired window as a side effect.
+fn rate_limited(user: &str) -> bool {
+    if rate_max_strikes() == 0 {
+        return false;
+    }
+    let mut map = rate_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = map.get_mut(user) {
+        if let Some(until) = s.cooldown_until {
+            if std::time::Instant::now() < until {
+                return true;
+            }
+            s.cooldown_until = None;
+            s.strikes = 0;
+        }
+    }
+    false
+}
+
+/// Record a face attempt's outcome. A grant resets the user; a rejected live
+/// presentation is a strike, and `rate_max_strikes()` of them starts a cooldown.
+/// `faced` is false when no face was presented (nobody in frame), so walking
+/// away never counts against the user.
+fn rate_record(user: &str, granted: bool, faced: bool) {
+    if rate_max_strikes() == 0 {
+        return;
+    }
+    let mut map = rate_state().lock().unwrap_or_else(|e| e.into_inner());
+    let s = map.entry(user.to_string()).or_default();
+    if granted {
+        s.strikes = 0;
+        s.cooldown_until = None;
+        return;
+    }
+    if !faced {
+        return;
+    }
+    s.strikes += 1;
+    if s.strikes >= rate_max_strikes() {
+        s.cooldown_until = Some(std::time::Instant::now() + rate_cooldown());
+        s.strikes = 0;
+        eprintln!(
+            "irlumed: '{user}' hit {} consecutive face failures; face throttled for {}s (password still works)",
+            rate_max_strikes(),
+            rate_cooldown().as_secs()
+        );
+    }
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
 }
@@ -571,10 +658,20 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     };
                 }
             }
+            // Too many recent failures: don't fire the camera, fall to password.
+            if rate_limited(&user) {
+                return Response::AuthResult {
+                    granted: false,
+                    score: 0.0,
+                    live: false,
+                    reason: "too many recent face attempts; use your password".into(),
+                };
+            }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
             match engine.authenticate(&user, service.as_deref()) {
                 Ok(o) => {
+                    rate_record(&user, o.granted, o.live || o.score > 0.0);
                     if convenience || irlume_common::dbglog::on() {
                         // Denied score + reason measurements quantized/redacted
                         // unless tracing (anti-oracle); grants log exact.
@@ -1270,6 +1367,11 @@ fn do_unseal_password(
             "no sealed password for '{user}': run `irlume keyring arm`"
         ));
     }
+    // Same failure throttle as the login/sudo path: after a run of failures,
+    // skip the camera and let PAM fall to the password.
+    if rate_limited(user) {
+        return Response::Error("too many recent face attempts; use your password".into());
+    }
     let outcome = match engine.authenticate(user, service) {
         Ok(o) => o,
         Err(e) => {
@@ -1287,6 +1389,7 @@ fn do_unseal_password(
             return Response::Error(e.to_string());
         }
     };
+    rate_record(user, outcome.granted, outcome.live || outcome.score > 0.0);
     if !outcome.granted {
         // Denied-attempt scores are QUANTIZED to one decimal unless tracing is
         // on: a 4-decimal score after every try is a gradient a journal-reading
@@ -1805,6 +1908,54 @@ mod tests {
             }
             other => panic!("expected PasswordUnsealed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rate_throttle_trips_after_the_limit_and_resets_on_grant() {
+        let _g = env_lock();
+        std::env::set_var("IRLUME_RATE_LIMIT", "3");
+        std::env::set_var("IRLUME_RATE_COOLDOWN_SECS", "30");
+        // Unique user so the process-global map does not bleed across tests.
+        let u = format!("throttle-{}", std::process::id());
+
+        // Below the limit: strikes accumulate, not yet throttled.
+        assert!(!rate_limited(&u));
+        rate_record(&u, false, true); // strike 1
+        rate_record(&u, false, true); // strike 2
+        assert!(!rate_limited(&u), "under the limit must not throttle");
+        rate_record(&u, false, true); // strike 3 -> cooldown
+        assert!(rate_limited(&u), "at the limit the user is throttled");
+
+        // No-face outcomes (nobody in frame) never count: fresh user stays open
+        // even after many of them.
+        let u2 = format!("noface-{}", std::process::id());
+        for _ in 0..10 {
+            rate_record(&u2, false, false);
+        }
+        assert!(!rate_limited(&u2), "absence must not throttle");
+
+        // A grant clears the throttle immediately.
+        let u3 = format!("grant-{}", std::process::id());
+        rate_record(&u3, false, true);
+        rate_record(&u3, false, true);
+        rate_record(&u3, false, true);
+        assert!(rate_limited(&u3));
+        rate_record(&u3, true, true);
+        assert!(!rate_limited(&u3), "a grant resets the throttle");
+
+        // Limit of 0 disables the throttle entirely.
+        std::env::set_var("IRLUME_RATE_LIMIT", "0");
+        let u4 = format!("disabled-{}", std::process::id());
+        for _ in 0..20 {
+            rate_record(&u4, false, true);
+        }
+        assert!(
+            !rate_limited(&u4),
+            "IRLUME_RATE_LIMIT=0 disables the throttle"
+        );
+
+        std::env::remove_var("IRLUME_RATE_LIMIT");
+        std::env::remove_var("IRLUME_RATE_COOLDOWN_SECS");
     }
 
     #[test]

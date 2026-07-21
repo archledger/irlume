@@ -149,7 +149,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
     );
     match daemon_request(&Request::Enroll {
-        user,
+        user: user.clone(),
         profile: name,
         scans,
         reset,
@@ -163,6 +163,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         }) => {
             if created {
                 println!("[enroll] enrolled '{profile}' with {total} scans");
+                offer_blink_challenge(&user);
             } else {
                 println!(
                     "[enroll] this face is already enrolled as '{profile}'; added {added} scans \
@@ -184,6 +185,52 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             eprintln!("enroll: {e}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// After a fresh enrollment on IR hardware, make the opt-in anti-spoof blink
+/// challenge an informed choice rather than a hidden flag. It stays OFF by
+/// default (every mainstream face authenticator, Windows Hello / Face ID /
+/// Android, ships passive PAD, not an active challenge; the default IR gate is
+/// the passive analogue). This offers the extra print/replay defense to those
+/// who want it, being honest about the latency and glasses cost.
+fn offer_blink_challenge(user: &str) {
+    use std::io::{BufRead, IsTerminal, Write};
+    // Only meaningful on IR-capable (Secure-tier) hardware.
+    if !irlume_camera::capabilities().ir_pair {
+        return;
+    }
+    let tip =
+        "Tip: the opt-in anti-spoof blink challenge blocks printed/screen-replay spoofs.\n      \
+               Enable it any time with: irlume profiles challenge on";
+    if !std::io::stdin().is_terminal() {
+        println!("{tip}");
+        return;
+    }
+    print!(
+        "\nEnable the anti-spoof blink challenge now? It blocks printed-photo and\n\
+         screen-replay spoofs, but adds a few seconds per login and can be finicky\n\
+         with glasses. The default IR gate already blocks screens and matte prints.\n\
+         Enable blink challenge? [y/N] "
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        println!("{tip}");
+        return;
+    }
+    if matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
+        match daemon_request(&irlume_common::Request::SetRequireChallenge {
+            user: user.to_string(),
+            on: true,
+        }) {
+            Ok(irlume_common::Response::Enrollment { .. }) | Ok(irlume_common::Response::Ok(_)) => {
+                println!("[enroll] anti-spoof blink challenge enabled. Disable with `irlume profiles challenge off`.")
+            }
+            _ => println!("[enroll] could not enable the challenge now; run `irlume profiles challenge on` later."),
+        }
+    } else {
+        println!("[enroll] keeping the default (fast) IR gate. {tip}");
     }
 }
 
@@ -2175,6 +2222,17 @@ fn doctor() -> std::process::ExitCode {
     let nodes = irlume_camera::discover_nodes();
     if nodes.is_empty() {
         println!("  (none found under /dev/video0..9)");
+        if let Some(gen) = irlume_camera::intel_ipu_present() {
+            println!(
+                "  ⚠ this laptop has an Intel {gen} MIPI camera, which irlume cannot use:\n     \
+                 - its capture nodes emit raw Bayer, not a directly-openable YUYV/GREY stream;\n     \
+                 - the IR (Windows Hello) sensor is not exposed on Linux at all, so IR face\n       \
+                 auth and IR liveness are unavailable on this hardware.\n     \
+                 RGB-only webcam use is possible via a libcamera software-ISP + v4l2loopback\n     \
+                 bridge, but irlume needs the IR sensor; an external USB IR camera is the\n     \
+                 supported path on {gen} machines."
+            );
+        }
     }
     for (path, role) in &nodes {
         let priv_on = if irlume_camera::privacy_engaged(path) {
@@ -2183,6 +2241,30 @@ fn doctor() -> std::process::ExitCode {
             ""
         };
         println!("  {path}: {role:?}{priv_on}");
+        // An RGB node the capture path can't decode (MJPEG-only) classifies as
+        // usable but would fail at capture; warn here instead.
+        if *role == irlume_camera::Role::Rgb {
+            let fmts = irlume_camera::rgb_node_formats(path);
+            let decodable = fmts
+                .iter()
+                .any(|f| f == b"YUYV" || f == b"NV12" || f == b"RGB3" || f == b"BGR3");
+            if !fmts.is_empty() && !decodable {
+                let list: Vec<String> = fmts
+                    .iter()
+                    .map(|f| {
+                        std::str::from_utf8(f)
+                            .unwrap_or("????")
+                            .trim_end()
+                            .to_string()
+                    })
+                    .collect();
+                println!(
+                    "     ⚠ offers only [{}]; irlume needs an uncompressed format\n       \
+                     (YUYV or NV12). This camera will detect but fail at capture.",
+                    list.join(", ")
+                );
+            }
+        }
     }
 
     // --- models / runtime --------------------------------------------------
@@ -2229,6 +2311,24 @@ fn doctor() -> std::process::ExitCode {
             );
         }
         _ => println!("[doctor] templates ({user}): unknown (daemon not reachable; run `irlume recovery status`)"),
+    }
+
+    // --- wiring drift ------------------------------------------------------
+    // If the user is enrolled but no greeter is wired, a distro tool most
+    // likely regenerated the PAM stacks (authselect apply on Fedora,
+    // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
+    // back to the password, so this is not a lockout, but face login silently
+    // stopped working. Surface it with the one-command fix.
+    let enrolled = matches!(
+        daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
+        Ok(irlume_common::Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()
+    );
+    if enrolled && !crate::pamwire::login_wired() {
+        println!(
+            "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
+             A system update (authselect / pam-auth-update) may have regenerated the\n     \
+             PAM stacks. Re-wire with: sudo irlume login enable --apply"
+        );
     }
 
     std::process::ExitCode::SUCCESS

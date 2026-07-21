@@ -479,32 +479,174 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
         id: V4L2_CID_BACKLIGHT_COMPENSATION,
         value: v4l::control::Value::Integer(2),
     });
-    let fmt = Format::new(RGB_W, RGB_H, FourCC::new(b"YUYV"));
+    // Pick an uncompressed format the camera actually offers. Some webcams
+    // advertise RGB only as MJPEG (or NV12) and reject YUYV; classify() still
+    // labels them usable, so without this negotiation they would detect fine
+    // then fail at capture with a cryptic "expected YUYV". YUYV is preferred;
+    // NV12 is the common uncompressed fallback.
+    let chosen = negotiate_rgb_format(device, &dev)?;
+    let fmt = Format::new(RGB_W, RGB_H, FourCC::new(&chosen));
     let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
-    if &fmt.fourcc.repr != b"YUYV" {
+    if fmt.fourcc.repr != chosen {
         return Err(Error::Hardware(format!(
-            "{device}: driver gave {:?}, expected YUYV",
-            std::str::from_utf8(&fmt.fourcc.repr).unwrap_or("????")
+            "{device}: driver gave {}, expected {}",
+            fourcc_str(&fmt.fourcc.repr),
+            fourcc_str(&chosen)
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
 
+    warm_up_stream(device, &mut stream)?;
     for _ in 0..AE_WARMUP {
         stream.next().map_err(|e| map_io(device, e))?; // discard while AE settles
     }
     let mut frames = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        let data = match &chosen {
+            b"NV12" => nv12_to_rgb(buf, w, h),
+            _ => yuyv_to_rgb(buf, w, h),
+        };
         frames.push(Frame {
             width: w,
             height: h,
             spectrum: Spectrum::Rgb,
-            data: yuyv_to_rgb(buf, w, h),
+            data,
         });
     }
     Ok(frames)
+}
+
+/// The uncompressed RGB fourccs the capture path can decode, best first.
+const DECODABLE_RGB: [&[u8; 4]; 2] = [b"YUYV", b"NV12"];
+
+/// The first decodable format (`DECODABLE_RGB` order) the camera advertises, or
+/// None if it offers only formats we cannot decode (e.g. MJPEG-only).
+fn choose_rgb_format(offered: &[[u8; 4]]) -> Option<[u8; 4]> {
+    DECODABLE_RGB
+        .iter()
+        .find(|f| offered.contains(**f))
+        .map(|f| **f)
+}
+
+/// Detects an Intel IPU6/IPU7 MIPI camera complex and returns which generation
+/// ("IPU6" or "IPU7"), or None. These are common on 2020+ Intel laptops (Tiger
+/// Lake onward; IPU7 on Lunar Lake / Panther Lake / Arrow Lake). They expose no
+/// directly-openable V4L2 capture node: the in-kernel ISYS nodes emit raw Bayer
+/// plus metadata, not YUYV/GREY, so `discover_nodes` finds nothing usable and a
+/// user just sees "no camera". Worse for irlume specifically, the IR / Windows
+/// Hello sensor on these modules is not exposed on Linux at all (only the RGB
+/// sensor, and only through a libcamera software-ISP bridge). `doctor` uses
+/// this to explain the situation instead of a bare "no camera".
+///
+/// Detection is root-free and identical for the out-of-tree dkms driver and the
+/// mainline in-kernel one (both register the same PCI-driver and module names):
+/// a bound PCI device under the driver, or the module loaded, or (hardware
+/// present but driver/firmware missing) a known IPU PCI device ID.
+pub fn intel_ipu_present() -> Option<&'static str> {
+    for (gen, drv, module) in [
+        (
+            "IPU7",
+            "/sys/bus/pci/drivers/intel-ipu7",
+            "/sys/module/intel_ipu7",
+        ),
+        (
+            "IPU6",
+            "/sys/bus/pci/drivers/intel-ipu6",
+            "/sys/module/intel_ipu6",
+        ),
+    ] {
+        if driver_has_bound_device(drv) || std::path::Path::new(module).exists() {
+            return Some(gen);
+        }
+    }
+    ipu_pci_generation()
+}
+
+/// True if a `/sys/bus/pci/drivers/<name>` directory has at least one bound PCI
+/// device (a `0000:*` symlink), i.e. the driver is actually driving hardware.
+fn driver_has_bound_device(driver_dir: &str) -> bool {
+    std::fs::read_dir(driver_dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("0000:"))
+        })
+        .unwrap_or(false)
+}
+
+/// Scan PCI devices for a known IPU6/IPU7 device ID (vendor 0x8086), catching
+/// the "hardware present but no driver bound" case, the one where the user has
+/// both no camera and no working stack. IDs from the mainline ipu6/ipu7 drivers.
+fn ipu_pci_generation() -> Option<&'static str> {
+    let rd = std::fs::read_dir("/sys/bus/pci/devices").ok()?;
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        let vendor = std::fs::read_to_string(dir.join("vendor")).unwrap_or_default();
+        if vendor.trim() != "0x8086" {
+            continue;
+        }
+        let device = std::fs::read_to_string(dir.join("device")).unwrap_or_default();
+        if let Some(gen) = ipu_generation_for_id(device.trim()) {
+            return Some(gen);
+        }
+    }
+    None
+}
+
+/// Map an Intel PCI device ID (as sysfs prints it, e.g. `0x7d19`) to the IPU
+/// generation, or None. IDs from the mainline ipu6/ipu7 drivers.
+fn ipu_generation_for_id(device_id: &str) -> Option<&'static str> {
+    const IPU6: &[&str] = &["0x9a19", "0x4e19", "0x465d", "0x462e", "0xa75d", "0x7d19"];
+    const IPU7: &[&str] = &["0x645d", "0xb05d"];
+    if IPU7.contains(&device_id) {
+        Some("IPU7")
+    } else if IPU6.contains(&device_id) {
+        Some("IPU6")
+    } else {
+        None
+    }
+}
+
+/// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
+pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
+    let Ok(dev) = Device::with_path(device) else {
+        return Vec::new();
+    };
+    Capture::enum_formats(&dev)
+        .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
+        .unwrap_or_default()
+}
+
+/// Choose the format to capture in: the first `DECODABLE_RGB` entry the camera
+/// advertises. If it advertises none we can decode (e.g. MJPEG-only), fail with
+/// a message that names what it offers rather than a bare "expected YUYV".
+fn negotiate_rgb_format(device: &str, dev: &Device) -> irlume_common::Result<[u8; 4]> {
+    let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
+        .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
+        .unwrap_or_default();
+    // If enumeration is unavailable, keep the historical behaviour (try YUYV).
+    if offered.is_empty() {
+        return Ok(*b"YUYV");
+    }
+    if let Some(f) = choose_rgb_format(&offered) {
+        return Ok(f);
+    }
+    let offered_str: Vec<String> = offered.iter().map(fourcc_str).collect();
+    Err(Error::Hardware(format!(
+        "{device}: RGB camera offers only [{}]; irlume needs an uncompressed \
+         format (YUYV or NV12). MJPEG-only cameras are not supported yet.",
+        offered_str.join(", ")
+    )))
+}
+
+/// Printable fourcc (trailing spaces trimmed), for diagnostics.
+fn fourcc_str(cc: &[u8; 4]) -> String {
+    std::str::from_utf8(cc)
+        .unwrap_or("????")
+        .trim_end()
+        .to_string()
 }
 
 /// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
@@ -616,6 +758,8 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
         .map_err(|e| map_io(device, e))?;
+    // Survive the first-capture-after-resume race (uvcvideo still re-initializing).
+    warm_up_stream(device, &mut stream)?;
     // Fire the active-IR emitter on the open fd (Hello modules reset it per-open,
     // so we must do it here, while streaming, not via an external one-shot).
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
@@ -1124,6 +1268,66 @@ pub fn yuyv_to_rgb(yuyv: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgb
 }
 
+/// Convert an NV12 (4:2:0, Y plane then interleaved UV plane) buffer to
+/// interleaved RGB8 (BT.601). Each 2x2 pixel block shares one U/V pair.
+pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut rgb = vec![0u8; w * h * 3];
+    let y_plane = w * h;
+    // Guard against a short buffer: need the full Y plane plus a UV plane.
+    if nv12.len() < y_plane + (w * h / 2) {
+        return rgb;
+    }
+    for row in 0..h {
+        for col in 0..w {
+            let y = nv12[row * w + col] as f32;
+            // UV plane is half-resolution in both axes; one pair per 2x2 block.
+            let uv = y_plane + (row / 2) * w + (col / 2) * 2;
+            let u = nv12[uv] as f32 - 128.0;
+            let v = nv12[uv + 1] as f32 - 128.0;
+            let o = (row * w + col) * 3;
+            rgb[o] = (y + 1.402 * v).clamp(0.0, 255.0) as u8;
+            rgb[o + 1] = (y - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
+            rgb[o + 2] = (y + 1.772 * u).clamp(0.0, 255.0) as u8;
+        }
+    }
+    rgb
+}
+
+/// Pull and discard one frame with a short retry, so the FIRST capture after a
+/// suspend/resume (or USB re-enumeration) does not fail outright while the
+/// uvcvideo device is still coming back. The daemon opens the device per
+/// request, so there is no stale handle to recover; the only gap is that the
+/// very first `stream.next()` can return EIO/ENODEV for a few hundred ms after
+/// resume. Retry that, then let the normal AE warmup run.
+fn warm_up_stream(
+    device: &str,
+    stream: &mut v4l::io::mmap::Stream<'_>,
+) -> irlume_common::Result<()> {
+    use std::io::ErrorKind;
+    const TRIES: u32 = 8;
+    const GAP: std::time::Duration = std::time::Duration::from_millis(120);
+    for attempt in 0..TRIES {
+        match stream.next() {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if attempt + 1 < TRIES
+                    && matches!(
+                        e.kind(),
+                        ErrorKind::BrokenPipe
+                            | ErrorKind::NotConnected
+                            | ErrorKind::Other
+                            | ErrorKind::TimedOut
+                    ) =>
+            {
+                std::thread::sleep(GAP);
+            }
+            Err(e) => return Err(map_io(device, e)),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,6 +1389,54 @@ mod tests {
         for c in rgb {
             assert!((c as i32 - 128).abs() <= 1);
         }
+    }
+
+    #[test]
+    fn rgb_format_choice_prefers_yuyv_then_nv12_else_none() {
+        // YUYV wins even when listed after MJPG (real ASUS camera order).
+        assert_eq!(choose_rgb_format(&[*b"MJPG", *b"YUYV"]), Some(*b"YUYV"));
+        // NV12 rescues a camera that offers no YUYV.
+        assert_eq!(choose_rgb_format(&[*b"MJPG", *b"NV12"]), Some(*b"NV12"));
+        // YUYV still preferred over NV12 when both are present.
+        assert_eq!(choose_rgb_format(&[*b"NV12", *b"YUYV"]), Some(*b"YUYV"));
+        // MJPEG-only: nothing decodable, negotiation must fail (not pick MJPG).
+        assert_eq!(choose_rgb_format(&[*b"MJPG"]), None);
+    }
+
+    #[test]
+    fn ipu_generation_maps_ids_and_rejects_others() {
+        assert_eq!(ipu_generation_for_id("0x7d19"), Some("IPU6")); // Meteor Lake
+        assert_eq!(ipu_generation_for_id("0x645d"), Some("IPU7")); // Lunar Lake
+        assert_eq!(ipu_generation_for_id("0xb05d"), Some("IPU7")); // Panther Lake
+        assert_eq!(ipu_generation_for_id("0x1234"), None);
+        assert_eq!(ipu_generation_for_id(""), None);
+    }
+
+    #[test]
+    fn fourcc_str_trims_padding() {
+        assert_eq!(fourcc_str(b"YUYV"), "YUYV");
+        assert_eq!(fourcc_str(b"Y8  "), "Y8");
+    }
+
+    #[test]
+    fn nv12_neutral_chroma_is_grey_and_short_buffer_is_safe() {
+        // 2x2 Y plane at 200, one neutral UV pair (128,128) -> near-grey 200.
+        let nv12 = [200u8, 200, 200, 200, 128, 128];
+        let rgb = nv12_to_rgb(&nv12, 2, 2);
+        assert_eq!(rgb.len(), 2 * 2 * 3);
+        for c in &rgb {
+            assert!(
+                (*c as i32 - 200).abs() <= 1,
+                "neutral chroma should stay grey"
+            );
+        }
+        // Chroma carries into RGB: a red-ish V lifts R above Y and drops B.
+        let red = [128u8, 128, 128, 128, 128, 200];
+        let out = nv12_to_rgb(&red, 2, 2);
+        assert!(out[0] > out[2], "V>128 should make R exceed B");
+        // A short buffer never panics; returns a zeroed frame of the right size.
+        let short = [0u8; 3];
+        assert_eq!(nv12_to_rgb(&short, 2, 2).len(), 2 * 2 * 3);
     }
 
     #[test]

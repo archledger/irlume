@@ -43,12 +43,39 @@ const RESEAL_STASH_KEY: &str = "pam_irlume_reseal_authtok";
 
 struct IrlumePam;
 
+/// True when the PAM transaction is for a remote (non-local) session, so the
+/// local camera must not be engaged. Checks PAM_RHOST first (set by sshd and
+/// other network services to the client host); an empty or "localhost" rhost is
+/// local. Falls back to the SSH_CONNECTION / SSH_TTY environment markers for
+/// services that do not set rhost but run under an ssh session (e.g. `sudo` in
+/// an ssh shell).
+fn is_remote_session(pamh: &Pam) -> bool {
+    if let Ok(Some(rhost)) = pamh.get_rhost() {
+        let h = rhost.to_string_lossy();
+        let h = h.trim();
+        if !h.is_empty() && h != "localhost" && h != "localhost.localdomain" {
+            return true;
+        }
+    }
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
 impl PamServiceModule for IrlumePam {
     fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         let user = match pamh.get_user(None) {
             Ok(Some(u)) => u.to_string_lossy().into_owned(),
             _ => return PamError::IGNORE,
         };
+        // Remote-session guard: never fire the local camera for an SSH / remote
+        // login or sudo. The camera is physically at the machine, so whoever is
+        // in front of it (not the remote user) would grant the remote session.
+        // A non-empty PAM_RHOST (or the SSH_* env markers) means remote; return
+        // IGNORE so the password/other factor authenticates instead. Always-on,
+        // independent of biopolicy or how the stack is wired (a hand-added
+        // pam_irlume line in system-auth is covered too).
+        if is_remote_session(&pamh) {
+            return PamError::IGNORE;
+        }
         let unseal = args.iter().any(|a| a == "unseal");
         let wait = args.iter().any(|a| a == "wait");
         let reseal = args.iter().any(|a| a == "reseal");

@@ -151,7 +151,11 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
 /// 2026-07-15: without this, settling into frame can be denied on the
 /// transient mismatch. Other Spoof reasons (flat/depth/2D) are NOT retried,
 /// and a below-threshold MATCH is never retried (that would multiply FAR).
-fn presence_retryable(o: &Outcome) -> bool {
+/// True when an outcome is a mere "no usable face yet" (nobody in frame, or
+/// liveness inconclusive): the grace loop retries these, and the daemon
+/// throttle must NOT count them as failed attempts. A real rejection (wrong
+/// person, a caught spoof that produced a live face) is NOT presence-retryable.
+pub fn presence_retryable(o: &Outcome) -> bool {
     !o.granted
         && !o.live
         && (o.reason.starts_with("no face:")
@@ -741,6 +745,17 @@ impl Engine {
         let pose = rgb_top
             .as_ref()
             .map(|f| irlume_vision::head_pose(&f.landmarks));
+        // Real RGB face luma: the cross-spectrum liveness gate does not read it,
+        // but stage-2 fusion's `rgb_quality_weight` does. Hardcoding 0.0 here
+        // made fusion always treat the RGB modality as pitch-dark (minimal
+        // weight), collapsing the fused score toward IR regardless of actual
+        // ambient light and weakening the "must fool both modalities" bound.
+        // Measure it exactly as the RGB-only path does. The PAD-specific
+        // moiré/specular cues stay 0.0 (the IR gate doesn't use them).
+        let rgb_brightness = rgb_top
+            .as_ref()
+            .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox).0)
+            .unwrap_or(0.0);
         let signals = Signals {
             rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width, rgb.height)),
             ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
@@ -753,7 +768,7 @@ impl Engine {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: ir_stats.ambient_mean,
-            rgb_face_brightness: 0.0, // IR path doesn't use the RGB-PAD cues
+            rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
         };
@@ -1196,6 +1211,30 @@ impl Engine {
                     score: 0.0,
                     reason: format!("dark liveness {verdict:?}: {reason}"),
                 });
+            }
+            // Per-user calibrated IR depth floor, same as the RGB primary path.
+            // `evaluate_ir_only` uses the lenient global DEPTH_MIN_RATIO; the
+            // per-user floor is stricter and ambient-independent, so a curved
+            // warm spoof that sits between the global ratio and this user's
+            // enrolled 3D structure is caught in lit conditions but must not
+            // slip through in the dark. Apply it here too before the IR match.
+            if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+                irlume_common::dlog!(
+                    "gate(per-user depth floor, dark): live {:.2} vs floor {:.2}",
+                    a.ir_depth,
+                    depth_floor
+                );
+                if a.ir_depth < depth_floor {
+                    return Ok(Outcome {
+                        granted: false,
+                        live: false,
+                        score: 0.0,
+                        reason: format!(
+                            "IR depth {:.2} below your calibrated floor {:.2}; looks 2D (screen/photo)",
+                            a.ir_depth, depth_floor
+                        ),
+                    });
+                }
             }
             // Opt-in third-party PAD cue, deny-only (scored in assess_full on
             // the lit IR frame; the dark path re-derives its own gate verdict,
@@ -2035,6 +2074,12 @@ fn rgb_luma_stats(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> (f32, f32) {
 }
 
 pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+    // The pixel loop assumes grey.len() == w*h (the invariant the camera crate
+    // upholds). Guard once so a truncated/mismatched IR frame degrades to 0.0
+    // (treated as "too dark", a safe deny) instead of panicking the daemon.
+    if grey.len() < (w as usize).saturating_mul(h as usize) {
+        return 0.0;
+    }
     let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
     let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
     let x2 = (bbox[2].max(0.0) as u32).min(w);
@@ -2705,6 +2750,9 @@ mod tests {
         // Out-of-frame bbox clamps to the frame.
         assert!((mean_in_bbox(&grey, w, h, &[-9.0, -9.0, 99.0, 99.0]) - 45.0).abs() < 1e-4);
         assert_eq!(mean_in_bbox(&grey, w, h, &[3.0, 1.0, 3.0, 1.0]), 0.0);
+        // A frame shorter than w*h (truncated/mismatched capture) must degrade
+        // to 0.0, not panic on the out-of-bounds index.
+        assert_eq!(mean_in_bbox(&grey[..3], w, h, &[0.0, 0.0, 4.0, 2.0]), 0.0);
     }
 
     #[test]

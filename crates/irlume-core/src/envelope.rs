@@ -99,9 +99,32 @@ impl SealedEnvelope {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| Error::Protocol(e.to_string()))?;
-        fs::write(path, s).map_err(|e| Error::Io(e.to_string()))?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        // Create at 0600 atomically (mode on open) rather than write-then-chmod,
+        // so the sealed envelope is never briefly readable under a lax umask.
+        // The payload is TPM-sealed / passphrase-wrapped, so the window was
+        // low-value, but there is no reason to leave it open.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| Error::Io(e.to_string()))?;
+            f.write_all(s.as_bytes())
+                .map_err(|e| Error::Io(e.to_string()))?;
+            // Re-assert the mode in case the file pre-existed at a wider mode
+            // (open with an existing file keeps its permissions).
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(path, s).map_err(|e| Error::Io(e.to_string()))?;
+        }
         Ok(())
     }
 }

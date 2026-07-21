@@ -2244,10 +2244,10 @@ fn doctor() -> std::process::ExitCode {
         // An RGB node the capture path can't decode (MJPEG-only) classifies as
         // usable but would fail at capture; warn here instead.
         if *role == irlume_camera::Role::Rgb {
+            // Must match the capture path's DECODABLE_RGB (YUYV, NV12); listing
+            // RGB3/BGR3 here would pass doctor then fail at capture.
             let fmts = irlume_camera::rgb_node_formats(path);
-            let decodable = fmts
-                .iter()
-                .any(|f| f == b"YUYV" || f == b"NV12" || f == b"RGB3" || f == b"BGR3");
+            let decodable = fmts.iter().any(|f| f == b"YUYV" || f == b"NV12");
             if !fmts.is_empty() && !decodable {
                 let list: Vec<String> = fmts
                     .iter()

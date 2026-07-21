@@ -25,5 +25,36 @@ RestartSec=2
 # mid-flight.
 TimeoutStopSec=10s
 
+# Sandboxing, layered UNDER the SELinux/AppArmor policies (defense in depth).
+# Scoped to what the daemon actually needs: it opens /dev/video* and the TPM,
+# binds a Unix socket, and reads/writes each target user's enrollment (which is
+# why ProtectHome and PrivateDevices are deliberately NOT set, and CAP_CHOWN et
+# al are kept so it can own enrolled files to the user). MemoryDenyWriteExecute
+# stays off because the ONNX runtime JITs.
+NoNewPrivileges=yes
+# No network in the auth loop: the daemon speaks only a local Unix socket.
+# AF_NETLINK is kept for kernel device/uevent queries; no AF_INET/AF_INET6.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+# /usr, /boot, /etc read-only; /var, /run, /home stay writable (state + socket
+# + per-user enrollment live there). Not =strict, which would need the enrolled
+# users' homes in ReadWritePaths.
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# The daemon chowns enrolled files to the target user; keep only those caps.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+UMask=0027
+
 [Install]
 WantedBy=multi-user.target

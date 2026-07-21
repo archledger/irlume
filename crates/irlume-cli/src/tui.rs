@@ -1888,6 +1888,21 @@ impl App {
                     map_settings,
                 );
             }
+            // Blink challenge is a per-user opt-in gate, togglable exactly like
+            // eyes-open; [c] flips it so the anti-spoof stage no longer needs a
+            // drop to the shell (`irlume profiles challenge on|off`).
+            (SC_SETTINGS, KeyCode::Char('c')) => {
+                let on = !self.challenge;
+                self.start_async(
+                    "toggle require-challenge",
+                    OpTag::Generic,
+                    Request::SetRequireChallenge {
+                        user: self.user.clone(),
+                        on,
+                    },
+                    map_settings,
+                );
+            }
             _ => {}
         }
     }
@@ -2271,7 +2286,7 @@ impl App {
                 SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
                 SC_PAM => "Turn on face login for your screen: press [w] (asks for your password).",
                 SC_SETTINGS => {
-                    "Press [enter] to toggle the eyes-open check; other settings are root or read-only."
+                    "[enter] toggles the eyes-open check, [c] the blink challenge; other settings are root or read-only."
                 }
                 SC_DONE => {
                     "Green = done; anything left shows its key. Press [q] to close."
@@ -3423,7 +3438,7 @@ impl App {
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
             SC_FINGERPRINT => &[("a", "enroll finger")],
             SC_PAM => &[("w", "wire login (sudo)"), ("s", "show status")],
-            SC_SETTINGS => &[("enter", "toggle eyes-open")],
+            SC_SETTINGS => &[("enter", "toggle eyes-open"), ("c", "toggle blink")],
             SC_DONE => &[("w", "wire login"), ("r", "refresh")],
             _ => &[("r", "refresh")],
         };
@@ -4975,6 +4990,24 @@ mod tests {
         assert_eq!(
             app.op.as_ref().map(|o| o.label.as_str()),
             Some("toggle require-eyes-open")
+        );
+        wait_op_done(&mut app);
+        assert!(
+            app.error.is_some(),
+            "a failed toggle must raise the error banner, not vanish"
+        );
+    }
+
+    #[test]
+    fn settings_c_toggles_blink_challenge_via_the_daemon() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(
+            app.op.as_ref().map(|o| o.label.as_str()),
+            Some("toggle require-challenge"),
+            "[c] must fire the SetRequireChallenge toggle, not fall through"
         );
         wait_op_done(&mut app);
         assert!(

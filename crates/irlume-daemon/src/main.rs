@@ -362,10 +362,15 @@ fn rate_limited(user: &str) -> bool {
     false
 }
 
-/// Record a face attempt's outcome. A grant resets the user; a rejected live
+/// Record a face attempt's outcome. A grant resets the user; a rejected real
 /// presentation is a strike, and `rate_max_strikes()` of them starts a cooldown.
-/// `faced` is false when no face was presented (nobody in frame), so walking
-/// away never counts against the user.
+/// `faced` is the *strike-worthy* signal: it must be true for a genuine failed
+/// presentation, which includes a hard spoof rejection (those return
+/// `live=false, score=0`, so an earlier `live || score>0` test never struck on
+/// the actual attack it is meant to throttle). Callers pass
+/// `!presence_retryable(&outcome)`: false only for the retryable no-face /
+/// uncertain-liveness outcomes (nobody in frame, walk-away, transient
+/// uncertainty), which must never count against the user.
 fn rate_record(user: &str, granted: bool, faced: bool) {
     if rate_max_strikes() == 0 {
         return;
@@ -671,7 +676,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             let t = std::time::Instant::now();
             match engine.authenticate(&user, service.as_deref()) {
                 Ok(o) => {
-                    rate_record(&user, o.granted, o.live || o.score > 0.0);
+                    rate_record(&user, o.granted, !irlume_auth::presence_retryable(&o));
                     if convenience || irlume_common::dbglog::on() {
                         // Denied score + reason measurements quantized/redacted
                         // unless tracing (anti-oracle); grants log exact.
@@ -1389,7 +1394,11 @@ fn do_unseal_password(
             return Response::Error(e.to_string());
         }
     };
-    rate_record(user, outcome.granted, outcome.live || outcome.score > 0.0);
+    rate_record(
+        user,
+        outcome.granted,
+        !irlume_auth::presence_retryable(&outcome),
+    );
     if !outcome.granted {
         // Denied-attempt scores are QUANTIZED to one decimal unless tracing is
         // on: a 4-decimal score after every try is a gradient a journal-reading

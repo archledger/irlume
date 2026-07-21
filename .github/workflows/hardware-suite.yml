@@ -33,12 +33,12 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Cache Git LFS objects (ONNX model weights)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .git/lfs
-          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
-
+      # No actions/cache here: on a self-hosted runner the repo's .git (with
+      # its LFS objects) persists in the runner work directory between runs,
+      # so this pull is a no-op after the first run; a round-trip to the
+      # Actions cache service would be pure overhead. Incremental build state
+      # likewise persists via the runner-level CARGO_TARGET_DIR (set in the
+      # runner's .env, outside the work dir so checkout's clean never wipes it).
       - name: Pull model weights (Git LFS)
         run: git lfs pull
 

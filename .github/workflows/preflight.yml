@@ -1,0 +1,46 @@
+# Fast pre-merge feedback on the MAINTAINER'S OWN pull requests, using the
+# self-hosted runner's persistent state (incremental cargo target, local LFS,
+# pre-fetched ONNX runtime, pinned MSRV toolchain). ADDITIVE: the required
+# merge gate stays the GitHub-hosted ci.yml, which builds from scratch in a
+# deterministic environment; this job exists to surface breakage in minutes
+# instead of tens, on real hardware-adjacent state (rolling Arch).
+#
+# SECURITY: the job-level guard restricts this to SAME-REPO pull requests —
+# creating one requires push access, so fork PRs (anyone on the internet)
+# never reach the personal-machine runner. They are also behind the
+# repo-wide all-outside-collaborators approval wall, but the guard here must
+# stand on its own: do not remove it.
+name: Preflight (self-hosted)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same PR cancels the in-flight preflight: the runner is
+# a single machine, and only the latest commit's verdict matters here.
+concurrency:
+  group: preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: preflight · fmt · clippy · test (archhost)
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, arch]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Pull model weights (Git LFS, local no-op after first run)
+        run: git lfs pull
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked

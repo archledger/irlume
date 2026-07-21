@@ -35,6 +35,10 @@ fn ort_dylib() -> Option<String> {
     None
 }
 
+// The child is killed on every failure path and reaped on success; a panicking
+// test process is itself reaped by the OS (which cleans up the child), so the
+// zombie-process lint does not apply to this integration test.
+#[allow(clippy::zombie_processes)]
 #[test]
 #[ignore = "needs ONNX models + onnxruntime to boot the daemon (CI provides them)"]
 fn daemon_exits_promptly_on_sigterm() {
@@ -84,7 +88,12 @@ fn daemon_exits_promptly_on_sigterm() {
     // this fails loudly if a handler ever swallows it).
     let pid = child.id() as i32;
     let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-    assert_eq!(rc, 0, "kill(SIGTERM) failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "kill(SIGTERM) failed: {}",
+        std::io::Error::last_os_error()
+    );
 
     let stop = Instant::now() + Duration::from_secs(3);
     let mut exited = false;

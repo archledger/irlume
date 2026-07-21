@@ -522,6 +522,15 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
 /// The uncompressed RGB fourccs the capture path can decode, best first.
 const DECODABLE_RGB: [&[u8; 4]; 2] = [b"YUYV", b"NV12"];
 
+/// The first decodable format (`DECODABLE_RGB` order) the camera advertises, or
+/// None if it offers only formats we cannot decode (e.g. MJPEG-only).
+fn choose_rgb_format(offered: &[[u8; 4]]) -> Option<[u8; 4]> {
+    DECODABLE_RGB
+        .iter()
+        .find(|f| offered.contains(**f))
+        .map(|f| **f)
+}
+
 /// Detects an Intel IPU6/IPU7 MIPI camera complex and returns which generation
 /// ("IPU6" or "IPU7"), or None. These are common on 2020+ Intel laptops (Tiger
 /// Lake onward; IPU7 on Lunar Lake / Panther Lake / Arrow Lake). They expose no
@@ -571,8 +580,6 @@ fn driver_has_bound_device(driver_dir: &str) -> bool {
 /// the "hardware present but no driver bound" case, the one where the user has
 /// both no camera and no working stack. IDs from the mainline ipu6/ipu7 drivers.
 fn ipu_pci_generation() -> Option<&'static str> {
-    const IPU6: &[&str] = &["0x9a19", "0x4e19", "0x465d", "0x462e", "0xa75d", "0x7d19"];
-    const IPU7: &[&str] = &["0x645d", "0xb05d"];
     let rd = std::fs::read_dir("/sys/bus/pci/devices").ok()?;
     for entry in rd.flatten() {
         let dir = entry.path();
@@ -581,15 +588,25 @@ fn ipu_pci_generation() -> Option<&'static str> {
             continue;
         }
         let device = std::fs::read_to_string(dir.join("device")).unwrap_or_default();
-        let device = device.trim();
-        if IPU7.contains(&device) {
-            return Some("IPU7");
-        }
-        if IPU6.contains(&device) {
-            return Some("IPU6");
+        if let Some(gen) = ipu_generation_for_id(device.trim()) {
+            return Some(gen);
         }
     }
     None
+}
+
+/// Map an Intel PCI device ID (as sysfs prints it, e.g. `0x7d19`) to the IPU
+/// generation, or None. IDs from the mainline ipu6/ipu7 drivers.
+fn ipu_generation_for_id(device_id: &str) -> Option<&'static str> {
+    const IPU6: &[&str] = &["0x9a19", "0x4e19", "0x465d", "0x462e", "0xa75d", "0x7d19"];
+    const IPU7: &[&str] = &["0x645d", "0xb05d"];
+    if IPU7.contains(&device_id) {
+        Some("IPU7")
+    } else if IPU6.contains(&device_id) {
+        Some("IPU6")
+    } else {
+        None
+    }
 }
 
 /// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
@@ -613,8 +630,8 @@ fn negotiate_rgb_format(device: &str, dev: &Device) -> irlume_common::Result<[u8
     if offered.is_empty() {
         return Ok(*b"YUYV");
     }
-    if let Some(f) = DECODABLE_RGB.iter().find(|f| offered.contains(*f)) {
-        return Ok(**f);
+    if let Some(f) = choose_rgb_format(&offered) {
+        return Ok(f);
     }
     let offered_str: Vec<String> = offered.iter().map(fourcc_str).collect();
     Err(Error::Hardware(format!(
@@ -1372,6 +1389,33 @@ mod tests {
         for c in rgb {
             assert!((c as i32 - 128).abs() <= 1);
         }
+    }
+
+    #[test]
+    fn rgb_format_choice_prefers_yuyv_then_nv12_else_none() {
+        // YUYV wins even when listed after MJPG (real ASUS camera order).
+        assert_eq!(choose_rgb_format(&[*b"MJPG", *b"YUYV"]), Some(*b"YUYV"));
+        // NV12 rescues a camera that offers no YUYV.
+        assert_eq!(choose_rgb_format(&[*b"MJPG", *b"NV12"]), Some(*b"NV12"));
+        // YUYV still preferred over NV12 when both are present.
+        assert_eq!(choose_rgb_format(&[*b"NV12", *b"YUYV"]), Some(*b"YUYV"));
+        // MJPEG-only: nothing decodable, negotiation must fail (not pick MJPG).
+        assert_eq!(choose_rgb_format(&[*b"MJPG"]), None);
+    }
+
+    #[test]
+    fn ipu_generation_maps_ids_and_rejects_others() {
+        assert_eq!(ipu_generation_for_id("0x7d19"), Some("IPU6")); // Meteor Lake
+        assert_eq!(ipu_generation_for_id("0x645d"), Some("IPU7")); // Lunar Lake
+        assert_eq!(ipu_generation_for_id("0xb05d"), Some("IPU7")); // Panther Lake
+        assert_eq!(ipu_generation_for_id("0x1234"), None);
+        assert_eq!(ipu_generation_for_id(""), None);
+    }
+
+    #[test]
+    fn fourcc_str_trims_padding() {
+        assert_eq!(fourcc_str(b"YUYV"), "YUYV");
+        assert_eq!(fourcc_str(b"Y8  "), "Y8");
     }
 
     #[test]

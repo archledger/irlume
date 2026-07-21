@@ -8,8 +8,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter on pull_request: stacked PRs (a branch targeting
+  # another feature branch) previously ran ZERO checks and could only be
+  # gated after retargeting to main. Every PR gets the same gate now.
   pull_request:
-    branches: [main]
 
 # Least privilege for GITHUB_TOKEN: this workflow only reads the repo
 # (checkout + LFS); nothing here publishes or writes.

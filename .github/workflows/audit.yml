@@ -24,3 +24,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories
+
+      # The cargo-fuzz workspace has its own lockfile that the root check never
+      # reads (see the note in .github/dependabot.yml); scan it here so an
+      # advisory against a fuzz-only dependency does not rot silently.
+      - name: Advisories for the fuzz workspace lockfile
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories

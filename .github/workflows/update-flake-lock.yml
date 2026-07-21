@@ -13,14 +13,18 @@ on:
     - cron: "15 6 1 * *"
   workflow_dispatch:
 
+# Least privilege at the top; the one job that commits and opens a PR
+# escalates below (Scorecard Token-Permissions best practice).
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   update:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 

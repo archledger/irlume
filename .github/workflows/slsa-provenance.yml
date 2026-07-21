@@ -1,0 +1,49 @@
+# SLSA build provenance for the release artifacts. The distributable assets
+# (the universal .deb and the SELinux .noarch.rpm) are built and GPG-signed on
+# the maintainer's machine; this attaches a signed SLSA v1 provenance
+# attestation (multiple.intoto.jsonl, Sigstore/Fulcio keyless-signed and logged
+# in Rekor) covering their sha256 digests. Consumers can then verify a release
+# with slsa-verifier. Complements the GPG-signed SHA256SUMS already published.
+name: SLSA release provenance
+
+on:
+  release:
+    types: [published]
+
+permissions: read-all
+
+jobs:
+  # Collect the sha256 of the release's distributable artifacts into the
+  # base64 subjects blob the generator signs over.
+  hashes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
+      - name: Base64 subjects for the deb + rpm
+        id: hash
+        working-directory: assets
+        run: |
+          # Provenance covers the distributables, not the checksum manifest or
+          # its detached signature (those authenticate these same artifacts).
+          echo "digests=$(sha256sum irlume_*.deb irlume-selinux-*.rpm | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  # The generic generator runs in an isolated reusable workflow (SLSA L3 for the
+  # provenance step) and uploads multiple.intoto.jsonl to the release. It must be
+  # referenced by tag, not SHA, per its own security model.
+  provenance:
+    needs: hashes
+    permissions:
+      actions: read # read this run's metadata for the provenance
+      id-token: write # Sigstore/Fulcio keyless signing (no stored secret)
+      contents: write # upload the provenance file to the release
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.digests }}
+      upload-assets: true

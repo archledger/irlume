@@ -37,9 +37,11 @@ jobs:
             | grep -q "VALIDSIG F35053398E3C80FE20891B82C10B8492BD7F30C6" \
             || { echo "signature is not from the release key"; exit 1; }
           sha256sum --check --strict SHA256SUMS
-          # Every asset except the sums pair must be listed in SHA256SUMS.
+          # Every asset except the sums pair (and the SLSA provenance the
+          # slsa-provenance workflow uploads after the checksums are signed)
+          # must be listed in SHA256SUMS.
           for f in *; do
-            case "$f" in SHA256SUMS|SHA256SUMS.asc) continue;; esac
+            case "$f" in SHA256SUMS|SHA256SUMS.asc|*.intoto.jsonl) continue;; esac
             grep -q "  $f\$" SHA256SUMS || { echo "asset not covered by SHA256SUMS: $f"; exit 1; }
           done
 

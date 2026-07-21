@@ -141,6 +141,7 @@ jobs:
           cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           cargo test -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
           cargo test -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
+          cargo test -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
 
       - name: test (PAM FFI, against pam_wrapper)
         run: cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
@@ -278,6 +279,7 @@ jobs:
           cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
           cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
           cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
           cargo llvm-cov report --summary-only --fail-under-lines 79
 

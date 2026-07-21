@@ -98,7 +98,13 @@ jobs:
           key: lfs-${{ hashFiles('models/SHA256SUMS') }}
 
       - name: Pull model weights (Git LFS)
-        run: git lfs pull
+        run: |
+          # Container job: checkout writes safe.directory into a temporary
+          # HOME, so later steps' git sees "dubious ownership" and git-lfs
+          # reports it as "Not in a Git repository" (first dispatch failed
+          # exactly here). Re-assert it in this step's real HOME.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git lfs pull
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 

@@ -130,4 +130,40 @@ mod tests {
         assert!(encrypt(&[0u8; 16], b"x").is_err());
         assert!(decrypt(&[0u8; 16], &[0u8; 40]).is_err());
     }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// NIST CAVP known-answer test (gcmEncryptExtIV256.rsp, AES-256-GCM,
+    /// 96-bit IV, no AAD) hand-assembled into this module's on-disk layout
+    /// `nonce ‖ ciphertext ‖ tag`. Pins BOTH the algorithm and the blob layout:
+    /// an aes-gcm upgrade that changes either fails here instead of silently
+    /// orphaning every encrypted enrollment on disk.
+    #[test]
+    fn nist_cavp_vector_decrypts_through_the_blob_layout() {
+        let key = unhex("31bdadd96698c204aa9ce1448ea94ae1fb4a9a0b3c9d773b51bb1822666b8f22");
+        let mut blob = unhex("0d18e06c7c725ac9e362e1ce"); // nonce
+        blob.extend(unhex("fa4362189661d163fcd6a56d8bf0405a")); // ciphertext
+        blob.extend(unhex("d636ac1bbedd5cc3ee727dc2ab4a9489")); // tag
+        let plain = decrypt(&key, &blob).expect("NIST vector must decrypt");
+        assert_eq!(
+            &*plain,
+            &unhex("2db5168e932556f8089a0622981d017d")[..],
+            "AES-256-GCM output no longer matches the NIST CAVP vector"
+        );
+    }
+
+    /// The wire layout is load-bearing: nonce is the first 12 bytes, the GCM tag
+    /// the last 16, and the total overhead is exactly 28 bytes. A dependency
+    /// change that alters framing must trip this before it ships.
+    #[test]
+    fn blob_layout_overhead_is_stable() {
+        let key = generate_key();
+        let enc = encrypt(&key, b"x").unwrap();
+        assert_eq!(enc.len(), NONCE_LEN + 1 + TAG_LEN);
+    }
 }

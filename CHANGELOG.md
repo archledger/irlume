@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **`fingerprint enable` no longer disables face auth with nothing wired on
+  Arch-family distros.** On distros without authselect/pam-auth-update the
+  command printed manual wiring instructions and then recorded
+  `method=fingerprint` anyway, so the daemon stood face down while no module
+  drove the fingerprint prompt: the box silently became password-only. The
+  method now changes only after an active `pam_fprintd.so` line actually exists
+  in `/etc/pam.d`; the same check guards the authselect/pam-auth-update paths,
+  which can exit 0 without producing the line (e.g. a custom authselect profile
+  lacking the feature).
+
 - **Tier-1 signed-PCR sealing works.** irlume's strongest TPM tier (a
   `PolicyAuthorize` over systemd's PCR-signing key, the one that survives kernel
   updates without a reseal) never actually engaged. It loaded systemd's public
@@ -16,6 +26,25 @@ All notable changes to irlume are documented here. This project adheres to
   hierarchy fixes it (the key's Name, which the sealed policy commits to, is
   hierarchy-independent, so the policy is unchanged). Verified on a real
   systemd-boot host, including a Tier-1 seal that unseals after a reboot.
+
+### Added
+
+- **Panic firewall in `pam_irlume.so`.** Every PAM entry point now runs behind
+  `catch_unwind`; a panic anywhere in the module or a dependency maps to
+  `PAM_IGNORE`, so the stack falls through to the password. Without it, a panic
+  reaching the `extern "C"` boundary aborts the calling process (sudo or the
+  greeter, since Rust 1.81), and the module's own dependency stack contains
+  reachable panics. Crashing auth modules were the dominant lockout/fail-open
+  class in the pre-2020 generation of face-PAM projects.
+- **NIST known-answer test for the template envelope.** A CAVP AES-256-GCM
+  vector (`gcmEncryptExtIV256.rsp`) is decrypted through the on-disk
+  `nonce ‖ ciphertext ‖ tag` layout in the test suite, and the 28-byte framing
+  overhead is pinned. An `aes-gcm` upgrade that changes the algorithm or the
+  blob layout now fails CI instead of silently orphaning every encrypted
+  enrollment (a sibling project nearly merged exactly that dependency bump).
+- **Hardware-report issue template.** New GitHub issue form that asks for the
+  machine/camera model, distro, and `irlume doctor` / `irlume detect` output up
+  front, so camera and emitter quirks arrive with the data a fix needs.
 
 ### Changed
 

@@ -1637,6 +1637,14 @@ mod tests {
 
     #[test]
     fn verify_pinned_rejects_missing_and_non_sysfs_devices() {
+        // `verify_pinned` reads IRLUME_TEST_ALLOW_VIRTUAL_CAMERA / IRLUME_CAMERA_*;
+        // hold the same lock the env-setting tests take, and clear those vars, so
+        // a concurrent setter cannot flip the verdict mid-assertion (this test
+        // otherwise passes alone but flakes under full-workspace parallelism).
+        let _lock = env_lock();
+        let _a = EnvGuard::unset("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA");
+        let _b = EnvGuard::unset("IRLUME_CAMERA_PIN");
+        let _c = EnvGuard::unset("IRLUME_CAMERA_REQUIRE_FIXED");
         // No node at all: the plain no-camera error, not the injection one.
         let e = verify_pinned("/dev/irlume-test-missing").unwrap_err();
         assert!(e.to_string().contains("no camera found"), "{e}");

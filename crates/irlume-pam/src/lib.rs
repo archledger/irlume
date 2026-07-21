@@ -45,15 +45,20 @@ struct IrlumePam;
 
 /// True when the PAM transaction is for a remote (non-local) session, so the
 /// local camera must not be engaged. Checks PAM_RHOST first (set by sshd and
-/// other network services to the client host); an empty or "localhost" rhost is
-/// local. Falls back to the SSH_CONNECTION / SSH_TTY environment markers for
-/// services that do not set rhost but run under an ssh session (e.g. `sudo` in
-/// an ssh shell).
+/// other network services to the client host); an empty, "localhost", or
+/// loopback (127.0.0.1 / ::1) rhost is local. Falls back to the SSH_CONNECTION
+/// / SSH_TTY environment markers for services that do not set rhost but run
+/// under an ssh session (e.g. `sudo` in an ssh shell).
 fn is_remote_session(pamh: &Pam) -> bool {
     if let Ok(Some(rhost)) = pamh.get_rhost() {
         let h = rhost.to_string_lossy();
         let h = h.trim();
-        if !h.is_empty() && h != "localhost" && h != "localhost.localdomain" {
+        let local = h.is_empty()
+            || h.eq_ignore_ascii_case("localhost")
+            || h.eq_ignore_ascii_case("localhost.localdomain")
+            || h == "127.0.0.1"
+            || h == "::1";
+        if !local {
             return true;
         }
     }

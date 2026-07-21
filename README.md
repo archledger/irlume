@@ -72,7 +72,7 @@ Enrollment on IR hardware offers to enable it. See [Honest limitations](#-honest
 
 ## 📦 Install
 
-> **v0.3.0.** Works end-to-end on real hardware across all three families. Not
+> **v0.4.0.** Works end-to-end on real hardware across all three families. Not
 > yet certified (no iBeta lab pass); see [Honest limitations](#-honest-limitations).
 
 **You need:** x86-64 Linux with systemd & PAM; the distros below are
@@ -406,7 +406,7 @@ default IR-structure gate already rejects photos, screens, and video replays.
 
 ## 🛠️ Status
 
-**v0.3.0: working, validated on real hardware** across Fedora (full IR Secure tier,
+**v0.4.0: working, validated on real hardware** across Fedora (full IR Secure tier,
 end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
 CLI/daemon on a camera-less testbed). Packaged for all three families: Fedora via Copr,
 Arch via the [AUR](https://aur.archlinux.org/packages/irlume), Ubuntu via the PPA (see

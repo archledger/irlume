@@ -99,7 +99,7 @@ fn chol_solve(l: &[Vec<f64>], b: &mut [f64]) {
     }
 }
 
-/// Fit the ridge map from paired rows (ir[i] ↔ rgb[i]). Inputs need not be
+/// Fit the ridge map from paired rows (`ir[i]` ↔ `rgb[i]`). Inputs need not be
 /// pre-normalized; rows are normalized here to match apply-time inputs.
 /// Returns `None` below [`MIN_FIT_PAIRS`] or on dimension mismatch.
 // Gram-matrix accumulation indexes two positions of the same row; index

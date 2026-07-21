@@ -3,11 +3,66 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-07-21
 
-Batch from a whole-codebase, CLI/TUI, and auth-pipeline audit (PR #56). The two
-matching/liveness changes below were confirmed on the KDE lock screen (face
-grants in a bright room and in the dark) before merge.
+Two batches: preempting camera and UX failure classes mined from other Linux
+face-auth projects' issue trackers with research-grounded auth-policy hardening,
+and a whole-codebase, CLI/TUI, and auth-pipeline audit. The matching and
+liveness changes were confirmed on the KDE lock screen (face grants in a bright
+room and in the dark) before release.
+
+### Added
+
+- **RGB pixel-format negotiation.** Capture now negotiates `NV12` in addition to
+  `YUYV`, so cameras that expose only `NV12` work instead of failing at capture.
+  A camera that offers neither (MJPEG-only) gets a clear up-front error and an
+  `irlume doctor` diagnosis, in place of a cryptic "expected YUYV". `doctor`
+  reports RGB decodability using the same format list capture actually decodes.
+- **`irlume doctor` recognizes Intel IPU6/IPU7 cameras.** These expose no direct
+  V4L2 node, so a bare "no camera" was misleading; doctor now names the sensor
+  and points at the libcamera software relay, covering both IPU6 and IPU7 across
+  the dkms and in-kernel drivers with a PCI-ID fallback. It also states the
+  accurate limitation that the IR sensor is not exposed on Linux at all.
+- **`irlume doctor` warns when a user is enrolled but no greeter is wired.**
+  `authselect` / `pam-auth-update` can regenerate the PAM stacks and drop
+  irlume; doctor now surfaces that state instead of leaving a silently
+  face-less login.
+- **Consecutive-failure throttle.** After a run of failed face attempts (5 by
+  default, `IRLUME_RATE_LIMIT`) the daemon stops firing the camera on the
+  gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls
+  straight to the password; a grant resets it, and an empty frame (nobody
+  present) never counts. A rejected real presentation counts, including a caught
+  spoof, so an attacker cannot cheaply grind presentation attacks against the
+  gate. This is a throttle, not the NIST SP 800-63B-4 §3.2.3 hard
+  biometric-disable tier: the password is always the fallback and there is no
+  account lockout. Applied on both the login/sudo and keyring-unseal paths.
+- **Informed opt-in for the anti-spoof blink challenge at enrollment.** Every
+  mainstream authenticator (Face ID, Android, Windows Hello) ships passive
+  presentation-attack detection rather than an active challenge, so the blink
+  challenge stays off by default; the enroll flow now surfaces the choice
+  instead of leaving it a hidden flag. The TUI Settings screen toggles it in
+  place with `[c]`, alongside the existing `[enter]` eyes-open toggle.
+
+### Changed
+
+- **First capture warms up and retries.** A suspend/resume can leave `uvcvideo`
+  re-initializing when the first frame is requested; capture now warms the
+  stream and retries so a resume does not fail the login outright.
+- **`irlumed.service` stops promptly and runs sandboxed.** `TimeoutStopSec=10s`
+  caps the stop wait so a package-upgrade restart cannot stall (the 90s-hang
+  class seen elsewhere), guarded by a SIGTERM regression test. The unit also
+  gains `NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX AF_NETLINK`,
+  `ProtectSystem=full`, the `ProtectKernel*`/`ProtectControlGroups` set, and a
+  `CapabilityBoundingSet` scoped to `CAP_CHOWN`/`CAP_DAC_OVERRIDE`/`CAP_FOWNER`
+  (the caps it needs to own enrolled files to the user). `ProtectHome`,
+  `PrivateDevices`, and `MemoryDenyWriteExecute` are deliberately left off
+  (per-user `$HOME` state, camera and TPM access, the ONNX runtime's JIT).
+  Validated live: the daemon starts, loads models, binds the socket, and raises
+  no SELinux denials under the restrictions.
+- **`docs/THREAT_MODEL.md`** documents that the on-demand empty-Enter gesture
+  already supplies the deliberate intent (FIDO User Presence) a passive
+  face-auth tool otherwise lacks for `sudo`, so privilege elevation needs no
+  extra challenge beyond the gesture and the default liveness gate.
 
 ### Security
 
@@ -18,15 +73,7 @@ grants in a bright room and in the dark) before merge.
   environment markers) up front and returns `PAM_IGNORE` for a remote
   transaction, so the password or another factor authenticates instead. Always
   on, independent of how the stack is wired.
-- **The consecutive-failure throttle now strikes on the attack it exists to
-  slow.** A caught spoof returns `live = false, score = 0`, so the previous
-  strike test (`live || score > 0`) never counted a rejected presentation
-  attack, only a below-threshold match of a real face. An attacker could grind
-  presentation attacks against the gate without ever tripping the cooldown. The
-  daemon now strikes whenever the outcome is a real, non-retryable rejection
-  (`!presence_retryable`), which includes hard spoof rejections; genuine
-  no-face and transient-uncertainty outcomes still never count.
-- **Stage-2 fusion weighs the RGB modality by its real brightness again.** The
+- **Stage-2 fusion weighs the RGB modality by its real brightness.** The
   cross-spectrum path passed a hardcoded RGB face brightness of 0 into fusion's
   quality weight, so fusion always treated RGB as if the room were pitch-dark
   and collapsed the fused score toward IR regardless of actual light. That
@@ -43,15 +90,6 @@ grants in a bright room and in the dark) before merge.
   existed under the default umask. The payload is TPM-sealed or
   passphrase-wrapped, so the window was low-value, but the file is now opened
   with the mode set so it is never momentarily wider.
-- **The daemon unit is sandboxed.** `irlumed.service` gains `NoNewPrivileges`,
-  `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `ProtectSystem=full`, the
-  `ProtectKernel*`/`ProtectControlGroups` set, and a `CapabilityBoundingSet`
-  scoped to `CAP_CHOWN`/`CAP_DAC_OVERRIDE`/`CAP_FOWNER` (the caps it needs to
-  own enrolled files to the user). `ProtectHome`, `PrivateDevices`, and
-  `MemoryDenyWriteExecute` are deliberately left off (per-user `$HOME` state,
-  camera and TPM access, and the ONNX runtime's JIT). Validated live: the
-  daemon starts, loads models, binds the socket, and raises no SELinux denials
-  under the restrictions.
 
 ### Fixed
 
@@ -69,18 +107,6 @@ grants in a bright room and in the dark) before merge.
   `mean_in_bbox` indexed the frame assuming `len == width * height`; a short or
   mismatched buffer from the camera would panic. It now length-checks once and
   returns 0 (read as "too dark") on a short frame.
-- **`irlume doctor` reports RGB decodability the way capture actually works.**
-  Doctor counted `RGB3` and `BGR3` as decodable, but the capture path only
-  decodes `YUYV` and `NV12`, so a node advertising only those formats passed
-  doctor and then failed at capture. Doctor now matches the capture path's
-  format list.
-
-### Added
-
-- **TUI: toggle the blink challenge from the Settings screen.** The opt-in
-  passive-blink liveness gate was shown there as status only, so changing it
-  meant dropping to `irlume profiles challenge on|off`. Pressing `[c]` now
-  toggles it in place, alongside the existing `[enter]` eyes-open toggle.
 
 ## [0.3.0] - 2026-07-19
 
@@ -549,6 +575,7 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[0.4.0]: https://github.com/archledger/irlume/releases/tag/v0.4.0
 [0.3.0]: https://github.com/archledger/irlume/releases/tag/v0.3.0
 [0.2.1]: https://github.com/archledger/irlume/releases/tag/v0.2.1
 [0.2.0]: https://github.com/archledger/irlume/releases/tag/v0.2.0

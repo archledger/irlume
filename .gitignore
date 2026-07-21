@@ -17,3 +17,6 @@ irlume_*.deb
 .arch-build
 irlume-*.pkg.tar.zst
 result
+
+# Claude Code session worktrees / local agent state
+.claude/

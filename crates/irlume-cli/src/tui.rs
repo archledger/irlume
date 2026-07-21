@@ -389,7 +389,7 @@ impl App {
     /// Done. Diagnostic/advanced screens earn their place instead of always
     /// claiming one: Repair appears only when something actually needs fixing
     /// (daemon down or a failing check), and Cameras / Identify / Settings
-    /// live behind the [v] advanced toggle.
+    /// live behind the `[v]` advanced toggle.
     fn compute_visible(
         caps: &irlume_camera::Caps,
         fp_present: bool,
@@ -577,7 +577,7 @@ impl App {
 
     /// FULL refresh = cheap poll + the heavier probes (fingerprint via fprintd,
     /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
-    /// on demand ([r]), after an op, and when opening Repair/Fingerprint, but
+    /// on demand (`[r]`), after an op, and when opening Repair/Fingerprint, but
     /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
     fn refresh(&mut self) {
         self.refresh_light();

@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-camera"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "irlume-common",
  "libc",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "serde",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-vision"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "irlume-camera",
  "irlume-common",

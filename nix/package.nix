@@ -26,7 +26,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "irlume";
-  version = "0.3.0";
+  version = "0.4.0";
   inherit src;
 
   # Vendored via importCargoLock. The two tss-esapi crates come from our

@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -144,6 +144,21 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Jul 21 2026 archledger <archledger236@gmail.com> - 0.4.0-1
+- New: RGB pixel-format negotiation (NV12 alongside YUYV); MJPEG-only cameras
+  get a clear error and an `irlume doctor` diagnosis instead of failing at
+  capture. Doctor now recognizes Intel IPU6/IPU7 cameras and warns when a user
+  is enrolled but no greeter is wired.
+- New: consecutive-failure throttle (`IRLUME_RATE_LIMIT`,
+  `IRLUME_RATE_COOLDOWN_SECS`) on the login/sudo and keyring paths, and an
+  informed opt-in for the anti-spoof blink challenge at enrollment (default
+  off), toggleable in the TUI Settings screen with `[c]`.
+- Security: a remote (SSH) session no longer fires the local camera; stage-2
+  fusion weighs RGB by real brightness again; the dark path enforces the
+  per-user depth floor; sealed key/recovery files are created at mode 0600
+  atomically. The daemon unit is sandboxed and stops within 10s.
+- Fixed: malformed `pcrlock.json` hex, a non-finite detector score, and a
+  truncated IR frame no longer panic the daemon.
 * Sun Jul 19 2026 archledger <archledger236@gmail.com> - 0.3.0-1
 - New: `irlume uninstall` (CLI and TUI) removes irlume the way it was installed,
   un-wiring PAM and stopping the daemon first so a box is never left locked out,

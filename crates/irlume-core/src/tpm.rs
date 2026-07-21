@@ -78,7 +78,7 @@ fn open_context() -> Result<Context> {
     Context::new(conf).map_err(tpm_err)
 }
 
-/// The PCRs to bind to: `IRLUME_PCRS` (comma-separated) or [`DEFAULT_PCRS`].
+/// The PCRs to bind to: `IRLUME_PCRS` (comma-separated) or `DEFAULT_PCRS`.
 pub fn policy_pcrs() -> Vec<u32> {
     std::env::var("IRLUME_PCRS")
         .ok()

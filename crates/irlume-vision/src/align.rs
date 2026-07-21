@@ -70,7 +70,7 @@ impl Affine2 {
 /// Least-squares 2-D similarity transform mapping `src` onto `dst`.
 ///
 /// Model (no reflection): X = a·x − b·y + tx,  Y = b·x + a·y + ty.
-/// Each correspondence gives two linear rows in the unknowns θ = [a, b, tx, ty];
+/// Each correspondence gives two linear rows in the unknowns θ = `[a, b, tx, ty]`;
 /// we solve the 4x4 normal equations directly (no SVD needed for a non-reflective
 /// similarity; equivalent to the Umeyama/`skimage.SimilarityTransform` result).
 pub fn estimate_similarity(src: &[(f32, f32)], dst: &[(f32, f32)]) -> Option<Affine2> {
@@ -197,7 +197,7 @@ pub fn align_to_arcface(frame: &RgbView, src: &Landmarks5) -> irlume_common::Res
 }
 
 /// Preprocess an aligned 112x112 RGB chip into the NCHW f32 tensor the net wants:
-/// planar [1,3,112,112], `(px − 127.5) / 128.0`, channel order per [`INPUT_IS_RGB`].
+/// planar `[1,3,112,112]`, `(px − 127.5) / 128.0`, channel order per [`INPUT_IS_RGB`].
 pub fn preprocess_arcface(chip_rgb: &[u8]) -> Vec<f32> {
     let n = (OUT_SIZE * OUT_SIZE) as usize;
     debug_assert_eq!(chip_rgb.len(), n * 3);

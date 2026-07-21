@@ -540,7 +540,7 @@ mod onnx {
     ///
     /// Contract (decode parity-tested against the official MediaPipe
     /// runtime: 0.94 mean IoU, eyes within ~5px): input 128x128x3 RGB NHWC
-    /// in [-1,1] from a zero-padded square letterbox; outputs 896 SSD
+    /// in `[-1,1]` from a zero-padded square letterbox; outputs 896 SSD
     /// anchors x 16 regressors (cx,cy,w,h + 6 keypoints, all /128 relative
     /// to anchor centers) + 896 logits (sigmoid, clipped +/-100). Anchors:
     /// 16x16 cells x2 (stride 8) then 8x8 x6 (stride 16), sizes 1.0.
@@ -698,7 +698,7 @@ mod onnx {
             Self::load_from_memory(&bytes)
         }
 
-        /// P(fake) for the face at `bbox` (frame pixel coords, [x1,y1,x2,y2]).
+        /// P(fake) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
         pub fn p_fake(
             &mut self,
             frame: &align::RgbView,

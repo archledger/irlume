@@ -1322,15 +1322,15 @@ impl Engine {
     /// path only: a diagnostic, not a dark-mode unlock.
     /// 1:N identify across every enrolled user. Full cross-user search, an
     /// admin/testing capability; the daemon restricts a non-root caller to
-    /// [`identify_within`] so the returned score can't become a hill-climbing
-    /// oracle against other users' templates.
+    /// [`Self::identify_within`] so the returned score can't become a
+    /// hill-climbing oracle against other users' templates.
     pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
         self.identify_impl(None)
     }
 
     /// Identify scoped to a single enrolled user ("is this `user`?"). Same
-    /// liveness gate and RGB match as [`identify`], but the search set is just
-    /// this one account: what a non-root peer is allowed to ask about itself.
+    /// liveness gate and RGB match as [`Self::identify`], but the search set is
+    /// just this one account: what a non-root peer is allowed to ask about itself.
     pub fn identify_within(&mut self, user: &str) -> irlume_common::Result<IdentifyOutcome> {
         self.identify_impl(Some(user))
     }

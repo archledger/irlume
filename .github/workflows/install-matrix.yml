@@ -104,7 +104,16 @@ jobs:
           # reports it as "Not in a Git repository" (first dispatch failed
           # exactly here). Re-assert it in this step's real HOME.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Arch's git-lfs package does not preconfigure the smudge filters
+          # (Ubuntu runner images do), so a bare pull downloads objects but
+          # SKIPS checkout with exit 0 — pointer files remain and the engine
+          # tests fail with a cryptic protobuf error (second dispatch).
+          git lfs install --skip-repo
           git lfs pull
+          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
+            echo "::error::model weights are still LFS pointers after pull"
+            exit 1
+          fi
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 

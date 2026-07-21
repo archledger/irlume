@@ -231,7 +231,7 @@ pub enum Request {
     RecoveryForget { user: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SelfTestKind {
     /// Phase-1 gate: same aligned crop in twice MUST yield cosine ~= 1.0.
     /// Catches the AuraFace alignment/normalization mismatch (the "identical

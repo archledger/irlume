@@ -1198,6 +1198,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             })
         }
         Request::SelfTest { kind } => {
+            // Fires the camera and returns raw liveness/alignment measurements
+            // (IR brightness, depth, glint), which are a spoof-tuning oracle and
+            // a way to tie up the single-threaded daemon. Gate to root, like the
+            // other camera-bearing requests; on the 0666 socket fallback this is
+            // the only thing keeping an arbitrary local uid out.
+            if peer.uid != 0 {
+                return Response::Error(format!("self_test requires root (peer uid {})", peer.uid));
+            }
             use irlume_common::SelfTestKind;
             let r = match kind {
                 SelfTestKind::Liveness => engine.liveness_selftest(),
@@ -3437,6 +3445,15 @@ mod tests {
             match dispatch(Request::SelfTest { kind }, &peer(0), &mut e) {
                 Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
                 other => panic!("selftest without a camera must Error, got {other:?}"),
+            }
+            // A non-root peer is refused before the camera ever fires: the
+            // self-test returns raw liveness measurements (a spoof oracle).
+            match dispatch(Request::SelfTest { kind }, &peer(NOBODY), &mut e) {
+                Response::Error(msg) => assert!(
+                    msg.contains("requires root"),
+                    "non-root selftest must be refused as root-only, got {msg}"
+                ),
+                other => panic!("non-root selftest must Error, got {other:?}"),
             }
         }
         // A non-root peer asking to tune for another user is silently scoped

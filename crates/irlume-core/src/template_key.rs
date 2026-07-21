@@ -148,6 +148,23 @@ fn save_recovery(user: &str, env: &RecoveryEnvelope) -> Result<()> {
     std::fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
     let json = serde_json::to_vec_pretty(env).map_err(|e| Error::Protocol(e.to_string()))?;
     let path = recovery_path(user);
+    // Create at 0600 atomically (mode-on-open) rather than write-then-chmod, so
+    // the Argon2id-wrapped key blob is never briefly readable under a lax umask,
+    // matching envelope::save and storage::write_0600.
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| Error::Io(e.to_string()))?;
+        f.write_all(&json).map_err(|e| Error::Io(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(&path, json).map_err(|e| Error::Io(e.to_string()))?;
     set_0600(&path);
     Ok(())

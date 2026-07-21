@@ -82,6 +82,9 @@ jobs:
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: doc (broken intra-doc links are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
       - name: build
         run: cargo build --release --locked
 

@@ -205,6 +205,41 @@ in
         ExecStart = "${cfg.package}/bin/irlumed";
         Restart = "on-failure";
         RestartSec = 2;
+        # Cap the stop wait so a rebuild-switch restart cannot stall (the socket
+        # loop exits promptly on SIGTERM; captures open and drop the device per
+        # request, so no long-held camera handle).
+        TimeoutStopSec = "10s";
+        # Sandboxing, mirroring packaging/systemd/irlumed.service so the hardening
+        # holds on NixOS too. Scoped to what the daemon needs: it opens
+        # /dev/video* and the TPM, binds a Unix socket, and chowns each target
+        # user's enrollment. ProtectHome / PrivateDevices / MemoryDenyWriteExecute
+        # are deliberately NOT set (per-user $HOME state, camera + TPM access, and
+        # the ONNX runtime JITs).
+        NoNewPrivileges = true;
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_NETLINK"
+        ];
+        IPAddressDeny = "any";
+        ProtectSystem = "full";
+        PrivateTmp = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        LockPersonality = true;
+        SystemCallArchitectures = "native";
+        CapabilityBoundingSet = [
+          "CAP_CHOWN"
+          "CAP_DAC_OVERRIDE"
+          "CAP_FOWNER"
+        ];
+        UMask = "0027";
       };
       environment = {
         ORT_DYLIB_PATH = "${onnxruntime-bin}/lib/libonnxruntime.so";

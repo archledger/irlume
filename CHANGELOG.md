@@ -85,6 +85,10 @@ room and in the dark) before release.
   3D-structure floor; the dark path used only the lenient global ratio, so a
   curved warm spoof sitting between the two could be rejected in lit conditions
   yet granted in the dark. The same floor now applies on both paths.
+- **The daemon self-test is gated to root.** `SelfTest` fires the camera and
+  returns raw liveness measurements (IR brightness, depth, glint), a
+  spoof-tuning oracle; it now refuses a non-root peer like the other
+  camera-bearing requests, which matters on the permissive-socket fallback.
 - **Sealed key and recovery files are created at mode 0600 atomically.** They
   were written and then `chmod`-ed, leaving a brief window where the file
   existed under the default umask. The payload is TPM-sealed or
@@ -107,6 +111,14 @@ room and in the dark) before release.
   `mean_in_bbox` indexed the frame assuming `len == width * height`; a short or
   mismatched buffer from the camera would panic. It now length-checks once and
   returns 0 (read as "too dark") on a short frame.
+- **A wrong-dimension stored template can no longer crash the daemon.** The
+  cosine matcher assumed both embeddings were the same length (only a
+  debug-time assertion), so a template whose dimension differs from the live
+  probe (a swapped recognizer model, which the daemon allows with a warning, or
+  a truncated file) indexed out of bounds and panicked the root daemon into a
+  restart loop. Mismatched lengths now score a definitive non-match, so the
+  account falls back to re-enrollment instead. The IR path already filtered by
+  dimension; this covers the RGB and identify paths.
 
 ## [0.3.0] - 2026-07-19
 

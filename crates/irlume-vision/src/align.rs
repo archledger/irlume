@@ -244,7 +244,16 @@ pub fn flip_h(chip: &[u8]) -> Vec<u8> {
 }
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    // Embeddings of different lengths are never a real match: it means a
+    // swapped recognizer model (a different output dimension, which the daemon
+    // allows with a warning) or a truncated stored template. Return a
+    // definitive non-match (the cosine minimum, below any positive threshold)
+    // instead of indexing past the shorter slice and panicking the root daemon
+    // into a crash loop. The IR path already filters by dimension upstream
+    // (`Enrollment::ir_scans_for`); this guards the RGB and identify paths too.
+    if a.len() != b.len() {
+        return -1.0;
+    }
     let mut acc = [0.0f32; 8];
     let chunks = a.len() / 8;
     for k in 0..chunks {
@@ -283,6 +292,18 @@ mod tests {
             .sum::<f32>()
             .clamp(-1.0, 1.0);
         assert!((cosine(&a, &b) - naive).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cosine_length_mismatch_is_a_nonmatch_not_a_panic() {
+        // A stored template of the wrong dimension (swapped recognizer model or
+        // a truncated file) must score a definitive non-match, never index out
+        // of bounds and panic the daemon. Try both orderings and a zero-length.
+        let a = vec![0.5f32; 512];
+        let b = vec![0.5f32; 256];
+        assert_eq!(cosine(&a, &b), -1.0);
+        assert_eq!(cosine(&b, &a), -1.0);
+        assert_eq!(cosine(&a, &[]), -1.0);
     }
 
     #[test]

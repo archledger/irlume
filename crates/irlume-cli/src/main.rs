@@ -149,7 +149,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
     );
     match daemon_request(&Request::Enroll {
-        user,
+        user: user.clone(),
         profile: name,
         scans,
         reset,
@@ -163,6 +163,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         }) => {
             if created {
                 println!("[enroll] enrolled '{profile}' with {total} scans");
+                offer_blink_challenge(&user);
             } else {
                 println!(
                     "[enroll] this face is already enrolled as '{profile}'; added {added} scans \
@@ -184,6 +185,52 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             eprintln!("enroll: {e}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// After a fresh enrollment on IR hardware, make the opt-in anti-spoof blink
+/// challenge an informed choice rather than a hidden flag. It stays OFF by
+/// default (every mainstream face authenticator, Windows Hello / Face ID /
+/// Android, ships passive PAD, not an active challenge; the default IR gate is
+/// the passive analogue). This offers the extra print/replay defense to those
+/// who want it, being honest about the latency and glasses cost.
+fn offer_blink_challenge(user: &str) {
+    use std::io::{BufRead, IsTerminal, Write};
+    // Only meaningful on IR-capable (Secure-tier) hardware.
+    if !irlume_camera::capabilities().ir_pair {
+        return;
+    }
+    let tip =
+        "Tip: the opt-in anti-spoof blink challenge blocks printed/screen-replay spoofs.\n      \
+               Enable it any time with: irlume profiles challenge on";
+    if !std::io::stdin().is_terminal() {
+        println!("{tip}");
+        return;
+    }
+    print!(
+        "\nEnable the anti-spoof blink challenge now? It blocks printed-photo and\n\
+         screen-replay spoofs, but adds a few seconds per login and can be finicky\n\
+         with glasses. The default IR gate already blocks screens and matte prints.\n\
+         Enable blink challenge? [y/N] "
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        println!("{tip}");
+        return;
+    }
+    if matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
+        match daemon_request(&irlume_common::Request::SetRequireChallenge {
+            user: user.to_string(),
+            on: true,
+        }) {
+            Ok(irlume_common::Response::Enrollment { .. }) | Ok(irlume_common::Response::Ok(_)) => {
+                println!("[enroll] anti-spoof blink challenge enabled. Disable with `irlume profiles challenge off`.")
+            }
+            _ => println!("[enroll] could not enable the challenge now; run `irlume profiles challenge on` later."),
+        }
+    } else {
+        println!("[enroll] keeping the default (fast) IR gate. {tip}");
     }
 }
 
@@ -2175,11 +2222,15 @@ fn doctor() -> std::process::ExitCode {
     let nodes = irlume_camera::discover_nodes();
     if nodes.is_empty() {
         println!("  (none found under /dev/video0..9)");
-        if irlume_camera::ipu6_camera_present() {
+        if let Some(gen) = irlume_camera::intel_ipu_present() {
             println!(
-                "  ⚠ an Intel IPU6 camera is present but exposes no direct V4L2 node.\n     \
-                 These MIPI cameras need the libcamera software-ISP relay; irlume\n     \
-                 cannot open them directly yet. Track: intel-ipu6 driver stack."
+                "  ⚠ this laptop has an Intel {gen} MIPI camera, which irlume cannot use:\n     \
+                 - its capture nodes emit raw Bayer, not a directly-openable YUYV/GREY stream;\n     \
+                 - the IR (Windows Hello) sensor is not exposed on Linux at all, so IR face\n       \
+                 auth and IR liveness are unavailable on this hardware.\n     \
+                 RGB-only webcam use is possible via a libcamera software-ISP + v4l2loopback\n     \
+                 bridge, but irlume needs the IR sensor; an external USB IR camera is the\n     \
+                 supported path on {gen} machines."
             );
         }
     }
@@ -2200,7 +2251,12 @@ fn doctor() -> std::process::ExitCode {
             if !fmts.is_empty() && !decodable {
                 let list: Vec<String> = fmts
                     .iter()
-                    .map(|f| std::str::from_utf8(f).unwrap_or("????").trim_end().to_string())
+                    .map(|f| {
+                        std::str::from_utf8(f)
+                            .unwrap_or("????")
+                            .trim_end()
+                            .to_string()
+                    })
                     .collect();
                 println!(
                     "     ⚠ offers only [{}]; irlume needs an uncompressed format\n       \

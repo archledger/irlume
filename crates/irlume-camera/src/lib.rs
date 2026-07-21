@@ -522,14 +522,74 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
 /// The uncompressed RGB fourccs the capture path can decode, best first.
 const DECODABLE_RGB: [&[u8; 4]; 2] = [b"YUYV", b"NV12"];
 
-/// True when an Intel IPU6 camera stack is present. These MIPI cameras (common
-/// on 2024+ Intel laptops) expose no plain V4L2 GREY/YUYV capture node: they
-/// need the libcamera/software-ISP relay, so `discover_nodes` finds nothing and
-/// a user sees a bare "no camera". `doctor` uses this to give a real diagnosis
-/// instead. Detected by the kernel driver's presence in sysfs.
-pub fn ipu6_camera_present() -> bool {
-    std::path::Path::new("/sys/bus/pci/drivers/intel-ipu6").exists()
-        || std::path::Path::new("/sys/module/intel_ipu6").exists()
+/// Detects an Intel IPU6/IPU7 MIPI camera complex and returns which generation
+/// ("IPU6" or "IPU7"), or None. These are common on 2020+ Intel laptops (Tiger
+/// Lake onward; IPU7 on Lunar Lake / Panther Lake / Arrow Lake). They expose no
+/// directly-openable V4L2 capture node: the in-kernel ISYS nodes emit raw Bayer
+/// plus metadata, not YUYV/GREY, so `discover_nodes` finds nothing usable and a
+/// user just sees "no camera". Worse for irlume specifically, the IR / Windows
+/// Hello sensor on these modules is not exposed on Linux at all (only the RGB
+/// sensor, and only through a libcamera software-ISP bridge). `doctor` uses
+/// this to explain the situation instead of a bare "no camera".
+///
+/// Detection is root-free and identical for the out-of-tree dkms driver and the
+/// mainline in-kernel one (both register the same PCI-driver and module names):
+/// a bound PCI device under the driver, or the module loaded, or (hardware
+/// present but driver/firmware missing) a known IPU PCI device ID.
+pub fn intel_ipu_present() -> Option<&'static str> {
+    for (gen, drv, module) in [
+        (
+            "IPU7",
+            "/sys/bus/pci/drivers/intel-ipu7",
+            "/sys/module/intel_ipu7",
+        ),
+        (
+            "IPU6",
+            "/sys/bus/pci/drivers/intel-ipu6",
+            "/sys/module/intel_ipu6",
+        ),
+    ] {
+        if driver_has_bound_device(drv) || std::path::Path::new(module).exists() {
+            return Some(gen);
+        }
+    }
+    ipu_pci_generation()
+}
+
+/// True if a `/sys/bus/pci/drivers/<name>` directory has at least one bound PCI
+/// device (a `0000:*` symlink), i.e. the driver is actually driving hardware.
+fn driver_has_bound_device(driver_dir: &str) -> bool {
+    std::fs::read_dir(driver_dir)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("0000:"))
+        })
+        .unwrap_or(false)
+}
+
+/// Scan PCI devices for a known IPU6/IPU7 device ID (vendor 0x8086), catching
+/// the "hardware present but no driver bound" case, the one where the user has
+/// both no camera and no working stack. IDs from the mainline ipu6/ipu7 drivers.
+fn ipu_pci_generation() -> Option<&'static str> {
+    const IPU6: &[&str] = &["0x9a19", "0x4e19", "0x465d", "0x462e", "0xa75d", "0x7d19"];
+    const IPU7: &[&str] = &["0x645d", "0xb05d"];
+    let rd = std::fs::read_dir("/sys/bus/pci/devices").ok()?;
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        let vendor = std::fs::read_to_string(dir.join("vendor")).unwrap_or_default();
+        if vendor.trim() != "0x8086" {
+            continue;
+        }
+        let device = std::fs::read_to_string(dir.join("device")).unwrap_or_default();
+        let device = device.trim();
+        if IPU7.contains(&device) {
+            return Some("IPU7");
+        }
+        if IPU6.contains(&device) {
+            return Some("IPU6");
+        }
+    }
+    None
 }
 
 /// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
@@ -1321,7 +1381,10 @@ mod tests {
         let rgb = nv12_to_rgb(&nv12, 2, 2);
         assert_eq!(rgb.len(), 2 * 2 * 3);
         for c in &rgb {
-            assert!((*c as i32 - 200).abs() <= 1, "neutral chroma should stay grey");
+            assert!(
+                (*c as i32 - 200).abs() <= 1,
+                "neutral chroma should stay grey"
+            );
         }
         // Chroma carries into RGB: a red-ish V lifts R above Y and drops B.
         let red = [128u8, 128, 128, 128, 128, 200];

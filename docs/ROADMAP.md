@@ -41,16 +41,24 @@ The audit backlog, in rough order:
 
 - Test discipline toward the OpenSSF silver criteria: measure statement
   coverage (cargo-llvm-cov), and add a regression test with every bug fix
-  that can be tested without hardware. Coverage sits at ~80%; the last few
-  points are hardware-only paths (live-face match, camera streaming, the
-  TTY main loops) plus the Tier-1 signed-PCR unseal. The signed-PCR path
-  cannot be covered against swtpm: swtpm rejects the `TPM2_PolicyAuthorize`
-  ticket that `TPM2_VerifySignature` produces for a null-hierarchy external
-  public key (checkTicket TPM_RC_VALUE), the exact key kind the signed-PCR
-  flow requires. A TPM-generated key authorizes fine on swtpm, so the
-  production code is correct; the simulator just cannot exercise this path.
-  It stays covered by the real-hardware `#[ignore]` test. Do not re-attempt
-  a swtpm signed-PCR test.
+  that can be tested without hardware. With the Tier-1 signed-PCR unseal now
+  working (see below), the `seal_unseal_signed_pcr_roundtrip_real_hardware`
+  test on a systemd-boot/UKI host covers `seal_authorized` / `unseal_authorized`
+  and the full suite reaches ~80.1% line coverage. The remaining points are
+  hardware-only paths (live-face match, camera streaming, the TTY main loops)
+  that CI cannot exercise. swtpm still cannot run the signed-PCR test: it
+  rejects the `TPM2_PolicyAuthorize` ticket from `TPM2_VerifySignature`
+  (`TPM_RC_VALUE`), so that test stays `#[ignore]` and runs on real signed-UKI
+  hardware; do not re-attempt a swtpm signed-PCR test.
+  Earlier this was misread as a swtpm-only quirk with correct production code.
+  It was not: `load_external_pubkey` loaded systemd's public key under the
+  **Null** hierarchy, so `VerifySignature` yielded a null ticket that
+  `PolicyAuthorize` rejects with `TPM_RC_VALUE` on real TPMs too (confirmed on
+  systemd-boot hardware). Tier-1 therefore never engaged and every UKI host
+  silently fell back to Tier-2. Loading the key under the **Owner** hierarchy
+  (the key Name, which the sealed policy commits to, is hierarchy-independent)
+  fixes it; verified by a real-TPM seal→unseal round-trip landing on
+  `PolicyKind::Authorized`.
 - cargo-vet with the Mozilla and Google shared audit sets for the
   174-crate dependency tree.
 - Hardware reports: more IR camera modules, NixOS on bare metal, Fedora

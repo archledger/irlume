@@ -372,6 +372,25 @@ fn with_srk<T>(
 /// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
 /// up a tier when one became available, and only lands on a lower tier when
 /// the higher one genuinely does not unseal on this machine.
+/// True when this machine could seal under a strictly stronger tier than
+/// `current` right now. Used by the login-time self-heal to auto-upgrade an
+/// envelope sealed under a weaker tier (e.g. one written before signed-PCR
+/// worked) without the user re-arming, and without churning the TPM on a
+/// machine already at its best available tier. Only signals availability; the
+/// actual round-trip verification happens in [`seal`].
+pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
+    match current {
+        // Tier 1 is the strongest; nothing to upgrade to.
+        PolicyKind::Authorized { .. } => false,
+        // Tier 2 -> Tier 1 only if signed-PCR artifacts exist.
+        PolicyKind::PcrlockNv { .. } => crate::pcrsig::signed_policy_available(),
+        // Tier 3 -> a higher tier if either signed-PCR or pcrlock is available.
+        PolicyKind::PcrLiteral => {
+            crate::pcrsig::signed_policy_available() || pcrlock_provisioned().is_some()
+        }
+    }
+}
+
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
         match seal_authorized(secret) {
@@ -643,11 +662,17 @@ fn unseal_authorized(
     })
 }
 
-/// Load an external RSA public key (SPKI PEM) into the TPM under the Null
+/// Load an external RSA public key (SPKI PEM) into the TPM under the Owner
 /// hierarchy so its Name can be taken and signatures verified against it.
+/// The hierarchy matters: `TPM2_VerifySignature` over a key loaded under the
+/// Null hierarchy yields a null verification ticket, which `TPM2_PolicyAuthorize`
+/// rejects with `TPM_RC_VALUE` on both swtpm and real TPMs, so the Tier-1
+/// signed-PCR unseal always fell back. Loading under Owner produces a ticket
+/// PolicyAuthorize accepts. The key's Name (which the sealed object's authPolicy
+/// commits to) is hierarchy-independent, so this does not change the policy.
 fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle> {
     let public = rsa_pem_to_public(pubkey_pem)?;
-    ctx.load_external_public(public, Hierarchy::Null)
+    ctx.load_external_public(public, Hierarchy::Owner)
         .map_err(tpm_err)
 }
 
@@ -1221,6 +1246,20 @@ mod tests {
         let env = seal_with_pcrs(secret, &[7]).expect("seal");
         let got = unseal(&env).expect("unseal");
         assert_eq!(&*got, secret, "round-trip must match");
+    }
+
+    #[test]
+    #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot); covers Tier-1 PolicyAuthorize"]
+    fn seal_unseal_signed_pcr_roundtrip_real_hardware() {
+        let secret = b"irlume-keyring-secret-roundtrip!";
+        let env = seal(secret).expect("ladder seal on signed-PCR hardware");
+        assert!(
+            matches!(env.policy, PolicyKind::Authorized { .. }),
+            "on signed-PCR hardware the ladder must land on Tier-1 PolicyAuthorize, got {:?}",
+            env.policy
+        );
+        let got = unseal(&env).expect("unseal the signed-PCR envelope");
+        assert_eq!(&*got, secret, "signed-PCR round-trip must match");
     }
 
     /// Real Tier-2 pcrlock seal→unseal on the host TPM. Ignored by default: needs

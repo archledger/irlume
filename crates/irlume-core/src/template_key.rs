@@ -79,7 +79,24 @@ pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
         )));
     }
     let env = SealedEnvelope::load(&path)?;
-    tpm::unseal(&env)
+    let key = tpm::unseal(&env)?;
+    // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
+    // strictly stronger sealing tier became available since this key was sealed
+    // (e.g. signed-PCR started working), re-seal the key to it so an existing
+    // enrollment reaches Tier 1 with no re-enroll. The check short-circuits to a
+    // no-op once the envelope is already at the best tier, so there is no steady
+    // per-match cost. Never fail the load on it: the key unsealed fine and the
+    // weaker envelope stays usable.
+    if tpm::stronger_tier_available_than(&env.policy) {
+        if let Ok(candidate) = tpm::seal(&key) {
+            if candidate.policy.tier_rank() > env.policy.tier_rank()
+                && candidate.save(&path).is_ok()
+            {
+                set_0600(&path);
+            }
+        }
+    }
+    Ok(key)
 }
 
 /// (Re-)seal `key` for `user` against the current TPM PCR policy and persist it.
@@ -258,5 +275,49 @@ mod tests {
         forget_recovery("rt").unwrap();
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::env::remove_var("IRLUME_RECOVERY_DIR");
+    }
+
+    /// On signed-UKI hardware, a template key sealed under a weaker tier
+    /// auto-upgrades to Tier 1 the next time it is loaded (i.e. the next face
+    /// match), with no re-enroll. Companion to the keyring reseal upgrade.
+    #[test]
+    #[ignore = "requires a real TPM + fresh systemd signed-PCR artifacts (UKI/systemd-boot)"]
+    fn load_key_auto_upgrades_weaker_tier_to_signed() {
+        use crate::crypto;
+        use crate::envelope::PolicyKind;
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/tmp/irlume-tk-upg");
+        let _ = std::fs::remove_dir_all("/tmp/irlume-tk-upg");
+        std::fs::create_dir_all("/tmp/irlume-tk-upg").unwrap();
+
+        let key = crypto::generate_key();
+        // Simulate an "old" seal under the weakest tier (literal PCR 7).
+        crate::tpm::seal_with_pcrs(&key, &[7])
+            .unwrap()
+            .save(&key_path("rt"))
+            .unwrap();
+        assert_eq!(
+            SealedEnvelope::load(&key_path("rt"))
+                .unwrap()
+                .policy
+                .tier_rank(),
+            1,
+            "precondition: sealed at Tier 3"
+        );
+        // A load (what every match does) returns the key AND upgrades the tier.
+        assert_eq!(&*load_key("rt").unwrap(), &*key);
+        let env = SealedEnvelope::load(&key_path("rt")).unwrap();
+        assert!(
+            matches!(env.policy, PolicyKind::Authorized { .. }),
+            "should climb to Tier 1, got {:?}",
+            env.policy
+        );
+        assert_eq!(
+            &*load_key("rt").unwrap(),
+            &*key,
+            "still loads after upgrade"
+        );
+        forget_key("rt").unwrap();
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
     }
 }

@@ -8,8 +8,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter on pull_request: stacked PRs (a branch targeting
+  # another feature branch) previously ran ZERO checks and could only be
+  # gated after retargeting to main. Every PR gets the same gate now.
   pull_request:
-    branches: [main]
 
 # Least privilege for GITHUB_TOKEN: this workflow only reads the repo
 # (checkout + LFS); nothing here publishes or writes.
@@ -68,6 +70,12 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # PRs RESTORE from main's cache but never SAVE their own: per-PR
+          # entries were filling the repo's 10 GB cache quota, and LRU
+          # eviction would eventually knock out the LFS model cache that
+          # guards the (scarcer) LFS bandwidth quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
@@ -192,6 +200,12 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # PRs RESTORE from main's cache but never SAVE their own: per-PR
+          # entries were filling the repo's 10 GB cache quota, and LRU
+          # eviction would eventually knock out the LFS model cache that
+          # guards the (scarcer) LFS bandwidth quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
@@ -239,6 +253,12 @@ jobs:
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # PRs RESTORE from main's cache but never SAVE their own: per-PR
+          # entries were filling the repo's 10 GB cache quota, and LRU
+          # eviction would eventually knock out the LFS model cache that
+          # guards the (scarcer) LFS bandwidth quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
@@ -387,6 +407,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          # PRs RESTORE from main's cache but never SAVE their own: per-PR
+          # entries were filling the repo's 10 GB cache quota, and LRU
+          # eviction would eventually knock out the LFS model cache that
+          # guards the (scarcer) LFS bandwidth quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: fuzz
 
       # Build cargo-fuzz with nightly: it (via cargo-platform) needs a rustc

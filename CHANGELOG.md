@@ -68,6 +68,15 @@ All notable changes to irlume are documented here. This project adheres to
   pam_fprintd reachable from `sudo` while an SSH server runs (every remote
   `sudo` stalls up to 30s waiting on the local reader).
 
+- **Real-hardware validation joins CI.** A self-hosted runner with a real TPM
+  and a real IR camera now runs the TPM seal/unseal tests against silicon
+  rather than a software TPM, and captures a live emitter strobe burst —
+  nightly and on every maintainer pull request. The distinction matters: the
+  Tier-1 sealing fix above is a bug class that passed software-TPM CI
+  completely and only ever failed on real hardware. The universal `.deb` is
+  also now installed and smoke-tested weekly on bare Debian 12/13 and
+  Ubuntu 22.04/24.04/26.04 images, guarding the glibc floor the package
+  promises.
 - **IR capture negotiates beyond native GREY.** IR nodes that expose only the
   16-bit grey family (Y16/Y10/Y12) or only a packed colour container
   (NV12/YUYV) now work: 16-bit frames are converted with an effective-depth

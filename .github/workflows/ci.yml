@@ -127,10 +127,22 @@ jobs:
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
           sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
+          # Let udev finish applying its default (root:video 0660) perms BEFORE
+          # our chmod, otherwise a late udev event overrides it and a test opens
+          # the node with EACCES ("permission denied"), an intermittent flake.
+          sudo udevadm settle
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
-          sleep 3
+          # Poll until the fed nodes are actually readable (a feeder opening the
+          # node can re-trigger udev), re-asserting perms each round, instead of a
+          # blind sleep that can finish before the device is ready.
+          for _ in $(seq 1 15); do
+            sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
+            if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
+            sleep 1
+          done
+          ls -l /dev/video8 /dev/video9 /dev/video10
 
       - name: test (camera + capture paths, against v4l2loopback)
         env:
@@ -261,10 +273,22 @@ jobs:
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
           sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
+          # Let udev finish applying its default (root:video 0660) perms BEFORE
+          # our chmod, otherwise a late udev event overrides it and a test opens
+          # the node with EACCES ("permission denied"), an intermittent flake.
+          sudo udevadm settle
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
-          sleep 3
+          # Poll until the fed nodes are actually readable (a feeder opening the
+          # node can re-trigger udev), re-asserting perms each round, instead of a
+          # blind sleep that can finish before the device is ready.
+          for _ in $(seq 1 15); do
+            sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
+            if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
+            sleep 1
+          done
+          ls -l /dev/video8 /dev/video9 /dev/video10
 
       - name: Coverage incl. TPM-gated and camera tests (fail under the ratchet floor)
         env:

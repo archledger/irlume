@@ -94,7 +94,14 @@ jobs:
             if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
             sleep 1
           done
-          cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          # --skip loopback_capabilities_classify_rgb_but_never_pair: that test
+          # asserts capabilities().ir_pair is false, on the premise that the
+          # only cameras are virtual — true on hosted runners, false here where
+          # the real NexiGo Hello pair is attached. Hosted CI still runs it.
+          # (Proper fix later: assert the LOOPBACK nodes never join a pair,
+          # instead of the global capability bit.)
+          cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ \
+            --skip loopback_capabilities_classify_rgb_but_never_pair --test-threads=1
           cargo test -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
           cargo test -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
           cargo test -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1

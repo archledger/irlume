@@ -46,6 +46,18 @@ const RESEAL_STASH_KEY: &str = "pam_irlume_reseal_authtok";
 
 struct IrlumePam;
 
+/// Panic firewall for the PAM entry points. Unwinding across the C FFI boundary
+/// into libpam is undefined behavior, and a crashing auth module historically
+/// takes the calling process (sudo, the greeter) down with it or wedges the
+/// stack in a fail-open state. Any panic in this module or a dependency maps to
+/// `PAM_IGNORE`: the stack cascades to the password, the floor factor.
+fn firewall(body: impl FnOnce() -> PamError) -> PamError {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(code) => code,
+        Err(_) => PamError::IGNORE,
+    }
+}
+
 /// True when the PAM transaction is for a remote (non-local) session, so the
 /// local camera must not be engaged. Checks PAM_RHOST first (set by sshd and
 /// other network services to the client host); an empty, "localhost", or
@@ -70,177 +82,181 @@ fn is_remote_session(pamh: &Pam) -> bool {
 
 impl PamServiceModule for IrlumePam {
     fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
-        let user = match pamh.get_user(None) {
-            Ok(Some(u)) => u.to_string_lossy().into_owned(),
-            _ => return PamError::IGNORE,
-        };
-        // Remote-session guard: never fire the local camera for an SSH / remote
-        // login or sudo. The camera is physically at the machine, so whoever is
-        // in front of it (not the remote user) would grant the remote session.
-        // A non-empty PAM_RHOST (or the SSH_* env markers) means remote; return
-        // IGNORE so the password/other factor authenticates instead. Always-on,
-        // independent of biopolicy or how the stack is wired (a hand-added
-        // pam_irlume line in system-auth is covered too).
-        if is_remote_session(&pamh) {
-            return PamError::IGNORE;
-        }
-        let unseal = args.iter().any(|a| a == "unseal");
-        let wait = args.iter().any(|a| a == "wait");
-        let reseal = args.iter().any(|a| a == "reseal");
-        let keyring = args.iter().any(|a| a == "keyring");
-        // `kr` (keyring-continue): on a Debian `@include` greeter whose face line
-        // is `sufficient`, a plain SUCCESS short-circuits before pam_gnome_keyring,
-        // so a COLD face login leaves the login keyring locked. With `kr` we
-        // instead return IGNORE on a cold login that released the password;
-        // `sufficient` then CONTINUES, pam_unix authenticates with the token, and
-        // pam_gnome_keyring unlocks the keyring. A WARM lock still returns SUCCESS
-        // (short-circuit: keyring already open, and cosmic's locker needs it).
-        // Opt-in, so the Fedora success=1 layout (no `kr`) is unchanged.
-        let kr = args.iter().any(|a| a == "kr");
-
-        // `keyring` mode: post-auth login-keyring unlock for the FINGERPRINT
-        // path. This line sits at the auth landing, after a trusted factor has
-        // already succeeded. If a password is present (the user typed one, or an
-        // earlier face `unseal` set it) the keyring unlocks from it; do nothing.
-        // If PAM_AUTHTOK is empty (a fingerprint login provides no password), ask
-        // the daemon to release the TPM-sealed password and set it, so a later
-        // pam_gnome_keyring/pam_kwallet opens the wallet. ALWAYS IGNORE: keyring
-        // unlock is best-effort and must never fail or block the login.
-        if keyring {
-            if let Ok(Some(tok)) = pamh.get_cached_authtok() {
-                if !tok.to_bytes().is_empty() {
-                    return PamError::IGNORE; // password present → keyring self-unlocks
-                }
-            }
-            let service = pamh
-                .get_service()
-                .ok()
-                .flatten()
-                .and_then(|c| c.to_str().ok().map(str::to_string));
-            if let Ok(Response::PasswordUnsealed { secret }) = request(&Request::UnsealKeyring {
-                user: user.clone(),
-                service,
-            }) {
-                if let Ok(tok) = CString::new(secret.expose()) {
-                    let _ = pamh.set_authtok(&tok);
-                    // PAM copied the token into its own store; wipe our copy so
-                    // the plaintext password does not linger on this heap.
-                    zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
-                }
-            }
-            return PamError::IGNORE;
-        }
-        // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
-        // active password probe until the user types (unlike plasmalogin/SDDM,
-        // which answer instantly from the buffered field), so skip the probe and
-        // scan right away; a typed password still wins via the modules after us.
-        let facefirst = args.iter().any(|a| a == "facefirst");
-
-        // `ondemand` (COSMIC / cosmic-greeter): a greeter that DOES answer the
-        // active probe from the buffered field (like plasmalogin) but drives BOTH
-        // the cold login and the live lock screen through ONE service (like GDM).
-        // So we want the on-demand ACTIVE probe (face engages only when the user
-        // submits an empty field; never ambient, never after a typed/rejected
-        // password) AND the warm `unseal→verify` fallback below (so the lock
-        // screen still unlocks). It is `facefirst`'s warm-fallback WITHOUT its
-        // scan-immediately probe. Uses the active-probe path (it never sets
-        // `facefirst`, so the `!facefirst` probe test below stays true).
-        let ondemand = args.iter().any(|a| a == "ondemand");
-
-        // `reseal` AUTH line (placed AFTER password-auth): STASH ONLY. We copy the
-        // current PAM_AUTHTOK into PAM transaction data so the matching `reseal`
-        // SESSION line can re-bind it later. We deliberately do NOT contact the
-        // daemon or touch the TPM here, because this auth line runs even after a
-        // FAILED password attempt; acting on the token here is exactly the bug
-        // that let a typo overwrite the good seal. The mutation happens in
-        // open_session, which PAM only runs once auth has SUCCEEDED, so the token
-        // it acts on is always one pam_unix accepted. Always IGNORE.
-        if reseal {
-            stash_authtok(&pamh);
-            return PamError::IGNORE;
-        }
-
-        // If the user has typed a password, defer to it; don't power up the
-        // camera at all. Scanning a face when they already chose to type would be
-        // a 2-3s annoyance for nothing, and we lose no capability by skipping:
-        // pam_kwallet5/pam_gnome_keyring open the wallet from the typed password
-        // exactly as they would from an unsealed one. Returning IGNORE keeps the
-        // password fallback intact.
-        //
-        // Learning whether they typed depends on the surface:
-        //
-        //  * Active probe (interactive login greeter; `unseal`, no `wait`): the
-        //    plasmalogin/SDDM greeter does NOT pre-set PAM_AUTHTOK; the typed
-        //    password only reaches PAM when a module asks for it. So we ask, once:
-        //    `pam_get_authtok` returns whatever the user already entered (an empty
-        //    string if they submitted a blank field to choose face) WITHOUT
-        //    re-prompting (the greeter answers it immediately from the password
-        //    it buffered on submit) and caches a non-empty answer as PAM_AUTHTOK
-        //    so the downstream pam_unix reuses it with no second prompt. Any
-        //    typed character ⇒ non-empty ⇒ we bail before the camera.
-        //
-        //  * Passive peek (everything else: sudo verify, lock screen `wait`): just
-        //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
-        //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
-        //    biometric device (kde-fingerprint) and cancels us natively the moment
-        //    a key is pressed, so an echo-off prompt from us would hijack the
-        //    password field; and a TTY `sudo` should keep "just look at the camera"
-        //    working without forcing the user to press Enter past a prompt first.
-        let typed = if unseal && !wait && !facefirst {
-            pamh.get_authtok(Some("Password: "))
-        } else {
-            pamh.get_cached_authtok()
-        };
-        if let Ok(Some(tok)) = typed {
-            if !tok.to_bytes().is_empty() {
+        firewall(move || {
+            let user = match pamh.get_user(None) {
+                Ok(Some(u)) => u.to_string_lossy().into_owned(),
+                _ => return PamError::IGNORE,
+            };
+            // Remote-session guard: never fire the local camera for an SSH / remote
+            // login or sudo. The camera is physically at the machine, so whoever is
+            // in front of it (not the remote user) would grant the remote session.
+            // A non-empty PAM_RHOST (or the SSH_* env markers) means remote; return
+            // IGNORE so the password/other factor authenticates instead. Always-on,
+            // independent of biopolicy or how the stack is wired (a hand-added
+            // pam_irlume line in system-auth is covered too).
+            if is_remote_session(&pamh) {
                 return PamError::IGNORE;
             }
-        }
+            let unseal = args.iter().any(|a| a == "unseal");
+            let wait = args.iter().any(|a| a == "wait");
+            let reseal = args.iter().any(|a| a == "reseal");
+            let keyring = args.iter().any(|a| a == "keyring");
+            // `kr` (keyring-continue): on a Debian `@include` greeter whose face line
+            // is `sufficient`, a plain SUCCESS short-circuits before pam_gnome_keyring,
+            // so a COLD face login leaves the login keyring locked. With `kr` we
+            // instead return IGNORE on a cold login that released the password;
+            // `sufficient` then CONTINUES, pam_unix authenticates with the token, and
+            // pam_gnome_keyring unlocks the keyring. A WARM lock still returns SUCCESS
+            // (short-circuit: keyring already open, and cosmic's locker needs it).
+            // Opt-in, so the Fedora success=1 layout (no `kr`) is unchanged.
+            let kr = args.iter().any(|a| a == "kr");
 
-        // In `wait` mode, retry until a match or the budget runs out; otherwise
-        // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
-        // stack always cascades to the password (NIST: a fallback must exist).
-        let deadline = Instant::now() + WAIT_BUDGET;
-        loop {
-            let mut attempt = if unseal {
-                try_unseal(&pamh, &user)
-            } else {
-                try_verify(&pamh, &user)
-            };
-            // Did the SUCCESSFUL attempt release the sealed password into
-            // PAM_AUTHTOK? Only `try_unseal` does; the verify fallback below does
-            // not. This drives the `kr` cold-login keyring-continue decision.
-            let mut unsealed = unseal && attempt == PamError::SUCCESS;
-            // GDM and cosmic-greeter each drive BOTH the cold greeter and the
-            // live lock screen through one service. Unsealing is refused on the
-            // convenience tier (and on an un-armed keyring); a warm screen unlock
-            // only needs identity, so fall back to a plain verify before giving up
-            // to the password. `try_verify` re-applies biopolicy in the daemon, so
-            // a cold login on a convenience tier still returns Deny here: the
-            // fallback only rescues the identity-only warm-unlock case.
-            if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
-                attempt = try_verify(&pamh, &user);
-                unsealed = false; // the fallback verifies identity, releases no token
+            // `keyring` mode: post-auth login-keyring unlock for the FINGERPRINT
+            // path. This line sits at the auth landing, after a trusted factor has
+            // already succeeded. If a password is present (the user typed one, or an
+            // earlier face `unseal` set it) the keyring unlocks from it; do nothing.
+            // If PAM_AUTHTOK is empty (a fingerprint login provides no password), ask
+            // the daemon to release the TPM-sealed password and set it, so a later
+            // pam_gnome_keyring/pam_kwallet opens the wallet. ALWAYS IGNORE: keyring
+            // unlock is best-effort and must never fail or block the login.
+            if keyring {
+                if let Ok(Some(tok)) = pamh.get_cached_authtok() {
+                    if !tok.to_bytes().is_empty() {
+                        return PamError::IGNORE; // password present → keyring self-unlocks
+                    }
+                }
+                let service = pamh
+                    .get_service()
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.to_str().ok().map(str::to_string));
+                if let Ok(Response::PasswordUnsealed { secret }) =
+                    request(&Request::UnsealKeyring {
+                        user: user.clone(),
+                        service,
+                    })
+                {
+                    if let Ok(tok) = CString::new(secret.expose()) {
+                        let _ = pamh.set_authtok(&tok);
+                        // PAM copied the token into its own store; wipe our copy so
+                        // the plaintext password does not linger on this heap.
+                        zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
+                    }
+                }
+                return PamError::IGNORE;
             }
-            if attempt == PamError::SUCCESS {
-                // `kr` + a COLD login that released the password → IGNORE, so the
-                // `sufficient` control CONTINUES and pam_gnome_keyring unlocks the
-                // login keyring (pam_unix accepts the token we set). Every other
-                // success (warm lock, no token, or no `kr`) short-circuits.
-                if kr && unsealed && !irlume_common::platform::user_has_live_session(&user) {
+            // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
+            // active password probe until the user types (unlike plasmalogin/SDDM,
+            // which answer instantly from the buffered field), so skip the probe and
+            // scan right away; a typed password still wins via the modules after us.
+            let facefirst = args.iter().any(|a| a == "facefirst");
+
+            // `ondemand` (COSMIC / cosmic-greeter): a greeter that DOES answer the
+            // active probe from the buffered field (like plasmalogin) but drives BOTH
+            // the cold login and the live lock screen through ONE service (like GDM).
+            // So we want the on-demand ACTIVE probe (face engages only when the user
+            // submits an empty field; never ambient, never after a typed/rejected
+            // password) AND the warm `unseal→verify` fallback below (so the lock
+            // screen still unlocks). It is `facefirst`'s warm-fallback WITHOUT its
+            // scan-immediately probe. Uses the active-probe path (it never sets
+            // `facefirst`, so the `!facefirst` probe test below stays true).
+            let ondemand = args.iter().any(|a| a == "ondemand");
+
+            // `reseal` AUTH line (placed AFTER password-auth): STASH ONLY. We copy the
+            // current PAM_AUTHTOK into PAM transaction data so the matching `reseal`
+            // SESSION line can re-bind it later. We deliberately do NOT contact the
+            // daemon or touch the TPM here, because this auth line runs even after a
+            // FAILED password attempt; acting on the token here is exactly the bug
+            // that let a typo overwrite the good seal. The mutation happens in
+            // open_session, which PAM only runs once auth has SUCCEEDED, so the token
+            // it acts on is always one pam_unix accepted. Always IGNORE.
+            if reseal {
+                stash_authtok(&pamh);
+                return PamError::IGNORE;
+            }
+
+            // If the user has typed a password, defer to it; don't power up the
+            // camera at all. Scanning a face when they already chose to type would be
+            // a 2-3s annoyance for nothing, and we lose no capability by skipping:
+            // pam_kwallet5/pam_gnome_keyring open the wallet from the typed password
+            // exactly as they would from an unsealed one. Returning IGNORE keeps the
+            // password fallback intact.
+            //
+            // Learning whether they typed depends on the surface:
+            //
+            //  * Active probe (interactive login greeter; `unseal`, no `wait`): the
+            //    plasmalogin/SDDM greeter does NOT pre-set PAM_AUTHTOK; the typed
+            //    password only reaches PAM when a module asks for it. So we ask, once:
+            //    `pam_get_authtok` returns whatever the user already entered (an empty
+            //    string if they submitted a blank field to choose face) WITHOUT
+            //    re-prompting (the greeter answers it immediately from the password
+            //    it buffered on submit) and caches a non-empty answer as PAM_AUTHTOK
+            //    so the downstream pam_unix reuses it with no second prompt. Any
+            //    typed character ⇒ non-empty ⇒ we bail before the camera.
+            //
+            //  * Passive peek (everything else: sudo verify, lock screen `wait`): just
+            //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
+            //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
+            //    biometric device (kde-fingerprint) and cancels us natively the moment
+            //    a key is pressed, so an echo-off prompt from us would hijack the
+            //    password field; and a TTY `sudo` should keep "just look at the camera"
+            //    working without forcing the user to press Enter past a prompt first.
+            let typed = if unseal && !wait && !facefirst {
+                pamh.get_authtok(Some("Password: "))
+            } else {
+                pamh.get_cached_authtok()
+            };
+            if let Ok(Some(tok)) = typed {
+                if !tok.to_bytes().is_empty() {
                     return PamError::IGNORE;
                 }
-                return PamError::SUCCESS;
             }
-            if !wait || Instant::now() >= deadline {
-                return PamError::IGNORE;
+
+            // In `wait` mode, retry until a match or the budget runs out; otherwise
+            // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
+            // stack always cascades to the password (NIST: a fallback must exist).
+            let deadline = Instant::now() + WAIT_BUDGET;
+            loop {
+                let mut attempt = if unseal {
+                    try_unseal(&pamh, &user)
+                } else {
+                    try_verify(&pamh, &user)
+                };
+                // Did the SUCCESSFUL attempt release the sealed password into
+                // PAM_AUTHTOK? Only `try_unseal` does; the verify fallback below does
+                // not. This drives the `kr` cold-login keyring-continue decision.
+                let mut unsealed = unseal && attempt == PamError::SUCCESS;
+                // GDM and cosmic-greeter each drive BOTH the cold greeter and the
+                // live lock screen through one service. Unsealing is refused on the
+                // convenience tier (and on an un-armed keyring); a warm screen unlock
+                // only needs identity, so fall back to a plain verify before giving up
+                // to the password. `try_verify` re-applies biopolicy in the daemon, so
+                // a cold login on a convenience tier still returns Deny here: the
+                // fallback only rescues the identity-only warm-unlock case.
+                if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
+                    attempt = try_verify(&pamh, &user);
+                    unsealed = false; // the fallback verifies identity, releases no token
+                }
+                if attempt == PamError::SUCCESS {
+                    // `kr` + a COLD login that released the password → IGNORE, so the
+                    // `sufficient` control CONTINUES and pam_gnome_keyring unlocks the
+                    // login keyring (pam_unix accepts the token we set). Every other
+                    // success (warm lock, no token, or no `kr`) short-circuits.
+                    if kr && unsealed && !irlume_common::platform::user_has_live_session(&user) {
+                        return PamError::IGNORE;
+                    }
+                    return PamError::SUCCESS;
+                }
+                if !wait || Instant::now() >= deadline {
+                    return PamError::IGNORE;
+                }
+                std::thread::sleep(WAIT_RETRY_GAP);
             }
-            std::thread::sleep(WAIT_RETRY_GAP);
-        }
+        })
     }
 
     fn setcred(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
-        PamError::SUCCESS
+        firewall(|| PamError::SUCCESS)
     }
 
     /// `reseal` SESSION line: the actual self-heal. Reached ONLY after auth +
@@ -251,16 +267,18 @@ impl PamServiceModule for IrlumePam {
     /// fail because of this, and other modes (unseal/verify/wait) wire no session
     /// line so they fall straight through.
     fn open_session(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
-        if args.iter().any(|a| a == "reseal") {
-            if let Ok(Some(u)) = pamh.get_user(None) {
-                try_reseal_session(&pamh, &u.to_string_lossy());
+        firewall(move || {
+            if args.iter().any(|a| a == "reseal") {
+                if let Ok(Some(u)) = pamh.get_user(None) {
+                    try_reseal_session(&pamh, &u.to_string_lossy());
+                }
             }
-        }
-        PamError::IGNORE
+            PamError::IGNORE
+        })
     }
 
     fn close_session(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
-        PamError::IGNORE
+        firewall(|| PamError::IGNORE)
     }
 }
 
@@ -364,3 +382,26 @@ fn request(req: &Request) -> std::io::Result<Response> {
 }
 
 pam_module!(IrlumePam);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firewall_passes_normal_returns_through() {
+        assert_eq!(firewall(|| PamError::SUCCESS), PamError::SUCCESS);
+        assert_eq!(firewall(|| PamError::IGNORE), PamError::IGNORE);
+    }
+
+    #[test]
+    fn firewall_maps_a_panic_to_ignore() {
+        // A panic must become IGNORE (password fallback), never unwind toward
+        // the pam_module! extern "C" shims: since Rust 1.81 that aborts the
+        // calling process, i.e. kills sudo or the greeter mid-auth.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the test log clean
+        let got = firewall(|| panic!("boom"));
+        std::panic::set_hook(prev);
+        assert_eq!(got, PamError::IGNORE);
+    }
+}

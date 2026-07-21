@@ -2296,12 +2296,56 @@ fn doctor() -> std::process::ExitCode {
     println!("[doctor] third-party PAD model: {}", models::doctor_line());
 
     // --- companion factors / data-at-rest ----------------------------------
-    let fp = match irlume_fingerprint::device_name() {
-        Some(n) => format!("{n} ✓ (manage with `irlume fingerprint`)"),
-        None if irlume_fingerprint::available() => "present ✓".into(),
-        None => "none".into(),
+    let fp_names = irlume_fingerprint::device_names();
+    let fp = match fp_names.len() {
+        0 if irlume_fingerprint::available() => "present ✓".into(),
+        0 => "none".into(),
+        _ => format!(
+            "{} ✓ (manage with `irlume fingerprint`)",
+            fp_names.join(" + ")
+        ),
     };
     println!("[doctor] fingerprint reader: {fp}");
+    if irlume_fingerprint::fprintd_present() {
+        // Vendor stack behind the fprint bus name: open-fprintd/python-validity
+        // answer the same D-Bus name with different failure modes (stale PPAs,
+        // resume crashes, missing RegisterDevice); name it so bug reports and
+        // remedies point at the right daemon.
+        if let Some(unit) = irlume_fingerprint::bus_owner_unit() {
+            if unit != "fprintd.service" {
+                println!(
+                    "  ⚠ the fprint bus name is owned by '{unit}', not fprintd.service: a \
+                     vendor driver stack is answering; its failure modes differ from stock \
+                     fprintd"
+                );
+            }
+        }
+        // Stale device claim: pam_fprintd then fails silently and the finger
+        // prompt never appears. The dominant post-suspend fingerprint failure.
+        let user = user_arg(&[]);
+        if irlume_fingerprint::reader_stuck(&user) {
+            println!(
+                "  ⚠ the reader is held by a stale fprintd claim (finger prompts will not \
+                 appear; common after suspend/resume) — fix: sudo systemctl restart fprintd"
+            );
+        }
+        let pam_dir = std::path::Path::new("/etc/pam.d");
+        if fingerprint::faillock_cohabits(pam_dir) {
+            println!(
+                "  ⚠ pam_faillock and pam_fprintd share a PAM stack: a touch-sensor misread \
+                 can burn every fingerprint retry in seconds, and each one counts toward the \
+                 account lockout. If you get locked out: faillock --user <you> --reset"
+            );
+        }
+        if fingerprint::fprintd_in_sudo(pam_dir) && fingerprint::sshd_present() {
+            println!(
+                "  ⚠ pam_fprintd is reachable from the sudo stack and an SSH server is \
+                 enabled: `sudo` inside an SSH session will stall for the fingerprint \
+                 timeout (up to 30s) waiting on the local reader. Consider scoping \
+                 fingerprint to login/lock services only."
+            );
+        }
+    }
 
     // Template encryption + recovery come from the daemon (root-only store).
     let user = user_arg(&[]);

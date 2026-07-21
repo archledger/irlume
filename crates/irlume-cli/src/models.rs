@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume models`: opt-in third-party model management.
 //!
 //!   irlume models                 list the catalog + what is enabled

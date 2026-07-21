@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Memory-protection helper: `mlock` + `MADV_DONTDUMP` on the pages backing a
 //! secret, so the plaintext can't be swapped to disk or captured in a core
 //! dump while it's live. This complements (does not replace) `Zeroize`, which

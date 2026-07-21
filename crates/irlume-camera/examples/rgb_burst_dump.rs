@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Dump RGB frames to disk as PPM, the color-side companion to `burst_dump`:
 //! sun-blown or backlit RGB captures feed the detection-floor and fusion
 //! analysis offline.

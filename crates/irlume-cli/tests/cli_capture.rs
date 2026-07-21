@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Black-box tests of the IRLUME_DEV camera/benchmark subcommands (`capture`,
 //! `liveness`, `meshprobe`, `calcapture`, `padcapture`, `genuine`, `suncal`)
 //! against the v4l2loopback virtual-camera harness CI provides.

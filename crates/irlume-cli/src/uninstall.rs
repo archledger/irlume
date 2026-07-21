@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume uninstall`: the safe teardown a package `remove` cannot do.
 //!
 //! Removing the distro package deletes the binary and `pam_irlume.so`, but the

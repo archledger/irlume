@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Matching, template storage, and TPM-bound secret release.
 //!
 //! Decision rule (NIST SP 800-63B-4 aligned): grant only if the liveness gate

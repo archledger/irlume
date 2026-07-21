@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! TPM 2.0 sealing of the unlock secret (not the template).
 //!
 //! We seal a secret (the user's login password, used to unlock the

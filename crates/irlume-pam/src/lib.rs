@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `pam_irlume.so`: the thin, UNPRIVILEGED PAM module.
 //!
 //! It does almost nothing itself: open the Unix socket to `irlumed`, send a

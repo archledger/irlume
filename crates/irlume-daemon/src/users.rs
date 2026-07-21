@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Thread-safe passwd/group lookups via libc reentrant calls.
 //!
 //! Two uses: (a) resolve the `irlume` group so the socket can be `0660

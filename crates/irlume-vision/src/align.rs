@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Face alignment to the canonical ArcFace 112x112 template, plus the
 //! preprocessing and similarity scoring around it.
 //!

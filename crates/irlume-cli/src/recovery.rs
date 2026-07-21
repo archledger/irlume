@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume recovery <status|setup|restore|forget>`: manage the recovery
 //! passphrase that backs up the per-user template key (the AES key encrypting
 //! enrolled faces at rest). It's the manual backstop for when the TPM seal can

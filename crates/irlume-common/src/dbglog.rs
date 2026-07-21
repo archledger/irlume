@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Opt-in diagnostic tracing, shared by the daemon and CLI.
 //!
 //! `IRLUME_LOG=debug` turns on per-stage pipeline traces (capture timings,

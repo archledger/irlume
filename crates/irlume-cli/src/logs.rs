@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume logs`: one journal view for diagnosing auth problems, and the
 //! switch for the daemon's diagnostic tracing.
 //!

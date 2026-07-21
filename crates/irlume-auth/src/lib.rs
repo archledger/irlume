@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Shared authentication orchestration: the one place the security-critical
 //! pipeline lives. Both the CLI and the `irlumed` daemon drive this.
 //!

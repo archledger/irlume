@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Stage-2 lighting-adaptive RGB+IR score fusion.
 //!
 //! Each modality's cosine is mapped to a *calibrated* genuine-probability (Platt

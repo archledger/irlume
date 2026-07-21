@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Black-box tests of the IMAGE-DATASET benchmark/dev tools in `irlume`:
 //! `irbench`, `eval`, `normprobe`, `enrolldev`. These tools take directories
 //! (or a single file) of images rather than a live camera, so their offline

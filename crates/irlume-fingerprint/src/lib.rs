@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Fingerprint modality, backed by **fprintd** (the standard Linux fingerprint
 //! service). irlume does not talk to the sensor directly; it drives fprintd,
 //! which owns libfprint and the device. Verification is performed by

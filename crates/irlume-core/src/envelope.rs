@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! On-disk TPM envelope format for a sealed secret.
 //!
 //! ```json

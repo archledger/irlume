@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Catalog of OPTIONAL third-party models irlume can fetch on the operator's
 //! own machine, but does not ship, mirror, or warrant.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Decisive test for the overlapped-capture change: does the concurrent-load
 //! RGB dimming shift the face embedding enough to hurt recognition?
 //!

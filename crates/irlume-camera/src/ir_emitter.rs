@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Active-IR emitter activation for Windows-Hello-class UVC cameras.
 //!
 //! Hello camera modules pair a greyscale NIR sensor with an 850nm illuminator

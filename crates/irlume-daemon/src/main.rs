@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlumed`: the privileged daemon. Owns the camera + models and is the only
 //! component that runs the biometric pipeline. Untrusted clients (`pam_irlume`,
 //! the CLI) connect over a Unix socket and send line-delimited JSON requests;

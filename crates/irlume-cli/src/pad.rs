@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! `irlume padcapture` / `irlume padreport`: the ISO/IEC 30107-3 presentation-
 //! attack-detection (PAD) self-test harness.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! End-to-end tests of the real `pam_irlume.so` driven through a real PAM
 //! stack, no root and no daemon binary required.
 //!

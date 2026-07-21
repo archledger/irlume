@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! A/B harness for ambient subtraction under a real ambient-IR or spoof
 //! condition. For the given IR device it captures a raw strobe burst and
 //! reports the emitter-OFF (ambient) frame brightness (the whole question: is

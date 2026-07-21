@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Ambient-subtraction feasibility probe. Captures a raw IR burst with the
 //! emitter enabled and prints each frame's mean brightness, so we can see
 //! whether the module STROBES the 850nm emitter (interleaved bright/dark

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! ISO/IEC 30107-3 presentation-attack-detection (PAD) metrics.
 //!
 //! Pure, hardware-free aggregation of labeled presentation trials into the

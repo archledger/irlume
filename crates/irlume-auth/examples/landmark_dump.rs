@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Capture a raw IR strobe burst and dump, per frame, the FaceMesh landmark
 //! coordinates plus the IR brightness sampled at each landmark, the input a
 //! landmark-anchored relief prototype needs (nose vs cheek vs eye-socket

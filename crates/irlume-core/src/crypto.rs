@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! AES-256-GCM encryption for face-template storage at rest.
 //!
 //! Blob format: `[12-byte nonce][ciphertext + 16-byte GCM tag]`. The nonce is

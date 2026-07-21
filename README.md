@@ -200,15 +200,35 @@ CLI are *untrusted* clients of the privileged **`irlumed`** daemon, the only thi
 that ever touches the camera, IR emitter, models, templates, or TPM. They speak
 over a Unix socket authenticated with `SO_PEERCRED`.
 
+```mermaid
+flowchart LR
+    subgraph U["Untrusted clients"]
+        direction TB
+        P["pam_irlume.so<br/>greeter · sudo · lock"]
+        C["irlume CLI<br/>+ live TUI"]
+    end
+    subgraph D["irlumed · privileged daemon (root)"]
+        direction TB
+        CAM["Camera + IR emitter"]
+        ML["YuNet + rescue → AuraFace<br/>IR liveness gate · matcher"]
+        T["TPM seal · encrypted templates"]
+    end
+    P -->|"Unix socket · SO_PEERCRED"| D
+    C -->|"Unix socket · SO_PEERCRED"| D
 ```
-    ┌───────────────┐   ┌───────────────┐        ╔═══════════════════════════╗
-    │ pam_irlume.so │   │  irlume  (CLI │        ║  irlumed   (privileged)   ║
-    │  greeter/sudo │   │   + live TUI) │        ║                           ║
-    └──────┬────────┘   └───────┬───────┘        ║  camera + IR emitter      ║
-           │  SO_PEERCRED       │   Unix socket  ║  YuNet+rescue → AuraFace  ║
-           └────────────────────┴───────────────▶║  IR liveness · matcher    ║
-                                                 ║  TPM seal · templates     ║
-                                                 ╚═══════════════════════════╝
+
+**A login, end to end.** Every branch that isn't a clean, live match falls
+back to the password; there is no lockout.
+
+```mermaid
+flowchart TD
+    A["Greeter / lock screen:<br/>leave password empty, press Enter"] --> B["Camera fires, on demand<br/>captures RGB + IR in parallel"]
+    B --> DET["Detect face<br/>YuNet → BlazeFace rescue"]
+    DET --> L{"IR liveness gate<br/>depth · reflectance · glint"}
+    L -->|spoof or no face| PW["Type your password<br/>no lockout, ever"]
+    L -->|live| M{"Match embedding<br/>at or above threshold?"}
+    M -->|no| PW
+    M -->|yes| G["Grant<br/>+ TPM-unseal your keyring"]
 ```
 
 **Model bill-of-materials.** Every weight is permissive or first-party, all
@@ -404,50 +424,42 @@ want the extra deterrent, or leave it off for the ~2.5-second login; the
 default IR-structure gate already rejects photos, screens, and video replays.
 </details>
 
+## 📚 Documentation
+
+| I want to… | Go to |
+|---|---|
+| **Install and set up**, guided or by hand | [`docs/SETUP.md`](docs/SETUP.md) |
+| Look up **every command and flag** | [`docs/COMMANDS.md`](docs/COMMANDS.md) |
+| Understand the **architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| Read the **threat model** and standards mapping | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) · [`docs/STANDARDS.md`](docs/STANDARDS.md) |
+| **Verify the claims** on my own machine | [`docs/VERIFY.md`](docs/VERIFY.md) |
+| **Debug** a login or trace every stage | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) |
+| **Contribute** and set up a dev shell | [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) |
+| Run it on **NixOS** | [`docs/NIXOS.md`](docs/NIXOS.md) |
+| See **what changed** in each release | [`CHANGELOG.md`](CHANGELOG.md) |
+
 ## 🛠️ Status
 
-**v0.4.0: working, validated on real hardware** across Fedora (full IR Secure tier,
-end-to-end), Ubuntu/Pop!_OS (RGB Convenience tier + fingerprint), and Arch (packaging +
-CLI/daemon on a camera-less testbed). Packaged for all three families: Fedora via Copr,
-Arch via the [AUR](https://aur.archlinux.org/packages/irlume), Ubuntu via the PPA (see
-[Install](#-install)).
+**v0.4.0: working and validated on real hardware.** Fedora runs the full IR
+Secure tier end to end; Ubuntu / Pop!_OS runs the RGB Convenience tier plus a
+fingerprint; Arch is validated for packaging and the CLI/daemon on a camera-less
+testbed. Packaged for all three families (Copr · AUR · PPA). Interfaces may still
+shift before 1.0.
 
-0.3.0 adds `irlume uninstall`, which removes irlume the way it was installed and un-wires
-PAM first so a box is never left locked out; opt-in third-party liveness models via `irlume
-models` (fetched from the publisher, SHA-256 pinned, never shipped, wired deny-only); a
-NixOS module (`nixosModules.irlume`); and merge-aware enrollment in the TUI, so enrolling a
-known face adds scans to that profile instead of making a duplicate. It also carries a batch
-of TUI fixes from a full micro-audit and a fuzz-found parser hardening in the PCR-signature
-path.
+- ✅ **Presentation attacks tested and denied** on a NexiGo N930W: printed photo
+  (including in direct sunlight), laptop screen, phone screen at full brightness,
+  and a video replay with real head motion. All rejected at the infrared stage;
+  a physical 3D mask is not yet tested ([contributions welcome](#-contributing--license)).
+- ✅ **TPM sealing picks the strongest tier the machine supports** (signed-PCR →
+  pcrlock → literal PCR-7) and round-trip-verifies it before trusting it, so a
+  policy that cannot unseal on this boot never holds the secret.
+- 🧪 **Self-tested against ISO/IEC 30107-3**; not lab-certified (no iBeta pass).
+  Demographic FMR tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
+- 🧰 **Contributor-ready:** a reproducible Nix dev shell and
+  [developer guide](docs/DEVELOPMENT.md); CI runs fmt / clippy / build / test on
+  every push and PR.
 
-0.2.0 removes the last non-permissive model, the research-only-trained IR adapter, so the
-**entire shipped model stack is now MIT/Apache-2.0**; the default IR path is raw AuraFace
-plus per-enrollment on-device calibration (no bundled weights). It also adds a BlazeFace
-detection-rescue cascade (outdoor detection 76.9% → 98.5%), the 478-point FaceLandmarker
-mesh, and a presence grace window after the consent gesture. Upgrading from 0.1.x needs a
-one-time re-enroll for dark/dim login; bright-light login and the password are unaffected.
-Every accuracy figure is reproducible from [`benchmarks/`](benchmarks/).
-
-0.2.1 makes that upgrade a one-step affair: `irlume enroll` now adds the fresh scans to
-the profile your face already matches (sized to the free scan slots) instead of refusing
-with "this face is already enrolled".
-
-**Tier-2 TPM sealing via systemd-pcrlock** (since 0.1.5): on a pcrlock-provisioned machine a
-firmware or Secure Boot update needs one `systemd-pcrlock make-policy` run instead of
-re-arming the keyring, and the sealed password keeps releasing. Sealing picks the best
-policy the machine supports (signed PCR, then pcrlock, then a literal PCR-7 seal) and
-round-trip-verifies it before trusting it, so a policy that cannot unseal on the current
-boot never holds the secret.
-
-**Presentation attacks tested and denied** on a NexiGo HelloCam N930W: a printed photo
-(including in direct sunlight), a laptop screen, a phone screen at full brightness, and a
-video replay with real head motion. Each is rejected at the infrared face-detection stage,
-because print and screens do not reproduce a face at 850nm. A physical 3D mask is not yet
-tested; see [contributing](#-contributing--license) if you can run that.
-
-**Contributor-ready:** a reproducible Nix dev shell and [developer guide](docs/DEVELOPMENT.md),
-with CI running fmt / clippy / build / test on every push and PR. Interfaces may still shift
-before 1.0.
+The per-release detail (0.1.x through 0.4.0) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🙏 Credits
 

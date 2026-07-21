@@ -178,7 +178,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
   correct merge-prompt rendering, a static footer with a scrollable activity
   panel, and scroll-handling fixes.
 
-* Wed Jul 16 2026 archledger <archledger236@gmail.com> - 0.2.1-1
+* Thu Jul 16 2026 archledger <archledger236@gmail.com> - 0.2.1-1
 - irlume enroll now merges into the profile the captured face already matches,
   adding the scans instead of refusing with "this face is already enrolled".
   This makes plain `irlume enroll` the working upgrade remedy the 0.2.0 notes
@@ -187,7 +187,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
   profile with 5 slots left gets a 5-scan top-up instead of a 10-scan session
   that discards half, and a full profile is refused after one probe scan.
 
-* Tue Jul 15 2026 archledger <archledger236@gmail.com> - 0.2.0-1
+* Wed Jul 15 2026 archledger <archledger236@gmail.com> - 0.2.0-1
 - BREAKING: re-enroll needed for dark/dim (IR) login. The IR adapter was
   removed (its training data was research-only), so IR templates enrolled under
   0.1.x no longer match. Bright-light (RGB) login keeps working and the password

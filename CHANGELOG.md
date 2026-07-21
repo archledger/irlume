@@ -3,6 +3,29 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Tier-1 signed-PCR sealing works.** irlume's strongest TPM tier (a
+  `PolicyAuthorize` over systemd's PCR-signing key, the one that survives kernel
+  updates without a reseal) never actually engaged. It loaded systemd's public
+  key under the Null hierarchy, so the TPM rejected the resulting
+  `PolicyAuthorize` ticket with `TPM_RC_VALUE`, and every UKI / systemd-boot
+  host silently fell back to Tier-2 (pcrlock). Loading the key under the Owner
+  hierarchy fixes it (the key's Name, which the sealed policy commits to, is
+  hierarchy-independent, so the policy is unchanged). Verified on a real
+  systemd-boot host, including a Tier-1 seal that unseals after a reboot.
+
+### Changed
+
+- **Existing seals climb to the strongest available tier automatically, with no
+  re-arm.** After the fix above a machine that was sealed under a weaker tier
+  upgrades on its own: the keyring seal on the next login, and the template key
+  on the next face match. The upgrade fires only when a strictly stronger tier
+  is available and the ladder round-trip-verifies it, so a machine already at
+  its best tier does nothing. New enrollments seal at Tier-1 directly.
+
 ## [0.4.0] - 2026-07-21
 
 Two batches: preempting camera and UX failure classes mined from other Linux

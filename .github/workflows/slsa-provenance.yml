@@ -17,6 +17,7 @@ jobs:
   # base64 subjects blob the generator signs over.
   hashes:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -43,6 +44,10 @@ jobs:
       actions: read # read this run's metadata for the provenance
       id-token: write # Sigstore/Fulcio keyless signing (no stored secret)
       contents: write # upload the provenance file to the release
+    # MUST be referenced by an @vX.Y.Z tag, not a SHA: the generator's L3 model
+    # embeds this tag in the signed provenance identity, and slsa-verifier
+    # validates it. scripts/check-action-pins.sh excepts slsa-framework/* for
+    # exactly this reason — do not "pin" this to a commit SHA.
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: ${{ needs.hashes.outputs.digests }}

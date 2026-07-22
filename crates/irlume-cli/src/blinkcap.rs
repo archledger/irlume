@@ -126,10 +126,18 @@ fn capture(args: &[String]) -> ExitCode {
             ));
         }
         println!("[blinkcap] label='{label}' n={n} -> {out}");
-        println!(
-            "[blinkcap] perform the gesture NOW; capturing ~{}s...",
-            n / 15
-        );
+        // Countdown so the take has a defined start: the operator can perform a
+        // timed gesture (look, hold ~1s, open) instead of guessing when capture
+        // began. The camera warm-up inside capture adds ~1s before real frames.
+        use std::io::Write as _;
+        print!("[blinkcap] get ready");
+        let _ = std::io::stdout().flush();
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            print!(" .");
+            let _ = std::io::stdout().flush();
+        }
+        println!(" GO  (capturing ~{}s)", n / 15);
         let samples = eng.capture_ear_samples(n)?;
         write_jsonl(out, label, &samples)?;
         // Immediate feedback: face count + blink verdict. The consent verdict

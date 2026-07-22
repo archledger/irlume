@@ -35,10 +35,13 @@ OUT="$DATASET/$LABEL-$(printf '%02d' "$IDX").jsonl"
 
 echo "== capturing '$LABEL' take $IDX -> $OUT =="
 case "$LABEL" in
-  held-closure)  echo "   HOLD your eyes shut for ~1 second when it says GO." ;;
-  natural-blink) echo "   Just look at the camera and blink NATURALLY (do not force it)." ;;
-  ae-settle)     echo "   Look at the camera; change the room light mid-capture." ;;
-  spoof)         echo "   Hold a photo/print of your face over BOTH lenses; stay out of frame." ;;
+  held-closure)  echo "   On GO: look at the camera, then close your eyes and HOLD ~1s, then open." ;;
+  natural-blink) echo "   On GO: look at the camera and blink NATURALLY (do not force it)." ;;
+  squint)        echo "   On GO: SQUINT / half-close your eyes a few times (the hard negative)." ;;
+  look-down)     echo "   On GO: look DOWN and around (pose-driven false-closure negative)." ;;
+  ae-settle)     echo "   On GO: look at the camera; change the room light mid-capture." ;;
+  spoof)         echo "   On GO: hold a photo/print of your face over BOTH lenses; stay out of frame." ;;
+  *)             echo "   On GO: perform the '$LABEL' gesture." ;;
 esac
 
 RESTART=0

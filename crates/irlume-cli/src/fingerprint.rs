@@ -170,7 +170,10 @@ fn offer_verify(user: &str) {
     if !std::io::stdin().is_terminal() {
         return;
     }
-    if !confirm("[fingerprint] verify the new print now?", true) {
+    if !confirm(
+        "[fingerprint] verify the new print now?",
+        /* default_yes: */ true,
+    ) {
         return;
     }
     verify_round(user);
@@ -260,7 +263,7 @@ fn reset(user: &str, args: &[String]) -> ExitCode {
             eprintln!("[fingerprint] refusing to delete without a terminal; pass --yes to force");
             return ExitCode::FAILURE;
         }
-        if !confirm("[fingerprint] delete them?", false) {
+        if !confirm("[fingerprint] delete them?", /* default_yes: */ false) {
             println!("[fingerprint] nothing deleted");
             return ExitCode::SUCCESS;
         }
@@ -270,7 +273,12 @@ fn reset(user: &str, args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     println!("[fingerprint] ✓ deleted {} print(s)", fingers.len());
-    if std::io::stdin().is_terminal() && confirm("[fingerprint] enroll a fresh print now?", true) {
+    if std::io::stdin().is_terminal()
+        && confirm(
+            "[fingerprint] enroll a fresh print now?",
+            /* default_yes: */ true,
+        )
+    {
         if enroll_one(user) {
             offer_verify(user);
         } else {

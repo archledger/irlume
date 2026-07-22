@@ -22,6 +22,7 @@
 //! own double-confirmation in front of it and exits once it returns.
 
 use crate::commands::{install_origin, InstallOrigin};
+use crate::is_root;
 use crate::pamwire;
 use std::io::Write;
 use std::path::PathBuf;
@@ -320,10 +321,6 @@ fn yn(b: bool) -> &'static str {
     } else {
         "no (may not have been running)"
     }
-}
-
-fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
 }
 
 fn stdin_is_tty() -> bool {

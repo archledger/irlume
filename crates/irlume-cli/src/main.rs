@@ -352,60 +352,60 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 /// (the daemon writes /etc/irlume/cameras.conf); the TUI camera picker runs this
 /// via sudo, and headless setups call it directly.
 fn set_cameras(args: &[String]) -> std::process::ExitCode {
-    use irlume_common::{Request, Response};
+    use irlume_common::Request;
     let (Some(rgb), Some(ir)) = (args.get(1), args.get(2)) else {
         eprintln!(
             "usage: irlume set-cameras <rgb-node> <ir-node>   (root; e.g. /dev/video0 /dev/video2)"
         );
         return std::process::ExitCode::from(2);
     };
-    match daemon_request(&Request::SetCameras {
-        rgb: rgb.clone(),
-        ir: ir.clone(),
-    }) {
+    report_ok_response(
+        "set-cameras",
+        daemon_request(&Request::SetCameras {
+            rgb: rgb.clone(),
+            ir: ir.clone(),
+        }),
+    )
+}
+
+/// Report the daemon's answer to a request whose success case is
+/// `Response::Ok(msg)`: the message on stdout tagged `[tag]`, everything else
+/// on stderr with a FAILURE exit code.
+fn report_ok_response(
+    tag: &str,
+    res: Result<irlume_common::Response, String>,
+) -> std::process::ExitCode {
+    use irlume_common::Response;
+    match res {
         Ok(Response::Ok(msg)) => {
-            println!("[set-cameras] {msg}");
+            println!("[{tag}] {msg}");
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
-            eprintln!("[set-cameras] {e}");
+            eprintln!("[{tag}] {e}");
             std::process::ExitCode::FAILURE
         }
         Ok(other) => {
-            eprintln!("[set-cameras] unexpected response {other:?}");
+            eprintln!("[{tag}] unexpected response {other:?}");
             std::process::ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("[set-cameras] {e}");
+            eprintln!("[{tag}] {e}");
             std::process::ExitCode::FAILURE
         }
     }
 }
 
 fn ir_setup(args: &[String]) -> std::process::ExitCode {
-    use irlume_common::{Request, Response};
+    use irlume_common::Request;
     let dry = args.iter().any(|a| a == "--dry-run");
     if !dry {
         eprintln!("[ir-setup] probing the IR camera and trying to enable the 850nm emitter (a few seconds)…");
     }
-    match daemon_request(&Request::SetupIrEmitter { dry_run: dry }) {
-        Ok(Response::Ok(msg)) => {
-            println!("[ir-setup] {msg}");
-            std::process::ExitCode::SUCCESS
-        }
-        Ok(Response::Error(e)) => {
-            eprintln!("[ir-setup] {e}");
-            std::process::ExitCode::FAILURE
-        }
-        Ok(other) => {
-            eprintln!("[ir-setup] unexpected response {other:?}");
-            std::process::ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("[ir-setup] {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
+    report_ok_response(
+        "ir-setup",
+        daemon_request(&Request::SetupIrEmitter { dry_run: dry }),
+    )
 }
 
 fn usage_profiles() -> std::process::ExitCode {
@@ -620,6 +620,11 @@ pub(crate) fn user_arg(args: &[String]) -> String {
         })
 }
 
+/// Effective UID 0: the command can write /etc and manage the daemon.
+pub(crate) fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// Build an Engine: optional --rgb/--ir device overrides, and load an IR
 /// adapter from --adapter PATH if one is supplied (none ships by default since
 /// ADR-0004; the default IR path is raw AuraFace + per-enrollment calibration).
@@ -661,6 +666,12 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// Build the direct-mode Engine for the dev tools (`verify`, `enrolldev`,
+/// benchmarks): no daemon involved. Prints one `[engine] …` line to stderr for
+/// each optional model it loads (adapter / mesh / BlazeFace), so a benchmark
+/// log records which stack produced the numbers. `--mesh` and `--blaze`
+/// default to `models/…` paths relative to the CURRENT DIRECTORY, i.e. a repo
+/// checkout; pass explicit paths when running from anywhere else.
 fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
     let e = match (flag(args, "--rgb"), flag(args, "--ir")) {
@@ -1112,7 +1123,6 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
     std::process::ExitCode::SUCCESS
 }
 
-/// Recursively collect jpg/jpeg/png/bmp files under `dir`.
 /// Darken a 112x112x3 RGB chip (simulate low light): pixel *= factor.
 fn darken_chip(chip: &[u8], factor: f32) -> Vec<u8> {
     chip.iter()
@@ -1244,6 +1254,7 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// Recursively collect jpg/jpeg/png/bmp files under `dir`.
 fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -2160,8 +2171,6 @@ fn eval(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
-/// privacy switch, and confirm models + ONNX Runtime are present.
 /// TPM character device the kernel exposes, if any (resource-managed preferred).
 pub(crate) fn tpm_device() -> Option<&'static str> {
     ["/dev/tpmrm0", "/dev/tpm0"]
@@ -2169,6 +2178,8 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
         .find(|d| std::path::Path::new(d).exists())
 }
 
+/// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
+/// privacy switch, and confirm models + ONNX Runtime are present.
 fn doctor() -> std::process::ExitCode {
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------

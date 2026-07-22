@@ -347,7 +347,7 @@ fn run_streamed(mut cmd: Command, deadline: Duration) -> Result<StreamedRun, Str
         readers.push(std::thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(std::io::Result::ok) {
                 println!("{line}"); // live feedback for the placement prompts
-                let mut c = cap.lock().unwrap();
+                let mut c = cap.lock().unwrap_or_else(|e| e.into_inner());
                 c.push_str(&line);
                 c.push('\n');
             }
@@ -358,7 +358,7 @@ fn run_streamed(mut cmd: Command, deadline: Duration) -> Result<StreamedRun, Str
         readers.push(std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(std::io::Result::ok) {
                 eprintln!("{line}");
-                let mut c = cap.lock().unwrap();
+                let mut c = cap.lock().unwrap_or_else(|e| e.into_inner());
                 c.push_str(&line);
                 c.push('\n');
             }
@@ -380,7 +380,9 @@ fn run_streamed(mut cmd: Command, deadline: Duration) -> Result<StreamedRun, Str
     for r in readers {
         let _ = r.join();
     }
-    let output = captured.lock().unwrap().clone();
+    // Poison-tolerant like the locks above: a panicked reader thread should
+    // not discard the output we did capture.
+    let output = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(StreamedRun { output, status })
 }
 

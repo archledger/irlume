@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -144,6 +144,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Jul 21 2026 archledger <archledger236@gmail.com> - 0.5.0-1
+- Field-hardening release: Tier-1 signed-PCR sealing fix with automatic
+  tier upgrade, fingerprint robustness batch, IR format negotiation
+  (Y16/NV12/YUYV), PAM panic firewall, hardware-validated in CI
+
 * Tue Jul 21 2026 archledger <archledger236@gmail.com> - 0.4.0-1
 - New: RGB pixel-format negotiation (NV12 alongside YUYV); MJPEG-only cameras
   get a clear error and an `irlume doctor` diagnosis instead of failing at

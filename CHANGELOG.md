@@ -5,6 +5,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-21
+
+Driven by a field-research campaign across 25+ sibling projects' issue
+trackers (Howdy alone contributed 1,124 mined issues): the release fixes the
+failure classes their users hit before irlume users can, hardens the
+fingerprint path against everything the libfprint/fprintd corpus documents,
+and stands up hardware-in-the-loop CI: a self-hosted runner with a real TPM
+and IR camera that validates every change on silicon. That runner found and
+fixed its first kernel-drift bug before this release shipped.
+
 ### Fixed
 
 - **`fingerprint enable` no longer disables face auth with nothing wired on
@@ -70,7 +80,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 - **Real-hardware validation joins CI.** A self-hosted runner with a real TPM
   and a real IR camera now runs the TPM seal/unseal tests against silicon
-  rather than a software TPM, and captures a live emitter strobe burst —
+  rather than a software TPM, and captures a live emitter strobe burst,
   nightly and on every maintainer pull request. The distinction matters: the
   Tier-1 sealing fix above is a bug class that passed software-TPM CI
   completely and only ever failed on real hardware. The universal `.deb` is
@@ -98,7 +108,7 @@ All notable changes to irlume are documented here. This project adheres to
   its own actionable message: reader claimed by another session, on-sensor
   storage full, reader disconnected mid-enroll, polkit refusal, no device.
 - Listing enrolled fingers now distinguishes "no fingers enrolled" from "the
-  listing failed" (stale claim, polkit refusal, readerless box —
+  listing failed" (stale claim, polkit refusal, readerless box;
   `fprintd-list` exits 0 in all of them). Found live: over SSH, polkit refuses
   the listing, and status/verify used to answer "no finger enrolled; run
   irlume fingerprint add", pointing exactly the wrong way.

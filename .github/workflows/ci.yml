@@ -198,7 +198,9 @@ jobs:
             build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # stable
+        # @master (declares the `toolchain` input); the version tag branches
+        # (e.g. @1.88.0) have no such input and ignore `with: toolchain:`.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
 
@@ -250,7 +252,9 @@ jobs:
             build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
 
       - name: Install stable Rust with llvm-tools
-        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # stable
+        # @master (declares the `toolchain` input); the version tag branches
+        # (e.g. @1.88.0) have no such input and ignore `with: toolchain:`.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: llvm-tools-preview
@@ -404,7 +408,9 @@ jobs:
       # changed nothing and masquerade as a fuzz finding. Bump the date (and
       # the cargo-fuzz version below) when touching the harness.
       - name: Install nightly Rust (cargo-fuzz needs it)
-        uses: dtolnay/rust-toolchain@39b0b3842c7e8bbf6904c0bfc3d9006fdd4dc4e0 # nightly
+        # @master so `toolchain: nightly-...` is honored (the version-branch pin
+        # ignored it; nightly only worked via the RUSTUP_TOOLCHAIN env fallback).
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: nightly-2026-07-15
 

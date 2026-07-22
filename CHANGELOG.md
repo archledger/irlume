@@ -5,6 +5,31 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The "test (stable)" CI job now actually tests on stable.** Its
+  `dtolnay/rust-toolchain` step was pinned to the action's `1.88.0` version
+  branch, which has no `toolchain` input, so `with: toolchain: stable` was
+  silently ignored and the job installed 1.88.0 (a duplicate of the MSRV job).
+  The stable, coverage, and fuzz jobs now pin `@master`, which declares the
+  input and honors the requested toolchain. Found by a workflow audit.
+- **The `install.sh` installer refuses to run without a verified signature.**
+  It previously fell back to unsigned checksums with a warning when
+  `SHA256SUMS.asc` or `gpg` was absent, so an attacker serving a modified
+  release could strip the signature to disable enforcement. Signature
+  verification is now mandatory (fail-closed); `IRLUME_INSECURE_NO_SIG=1` is
+  the explicit, documented opt-out for installing without gpg.
+
+### Security
+
+- **The self-hosted preflight runner no longer has any path to running fork
+  code.** It triggered on `pull_request` behind a same-repo `if:` guard, but a
+  `pull_request` run executes the fork's own copy of the workflow, so the guard
+  text was attacker-editable and the real control was the fork-approval wall.
+  Preflight now triggers on `push` instead, which a fork cannot fire against
+  this repo at all, removing the untrusted-code path structurally. The
+  self-hosted checkouts also set `persist-credentials: false`.
+
 ## [0.5.0] - 2026-07-21
 
 Driven by a field-research campaign across 25+ sibling projects' issue

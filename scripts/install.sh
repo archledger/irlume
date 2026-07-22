@@ -70,29 +70,40 @@ install_channel() {
   fi
 }
 
-# Fetch SHA256SUMS into $1 (a temp dir) and, when a GPG signature is published,
-# verify it against the pinned key. Aborts on a bad signature; falls back to
-# HTTPS + SHA256 (with a warning) when no signature or no gpg is available.
+# Fetch SHA256SUMS into $1 (a temp dir) and verify its GPG signature against the
+# pinned key. Every published irlume release ships SHA256SUMS.asc, so a MISSING
+# signature is treated as an attack (signature stripping), not a soft fallback:
+# an attacker who can serve a modified release would otherwise just omit the
+# .asc to disable enforcement. The script therefore fails closed by default and
+# aborts when the signature is absent or gpg is missing. IRLUME_INSECURE_NO_SIG=1
+# is the explicit, documented escape hatch for the rare case of installing on a
+# box with no gpg where the user accepts HTTPS+SHA256 only.
 fetch_sums() {
   d="$1"
   curl -fsSL "${RELEASE_BASE}/SHA256SUMS" -o "${d}/SHA256SUMS" \
     || die "could not fetch SHA256SUMS from the latest release."
-  if command -v gpg >/dev/null 2>&1 \
-     && curl -fsSL "${RELEASE_BASE}/SHA256SUMS.asc" -o "${d}/SHA256SUMS.asc" 2>/dev/null; then
-    # Throwaway keyring holding only the pinned key: nothing else can sign,
-    # and the user's own keyring is never read or written.
-    kh="${d}/gnupg"
-    mkdir -p "$kh" && chmod 700 "$kh"
-    printf '%s\n' "$KEY_ASC" | GNUPGHOME="$kh" gpg --batch --import >/dev/null 2>&1 \
-      || { warn "could not import the pinned irlume key; relying on HTTPS + SHA256 only."; return 0; }
-    if GNUPGHOME="$kh" gpg --batch --status-fd 1 --verify "${d}/SHA256SUMS.asc" "${d}/SHA256SUMS" 2>/dev/null \
-         | grep -q "VALIDSIG ${KEY_FP}"; then
-      say "SHA256SUMS GPG signature verified against the pinned irlume key."
-    else
-      die "SHA256SUMS signature did NOT verify against the pinned irlume key ${KEY_FP}; refusing to install."
-    fi
+
+  if [ "${IRLUME_INSECURE_NO_SIG:-}" = "1" ]; then
+    warn "IRLUME_INSECURE_NO_SIG=1 set: skipping GPG signature verification (HTTPS + SHA256 only)."
+    return 0
+  fi
+
+  command -v gpg >/dev/null 2>&1 \
+    || die "gpg is required to verify the release signature. Install gnupg, or (not recommended) set IRLUME_INSECURE_NO_SIG=1 to trust HTTPS + SHA256 only."
+  curl -fsSL "${RELEASE_BASE}/SHA256SUMS.asc" -o "${d}/SHA256SUMS.asc" 2>/dev/null \
+    || die "SHA256SUMS.asc not found for this release. Every irlume release is signed; a missing signature may mean the download was tampered with. Refusing to install. (Override at your own risk with IRLUME_INSECURE_NO_SIG=1.)"
+
+  # Throwaway keyring holding only the pinned key: nothing else can sign,
+  # and the user's own keyring is never read or written.
+  kh="${d}/gnupg"
+  mkdir -p "$kh" && chmod 700 "$kh"
+  printf '%s\n' "$KEY_ASC" | GNUPGHOME="$kh" gpg --batch --import >/dev/null 2>&1 \
+    || die "could not import the pinned irlume key; cannot verify the release signature."
+  if GNUPGHOME="$kh" gpg --batch --status-fd 1 --verify "${d}/SHA256SUMS.asc" "${d}/SHA256SUMS" 2>/dev/null \
+       | grep -q "VALIDSIG ${KEY_FP}"; then
+    say "SHA256SUMS GPG signature verified against the pinned irlume key."
   else
-    warn "no GPG signature checked (gpg absent or unsigned release); relying on HTTPS + SHA256."
+    die "SHA256SUMS signature did NOT verify against the pinned irlume key ${KEY_FP}; refusing to install."
   fi
 }
 

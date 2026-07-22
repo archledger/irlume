@@ -1,25 +1,31 @@
-# Fast pre-merge feedback on the MAINTAINER'S OWN pull requests, using the
-# self-hosted runner's persistent state (incremental cargo target, local LFS,
-# pre-fetched ONNX runtime, pinned MSRV toolchain). ADDITIVE: the required
-# merge gate stays the GitHub-hosted ci.yml, which builds from scratch in a
-# deterministic environment; this job exists to surface breakage in minutes
-# instead of tens, on real hardware-adjacent state (rolling Arch).
+# Fast pre-merge feedback for the maintainer, using the self-hosted runner's
+# persistent state (incremental cargo target, local LFS, pre-fetched ONNX
+# runtime, pinned MSRV toolchain). ADDITIVE: the required merge gate stays the
+# GitHub-hosted ci.yml, which builds from scratch in a deterministic
+# environment; this surfaces breakage in minutes instead of tens, on real
+# hardware-adjacent state (rolling Arch).
 #
-# SECURITY: the job-level guard restricts this to SAME-REPO pull requests —
-# creating one requires push access, so fork PRs (anyone on the internet)
-# never reach the personal-machine runner. They are also behind the
-# repo-wide all-outside-collaborators approval wall, but the guard here must
-# stand on its own: do not remove it.
+# SECURITY: this triggers on `push`, NOT `pull_request`. A `pull_request` run
+# executes the workflow file taken from the PR's own head commit, so a fork PR
+# could edit an `if:` guard to `true` and run on the personal-machine runner if
+# a maintainer ever approved it (and "Approve and run" cannot be scoped to
+# hosted CI alone). A `push` event, by contrast, can only be triggered by
+# someone with push access to THIS repo — a fork cannot push here at all — so no
+# untrusted code ever reaches the runner, with no dependence on the approval
+# wall or an in-file guard. Feedback still appears on same-repo PRs via the
+# commit status. `main` is excluded (it runs the full hosted ci.yml).
 name: Preflight (self-hosted)
 
 on:
-  pull_request:
+  push:
+    branches-ignore:
+      - main
 
 permissions:
   contents: read
 
-# A newer push to the same PR cancels the in-flight preflight: the runner is
-# a single machine, and only the latest commit's verdict matters here.
+# A newer push to the same branch cancels the in-flight preflight: the runner
+# is a single machine, and only the latest commit's verdict matters here.
 concurrency:
   group: preflight-${{ github.ref }}
   cancel-in-progress: true
@@ -27,11 +33,12 @@ concurrency:
 jobs:
   preflight:
     name: preflight · fmt · clippy · test (archhost)
-    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, arch]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Pull model weights (Git LFS, local no-op after first run)
         run: |
@@ -70,9 +77,19 @@ jobs:
       # for command parity with ci.yml.
       - name: test (TPM-gated, against the REAL TPM)
         run: |
+          set -o pipefail
+          # Guard against a renamed test silently matching nothing: an explicit
+          # `cargo test <names>` exits 0 when a name matches zero tests, which
+          # would let the real-TPM coverage quietly stop running. Assert the
+          # expected count actually ran.
+          out="$(mktemp)"
           cargo test -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
-            tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
+            tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv \
+            --test-threads=1 2>&1 | tee "$out"
+          ran=$(grep -oE 'test result: ok\. [0-9]+ passed' "$out" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
+          [ "$ran" -ge 5 ] || { echo "::error::expected 5 real-TPM tests, ran $ran (renamed/typo'd filter?)"; exit 1; }
+          # The daemon tpm_ test self-guards to swtpm-only; kept for parity.
           cargo test -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
 
       # Same loopback camera matrix as the hosted gate. The nodes are

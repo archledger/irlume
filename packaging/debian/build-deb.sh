@@ -6,6 +6,9 @@
 set -euo pipefail
 
 ORT_VER="${ORT_VER:-1.24.4}"
+# sha256 of onnxruntime-linux-x64-${ORT_VER}.tgz (bundled .so runs in the
+# privileged daemon); verify rather than trusting HTTPS. Update with ORT_VER.
+ORT_SHA256="${ORT_SHA256:-3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 STAGE="$REPO/.deb-staging"
 cd "$REPO"
@@ -36,6 +39,8 @@ rm -rf "$STAGE"; mkdir -p "$STAGE"
 # Bundle onnxruntime.
 curl -fsSL -o "$STAGE/ort.tgz" \
   "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz"
+echo "${ORT_SHA256}  $STAGE/ort.tgz" | sha256sum -c - \
+  || { echo "onnxruntime tarball failed sha256 check; refusing to bundle."; exit 1; }
 mkdir -p "$STAGE/onnxruntime"
 tar -xzf "$STAGE/ort.tgz" -C "$STAGE/onnxruntime" --strip-components=1
 

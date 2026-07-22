@@ -138,6 +138,12 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_bindir}/irlumed
 %{_bindir}/irlume
 %{_libdir}/security/pam_irlume.so
+# Own the directories the globs populate (rpmlint: "directory not owned by a
+# package"; also leaves them behind on erase otherwise).
+%dir %{_datadir}/%{name}
+%dir %{_datadir}/%{name}/models
+%dir %{_datadir}/%{name}/onnxruntime
+%dir %{_datadir}/%{name}/onnxruntime/lib
 %{_datadir}/%{name}/models/*.onnx
 %{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service

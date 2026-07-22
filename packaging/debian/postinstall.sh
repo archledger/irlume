@@ -8,7 +8,12 @@ if command -v apparmor_parser >/dev/null 2>&1; then
     apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>/dev/null || true
 fi
 systemctl daemon-reload 2>/dev/null || true
-systemctl enable --now irlumed.service 2>/dev/null || true
+# Enable + start ONLY on first install ($2 empty). On an upgrade, re-enabling
+# would override a unit the user deliberately disabled; try-restart below picks
+# up the new binary/unit for a running daemon and is a no-op for a stopped one.
+if [ -z "${2:-}" ]; then
+    systemctl enable --now irlumed.service 2>/dev/null || true
+fi
 systemctl try-restart irlumed.service 2>/dev/null || true
 cat <<'EOF'
 irlume installed. Next steps:

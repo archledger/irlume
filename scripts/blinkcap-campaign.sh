@@ -27,8 +27,10 @@ export IRLUME_DEV=1
 
 [ -x "$BIN" ] || { echo "build first: cargo build --release -p irlume-cli"; exit 1; }
 mkdir -p "$DATASET"
-# Next take number for this label.
-IDX=$(( $(ls "$DATASET"/"$LABEL"-*.jsonl 2>/dev/null | wc -l) + 1 ))
+# Next take number for this label. `find` (not `ls <glob>`) so a not-yet-created
+# label returns 0 matches instead of exit 2, which under `set -euo pipefail`
+# would kill the script silently before any capture.
+IDX=$(( $(find "$DATASET" -maxdepth 1 -name "$LABEL-*.jsonl" 2>/dev/null | wc -l) + 1 ))
 OUT="$DATASET/$LABEL-$(printf '%02d' "$IDX").jsonl"
 
 echo "== capturing '$LABEL' take $IDX -> $OUT =="
@@ -40,13 +42,32 @@ case "$LABEL" in
 esac
 
 RESTART=0
+# Bring the daemon back, robustly: its startup re-opens the camera, which the
+# just-finished capture may not have fully released yet, so a bare `start` can
+# time out. Retry, and warn LOUDLY if it never comes back so face-login is never
+# left silently down. `set -e` is disabled inside so a failed attempt still
+# retries. Runs on every exit path (including capture failure).
+restart_daemon() {
+  [ "$RESTART" = 1 ] || return 0
+  set +e
+  for attempt in 1 2 3; do
+    sleep 2 # let the camera fully release before the daemon grabs it
+    systemctl restart irlumed
+    sleep 2
+    if systemctl is-active --quiet irlumed; then
+      echo "[campaign] irlumed restarted (face-login is back)."
+      return 0
+    fi
+  done
+  echo "[campaign] ⚠ irlumed did NOT come back. Run:  sudo systemctl restart irlumed"
+}
+trap restart_daemon EXIT
+
 if systemctl is-active --quiet irlumed; then
   echo "   stopping irlumed for camera access..."
   systemctl stop irlumed
   RESTART=1
 fi
-# Always hand the camera back, even on error.
-trap '[ "$RESTART" = 1 ] && systemctl start irlumed || true' EXIT
 
 sleep 1
 "$BIN" blinkcap capture \

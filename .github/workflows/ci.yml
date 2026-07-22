@@ -39,7 +39,7 @@ jobs:
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # Credentials stay persisted on this job only: `git lfs pull` below
         # needs them on a cache miss. The token is contents:read.
 
@@ -69,7 +69,7 @@ jobs:
           toolchain: "1.88.0"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # PRs RESTORE from main's cache but never SAVE their own: per-PR
           # entries were filling the repo's 10 GB cache quota, and LRU
@@ -133,8 +133,8 @@ jobs:
           # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
           # spare the camera streaming tests feed themselves.
           sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
-          git clone https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
-          git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
+          git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
+          git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
           sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
@@ -180,7 +180,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Cache Git LFS objects (ONNX model weights)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -204,7 +204,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # PRs RESTORE from main's cache but never SAVE their own: per-PR
           # entries were filling the repo's 10 GB cache quota, and LRU
@@ -234,7 +234,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Cache Git LFS objects (ONNX model weights)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -259,7 +259,7 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # PRs RESTORE from main's cache but never SAVE their own: per-PR
           # entries were filling the repo's 10 GB cache quota, and LRU
@@ -295,8 +295,8 @@ jobs:
           # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
           # spare the camera streaming tests feed themselves.
           sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
-          git clone https://github.com/umlaeute/v4l2loopback /tmp/v4l2loopback
-          git -C /tmp/v4l2loopback checkout 9ef83fb9bc88e8f841786753c362ac52c580defc
+          git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
+          git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
           make -C /tmp/v4l2loopback -j"$(nproc)"
           sudo modprobe videodev
           sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
@@ -326,6 +326,10 @@ jobs:
           # verify_pinned accept just these (see THREAT_MODEL.md).
           IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
         run: |
+          # Discard any .profraw restored in target/ by rust-cache before the
+          # first --no-report, so a prior build's coverage can't contaminate
+          # this run's merged report.
+          cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report --workspace --locked
           IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
@@ -342,10 +346,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories bans licenses sources
 
@@ -358,7 +362,7 @@ jobs:
       # (flake structure, the package derivation, the NixOS module, the dev
       # shell); it never reads the ONNX model contents, so the LFS pointer
       # files left by a plain checkout are enough and the job stays fast.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -394,7 +398,7 @@ jobs:
       # stable and rejects the -Z sanitizer flags) uses the pinned nightly.
       RUSTUP_TOOLCHAIN: nightly-2026-07-15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -414,7 +418,7 @@ jobs:
         with:
           toolchain: nightly-2026-07-15
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # PRs RESTORE from main's cache but never SAVE their own: per-PR
           # entries were filling the repo's 10 GB cache quota, and LRU
@@ -433,8 +437,15 @@ jobs:
       # The generated corpus accumulates across runs via the cache below, so
       # each 45-second round explores from everything earlier rounds found
       # instead of restarting from the 5 seed files.
+      # Restore on every run (PRs seed from the latest main corpus via
+      # restore-keys), but SAVE only from main. Keyed on run_id, saving on
+      # every PR would append a fresh entry each run and refill the 10 GB cache
+      # quota — the same pressure the rust-cache `save-if` guard prevents (it
+      # would LRU-evict the LFS model cache guarding the scarcer LFS bandwidth
+      # quota). Restore/save are split so the save can be gated to main.
       - name: Restore fuzz corpus from previous runs
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: fuzz-corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -454,6 +465,14 @@ jobs:
             cargo fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096
             echo "::endgroup::"
           done
+
+      # Persist the grown corpus only from main (see the restore step's note).
+      - name: Save fuzz corpus
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
 
       - name: Upload crashing inputs
         if: failure()

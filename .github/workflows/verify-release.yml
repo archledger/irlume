@@ -9,16 +9,28 @@ name: Verify release assets
 on:
   release:
     types: [published, edited]
+  # Assets are GPG-signed off-CI and uploaded one at a time; a re-verify from
+  # the complete state can always be requested here.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# Assets upload one at a time, so `edited` fires several times mid-upload while
+# SHA256SUMS / the .deb don't yet exist. Without this, each intermediate event
+# ran to a red failure and emailed the maintainer (4 false failures on v0.5.0),
+# training them to ignore the check. Cancelling supersedes the intermediate
+# runs (grey, no email); only the final complete state is verified.
+concurrency:
+  group: verify-release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -27,9 +39,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
 
-      - name: Verify signature, checksums, and coverage
+      - name: Skip until the signed checksums are present
         working-directory: assets
         run: |
+          # An `edited` event mid-upload can fire before SHA256SUMS(.asc) land.
+          # That is an incomplete state, not a bad release: exit neutrally
+          # (the final upload's run does the real verification, and
+          # workflow_dispatch can force it). Only treat a genuinely absent
+          # sums file after all uploads as the maintainer's problem to notice.
+          if [ ! -f SHA256SUMS ] || [ ! -f SHA256SUMS.asc ]; then
+            echo "::notice::SHA256SUMS/.asc not present yet — assets still uploading; skipping this run"
+            echo "incomplete=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify signature, checksums, and coverage
+        if: env.incomplete != '1'
+        working-directory: assets
+        run: |
+          set -euo pipefail
           # The release public key is committed, not fetched from a keyserver:
           # a keyserver lookup could be poisoned, the repo copy is reviewed.
           gpg --import ../.github/release-signing-key.asc
@@ -42,11 +69,20 @@ jobs:
           # must be listed in SHA256SUMS.
           for f in *; do
             case "$f" in SHA256SUMS|SHA256SUMS.asc|*.intoto.jsonl) continue;; esac
-            grep -q "  $f\$" SHA256SUMS || { echo "asset not covered by SHA256SUMS: $f"; exit 1; }
+            grep -qF -- "  $f" SHA256SUMS || { echo "asset not covered by SHA256SUMS: $f"; exit 1; }
           done
 
-      - name: Sanity-check the .deb
+      - name: Sanity-check the packages
+        if: env.incomplete != '1'
         working-directory: assets
         run: |
+          set -euo pipefail
           dpkg-deb --info irlume_*.deb
           dpkg-deb --contents irlume_*.deb >/dev/null
+          # The SELinux .rpm is integrity-covered by the signed sums; also give
+          # it a structural check symmetric with the .deb.
+          for rpm in irlume-selinux-*.rpm; do
+            [ -e "$rpm" ] || continue
+            rpm -qip "$rpm"
+            rpm -qlp "$rpm" >/dev/null
+          done

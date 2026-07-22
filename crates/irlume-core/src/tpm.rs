@@ -102,6 +102,9 @@ fn pcr_selection(pcrs: &[u32]) -> Result<PcrSelectionList> {
         .map_err(tpm_err)
 }
 
+// PCRs 17-22 (DRTM / locality-restricted PCRs) are intentionally unsupported
+// for sealing policies: nothing in the boot chains irlume binds to extends
+// them, so a seal over them would add no protection.
 fn pcr_slot(index: u32) -> Result<PcrSlot> {
     Ok(match index {
         0 => PcrSlot::Slot0,
@@ -357,24 +360,6 @@ fn with_srk<T>(
     result
 }
 
-/// Seal `secret` under the best policy available on this machine, trying each
-/// tier in order and round-trip-verifying before trusting it:
-///   * Tier 1: if systemd has published signed-PCR artifacts (UKI / systemd-boot),
-///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
-///     (typically PCR 11). Survives kernel updates with no reseal.
-///   * Tier 2: if a systemd-pcrlock policy is provisioned
-///     ([`pcrlock_provisioned`]), a `PolicyAuthorizeNV` against its NV index.
-///     `make-policy` re-predicts the index across firmware / Secure Boot
-///     updates, so those don't require a reseal either. Explicit sealing at
-///     this tier is also available via [`seal_with_pcrlock`].
-///   * Tier 3: otherwise a literal `PolicyPCR` over the configured PCRs
-///     ([`policy_pcrs`], default PCR 7). If those PCRs move (dbx/Secure Boot
-///     update) the envelope stops unsealing and the user re-runs `keyring arm`.
-///
-/// Every producer funnels through here (keyring arm, the template key, both
-/// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
-/// up a tier when one became available, and only lands on a lower tier when
-/// the higher one genuinely does not unseal on this machine.
 /// True when this machine could seal under a strictly stronger tier than
 /// `current` right now. Used by the login-time self-heal to auto-upgrade an
 /// envelope sealed under a weaker tier (e.g. one written before signed-PCR
@@ -394,6 +379,24 @@ pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
     }
 }
 
+/// Seal `secret` under the best policy available on this machine, trying each
+/// tier in order and round-trip-verifying before trusting it:
+///   * Tier 1: if systemd has published signed-PCR artifacts (UKI / systemd-boot),
+///     a `PolicyAuthorize` over its signing key, binding the PCRs it signs
+///     (typically PCR 11). Survives kernel updates with no reseal.
+///   * Tier 2: if a systemd-pcrlock policy is provisioned
+///     ([`pcrlock_provisioned`]), a `PolicyAuthorizeNV` against its NV index.
+///     `make-policy` re-predicts the index across firmware / Secure Boot
+///     updates, so those don't require a reseal either. Explicit sealing at
+///     this tier is also available via [`seal_with_pcrlock`].
+///   * Tier 3: otherwise a literal `PolicyPCR` over the configured PCRs
+///     ([`policy_pcrs`], default PCR 7). If those PCRs move (dbx/Secure Boot
+///     update) the envelope stops unsealing and the user re-runs `keyring arm`.
+///
+/// Every producer funnels through here (keyring arm, the template key, both
+/// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
+/// up a tier when one became available, and only lands on a lower tier when
+/// the higher one genuinely does not unseal on this machine.
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
         match seal_authorized(secret) {
@@ -807,7 +810,7 @@ fn read_pcrlock_json() -> Result<PcrlockJson> {
             "cannot read {path}: {e} (run `systemd-pcrlock make-policy` first)"
         ))
     })?;
-    parse_pcrlock_json(&raw)
+    parse_pcrlock_json(&raw, &path)
 }
 
 /// Parse and validate a pcrlock prediction. Rejects a policy that would provide
@@ -817,9 +820,11 @@ fn read_pcrlock_json() -> Result<PcrlockJson> {
 /// PCRs to use for policy is empty. Generated policy will not provide any
 /// protection"); binding a secret to that is a false sense of security, so both
 /// seal (refuse to arm) and unseal (fail-safe to the password) reject it here.
-fn parse_pcrlock_json(raw: &[u8]) -> Result<PcrlockJson> {
+fn parse_pcrlock_json(raw: &[u8], source: &str) -> Result<PcrlockJson> {
+    // `source` is the path the bytes came from (the IRLUME_PCRLOCK_JSON
+    // override or the default), so the error names the file actually read.
     let plock: PcrlockJson = serde_json::from_slice(raw)
-        .map_err(|e| Error::Policy(format!("malformed {PCRLOCK_JSON}: {e}")))?;
+        .map_err(|e| Error::Policy(format!("malformed {source}: {e}")))?;
     if plock.pcr_bank != "sha256" {
         return Err(Error::Policy(format!(
             "pcrlock bank is {:?}; only sha256 is supported",
@@ -883,6 +888,7 @@ fn nv_index_handle(ctx: &mut Context, nv_index: u32) -> Result<NvIndexHandle> {
 
 /// One step of a systemd super-PCR policy, replayable in a trial session to
 /// derive intermediate digests (the OR-branch digests the live session needs).
+#[derive(Clone)]
 enum PolicyStep {
     /// `TPM2_PolicyPCR` over `sel` committing to the given composite `digest`.
     Pcr { sel: Vec<u32>, digest: Digest },
@@ -971,7 +977,7 @@ fn build_super_pcr(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
     for (pcr, values) in entries.iter().filter(|(_, v)| v.len() > 1) {
         let mut branches = Vec::with_capacity(values.len());
         for val in values {
-            let mut steps = prefix_clone(&prefix);
+            let mut steps = prefix.clone();
             steps.push(PolicyStep::Pcr {
                 sel: vec![*pcr],
                 digest: pcr_composite_digest(&[*val])?,
@@ -989,19 +995,6 @@ fn build_super_pcr(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
     }
 
     Ok(SuperPcr { singles, multis })
-}
-
-fn prefix_clone(prefix: &[PolicyStep]) -> Vec<PolicyStep> {
-    prefix
-        .iter()
-        .map(|s| match s {
-            PolicyStep::Pcr { sel, digest } => PolicyStep::Pcr {
-                sel: sel.clone(),
-                digest: digest.clone(),
-            },
-            PolicyStep::Or(d) => PolicyStep::Or(d.clone()),
-        })
-        .collect()
 }
 
 /// Compute the sealed object's `authPolicy` (a `PolicyAuthorizeNV` over the NV
@@ -1206,16 +1199,25 @@ mod tests {
     fn pcrlock_json_rejects_empty_protection_mask() {
         // A policy covering ≥1 PCR parses.
         let good = br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":["aa"]}]}"#;
-        assert!(parse_pcrlock_json(good).is_ok());
+        assert!(parse_pcrlock_json(good, PCRLOCK_JSON).is_ok());
         // Empty protection mask (no PCRs) is refused: no measured-boot protection.
         let empty = br#"{"pcrBank":"sha256","pcrValues":[]}"#;
-        assert!(matches!(parse_pcrlock_json(empty), Err(Error::Policy(_))));
+        assert!(matches!(
+            parse_pcrlock_json(empty, PCRLOCK_JSON),
+            Err(Error::Policy(_))
+        ));
         // A PCR entry with no predicted values is refused (would be silently dropped).
         let novals = br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":[]}]}"#;
-        assert!(matches!(parse_pcrlock_json(novals), Err(Error::Policy(_))));
+        assert!(matches!(
+            parse_pcrlock_json(novals, PCRLOCK_JSON),
+            Err(Error::Policy(_))
+        ));
         // Wrong bank is refused.
         let sha1 = br#"{"pcrBank":"sha1","pcrValues":[{"pcr":7,"values":["aa"]}]}"#;
-        assert!(matches!(parse_pcrlock_json(sha1), Err(Error::Policy(_))));
+        assert!(matches!(
+            parse_pcrlock_json(sha1, PCRLOCK_JSON),
+            Err(Error::Policy(_))
+        ));
     }
 
     #[test]
@@ -1224,13 +1226,20 @@ mod tests {
         let with_nv =
             br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":["aa"]}],"nvIndex":26196898}"#;
         assert_eq!(
-            parse_pcrlock_json(with_nv).expect("parse").nv_index,
+            parse_pcrlock_json(with_nv, PCRLOCK_JSON)
+                .expect("parse")
+                .nv_index,
             Some(26_196_898)
         );
         // Without one (recovery-pin setups): still a valid prediction, but no
         // Tier 2 rung.
         let without = br#"{"pcrBank":"sha256","pcrValues":[{"pcr":7,"values":["aa"]}]}"#;
-        assert_eq!(parse_pcrlock_json(without).expect("parse").nv_index, None);
+        assert_eq!(
+            parse_pcrlock_json(without, PCRLOCK_JSON)
+                .expect("parse")
+                .nv_index,
+            None
+        );
     }
 
     #[test]

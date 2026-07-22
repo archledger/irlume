@@ -626,17 +626,24 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // a remote/unknown service (those keep the password). Always-on for
             // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
-                use irlume_core::biopolicy::{classify, OperationClass};
-                // "Warm" = the user already has a running session (their systemd
+                use irlume_core::biopolicy::{classify, OperationClass, SessionState};
+                // Warm = the user already has a running session (their systemd
                 // runtime dir exists); then an ambiguous greeter service (GDM
                 // drives cold login AND the lock screen through gdm-password) is
                 // a screen unlock, not a login. Caveat: lingering user services
                 // also create /run/user/<uid>; acceptable for the convenience
                 // tier where the worst case is unlocking a lock screen.
-                let warm = users::uid_for_name(&user)
+                let session = users::uid_for_name(&user)
                     .map(|uid| std::path::Path::new(&format!("/run/user/{uid}")).exists())
-                    .unwrap_or(false);
-                let class = classify(service.as_deref().unwrap_or(""), warm);
+                    .map(|has_runtime_dir| {
+                        if has_runtime_dir {
+                            SessionState::Warm
+                        } else {
+                            SessionState::Cold
+                        }
+                    })
+                    .unwrap_or(SessionState::Cold);
+                let class = classify(service.as_deref().unwrap_or(""), session);
                 if class != OperationClass::ScreenUnlock {
                     eprintln!("irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password", service.as_deref().unwrap_or("?"));
                     return Response::AuthResult {
@@ -654,9 +661,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // for a Remote/Unknown service would bypass the "face never satisfies
             // remote" invariant. Off by default (behaviour unchanged).
             if biopolicy_enforced() && engine.tier() != irlume_core::biopolicy::Tier::Convenience {
-                use irlume_core::biopolicy::{classify, decide, Action, Tier};
+                use irlume_core::biopolicy::{classify, decide, Action, SessionState, Tier};
                 let svc = service.as_deref().unwrap_or("");
-                if decide(classify(svc, false), Tier::Secure) == Action::Deny {
+                if decide(classify(svc, SessionState::Cold), Tier::Secure) == Action::Deny {
                     eprintln!("irlumed: biopolicy denies verify for service '{svc}' -> password");
                     return Response::AuthResult {
                         granted: false,
@@ -864,9 +871,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // pull the login password out of the TPM; polkit gets verify-only
             // (Authenticate).
             {
-                use irlume_core::biopolicy::{classify, OperationClass};
+                use irlume_core::biopolicy::{classify, OperationClass, SessionState};
                 let svc = service.as_deref().unwrap_or("");
-                if classify(svc, false) == OperationClass::AppConsent {
+                if classify(svc, SessionState::Cold) == OperationClass::AppConsent {
                     eprintln!("irlumed: UnsealPassword refused for polkit service '{svc}' (verify-only class)");
                     return Response::Error(format!(
                         "'{svc}' is verify-only: a polkit prompt never releases the credential"
@@ -885,12 +892,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // release by the PAM service's operation class (e.g. refuse a remote
             // / unknown service). Default off → unchanged behaviour.
             if biopolicy_enforced() {
-                use irlume_core::biopolicy::{classify, decide, Action, Tier};
+                use irlume_core::biopolicy::{classify, decide, Action, SessionState, Tier};
                 let svc = service.as_deref().unwrap_or("");
                 // UnsealPassword is the cold-login path (the lock screen uses
-                // verify-only `wait`), so warm=false. irlume's liveness already
+                // verify-only `wait`), so Cold. irlume's liveness already
                 // requires IR for any grant, so a granted match is Secure tier.
-                let action = decide(classify(svc, false), Tier::Secure);
+                let action = decide(classify(svc, SessionState::Cold), Tier::Secure);
                 if action != Action::Unseal {
                     eprintln!("irlumed: biopolicy denies unseal for service '{svc}' ({action:?}) -> password");
                     return Response::Error(format!(
@@ -929,8 +936,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // does not stop a root attacker; it does stop the keyring line being
             // (mis)wired into a non-login stack from releasing the credential.
             {
-                use irlume_core::biopolicy::{classify, OperationClass};
-                let class = classify(service.as_deref().unwrap_or(""), true);
+                use irlume_core::biopolicy::{classify, OperationClass, SessionState};
+                let class = classify(service.as_deref().unwrap_or(""), SessionState::Warm);
                 if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
                     eprintln!(
                         "irlumed: UnsealKeyring refused for service '{}' ({class:?})",

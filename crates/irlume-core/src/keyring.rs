@@ -120,7 +120,7 @@ pub fn reseal_password(user: &str, password: &[u8]) -> Result<Reseal> {
             if let Ok(env) = SealedEnvelope::load(&envelope_path(user)) {
                 if tpm::stronger_tier_available_than(&env.policy) {
                     let candidate = tpm::seal(password)?;
-                    if candidate.policy.tier_rank() > env.policy.tier_rank() {
+                    if candidate.policy.strength_rank() > env.policy.strength_rank() {
                         candidate.save(&envelope_path(user))?;
                         return Ok(Reseal::Upgraded);
                     }
@@ -202,7 +202,7 @@ mod tests {
             SealedEnvelope::load(&envelope_path("tester"))
                 .unwrap()
                 .policy
-                .tier_rank(),
+                .strength_rank(),
             1,
             "precondition: sealed at Tier 3 (literal)"
         );

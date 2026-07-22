@@ -1020,7 +1020,8 @@ impl Engine {
         self.forced_consent = service
             .map(|s| {
                 irlume_core::biopolicy::requires_consent_gesture(irlume_core::biopolicy::classify(
-                    s, false,
+                    s,
+                    irlume_core::biopolicy::SessionState::Cold,
                 )) && consent_gesture_enabled()
             })
             .unwrap_or(false);
@@ -1130,7 +1131,7 @@ impl Engine {
             // genuine dim/night logins as "screen/photo". The global gate above
             // (`evaluate`) already enforces an ambient-tolerant IR brightness floor.
             // Only meaningful when IR was actually captured (skip on RGB-only).
-            if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+            if let Some(depth_floor) = enr.ir_depth_floor().filter(|_| self.ir_available) {
                 irlume_common::dlog!(
                     "gate(per-user depth floor): live {:.2} vs floor {:.2}",
                     a.ir_depth,
@@ -1268,7 +1269,7 @@ impl Engine {
             // warm spoof that sits between the global ratio and this user's
             // enrolled 3D structure is caught in lit conditions but must not
             // slip through in the dark. Apply it here too before the IR match.
-            if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+            if let Some(depth_floor) = enr.ir_depth_floor().filter(|_| self.ir_available) {
                 irlume_common::dlog!(
                     "gate(per-user depth floor, dark): live {:.2} vs floor {:.2}",
                     a.ir_depth,

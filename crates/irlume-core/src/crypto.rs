@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 
 pub const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-/// Minimum valid blob: nonce + the 16-byte GCM tag (empty plaintext).
+/// GCM authentication tag length in bytes.
 const TAG_LEN: usize = 16;
 
 /// A fresh random 256-bit key, zeroized on drop.
@@ -39,7 +39,7 @@ pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| Error::Tpm(format!("aes init: {e}")))?;
+        Aes256Gcm::new_from_slice(key).map_err(|e| Error::Policy(format!("aes init: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce_bytes);
@@ -47,7 +47,7 @@ pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let ct = cipher
         .encrypt(&nonce, plaintext)
-        .map_err(|e| Error::Tpm(format!("aes encrypt: {e}")))?;
+        .map_err(|e| Error::Policy(format!("aes encrypt: {e}")))?;
 
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -65,6 +65,7 @@ pub fn decrypt(key: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
             key.len()
         )));
     }
+    // Minimum valid blob: nonce + tag (empty plaintext).
     if blob.len() < NONCE_LEN + TAG_LEN {
         return Err(Error::Policy("encrypted blob too short".into()));
     }
@@ -75,7 +76,7 @@ pub fn decrypt(key: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         .map_err(|_| Error::Policy("encrypted blob has malformed nonce".into()))?;
 
     let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| Error::Tpm(format!("aes init: {e}")))?;
+        Aes256Gcm::new_from_slice(key).map_err(|e| Error::Policy(format!("aes init: {e}")))?;
 
     let plain = cipher
         .decrypt(&nonce, ct)

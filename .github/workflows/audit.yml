@@ -18,18 +18,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
 
       # The cargo-fuzz workspace has its own lockfile that the root check never
       # reads (see the note in .github/dependabot.yml); scan it here so an
-      # advisory against a fuzz-only dependency does not rot silently.
+      # advisory against a fuzz-only dependency does not rot silently. `always`
+      # so a root-lockfile advisory doesn't hide whether the fuzz workspace has
+      # one too — both are reported in a single run.
       - name: Advisories for the fuzz workspace lockfile
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        if: always()
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: fuzz/Cargo.toml
           command: check advisories

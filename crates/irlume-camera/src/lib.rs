@@ -2135,11 +2135,20 @@ mod tests {
             caps.rgb,
             "a YUYV-fed loopback node classifies as a usable RGB camera"
         );
-        assert!(
-            !caps.ir_pair,
-            "virtual nodes share no physical sysfs parent, so they must never \
-             form a Hello pair"
-        );
+        // Assert the LOOPBACK nodes specifically never join a Hello pair
+        // (no physical sysfs parent), rather than that no pair exists at all:
+        // on the hardware CI runner a real Hello camera is attached, so the
+        // global `caps.ir_pair` bit is legitimately true there.
+        let (rgb, ir) = loopback_pair().expect("checked above");
+        for pair in list_pairs() {
+            assert!(
+                pair.rgb != rgb && pair.rgb != ir && pair.ir != rgb && pair.ir != ir,
+                "virtual nodes share no physical sysfs parent, so they must never \
+                 appear in a Hello pair (got rgb={} ir={})",
+                pair.rgb,
+                pair.ir
+            );
+        }
     }
 
     #[test]

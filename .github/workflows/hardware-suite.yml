@@ -88,3 +88,52 @@ jobs:
           # brightest (emitter-lit) and darkest frame means, the same signal
           # capture_ir keys on. A dead emitter shows as a flat, dark burst.
           awk '{print $2}' "$out/means.txt" | sort -n | awk 'NR==1{min=$1} END{max=$1; d=max-min; printf "mean spread: %.1f\n", d; exit (d < 5)}'
+
+  # Hardware-inclusive statement coverage: the same measurement the hosted
+  # ratchet takes, but with the TPM-gated tests on REAL silicon and the
+  # camera/PAM matrices included. Report-only (no floor): the number feeds
+  # the OpenSSF Best Practices gold criterion (test_statement_coverage90),
+  # and the delta against the hosted number shows which hardware-only paths
+  # remain unreached. Runs after the smoke job so the two never contend for
+  # the camera.
+  coverage:
+    name: coverage (hardware-inclusive, report only)
+    needs: hardware
+    runs-on: [self-hosted, tpm, ir-camera]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Pull model weights (Git LFS)
+        run: |
+          git lfs pull
+          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
+            echo "::error::model weights are LFS pointers — run 'git lfs install' for the runner user"
+            exit 1
+          fi
+
+      - name: Coverage (workspace + real-TPM + loopback cameras + PAM FFI)
+        env:
+          IRLUME_TEST_RGB_DEVICE: /dev/video8
+          IRLUME_TEST_IR_DEVICE: /dev/video9
+          IRLUME_TEST_SPARE_DEVICE: /dev/video10
+          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
+        run: |
+          test -w /dev/video8 && test -w /dev/video9 || { echo "::error::loopback nodes missing — re-provision v4l2loopback"; exit 1; }
+          ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
+          ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
+          trap 'kill %1 %2 2>/dev/null || true' EXIT
+          for _ in $(seq 1 15); do
+            if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
+            sleep 1
+          done
+          cargo llvm-cov --no-report --workspace --locked
+          cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
+            tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
+          cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
+          cargo llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
+          cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
+          cargo llvm-cov report --summary-only

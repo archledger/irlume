@@ -2282,6 +2282,48 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
 /// privacy switch, and confirm models + ONNX Runtime are present.
+/// Certify that the polkit agent helper (polkit 126+ socket-activated,
+/// device-sandboxed unit) can still reach the irlume daemon socket. irlume is
+/// structurally immune to the sandbox that broke Howdy (it opens no camera in
+/// the PAM process, only `/run/irlume.sock`), UNLESS a unit override hides the
+/// socket path with a filesystem restriction. Best-effort, informative.
+fn report_polkit_sandbox() {
+    // No socket-activated helper unit → pre-126 setuid helper (runs unconfined);
+    // nothing to certify.
+    let unit = std::process::Command::new("systemctl")
+        .args(["cat", "polkit-agent-helper@.service"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let Some(unit) = unit else {
+        return;
+    };
+    // Directives that would hide /run (and thus /run/irlume.sock) from the
+    // sandboxed helper. PrivateDevices/DeviceAllow do NOT block an AF_UNIX
+    // socket, so they are deliberately not in this list; only path-hiding ones.
+    let hides_run = unit.lines().any(|l| {
+        let t = l.trim();
+        (t.starts_with("RootDirectory=") && !t.ends_with('='))
+            || t.starts_with("ProtectSystem=strict")
+            || (t.starts_with("InaccessiblePaths=") && t.contains("/run"))
+            || (t.starts_with("TemporaryFileSystem=") && t.contains("/run"))
+    });
+    if hides_run {
+        println!(
+            "[doctor] ⚠ polkit helper sandbox may hide /run/irlume.sock; polkit face prompts\n     \
+             would fall back to the password. Add a drop-in exposing only the socket:\n     \
+             /etc/systemd/system/polkit-agent-helper@.service.d/irlume.conf with\n     \
+             [Service] then a BindReadOnlyPaths=/run/irlume.sock line."
+        );
+    } else {
+        println!(
+            "[doctor] polkit helper sandbox: OK ✓ (irlume uses the daemon socket, not the \
+             camera, so the device sandbox that breaks Howdy does not apply)"
+        );
+    }
+}
+
 fn doctor() -> std::process::ExitCode {
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
@@ -2521,6 +2563,15 @@ fn doctor() -> std::process::ExitCode {
              --with-polkit --apply)"
         ),
         None => {}
+    }
+    // polkit 126+ moved the agent helper into a sandboxed, socket-activated
+    // systemd unit (PrivateDevices etc.) that BROKE Howdy's polkit face path,
+    // because Howdy opens the camera inside the PAM process. irlume's PAM module
+    // opens no device: it only connects the AF_UNIX daemon socket, which the
+    // device sandbox does not block. Certify that here so a future sandbox
+    // tightening that hid /run/irlume.sock would be visible.
+    if crate::pamwire::polkit_wired() == Some(true) {
+        report_polkit_sandbox();
     }
 
     // --- wiring drift ------------------------------------------------------

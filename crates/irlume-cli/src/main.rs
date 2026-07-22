@@ -2299,16 +2299,25 @@ fn report_polkit_sandbox() {
     let Some(unit) = unit else {
         return;
     };
-    // Directives that would hide /run (and thus /run/irlume.sock) from the
-    // sandboxed helper. PrivateDevices/DeviceAllow do NOT block an AF_UNIX
-    // socket, so they are deliberately not in this list; only path-hiding ones.
-    let hides_run = unit.lines().any(|l| {
-        let t = l.trim();
-        (t.starts_with("RootDirectory=") && !t.ends_with('='))
-            || t.starts_with("ProtectSystem=strict")
-            || (t.starts_with("InaccessiblePaths=") && t.contains("/run"))
-            || (t.starts_with("TemporaryFileSystem=") && t.contains("/run"))
-    });
+    // If the socket-activated helper is inactive, polkit uses the setuid helper,
+    // which runs UNCONFINED: no sandbox applies, so the socket is reachable.
+    let socket_active = std::process::Command::new("systemctl")
+        .args(["is-active", "polkit-agent-helper.socket"])
+        .output()
+        .map(|o| o.stdout.starts_with(b"active"))
+        .unwrap_or(false);
+    // Directives that HIDE /run (and thus /run/irlume.sock) from the sandboxed
+    // helper. Note what is NOT here: PrivateDevices/DeviceAllow (they gate
+    // devices, not an AF_UNIX socket) and ProtectSystem=strict (it makes /run
+    // READ-ONLY, but connect() to a socket does not write the file, so the
+    // socket stays reachable). Only chroot/hide directives actually block it.
+    let hides_run = socket_active
+        && unit.lines().any(|l| {
+            let t = l.trim();
+            (t.starts_with("RootDirectory=") && !t.ends_with('='))
+                || (t.starts_with("InaccessiblePaths=") && t.contains("/run"))
+                || (t.starts_with("TemporaryFileSystem=") && t.contains("/run"))
+        });
     if hides_run {
         println!(
             "[doctor] ⚠ polkit helper sandbox may hide /run/irlume.sock; polkit face prompts\n     \

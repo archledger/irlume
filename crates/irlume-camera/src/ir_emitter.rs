@@ -64,6 +64,16 @@ impl EmitterControl {
     }
 }
 
+/// 8-bit greyscale mean above which an IR capture counts as emitter-lit.
+/// Emitter-only illumination measures ~40-140 on validated hardware (Zenbook,
+/// N930W); an unlit sensor sits below ~35 even in a bright room.
+pub(crate) const IR_LIT_MEAN: f32 = 40.0;
+/// Minimum mean lift over the emitter-off baseline before `autoconfigure`
+/// calls a control a success; filters ambient flicker and exposure drift.
+const AUTOCONF_MIN_LIFT: f32 = 20.0;
+/// Minimum extra lift for a companion BOOST control to beat measurement noise.
+const BOOST_MIN_LIFT: f32 = 6.0;
+
 /// Built-in table, matched on the V4L card name (substring). Verified on-hardware.
 fn known_control(card: &str) -> Option<EmitterControl> {
     if card.contains("ASUS") {
@@ -261,7 +271,7 @@ fn candidate_payloads(size: usize) -> Vec<Vec<u8>> {
 /// camera unchanged.
 pub fn autoconfigure<F: FnMut() -> f32>(fd: c_int, measure: &mut F) -> Option<EmitterControl> {
     let baseline = measure(); // emitter off
-    let success = |b: f32| b >= baseline + 20.0 && b >= 40.0;
+    let success = |b: f32| b >= baseline + AUTOCONF_MIN_LIFT && b >= IR_LIT_MEAN;
     let mut best: Option<(EmitterControl, f32)> = None;
     for unit in 0u8..=31 {
         for selector in 0u8..=15 {
@@ -333,7 +343,7 @@ pub fn discover_boost<F: FnMut() -> f32>(
                 }
                 let b = measure();
                 // Require a clear lift so we don't latch onto measurement noise.
-                if b >= base + 6.0 && best.as_ref().is_none_or(|(_, bb)| b > *bb) {
+                if b >= base + BOOST_MIN_LIFT && best.as_ref().is_none_or(|(_, bb)| b > *bb) {
                     best = Some((
                         EmitterControl {
                             unit,

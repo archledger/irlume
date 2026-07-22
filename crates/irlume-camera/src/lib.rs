@@ -68,11 +68,22 @@ pub const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
 /// subject over a bright background, fixing the backlit-window case.
 pub const V4L2_CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
 
-/// Active-IR emitter table (UVC Extension-Unit `SET_CUR`), ported from linhello.
-/// archhost's **NexiGo HelloCam N930W** lives here: XU unit 4, selector 6,
-/// payload below fires the ~850nm illuminator (like `linux-enable-ir-emitter`).
-/// Override with `IRLUME_IR_EMITTER=unit:selector:b,b,...` or `off`.
-pub const IR_EMITTER_NEXIGO_N930W: (u8, u8, [u8; 9]) = (4, 6, [1, 3, 2, 0, 0, 0, 0, 0, 0]);
+/// Frozen-stream recovery for burst captures: after this many consecutive
+/// identical frames the stream is torn down and re-opened, at most
+/// `FROZEN_RESTART_BUDGET` times per burst (a fully static feed therefore
+/// yields 1 + budget frames instead of hanging).
+const FROZEN_RUN_BEFORE_RESTART: usize = 2;
+const FROZEN_RESTART_BUDGET: usize = 4;
+
+/// Below this 8-bit greyscale mean with no emitter fired, the IR sensor is
+/// dark and the onboarding hint (configure your emitter) is printed; see
+/// `ir_emitter::IR_LIT_MEAN` for the lit threshold on the other side.
+const IR_DARK_HINT_MAX: f64 = 35.0;
+
+/// mmap ring size for every V4L2 capture stream. Four buffers is the classic
+/// quad-buffer: enough that the driver never stalls waiting for a dequeue at
+/// 30fps, small enough to be granted by every UVC camera we have seen.
+const MMAP_BUFFERS: u32 = 4;
 
 /// Colour pixel formats imply an RGB sensor; greyscale-only implies the IR
 /// companion. linhello lesson: classify by advertised FourCC, never hardcode.
@@ -88,6 +99,7 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
     use std::io::ErrorKind;
     match e.raw_os_error() {
         Some(16) => {
+            // 16 == EBUSY
             let who = camera_holder(device)
                 .map(|h| format!(", in use by {h}"))
                 .unwrap_or_else(|| ", another app is using it".into());
@@ -509,7 +521,7 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
         .map_err(|e| map_io(device, e))?;
 
     warm_up_stream(device, &mut stream)?;
@@ -836,8 +848,9 @@ const SUBTRACT_MIN_RESULT: f64 = 12.0;
 
 /// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
 /// emitter must be illuminating for a usable image; on integrated Hello modules
-/// it often fires when the stream opens, otherwise it needs a UVC-XU write (TODO,
-/// see `IR_EMITTER_NEXIGO_N930W`).
+/// it often fires when the stream opens, otherwise `ir_emitter::enable` sends
+/// the UVC-XU write on the open fd (its `known_control` table holds the
+/// per-camera unit/selector/payload).
 pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     Ok(capture_ir_with_stats(device)?.0)
 }
@@ -855,7 +868,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
         .map_err(|e| map_io(device, e))?;
     // Survive the first-capture-after-resume race (uvcvideo still re-initializing).
     warm_up_stream(device, &mut stream)?;
@@ -974,7 +987,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
     // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
     // don't have a table entry for. Guide the user to configure it.
-    if !lit && (0.0..35.0).contains(&best_mean) {
+    if !lit && (0.0..IR_DARK_HINT_MAX).contains(&best_mean) {
         eprintln!(
             "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter; for an \
              external Hello camera run `linux-enable-ir-emitter configure`, then set \
@@ -1104,8 +1117,9 @@ pub mod ir_probe {
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
         let (w, h) = (fmt.width, fmt.height);
-        let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
-            .map_err(|e| map_io(device, e))?;
+        let mut stream =
+            v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, super::MMAP_BUFFERS)
+                .map_err(|e| map_io(device, e))?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         ir_emitter::enable(dev.handle().fd(), &card);
         let mut out = Vec::with_capacity(n);
@@ -1166,7 +1180,7 @@ pub fn capture_ir_sequence(
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = Some(
-        v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+        v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| map_io(device, e))?,
     );
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
@@ -1214,13 +1228,13 @@ pub fn capture_ir_sequence(
         last_sig = Some(sig);
         if frozen {
             dead_run += 1;
-            if dead_run >= 2 && restarts < 4 {
+            if dead_run >= FROZEN_RUN_BEFORE_RESTART && restarts < FROZEN_RESTART_BUDGET {
                 restarts += 1;
                 dead_run = 0;
                 last_sig = None;
                 drop(stream.take()); // stop + release buffers before re-arming
                 stream = Some(
-                    v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+                    v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
                         .map_err(|e| map_io(device, e))?,
                 );
                 ir_emitter::enable(dev.handle().fd(), &card);
@@ -1255,7 +1269,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, 4)
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
         .map_err(|e| map_io(device, e))?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
@@ -1316,12 +1330,12 @@ pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<(u8, u8, usiz
 pub fn ensure_ir_emitter(device: &str) -> irlume_common::Result<bool> {
     let mean_of =
         |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
-    if mean_of(&capture_ir(device)?) >= 40.0 {
+    if mean_of(&capture_ir(device)?) >= ir_emitter::IR_LIT_MEAN as f64 {
         return Ok(true); // already working; do not touch the camera
     }
     // Dark: attempt integrated auto-setup, then re-check.
     setup_ir_emitter(device)?;
-    Ok(mean_of(&capture_ir(device)?) >= 40.0)
+    Ok(mean_of(&capture_ir(device)?) >= ir_emitter::IR_LIT_MEAN as f64)
 }
 
 /// Replicate an 8-bit greyscale buffer into interleaved RGB8 (for feeding the

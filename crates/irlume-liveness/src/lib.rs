@@ -350,11 +350,10 @@ impl LivenessGate {
     /// Windows Hello uses in the dark.
     pub fn evaluate_ir_only(&self, s: &Signals) -> (Verdict, Cues, String) {
         let mut cues = Cues::default();
-        let Some(ir) = s.ir_face.filter(|f| f.score >= MIN_FACE_SCORE) else {
+        if s.ir_face.filter(|f| f.score >= MIN_FACE_SCORE).is_none() {
             return (Verdict::Uncertain, cues, "no face in IR".into());
-        };
+        }
         cues.face_in_ir = true;
-        let _ = ir;
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
             let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {

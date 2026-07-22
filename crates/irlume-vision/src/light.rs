@@ -13,11 +13,16 @@ fn luma(r: u8, g: u8, b: u8) -> f32 {
     0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
 }
 
+/// Ceiling on per-pixel luma gain: brightening a near-black pixel more than
+/// this amplifies sensor noise into visible speckle that hurts the detector
+/// more than the darkness did.
+const MAX_LUMA_GAIN: f32 = 8.0;
+
 /// Rescale each RGB pixel so its luma becomes `new_y[i]`, preserving hue.
 fn apply_luma_map(chip: &mut [u8], new_y: &[f32]) {
     for (i, px) in chip.chunks_mut(3).enumerate() {
         let y = luma(px[0], px[1], px[2]).max(1.0);
-        let gain = (new_y[i] / y).clamp(0.0, 8.0);
+        let gain = (new_y[i] / y).clamp(0.0, MAX_LUMA_GAIN);
         for pc in px.iter_mut() {
             *pc = ((*pc as f32) * gain).round().clamp(0.0, 255.0) as u8;
         }

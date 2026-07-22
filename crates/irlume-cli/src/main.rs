@@ -19,6 +19,7 @@
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 //!   irlume tui                                   interactive setup/management UI
 
+mod blinkcap;
 mod commands;
 mod fingerprint;
 mod logs;
@@ -47,6 +48,7 @@ const DEV_CMDS: &[&str] = &[
     "irbench",
     "genuine",
     "calcapture",
+    "blinkcap",
     "normprobe",
     "liveness",
     "meshprobe",
@@ -87,6 +89,7 @@ fn main() -> std::process::ExitCode {
         (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
         (Some("calcapture"), _) => calcapture(&args),
+        (Some("blinkcap"), _) => blinkcap::run(&args),
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("suncal"), _) => suncal::run(&args),
@@ -672,7 +675,11 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
 /// log records which stack produced the numbers. `--mesh` and `--blaze`
 /// default to `models/…` paths relative to the CURRENT DIRECTORY, i.e. a repo
 /// checkout; pass explicit paths when running from anywhere else.
-fn engine(det: &str, model: &str, args: &[String]) -> irlume_common::Result<irlume_auth::Engine> {
+pub(crate) fn engine(
+    det: &str,
+    model: &str,
+    args: &[String],
+) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
     let e = match (flag(args, "--rgb"), flag(args, "--ir")) {
         (Some(r), Some(i)) => e.with_devices(r, i),

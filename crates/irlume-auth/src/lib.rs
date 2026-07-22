@@ -979,21 +979,35 @@ impl Engine {
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
     /// natural blink → Blinked, static vinyl banner → NoBlink.
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
-        // Raw frame rate (~15 fps, no de-strobe burst): the detector separates
-        // emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
-        // spans only 2–3 raw frames; halving the rate loses it (measured 2026-07-01).
-        const SAMPLES: usize = 75; // ~5s window
-        const BURST: usize = 1;
-        let Some(mesh) = self.mesh.as_mut() else {
-            // No landmark model: can't run the passive gate. Signal NoEyes so the
-            // caller can decide (challenge_if_required skips when mesh is absent).
-            return Ok(irlume_liveness::BlinkResult::NoEyes);
-        };
-        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, SAMPLES, BURST)?;
-        // Per-frame EAR (smaller eye). Frames with no detected face carry ear=None
-        // (a missed detection must not masquerade as a blink) but keep their
-        // brightness so the detector can classify the emitter strobe.
-        let mut samples = Vec::with_capacity(frames.len());
+        // ~5s window at the raw ~15 fps rate.
+        const SAMPLES: usize = 75;
+        // No landmark model → no samples → `detect_blink` reads NoEyes, which is
+        // the historical no-mesh result (the caller decides what to do with it).
+        let samples = self.capture_ear_samples(SAMPLES)?;
+        Ok(irlume_liveness::detect_blink(&samples))
+    }
+
+    /// Capture a temporal IR sequence and compute the per-frame [`EarSample`]s
+    /// that the blink / deliberate-closure detectors consume. Public so the
+    /// blink-tuning capture tool records the EXACT samples the live gate sees.
+    ///
+    /// Raw frame rate (~15 fps, no de-strobe burst): the detector separates
+    /// emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
+    /// spans only 2-3 raw frames; halving the rate loses it (measured
+    /// 2026-07-01). Frames with no detected face carry `ear = None` (a missed
+    /// detection must not masquerade as a blink) but keep their brightness so the
+    /// detector can classify the emitter strobe. Returns an empty vec when the
+    /// FaceMesh model is not loaded (the gate cannot run).
+    pub fn capture_ear_samples(
+        &mut self,
+        samples: usize,
+    ) -> irlume_common::Result<Vec<irlume_liveness::EarSample>> {
+        if self.mesh.is_none() {
+            return Ok(Vec::new());
+        }
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
+        let mesh = self.mesh.as_mut().expect("mesh present (checked above)");
+        let mut out = Vec::with_capacity(frames.len());
         for (i, f) in frames.iter().enumerate() {
             let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
             let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
@@ -1017,7 +1031,7 @@ impl Engine {
                 // landmarks (the second liveness cue: collapses on a real blink).
                 contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
             }
-            samples.push(irlume_liveness::EarSample {
+            out.push(irlume_liveness::EarSample {
                 idx: i,
                 ear,
                 bri,
@@ -1027,7 +1041,7 @@ impl Engine {
                 contrast,
             });
         }
-        Ok(irlume_liveness::detect_blink(&samples))
+        Ok(out)
     }
 
     /// If the passive blink gate is wanted and we're about to grant, require a

@@ -20,3 +20,4 @@ result
 
 # Claude Code session worktrees / local agent state
 .claude/
+/ppa-out/

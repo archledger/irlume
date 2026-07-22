@@ -54,44 +54,51 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
 }
 
+/// Map a "nobody is listening" error to the actionable start-the-daemon
+/// message. A missing socket / dead peer is the #1 first-run failure (fresh
+/// package install, unit disabled by distro preset policy), so name the daemon
+/// and the exact command instead of a raw errno. Covers every errno the
+/// no-listener case produces across kernels: ENOENT (no socket file),
+/// ECONNREFUSED (socket file, no accept), ECONNRESET / EPIPE (stale socket that
+/// connects then resets on first I/O, seen on newer kernels).
+fn map_not_running(e: io::Error) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::NotFound
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe => io::Error::new(
+            e.kind(),
+            "irlumed is not running; start it with: sudo systemctl enable --now irlumed",
+        ),
+        _ => e,
+    }
+}
+
 fn request_with_timeouts(
     req: &Request,
     connect_timeout: Duration,
     rw_timeout: Duration,
 ) -> io::Result<Response> {
-    let stream = connect_with_timeout(&socket_path(), connect_timeout).map_err(|e| {
-        // A missing socket / nobody listening is the #1 first-run failure
-        // (fresh package install, unit disabled by distro preset policy), so
-        // name the daemon and the exact command instead of "os error 2".
-        match e.kind() {
-            // ConnectionReset included: connecting to a stale socket file
-            // (daemon gone, file left behind) yields ECONNREFUSED on most
-            // kernels but ECONNRESET on newer ones (observed on 7.1.4-zen by
-            // the self-hosted runner); both mean "nobody is listening" and
-            // deserve the same actionable guidance, not a raw errno.
-            io::ErrorKind::NotFound
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset => io::Error::new(
-                e.kind(),
-                "irlumed is not running; start it with: sudo systemctl enable --now irlumed",
-            ),
-            _ => e,
-        }
-    })?;
+    let stream = connect_with_timeout(&socket_path(), connect_timeout).map_err(map_not_running)?;
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 
     let mut line =
         serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');
-    (&stream).write_all(&line)?;
-    (&stream).flush()?;
+    // Map send/first-read failures too, not just connect: on newer kernels
+    // (7.1.4-zen, found by the self-hosted runner) a stale socket file CONNECTS
+    // successfully and only resets on the first write/read, so a connect-only
+    // mapping left a raw ECONNRESET. Before any bytes are exchanged, a reset or
+    // broken pipe still means "nobody is really listening".
+    (&stream).write_all(&line).map_err(map_not_running)?;
+    (&stream).flush().map_err(map_not_running)?;
     // The request may carry a password (SealPassword/RecoverySetup); wipe it.
     line.zeroize();
 
     let mut reader = BufReader::new(&stream);
     let mut buf = String::new();
-    reader.read_line(&mut buf)?;
+    reader.read_line(&mut buf).map_err(map_not_running)?;
     if buf.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -200,8 +207,10 @@ mod tests {
             ),
             "got: {err}"
         );
-        // A stale socket file nobody listens on: ECONNREFUSED on most kernels,
-        // ECONNRESET on newer ones (7.1.4-zen observed) — same guidance either way.
+        // A stale socket file nobody listens on: ECONNREFUSED on most kernels;
+        // on newer kernels (7.1.4-zen observed) connect() succeeds and the
+        // first write/read resets (ECONNRESET) or breaks the pipe (EPIPE). All
+        // must yield the same actionable guidance, whichever the kernel picks.
         let stale = sock("stale");
         drop(UnixListener::bind(&stale).unwrap()); // bind then close: file remains
         std::env::set_var("IRLUME_SOCKET", &stale);
@@ -209,7 +218,9 @@ mod tests {
         assert!(
             matches!(
                 err.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
             ),
             "stale socket must read as nobody-listening, got: {:?}",
             err.kind()

@@ -433,16 +433,28 @@ pub const BLINK_V_POST_WIN: usize = 6;
 /// tiny windows (camera stream died / exposure never settled) read NoEyes.
 pub const BLINK_MIN_CLASS_SAMPLES: usize = 8;
 /// Deliberate consent gesture ([`detect_deliberate_closure`]): the eyes must be
-/// held shut for at least this many frames. At the IR node's ~15 fps (~67 ms per
-/// frame) 8 frames is ~530 ms. A spontaneous blink is 100-400 ms (~2-6 frames at
-/// this rate; Bentivoglio et al. 1997, blink-kinematics review PMC11133197), so
-/// a closure past ~500 ms clears the natural range with margin and reads as
-/// intentional. Chosen over a "blink twice" count because two spontaneous blinks
-/// fall inside a short window on the order of 1% of the time for a passive
-/// screen viewer (too high for a consent gate), whereas a held closure is the
-/// cleanest voluntary-vs-spontaneous discriminator in the literature. Finalize
-/// against on-hardware tuning; overridable via `IRLUME_CONSENT_CLOSURE_FRAMES`.
-pub const CONSENT_CLOSURE_MIN_FRAMES: usize = 8;
+/// held shut (EAR below the per-user closed threshold) for at least this many
+/// consecutive FACE frames. Validated on real captures 2026-07-22: a deliberate
+/// hold produced 18-35 sub-threshold face frames, while spontaneous blinks and
+/// an accidental squint produced ≤5, so 10 separates them with a wide margin
+/// (the face node runs ~7-8 fps after the strobe, so ~10 frames is ~1.3 s, above
+/// the 100-400 ms spontaneous-blink range and within the 500-1000 ms deliberate
+/// range the dwell-blink literature uses). Overridable via
+/// `IRLUME_CONSENT_CLOSURE_FRAMES` for other frame rates.
+pub const CONSENT_CLOSURE_MIN_FRAMES: usize = 10;
+/// Frames the eyes may blip back open mid-hold without ending the closure run
+/// (landmark noise tolerance).
+pub const CLOSURE_HYSTERESIS_FRAMES: usize = 2;
+/// Openness fraction (0 = fully shut, 1 = fully open) at/below which the eye
+/// counts as shut for the consent gesture. The blink-taxonomy "complete closure"
+/// level is ~0.20-0.25 (PMC11133197); this sits just above it so a genuine full
+/// hold clears it while a partial squint does not. Validated on real captures
+/// 2026-07-22 (deep threshold ~0.10 for this camera separates a held closure
+/// from a squint that hovered near 0.12).
+pub const CLOSURE_DEEP_FRACTION: f32 = 0.30;
+/// Minimum open-minus-closed EAR gap for a [`ClosureCalibration`] to be trusted;
+/// a smaller gap means the open and closed extremes were not cleanly captured.
+pub const MIN_CALIBRATION_SEPARATION: f32 = 0.05;
 /// The V's pre/post near-open samples must have frame brightness within this
 /// factor of the dip's; EAR shifts with exposure, so a dip during auto-exposure
 /// slewing (measured live 2026-07-01) must not pass as a blink.
@@ -868,32 +880,109 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
     }
 }
 
-/// Detect a DELIBERATE held eye-closure consent gesture: an eyelid closure
-/// sustained for at least [`consent_closure_frames`] frames, longer than any
-/// spontaneous blink. A single natural blink is 100-400 ms (Bentivoglio 1997;
-/// blink-kinematics review PMC11133197), so at the IR node's ~15 fps it spans
-/// ~2-6 frames; holding the eyes shut past that is a volitional act a passively
-/// watching person will not perform, which is what makes it a consent signal
-/// rather than mere liveness. All the same anti-spoof gates as [`detect_blink`]
-/// apply. `Blinked` = the gesture was seen, `NoBlink` = eyes seen but not the
-/// gesture, `NoEyes` = no open eye.
-pub fn detect_deliberate_closure(samples: &[EarSample]) -> BlinkResult {
-    match blink_scan(samples) {
-        BlinkScan::NoEyes => BlinkResult::NoEyes,
-        BlinkScan::Gated => BlinkResult::NoBlink,
-        BlinkScan::Events(events) => {
-            let min = consent_closure_frames();
-            if events.iter().any(|e| e.end - e.onset >= min) {
-                BlinkResult::Blinked
-            } else {
-                BlinkResult::NoBlink
-            }
-        }
+/// Per-user eye-closure calibration: the enrolled open-eye and closed-eye EAR
+/// medians. Set once from an enrollment calibration (a few open frames, then a
+/// held closure), NOT from the gesture window itself.
+///
+/// The consent gesture is measured against an ABSOLUTE, per-user threshold, not
+/// a running-median baseline. That is deliberate: a running median is polluted
+/// by the very closure being detected (once the eyes are shut for most of the
+/// window the median drops to the closed value and the closure vanishes into the
+/// "baseline"), a documented failure mode of relative EAR gating. Capturing the
+/// open/closed extremes offline and comparing at a fixed midpoint (the
+/// Modified-EAR method, PeerJ CS-943 / PMC9044337) avoids it, and validated
+/// cleanly on real captures (a deliberate hold reads a 18-35 frame sub-threshold
+/// run; spontaneous blinks and squints read ≤5).
+#[derive(Debug, Clone, Copy)]
+pub struct ClosureCalibration {
+    /// Median EAR with the eyes open (the smaller eye, as [`EarSample::ear`]).
+    pub ear_open: f32,
+    /// Median EAR with the eyes deliberately shut (near 0 on a clean landmark).
+    pub ear_closed: f32,
+}
+
+impl ClosureCalibration {
+    /// The closed threshold below which the eye counts as shut for the gesture.
+    /// A DEEP fraction of the way from the user's closed extreme toward open, not
+    /// the halfway Modified-EAR point: the blink-taxonomy "complete closure"
+    /// level is an openness fraction of ~0.20-0.25 (PMC11133197), and requiring
+    /// that depth is what rejects a shallow squint that only partly closes. On
+    /// real captures the halfway point let a squint that hovered at ~0.12 count
+    /// as shut; the deep fraction (~0.10 for this camera) breaks that run while
+    /// still catching a genuine full hold (~0.05).
+    pub fn closed_threshold(&self) -> f32 {
+        self.ear_closed + CLOSURE_DEEP_FRACTION * (self.ear_open - self.ear_closed)
+    }
+
+    /// True when open and closed are far enough apart to threshold reliably; a
+    /// too-small gap means bad landmarks / pose and the calibration should be
+    /// re-taken rather than trusted.
+    pub fn is_usable(&self) -> bool {
+        self.ear_open - self.ear_closed >= MIN_CALIBRATION_SEPARATION
     }
 }
 
-/// Minimum sustained-closure length (frames) for the deliberate consent gesture,
-/// overridable via `IRLUME_CONSENT_CLOSURE_FRAMES` for per-camera-fps tuning.
+/// Median open-eye EAR over a window of samples, for the OPEN half of an
+/// enrollment calibration (the user simply looks at the camera). `None` if no
+/// eye was ever detected. Uses the median so a stray blink during the open
+/// capture does not drag it down.
+pub fn calibrate_open_ear(samples: &[EarSample]) -> Option<f32> {
+    let mut ears: Vec<f32> = samples
+        .iter()
+        .filter_map(|s| s.ear)
+        .filter(|e| e.is_finite())
+        .collect();
+    median(&mut ears)
+}
+
+/// Detect a DELIBERATE held eye-closure consent gesture: the eyes stay shut
+/// (EAR below the per-user [`ClosureCalibration::closed_threshold`]) for at
+/// least [`consent_closure_frames`] consecutive face frames, tolerating a few
+/// dropout frames ([`CLOSURE_HYSTERESIS_FRAMES`]) for landmark noise. A single
+/// spontaneous blink is 100-400 ms (Bentivoglio 1997; blink-kinematics review
+/// PMC11133197) so it spans only a handful of frames; a sustained deliberate
+/// hold is a volitional act a passively watching person will not perform, which
+/// is what makes it a consent signal rather than mere liveness. The absolute
+/// threshold (not a running median) is what lets a hold that dominates the
+/// window still register instead of vanishing into a polluted baseline, and a
+/// wandering squint fails because it does not stay continuously below the deep
+/// threshold. `Blinked` = the gesture was seen, `NoBlink` = a face was seen but
+/// not the gesture, `NoEyes` = no face frames at all.
+pub fn detect_deliberate_closure(samples: &[EarSample], cal: &ClosureCalibration) -> BlinkResult {
+    let face_frames: Vec<f32> = samples.iter().filter_map(|s| s.ear).collect();
+    if face_frames.is_empty() {
+        return BlinkResult::NoEyes;
+    }
+    let threshold = cal.closed_threshold();
+    let need = consent_closure_frames();
+    let hysteresis = CLOSURE_HYSTERESIS_FRAMES;
+
+    // Longest run of consecutive face frames below the closed threshold, allowing
+    // up to `hysteresis` frames back above it inside a run before it is broken
+    // (a blip from landmark noise mid-hold must not split the closure).
+    let (mut longest, mut current, mut dropouts) = (0usize, 0usize, 0usize);
+    for ear in &face_frames {
+        if *ear < threshold {
+            current += 1;
+            dropouts = 0;
+            longest = longest.max(current);
+        } else if current > 0 && dropouts < hysteresis {
+            dropouts += 1; // tolerate a brief blip without ending the run
+        } else {
+            current = 0;
+            dropouts = 0;
+        }
+    }
+    if longest >= need {
+        BlinkResult::Blinked
+    } else {
+        BlinkResult::NoBlink
+    }
+}
+
+/// Minimum sustained-closure length (consecutive face frames below the per-user
+/// closed threshold) for the deliberate consent gesture, overridable via
+/// `IRLUME_CONSENT_CLOSURE_FRAMES` for per-camera-fps tuning.
 fn consent_closure_frames() -> usize {
     std::env::var("IRLUME_CONSENT_CLOSURE_FRAMES")
         .ok()
@@ -902,14 +991,6 @@ fn consent_closure_frames() -> usize {
         .unwrap_or(CONSENT_CLOSURE_MIN_FRAMES)
 }
 
-/// Detect a DELIBERATE double-blink consent gesture: two trustworthy blinks
-/// whose onsets fall within [`DOUBLE_BLINK_SPAN_FRAMES`] of each other (and at
-/// least [`DOUBLE_BLINK_MIN_SEP_FRAMES`] apart, so it is two blinks and not one
-/// counted twice). A single natural blink is not enough, because a passively
-/// watching person blinks spontaneously; requiring two blinks close together is
-/// a volitional act they must choose to perform. All the same anti-spoof gates
-/// as [`detect_blink`] apply. `Blinked` = the gesture was seen, `NoBlink` =
-/// eyes seen but not the gesture, `NoEyes` = no open eye.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,50 +1153,98 @@ mod tests {
     }
 
     // --- deliberate held-closure consent gesture (detect_deliberate_closure) ---
-    // These isolate the closure-duration logic under UNIFORM lighting (no
-    // strobe). Strobe interaction, auto-exposure-settle rejection, and the exact
-    // frame threshold need an on-hardware capture campaign like the original
-    // blink detector's, so the default CONSENT_CLOSURE_MIN_FRAMES is provisional.
+    // The detector compares EAR to a per-user ABSOLUTE closed threshold from an
+    // enrollment calibration, so unlike the natural-blink gate it needs no open
+    // baseline in the window (a hold that fills the window still registers). Test
+    // calibration: open 0.24 / closed 0.05 → threshold 0.145.
+
+    fn cal() -> ClosureCalibration {
+        ClosureCalibration {
+            ear_open: 0.24,
+            ear_closed: 0.05,
+        }
+    }
 
     #[test]
     fn deliberate_held_closure_is_the_consent_gesture() {
-        // Eyes held shut ~10 frames (well past a spontaneous blink): a deliberate
-        // closure. The open frames must dominate the window so the median EAR
-        // baseline stays open (as in the real ~5s watch, where a ~0.5s closure is
-        // a small minority); a closure-heavy window would pull the median down.
-        let mut ears = vec![0.24; 14]; // open
-        ears.extend([0.15; 10]); // held closed
-        ears.extend([0.24; 14]); // reopened
-        let seq = flat(&ears);
-        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::Blinked);
-        assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
+        // Eyes held shut for the WHOLE window (0.05 < 0.145 threshold), as the
+        // real held-closure captures did: no open baseline needed. 10 frames
+        // clears CONSENT_CLOSURE_MIN_FRAMES.
+        let seq = flat(&[0.05; 12]);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::Blinked
+        );
     }
 
     #[test]
     fn brief_natural_blink_is_not_the_consent_gesture() {
-        // A spontaneous blink (~2 frames closed) is a blink but NOT consent: a
-        // passively watching person blinks, so this must not approve.
-        let seq = flat(&[0.24, 0.24, 0.24, 0.15, 0.16, 0.24, 0.24, 0.24]);
+        // A spontaneous blink (~2 frames shut) and an open window: a blink but
+        // NOT consent. A passively watching person blinks, so this must not
+        // approve.
+        let seq = flat(&[0.24, 0.24, 0.24, 0.05, 0.06, 0.24, 0.24, 0.24]);
         assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
-        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::NoBlink);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+    }
+
+    #[test]
+    fn wandering_squint_is_not_the_consent_gesture() {
+        // The real false-positive shape: a blink then a squint wandering above
+        // and below the threshold (0.05..0.13), never a sustained deep run. The
+        // absolute-threshold run breaks on the frames above 0.145, so it stays
+        // short and is rejected (the relative-baseline detector wrongly read it
+        // as one long closure).
+        let seq = flat(&[
+            0.24, 0.05, 0.09, 0.13, 0.12, 0.11, 0.13, 0.10, 0.12, 0.24, 0.24,
+        ]);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
     }
 
     #[test]
     fn open_eyes_are_neither_blink_nor_consent() {
         let seq = flat(&[0.24; 12]);
         assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
-        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::NoBlink);
-        // No eyes at all → NoEyes on both.
-        assert_eq!(detect_deliberate_closure(&[]), BlinkResult::NoEyes);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+        // No face frames at all → NoEyes.
+        assert_eq!(detect_deliberate_closure(&[], &cal()), BlinkResult::NoEyes);
+    }
+
+    #[test]
+    fn calibration_midpoint_and_usability() {
+        let c = ClosureCalibration {
+            ear_open: 0.24,
+            ear_closed: 0.05,
+        };
+        // closed + 0.30*(open-closed) = 0.05 + 0.30*0.19 = 0.107.
+        assert!((c.closed_threshold() - 0.107).abs() < 1e-6);
+        assert!(c.is_usable());
+        // Too small a gap = untrustworthy calibration.
+        assert!(!ClosureCalibration {
+            ear_open: 0.10,
+            ear_closed: 0.09
+        }
+        .is_usable());
     }
 
     #[test]
     fn consent_closure_frame_threshold_is_env_overridable() {
-        // A 4-frame closure is below the default 8 but passes with a lowered bar.
-        let seq = flat(&[0.24, 0.24, 0.15, 0.15, 0.15, 0.15, 0.24, 0.24]);
-        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::NoBlink);
+        // A 4-frame closure is below the default but passes with a lowered bar.
+        let seq = flat(&[0.24, 0.24, 0.05, 0.05, 0.05, 0.05, 0.24, 0.24]);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
         std::env::set_var("IRLUME_CONSENT_CLOSURE_FRAMES", "3");
-        let got = detect_deliberate_closure(&seq);
+        let got = detect_deliberate_closure(&seq, &cal());
         std::env::remove_var("IRLUME_CONSENT_CLOSURE_FRAMES");
         assert_eq!(got, BlinkResult::Blinked);
     }

@@ -24,9 +24,29 @@
 //! and `spoof` (a photo/print, must NOT pass).
 
 use crate::{engine, flag};
-use irlume_liveness::{detect_blink, detect_deliberate_closure, BlinkResult, EarSample};
+use irlume_liveness::{
+    detect_blink, detect_deliberate_closure, BlinkResult, ClosureCalibration, EarSample,
+};
 use std::path::Path;
 use std::process::ExitCode;
+
+/// Derive a [`ClosureCalibration`] from a pool of samples: open = the 75th
+/// percentile EAR (eyes-open dominates the open/blink takes), closed = the 10th
+/// percentile (the deep closures and blinks). Used for offline replay when no
+/// enrollment calibration is stored; the real gate uses the per-user enrollment
+/// values. `None` if too few face frames to estimate.
+fn derive_calibration(pool: &[f32]) -> Option<ClosureCalibration> {
+    let mut v: Vec<f32> = pool.iter().copied().filter(|e| e.is_finite()).collect();
+    if v.len() < 8 {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    let pct = |p: f32| v[(((v.len() - 1) as f32) * p).round() as usize];
+    Some(ClosureCalibration {
+        ear_open: pct(0.75),
+        ear_closed: pct(0.10),
+    })
+}
 
 /// One recorded frame: the serializable mirror of [`EarSample`] (the liveness
 /// crate stays serde-free; conversion lives here).
@@ -112,14 +132,16 @@ fn capture(args: &[String]) -> ExitCode {
         );
         let samples = eng.capture_ear_samples(n)?;
         write_jsonl(out, label, &samples)?;
-        // Live verdicts so the operator can confirm the take before saving more.
+        // Immediate feedback: face count + blink verdict. The consent verdict
+        // needs a per-user calibration (open + closed EAR) that a single gesture
+        // take cannot supply, so it comes from `blinkcap replay` on the dataset.
         println!(
-            "[blinkcap] captured {} frames, {} with a face; detect_blink={:?} detect_deliberate_closure={:?}",
+            "[blinkcap] captured {} frames, {} with a face; detect_blink={:?}",
             samples.len(),
             samples.iter().filter(|s| s.ear.is_some()).count(),
             detect_blink(&samples),
-            detect_deliberate_closure(&samples),
         );
+        println!("[blinkcap] saved. Run `blinkcap replay <dir>` for the consent-gate verdict.");
         Ok(())
     };
     match run() {
@@ -208,6 +230,30 @@ fn replay(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Derive one calibration from the WHOLE dataset (the real gate uses per-user
+    // enrollment values; here the pooled open/closed percentiles stand in). The
+    // consent detector needs an absolute threshold, not a per-take median which
+    // a held closure would pollute.
+    let pool: Vec<f32> = recordings
+        .iter()
+        .flat_map(|r| r.samples.iter().filter_map(|s| s.ear))
+        .collect();
+    let Some(cal) = derive_calibration(&pool) else {
+        eprintln!("[blinkcap] too few face frames to derive a calibration");
+        return ExitCode::FAILURE;
+    };
+    println!(
+        "== calibration (pooled): open EAR {:.3}, closed EAR {:.3}, closed threshold {:.3}{} ==",
+        cal.ear_open,
+        cal.ear_closed,
+        cal.closed_threshold(),
+        if cal.is_usable() {
+            ""
+        } else {
+            "  ⚠ open/closed gap too small"
+        }
+    );
+
     // Per-recording verdicts at the current (default/env) threshold.
     println!(
         "== per-recording (closure threshold = {} frames) ==",
@@ -221,8 +267,8 @@ fn replay(args: &[String]) -> ExitCode {
             r.label,
             s.len(),
             detect_blink(s),
-            detect_deliberate_closure(s),
-            max_closure_frames(s),
+            detect_deliberate_closure(s, &cal),
+            max_closure_frames(s, &cal),
         );
     }
 
@@ -248,7 +294,7 @@ fn replay(args: &[String]) -> ExitCode {
             let group: Vec<&Recording> = recordings.iter().filter(|r| &r.label == l).collect();
             let acc = group
                 .iter()
-                .filter(|r| detect_deliberate_closure(&r.samples) == BlinkResult::Blinked)
+                .filter(|r| detect_deliberate_closure(&r.samples, &cal) == BlinkResult::Blinked)
                 .count();
             print!("  {:>14}", format!("{}/{}", acc, group.len()));
         }
@@ -262,16 +308,14 @@ fn replay(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Longest sustained eyelid closure in a recording, in frame indices: the raw
-/// signal the consent threshold is compared against. Mirrors the deep-dip
-/// closure span in `blink_scan` but reported here for dataset inspection.
-fn max_closure_frames(samples: &[EarSample]) -> usize {
-    // Reuse the detector by sweeping: the largest threshold that still accepts
-    // is the max closure length. Bounded by the sample count.
+/// Longest sustained sub-threshold closure run in a recording (frames), the raw
+/// signal the consent gate thresholds. Found by sweeping the run-length bar with
+/// the given calibration until the detector stops accepting.
+fn max_closure_frames(samples: &[EarSample], cal: &ClosureCalibration) -> usize {
     let mut best = 0;
-    for thr in 1..=samples.len() {
+    for thr in 1..=samples.len().max(1) {
         std::env::set_var("IRLUME_CONSENT_CLOSURE_FRAMES", thr.to_string());
-        if detect_deliberate_closure(samples) == BlinkResult::Blinked {
+        if detect_deliberate_closure(samples, cal) == BlinkResult::Blinked {
             best = thr;
         } else {
             break;

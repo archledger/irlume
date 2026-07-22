@@ -432,6 +432,17 @@ pub const BLINK_V_POST_WIN: usize = 6;
 /// A brightness class needs at least this many face samples to be trusted;
 /// tiny windows (camera stream died / exposure never settled) read NoEyes.
 pub const BLINK_MIN_CLASS_SAMPLES: usize = 8;
+/// Deliberate consent gesture ([`detect_deliberate_closure`]): the eyes must be
+/// held shut for at least this many frames. At the IR node's ~15 fps (~67 ms per
+/// frame) 8 frames is ~530 ms. A spontaneous blink is 100-400 ms (~2-6 frames at
+/// this rate; Bentivoglio et al. 1997, blink-kinematics review PMC11133197), so
+/// a closure past ~500 ms clears the natural range with margin and reads as
+/// intentional. Chosen over a "blink twice" count because two spontaneous blinks
+/// fall inside a short window on the order of 1% of the time for a passive
+/// screen viewer (too high for a consent gate), whereas a held closure is the
+/// cleanest voluntary-vs-spontaneous discriminator in the literature. Finalize
+/// against on-hardware tuning; overridable via `IRLUME_CONSENT_CLOSURE_FRAMES`.
+pub const CONSENT_CLOSURE_MIN_FRAMES: usize = 8;
 /// The V's pre/post near-open samples must have frame brightness within this
 /// factor of the dip's; EAR shifts with exposure, so a dip during auto-exposure
 /// slewing (measured live 2026-07-01) must not pass as a blink.
@@ -597,9 +608,39 @@ pub fn contrast_signature(samples: &[EarSample]) -> (f32, f32) {
 /// length and has near-open samples just before and after it. A static print's
 /// jitter is neither deep nor a coherent drop-and-recover; slow drifts (AE
 /// settling, squints) fail the pre/post near-open check or the run-length cap.
-pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
+/// Outcome of the shared blink analysis over a sample window. Both
+/// [`detect_blink`] (any blink → live) and [`detect_double_blink`] (a deliberate
+/// two-blink consent gesture) derive from this, so the anti-spoof gates and dip
+/// detection live in exactly one place.
+enum BlinkScan {
+    /// No plausibly-open eye anywhere in the window (mesh failed / print / dark).
+    NoEyes,
+    /// An anti-spoof gate (motion or corneal-contrast) rejected the window; no
+    /// dip may be trusted as a blink.
+    Gated,
+    /// Trustworthy blink closures in ascending onset order, de-duplicated so one
+    /// blink counts once. Empty means eyes were seen but no blink occurred.
+    Events(Vec<BlinkEvent>),
+}
+
+/// One detected eyelid closure: the frame index where it began and the last
+/// frame it was still closed. `end - onset` is the closure duration in frames,
+/// which distinguishes a brief spontaneous blink from a deliberately held one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlinkEvent {
+    onset: usize,
+    end: usize,
+}
+
+/// Shared blink analysis: strobe classification, per-class open baseline, the
+/// motion and corneal-contrast anti-spoof gates, and blink-onset detection
+/// (deep EAR dip and sharp-V run). Returns every detected blink onset rather
+/// than short-circuiting on the first, so a consumer can count deliberate
+/// repeats. [`detect_blink`]'s observable result is unchanged: non-empty
+/// `Events` ⇔ the old code returned `Blinked`.
+fn blink_scan(samples: &[EarSample]) -> BlinkScan {
     if samples.is_empty() {
-        return BlinkResult::NoEyes;
+        return BlinkScan::NoEyes;
     }
     // Strobe visible? Compare typical adjacent brightness jump to typical level.
     let mut bris: Vec<f32> = samples.iter().map(|s| s.bri).collect();
@@ -660,7 +701,7 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         })
         .collect();
     if ratios.is_empty() {
-        return BlinkResult::NoEyes;
+        return BlinkScan::NoEyes;
     }
     // Motion gate: a moving print/camera fakes EAR dips via landmark jitter. If
     // the face was moving through the window (median speed over threshold), we
@@ -676,7 +717,7 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         .unwrap_or(BLINK_MOTION_MAX_MEDIAN);
     let (_, motion_med, _) = face_speeds(samples);
     if motion_med > motion_max {
-        return BlinkResult::NoBlink;
+        return BlinkScan::Gated;
     }
     // Corneal-contrast gate (second, independent cue): a real blink occludes the
     // eye's specular glint under the lid, so open-eye contrast must exceed the
@@ -711,16 +752,44 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .unwrap_or(BLINK_CONTRAST_DROP_MIN);
             if open_c / dip_c < drop_min {
-                return BlinkResult::NoBlink;
+                return BlinkScan::Gated;
             }
         }
     }
-    if ratios.iter().any(|o| o.ratio <= BLINK_EAR_DIP_RATIO) {
-        return BlinkResult::Blinked;
+    // Collect blink events from both detectors (rather than returning on the
+    // first), each with the eyelid-closure span so a caller can tell a brief
+    // spontaneous blink from a deliberately HELD closure.
+    let mut events: Vec<BlinkEvent> = Vec::new();
+    // Deep-dip detector: a closure begins on the first frame whose EAR falls to/
+    // below the dip ratio and ends when the eye REOPENS (ratio back above the
+    // open ratio). `end` tracks the last still-closed frame, so `end - onset` is
+    // the closure duration in frame indices. Requiring a genuine reopen (not a
+    // bare frame gap) is what separates two blinks from one long closure.
+    let mut cur: Option<BlinkEvent> = None;
+    for o in &ratios {
+        if o.ratio <= BLINK_EAR_DIP_RATIO {
+            match &mut cur {
+                Some(ev) => ev.end = o.idx,
+                None => {
+                    cur = Some(BlinkEvent {
+                        onset: o.idx,
+                        end: o.idx,
+                    })
+                }
+            }
+        } else if o.ratio >= BLINK_V_OPEN_RATIO {
+            if let Some(ev) = cur.take() {
+                events.push(ev);
+            }
+        }
+    }
+    if let Some(ev) = cur.take() {
+        events.push(ev);
     }
     // Sharp-V scan: maximal same-class runs of near-consecutive samples (frame
     // gap ≤ 3) at/below the run ratio. A blink spanning both classes appears as
-    // one run per class, each judged on its own.
+    // one run per class, each judged on its own. These are brief by construction
+    // (`BLINK_V_MAX_RUN`), so they register as short-closure events.
     let mut start = 0;
     while start < ratios.len() {
         if ratios[start].ratio > BLINK_V_RUN_RATIO {
@@ -761,14 +830,86 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
                     && bri_ok(o.bri)
             });
             if pre && post {
-                return BlinkResult::Blinked;
+                events.push(BlinkEvent {
+                    onset: first_idx,
+                    end: last_idx,
+                });
             }
         }
         start = end + 1;
     }
-    BlinkResult::NoBlink
+    // A blink caught by BOTH detectors (or by overlapping runs) must count once:
+    // sort by onset and merge events whose onsets are within 3 frames, keeping
+    // the wider closure span.
+    events.sort_unstable_by_key(|e| e.onset);
+    events.dedup_by(|next, kept| {
+        if next.onset.saturating_sub(kept.onset) <= 3 {
+            kept.end = kept.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+    BlinkScan::Events(events)
 }
 
+/// True when a NATURAL blink was observed (a clear EAR dip below the open
+/// baseline) → live. Any single blink of any duration suffices. `NoBlink` = a
+/// plausibly-open eye but no blink (a static artefact, or the user didn't blink;
+/// the caller re-captures / falls back to password). `NoEyes` = no open eye
+/// anywhere (mesh failed, or a non-eye/print): the median EAR never reached the
+/// open floor.
+pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
+    match blink_scan(samples) {
+        BlinkScan::NoEyes => BlinkResult::NoEyes,
+        BlinkScan::Gated => BlinkResult::NoBlink,
+        BlinkScan::Events(events) if !events.is_empty() => BlinkResult::Blinked,
+        BlinkScan::Events(_) => BlinkResult::NoBlink,
+    }
+}
+
+/// Detect a DELIBERATE held eye-closure consent gesture: an eyelid closure
+/// sustained for at least [`consent_closure_frames`] frames, longer than any
+/// spontaneous blink. A single natural blink is 100-400 ms (Bentivoglio 1997;
+/// blink-kinematics review PMC11133197), so at the IR node's ~15 fps it spans
+/// ~2-6 frames; holding the eyes shut past that is a volitional act a passively
+/// watching person will not perform, which is what makes it a consent signal
+/// rather than mere liveness. All the same anti-spoof gates as [`detect_blink`]
+/// apply. `Blinked` = the gesture was seen, `NoBlink` = eyes seen but not the
+/// gesture, `NoEyes` = no open eye.
+pub fn detect_deliberate_closure(samples: &[EarSample]) -> BlinkResult {
+    match blink_scan(samples) {
+        BlinkScan::NoEyes => BlinkResult::NoEyes,
+        BlinkScan::Gated => BlinkResult::NoBlink,
+        BlinkScan::Events(events) => {
+            let min = consent_closure_frames();
+            if events.iter().any(|e| e.end - e.onset >= min) {
+                BlinkResult::Blinked
+            } else {
+                BlinkResult::NoBlink
+            }
+        }
+    }
+}
+
+/// Minimum sustained-closure length (frames) for the deliberate consent gesture,
+/// overridable via `IRLUME_CONSENT_CLOSURE_FRAMES` for per-camera-fps tuning.
+fn consent_closure_frames() -> usize {
+    std::env::var("IRLUME_CONSENT_CLOSURE_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(CONSENT_CLOSURE_MIN_FRAMES)
+}
+
+/// Detect a DELIBERATE double-blink consent gesture: two trustworthy blinks
+/// whose onsets fall within [`DOUBLE_BLINK_SPAN_FRAMES`] of each other (and at
+/// least [`DOUBLE_BLINK_MIN_SEP_FRAMES`] apart, so it is two blinks and not one
+/// counted twice). A single natural blink is not enough, because a passively
+/// watching person blinks spontaneously; requiring two blinks close together is
+/// a volitional act they must choose to perform. All the same anti-spoof gates
+/// as [`detect_blink`] apply. `Blinked` = the gesture was seen, `NoBlink` =
+/// eyes seen but not the gesture, `NoEyes` = no open eye.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,6 +1069,55 @@ mod tests {
             }
         }
         out
+    }
+
+    // --- deliberate held-closure consent gesture (detect_deliberate_closure) ---
+    // These isolate the closure-duration logic under UNIFORM lighting (no
+    // strobe). Strobe interaction, auto-exposure-settle rejection, and the exact
+    // frame threshold need an on-hardware capture campaign like the original
+    // blink detector's, so the default CONSENT_CLOSURE_MIN_FRAMES is provisional.
+
+    #[test]
+    fn deliberate_held_closure_is_the_consent_gesture() {
+        // Eyes held shut ~10 frames (well past a spontaneous blink): a deliberate
+        // closure. The open frames must dominate the window so the median EAR
+        // baseline stays open (as in the real ~5s watch, where a ~0.5s closure is
+        // a small minority); a closure-heavy window would pull the median down.
+        let mut ears = vec![0.24; 14]; // open
+        ears.extend([0.15; 10]); // held closed
+        ears.extend([0.24; 14]); // reopened
+        let seq = flat(&ears);
+        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::Blinked);
+        assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
+    }
+
+    #[test]
+    fn brief_natural_blink_is_not_the_consent_gesture() {
+        // A spontaneous blink (~2 frames closed) is a blink but NOT consent: a
+        // passively watching person blinks, so this must not approve.
+        let seq = flat(&[0.24, 0.24, 0.24, 0.15, 0.16, 0.24, 0.24, 0.24]);
+        assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
+        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::NoBlink);
+    }
+
+    #[test]
+    fn open_eyes_are_neither_blink_nor_consent() {
+        let seq = flat(&[0.24; 12]);
+        assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
+        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::NoBlink);
+        // No eyes at all → NoEyes on both.
+        assert_eq!(detect_deliberate_closure(&[]), BlinkResult::NoEyes);
+    }
+
+    #[test]
+    fn consent_closure_frame_threshold_is_env_overridable() {
+        // A 4-frame closure is below the default 8 but passes with a lowered bar.
+        let seq = flat(&[0.24, 0.24, 0.15, 0.15, 0.15, 0.15, 0.24, 0.24]);
+        assert_eq!(detect_deliberate_closure(&seq), BlinkResult::NoBlink);
+        std::env::set_var("IRLUME_CONSENT_CLOSURE_FRAMES", "3");
+        let got = detect_deliberate_closure(&seq);
+        std::env::remove_var("IRLUME_CONSENT_CLOSURE_FRAMES");
+        assert_eq!(got, BlinkResult::Blinked);
     }
 
     #[test]

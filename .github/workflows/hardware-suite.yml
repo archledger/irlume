@@ -32,6 +32,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       # No actions/cache here: on a self-hosted runner the repo's .git (with
       # its LFS objects) persists in the runner work directory between runs,
@@ -61,9 +63,16 @@ jobs:
       # non-destructive on this hardware during the seal-ladder campaigns.
       - name: test (TPM-gated, against the REAL TPM)
         run: |
+          set -o pipefail
+          # Assert the named tests actually ran: `cargo test <names>` exits 0
+          # on a zero-match filter, so a renamed test would silently stop being
+          # exercised on the real TPM this runner exists to cover.
+          out="$(mktemp)"
           cargo test -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
-            tpm_key_and_recovery_lifecycle --test-threads=1
+            tpm_key_and_recovery_lifecycle --test-threads=1 2>&1 | tee "$out"
+          ran=$(grep -oE 'test result: ok\. [0-9]+ passed' "$out" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
+          [ "$ran" -ge 4 ] || { echo "::error::expected 4 real-TPM tests, ran $ran (renamed/typo'd filter?)"; exit 1; }
 
       # Real-camera smoke: find the IR node by the same classifier users run,
       # then capture a strobe burst and require real frames. Skips cleanly when
@@ -72,7 +81,17 @@ jobs:
       # and are deleted; they are never uploaded (they picture the room).
       - name: IR camera strobe-burst capture
         run: |
-          ir=$(./target/debug/irlume doctor 2>/dev/null | awk -F: '/: Ir$/{print $1}' | tr -d " " | head -1)
+          # Distinguish "camera genuinely absent" from "doctor itself failed":
+          # a doctor crash or a changed output format must NOT read as a clean
+          # skip (that would let a real regression pass green). Run doctor once,
+          # fail loudly if it errors, and only skip when it succeeded AND
+          # reported no IR node.
+          doc="$(mktemp)"
+          if ! ./target/debug/irlume doctor >"$doc" 2>&1; then
+            echo "::error::irlume doctor failed — not a clean camera-absent skip"
+            cat "$doc"; exit 1
+          fi
+          ir=$(awk -F: '/: Ir$/{print $1}' "$doc" | tr -d " " | head -1)
           if [ -z "$ir" ]; then
             echo "::notice::no IR camera present — camera stage skipped (borrowed for the OS bench?)"
             exit 0
@@ -103,6 +122,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Pull model weights (Git LFS)
         run: |

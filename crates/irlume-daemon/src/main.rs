@@ -150,7 +150,7 @@ fn main() {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!(
-                        "irlumed: WARNING: third-party PAD '{name}' enabled but {} unreadable ({e});                          cue disabled (run `sudo irlume models enable {name}` to re-fetch)",
+                        "irlumed: WARNING: third-party PAD '{name}' enabled but {} unreadable ({e}); cue disabled (run `sudo irlume models enable {name}` to re-fetch)",
                         path.display()
                     );
                     return None;
@@ -420,6 +420,8 @@ fn biopolicy_enforced() -> bool {
 /// Peer identity from SO_PEERCRED.
 struct Peer {
     uid: u32,
+    // gid/pid are unread today; kept for future audit logging, since
+    // SO_PEERCRED delivers all three fields in the same getsockopt call.
     #[allow(dead_code)]
     gid: u32,
     #[allow(dead_code)]
@@ -1488,10 +1490,10 @@ fn do_unseal_password(
 }
 
 /// A PCR-drift unseal failure (Secure Boot / firmware / dbx change moved a bound
-/// PCR). [`irlume_core::tpm`] tags these by naming the changed PCRs in the error,
-/// so the daemon can print the right remedy without re-reading the TPM.
+/// PCR). [`irlume_core::tpm`] tags these where the error is built, so the
+/// daemon can print the right remedy without re-reading the TPM.
 fn is_pcr_drift(e: &irlume_common::Error) -> bool {
-    matches!(e, irlume_common::Error::Policy(m) if m.contains("PCR mismatch"))
+    irlume_core::tpm::is_pcr_mismatch(e)
 }
 
 fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {

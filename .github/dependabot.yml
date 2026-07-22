@@ -8,18 +8,22 @@
 # bumps are collapsed into one grouped PR per ecosystem per week. Major bumps
 # come as their own PR because they can break the build. Dependabot does not
 # touch the two git-sourced crates (the tss-esapi fork); those are bumped by
-# hand when the fork moves.
+# hand when the fork moves. INVARIANT: this relies on Dependabot's cargo
+# ecosystem not updating rev-pinned git deps — keep the fork pinned by exact
+# `rev`. Switching it to a `tag`/`branch` would let Dependabot start proposing
+# bumps (dependabot-core#10913), and name-based `ignore` does not work for git
+# deps (dependabot-core#4388), so the rev pin is the only reliable guard.
 version: 2
 updates:
-  # GitHub Actions used by .github/workflows/ci.yml. These change rarely and
-  # every bump is worth seeing (a moved tag is a supply-chain event).
+  # GitHub Actions across all workflows. Deliberately NOT grouped: the header
+  # says every bump is worth seeing because a moved action is a supply-chain
+  # event, and a grouped PR would review a possibly-compromised action bump
+  # alongside benign ones. Actions are few and change rarely, so per-action
+  # PRs cost little noise for a clear per-bump audit trail.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    groups:
-      actions:
-        patterns: ["*"]
     commit-message:
       prefix: "ci"
 

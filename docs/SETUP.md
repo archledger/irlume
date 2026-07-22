@@ -180,6 +180,20 @@ The password still works for `sudo` too; face is `sufficient`, not required.
 Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
 `sudo true`.
 
+## App prompts via polkit (optional)
+
+Desktop apps ask polkit to verify you; Bitwarden's biometric unlock and
+`pkexec` are polkit prompts. Opt in with:
+
+```sh
+sudo irlume login enable --with-polkit --apply
+```
+
+The daemon treats polkit as verify-only (it never releases the TPM-sealed
+credential to it) and requires a natural blink before approving, because the
+prompt starts scanning without any gesture from you. Full walkthrough,
+Bitwarden setup, and the security stance: [APP-INTEGRATION.md](APP-INTEGRATION.md).
+
 ## Fingerprint companion (optional)
 
 On a laptop with a fingerprint reader, add it as a second factor:

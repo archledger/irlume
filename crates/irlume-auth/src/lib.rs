@@ -51,6 +51,12 @@ pub struct Engine {
     /// RGB-only device → face runs in CONVENIENCE tier (lock-screen unlock only,
     /// RGB-only liveness, never releases credentials / logs in / elevates).
     ir_available: bool,
+    /// Set per-[`authenticate`] call from the PAM service's operation class:
+    /// true while serving a service that forces the passive blink gate even
+    /// without the per-enrollment opt-in (polkit prompts; see
+    /// `biopolicy::requires_consent_gesture`). Unlike the opt-in flag, a
+    /// forced gate FAILS CLOSED when it can't run (no IR / no mesh model).
+    forced_consent: bool,
 }
 
 /// Assurance tier of this engine, derived from the available camera hardware.
@@ -125,8 +131,11 @@ fn is_sudo_like(service: &str) -> bool {
 }
 
 /// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
-/// (testing); otherwise sudo/su get the short window and every login/lock
-/// service (and an unknown/absent service) gets the full login window.
+/// (testing); otherwise sudo/su and polkit get the short window (the user is
+/// already at the machine, and the KDE polkit agent re-runs the stack up to 3
+/// times on failure, so a long window would just hold its dialog busy) and
+/// every login/lock service (and an unknown/absent service) gets the full
+/// login window.
 fn grace_window_ms(service: Option<&str>) -> u64 {
     if let Some(v) = std::env::var("IRLUME_GRACE_MS")
         .ok()
@@ -135,9 +144,20 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
         return v;
     }
     match service {
-        Some(s) if is_sudo_like(s) => SUDO_GRACE_WINDOW_MS,
+        Some(s) if is_sudo_like(s) || s == "polkit-1" || s == "polkit" => SUDO_GRACE_WINDOW_MS,
         _ => GRACE_WINDOW_MS,
     }
+}
+
+/// Escape hatch for the forced polkit blink gate: default ON; disable with
+/// `IRLUME_POLKIT_GESTURE=0` or `polkit_gesture=0` in settings.conf. Verify
+/// stays face-gated either way; this only controls the extra blink.
+fn consent_gesture_enabled() -> bool {
+    let falsy = |v: &str| matches!(v.trim(), "0" | "false" | "no" | "off");
+    if let Ok(v) = std::env::var("IRLUME_POLKIT_GESTURE") {
+        return !falsy(&v);
+    }
+    !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
 }
 
 /// Presence-class failure: the attempt never reached a match verdict because
@@ -281,6 +301,7 @@ impl Engine {
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
             ir_available: irlume_camera::capabilities().ir_pair,
+            forced_consent: false,
         })
     }
 
@@ -922,22 +943,38 @@ impl Engine {
         Ok(irlume_liveness::detect_blink(&samples))
     }
 
-    /// If the user opted into passive liveness and we're about to grant, require a
-    /// natural blink before releasing anything. Failure downgrades to a non-grant
-    /// with an Uncertain-style reason (PAM cascades to the password fallback, never
-    /// a lockout). No-op unless the outcome is a grant, the flag is on, IR is
-    /// available, and the FaceMesh model is loaded (else the gate can't run; we log
-    /// and skip rather than lock the user out of an undeployed model).
+    /// If the passive blink gate is wanted and we're about to grant, require a
+    /// natural blink before releasing anything. Wanted = the user's enrollment
+    /// opted in (`require_challenge`) OR the current service forces it
+    /// (`forced_consent`, polkit prompts). Failure downgrades to a non-grant
+    /// with an Uncertain-style reason (PAM cascades to the password fallback,
+    /// never a lockout). When IR or the FaceMesh model is missing the opt-in
+    /// path logs and skips (never lock a user out of an undeployed model); the
+    /// forced path fails closed instead.
     fn challenge_if_required(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         outcome: Outcome,
     ) -> irlume_common::Result<Outcome> {
-        if !outcome.granted || !enr.require_challenge || !self.ir_available {
+        if !outcome.granted || !(enr.require_challenge || self.forced_consent) {
             return Ok(outcome);
         }
-        if self.mesh.is_none() {
-            eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded; skipping (set IRLUME_MESH_MODEL)");
+        // The gate needs IR frames and the FaceMesh model. When either is
+        // missing, the per-enrollment OPT-IN keeps its historical skip (never
+        // lock a user out of an undeployed model), but a FORCED gate (polkit
+        // consent) fails closed: the blink is the whole point of allowing face
+        // on that service, so without it the grant is withdrawn and PAM
+        // cascades to the password.
+        if !self.ir_available || self.mesh.is_none() {
+            if self.forced_consent {
+                return Ok(Outcome {
+                    granted: false, live: outcome.live, score: outcome.score,
+                    reason: "consent gesture required for this service but the blink gate can't run (IR or face_landmark.onnx missing); use your password".into(),
+                });
+            }
+            if self.ir_available {
+                eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded; skipping (set IRLUME_MESH_MODEL)");
+            }
             return Ok(outcome);
         }
         use irlume_liveness::BlinkResult;
@@ -977,6 +1014,16 @@ impl Engine {
         user: &str,
         service: Option<&str>,
     ) -> irlume_common::Result<Outcome> {
+        // Consent-class services (polkit) force the passive blink gate for this
+        // call; see `challenge_if_required`. Set fresh on every call so a
+        // polkit verify can never leak the flag into a later login/lock verify.
+        self.forced_consent = service
+            .map(|s| {
+                irlume_core::biopolicy::requires_consent_gesture(irlume_core::biopolicy::classify(
+                    s, false,
+                )) && consent_gesture_enabled()
+            })
+            .unwrap_or(false);
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
         let mut attempt = 0u32;
@@ -3203,6 +3250,51 @@ mod engine_tests {
         write_enrollment(&dir, &e);
         let err = s.engine.authenticate("irlume-test-cam", None).unwrap_err();
         assert!(err.to_string().contains("no camera found"), "{err}");
+
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn polkit_service_forces_the_consent_gesture_and_it_fails_closed() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("consent");
+
+        // authenticate() derives the forced flag from the service class, fresh
+        // per call: polkit-1 sets it, sudo (and None) clear it. The not-enrolled
+        // early return keeps the camera out of this test.
+        let _ = s.engine.authenticate("irlume-test-ghost", Some("polkit-1"));
+        assert!(s.engine.forced_consent);
+        let _ = s.engine.authenticate("irlume-test-ghost", Some("sudo"));
+        assert!(!s.engine.forced_consent);
+        // Escape hatch: IRLUME_POLKIT_GESTURE=0 turns the forcing off.
+        std::env::set_var("IRLUME_POLKIT_GESTURE", "0");
+        let _ = s.engine.authenticate("irlume-test-ghost", Some("polkit-1"));
+        assert!(!s.engine.forced_consent);
+        std::env::remove_var("IRLUME_POLKIT_GESTURE");
+
+        // The shared engine runs IR-less (IRLUME_FORCE_NO_IR), where the blink
+        // gate cannot run. A FORCED gate must then withdraw the grant (fail
+        // closed) while the per-enrollment opt-in keeps its historical skip.
+        let enr = Enrollment::new("irlume-test-consent");
+        let granted = || Outcome {
+            granted: true,
+            live: true,
+            score: 0.9,
+            reason: "match".into(),
+        };
+        s.engine.forced_consent = true;
+        let out = s.engine.challenge_if_required(&enr, granted()).unwrap();
+        assert!(!out.granted, "forced gate must fail closed without IR");
+        assert!(out.reason.contains("consent gesture"), "{}", out.reason);
+        s.engine.forced_consent = false;
+        let mut opt_in = Enrollment::new("irlume-test-consent");
+        opt_in.require_challenge = true;
+        let out = s.engine.challenge_if_required(&opt_in, granted()).unwrap();
+        assert!(
+            out.granted,
+            "opt-in path keeps its skip when the gate can't run"
+        );
 
         teardown_sandbox(&dir);
     }

@@ -15,8 +15,8 @@
 //! [`decide`] maps `(class, tier)` to an [`Action`]: release the sealed
 //! credential (`Unseal`), only verify identity without releasing it (`Verify`),
 //! or refuse (`Deny`). The headline rules: a credential is only released to a
-//! `Secure`-tier match, a screen-unlock never releases a credential, and an
-//! unknown / remote service is always denied.
+//! `Secure`-tier match, a screen-unlock or polkit prompt never releases a
+//! credential, and an unknown / remote service is always denied.
 //!
 //! This is pure logic with no I/O; the daemon consults it only when biopolicy
 //! enforcement is enabled (default off; see the daemon), so it never changes
@@ -40,8 +40,16 @@ pub enum OperationClass {
     /// A cold login at a display-manager greeter: releasing the sealed password
     /// lets the keyring/wallet open.
     Login,
-    /// Privilege elevation (sudo/polkit): verify identity; no keyring.
+    /// Privilege elevation (sudo/su): verify identity; no keyring.
     Elevation,
+    /// A polkit prompt approving an action for an application (Bitwarden vault
+    /// unlock, pkexec, systemd unit control). Verify-only, and the sealed
+    /// credential is NEVER released to it: the polkit agent starts the PAM
+    /// conversation the moment its dialog opens, with no user gesture, so this
+    /// class must not be able to pull anything out of the TPM. The engine also
+    /// forces the passive-liveness blink gate for it (see
+    /// [`requires_consent_gesture`]).
+    AppConsent,
     /// Remote access (sshd, etc.); face auth must never satisfy this.
     Remote,
     /// Unrecognised service; fail closed.
@@ -82,7 +90,10 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
             }
         }
         // Elevation.
-        "sudo" | "sudo-i" | "polkit-1" | "su" | "su-l" | "doas" => OperationClass::Elevation,
+        "sudo" | "sudo-i" | "su" | "su-l" | "doas" => OperationClass::Elevation,
+        // polkit's agent helper hardcodes pam_start("polkit-1", ...); "polkit"
+        // is kept for any downstream that renames the service file.
+        "polkit-1" | "polkit" => OperationClass::AppConsent,
         // Remote / network: never satisfiable by face.
         "sshd" | "remote" | "cockpit" => OperationClass::Remote,
         _ => OperationClass::Unknown,
@@ -96,12 +107,29 @@ pub fn decide(class: OperationClass, tier: Tier) -> Action {
         OperationClass::Remote | OperationClass::Unknown => Action::Deny,
         // A live-session unlock only needs identity, never a credential release.
         OperationClass::ScreenUnlock => Action::Verify,
+        // A polkit approval only needs identity, and only from the IR tier: an
+        // RGB-only match must not approve app actions (a printed photo held up
+        // to a webcam would satisfy every polkit prompt in the session).
+        OperationClass::AppConsent => match tier {
+            Tier::Secure => Action::Verify,
+            Tier::Convenience => Action::Deny,
+        },
         // Credential-releasing operations require the Secure (IR) tier.
         OperationClass::Login | OperationClass::Elevation => match tier {
             Tier::Secure => Action::Unseal,
             Tier::Convenience => Action::Deny,
         },
     }
+}
+
+/// True for classes where a face grant must additionally pass the passive
+/// blink gate even when the user's enrollment did not opt in. polkit agents
+/// (KDE, GNOME Shell) start the PAM conversation as soon as their dialog
+/// opens, so without this a face match completes with no user action at all;
+/// requiring a natural blink guarantees a live person is looking at the
+/// dialog that names what is being approved.
+pub fn requires_consent_gesture(class: OperationClass) -> bool {
+    matches!(class, OperationClass::AppConsent)
 }
 
 #[cfg(test)]
@@ -178,5 +206,31 @@ mod tests {
             decide(OperationClass::Elevation, Tier::Secure),
             Action::Unseal
         );
+    }
+
+    #[test]
+    fn polkit_verifies_but_never_unseals() {
+        // The B6 stance: a polkit prompt may be satisfied by a face match
+        // (verify) but must never release the TPM-sealed credential, on any
+        // tier, warm or cold.
+        for warm in [false, true] {
+            assert_eq!(classify("polkit-1", warm), OperationClass::AppConsent);
+        }
+        assert_eq!(
+            decide(OperationClass::AppConsent, Tier::Secure),
+            Action::Verify
+        );
+        assert_eq!(
+            decide(OperationClass::AppConsent, Tier::Convenience),
+            Action::Deny
+        );
+    }
+
+    #[test]
+    fn polkit_requires_the_consent_gesture_and_others_do_not() {
+        assert!(requires_consent_gesture(classify("polkit-1", false)));
+        for svc in ["sudo", "kde", "plasmalogin", "sshd", "nonsense"] {
+            assert!(!requires_consent_gesture(classify(svc, false)), "{svc}");
+        }
     }
 }

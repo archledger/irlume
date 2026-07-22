@@ -5,6 +5,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **polkit app prompts can be face-approved (opt-in): `sudo irlume login
+  enable --with-polkit --apply`.** Desktop apps ask polkit to verify the user
+  (Bitwarden's "unlock with biometrics" is a polkit prompt, as are `pkexec`
+  and GNOME Software); wiring `pam_irlume` into the `polkit-1` stack lets a
+  face match answer them, password fallback unchanged. The polkit class is
+  verify-only at the daemon (an always-on refusal guards the TPM-sealed
+  credential, independent of tier or biopolicy config), requires the passive
+  blink gate even without the per-enrollment opt-in (polkit agents start the
+  PAM conversation with no user gesture; the blink proves a live person is
+  looking at the dialog), fails closed when the blink gate cannot run, and is
+  denied outright on RGB-only hardware. `irlume login status` gains a polkit
+  row, `irlume doctor` flags a Bitwarden polkit action with no wiring, and the
+  SELinux policy (1.1.0) grants the polkit helper domain socket access. See
+  docs/APP-INTEGRATION.md.
+
 ### Fixed
 
 - **The "test (stable)" CI job now actually tests on stable.** Its

@@ -41,7 +41,7 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 |  |  |
 |---|---|
 | 🌑 **Works in the dark** | Active **infrared** recognition (Windows-Hello cameras); no ambient light needed. |
-| 🔒 **Unlocks everything** | Login greeter, lock screen, and `sudo` (opt-in via `login enable --with-sudo`), with the password always as fallback (**no lockout, ever**). |
+| 🔒 **Unlocks everything** | Login greeter, lock screen, `sudo` (opt-in via `login enable --with-sudo`), and app prompts like **Bitwarden's biometric unlock** via polkit (opt-in via `login enable --with-polkit`, [details](docs/APP-INTEGRATION.md)), with the password always as fallback (**no lockout, ever**). |
 | 🙋 **On-demand, by consent** | The camera fires only when you ask: leave the password field **empty and press Enter**. Typing a password never starts a scan. A **grace window** after the gesture (~15 s at login/lock, ~5 s for `sudo`) keeps retrying while you settle into frame, but never retries a failed match. Wiring is tailored per login manager (GDM · SDDM · Plasma Login · LightDM · greetd · COSMIC). |
 | 🗝️ **Opens your keyring** | On IR hardware a face match **TPM-unseals your login password** so the wallet unlocks at login, like Hello. |
 | 👁️ **Real liveness** | Algorithmic IR anti-spoof gate + **opt-in passive blink** detection (no prompt, no action). |

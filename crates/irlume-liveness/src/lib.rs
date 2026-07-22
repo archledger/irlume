@@ -529,6 +529,39 @@ pub struct EarSample {
     pub contrast: f32,
 }
 
+/// One observation of HEAD POSE from an IR capture frame, for the head-nod
+/// consent gesture. Pose comes from the DETECTOR's 5-point landmarks (not the
+/// FaceMesh), so unlike [`EarSample`] it does not depend on eye landmarks and is
+/// robust to head angle and lighting: a nod reads the same reclined or upright.
+/// `pitch_frac`/`yaw_signed` are `None` when no face was detected in the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct PoseSample {
+    pub idx: usize,
+    /// Nose vertical position between eye and mouth lines: ~0.5 frontal, LARGER
+    /// looking down, SMALLER looking up (see `irlume_vision::HeadPose`). A nod
+    /// swings this down-and-back.
+    pub pitch_frac: Option<f32>,
+    /// Signed horizontal turn: ~0 frontal, sign = nose toward image-left/right. A
+    /// shake swings this side-to-side.
+    pub yaw_signed: Option<f32>,
+    /// Frame mean brightness (IR strobe phase), carried for parity with the
+    /// blink pipeline; the pose detector does not currently gate on it.
+    pub bri: f32,
+}
+
+/// Whether a deliberate head gesture (the consent nod) was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadGesture {
+    /// A deliberate NOD (approve).
+    Nod,
+    /// A deliberate SHAKE (reserved for a future "deny"; detected but distinct).
+    Shake,
+    /// A face was tracked but no deliberate gesture (still, drift, or noise).
+    None,
+    /// No face tracked in enough of the window to judge.
+    NoFace,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlinkResult {
     /// A natural blink was observed (a clear EAR dip below the open baseline) → live.

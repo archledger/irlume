@@ -37,6 +37,13 @@ mkdir -p "$DATASET"
 IDX=$(( $(find "$DATASET" -maxdepth 1 -name "$LABEL-*.jsonl" 2>/dev/null | wc -l) + 1 ))
 OUT="$DATASET/$LABEL-$(printf '%02d' "$IDX").jsonl"
 
+# Head-pose labels record pitch/yaw (--pose) for the head-nod gesture; the rest
+# record EAR for the blink/closure gate.
+POSE_FLAG=""
+case "$LABEL" in
+  nod|shake|still|look-around|reclined-nod|reclined-still) POSE_FLAG="--pose" ;;
+esac
+
 echo "== capturing '$LABEL' take $IDX -> $OUT =="
 case "$LABEL" in
   held-closure)  echo "   On GO: look at the camera, then close your eyes and HOLD ~1s, then open." ;;
@@ -45,6 +52,12 @@ case "$LABEL" in
   look-down)     echo "   On GO: look DOWN and around (pose-driven false-closure negative)." ;;
   ae-settle)     echo "   On GO: look at the camera; change the room light mid-capture." ;;
   spoof)         echo "   On GO: hold a photo/print of your face over BOTH lenses; stay out of frame." ;;
+  nod)           echo "   On GO: NOD your head (chin down, back up) 2-3 times, deliberately." ;;
+  shake)         echo "   On GO: SHAKE your head (left-right) 2-3 times." ;;
+  still)         echo "   On GO: hold your head STILL and look at the camera (the negative)." ;;
+  look-around)   echo "   On GO: glance around / small idle head movements (the hard negative)." ;;
+  reclined-nod)  echo "   On GO (LYING DOWN): nod your head 2-3 times." ;;
+  reclined-still)echo "   On GO (LYING DOWN): hold still and look at the camera (negative)." ;;
   *)             echo "   On GO: perform the '$LABEL' gesture." ;;
 esac
 
@@ -84,6 +97,7 @@ sleep 1
   --mesh "$MODELS/face_landmark.onnx" \
   --ir /dev/video2 \
   --n "$N" \
+  $POSE_FLAG \
   --out "$OUT"
 
 # Hand the capture (and dataset dir) back to the invoking user so it is readable

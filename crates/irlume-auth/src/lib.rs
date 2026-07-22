@@ -1044,6 +1044,42 @@ impl Engine {
         Ok(out)
     }
 
+    /// Capture a temporal IR sequence and record per-frame HEAD POSE (pitch and
+    /// yaw from the DETECTOR's 5-point landmarks) for the head-nod consent
+    /// gesture. Needs only the detector, not the FaceMesh, so it works at head
+    /// angles and in IR-only light where the eye-based EAR gesture collapses. A
+    /// frame with no detected face carries `None` pose.
+    pub fn capture_pose_samples(
+        &mut self,
+        samples: usize,
+    ) -> irlume_common::Result<Vec<irlume_liveness::PoseSample>> {
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
+        let mut out = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
+            let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
+            let view = align::RgbView {
+                data: &grey_rgb,
+                width: f.width,
+                height: f.height,
+            };
+            let (mut pitch_frac, mut yaw_signed) = (None, None);
+            let faces = self.det.detect(&view)?;
+            if let Some(t) = top_detection(&faces) {
+                let pose = irlume_vision::head_pose(&t.landmarks);
+                pitch_frac = Some(pose.pitch_frac);
+                yaw_signed = Some(pose.yaw_signed);
+            }
+            out.push(irlume_liveness::PoseSample {
+                idx: i,
+                pitch_frac,
+                yaw_signed,
+                bri,
+            });
+        }
+        Ok(out)
+    }
+
     /// If the passive blink gate is wanted and we're about to grant, require a
     /// natural blink before releasing anything. Wanted = the user's enrollment
     /// opted in (`require_challenge`) OR the current service forces it

@@ -116,19 +116,25 @@ fn capture(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(75);
+    // `--pose` records HEAD POSE (pitch/yaw) for the head-nod gesture instead of
+    // EAR; needs only the detector, not the FaceMesh.
+    let pose_mode = args.iter().any(|a| a == "--pose");
 
     let run = || -> irlume_common::Result<()> {
         let mut eng = engine(det, model, args)?;
-        if !eng.has_mesh() {
+        if !pose_mode && !eng.has_mesh() {
             return Err(irlume_common::Error::Hardware(
                 "FaceMesh not loaded: pass --mesh <face_landmark.onnx> (the EAR gate needs it)"
                     .into(),
             ));
         }
-        println!("[blinkcap] label='{label}' n={n} -> {out}");
-        // Countdown so the take has a defined start: the operator can perform a
-        // timed gesture (look, hold ~1s, open) instead of guessing when capture
-        // began. The camera warm-up inside capture adds ~1s before real frames.
+        println!(
+            "[blinkcap] label='{label}' n={n}{} -> {out}",
+            if pose_mode { " (pose)" } else { "" }
+        );
+        // Countdown so the take has a defined start: the operator performs a
+        // timed gesture instead of guessing when capture began. The camera
+        // warm-up inside capture adds ~1s before real frames.
         use std::io::Write as _;
         print!("[blinkcap] get ready");
         let _ = std::io::stdout().flush();
@@ -138,18 +144,25 @@ fn capture(args: &[String]) -> ExitCode {
             let _ = std::io::stdout().flush();
         }
         println!(" GO  (capturing ~{}s)", n / 15);
-        let samples = eng.capture_ear_samples(n)?;
-        write_jsonl(out, label, &samples)?;
-        // Immediate feedback: face count + blink verdict. The consent verdict
-        // needs a per-user calibration (open + closed EAR) that a single gesture
-        // take cannot supply, so it comes from `blinkcap replay` on the dataset.
-        println!(
-            "[blinkcap] captured {} frames, {} with a face; detect_blink={:?}",
-            samples.len(),
-            samples.iter().filter(|s| s.ear.is_some()).count(),
-            detect_blink(&samples),
-        );
-        println!("[blinkcap] saved. Run `blinkcap replay <dir>` for the consent-gate verdict.");
+        if pose_mode {
+            let samples = eng.capture_pose_samples(n)?;
+            write_pose_jsonl(out, label, &samples)?;
+            println!(
+                "[blinkcap] captured {} frames, {} with a face (pose).",
+                samples.len(),
+                samples.iter().filter(|s| s.pitch_frac.is_some()).count(),
+            );
+        } else {
+            let samples = eng.capture_ear_samples(n)?;
+            write_jsonl(out, label, &samples)?;
+            println!(
+                "[blinkcap] captured {} frames, {} with a face; detect_blink={:?}",
+                samples.len(),
+                samples.iter().filter(|s| s.ear.is_some()).count(),
+                detect_blink(&samples),
+            );
+        }
+        println!("[blinkcap] saved.");
         Ok(())
     };
     match run() {
@@ -159,6 +172,37 @@ fn capture(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Serializable mirror of a head-pose sample (liveness crate stays serde-free).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecordedPose {
+    idx: usize,
+    pitch_frac: Option<f32>,
+    yaw_signed: Option<f32>,
+    bri: f32,
+}
+
+fn write_pose_jsonl(
+    out: &str,
+    label: &str,
+    samples: &[irlume_liveness::PoseSample],
+) -> irlume_common::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(out).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    let header = serde_json::json!({ "posecap": true, "label": label, "frames": samples.len() });
+    writeln!(f, "{header}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    for s in samples {
+        let rec = RecordedPose {
+            idx: s.idx,
+            pitch_frac: s.pitch_frac,
+            yaw_signed: s.yaw_signed,
+            bri: s.bri,
+        };
+        writeln!(f, "{}", serde_json::to_string(&rec).unwrap())
+            .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn write_jsonl(out: &str, label: &str, samples: &[EarSample]) -> irlume_common::Result<()> {

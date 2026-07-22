@@ -168,6 +168,18 @@ pub enum Request {
     /// Toggle the per-user "require blink challenge to unlock" gate (temporal
     /// liveness vs static prints, ADR-0002). PRIVILEGED.
     SetRequireChallenge { user: String, on: bool },
+    /// Capture a short IR sequence and return the MEDIAN eye-aspect-ratio over
+    /// it: one phase of the deliberate-closure consent calibration. The caller
+    /// prompts the user (eyes open, then eyes closed) and sends this once per
+    /// phase. Fires the camera; PRIVILEGED.
+    CaptureEarMedian { user: String },
+    /// Store the per-user eye-closure calibration `(ear_open, ear_closed)` from
+    /// the two `CaptureEarMedian` phases into the enrollment. PRIVILEGED.
+    SetClosureCalibration {
+        user: String,
+        ear_open: f32,
+        ear_closed: f32,
+    },
     /// Auto-configure the IR emitter (integrated linux-enable-ir-emitter): find
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
@@ -330,6 +342,10 @@ pub enum Response {
         profiles: Vec<ProfileSummary>,
         require_eyes_open: bool,
         require_challenge: bool,
+        /// Whether a usable eye-closure consent calibration is stored (for the
+        /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
+        #[serde(default)]
+        closure_calibrated: bool,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
@@ -369,6 +385,9 @@ pub enum Response {
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
+    /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
+    /// eye was detected in any frame.
+    EarMedian(Option<f32>),
     Error(String),
 
     // --- keyring unlock responses -------------------------------------------

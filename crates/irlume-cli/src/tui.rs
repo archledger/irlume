@@ -580,6 +580,7 @@ impl App {
                     profiles,
                     require_eyes_open,
                     require_challenge,
+                    ..
                 }) => {
                     self.profiles = profiles;
                     self.eyes_open = require_eyes_open;
@@ -4088,6 +4089,7 @@ mod tests {
             profiles: Vec::new(),
             require_eyes_open: true,
             require_challenge: false,
+            closure_calibrated: false,
         });
         assert!(ok);
         let (ok, _) = map_settings(Response::Error("boom".into()));

@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Deliberate eye-closure consent gesture for polkit prompts, with per-user
+  calibration.** A polkit face approval (Bitwarden unlock, `pkexec`) now
+  requires closing your eyes for about a second and reopening them, a
+  volitional act that a passively watching face, a natural blink, or a held
+  squint cannot produce (validated on a hardware capture campaign: zero false
+  accepts across squint / natural-blink / look-down / spoof captures). The
+  gesture is measured against a per-user absolute EAR threshold from a one-time
+  `sudo irlume calibrate-closure` (two prompts: eyes open, eyes closed), stored
+  in the enrollment; the daemon fails the polkit face path closed to the
+  password when no usable calibration exists. `pam_irlume` shows "close your
+  eyes for about a second, then open, to approve" on the polkit dialog, and
+  `irlume doctor` flags a wired-but-uncalibrated setup. New camera streaming
+  core (`capture_ir_streaming`) and a dev tool (`irlume blinkcap`, `IRLUME_DEV`)
+  underpin the tuning. See docs/APP-INTEGRATION.md.
+
 - **polkit app prompts can be face-approved (opt-in): `sudo irlume login
   enable --with-polkit --apply`.** Desktop apps ask polkit to verify the user
   (Bitwarden's "unlock with biometrics" is a polkit prompt, as are `pkexec`

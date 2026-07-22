@@ -1058,23 +1058,22 @@ impl Engine {
         forced_consent: bool,
         outcome: Outcome,
     ) -> irlume_common::Result<Outcome> {
-        if !outcome.granted || !(enr.require_challenge || forced_consent) {
+        if !outcome.granted {
             return Ok(outcome);
         }
-        // The gate needs IR frames and the FaceMesh model. When either is
-        // missing, the per-enrollment OPT-IN keeps its historical skip (never
-        // lock a user out of an undeployed model), but a FORCED gate (polkit
-        // consent) fails closed: the blink is the whole point of allowing face
-        // on that service, so without it the grant is withdrawn and PAM
-        // cascades to the password.
+        // A forced consent (polkit) requires the DELIBERATE eye-closure gesture,
+        // not a passive natural blink: a blink is liveness, the closure is
+        // intent. It fails closed.
+        if forced_consent {
+            return self.consent_gesture_gate(enr, outcome);
+        }
+        // Opt-in per-enrollment gate (ADR-0002): a natural blink, unchanged. When
+        // IR or the FaceMesh model is missing it logs and skips rather than lock
+        // a user out of an undeployed model.
+        if !enr.require_challenge {
+            return Ok(outcome);
+        }
         if !self.ir_available || self.mesh.is_none() {
-            if forced_consent {
-                return Ok(Outcome {
-                    granted: false, live: outcome.live, score: outcome.score,
-                    reason: "consent gesture required for this service but the blink gate can't run (IR or face_landmark.onnx missing); use your password".into(),
-                    kind: OutcomeKind::OtherDeny,
-                });
-            }
             if self.ir_available {
                 eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded; skipping (set IRLUME_MESH_MODEL)");
             }
@@ -1094,6 +1093,57 @@ impl Engine {
                 kind: OutcomeKind::OtherDeny,
             },
         })
+    }
+
+    /// The forced consent gate: require the deliberate eye-closure gesture
+    /// ("close your eyes ~1s, then open") using the user's enrolled calibration.
+    /// FAILS CLOSED (grant withdrawn, PAM cascades to the password) whenever the
+    /// gesture cannot be run or verified: no IR / no FaceMesh model, no stored
+    /// calibration, an untrustworthy calibration, or no gesture in the window.
+    fn consent_gesture_gate(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        outcome: Outcome,
+    ) -> irlume_common::Result<Outcome> {
+        // ~5s window: room for the user to read the prompt and perform the
+        // close-and-open. (A future rolling watch can return the instant the
+        // gesture completes; this fixed window is the simple, correct form.)
+        const CONSENT_WINDOW: usize = 75;
+        let (live, score) = (outcome.live, outcome.score);
+        let deny = |reason: &str| Outcome {
+            granted: false,
+            live,
+            score,
+            reason: reason.into(),
+            kind: OutcomeKind::OtherDeny,
+        };
+        if !self.ir_available || self.mesh.is_none() {
+            return Ok(deny(
+                "consent gesture required but IR / face_landmark.onnx is missing; use your password",
+            ));
+        }
+        let Some((ear_open, ear_closed)) = enr.closure_calibration else {
+            return Ok(deny(
+                "no consent calibration for this account; run `sudo irlume calibrate-closure`, or use your password",
+            ));
+        };
+        let cal = irlume_liveness::ClosureCalibration {
+            ear_open,
+            ear_closed,
+        };
+        if !cal.is_usable() {
+            return Ok(deny(
+                "consent calibration is unreliable (open/closed EAR too close); re-run `irlume calibrate-closure`",
+            ));
+        }
+        let samples = self.capture_ear_samples(CONSENT_WINDOW)?;
+        use irlume_liveness::BlinkResult;
+        Ok(
+            match irlume_liveness::detect_deliberate_closure(&samples, &cal) {
+                BlinkResult::Blinked => outcome,
+                _ => deny("close your eyes for about a second, then open, to approve"),
+            },
+        )
     }
 
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
@@ -2664,6 +2714,7 @@ mod tests {
             require_eyes_open: false,
             require_challenge: false,
             camera_binding: None,
+            closure_calibration: None,
             profiles: vec![
                 FaceProfile {
                     ir_calib: None,
@@ -3664,6 +3715,7 @@ mod engine_tests {
                 require_eyes_open: false,
                 require_challenge: false,
                 camera_binding: None,
+                closure_calibration: None,
                 profiles: vec![FaceProfile {
                     ir_calib: None,
                     name: "Face Profile 1".into(),

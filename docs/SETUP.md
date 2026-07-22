@@ -190,8 +190,9 @@ sudo irlume login enable --with-polkit --apply
 ```
 
 The daemon treats polkit as verify-only (it never releases the TPM-sealed
-credential to it) and requires a natural blink before approving, because the
-prompt starts scanning without any gesture from you. Full walkthrough,
+credential to it) and requires a deliberate eye-closure gesture (close your
+eyes ~1s, then open) before approving, because the prompt starts scanning
+without any action from you. Calibrate it once with `sudo irlume calibrate-closure`. Full walkthrough,
 Bitwarden setup, and the security stance: [APP-INTEGRATION.md](APP-INTEGRATION.md).
 
 ## Fingerprint companion (optional)

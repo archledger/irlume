@@ -105,6 +105,7 @@ fn main() -> std::process::ExitCode {
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),
+        (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
@@ -312,6 +313,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             profiles,
             require_eyes_open,
             require_challenge,
+            ..
         }) => {
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
@@ -394,6 +396,99 @@ fn report_ok_response(
         }
         Err(e) => {
             eprintln!("[{tag}] {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `irlume calibrate-closure`: teach irlume the user's open and closed eye
+/// shape (EAR) for the deliberate-closure consent gesture used by polkit prompts
+/// ("close your eyes for a second to approve"). Captures two phases (eyes open,
+/// eyes closed), validates they are far enough apart, and stores the pair in the
+/// enrollment. Needs root (fires the camera through the daemon's privileged
+/// path); the daemon must be running.
+fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
+    use irlume_common::{Request, Response};
+    let user = user_arg(args);
+    if !is_root() {
+        eprintln!("[calibrate] needs root (fires the camera): sudo irlume calibrate-closure");
+        return std::process::ExitCode::FAILURE;
+    }
+    println!("[calibrate] eye-closure consent calibration for '{user}'.");
+    println!(
+        "[calibrate] this teaches irlume your open/closed eye shape for the polkit\n            \
+         'close your eyes to approve' gesture. Two quick phases.\n"
+    );
+
+    // Capture one phase, returning the median EAR or a printed error.
+    let capture_phase = |label: &str| -> Result<f32, String> {
+        print!("[calibrate] {label} — hold still, capturing in 3");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        for n in [2, 1] {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            print!(" {n}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        println!(" GO");
+        match daemon_request(&Request::CaptureEarMedian { user: user.clone() }) {
+            Ok(Response::EarMedian(Some(v))) => Ok(v),
+            Ok(Response::EarMedian(None)) => {
+                Err("no eye detected in the capture; face the camera and retry".into())
+            }
+            Ok(Response::Error(e)) => Err(e),
+            Ok(other) => Err(format!("unexpected response: {other:?}")),
+            Err(e) => Err(e),
+        }
+    };
+
+    let ear_open = match capture_phase("Phase 1/2: look at the camera with your eyes OPEN") {
+        Ok(v) => {
+            println!("  open EAR {v:.3}");
+            v
+        }
+        Err(e) => {
+            eprintln!("[calibrate] {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let ear_closed = match capture_phase("Phase 2/2: CLOSE your eyes and HOLD them shut") {
+        Ok(v) => {
+            println!("  closed EAR {v:.3}");
+            v
+        }
+        Err(e) => {
+            eprintln!("[calibrate] {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    if ear_open - ear_closed < irlume_liveness::MIN_CALIBRATION_SEPARATION {
+        eprintln!(
+            "[calibrate] open ({ear_open:.3}) and closed ({ear_closed:.3}) EAR are too close to \
+             tell apart. Make sure you fully open then fully close your eyes, and retry."
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    match daemon_request(&Request::SetClosureCalibration {
+        user: user.clone(),
+        ear_open,
+        ear_closed,
+    }) {
+        Ok(Response::Ok(msg)) => {
+            println!("[calibrate] ✓ {msg}");
+            println!("[calibrate] the polkit consent gesture is now calibrated for '{user}'.");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("[calibrate] {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("[calibrate] unexpected response: {other:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[calibrate] {e}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -2385,10 +2480,23 @@ fn doctor() -> std::process::ExitCode {
     // biometric unlock to work (its flatpak/snap can't install it themselves).
     let bitwarden_action =
         std::path::Path::new("/usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy").exists();
+    // The consent gesture needs a per-user closure calibration; wired-but-
+    // uncalibrated silently falls to the password on every polkit prompt.
+    let closure_calibrated = matches!(
+        daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
+        Ok(irlume_common::Response::Enrollment {
+            closure_calibrated: true,
+            ..
+        })
+    );
     match crate::pamwire::polkit_wired() {
+        Some(true) if closure_calibrated => println!(
+            "[doctor] polkit app prompts: wired ✓ and calibrated ✓ (close your eyes ~1s to \
+             approve Bitwarden unlock, pkexec, …)"
+        ),
         Some(true) => println!(
-            "[doctor] polkit app prompts: wired ✓ (face + blink can approve Bitwarden unlock, \
-             pkexec, …)"
+            "[doctor] polkit app prompts: wired ✓ but NOT calibrated — the consent gesture can't\n     \
+             run, so prompts fall back to the password. Calibrate: sudo irlume calibrate-closure"
         ),
         Some(false) if bitwarden_action => println!(
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \

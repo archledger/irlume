@@ -212,6 +212,22 @@ impl PamServiceModule for IrlumePam {
                 }
             }
 
+            // On a polkit prompt the daemon requires the deliberate eye-closure
+            // consent gesture, which is not discoverable from the dialog, so tell
+            // the user what to do. Best-effort text info (the KDE/GNOME agent
+            // shows it inline); shown once, before the capture, only for the
+            // polkit service so sudo / lock screen are unaffected.
+            let is_polkit = matches!(
+                pamh.get_service().ok().flatten().and_then(|c| c.to_str().ok().map(str::to_string)),
+                Some(ref s) if s == "polkit-1" || s == "polkit"
+            );
+            if is_polkit && !unseal {
+                let _ = pamh.conv(
+                    Some("irlume: close your eyes for about a second, then open, to approve"),
+                    pamsm::PamMsgStyle::TEXT_INFO,
+                );
+            }
+
             // In `wait` mode, retry until a match or the budget runs out; otherwise
             // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
             // stack always cascades to the password (NIST: a fallback must exist).

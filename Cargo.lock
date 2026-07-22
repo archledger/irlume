@@ -960,6 +960,7 @@ dependencies = [
  "irlume-auth",
  "irlume-common",
  "irlume-core",
+ "irlume-liveness",
  "libc",
  "serde_json",
  "sha2 0.11.0",

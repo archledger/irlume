@@ -81,6 +81,33 @@ impl std::fmt::Debug for SecretBytes {
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";
 
+/// Create or truncate `path` with mode 0600 and write `bytes`, then fsync.
+///
+/// Mode-on-open (not write-then-chmod) so a secret-bearing file is never
+/// briefly readable under a lax umask. If the file pre-existed at a wider
+/// mode, open keeps its permissions, so the mode is re-asserted after the
+/// write. `sync_all` makes the bytes durable before any caller renames the
+/// file over a live one. Non-unix builds fall back to a plain write.
+pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)
+}
+
 /// Request from an (untrusted) client to the (privileged) daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {

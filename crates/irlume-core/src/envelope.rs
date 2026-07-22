@@ -6,6 +6,7 @@
 //! ```json
 //! {
 //!   "version": 1,
+//!   "policy": { "kind": "PcrLiteral" },
 //!   "pcrs": [7],
 //!   "public":  "<base64 TPM2B_PUBLIC>",
 //!   "private": "<base64 TPM2B_PRIVATE>",
@@ -57,7 +58,7 @@ impl PolicyKind {
     /// (Tier 1) > pcrlock NV (Tier 2) > literal PolicyPCR (Tier 3). Used to
     /// decide whether a re-seal would upgrade an existing envelope. The enum
     /// declaration order does not match tier order, so rank explicitly.
-    pub fn tier_rank(&self) -> u8 {
+    pub fn strength_rank(&self) -> u8 {
         match self {
             PolicyKind::Authorized { .. } => 3,
             PolicyKind::PcrlockNv { .. } => 2,
@@ -114,33 +115,7 @@ impl SealedEnvelope {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| Error::Protocol(e.to_string()))?;
-        // Create at 0600 atomically (mode on open) rather than write-then-chmod,
-        // so the sealed envelope is never briefly readable under a lax umask.
-        // The payload is TPM-sealed / passphrase-wrapped, so the window was
-        // low-value, but there is no reason to leave it open.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|e| Error::Io(e.to_string()))?;
-            f.write_all(s.as_bytes())
-                .map_err(|e| Error::Io(e.to_string()))?;
-            // Re-assert the mode in case the file pre-existed at a wider mode
-            // (open with an existing file keeps its permissions).
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
-        #[cfg(not(unix))]
-        {
-            fs::write(path, s).map_err(|e| Error::Io(e.to_string()))?;
-        }
-        Ok(())
+        irlume_common::write_0600(path, s.as_bytes()).map_err(|e| Error::Io(e.to_string()))
     }
 }
 
@@ -164,18 +139,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tier_rank_orders_signed_above_pcrlock_above_literal() {
+    fn strength_rank_orders_signed_above_pcrlock_above_literal() {
         let signed = PolicyKind::Authorized {
             pubkey_pem: String::new(),
             policy_ref: Vec::new(),
         };
         let pcrlock = PolicyKind::PcrlockNv { nv_index: 1 };
         let literal = PolicyKind::PcrLiteral;
-        assert!(signed.tier_rank() > pcrlock.tier_rank());
-        assert!(pcrlock.tier_rank() > literal.tier_rank());
+        assert!(signed.strength_rank() > pcrlock.strength_rank());
+        assert!(pcrlock.strength_rank() > literal.strength_rank());
         // A re-seal must never "upgrade" from a stronger tier to a weaker one.
-        assert_eq!(signed.tier_rank(), 3);
-        assert_eq!(literal.tier_rank(), 1);
+        assert_eq!(signed.strength_rank(), 3);
+        assert_eq!(literal.strength_rank(), 1);
     }
 
     #[test]

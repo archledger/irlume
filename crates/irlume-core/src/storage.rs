@@ -221,12 +221,6 @@ impl Enrollment {
         n
     }
 
-    /// Per-user IR-liveness floor `(depth_ratio, brightness)` derived from the
-    /// enrolled scans' own IR calibration: the live frame must clear it, so the
-    /// anti-screen / anti-photo threshold adapts to this user's camera/rig
-    /// instead of a one-size global constant. Returns `None` until there are at
-    /// least two IR-bearing scans (enough to be representative). The floor is the
-    /// weakest enrolled value with a 25% margin below it (live IR varies).
     /// Per-user IR **depth** floor (center/edge ratio, a 3D-structure cue) for the
     /// anti-screen/photo gate: 75% of the weakest enrolled IR depth. Needs ≥2 IR
     /// scans. DEPTH ONLY; the former per-user IR *brightness* floor was removed:
@@ -236,7 +230,7 @@ impl Enrollment {
     /// a "screen/photo". The global liveness gate (`evaluate`) already enforces an
     /// ambient-tolerant IR brightness floor (`IR_FACE_MIN_BRIGHTNESS`) and depth floor
     /// (`DEPTH_MIN_RATIO`); this adds a personalized depth tightening on top.
-    pub fn ir_calibration(&self) -> Option<f32> {
+    pub fn ir_depth_floor(&self) -> Option<f32> {
         let mut depths = Vec::new();
         for p in &self.profiles {
             for s in &p.scans {
@@ -363,6 +357,11 @@ struct EncEnvelope {
     enc: String,
 }
 
+/// Version written into new [`EncEnvelope`]s. Informational only: the load
+/// path detects the encrypted format by the `enc` field and never checks this
+/// number.
+const ENC_ENVELOPE_VERSION: u32 = 2;
+
 /// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
 /// host) or emitting pretty plaintext when not (dev / no-TPM). Pure; tested
 /// without a TPM.
@@ -377,7 +376,7 @@ fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Re
             );
             let blob = crypto::encrypt(k, &json)?;
             let env = EncEnvelope {
-                version: 2,
+                version: ENC_ENVELOPE_VERSION,
                 enc: STANDARD.encode(blob),
             };
             serde_json::to_vec_pretty(&env)
@@ -437,29 +436,10 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
     // rename over the target: a crash mid-write can't leave a truncated
     // profile, and there is no umask window on the real path.
     let tmp = path.with_extension("json.tmp");
-    write_0600(&tmp, &bytes).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
+    irlume_common::write_0600(&tmp, &bytes)
+        .map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     fs::rename(&tmp, &path).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     Ok(())
-}
-
-/// Create/truncate `path` with mode 0600 and write `bytes` (unix).
-#[cfg(unix)]
-fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
-}
-
-#[cfg(not(unix))]
-fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    fs::write(path, bytes)
 }
 
 /// Load an enrollment, transparently decrypting (v2) and migrating the legacy
@@ -647,12 +627,12 @@ mod tests {
             name: "p".into(),
             scans: vec![scan_with_ir(1.5, 100.0)],
         });
-        assert!(e.ir_calibration().is_none());
+        assert!(e.ir_depth_floor().is_none());
 
         // Two+ scans -> depth floor at 75% of the weakest enrolled depth.
         // (brightness is intentionally NOT floored per-user; it is ambient-dependent.)
         e.profiles[0].scans.push(scan_with_ir(1.2, 80.0));
-        let depth_floor = e.ir_calibration().unwrap();
+        let depth_floor = e.ir_depth_floor().unwrap();
         assert!((depth_floor - 1.2 * 0.75).abs() < 1e-5);
     }
 
@@ -749,7 +729,7 @@ mod tests {
                 scan_with_ir(1.5, 100.0),
             ],
         });
-        assert!(e.ir_calibration().is_none()); // only one IR-bearing scan
+        assert!(e.ir_depth_floor().is_none()); // only one IR-bearing scan
     }
 
     #[test]
@@ -777,7 +757,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.bin");
-        write_0600(&p, b"secret bytes").unwrap();
+        irlume_common::write_0600(&p, b"secret bytes").unwrap();
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "profile files must never be world-readable");
         assert_eq!(fs::read(&p).unwrap(), b"secret bytes");

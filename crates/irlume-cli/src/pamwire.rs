@@ -312,7 +312,7 @@ fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
         "ly" => ("ly", None),
         // COSMIC (System76 / Pop!_OS): cosmic-greeter drives BOTH the cold login
         // and the live lock screen through the SAME `cosmic-greeter` PAM service;
-        // the warm/cold flag in biopolicy::classify distinguishes them. No
+        // the SessionState in biopolicy::classify distinguishes them. No
         // separate fingerprint service.
         "cosmic-greeter" => ("cosmic-greeter", None),
         _ => ("(unknown)", None),

@@ -3,7 +3,8 @@
 
 //! Opt-in diagnostic tracing, shared by the daemon and CLI.
 //!
-//! `IRLUME_LOG=debug` turns on per-stage pipeline traces (capture timings,
+//! `IRLUME_LOG=debug` (also accepted: `trace`, `1`) turns on per-stage
+//! pipeline traces (capture timings,
 //! detection results, every liveness cue with its threshold verdict, match
 //! scores vs thresholds) so a failed (or suspiciously slow) auth can be
 //! diagnosed from the journal alone. Traces carry NUMBERS ONLY: never frames,

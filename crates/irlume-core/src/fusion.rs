@@ -60,8 +60,17 @@ pub fn ir_genuine_prob(cos: f32) -> f32 {
     sigmoid(IR_PLATT_A * cos + IR_PLATT_B)
 }
 
-/// A linear quality ramp on `[lo, hi]` mapped to `[floor, 1.0]`. `floor` keeps a
-/// modality contributing a little even at poor quality (never a hard 0 unless absent).
+/// Quality-ramp knees, mean face luma on the 0-255 scale; knee values from the
+/// real-ASUS calibration capture campaign.
+const RGB_QUALITY_LO: f32 = 60.0;
+const RGB_QUALITY_HI: f32 = 130.0;
+const IR_QUALITY_LO: f32 = 35.0;
+const IR_QUALITY_HI: f32 = 110.0;
+/// Weight at or below the low knee; keeps a captured modality contributing a
+/// little even at poor quality (never a hard 0 unless absent).
+const QUALITY_FLOOR: f32 = 0.2;
+
+/// A linear quality ramp on `[lo, hi]` mapped to `[QUALITY_FLOOR, 1.0]`.
 fn ramp(x: f32, lo: f32, hi: f32, floor: f32) -> f32 {
     let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
     floor + (1.0 - floor) * t
@@ -69,14 +78,19 @@ fn ramp(x: f32, lo: f32, hi: f32, floor: f32) -> f32 {
 
 /// RGB capture-quality weight from mean face brightness. Bright → 1.0, dim → 0.2.
 pub fn rgb_quality_weight(face_brightness: f32) -> f32 {
-    ramp(face_brightness, 60.0, 130.0, 0.2)
+    ramp(
+        face_brightness,
+        RGB_QUALITY_LO,
+        RGB_QUALITY_HI,
+        QUALITY_FLOOR,
+    )
 }
 /// IR capture-quality weight from IR face brightness. 0.0 if no IR face was captured.
 pub fn ir_quality_weight(ir_present: bool, ir_brightness: f32) -> f32 {
     if !ir_present {
         return 0.0;
     }
-    ramp(ir_brightness, 35.0, 110.0, 0.2)
+    ramp(ir_brightness, IR_QUALITY_LO, IR_QUALITY_HI, QUALITY_FLOOR)
 }
 
 /// Outcome of a fusion attempt.

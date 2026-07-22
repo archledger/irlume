@@ -1131,7 +1131,7 @@ fn policy_aware_err<E: std::fmt::Display>(e: E, env: &SealedEnvelope) -> Error {
     }
 }
 
-/// True when `e` is the PCR-drift unseal failure [`policy_aware_err`] tags
+/// True when `e` is the PCR-drift unseal failure `policy_aware_err` tags
 /// (Secure Boot / firmware / dbx change moved a bound PCR). Kept next to the
 /// construction site so callers never re-parse the message themselves.
 pub fn is_pcr_mismatch(e: &Error) -> bool {

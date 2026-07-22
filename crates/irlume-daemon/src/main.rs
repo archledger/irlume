@@ -461,6 +461,48 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+// libxcrypt's one-way hash (glibc moved `crypt` out of libc into libcrypt).
+#[link(name = "crypt")]
+extern "C" {
+    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
+}
+
+/// Verify `password` against `user`'s `/etc/shadow` hash so `keyring arm` can
+/// reject a password that is not the current LOGIN password (the cause of the
+/// later "-9" wallet-key-derive failure: the face path jumps over pam_unix, so a
+/// wrong seal is never caught at auth time, only when ksecretd tries to open the
+/// wallet). Returns `Some(true/false)` on a verifiable hash, or `None` when it
+/// cannot verify (no `/etc/shadow` access, no such user, or a locked / empty /
+/// non-password field) — in which case the caller does NOT block, since absence
+/// of proof is not proof of a wrong password. Root-only (`/etc/shadow`).
+fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
+    let shadow = std::fs::read_to_string("/etc/shadow").ok()?;
+    let stored = verifiable_shadow_hash(&shadow, user)?;
+    // An interior NUL can't be a shadow password; treat as unverifiable.
+    let key = std::ffi::CString::new(password).ok()?;
+    let setting = std::ffi::CString::new(stored.as_str()).ok()?;
+    // SAFETY: single-threaded daemon (crypt's static buffer is not shared); the
+    // pointers are valid NUL-terminated C strings for the call's duration.
+    let out = unsafe { crypt(key.as_ptr(), setting.as_ptr()) };
+    if out.is_null() {
+        return None; // unsupported hash format on this libcrypt
+    }
+    let computed = unsafe { std::ffi::CStr::from_ptr(out) };
+    Some(computed.to_bytes() == stored.as_bytes())
+}
+
+/// The user's VERIFIABLE `/etc/shadow` hash, or `None` when there is nothing to
+/// verify against: the user is absent, or the field is empty / locked (`!`,
+/// `!!`) / disabled (`*`). Pure (takes the shadow text) so the "don't block on
+/// an unverifiable account" rule is unit-tested.
+fn verifiable_shadow_hash(shadow: &str, user: &str) -> Option<String> {
+    let stored = shadow.lines().find_map(|line| {
+        let mut f = line.split(':');
+        (f.next()? == user).then(|| f.next().map(str::to_string))?
+    })?;
+    (!stored.is_empty() && !stored.starts_with('!') && !stored.starts_with('*')).then_some(stored)
+}
+
 /// Resolve a username to its uid via NSS (covers LDAP/SSSD/systemd-homed, not
 /// just `/etc/passwd`).
 fn uid_of(user: &str) -> Option<u32> {
@@ -842,6 +884,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // zeroizes on drop, covering every return path.
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to seal password for '{user}'"));
+            }
+            // Refuse to seal a password that is not the user's LOGIN password:
+            // it would seal cleanly but fail later at wallet key-derive ("-9").
+            // Only a POSITIVE mismatch blocks; an unverifiable hash proceeds.
+            if password_matches_login(&user, password.expose()) == Some(false) {
+                return Response::Error(format!(
+                    "that is not '{user}'s current login password; the keyring is unlocked with \
+                     the login password, so arming a different one would leave the wallet locked"
+                ));
             }
             match irlume_core::keyring::seal_password(&user, password.expose()) {
                 Ok(()) => {
@@ -1560,6 +1611,25 @@ fn set_mode(path: &str, mode: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifiable_shadow_hash_extracts_and_skips_unverifiable() {
+        let shadow = "root:$6$abc$hash:19000:0:99999:7:::\n\
+                      alice:$y$j9T$salt$realhash:19000::::::\n\
+                      locked:!$6$x$y:19000::::::\n\
+                      disabled:*:19000::::::\n\
+                      nopw::19000::::::\n";
+        // A real hash comes back for verification.
+        assert_eq!(
+            verifiable_shadow_hash(shadow, "alice").as_deref(),
+            Some("$y$j9T$salt$realhash")
+        );
+        // Locked / disabled / empty / absent all read None → the caller must NOT
+        // block the seal (absence of proof is not proof of a wrong password).
+        for u in ["locked", "disabled", "nopw", "ghost"] {
+            assert_eq!(verifiable_shadow_hash(shadow, u), None, "{u}");
+        }
+    }
 
     #[test]
     fn is_pcr_drift_matches_the_real_error_shape() {

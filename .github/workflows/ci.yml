@@ -84,6 +84,9 @@ jobs:
           tar xzf "onnxruntime-linux-x64-${ver}.tgz"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
+      - name: Action pins (SHA-pinned; SLSA generator excepted)
+        run: bash scripts/check-action-pins.sh
+
       - name: rustfmt
         run: cargo fmt --all --check
 

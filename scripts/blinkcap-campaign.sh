@@ -21,7 +21,11 @@ N="${2:-75}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO/target/release/irlume"
 MODELS=/usr/share/irlume/models
-DATASET="${BLINKCAP_DATASET:-$HOME/blink-dataset}"
+# Default the dataset into the INVOKING user's home (not root's, under sudo) so
+# the captures are readable without a copy; override with BLINKCAP_DATASET.
+INVOKER="${SUDO_USER:-$USER}"
+INVOKER_HOME="$(getent passwd "$INVOKER" | cut -d: -f6)"
+DATASET="${BLINKCAP_DATASET:-${INVOKER_HOME:-$HOME}/blink-dataset}"
 export ORT_DYLIB_PATH=/usr/share/irlume/onnxruntime/lib/libonnxruntime.so
 export IRLUME_DEV=1
 
@@ -82,5 +86,11 @@ sleep 1
   --n "$N" \
   --out "$OUT"
 
-echo "== done. Dataset now: =="
+# Hand the capture (and dataset dir) back to the invoking user so it is readable
+# without a manual copy/chown.
+if [ -n "${SUDO_USER:-}" ]; then
+  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$DATASET" 2>/dev/null || true
+fi
+
+echo "== done. Dataset ($DATASET) now: =="
 ls -1 "$DATASET"

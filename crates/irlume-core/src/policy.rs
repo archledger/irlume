@@ -20,6 +20,12 @@ pub enum Method {
     Face,
     /// Fingerprint chosen: the daemon disables face so `pam_fprintd` drives.
     Fingerprint,
+    /// Both face AND fingerprint are active: the user unlocks with whichever is
+    /// convenient. Face is NOT disabled (unlike `Fingerprint`); the wiring adds
+    /// both the face lines and the fingerprint companion so they coexist (on
+    /// GDM they run as concurrent PAM stacks, elsewhere the non-blocking
+    /// on-demand face line sits alongside a bounded-timeout `pam_fprintd`).
+    Both,
 }
 
 impl Method {
@@ -28,16 +34,19 @@ impl Method {
             Method::Auto => "auto",
             Method::Face => "face",
             Method::Fingerprint => "fingerprint",
+            Method::Both => "both",
         }
     }
     pub fn parse(s: &str) -> Method {
         match s.trim().to_lowercase().as_str() {
             "fingerprint" | "finger" | "fp" => Method::Fingerprint,
             "face" => Method::Face,
+            "both" | "face+fingerprint" | "face+fp" => Method::Both,
             _ => Method::Auto,
         }
     }
-    /// True when face should be disabled (fingerprint mode).
+    /// True when face should be disabled (fingerprint-only mode). `Both` keeps
+    /// face ON alongside fingerprint.
     pub fn face_disabled(&self) -> bool {
         matches!(self, Method::Fingerprint)
     }
@@ -70,13 +79,21 @@ mod tests {
     use super::*;
     #[test]
     fn parse_roundtrip() {
-        for m in [Method::Auto, Method::Face, Method::Fingerprint] {
+        for m in [
+            Method::Auto,
+            Method::Face,
+            Method::Fingerprint,
+            Method::Both,
+        ] {
             assert_eq!(Method::parse(m.as_str()), m);
         }
         assert_eq!(Method::parse("FP"), Method::Fingerprint);
         assert_eq!(Method::parse("nonsense"), Method::Auto);
+        assert_eq!(Method::parse("face+fp"), Method::Both);
         assert!(Method::Fingerprint.face_disabled());
         assert!(!Method::Auto.face_disabled());
+        // Coexist keeps face ON (the whole point): unlike Fingerprint-only.
+        assert!(!Method::Both.face_disabled());
     }
 
     #[test]

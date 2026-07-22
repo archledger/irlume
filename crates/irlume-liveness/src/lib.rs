@@ -432,16 +432,27 @@ pub const BLINK_V_POST_WIN: usize = 6;
 /// A brightness class needs at least this many face samples to be trusted;
 /// tiny windows (camera stream died / exposure never settled) read NoEyes.
 pub const BLINK_MIN_CLASS_SAMPLES: usize = 8;
-/// Deliberate consent gesture ([`detect_deliberate_closure`]): the eyes must be
-/// held shut (EAR below the per-user closed threshold) for at least this many
-/// consecutive FACE frames. Validated on real captures 2026-07-22: a deliberate
-/// hold produced 18-35 sub-threshold face frames, while spontaneous blinks and
-/// an accidental squint produced ≤5, so 10 separates them with a wide margin
-/// (the face node runs ~7-8 fps after the strobe, so ~10 frames is ~1.3 s, above
-/// the 100-400 ms spontaneous-blink range and within the 500-1000 ms deliberate
-/// range the dwell-blink literature uses). Overridable via
-/// `IRLUME_CONSENT_CLOSURE_FRAMES` for other frame rates.
-pub const CONSENT_CLOSURE_MIN_FRAMES: usize = 10;
+/// Consent gesture ([`detect_deliberate_closure`]) closure LOWER bound: the eyes
+/// must stay shut for at least this many consecutive face frames. Validated on
+/// real captures 2026-07-22: every accepted deliberate hold ran ≥11 face frames,
+/// while the one natural blink that reached the reopen test ran 10, so 11 is the
+/// clean floor (the face node runs ~7-8 fps after the strobe, so ~11 frames is
+/// ~1.5 s, well above the 100-400 ms spontaneous-blink range). Overridable via
+/// `IRLUME_CONSENT_CLOSURE_FRAMES`.
+pub const CONSENT_CLOSURE_MIN_FRAMES: usize = 11;
+/// Consent gesture closure UPPER bound: a run longer than this is a SUSTAINED
+/// hold (a held squint, eyes closed, or looking away), not a discrete ~1 s
+/// gesture. On the campaign data the deliberate holds ran ≤20 frames while the
+/// squints ran 32-38; 25 sits between them. Overridable via
+/// `IRLUME_CONSENT_CLOSURE_MAX`.
+pub const CONSENT_CLOSURE_MAX_FRAMES: usize = 25;
+/// Frames after a closure within which the eyes must reopen for it to count as a
+/// discrete gesture (a squint never reopens).
+pub const CLOSURE_REOPEN_WINDOW: usize = 4;
+/// Openness fraction the eyes must recover to after a closure to count as
+/// reopened (0 = shut, 1 = fully open). High, so easing a squint slightly does
+/// not read as a reopen.
+pub const CLOSURE_REOPEN_FRACTION: f32 = 0.6;
 /// Frames the eyes may blip back open mid-hold without ending the closure run
 /// (landmark noise tolerance).
 pub const CLOSURE_HYSTERESIS_FRAMES: usize = 2;
@@ -914,6 +925,14 @@ impl ClosureCalibration {
         self.ear_closed + CLOSURE_DEEP_FRACTION * (self.ear_open - self.ear_closed)
     }
 
+    /// EAR at/above which the eyes count as REOPENED after a closure, confirming
+    /// a discrete gesture rather than a sustained hold. A high openness fraction
+    /// ([`CLOSURE_REOPEN_FRACTION`]) of the way back toward the open extreme, so
+    /// a partial recovery (a squint easing slightly) does not count as a reopen.
+    pub fn reopen_threshold(&self) -> f32 {
+        self.ear_closed + CLOSURE_REOPEN_FRACTION * (self.ear_open - self.ear_closed)
+    }
+
     /// True when open and closed are far enough apart to threshold reliably; a
     /// too-small gap means bad landmarks / pose and the calibration should be
     /// re-taken rather than trusted.
@@ -935,53 +954,82 @@ pub fn calibrate_open_ear(samples: &[EarSample]) -> Option<f32> {
     median(&mut ears)
 }
 
-/// Detect a DELIBERATE held eye-closure consent gesture: the eyes stay shut
-/// (EAR below the per-user [`ClosureCalibration::closed_threshold`]) for at
-/// least [`consent_closure_frames`] consecutive face frames, tolerating a few
-/// dropout frames ([`CLOSURE_HYSTERESIS_FRAMES`]) for landmark noise. A single
-/// spontaneous blink is 100-400 ms (Bentivoglio 1997; blink-kinematics review
-/// PMC11133197) so it spans only a handful of frames; a sustained deliberate
-/// hold is a volitional act a passively watching person will not perform, which
-/// is what makes it a consent signal rather than mere liveness. The absolute
-/// threshold (not a running median) is what lets a hold that dominates the
-/// window still register instead of vanishing into a polluted baseline, and a
-/// wandering squint fails because it does not stay continuously below the deep
-/// threshold. `Blinked` = the gesture was seen, `NoBlink` = a face was seen but
-/// not the gesture, `NoEyes` = no face frames at all.
+/// Detect a DELIBERATE eye-closure consent gesture: a BOUNDED closure that
+/// REOPENS. The eyes must go shut (EAR below the per-user
+/// [`ClosureCalibration::closed_threshold`]) for a run of
+/// [`consent_closure_frames`]..=[`consent_closure_max_frames`] face frames
+/// (tolerating [`CLOSURE_HYSTERESIS_FRAMES`] dropout frames), then reopen (EAR
+/// back up past [`ClosureCalibration::reopen_threshold`]) within
+/// [`CLOSURE_REOPEN_WINDOW`] frames.
+///
+/// The bounds and the reopen are what make this robust, learned from a hardware
+/// capture campaign 2026-07-22: a deliberately HELD SQUINT is physically the
+/// same as a held eye-closure (it goes just as deep on EAR), so neither depth
+/// nor a duration floor alone can separate them. What separates them is SHAPE: a
+/// deliberate gesture is a discrete ~1 s close-and-reopen (bounded run, clear
+/// reopen), while a squint / eyes-closed / looking-away is a SUSTAINED hold that
+/// runs past the upper bound and never reopens. On the campaign data this
+/// rejected all 20 squints, all 20 look-down and every natural blink, while
+/// accepting the deliberate holds. A single spontaneous blink (100-400 ms;
+/// Bentivoglio 1997) is too SHORT to reach the lower bound.
+///
+/// `Blinked` = the gesture was seen, `NoBlink` = a face was seen but not the
+/// gesture, `NoEyes` = no face frames at all.
 pub fn detect_deliberate_closure(samples: &[EarSample], cal: &ClosureCalibration) -> BlinkResult {
     let face_frames: Vec<f32> = samples.iter().filter_map(|s| s.ear).collect();
     if face_frames.is_empty() {
         return BlinkResult::NoEyes;
     }
-    let threshold = cal.closed_threshold();
-    let need = consent_closure_frames();
+    let closed = cal.closed_threshold();
+    let reopen = cal.reopen_threshold();
+    let (min, max) = (consent_closure_frames(), consent_closure_max_frames());
     let hysteresis = CLOSURE_HYSTERESIS_FRAMES;
 
-    // Longest run of consecutive face frames below the closed threshold, allowing
-    // up to `hysteresis` frames back above it inside a run before it is broken
-    // (a blip from landmark noise mid-hold must not split the closure).
-    let (mut longest, mut current, mut dropouts) = (0usize, 0usize, 0usize);
-    for ear in &face_frames {
-        if *ear < threshold {
-            current += 1;
-            dropouts = 0;
-            longest = longest.max(current);
-        } else if current > 0 && dropouts < hysteresis {
-            dropouts += 1; // tolerate a brief blip without ending the run
-        } else {
-            current = 0;
-            dropouts = 0;
+    // Walk closure runs (consecutive frames below `closed`, tolerating a few
+    // dropout frames). A run qualifies when its length is within [min, max] AND
+    // the eyes reopen (a frame back above `reopen`) within a short window after
+    // it ends. A too-short run is a blink; a too-long run that never reopens is
+    // a sustained squint / eyes-closed.
+    let n = face_frames.len();
+    let mut i = 0;
+    while i < n {
+        if face_frames[i] >= closed {
+            i += 1;
+            continue;
         }
+        // Extend the run over sub-threshold frames, allowing `hysteresis`
+        // consecutive above-threshold blips before it ends.
+        let (start, mut end, mut dropouts) = (i, i, 0usize);
+        let mut j = i;
+        while j < n {
+            if face_frames[j] < closed {
+                end = j;
+                dropouts = 0;
+            } else if dropouts < hysteresis {
+                dropouts += 1;
+            } else {
+                break;
+            }
+            j += 1;
+        }
+        let length = end - start + 1;
+        if length >= min && length <= max {
+            let reopened = face_frames
+                .iter()
+                .skip(end + 1)
+                .take(CLOSURE_REOPEN_WINDOW)
+                .any(|&e| e >= reopen);
+            if reopened {
+                return BlinkResult::Blinked;
+            }
+        }
+        i = j.max(end + 1);
     }
-    if longest >= need {
-        BlinkResult::Blinked
-    } else {
-        BlinkResult::NoBlink
-    }
+    BlinkResult::NoBlink
 }
 
-/// Minimum sustained-closure length (consecutive face frames below the per-user
-/// closed threshold) for the deliberate consent gesture, overridable via
+/// Minimum closure length (consecutive face frames below the per-user closed
+/// threshold) for the consent gesture, overridable via
 /// `IRLUME_CONSENT_CLOSURE_FRAMES` for per-camera-fps tuning.
 fn consent_closure_frames() -> usize {
     std::env::var("IRLUME_CONSENT_CLOSURE_FRAMES")
@@ -989,6 +1037,16 @@ fn consent_closure_frames() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(CONSENT_CLOSURE_MIN_FRAMES)
+}
+
+/// Maximum closure length for the consent gesture; a longer run is a sustained
+/// hold, not a discrete gesture. Overridable via `IRLUME_CONSENT_CLOSURE_MAX`.
+fn consent_closure_max_frames() -> usize {
+    std::env::var("IRLUME_CONSENT_CLOSURE_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= consent_closure_frames())
+        .unwrap_or(CONSENT_CLOSURE_MAX_FRAMES)
 }
 
 #[cfg(test)]
@@ -1166,14 +1224,30 @@ mod tests {
     }
 
     #[test]
-    fn deliberate_held_closure_is_the_consent_gesture() {
-        // Eyes held shut for the WHOLE window (0.05 < 0.145 threshold), as the
-        // real held-closure captures did: no open baseline needed. 10 frames
-        // clears CONSENT_CLOSURE_MIN_FRAMES.
-        let seq = flat(&[0.05; 12]);
+    fn deliberate_bounded_closure_that_reopens_is_the_consent_gesture() {
+        // The real gesture: open, close ~12 frames (0.05 < deep threshold), then
+        // REOPEN. Within [min, max] and reopens → accepted.
+        let mut ears = vec![0.24; 4];
+        ears.extend([0.05; 12]);
+        ears.extend([0.24; 4]);
+        let seq = flat(&ears);
         assert_eq!(
             detect_deliberate_closure(&seq, &cal()),
             BlinkResult::Blinked
+        );
+    }
+
+    #[test]
+    fn sustained_hold_without_reopen_is_not_the_gesture() {
+        // A held squint / eyes-closed: shut the whole window, never reopens and
+        // runs past the upper bound. This is the case that broke a pure
+        // depth+duration detector; the reopen + upper bound reject it.
+        let mut ears = vec![0.24; 4];
+        ears.extend([0.03; 34]); // held to the end: no reopen, > max
+        let seq = flat(&ears);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
         );
     }
 

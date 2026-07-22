@@ -10,7 +10,7 @@
 //! `IRLUME_DEV=1 irlume suncal <det.onnx> <dataset_dir>`
 //!
 //! Emits one TSV row per burst: dir, ambient mean, lit mean, strobe gap,
-//! gap/ambient, raw face depth ratio, subtracted face depth ratio, raw/subtracted
+//! gap/ambient, raw face depth ratio, subtracted face depth ratio, subtracted
 //! IR face brightness. A trailing legend explains the current gate/floor and
 //! prints candidate thresholds derived from the run.
 
@@ -148,31 +148,32 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         let subtracted = ir_probe::subtract(&frames[best_i], &frames[amb_i]);
         let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("?");
 
-        // Simulate the NEW gate (must match lib.rs: STROBE_MIN_GAP=8,
-        // LOW_AMBIENT_SKIP=5, SUBTRACT_MIN_RESULT=12).
+        // Simulate the ambient-subtraction gate with the shipped constants, so
+        // this offline tool can never drift from the capture path.
         let sub_mean = ir_probe::mean(&subtracted);
-        let gate_subtracts = gap > 8.0 && amb_mean >= 5.0 && sub_mean >= 12.0;
+        let gate_subtracts = gap > irlume_camera::STROBE_MIN_GAP
+            && amb_mean >= irlume_camera::LOW_AMBIENT_SKIP
+            && sub_mean >= irlume_camera::SUBTRACT_MIN_RESULT;
 
-        let (draw, dsub, braw, bsub) = match face_depth(&mut det, &frames[best_i], w, h) {
-            Some((b, r)) => {
+        let (draw, dsub, bsub) = match face_depth(&mut det, &frames[best_i], w, h) {
+            Some((_bri, r)) => {
                 faces_found += 1;
                 let (bs, rs) = face_depth(&mut det, &subtracted, w, h).unwrap_or((0.0, 0.0));
-                (r, rs, b, bs)
+                (r, rs, bs)
             }
-            None => (0.0, 0.0, 0.0, 0.0),
+            None => (0.0, 0.0, 0.0),
         };
-        // DEPTH_MIN_RATIO = 1.03 is the shipped global floor.
-        let rp = draw >= 1.03;
+        // The shipped global depth floor (per-user calibration tightens it).
+        let rp = draw >= irlume_liveness::DEPTH_MIN_RATIO;
         // The gated outcome: the depth the gate would actually hand downstream.
         let gated_depth = if gate_subtracts { dsub } else { draw };
-        let gated_pass = gated_depth >= 1.03;
+        let gated_pass = gated_depth >= irlume_liveness::DEPTH_MIN_RATIO;
         if rp {
             raw_pass += 1;
         }
         if gated_pass && !rp && draw > 0.0 {
             sub_rescued += 1;
         }
-        let _ = braw;
         println!(
             "{name}\t{amb_mean:.0}\t{lit_mean:.0}\t{gap:.0}\t{sub_mean:.0}\t{draw:.2}\t{dsub:.2}\t{bsub:.0}\t{}\t{}\t{}",
             if rp { "Y" } else { "n" },

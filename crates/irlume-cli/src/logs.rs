@@ -17,6 +17,7 @@
 //! actually granted), and the keyring modules (`pam_kwallet*`,
 //! `pam_gnome_keyring`) that a face login is supposed to feed.
 
+use crate::is_root;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -162,10 +163,6 @@ fn restart_daemon() {
     let _ = Command::new("systemctl")
         .args(["try-restart", "irlumed.service"])
         .status();
-}
-
-fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(test)]

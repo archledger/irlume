@@ -842,9 +842,11 @@ const IR_BURST: usize = 10;
 /// the face becomes undetectable (dataset bursts 09/14: subtracted face
 /// vanished). Below this floor we revert to the raw lit frame rather than hand
 /// downstream a blank frame.
-const STROBE_MIN_GAP: f64 = 8.0;
-const LOW_AMBIENT_SKIP: f64 = 5.0;
-const SUBTRACT_MIN_RESULT: f64 = 12.0;
+/// Public so offline tools (`irlume suncal`) simulate the same gate instead of
+/// retyping the values.
+pub const STROBE_MIN_GAP: f64 = 8.0;
+pub const LOW_AMBIENT_SKIP: f64 = 5.0;
+pub const SUBTRACT_MIN_RESULT: f64 = 12.0;
 
 /// Capture one IR frame (GREY 8-bit) from the IR companion node. The active-IR
 /// emitter must be illuminating for a usable image; on integrated Hello modules

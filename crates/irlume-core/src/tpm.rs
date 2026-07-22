@@ -1115,16 +1115,27 @@ pub fn pcrlock_provisioned() -> Option<u32> {
     u32::try_from(plock.nv_index?).ok()
 }
 
+/// Marker `policy_aware_err` embeds when it diagnoses PCR drift;
+/// [`is_pcr_mismatch`] keys on it, so the two stay in sync here.
+const PCR_MISMATCH_MARKER: &str = "PCR mismatch";
+
 /// If the TSS error looks like a policy mismatch, enrich it with the list of
 /// PCRs that have changed since seal time.
 fn policy_aware_err<E: std::fmt::Display>(e: E, env: &SealedEnvelope) -> Error {
     let base = e.to_string();
     match diagnose_pcrs(env) {
         Ok(changed) if !changed.is_empty() => Error::Policy(format!(
-            "{base}: PCR mismatch: {changed:?} changed since seal"
+            "{base}: {PCR_MISMATCH_MARKER}: {changed:?} changed since seal"
         )),
         _ => Error::Tpm(base),
     }
+}
+
+/// True when `e` is the PCR-drift unseal failure [`policy_aware_err`] tags
+/// (Secure Boot / firmware / dbx change moved a bound PCR). Kept next to the
+/// construction site so callers never re-parse the message themselves.
+pub fn is_pcr_mismatch(e: &Error) -> bool {
+    matches!(e, Error::Policy(m) if m.contains(PCR_MISMATCH_MARKER))
 }
 
 /// Compare current PCR values against those stored in the envelope. Returns the

@@ -20,8 +20,15 @@
 #   bash packaging/debian/build-deb-container.sh
 # Output: ./irlume_<version>_amd64.deb (copied out of the container).
 set -euo pipefail
-BASE="${BASE:-debian:12}"        # oldest supported base (sets the glibc floor)
+# Digest-pinned so the glibc floor and toolchain are reproducible: the plain
+# `debian:12` tag tracks every point release. Bump the digest deliberately when
+# moving the base (the tag is `debian:12` as of this digest).
+BASE="${BASE:-debian:12@sha256:9344f8b8992482f80cba753f323adeaf17690076c095ccff6cc9536be98185dc}"
 RUST_VER="${RUST_VER:-1.88.0}"   # >= ort's MSRV (edition 2024)
+# nfpm builds the .deb; pin it and verify its published checksum rather than
+# fetching a floating "latest" (a compromised/behavior-changed nfpm would
+# otherwise silently alter every universal .deb).
+NFPM_VER="${NFPM_VER:-2.47.0}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${OUT:-$REPO}"
 
@@ -39,14 +46,19 @@ podman run --rm \
   -v "$OUT:/out:z" \
   "docker.io/library/$BASE" bash -euc '
     export DEBIAN_FRONTEND=noninteractive
+    NFPM_VER='"$NFPM_VER"'
     apt-get update -qq
     # clang/libclang-dev: bindgen (v4l2-sys-mit) needs libclang at build time.
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
         libtss2-dev libpam0g-dev clang libclang-dev git git-lfs xz-utils >/dev/null
     curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain '"$RUST_VER"' --profile minimal >/dev/null
     . "$HOME/.cargo/env"
-    NFPM_VER=$(curl -s https://api.github.com/repos/goreleaser/nfpm/releases/latest | grep -oP "\"tag_name\":\s*\"v\K[^\"]+")
+    # Pinned nfpm, verified against its published (goreleaser-signed) checksums.
     curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/nfpm_${NFPM_VER}_amd64.deb" -o /tmp/nfpm.deb
+    curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/checksums.txt" -o /tmp/nfpm.sums
+    ( cd /tmp && want=$(grep "nfpm_${NFPM_VER}_amd64.deb\$" nfpm.sums | awk "{print \$1}"); \
+      got=$(sha256sum nfpm.deb | awk "{print \$1}"); \
+      [ -n "$want" ] && [ "$want" = "$got" ] || { echo "nfpm checksum mismatch"; exit 1; } )
     apt-get install -y -qq /tmp/nfpm.deb >/dev/null
     cp -r /src /build && cd /build
     sed -i "/git lfs pull/d" packaging/debian/build-deb.sh   # models are already real in the mount

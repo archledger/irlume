@@ -25,6 +25,10 @@ set -euo pipefail
 SERIES="${SERIES:-resolute}"
 PPAREV="${PPAREV:-0ppa1}"
 ORT_VER="${ORT_VER:-1.24.4}"
+# sha256 of onnxruntime-linux-x64-${ORT_VER}.tgz; the bundled .so runs in the
+# privileged daemon, so verify it rather than trusting HTTPS alone. Update
+# together with ORT_VER.
+ORT_SHA256="${ORT_SHA256:-3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747}"
 BUILDROOT="${BUILDROOT:-$HOME/ppa-build}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -55,6 +59,9 @@ echo "==> bundling onnxruntime $ORT_VER"
 ORT_TGZ="$BUILDROOT/onnxruntime-linux-x64-${ORT_VER}.tgz"
 [ -f "$ORT_TGZ" ] || curl -fsSL -o "$ORT_TGZ" \
     "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz"
+# Verify every time (also re-checks a reused cached tarball).
+echo "${ORT_SHA256}  ${ORT_TGZ}" | sha256sum -c - \
+    || { echo "onnxruntime tarball failed sha256 check; refusing to bundle."; exit 1; }
 mkdir -p "$TREE/ort-prebuilt"
 tar -xzf "$ORT_TGZ" -C "$TREE/ort-prebuilt" --strip-components=1
 rm -rf "$TREE/ort-prebuilt/include"   # headers unused (load-dynamic)

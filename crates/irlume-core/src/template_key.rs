@@ -211,8 +211,9 @@ mod tests {
     #[test]
     fn recovery_envelope_save_load_round_trip() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_RECOVERY_DIR", "/tmp/irlume-rec-rt");
-        let _ = std::fs::remove_dir_all("/tmp/irlume-rec-rt");
+        let dir = crate::test_tmp_dir("rec-rt");
+        std::env::set_var("IRLUME_RECOVERY_DIR", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
         let key = crypto::generate_key();
         let env = crate::recovery::wrap(b"pass-phrase-here", &key).unwrap();
         save_recovery("rt", &env).unwrap();

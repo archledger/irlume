@@ -35,7 +35,7 @@ struct Theme {
     ok: Color,
     err: Color,
     warn: Color,
-    /// Key-chip style for the footer ([w], [?]…): colored chip normally,
+    /// Key-chip style for the footer (`[w]`, `[?]`…): colored chip normally,
     /// REVERSED under NO_COLOR (a black-on-Reset chip would be invisible).
     chip: Style,
 }
@@ -232,6 +232,11 @@ enum ConfirmAct {
     Sus(Suspend),
 }
 
+/// A y/n confirm with a SPECIFIC verb on the affirmative (GNOME HIG: "Label
+/// the affirmative button with a specific imperative verb… clearer than a
+/// generic label"): question, verb, action.
+type Confirm = (String, &'static str, ConfirmAct);
+
 /// Severity of a Repair-tab diagnostic.
 #[derive(Clone, Copy, PartialEq)]
 enum Sev {
@@ -409,12 +414,14 @@ struct App {
     pairs: Vec<irlume_camera::CameraPair>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
-    confirm: Option<(String, ConfirmAct)>,
+    confirm: Option<Confirm>,
     /// True while mouse capture is released so the terminal's own selection
     /// works (the `[M]` toggle); wheel scroll is unavailable meanwhile.
     mouse_select: bool,
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
+    /// Selected row of the Welcome hub (Enter jumps to its screen).
+    hub_sel: usize,
     op: Option<Op>,
     enroll: Option<EnrollUi>,
     /// A pending merge confirmation (scan 1 matched an existing profile).
@@ -524,6 +531,7 @@ impl App {
             confirm: None,
             mouse_select: false,
             show_help: false,
+            hub_sel: 0,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -1911,7 +1919,7 @@ impl App {
         if self.confirm.is_some() {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let (_, act) = self.confirm.take().unwrap();
+                    let (_, _, act) = self.confirm.take().unwrap();
                     match act {
                         // Async so the UI keeps animating; poll() logs the
                         // result (✓/error banner) and refreshes. map_confirm
@@ -2017,12 +2025,14 @@ impl App {
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
+            SC_WELCOME => self.hub_rows().len(),
             _ => self.rows().len(),
         };
         let n = len.max(1) as i32;
         let cur = match self.screen {
             SC_REPAIR => &mut self.repair_sel,
             SC_CAMERAS => &mut self.cam_sel,
+            SC_WELCOME => &mut self.hub_sel,
             _ => &mut self.sel,
         };
         *cur = (((*cur as i32 + d) % n + n) % n) as usize;
@@ -2030,6 +2040,16 @@ impl App {
 
     fn on_action(&mut self, code: KeyCode) {
         match (self.screen, code) {
+            // Hub: Enter opens the selected section (the summary IS the nav).
+            (SC_WELCOME, KeyCode::Enter) => {
+                if let Some((_, _, target)) = self.hub_rows().get(self.hub_sel).copied() {
+                    self.screen = target;
+                    self.sel = 0;
+                    if target == SC_REPAIR || target == SC_FINGERPRINT {
+                        self.refresh();
+                    }
+                }
+            }
             // Welcome / Done: refresh the whole snapshot.
             (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) => {
                 self.log('·', "refreshing status…");
@@ -2158,6 +2178,7 @@ impl App {
             (SC_KEYRING, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the TPM-sealed login password?".into(),
+                    "Erase",
                     ConfirmAct::Daemon(Request::ForgetPassword {
                         user: self.user.clone(),
                     }),
@@ -2181,6 +2202,7 @@ impl App {
             (SC_RECOVERY, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the recovery passphrase? (templates stay encrypted)".into(),
+                    "Erase",
                     ConfirmAct::Daemon(Request::RecoveryForget {
                         user: self.user.clone(),
                     }),
@@ -2214,6 +2236,7 @@ impl App {
             (SC_FINGERPRINT, KeyCode::Char('x')) => {
                 self.confirm = Some((
                     "Delete ALL enrolled fingerprints from the reader?".into(),
+                    "Delete",
                     ConfirmAct::Sus(Suspend::FingerprintReset),
                 ));
             }
@@ -2248,6 +2271,7 @@ impl App {
                 self.confirm = Some((
                     "Un-wire face auth from login/lock/sudo/apps? (password logins are untouched)"
                         .into(),
+                    "Un-wire",
                     ConfirmAct::Sus(Suspend::LoginDisable),
                 ));
             }
@@ -2311,6 +2335,7 @@ impl App {
                                 "Disable third-party model '{}'? (its weights are deleted)",
                                 m.name
                             ),
+                            "Disable",
                             ConfirmAct::Sus(Suspend::ModelsDisable),
                         ));
                     }
@@ -2423,6 +2448,7 @@ impl App {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
                     format!("Delete profile '{p}' and all its scans?"),
+                    "Delete",
                     ConfirmAct::Daemon(Request::DeleteProfile {
                         user: self.user.clone(),
                         profile: p,
@@ -2436,6 +2462,7 @@ impl App {
                 );
                 self.confirm = Some((
                     format!("Delete scan '{s}' from '{p}'?"),
+                    "Delete",
                     ConfirmAct::Daemon(Request::DeleteScan {
                         user: self.user.clone(),
                         profile: p,
@@ -2611,10 +2638,15 @@ impl App {
             // Prompt in the wrapping body (a long name/prompt would truncate as a
             // border title); the typed field on its own line below it.
             self.modal(f, "Input", &format!("{prompt}\n{shown}▏"));
-        } else if let Some((what, _)) = &self.confirm {
+        } else if let Some((what, _, _)) = &self.confirm {
             // Question in the body so a long target name isn't clipped by the
             // single-line border title.
-            self.modal(f, "Confirm", &format!("{what}\n[y] yes    [n] no"));
+            let verb = self.confirm.as_ref().map(|c| c.1).unwrap_or("Confirm");
+            self.modal(
+                f,
+                "Confirm",
+                &format!("{what}\n[n]/Esc Cancel    [y] {verb}"),
+            );
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
@@ -3353,9 +3385,36 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     }
 
-    fn draw_welcome(&self, f: &mut Frame, area: Rect) {
+    /// Hub rows for the Welcome screen: each visible section with its live
+    /// state, selectable and Enter-jumpable (hub-and-spoke: the summary IS
+    /// the navigation, the tab ribbon stays for direct access).
+    fn hub_rows(&self) -> Vec<(&'static str, bool, usize)> {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         let rec = self.recovery.unwrap_or_default();
+        let all: [(&'static str, bool, usize); 7] = [
+            ("daemon + checks", self.daemon_up, SC_REPAIR),
+            ("cameras", self.caps.rgb, SC_CAMERAS),
+            ("enrollment", scans > 0, SC_PROFILES),
+            (
+                "keyring unlock",
+                self.keyring_armed.unwrap_or(false),
+                SC_KEYRING,
+            ),
+            (
+                "recovery + encryption",
+                rec.encrypted && rec.recovery_set,
+                SC_RECOVERY,
+            ),
+            ("login wiring", crate::pamwire::login_wired(), SC_PAM),
+            ("settings", true, SC_SETTINGS),
+        ];
+        all.into_iter()
+            .filter(|(_, _, sc)| self.visible.contains(sc))
+            .collect()
+    }
+
+    fn draw_welcome(&self, f: &mut Frame, area: Rect) {
+        let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         let lines = vec![
             Line::from(Span::styled(
                 "  irlume - local face authentication",
@@ -3375,19 +3434,7 @@ impl App {
                 Style::new().dim(),
             )),
             Line::raw(""),
-            section("At a glance"),
-            Line::from(vec![Span::raw("  daemon       "), onoff(self.daemon_up)]),
-            Line::from(vec![
-                Span::raw("  enrolled     "),
-                count_badge(self.profiles.len(), scans),
-            ]),
-            Line::from(vec![
-                Span::raw("  keyring      "),
-                onoff(self.keyring_armed.unwrap_or(false)),
-            ]),
-            Line::from(vec![Span::raw("  encrypted    "), onoff(rec.encrypted)]),
-            Line::from(vec![Span::raw("  biopolicy    "), onoff(biopolicy_on())]),
-            Line::raw(""),
+            section("At a glance  (↑↓ pick a section, Enter opens it)"),
             Line::from(vec![
                 Span::styled("  Recommended  ", Style::new().add_modifier(Modifier::BOLD)),
                 Span::styled(self.recommended(), Style::new().fg(th().ok)),
@@ -3421,7 +3468,39 @@ impl App {
                 Style::new().dim(),
             )),
         ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        let mut lines = lines;
+        // Splice the selectable hub rows just under the "At a glance" header.
+        let at = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|sp| sp.content.contains("At a glance")))
+            .map(|i| i + 1)
+            .unwrap_or(lines.len());
+        let rows = self.hub_rows();
+        let n = rows.len();
+        for (i, (label, ok, _)) in rows.into_iter().enumerate() {
+            let selected = i == self.hub_sel;
+            let mut style = Style::new();
+            if selected {
+                style = style.fg(th().accent).add_modifier(Modifier::BOLD);
+            }
+            let badge = if label == "enrollment" {
+                count_badge(self.profiles.len(), scans)
+            } else {
+                onoff(ok)
+            };
+            let marker = if selected { '▸' } else { ' ' };
+            lines.insert(
+                at + i,
+                Line::from(vec![
+                    Span::styled(format!("  {marker} {label:<24}"), style),
+                    badge,
+                ]),
+            );
+        }
+        lines.insert(at + n, Line::raw(""));
+        // trim:false: leading spaces are the marker column of the hub rows;
+        // trim would collapse unselected rows against the ▸ rows.
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     /// Diagnostic + repair: a live checklist (✓/⚠/✗) of everything irlume needs
@@ -3875,6 +3954,16 @@ impl App {
         f.render_widget(blk, area);
         let h = inner.height as usize;
         // Window ends `act_scroll` lines up from the newest entry.
+        // Designed empty state (HIG placeholders): say what will appear, not
+        // nothing.
+        if self.activity.is_empty() {
+            f.render_widget(
+                Paragraph::new("Actions you take show up here, newest last.")
+                    .style(Style::new().dim()),
+                inner,
+            );
+            return;
+        }
         let end = self.activity.len().saturating_sub(self.act_scroll);
         let start = end.saturating_sub(h);
         let lines: Vec<Line> = self.activity[start..end]
@@ -4406,6 +4495,7 @@ mod tests {
             confirm: None,
             mouse_select: false,
             show_help: false,
+            hub_sel: 0,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -4620,6 +4710,29 @@ mod tests {
     // cut off. It must render inside the wrapping body, with the deliberate
     // [y] yes / [n] no hint from 093dc56.
     #[test]
+    fn hub_selection_and_enter_jump_to_the_picked_screen() {
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        app.visible = (0..SCREENS.len()).collect();
+        app.daemon_up = true;
+        let rows = app.hub_rows();
+        assert!(rows.len() >= 6, "hub rows: {rows:?}");
+        // 5 downs from 0 select row 5; Enter opens exactly that screen.
+        for _ in 0..5 {
+            app.move_sel(1);
+        }
+        assert_eq!(app.hub_sel, 5);
+        let target = app.hub_rows()[5].2;
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, target);
+        // Wrap: one Up from row 0 lands on the last row.
+        app.screen = SC_WELCOME;
+        app.hub_sel = 0;
+        app.move_sel(-1);
+        assert_eq!(app.hub_sel, app.hub_rows().len() - 1);
+    }
+
+    #[test]
     fn parity_keys_route_to_the_right_actions() {
         // The new per-screen actions: keys must set the right suspend/confirm,
         // and destructive ones must go through the y/n gate, not act directly.
@@ -4639,7 +4752,7 @@ mod tests {
         assert!(app.suspend.is_none());
         assert!(matches!(
             app.confirm,
-            Some((_, ConfirmAct::Sus(Suspend::LoginDisable)))
+            Some((_, _, ConfirmAct::Sus(Suspend::LoginDisable)))
         ));
         app.on_key(KeyCode::Char('y'));
         assert!(matches!(app.suspend, Some(Suspend::LoginDisable)));
@@ -4657,7 +4770,7 @@ mod tests {
         app.on_key(KeyCode::Char('x'));
         assert!(matches!(
             app.confirm,
-            Some((_, ConfirmAct::Sus(Suspend::FingerprintReset)))
+            Some((_, _, ConfirmAct::Sus(Suspend::FingerprintReset)))
         ));
         app.on_key(KeyCode::Esc); // cancel path leaves nothing armed
         assert!(app.confirm.is_none() && app.suspend.is_none());
@@ -4687,7 +4800,7 @@ mod tests {
             "Delete profile '{}ZZTARGETZZ' and all its scans?",
             ["word"; 20].join(" ")
         );
-        app.confirm = Some((question, ConfirmAct::Daemon(Request::Ping)));
+        app.confirm = Some((question, "Confirm", ConfirmAct::Daemon(Request::Ping)));
         let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let text = rendered(&term);
@@ -4695,7 +4808,12 @@ mod tests {
             text.contains("ZZTARGETZZ"),
             "end of a long confirm question was clipped:\n{text}"
         );
-        assert!(text.contains("[y] yes"), "deliberate-confirm hint missing");
+        // The affirmative carries the verb now (GNOME HIG), cancel is first.
+        assert!(
+            text.contains("[y] Confirm"),
+            "deliberate-confirm hint missing"
+        );
+        assert!(text.contains("Cancel"), "cancel option missing");
     }
 
     // Regression: f00f316. At MAX_PROFILES the guidance said only "delete one
@@ -4728,6 +4846,7 @@ mod tests {
         let mut app = test_app();
         app.confirm = Some((
             "Delete profile 'x'?".into(),
+            "Confirm",
             ConfirmAct::Daemon(Request::Ping),
         ));
         app.on_key(KeyCode::Char('x'));
@@ -4739,7 +4858,11 @@ mod tests {
         );
         app.on_key(KeyCode::Char('n'));
         assert!(app.confirm.is_none(), "[n] cancels");
-        app.confirm = Some(("Delete scan 's'?".into(), ConfirmAct::Daemon(Request::Ping)));
+        app.confirm = Some((
+            "Delete scan 's'?".into(),
+            "Delete",
+            ConfirmAct::Daemon(Request::Ping),
+        ));
         app.on_key(KeyCode::Esc);
         assert!(app.confirm.is_none(), "Esc cancels");
     }
@@ -5506,7 +5629,7 @@ mod tests {
         app.sel = 0;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
-            Some((q, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
+            Some((q, _, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
                 assert!(q.contains("Delete profile 'p1'"), "got: {q}");
                 assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
             }
@@ -5516,7 +5639,7 @@ mod tests {
         app.sel = 1;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
-            Some((q, ConfirmAct::Daemon(Request::DeleteScan { profile, scan, .. }))) => {
+            Some((q, _, ConfirmAct::Daemon(Request::DeleteScan { profile, scan, .. }))) => {
                 assert!(q.contains("Delete scan 's1' from 'p1'"), "got: {q}");
                 assert_eq!((profile.as_str(), scan.as_str()), ("p1", "s1"));
             }
@@ -5538,7 +5661,7 @@ mod tests {
         app.input = None;
         app.on_key(KeyCode::Char('f'));
         match &app.confirm {
-            Some((q, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {
+            Some((q, _, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {
                 assert!(q.contains("Erase the TPM-sealed"), "got: {q}");
                 assert_eq!(user, "testuser");
             }
@@ -5558,7 +5681,7 @@ mod tests {
         app.on_key(KeyCode::Char('f'));
         assert!(matches!(
             app.confirm,
-            Some((_, ConfirmAct::Daemon(Request::RecoveryForget { .. })))
+            Some((_, _, ConfirmAct::Daemon(Request::RecoveryForget { .. })))
         ));
     }
 
@@ -5946,6 +6069,7 @@ mod tests {
         let mut app = test_app();
         app.confirm = Some((
             "Delete profile 'x'?".into(),
+            "Confirm",
             ConfirmAct::Daemon(Request::Ping),
         ));
         app.on_key(KeyCode::Char('y'));

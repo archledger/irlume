@@ -37,7 +37,7 @@ fn usage() -> ExitCode {
 }
 
 /// The catalog name currently enabled in settings.conf, if any.
-fn enabled_name() -> Option<String> {
+pub(crate) fn enabled_name() -> Option<String> {
     irlume_common::config::read_kv("settings.conf", thirdparty::SETTINGS_KEY)
 }
 

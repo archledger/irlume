@@ -145,6 +145,41 @@ enum Suspend {
     /// Install Bitwarden's biometric-unlock polkit action; root op, suspends
     /// to `sudo irlume bitwarden setup --apply` (non-interactive, flavor-aware).
     BitwardenSetup,
+    /// Opt-in wiring extras and unwiring; each suspends to the matching
+    /// `sudo irlume login …` invocation (same shape as LoginEnable).
+    LoginEnableSudo,
+    LoginEnablePolkit,
+    LoginDisable,
+    /// Re-apply wiring a distro PAM regeneration stripped (Repair fix).
+    LoginReconcile,
+    /// Teach the eye-closure consent gesture; interactive + root, so it runs
+    /// `sudo irlume calibrate-closure` in the cooked terminal.
+    CalibrateClosure,
+    /// Flip daemon debug logging; the bool is the direction to switch TO.
+    LogsDebug(bool),
+    /// fprintd verify runs as the user with its own prompts (like Add).
+    FingerprintVerify,
+    FingerprintEnable,
+    FingerprintDisable,
+    /// Wipe enrolled fingers; TUI y/n-confirmed first, root op.
+    FingerprintReset,
+    /// Enable a third-party PAD model BY NAME. Deliberately runs the CLI's own
+    /// interactive flow under sudo (license text, name typed back, y/N): that
+    /// friction is the point of the models policy, so the TUI hosts it in the
+    /// cooked terminal instead of bypassing it.
+    ModelsEnable(String),
+    ModelsDisable,
+    /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
+    /// the package-manager step when one is needed).
+    Update,
+}
+
+/// What a y/n confirm modal executes on `[y]`: a daemon request (async, the
+/// original shape) or a suspend-to-terminal action (root ops like un-wiring
+/// PAM). A dedicated enum so a confirm can only name an action with a handler.
+enum ConfirmAct {
+    Daemon(Request),
+    Sus(Suspend),
 }
 
 /// Severity of a Repair-tab diagnostic.
@@ -171,6 +206,9 @@ enum Fix {
 #[derive(Clone, Copy)]
 enum RootFix {
     IrSetup,
+    /// `sudo irlume login reconcile`: re-apply wiring a distro PAM
+    /// regeneration stripped (marker says wired, active greeter is not).
+    LoginReconcile,
     RestartDaemon,
     RestartFprintd,
     LoginEnable,
@@ -321,7 +359,10 @@ struct App {
     pairs: Vec<irlume_camera::CameraPair>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
-    confirm: Option<(String, Request)>,
+    confirm: Option<(String, ConfirmAct)>,
+    /// True while mouse capture is released so the terminal's own selection
+    /// works (the `[M]` toggle); wheel scroll is unavailable meanwhile.
+    mouse_select: bool,
     op: Option<Op>,
     enroll: Option<EnrollUi>,
     /// A pending merge confirmation (scan 1 matched an existing profile).
@@ -429,6 +470,7 @@ impl App {
             activity: Vec::new(),
             input: None,
             confirm: None,
+            mouse_select: false,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -1055,12 +1097,23 @@ impl App {
                     "method is face-only but a fingerprint reader is also wired; both will unlock"
                         .into(),
                     Fix::Manual(
-                        "`sudo irlume fingerprint enable` (face OR fingerprint) or `... disable`"
+                        "[e] on the Fingerprint tab (face OR fingerprint), or [d] to disable"
                             .into(),
                     ),
                 ));
             }
             _ => {}
+        }
+        // Wiring drift: login WAS enabled (marker) but the active greeter's
+        // stack lost the module — authselect/pam-auth-update regenerated the
+        // PAM files. Face silently falls back to password until re-applied.
+        if crate::pamwire::reconcile_needed() {
+            v.push(mk(
+                "Login wiring",
+                Sev::Fail,
+                "a distro PAM regeneration dropped the face-auth wiring; logins fall back to password".into(),
+                Fix::Root(RootFix::LoginReconcile),
+            ));
         }
         // Foreign face-auth modules left over from another tool hijack the same
         // PAM slots (a leftover module intercepted the greeter in live testing).
@@ -1195,6 +1248,13 @@ impl App {
             Fix::Root(RootFix::FingerprintAdd) => {
                 self.log('→', "enrolling a finger (interactive)");
                 self.suspend = Some(Suspend::FingerprintAdd);
+            }
+            Fix::Root(RootFix::LoginReconcile) => {
+                self.log(
+                    '→',
+                    "sudo irlume login reconcile: re-applies the face-auth PAM wiring",
+                );
+                self.suspend = Some(Suspend::LoginReconcile);
             }
             Fix::Root(RootFix::SelinuxLoad) => {
                 self.log(
@@ -1442,7 +1502,17 @@ impl App {
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k.code),
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        // A Ctrl-modified letter (Ctrl-C…) must not alias to
+                        // that letter's action; found live when Ctrl-C fired
+                        // the [c] calibrate binding. Plain keys pass through.
+                        let ctrl = k
+                            .modifiers
+                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
+                        if !(ctrl && matches!(k.code, KeyCode::Char(_))) {
+                            self.on_key(k.code)
+                        }
+                    }
                     // Mouse wheel scrolls the Activity history.
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => {
@@ -1483,10 +1553,12 @@ impl App {
                 ratatui::restore();
                 self.run_suspended(s);
                 *terminal = ratatui::init();
-                let _ = ratatui::crossterm::execute!(
-                    std::io::stdout(),
-                    ratatui::crossterm::event::EnableMouseCapture
-                );
+                if !self.mouse_select {
+                    let _ = ratatui::crossterm::execute!(
+                        std::io::stdout(),
+                        ratatui::crossterm::event::EnableMouseCapture
+                    );
+                }
                 terminal.clear()?;
                 self.refresh();
                 // irlumed binds its socket only after loading the ONNX models;
@@ -1522,6 +1594,25 @@ impl App {
         Ok(())
     }
 
+    /// Flip mouse capture so the terminal's native selection (highlight +
+    /// copy) works while released. State survives suspend/resume.
+    fn toggle_mouse(&mut self) {
+        self.mouse_select = !self.mouse_select;
+        let mut out = std::io::stdout();
+        if self.mouse_select {
+            let _ =
+                ratatui::crossterm::execute!(out, ratatui::crossterm::event::DisableMouseCapture);
+            self.log(
+                '·',
+                "mouse released: highlight + copy with your terminal as usual; [M] restores wheel scroll",
+            );
+        } else {
+            let _ =
+                ratatui::crossterm::execute!(out, ratatui::crossterm::event::EnableMouseCapture);
+            self.log('·', "mouse captured: the wheel scrolls the TUI again");
+        }
+    }
+
     /// Run a privileged sub-step via `sudo` and surface its ACTUAL outcome. A
     /// cancelled or failed sudo (wrong password ×3, subcommand error) must not
     /// look like success: `refresh()` re-probes what it can, but a one-shot like
@@ -1529,7 +1620,27 @@ impl App {
     /// the error banner on failure.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
         eprintln!("\n{what}; running: sudo {}…", args.join(" "));
-        match std::process::Command::new("sudo").args(args).status() {
+        // In the cooked terminal, Ctrl-C goes to the whole foreground group:
+        // a user aborting the CHILD (a sudo prompt, the models license flow)
+        // must not also kill the TUI. Ignore SIGINT here while the child runs;
+        // the child gets the default disposition back pre-exec so Ctrl-C still
+        // cancels IT. (Found live: Ctrl-C in the license prompt took the whole
+        // TUI down.)
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.args(args);
+        // SAFETY: signal() is async-signal-safe; this runs in the forked child
+        // just before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let old_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+        let status = cmd.status();
+        unsafe { libc::signal(libc::SIGINT, old_int) };
+        match status {
             Ok(st) if st.success() => self.log('✓', format!("{what}: done")),
             Ok(st) => {
                 // A failed/cancelled sudo can't have started the daemon; drop
@@ -1578,6 +1689,60 @@ impl App {
                 "install Bitwarden's polkit action",
                 &["irlume", "bitwarden", "setup", "--apply"],
             ),
+            Suspend::LoginEnableSudo => self.sudo_step(
+                "wire face-sudo (opt-in)",
+                &["irlume", "login", "enable", "--with-sudo", "--apply"],
+            ),
+            Suspend::LoginEnablePolkit => self.sudo_step(
+                "wire app prompts / polkit (opt-in)",
+                &["irlume", "login", "enable", "--with-polkit", "--apply"],
+            ),
+            Suspend::LoginDisable => self.sudo_step(
+                "un-wire face auth from PAM",
+                &["irlume", "login", "disable", "--apply"],
+            ),
+            Suspend::LoginReconcile => self.sudo_step(
+                "re-apply the login wiring",
+                &["irlume", "login", "reconcile"],
+            ),
+            Suspend::CalibrateClosure => self.sudo_step(
+                "calibrate the eye-closure gesture",
+                &["irlume", "calibrate-closure"],
+            ),
+            Suspend::LogsDebug(on) => self.sudo_step(
+                if on {
+                    "turn daemon debug logging ON"
+                } else {
+                    "turn daemon debug logging OFF"
+                },
+                &["irlume", "logs", "debug", if on { "on" } else { "off" }],
+            ),
+            Suspend::FingerprintVerify => {
+                crate::fingerprint::run(Some("verify"), &none);
+            }
+            Suspend::FingerprintEnable => self.sudo_step(
+                "enable fingerprint (face OR finger)",
+                &["irlume", "fingerprint", "enable"],
+            ),
+            Suspend::FingerprintDisable => self.sudo_step(
+                "disable fingerprint for login",
+                &["irlume", "fingerprint", "disable"],
+            ),
+            Suspend::FingerprintReset => self.sudo_step(
+                "delete ALL enrolled fingerprints",
+                &["irlume", "fingerprint", "reset"],
+            ),
+            Suspend::ModelsEnable(name) => self.sudo_step(
+                "enable a third-party liveness model (license confirm follows)",
+                &["irlume", "models", "enable", &name],
+            ),
+            Suspend::ModelsDisable => self.sudo_step(
+                "disable the third-party model",
+                &["irlume", "models", "disable"],
+            ),
+            Suspend::Update => {
+                crate::commands::update(&none);
+            }
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
             // does the teardown (un-wire PAM, stop daemon, wipe data) as root
@@ -1693,11 +1858,17 @@ impl App {
         if self.confirm.is_some() {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let (_, req) = self.confirm.take().unwrap();
-                    // Async so the UI keeps animating; poll() logs the result
-                    // (✓/error banner) and refreshes. map_confirm handles the Ok
-                    // acks (delete, recovery-forget) and PasswordForgotten.
-                    self.start_async("(confirmed)", OpTag::Generic, req, map_confirm);
+                    let (_, act) = self.confirm.take().unwrap();
+                    match act {
+                        // Async so the UI keeps animating; poll() logs the
+                        // result (✓/error banner) and refreshes. map_confirm
+                        // handles the Ok acks and PasswordForgotten.
+                        ConfirmAct::Daemon(req) => {
+                            self.start_async("(confirmed)", OpTag::Generic, req, map_confirm)
+                        }
+                        // Root op: leave the alt-screen and run it under sudo.
+                        ConfirmAct::Sus(s) => self.suspend = Some(s),
+                    }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm = None;
@@ -1726,6 +1897,10 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // Release/recapture the mouse: captured, the wheel scrolls the TUI
+            // but the terminal cannot select text; released, highlight-to-copy
+            // works. A toggle because both are legitimate wants.
+            KeyCode::Char('M') => self.toggle_mouse(),
             // Advanced view: also show the diagnostic/tuning tabs.
             KeyCode::Char('v') => {
                 self.advanced = !self.advanced;
@@ -1921,9 +2096,9 @@ impl App {
             (SC_KEYRING, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the TPM-sealed login password?".into(),
-                    Request::ForgetPassword {
+                    ConfirmAct::Daemon(Request::ForgetPassword {
                         user: self.user.clone(),
-                    },
+                    }),
                 ));
             }
             // Recovery: masked in-TUI entry.
@@ -1944,9 +2119,9 @@ impl App {
             (SC_RECOVERY, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the recovery passphrase? (templates stay encrypted)".into(),
-                    Request::RecoveryForget {
+                    ConfirmAct::Daemon(Request::RecoveryForget {
                         user: self.user.clone(),
-                    },
+                    }),
                 ));
             }
             // Fingerprint.
@@ -1956,6 +2131,29 @@ impl App {
                 } else {
                     self.log('✗', "no fingerprint reader detected");
                 }
+            }
+            // 't' not 'v': 'v' is the global basic/advanced view toggle and
+            // never reaches per-screen actions (found in container E2E).
+            (SC_FINGERPRINT, KeyCode::Char('t')) => {
+                if self.fp.available {
+                    self.suspend = Some(Suspend::FingerprintVerify);
+                } else {
+                    self.log('✗', "no fingerprint reader detected");
+                }
+            }
+            (SC_FINGERPRINT, KeyCode::Char('e')) => {
+                self.log('→', "sudo irlume fingerprint enable: unlock with face OR fingerprint");
+                self.suspend = Some(Suspend::FingerprintEnable);
+            }
+            (SC_FINGERPRINT, KeyCode::Char('d')) => {
+                self.log('→', "sudo irlume fingerprint disable: remove fingerprint from login");
+                self.suspend = Some(Suspend::FingerprintDisable);
+            }
+            (SC_FINGERPRINT, KeyCode::Char('x')) => {
+                self.confirm = Some((
+                    "Delete ALL enrolled fingerprints from the reader?".into(),
+                    ConfirmAct::Sus(Suspend::FingerprintReset),
+                ));
             }
             // Login wiring (PAM): [w] wires the login stack (root, suspends to
             // sudo) from either the wiring tab or the Done dashboard; the last
@@ -1968,6 +2166,29 @@ impl App {
             }
             // Login wiring (PAM): show status outside the alt-screen.
             (SC_PAM, KeyCode::Char('s')) => self.suspend = Some(Suspend::LoginStatus),
+            // Opt-in wiring extras; each logs the exact command then suspends,
+            // so nothing needs to be copied out of the TUI to be run.
+            (SC_PAM, KeyCode::Char('u')) => {
+                self.log('→', "sudo irlume login enable --with-sudo --apply: face approves sudo prompts (password still works)");
+                self.suspend = Some(Suspend::LoginEnableSudo);
+            }
+            (SC_PAM, KeyCode::Char('p')) => {
+                self.log('→', "sudo irlume login enable --with-polkit --apply: face + consent gesture approve app prompts (Bitwarden, pkexec)");
+                self.suspend = Some(Suspend::LoginEnablePolkit);
+            }
+            (SC_PAM, KeyCode::Char('c')) => {
+                self.log('→', "sudo irlume calibrate-closure: teach the eye-closure consent gesture (the head nod needs no calibration)");
+                self.suspend = Some(Suspend::CalibrateClosure);
+            }
+            // Un-wiring is destructive-ish (face login stops working until
+            // re-enabled), so it gets the y/n gate.
+            (SC_PAM, KeyCode::Char('x')) => {
+                self.confirm = Some((
+                    "Un-wire face auth from login/lock/sudo/apps? (password logins are untouched)"
+                        .into(),
+                    ConfirmAct::Sus(Suspend::LoginDisable),
+                ));
+            }
             // Bitwarden app unlock: install its polkit action, only ever on
             // explicit request and only useful when the row says so.
             (SC_PAM, KeyCode::Char('b')) => match crate::bitwarden::tui_state() {
@@ -2010,6 +2231,49 @@ impl App {
                     },
                     map_settings,
                 );
+            }
+            // Third-party PAD model toggle. settings.conf is root-only, so the
+            // readable proxy for "enabled" is installed weights (disable
+            // deletes them). Enabling runs the CLI's own license/provenance
+            // confirm in the cooked terminal: that friction is the policy,
+            // the TUI hosts it rather than bypassing it.
+            (SC_SETTINGS, KeyCode::Char('m')) => {
+                use irlume_common::thirdparty::{weight_state, WeightState, CATALOG};
+                let installed = CATALOG
+                    .iter()
+                    .find(|m| matches!(weight_state(m), WeightState::ChecksumOk));
+                match installed {
+                    Some(m) => {
+                        self.confirm = Some((
+                            format!(
+                                "Disable third-party model '{}'? (its weights are deleted)",
+                                m.name
+                            ),
+                            ConfirmAct::Sus(Suspend::ModelsDisable),
+                        ));
+                    }
+                    None => match CATALOG.first() {
+                        Some(m) => {
+                            self.log('→', format!("sudo irlume models enable {}: the license + provenance confirm runs in the terminal", m.name));
+                            self.suspend = Some(Suspend::ModelsEnable(m.name.to_string()));
+                        }
+                        None => self.log('·', "no third-party models in the catalog"),
+                    },
+                }
+            }
+            // Daemon debug logging toggle; deny scores land in the journal
+            // while on, so remind the user to turn it back off.
+            (SC_REPAIR, KeyCode::Char('t')) => {
+                let on = crate::logs::debug_active();
+                if !on {
+                    self.log('·', "debug logging writes per-stage detail (incl. scores) to the journal; press [t] again to turn it off when done");
+                }
+                self.suspend = Some(Suspend::LogsDebug(!on));
+            }
+            // Origin-aware updater, from the dashboard.
+            (SC_DONE, KeyCode::Char('u')) => {
+                self.log('→', "irlume update: checks the release feed and updates via the channel this install came from");
+                self.suspend = Some(Suspend::Update);
             }
             _ => {}
         }
@@ -2097,10 +2361,10 @@ impl App {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
                     format!("Delete profile '{p}' and all its scans?"),
-                    Request::DeleteProfile {
+                    ConfirmAct::Daemon(Request::DeleteProfile {
                         user: self.user.clone(),
                         profile: p,
-                    },
+                    }),
                 ));
             }
             Some(Row::Scan(pi, si)) => {
@@ -2110,11 +2374,11 @@ impl App {
                 );
                 self.confirm = Some((
                     format!("Delete scan '{s}' from '{p}'?"),
-                    Request::DeleteScan {
+                    ConfirmAct::Daemon(Request::DeleteScan {
                         user: self.user.clone(),
                         profile: p,
                         scan: s,
-                    },
+                    }),
                 ));
             }
             None => {}
@@ -2624,7 +2888,7 @@ impl App {
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  Manage (root): sudo irlume models [enable <name>|disable]",
+                    "  [m] enables or disables one (sudo; the license confirm runs in the terminal)",
                     Style::new().dim(),
                 )),
                 Line::raw(""),
@@ -2822,12 +3086,12 @@ impl App {
                 Style::new().dim(),
             )));
             lines.push(Line::from(Span::styled(
-                "  [a] enroll a finger (interactive).  To unlock with face OR fingerprint:",
+                "  [a] enroll a finger · [t] test a finger · [x] wipe all enrolled fingers",
                 Style::new().dim(),
             )));
             lines.push(Line::from(Span::styled(
-                "  sudo irlume fingerprint enable      (add --fingerprint-only to replace face)",
-                Style::new().fg(ACCENT),
+                "  [e] unlock with face OR fingerprint (sudo) · [d] remove fingerprint from login",
+                Style::new().dim(),
             )));
         } else {
             lines.push(Line::from(Span::styled(
@@ -3360,15 +3624,17 @@ impl App {
         )));
         lines.push(Line::from(vec![
             Span::styled("  face-sudo ", Style::new()),
+            Span::styled("[u]", Style::new().fg(ACCENT)),
             Span::styled(
-                "opt-in, not wired by [w]: sudo irlume login enable --with-sudo --apply",
+                " wire it (opt-in, not part of [w]; face approves sudo prompts)",
                 Style::new().dim(),
             ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("  app prompts ", Style::new()),
+            Span::styled("[p]", Style::new().fg(ACCENT)),
             Span::styled(
-                "opt-in: sudo irlume login enable --with-polkit --apply  (face approves Bitwarden/pkexec)",
+                " wire them (opt-in; face approves Bitwarden/pkexec)",
                 Style::new().dim(),
             ),
         ]));
@@ -3377,7 +3643,7 @@ impl App {
             Style::new().dim(),
         )));
         lines.push(Line::from(Span::styled(
-            "    closure after `sudo irlume calibrate-closure`.  See docs/APP-INTEGRATION.md",
+            "    closure, taught once with [c].  See docs/APP-INTEGRATION.md",
             Style::new().dim(),
         )));
         // Bitwarden app-unlock row: only rendered when Bitwarden is installed
@@ -3410,7 +3676,11 @@ impl App {
         }
         lines.push(Line::from(vec![
             Span::styled("  disable ", Style::new()),
-            Span::styled("sudo irlume login disable --apply", Style::new().dim()),
+            Span::styled("[x]", Style::new().fg(ACCENT)),
+            Span::styled(
+                " un-wires face auth everywhere (confirmed first)",
+                Style::new().dim(),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("  [s]", Style::new().fg(ACCENT)),
@@ -3579,6 +3849,7 @@ impl App {
                 ("r", "re-check"),
                 ("l", "IR test"),
                 ("g", "logs"),
+                ("t", "debug logs"),
             ],
             SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
             SC_PROFILES => &[
@@ -3590,14 +3861,28 @@ impl App {
             SC_IDENTIFY => &[("i", "identify")],
             SC_KEYRING => &[("a", "arm"), ("f", "forget")],
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
-            SC_FINGERPRINT => &[("a", "enroll finger")],
+            SC_FINGERPRINT => &[
+                ("a", "enroll finger"),
+                ("t", "test finger"),
+                ("e", "enable both"),
+                ("d", "disable"),
+                ("x", "reset"),
+            ],
             SC_PAM => &[
                 ("w", "wire login (sudo)"),
-                ("s", "show status"),
+                ("u", "face-sudo"),
+                ("p", "app prompts"),
+                ("c", "calibrate gesture"),
                 ("b", "app unlock"),
+                ("x", "un-wire"),
+                ("s", "show status"),
             ],
-            SC_SETTINGS => &[("enter", "toggle eyes-open"), ("c", "toggle blink")],
-            SC_DONE => &[("w", "wire login"), ("r", "refresh")],
+            SC_SETTINGS => &[
+                ("enter", "toggle eyes-open"),
+                ("c", "toggle blink"),
+                ("m", "3rd-party model"),
+            ],
+            SC_DONE => &[("w", "wire login"), ("u", "update"), ("r", "refresh")],
             _ => &[("r", "refresh")],
         };
         let mut spans = vec![
@@ -4015,6 +4300,7 @@ mod tests {
             activity: Vec::new(),
             input: None,
             confirm: None,
+            mouse_select: false,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -4229,13 +4515,74 @@ mod tests {
     // cut off. It must render inside the wrapping body, with the deliberate
     // [y] yes / [n] no hint from 093dc56.
     #[test]
+    fn parity_keys_route_to_the_right_actions() {
+        // The new per-screen actions: keys must set the right suspend/confirm,
+        // and destructive ones must go through the y/n gate, not act directly.
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char('u'));
+        assert!(matches!(app.suspend, Some(Suspend::LoginEnableSudo)));
+        app.suspend = None;
+        app.on_key(KeyCode::Char('p'));
+        assert!(matches!(app.suspend, Some(Suspend::LoginEnablePolkit)));
+        app.suspend = None;
+        app.on_key(KeyCode::Char('c'));
+        assert!(matches!(app.suspend, Some(Suspend::CalibrateClosure)));
+        app.suspend = None;
+        // Un-wire: confirm first, nothing suspended yet; [y] flips it over.
+        app.on_key(KeyCode::Char('x'));
+        assert!(app.suspend.is_none());
+        assert!(matches!(
+            app.confirm,
+            Some((_, ConfirmAct::Sus(Suspend::LoginDisable)))
+        ));
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::LoginDisable)));
+        app.suspend = None;
+
+        // Fingerprint: reset is confirm-gated; verify honors reader absence.
+        app.screen = SC_FINGERPRINT;
+        app.fp.available = false;
+        app.on_key(KeyCode::Char('t'));
+        assert!(app.suspend.is_none(), "no reader: verify must not suspend");
+        app.fp.available = true;
+        app.on_key(KeyCode::Char('t'));
+        assert!(matches!(app.suspend, Some(Suspend::FingerprintVerify)));
+        app.suspend = None;
+        app.on_key(KeyCode::Char('x'));
+        assert!(matches!(
+            app.confirm,
+            Some((_, ConfirmAct::Sus(Suspend::FingerprintReset)))
+        ));
+        app.on_key(KeyCode::Esc); // cancel path leaves nothing armed
+        assert!(app.confirm.is_none() && app.suspend.is_none());
+
+        // Repair debug toggle and Done updater.
+        app.screen = SC_REPAIR;
+        app.on_key(KeyCode::Char('t'));
+        assert!(matches!(app.suspend, Some(Suspend::LogsDebug(_))));
+        app.suspend = None;
+        app.screen = SC_DONE;
+        app.on_key(KeyCode::Char('u'));
+        assert!(matches!(app.suspend, Some(Suspend::Update)));
+        app.suspend = None;
+
+        // The mouse toggle flips state and logs; second press restores.
+        assert!(!app.mouse_select);
+        app.on_key(KeyCode::Char('M'));
+        assert!(app.mouse_select);
+        app.on_key(KeyCode::Char('M'));
+        assert!(!app.mouse_select);
+    }
+
+    #[test]
     fn confirm_modal_question_wraps_in_body() {
         let mut app = test_app();
         let question = format!(
             "Delete profile '{}ZZTARGETZZ' and all its scans?",
             ["word"; 20].join(" ")
         );
-        app.confirm = Some((question, Request::Ping));
+        app.confirm = Some((question, ConfirmAct::Daemon(Request::Ping)));
         let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let text = rendered(&term);
@@ -4274,7 +4621,10 @@ mod tests {
     #[test]
     fn confirm_ignores_stray_keys_and_cancels_only_on_n_or_esc() {
         let mut app = test_app();
-        app.confirm = Some(("Delete profile 'x'?".into(), Request::Ping));
+        app.confirm = Some((
+            "Delete profile 'x'?".into(),
+            ConfirmAct::Daemon(Request::Ping),
+        ));
         app.on_key(KeyCode::Char('x'));
         app.on_key(KeyCode::Char(' '));
         app.on_key(KeyCode::Enter);
@@ -4284,7 +4634,7 @@ mod tests {
         );
         app.on_key(KeyCode::Char('n'));
         assert!(app.confirm.is_none(), "[n] cancels");
-        app.confirm = Some(("Delete scan 's'?".into(), Request::Ping));
+        app.confirm = Some(("Delete scan 's'?".into(), ConfirmAct::Daemon(Request::Ping)));
         app.on_key(KeyCode::Esc);
         assert!(app.confirm.is_none(), "Esc cancels");
     }
@@ -5049,7 +5399,7 @@ mod tests {
         app.sel = 0;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
-            Some((q, Request::DeleteProfile { user, profile })) => {
+            Some((q, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
                 assert!(q.contains("Delete profile 'p1'"), "got: {q}");
                 assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
             }
@@ -5059,7 +5409,7 @@ mod tests {
         app.sel = 1;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
-            Some((q, Request::DeleteScan { profile, scan, .. })) => {
+            Some((q, ConfirmAct::Daemon(Request::DeleteScan { profile, scan, .. }))) => {
                 assert!(q.contains("Delete scan 's1' from 'p1'"), "got: {q}");
                 assert_eq!((profile.as_str(), scan.as_str()), ("p1", "s1"));
             }
@@ -5081,7 +5431,7 @@ mod tests {
         app.input = None;
         app.on_key(KeyCode::Char('f'));
         match &app.confirm {
-            Some((q, Request::ForgetPassword { user })) => {
+            Some((q, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {
                 assert!(q.contains("Erase the TPM-sealed"), "got: {q}");
                 assert_eq!(user, "testuser");
             }
@@ -5101,7 +5451,7 @@ mod tests {
         app.on_key(KeyCode::Char('f'));
         assert!(matches!(
             app.confirm,
-            Some((_, Request::RecoveryForget { .. }))
+            Some((_, ConfirmAct::Daemon(Request::RecoveryForget { .. })))
         ));
     }
 
@@ -5487,7 +5837,10 @@ mod tests {
     fn confirm_yes_fires_the_stored_request_async() {
         let _sock = dead_socket();
         let mut app = test_app();
-        app.confirm = Some(("Delete profile 'x'?".into(), Request::Ping));
+        app.confirm = Some((
+            "Delete profile 'x'?".into(),
+            ConfirmAct::Daemon(Request::Ping),
+        ));
         app.on_key(KeyCode::Char('y'));
         assert!(app.confirm.is_none());
         assert!(app.op.is_some(), "[y] must run the stored request");

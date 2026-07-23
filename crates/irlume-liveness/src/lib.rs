@@ -562,6 +562,99 @@ pub enum HeadGesture {
     NoFace,
 }
 
+/// Deliberate head-nod consent gesture ([`detect_nod`]): minimum pitch RANGE
+/// (max-min of `pitch_frac`) over the window. A nod swings the head down and
+/// back; a still head barely moves. Validated on a hardware campaign 2026-07-22
+/// (upright + reclined): still heads ranged ≤0.061, deliberate nods 0.057-0.167,
+/// so 0.07 sits just above every still take with margin. Overridable via
+/// `IRLUME_NOD_PITCH_MIN`.
+pub const NOD_PITCH_MIN: f32 = 0.07;
+/// ...and maximum yaw RANGE, so idle LOOKING-AROUND (which swings yaw a lot) and
+/// a head SHAKE are not read as a nod. Campaign: nods ranged ≤0.46 in yaw while
+/// look-around ranged 0.87-6.95, so 0.6 separates them cleanly.
+pub const NOD_YAW_MAX: f32 = 0.6;
+/// Minimum pitch oscillation crossings (the pitch signal must cross above AND
+/// below its median, back and forth, this many times): a real nod is a rhythmic
+/// up-down, not a single look-down-and-hold drift.
+pub const NOD_MIN_CROSSINGS: usize = 2;
+/// A crossing counts only when the pitch moves past this fraction of the take's
+/// pitch range from the median, so sensor noise on a near-still head is ignored.
+pub const NOD_CROSSING_AMP_FRAC: f32 = 0.25;
+/// The window must have at least this many face frames to judge a nod.
+pub const NOD_MIN_FACE_FRAMES: usize = 12;
+
+/// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
+/// pitch swings through a range of at least [`nod_pitch_min`] while the yaw stays
+/// within [`NOD_YAW_MAX`] (not a look-around or shake), oscillating up-and-down
+/// at least [`NOD_MIN_CROSSINGS`] times (not a single drift). Pose-DEFINED, so
+/// unlike the eye-closure gesture it reads the same at any head angle or
+/// lighting, which is why it survives a reclined user where EAR collapses.
+///
+/// `Nod` = the gesture was seen; `None` = a face was tracked but no nod;
+/// `NoFace` = too few face frames to judge. `Shake` is not yet detected (returns
+/// `None` for a shake) pending its own tuning data.
+pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
+    let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
+    let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
+    if pitch.len() < NOD_MIN_FACE_FRAMES {
+        return HeadGesture::NoFace;
+    }
+    let range = |v: &[f32]| -> f32 {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &x in v {
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        hi - lo
+    };
+    let pitch_range = range(&pitch);
+    let yaw_range = range(&yaw);
+    if pitch_range < nod_pitch_min() || yaw_range > NOD_YAW_MAX {
+        return HeadGesture::None;
+    }
+    if nod_crossings(&pitch, pitch_range) >= NOD_MIN_CROSSINGS {
+        HeadGesture::Nod
+    } else {
+        HeadGesture::None
+    }
+}
+
+/// Count how many times the pitch signal alternates between clearly-above and
+/// clearly-below its median (each excursion past `range * NOD_CROSSING_AMP_FRAC`
+/// counts once when it flips sign): the rhythmic up-down of a nod.
+fn nod_crossings(pitch: &[f32], pitch_range: f32) -> usize {
+    let mut sorted = pitch.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let amp = pitch_range * NOD_CROSSING_AMP_FRAC;
+    let (mut crossings, mut sign) = (0usize, 0i8);
+    for &p in pitch {
+        let s = if p > median + amp {
+            1
+        } else if p < median - amp {
+            -1
+        } else {
+            0
+        };
+        if s != 0 && s != sign {
+            if sign != 0 {
+                crossings += 1;
+            }
+            sign = s;
+        }
+    }
+    crossings
+}
+
+/// Minimum nod pitch range, overridable via `IRLUME_NOD_PITCH_MIN`.
+fn nod_pitch_min() -> f32 {
+    std::env::var("IRLUME_NOD_PITCH_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(NOD_PITCH_MIN)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlinkResult {
     /// A natural blink was observed (a clear EAR dip below the open baseline) → live.
@@ -1085,6 +1178,73 @@ fn consent_closure_max_frames() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- head-nod consent gesture (detect_nod) ---
+    fn pose_seq(pitch: &[f32], yaw: &[f32]) -> Vec<PoseSample> {
+        pitch
+            .iter()
+            .zip(yaw)
+            .enumerate()
+            .map(|(i, (&p, &y))| PoseSample {
+                idx: i,
+                pitch_frac: Some(p),
+                yaw_signed: Some(y),
+                bri: 60.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deliberate_nod_is_detected() {
+        // Pitch swings down-up-down (a 2-nod), yaw flat. Range ~0.12, oscillates.
+        let pitch = [
+            0.53, 0.55, 0.60, 0.63, 0.58, 0.52, 0.51, 0.55, 0.62, 0.64, 0.57, 0.52, 0.53, 0.56,
+        ];
+        let yaw = [0.05; 14];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::Nod);
+    }
+
+    #[test]
+    fn still_head_is_not_a_nod() {
+        // Near-flat pitch (range ~0.02), the campaign still-take shape.
+        let pitch = [
+            0.57, 0.568, 0.571, 0.569, 0.57, 0.572, 0.568, 0.57, 0.569, 0.571, 0.57, 0.568, 0.569,
+            0.57,
+        ];
+        let yaw = [0.09; 14];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::None);
+    }
+
+    #[test]
+    fn look_around_is_not_a_nod() {
+        // Big yaw swings (idle glancing): excluded by the yaw gate even though
+        // pitch also moves.
+        let pitch = [
+            0.52, 0.58, 0.63, 0.55, 0.60, 0.51, 0.57, 0.62, 0.54, 0.59, 0.53, 0.61, 0.56, 0.58,
+        ];
+        let yaw = [
+            0.1, 1.2, -0.8, 2.0, -1.5, 0.9, -2.1, 1.8, -0.6, 1.1, -1.9, 0.7, -1.3, 1.6,
+        ];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::None);
+    }
+
+    #[test]
+    fn single_look_down_drift_is_not_a_nod() {
+        // Pitch drifts down and STAYS (looking down to read), never oscillates
+        // back up: high range but too few crossings.
+        let pitch = [
+            0.52, 0.54, 0.57, 0.60, 0.62, 0.63, 0.63, 0.64, 0.63, 0.64, 0.63, 0.64, 0.63, 0.64,
+        ];
+        let yaw = [0.05; 14];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::None);
+    }
+
+    #[test]
+    fn too_few_face_frames_is_noface() {
+        let pitch = [0.5, 0.6, 0.5];
+        let yaw = [0.0; 3];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::NoFace);
+    }
 
     fn fb(cx: f32, cy: f32) -> FaceBox {
         FaceBox { cx, cy, score: 0.9 }

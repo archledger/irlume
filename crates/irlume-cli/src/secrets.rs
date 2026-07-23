@@ -41,9 +41,8 @@ fn which_busctl() -> Option<PathBuf> {
 /// reporting a misleading "keyring unavailable".
 fn have_session_bus() -> bool {
     std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
-        || std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|r| {
-            std::path::Path::new(&r).join("bus").exists()
-        })
+        || std::env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|r| std::path::Path::new(&r).join("bus").exists())
 }
 
 /// Lock state of the login keyring collection.
@@ -179,7 +178,10 @@ mod tests {
         // Plasma 6 (ksecretd) and older KWallet both unlock via pam_kwallet5.
         assert_eq!(unlock_module_for("ksecretd"), Some("pam_kwallet5"));
         assert_eq!(unlock_module_for("kwalletd6"), Some("pam_kwallet5"));
-        assert_eq!(unlock_module_for("gnome-keyring-d"), Some("pam_gnome_keyring"));
+        assert_eq!(
+            unlock_module_for("gnome-keyring-d"),
+            Some("pam_gnome_keyring")
+        );
         // An unknown provider yields no hint rather than a wrong one.
         assert_eq!(unlock_module_for("keepassxc"), None);
     }

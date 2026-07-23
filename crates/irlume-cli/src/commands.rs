@@ -28,8 +28,9 @@ pub fn update(args: &[String]) -> ExitCode {
     println!("[update] installed: {current}");
     println!("[update] install method: {}", origin.describe());
 
-    let latest = latest_release_tag();
-    let newer = match &latest {
+    let release = latest_release();
+    let latest = &release.tag;
+    let newer = match latest {
         Some(tag) => {
             if version_gt(tag.trim_start_matches('v'), &current) {
                 println!("[update] available: {tag}  →  a newer release is out.");
@@ -97,6 +98,7 @@ pub fn update(args: &[String]) -> ExitCode {
             let (deb_arch, _, _) = arch_names();
             println!("  Update the way it was installed (the new .deb from the release page):");
             release_asset_steps(
+                &release.assets,
                 ver,
                 &format!("irlume_{ver}_{deb_arch}.deb"),
                 "sudo apt install",
@@ -413,9 +415,6 @@ fn cmd_stdout(prog: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Best-effort latest release tag from the GitHub API via curl. None if curl is
-/// missing, offline, or the response can't be parsed; the caller degrades to
-/// just printing the update method.
 /// Architecture names for (Debian `.deb`, pacman/tarball, PPA binary index),
 /// derived from the arch THIS binary runs on: a native binary's compile-time
 /// target arch is the machine's arch. Keeps the updater correct on arm64 etc.,
@@ -429,10 +428,25 @@ fn arch_names() -> (&'static str, &'static str, &'static str) {
     }
 }
 
-/// File names of the assets on the latest GitHub release (`.deb`/`.rpm`/pacman
-/// packages). Empty when offline or on an API hiccup; callers treat "empty" as
-/// "couldn't tell" and fall back to a best-effort URL rather than a false negative.
-fn release_assets() -> Vec<String> {
+/// The latest GitHub release, fetched once: tag plus the file names of its
+/// package assets (`.deb`/`.rpm`/pacman packages).
+struct LatestRelease {
+    /// e.g. "v0.5.0". None if curl is missing, offline, or the response can't
+    /// be parsed; the caller degrades to just printing the update method.
+    tag: Option<String>,
+    /// Empty when offline or on an API hiccup; callers treat "empty" as
+    /// "couldn't tell" and fall back to a best-effort URL rather than a false
+    /// negative.
+    assets: Vec<String>,
+}
+
+/// Best-effort fetch of the releases/latest API via curl, parsed for both the
+/// tag and the asset names, so one call serves the whole `update` run.
+fn latest_release() -> LatestRelease {
+    let offline = LatestRelease {
+        tag: None,
+        assets: Vec::new(),
+    };
     let Ok(out) = std::process::Command::new("curl")
         .args([
             "-fsSL",
@@ -442,16 +456,34 @@ fn release_assets() -> Vec<String> {
         ])
         .output()
     else {
-        return Vec::new();
+        return offline;
     };
     if !out.status.success() {
-        return Vec::new();
+        return offline;
     }
     let body = String::from_utf8_lossy(&out.stdout);
+    LatestRelease {
+        tag: parse_release_tag(&body),
+        assets: parse_package_assets(&body),
+    }
+}
+
+/// Tiny scan for `"tag_name": "vX.Y.Z"`; avoids a JSON dependency for one field.
+fn parse_release_tag(body: &str) -> Option<String> {
+    let key = "\"tag_name\"";
+    let i = body.find(key)?;
+    let after = &body[i + key.len()..];
+    let colon = after.find(':')?;
+    let q1 = after[colon..].find('"')? + colon + 1;
+    let q2 = after[q1..].find('"')? + q1;
+    Some(after[q1..q2].to_string())
+}
+
+/// Scan every `"name": "…"` and keep the package-file-looking ones (the release
+/// title is also a "name" but doesn't end in a package extension).
+fn parse_package_assets(body: &str) -> Vec<String> {
     let mut names = Vec::new();
-    let mut rest: &str = &body;
-    // Scan every "name": "…" and keep the package-file-looking ones (the release
-    // title is also a "name" but doesn't end in a package extension).
+    let mut rest: &str = body;
     while let Some(i) = rest.find("\"name\":") {
         rest = &rest[i + 7..];
         let Some(q1) = rest.find('"') else { break };
@@ -469,8 +501,7 @@ fn release_assets() -> Vec<String> {
 /// Print download+install steps for a release asset, but only if the running
 /// architecture's asset actually exists on the release; else say so honestly
 /// instead of printing a dead link.
-fn release_asset_steps(ver: &str, asset: &str, install_cmd: &str) {
-    let assets = release_assets();
+fn release_asset_steps(assets: &[String], ver: &str, asset: &str, install_cmd: &str) {
     if assets.is_empty() || assets.iter().any(|a| a == asset) {
         println!(
             "    curl -fLO https://github.com/archledger/irlume/releases/download/v{ver}/{asset}"
@@ -483,30 +514,6 @@ fn release_asset_steps(ver: &str, asset: &str, install_cmd: &str) {
         );
         println!("  Build from source, or watch https://github.com/archledger/irlume/releases");
     }
-}
-
-fn latest_release_tag() -> Option<String> {
-    let out = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "8",
-            "https://api.github.com/repos/archledger/irlume/releases/latest",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let body = String::from_utf8_lossy(&out.stdout);
-    // Tiny scan for "tag_name": "vX.Y.Z"; avoids a JSON dependency for one field.
-    let key = "\"tag_name\"";
-    let i = body.find(key)?;
-    let after = &body[i + key.len()..];
-    let colon = after.find(':')?;
-    let q1 = after[colon..].find('"')? + colon + 1;
-    let q2 = after[q1..].find('"')? + q1;
-    Some(after[q1..q2].to_string())
 }
 
 /// True if dotted version `a` is strictly greater than `b` (numeric per field,
@@ -573,6 +580,7 @@ pub fn status(args: &[String]) -> ExitCode {
             profiles,
             require_eyes_open,
             require_challenge,
+            ..
         }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
             println!(
@@ -1119,10 +1127,13 @@ pub fn setup(args: &[String]) -> ExitCode {
         Ok(Response::Enrollment { ref profiles, .. }) if !profiles.is_empty());
     if enrolled {
         println!("  already enrolled.");
-        if yes_no("  Re-enroll from scratch (wipes existing profiles)?", false) {
+        if yes_no(
+            "  Re-enroll from scratch (wipes existing profiles)?",
+            /* default_yes: */ false,
+        ) {
             run_enroll(&user, true);
         }
-    } else if yes_no("  Enroll your face now?", true) {
+    } else if yes_no("  Enroll your face now?", /* default_yes: */ true) {
         run_enroll(&user, false);
     }
 
@@ -1130,7 +1141,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("\n[3/6] Keyring unlock (face login opens your wallet)");
     if yes_no(
         "  Arm keyring unlock now (you'll enter your login password)?",
-        true,
+        /* default_yes: */ true,
     ) {
         if let Some(pw) = prompt_login_password() {
             match daemon_request(&Request::SealPassword {
@@ -1145,7 +1156,10 @@ pub fn setup(args: &[String]) -> ExitCode {
 
     // 4. Recovery passphrase + template encryption.
     println!("\n[4/6] Recovery passphrase (encrypts templates; backstop for TPM/firmware changes)");
-    if yes_no("  Set a recovery passphrase now?", true) {
+    if yes_no(
+        "  Set a recovery passphrase now?",
+        /* default_yes: */ true,
+    ) {
         println!("  (run `irlume recovery setup`; it prompts for a separate recovery passphrase)");
     }
 
@@ -1272,8 +1286,8 @@ SYSTEM INTEGRATION
 #[cfg(test)]
 mod origin_tests {
     use super::{
-        arch_names, gz_lists_irlume, installed_version, is_copr_repo, latest_release_tag,
-        ppa_serves, release_assets, ubuntu_codename, version_gt, InstallOrigin,
+        arch_names, gz_lists_irlume, installed_version, is_copr_repo, latest_release, ppa_serves,
+        ubuntu_codename, version_gt, InstallOrigin,
     };
 
     #[test]
@@ -1455,9 +1469,10 @@ esac"#,
         let old_path = std::env::var("PATH").unwrap();
         std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
 
-        assert_eq!(latest_release_tag().as_deref(), Some("v9.9.9"));
+        let rel = latest_release();
+        assert_eq!(rel.tag.as_deref(), Some("v9.9.9"));
         assert_eq!(
-            release_assets(),
+            rel.assets,
             vec![
                 "irlume_9.9.9_amd64.deb".to_string(),
                 "irlume-9.9.9-1.fc44.x86_64.rpm".to_string(),
@@ -1468,8 +1483,9 @@ esac"#,
 
         // Offline (curl connect failure): unknown, never a false answer.
         fake_tool(&dir, "curl", "exit 7");
-        assert_eq!(latest_release_tag(), None);
-        assert!(release_assets().is_empty());
+        let rel = latest_release();
+        assert_eq!(rel.tag, None);
+        assert!(rel.assets.is_empty());
 
         std::env::set_var("PATH", old_path);
         let _ = std::fs::remove_dir_all(&dir);

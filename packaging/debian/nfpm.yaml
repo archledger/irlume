@@ -60,6 +60,13 @@ contents:
     dst: /usr/lib/systemd/system/irlumed.service
   - src: ../../.deb-staging/10-ort.conf
     dst: /usr/lib/systemd/system/irlumed.service.d/10-ort.conf
+  # Self-heal: re-applies irlume's greeter PAM lines if a distro update
+  # (pam-auth-update, a fresh vendor PAM file) strips them. Enabled in
+  # postinstall; no-op until `irlume login enable` writes its marker.
+  - src: ../systemd/irlume-reconcile.path
+    dst: /usr/lib/systemd/system/irlume-reconcile.path
+  - src: ../systemd/irlume-reconcile.service
+    dst: /usr/lib/systemd/system/irlume-reconcile.service
   # AppArmor profile (ships in complain mode; see the profile header)
   - src: ../apparmor/usr.bin.irlumed
     dst: /etc/apparmor.d/usr.bin.irlumed

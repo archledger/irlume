@@ -12,6 +12,7 @@ path = "src/main.rs"
 irlume-common.workspace = true
 irlume-auth.workspace = true
 irlume-core.workspace = true
+irlume-liveness.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 sha2.workspace = true

@@ -51,12 +51,6 @@ pub struct Engine {
     /// RGB-only device → face runs in CONVENIENCE tier (lock-screen unlock only,
     /// RGB-only liveness, never releases credentials / logs in / elevates).
     ir_available: bool,
-    /// Set per-[`authenticate`] call from the PAM service's operation class:
-    /// true while serving a service that forces the passive blink gate even
-    /// without the per-enrollment opt-in (polkit prompts; see
-    /// `biopolicy::requires_consent_gesture`). Unlike the opt-in flag, a
-    /// forced gate FAILS CLOSED when it can't run (no IR / no mesh model).
-    forced_consent: bool,
 }
 
 /// Assurance tier of this engine, derived from the available camera hardware.
@@ -69,7 +63,8 @@ pub struct Assessment {
     /// RGB-face embedding (visible light), the primary identity.
     pub embedding: Option<[f32; EMBED_DIM]>,
     /// IR-face embedding (for dark operation), if a face was found in IR:
-    /// adapter-transformed (256-D) when the IR adapter is loaded, else raw 512-D.
+    /// adapter-transformed when the IR adapter is loaded (the deployed adapter
+    /// contract is 512→512, see [`Engine::ir_dim`]), else raw 512-D.
     pub ir_embedding: Option<Vec<f32>>,
     pub signals: Signals,
     pub ir_depth: f32,
@@ -91,6 +86,70 @@ pub struct Outcome {
     pub live: bool,
     pub score: f32,
     pub reason: String,
+    /// Typed class of this outcome, set where the outcome is built, so
+    /// [`presence_retryable`] branches on a field instead of parsing the
+    /// `reason` prose. Engine-internal: the daemon maps `Outcome` to the wire
+    /// `Response` field by field, and `kind` never crosses the socket.
+    pub kind: OutcomeKind,
+}
+
+/// Grant/failure class of an [`Outcome`]. The
+/// `grace_retries_only_presence_failures` test pins the kind assigned to every
+/// reason shape the engine produces against the legacy prefix contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    /// Access granted.
+    Granted,
+    /// No usable face in frame (nobody there, or the detector missed).
+    NoFace,
+    /// Liveness gate returned Uncertain (framing/quality, not an attack).
+    Uncertain,
+    /// Spoof verdict raised only because RGB saw a face and IR did not. Both a
+    /// screen attack and a genuine user mid-settle produce it, so it is the
+    /// one Spoof class the grace window may retry (see [`presence_retryable`]).
+    SpoofNoIrFace,
+    /// Any other Spoof verdict (flat/2D, PAD cue): a caught attack.
+    Spoof,
+    /// A real match verdict landed below the threshold.
+    BelowThreshold,
+    /// Every other refusal: pre-camera policy/state denials, camera-binding
+    /// mismatches, challenge-gate failures.
+    OtherDeny,
+}
+
+impl Outcome {
+    /// Refusal with no live face: `live: false, score: 0.0`.
+    fn deny(kind: OutcomeKind, reason: impl Into<String>) -> Self {
+        Self {
+            granted: false,
+            live: false,
+            score: 0.0,
+            reason: reason.into(),
+            kind,
+        }
+    }
+
+    /// Refusal of a live face that produced a real match score.
+    fn deny_live(kind: OutcomeKind, score: f32, reason: impl Into<String>) -> Self {
+        Self {
+            granted: false,
+            live: true,
+            score,
+            reason: reason.into(),
+            kind,
+        }
+    }
+
+    /// Grant: always live, kind [`OutcomeKind::Granted`].
+    fn grant(score: f32, reason: impl Into<String>) -> Self {
+        Self {
+            granted: true,
+            live: true,
+            score,
+            reason: reason.into(),
+            kind: OutcomeKind::Granted,
+        }
+    }
 }
 
 /// The result of a 1:N identification ("who is this?"). `user`/`profile` are set
@@ -105,9 +164,19 @@ pub struct IdentifyOutcome {
     pub reason: String,
 }
 
-/// One live enrollment scan: (rgb embedding, optional ir embedding, depth,
-/// brightness, signed pitch).
-type Scan = (Vec<f32>, Option<Vec<f32>>, f32, f32, f32);
+/// One live enrollment scan, as captured by [`Engine::capture_scans`].
+struct CapturedScan {
+    /// RGB-face embedding, the primary identity template.
+    rgb: Vec<f32>,
+    /// IR-face embedding, when an IR face was captured (engine `ir_space`).
+    ir: Option<Vec<f32>>,
+    /// IR center/edge depth ratio at capture (feeds the per-user depth floor).
+    depth: f32,
+    /// Mean IR face brightness at capture (0-255 grey).
+    brightness: f32,
+    /// Head pitch fraction at capture (calibrates this user's pitch neutral).
+    pitch: f32,
+}
 
 /// Presence grace window after the consent gesture, milliseconds, for the
 /// login and lock-screen path. The user pressed Enter (usually already in
@@ -160,31 +229,88 @@ fn consent_gesture_enabled() -> bool {
     !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
 }
 
-/// Presence-class failure: the attempt never reached a match verdict because
-/// no usable face was in frame (absent, off-angle, or missing in one
-/// spectrum). These are the ONLY outcomes the grace window may retry: they
-/// are FAR-neutral (no matcher ran) and give an attacker nothing.
+/// Which consent gesture(s) the polkit gate accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsentGesture {
+    /// Head nod only.
+    Nod,
+    /// Eye closure only.
+    Closure,
+    /// Accept either (the default): the user does whichever suits their position.
+    Either,
+}
+
+/// The configured consent-gesture mode: `consent_gesture=nod|closure` in
+/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset / any
+/// other value accepts EITHER.
+fn consent_gesture_mode() -> ConsentGesture {
+    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+        "nod" => ConsentGesture::Nod,
+        "closure" => ConsentGesture::Closure,
+        _ => ConsentGesture::Either,
+    };
+    if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
+        return parse(&v);
+    }
+    irlume_common::config::read_kv("settings.conf", "consent_gesture")
+        .map(|v| parse(&v))
+        .unwrap_or(ConsentGesture::Either)
+}
+
+/// Whether this PAM service forces the passive blink gate even without the
+/// per-enrollment opt-in (polkit prompts; see
+/// `biopolicy::requires_consent_gesture`). Unlike the opt-in flag, a forced
+/// gate FAILS CLOSED when it can't run (no IR / no mesh model). Computed per
+/// [`Engine::authenticate`] call and threaded down explicitly, so a polkit
+/// verify can never leak the flag into a later login/lock verify.
+fn forced_consent_for(service: Option<&str>) -> bool {
+    service.is_some_and(|s| {
+        irlume_core::biopolicy::requires_consent_gesture(irlume_core::biopolicy::classify(
+            s,
+            irlume_core::biopolicy::SessionState::Cold,
+        )) && consent_gesture_enabled()
+    })
+}
+
+/// True for a presence-class failure: the attempt never reached a match
+/// verdict because no usable face was in frame (absent, off-angle, or missing
+/// in one spectrum).
 ///
-/// The `no face in IR` Spoof is included deliberately. It fires when RGB sees a
-/// face but IR does not: BOTH a screen/print attack (no 850nm return) AND a
-/// genuine user mid-settle (IR field/timing hasn't caught them yet). Retrying
-/// is safe against the attack: a real screen never grows an IR face, so it
-/// keeps producing this Spoof until the window expires and the denial stands;
-/// a genuine user's IR catches up within a retry or two. Live-found
-/// 2026-07-15: without this, settling into frame can be denied on the
-/// transient mismatch. Other Spoof reasons (flat/depth/2D) are NOT retried,
-/// and a below-threshold MATCH is never retried (that would multiply FAR).
-/// True when an outcome is a mere "no usable face yet" (nobody in frame, or
-/// liveness inconclusive): the grace loop retries these, and the daemon
-/// throttle must NOT count them as failed attempts. A real rejection (wrong
-/// person, a caught spoof that produced a live face) is NOT presence-retryable.
+/// These are the ONLY outcomes the grace window may retry: they are
+/// FAR-neutral (no matcher ran) and give an attacker nothing. The daemon
+/// throttle must NOT count them as failed attempts either. A real rejection
+/// (wrong person, a caught spoof that produced a live face) is NOT
+/// presence-retryable, and a below-threshold MATCH is never retried (that
+/// would multiply FAR).
+///
+/// The `no face in IR` Spoof ([`OutcomeKind::SpoofNoIrFace`]) is included
+/// deliberately. It fires when RGB sees a face but IR does not: BOTH a
+/// screen/print attack (no 850nm return) AND a genuine user mid-settle (IR
+/// field/timing hasn't caught them yet). Retrying is safe against the attack:
+/// a real screen never grows an IR face, so it keeps producing this Spoof
+/// until the window expires and the denial stands; a genuine user's IR
+/// catches up within a retry or two. Live-found 2026-07-15: without this,
+/// settling into frame can be denied on the transient mismatch. Other Spoof
+/// reasons (flat/depth/2D) are NOT retried.
 pub fn presence_retryable(o: &Outcome) -> bool {
-    !o.granted
-        && !o.live
-        && (o.reason.starts_with("no face:")
-            || o.reason.starts_with("liveness Uncertain:")
-            || o.reason.starts_with("dark liveness Uncertain:")
-            || o.reason.starts_with("liveness Spoof: no face in IR"))
+    matches!(
+        o.kind,
+        OutcomeKind::NoFace | OutcomeKind::Uncertain | OutcomeKind::SpoofNoIrFace
+    )
+}
+
+/// Kind of a non-Live cross-spectrum gate verdict on the RGB primary path.
+/// The `no face in IR` reason is singled out because it is the retryable
+/// RGB-yes/IR-no transient; the prefix is pinned against the string
+/// irlume-liveness produces by `grace_retries_only_presence_failures`.
+fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
+    match verdict {
+        Verdict::Uncertain => OutcomeKind::Uncertain,
+        Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
+        Verdict::Spoof => OutcomeKind::Spoof,
+        // Callers only classify rejections; a Live verdict never reaches here.
+        Verdict::Live => OutcomeKind::OtherDeny,
+    }
 }
 
 /// Calibration-aware IR match result (see [`ir_match_in`]).
@@ -287,6 +413,12 @@ pub fn thirdparty_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f
     verdict == Verdict::Live && p_fake.is_some_and(|p| p >= threshold)
 }
 
+/// Highest-scoring detection: the face every pipeline stage keys on when a
+/// frame holds more than one.
+fn top_detection(faces: &[Detection]) -> Option<&Detection> {
+    faces.iter().max_by(|a, b| a.score.total_cmp(&b.score))
+}
+
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         Ok(Self {
@@ -301,7 +433,6 @@ impl Engine {
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
             ir_available: irlume_camera::capabilities().ir_pair,
-            forced_consent: false,
         })
     }
 
@@ -523,10 +654,7 @@ impl Engine {
             height: rgb.height,
         };
         let rgb_faces = self.det.detect(&rgb_view)?;
-        let rgb_top = rgb_faces
-            .iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score))
-            .cloned();
+        let rgb_top = top_detection(&rgb_faces).cloned();
         let (rgb_brightness, rgb_specular) = rgb_top
             .as_ref()
             .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox))
@@ -660,10 +788,7 @@ impl Engine {
             width: rgb.width,
             height: rgb.height,
         })?;
-        let mut rgb_top = rgb_faces
-            .iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score))
-            .cloned();
+        let mut rgb_top = top_detection(&rgb_faces).cloned();
         irlume_common::dlog!(
             "assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
             rgb.width,
@@ -700,10 +825,7 @@ impl Engine {
             height: ir.height,
         };
         let ir_faces = self.det.detect(&ir_view)?;
-        let mut ir_top = ir_faces
-            .iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score))
-            .cloned();
+        let mut ir_top = top_detection(&ir_faces).cloned();
         irlume_common::dlog!(
             "assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
             ir.width,
@@ -738,10 +860,7 @@ impl Engine {
                 width: rgb.width,
                 height: rgb.height,
             })?;
-            rgb_top = rgb_faces
-                .iter()
-                .max_by(|a, b| a.score.total_cmp(&b.score))
-                .cloned();
+            rgb_top = top_detection(&rgb_faces).cloned();
             irlume_common::dlog!(
                 "assess: rgb (recaptured) {}x{}, faces={} top-det={:.2}",
                 rgb.width,
@@ -888,21 +1007,35 @@ impl Engine {
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
     /// natural blink → Blinked, static vinyl banner → NoBlink.
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
-        // Raw frame rate (~15 fps, no de-strobe burst): the detector separates
-        // emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
-        // spans only 2–3 raw frames; halving the rate loses it (measured 2026-07-01).
-        const SAMPLES: usize = 75; // ~5s window
-        const BURST: usize = 1;
-        let Some(mesh) = self.mesh.as_mut() else {
-            // No landmark model: can't run the passive gate. Signal NoEyes so the
-            // caller can decide (challenge_if_required skips when mesh is absent).
-            return Ok(irlume_liveness::BlinkResult::NoEyes);
-        };
-        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, SAMPLES, BURST)?;
-        // Per-frame EAR (smaller eye). Frames with no detected face carry ear=None
-        // (a missed detection must not masquerade as a blink) but keep their
-        // brightness so the detector can classify the emitter strobe.
-        let mut samples = Vec::with_capacity(frames.len());
+        // ~5s window at the raw ~15 fps rate.
+        const SAMPLES: usize = 75;
+        // No landmark model → no samples → `detect_blink` reads NoEyes, which is
+        // the historical no-mesh result (the caller decides what to do with it).
+        let samples = self.capture_ear_samples(SAMPLES)?;
+        Ok(irlume_liveness::detect_blink(&samples))
+    }
+
+    /// Capture a temporal IR sequence and compute the per-frame [`irlume_liveness::EarSample`]s
+    /// that the blink / deliberate-closure detectors consume. Public so the
+    /// blink-tuning capture tool records the EXACT samples the live gate sees.
+    ///
+    /// Raw frame rate (~15 fps, no de-strobe burst): the detector separates
+    /// emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
+    /// spans only 2-3 raw frames; halving the rate loses it (measured
+    /// 2026-07-01). Frames with no detected face carry `ear = None` (a missed
+    /// detection must not masquerade as a blink) but keep their brightness so the
+    /// detector can classify the emitter strobe. Returns an empty vec when the
+    /// FaceMesh model is not loaded (the gate cannot run).
+    pub fn capture_ear_samples(
+        &mut self,
+        samples: usize,
+    ) -> irlume_common::Result<Vec<irlume_liveness::EarSample>> {
+        if self.mesh.is_none() {
+            return Ok(Vec::new());
+        }
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
+        let mesh = self.mesh.as_mut().expect("mesh present (checked above)");
+        let mut out = Vec::with_capacity(frames.len());
         for (i, f) in frames.iter().enumerate() {
             let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
             let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
@@ -913,12 +1046,8 @@ impl Engine {
             };
             let mut ear = None;
             let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
-            if let Some(t) = self
-                .det
-                .detect(&view)?
-                .into_iter()
-                .max_by(|a, b| a.score.total_cmp(&b.score))
-            {
+            let faces = self.det.detect(&view)?;
+            if let Some(t) = top_detection(&faces) {
                 let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
                 let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
                 let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
@@ -930,7 +1059,7 @@ impl Engine {
                 // landmarks (the second liveness cue: collapses on a real blink).
                 contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
             }
-            samples.push(irlume_liveness::EarSample {
+            out.push(irlume_liveness::EarSample {
                 idx: i,
                 ear,
                 bri,
@@ -940,7 +1069,172 @@ impl Engine {
                 contrast,
             });
         }
-        Ok(irlume_liveness::detect_blink(&samples))
+        Ok(out)
+    }
+
+    /// Capture a temporal IR sequence and record per-frame HEAD POSE (pitch and
+    /// yaw from the DETECTOR's 5-point landmarks) for the head-nod consent
+    /// gesture. Needs only the detector, not the FaceMesh, so it works at head
+    /// angles and in IR-only light where the eye-based EAR gesture collapses. A
+    /// frame with no detected face carries `None` pose.
+    pub fn capture_pose_samples(
+        &mut self,
+        samples: usize,
+    ) -> irlume_common::Result<Vec<irlume_liveness::PoseSample>> {
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
+        let mut out = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
+            let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
+            let view = align::RgbView {
+                data: &grey_rgb,
+                width: f.width,
+                height: f.height,
+            };
+            let (mut pitch_frac, mut yaw_signed) = (None, None);
+            let faces = self.det.detect(&view)?;
+            if let Some(t) = top_detection(&faces) {
+                let pose = irlume_vision::head_pose(&t.landmarks);
+                pitch_frac = Some(pose.pitch_frac);
+                yaw_signed = Some(pose.yaw_signed);
+            }
+            out.push(irlume_liveness::PoseSample {
+                idx: i,
+                pitch_frac,
+                yaw_signed,
+                bri,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Process one decoded IR frame into BOTH a head-pose sample (nod gesture)
+    /// and an EAR sample (closure gesture): the detector runs always (pose), the
+    /// FaceMesh only when loaded (EAR, else `None`). Shared by the fixed-window
+    /// capture and the rolling consent watch.
+    fn frame_to_consent_samples(
+        &mut self,
+        frame: &irlume_camera::Frame,
+        idx: usize,
+    ) -> irlume_common::Result<(irlume_liveness::PoseSample, irlume_liveness::EarSample)> {
+        let bri =
+            frame.data.iter().map(|&p| p as f32).sum::<f32>() / frame.data.len().max(1) as f32;
+        let grey_rgb = irlume_camera::grey_to_rgb(&frame.data);
+        let view = align::RgbView {
+            data: &grey_rgb,
+            width: frame.width,
+            height: frame.height,
+        };
+        let (mut pitch_frac, mut yaw_signed) = (None, None);
+        let mut ear = None;
+        let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
+        let faces = self.det.detect(&view)?;
+        if let Some(t) = top_detection(&faces) {
+            let pose = irlume_vision::head_pose(&t.landmarks);
+            pitch_frac = Some(pose.pitch_frac);
+            yaw_signed = Some(pose.yaw_signed);
+            cx = (t.bbox[0] + t.bbox[2]) * 0.5;
+            cy = (t.bbox[1] + t.bbox[3]) * 0.5;
+            fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
+            if let Some(mesh) = self.mesh.as_mut() {
+                let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
+                let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
+                let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
+                ear = Some(l.min(r));
+                contrast = eye_glint_contrast(&frame.data, frame.width, frame.height, &t.landmarks);
+            }
+        }
+        Ok((
+            irlume_liveness::PoseSample {
+                idx,
+                pitch_frac,
+                yaw_signed,
+                bri,
+            },
+            irlume_liveness::EarSample {
+                idx,
+                ear,
+                bri,
+                cx,
+                cy,
+                fsize,
+                contrast,
+            },
+        ))
+    }
+
+    /// Capture ONE IR sequence and record BOTH head pose and eye EAR per frame,
+    /// so the consent gate can accept whichever gesture the user performs.
+    #[allow(clippy::type_complexity)]
+    pub fn capture_consent_samples(
+        &mut self,
+        samples: usize,
+    ) -> irlume_common::Result<(
+        Vec<irlume_liveness::PoseSample>,
+        Vec<irlume_liveness::EarSample>,
+    )> {
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
+        let mut poses = Vec::with_capacity(frames.len());
+        let mut ears = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let (pose, ear) = self.frame_to_consent_samples(f, i)?;
+            poses.push(pose);
+            ears.push(ear);
+        }
+        Ok((poses, ears))
+    }
+
+    /// Rolling consent watch: drive a held-open IR stream, process each frame,
+    /// and return as SOON as an accepted gesture is seen (`nod` or, when
+    /// `check_closure` supplies a usable calibration, an eye closure), instead of
+    /// draining a fixed window and letting the polkit agent re-run the whole
+    /// prompt. Bounded by `max_frames`. Returns whether a gesture was accepted.
+    /// `check_closure` is `Some(cal)` only when the closure gesture is eligible.
+    fn consent_watch(
+        &mut self,
+        max_frames: usize,
+        allow_nod: bool,
+        closure_cal: Option<irlume_liveness::ClosureCalibration>,
+    ) -> irlume_common::Result<bool> {
+        // Re-check the accumulated gestures every few frames (not every frame:
+        // the detectors need a small window, and running them per frame is waste).
+        const CHECK_EVERY: usize = 6;
+        let ir_dev = self.ir_dev.clone();
+        let mut poses: Vec<irlume_liveness::PoseSample> = Vec::new();
+        let mut ears: Vec<irlume_liveness::EarSample> = Vec::new();
+        let mut err: Option<irlume_common::Error> = None;
+        let hit = irlume_camera::capture_ir_streaming(&ir_dev, max_frames, |sf| {
+            let idx = poses.len();
+            match self.frame_to_consent_samples(&sf.frame, idx) {
+                Ok((pose, ear)) => {
+                    poses.push(pose);
+                    ears.push(ear);
+                }
+                Err(e) => {
+                    err = Some(e);
+                    return std::ops::ControlFlow::Break(true);
+                }
+            }
+            if !poses.len().is_multiple_of(CHECK_EVERY) {
+                return std::ops::ControlFlow::Continue(());
+            }
+            if allow_nod && irlume_liveness::detect_nod(&poses) == irlume_liveness::HeadGesture::Nod
+            {
+                return std::ops::ControlFlow::Break(true);
+            }
+            if let Some(cal) = &closure_cal {
+                if irlume_liveness::detect_deliberate_closure(&ears, cal)
+                    == irlume_liveness::BlinkResult::Blinked
+                {
+                    return std::ops::ControlFlow::Break(true);
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(hit == Some(true))
     }
 
     /// If the passive blink gate is wanted and we're about to grant, require a
@@ -954,24 +1248,25 @@ impl Engine {
     fn challenge_if_required(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
+        forced_consent: bool,
         outcome: Outcome,
     ) -> irlume_common::Result<Outcome> {
-        if !outcome.granted || !(enr.require_challenge || self.forced_consent) {
+        if !outcome.granted {
             return Ok(outcome);
         }
-        // The gate needs IR frames and the FaceMesh model. When either is
-        // missing, the per-enrollment OPT-IN keeps its historical skip (never
-        // lock a user out of an undeployed model), but a FORCED gate (polkit
-        // consent) fails closed: the blink is the whole point of allowing face
-        // on that service, so without it the grant is withdrawn and PAM
-        // cascades to the password.
+        // A forced consent (polkit) requires the DELIBERATE eye-closure gesture,
+        // not a passive natural blink: a blink is liveness, the closure is
+        // intent. It fails closed.
+        if forced_consent {
+            return self.consent_gesture_gate(enr, outcome);
+        }
+        // Opt-in per-enrollment gate (ADR-0002): a natural blink, unchanged. When
+        // IR or the FaceMesh model is missing it logs and skips rather than lock
+        // a user out of an undeployed model.
+        if !enr.require_challenge {
+            return Ok(outcome);
+        }
         if !self.ir_available || self.mesh.is_none() {
-            if self.forced_consent {
-                return Ok(Outcome {
-                    granted: false, live: outcome.live, score: outcome.score,
-                    reason: "consent gesture required for this service but the blink gate can't run (IR or face_landmark.onnx missing); use your password".into(),
-                });
-            }
             if self.ir_available {
                 eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded; skipping (set IRLUME_MESH_MODEL)");
             }
@@ -980,22 +1275,98 @@ impl Engine {
         use irlume_liveness::BlinkResult;
         Ok(match self.run_passive_liveness()? {
             BlinkResult::Blinked => outcome,
-            BlinkResult::NoBlink => Outcome {
-                granted: false, live: true, score: outcome.score,
-                reason: "passive liveness: no natural blink in the window; look at the camera a moment longer".into(),
-            },
+            BlinkResult::NoBlink => Outcome::deny_live(
+                OutcomeKind::OtherDeny,
+                outcome.score,
+                "passive liveness: no natural blink in the window; look at the camera a moment longer",
+            ),
             BlinkResult::NoEyes => Outcome {
                 granted: false, live: false, score: outcome.score,
                 reason: "passive liveness: no live eyes (looks like a print/no face)".into(),
+                kind: OutcomeKind::OtherDeny,
             },
         })
+    }
+
+    /// The forced consent gate: require a DELIBERATE gesture before approving a
+    /// polkit prompt, accepting EITHER a head NOD or an eye CLOSURE so the user
+    /// does whichever suits their position. One capture feeds both detectors:
+    ///
+    /// * A head nod (pose-defined) always works and needs no calibration, so it
+    ///   is the universal path, including reclined where EAR collapses.
+    /// * An eye closure ("close ~1s, then open") is ALSO accepted when the user
+    ///   has calibrated it and the FaceMesh is loaded, for those who prefer it
+    ///   sitting upright. It cannot false-fire reclined (EAR stays flat, no
+    ///   reopen), so accepting it is safe.
+    ///
+    /// `consent_gesture=nod` or `=closure` in settings.conf restricts to one;
+    /// unset accepts either. FAILS CLOSED (PAM cascades to the password) when no
+    /// accepted gesture is seen.
+    fn consent_gesture_gate(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        outcome: Outcome,
+    ) -> irlume_common::Result<Outcome> {
+        // Rolling watch deadline: keep watching up to ~8s and return the INSTANT
+        // a gesture appears, so the user can nod whenever without a fixed 5s
+        // window to miss (which made the fixed-window version slow and unreliable
+        // as the polkit agent re-ran the whole prompt). A quick nod returns in
+        // ~2-3s; only a no-gesture window pays the full deadline before the
+        // password fallback. `IRLUME_CONSENT_MAX_FRAMES` overrides.
+        let max_frames = std::env::var("IRLUME_CONSENT_MAX_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= 24)
+            .unwrap_or(120);
+        let (live, score) = (outcome.live, outcome.score);
+        let deny = |reason: &str| Outcome {
+            granted: false,
+            live,
+            score,
+            reason: reason.into(),
+            kind: OutcomeKind::OtherDeny,
+        };
+        if !self.ir_available {
+            return Ok(deny(
+                "consent gesture required but no IR camera; use your password",
+            ));
+        }
+        let mode = consent_gesture_mode();
+        let allow_nod = mode != ConsentGesture::Closure;
+        // The eye closure is eligible only when not restricted to nod, the mesh
+        // is loaded, and the user has a usable calibration.
+        let closure_cal = (mode != ConsentGesture::Nod && self.mesh.is_some())
+            .then(|| {
+                enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
+                    let cal = irlume_liveness::ClosureCalibration {
+                        ear_open,
+                        ear_closed,
+                    };
+                    cal.is_usable().then_some(cal)
+                })
+            })
+            .flatten();
+        if self.consent_watch(max_frames, allow_nod, closure_cal)? {
+            Ok(outcome)
+        } else {
+            Ok(deny(match mode {
+                ConsentGesture::Nod => "nod your head to approve",
+                ConsentGesture::Closure => {
+                    "close your eyes for about a second, then open, to approve"
+                }
+                ConsentGesture::Either => {
+                    "nod your head to approve (or, if you've calibrated it, close your eyes ~1s then open)"
+                }
+            }))
+        }
     }
 
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),
     /// then 1:N cosine match against every scan in every enrolled face profile
     /// (any enrolled face unlocks). Threshold scales with the total scan count.
-    /// Consent-gesture authenticate with a presence GRACE WINDOW. The gesture
-    /// (blank password + Enter) already granted camera consent, so instead of
+    ///
+    /// Runs under a presence GRACE WINDOW. The consent gesture (blank
+    /// password + Enter) already granted camera consent, so instead of
     /// failing instantly when the user is not yet in frame (leaning over the
     /// keyboard they just pressed), capture attempts repeat until a face is
     /// assessed or [`GRACE_WINDOW_MS`] elapses.
@@ -1014,22 +1385,15 @@ impl Engine {
         user: &str,
         service: Option<&str>,
     ) -> irlume_common::Result<Outcome> {
-        // Consent-class services (polkit) force the passive blink gate for this
-        // call; see `challenge_if_required`. Set fresh on every call so a
-        // polkit verify can never leak the flag into a later login/lock verify.
-        self.forced_consent = service
-            .map(|s| {
-                irlume_core::biopolicy::requires_consent_gesture(irlume_core::biopolicy::classify(
-                    s, false,
-                )) && consent_gesture_enabled()
-            })
-            .unwrap_or(false);
+        // Consent-class services (polkit) force the passive blink gate for
+        // this call; see `challenge_if_required` and `forced_consent_for`.
+        let forced_consent = forced_consent_for(service);
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let out = self.authenticate_once(user)?;
+            let out = self.authenticate_once(user, forced_consent)?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -1046,55 +1410,46 @@ impl Engine {
         }
     }
 
-    fn authenticate_once(&mut self, user: &str) -> irlume_common::Result<Outcome> {
+    fn authenticate_once(
+        &mut self,
+        user: &str,
+        forced_consent: bool,
+    ) -> irlume_common::Result<Outcome> {
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
-            return Ok(Outcome {
-                granted: false,
-                live: false,
-                score: 0.0,
-                reason: "face disabled (fingerprint mode)".into(),
-            });
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                "face disabled (fingerprint mode)",
+            ));
         }
         let Some(enr) = irlume_core::storage::load(user)? else {
-            return Ok(Outcome {
-                granted: false,
-                live: false,
-                score: 0.0,
-                reason: format!("'{user}' is not enrolled"),
-            });
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                format!("'{user}' is not enrolled"),
+            ));
         };
         if enr.profiles.iter().all(|p| p.scans.is_empty()) {
-            return Ok(Outcome {
-                granted: false,
-                live: false,
-                score: 0.0,
-                reason: format!("'{user}' has no face scans enrolled"),
-            });
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                format!("'{user}' has no face scans enrolled"),
+            ));
         }
         // Anti-swap: refuse if the live camera no longer matches the one this
         // user enrolled on (only enforced once an enrollment carries a binding).
         if let Some(bind) = &enr.camera_binding {
             if let Some(reason) = self.binding_mismatch(bind) {
-                return Ok(Outcome {
-                    granted: false,
-                    live: false,
-                    score: 0.0,
-                    reason,
-                });
+                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
         }
         let a = self.assess()?;
 
         // Opt-in hard gate: never unlock unless both eyes read open.
         if enr.require_eyes_open && !a.eyes_open {
-            return Ok(Outcome {
-                granted: false,
-                live: false,
-                score: 0.0,
-                reason: "eyes not detected open (require-eyes-open is on)".into(),
-            });
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                "eyes not detected open (require-eyes-open is on)",
+            ));
         }
 
         // best match over a labeled set of templates -> (score, profile name).
@@ -1115,12 +1470,10 @@ impl Engine {
         // RGB recognition across all profiles' scans.
         if let Some(probe) = a.embedding {
             if a.verdict != Verdict::Live {
-                return Ok(Outcome {
-                    granted: false,
-                    live: false,
-                    score: 0.0,
-                    reason: format!("liveness {:?}: {}", a.verdict, a.reason),
-                });
+                return Ok(Outcome::deny(
+                    liveness_deny_kind(a.verdict, &a.reason),
+                    format!("liveness {:?}: {}", a.verdict, a.reason),
+                ));
             }
             // Per-user IR-liveness DEPTH floor (anti-screen/photo, calibrated to
             // this user's enrolled 3D face structure): the live frame must clear the
@@ -1130,20 +1483,20 @@ impl Engine {
             // genuine dim/night logins as "screen/photo". The global gate above
             // (`evaluate`) already enforces an ambient-tolerant IR brightness floor.
             // Only meaningful when IR was actually captured (skip on RGB-only).
-            if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+            if let Some(depth_floor) = enr.ir_depth_floor().filter(|_| self.ir_available) {
                 irlume_common::dlog!(
                     "gate(per-user depth floor): live {:.2} vs floor {:.2}",
                     a.ir_depth,
                     depth_floor
                 );
                 if a.ir_depth < depth_floor {
-                    return Ok(Outcome {
-                        granted: false, live: false, score: 0.0,
-                        reason: format!(
+                    return Ok(Outcome::deny(
+                        OutcomeKind::Spoof,
+                        format!(
                             "IR depth {:.2} below your calibrated floor {:.2}; looks 2D (screen/photo)",
                             a.ir_depth, depth_floor
                         ),
-                    });
+                    ));
                 }
             }
             let scans = enr.rgb_scans();
@@ -1156,12 +1509,8 @@ impl Engine {
             if score >= thr {
                 return self.challenge_if_required(
                     &enr,
-                    Outcome {
-                        granted: true,
-                        live: true,
-                        score,
-                        reason: format!("match: {who} (rgb)"),
-                    },
+                    forced_consent,
+                    Outcome::grant(score, format!("match: {who} (rgb)")),
                 );
             }
             // Stage-2 lighting-adaptive fusion: RGB recognition missed (poor ambient
@@ -1186,8 +1535,8 @@ impl Engine {
                         f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
                     if f.grant {
                         let who = if ir_score >= score { ir_who } else { who };
-                        return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: f.prob,
-                            reason: format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob) });
+                        return self.challenge_if_required(&enr, forced_consent, Outcome::grant(f.prob,
+                            format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
                     }
                     // (b) pure IR fallback: still valid when IR alone is clearly strong
                     // (e.g. IR-only enrollment, or RGB template absent). Stricter than the
@@ -1204,8 +1553,8 @@ impl Engine {
                         self.ir_adapter.is_some()
                     );
                     if ir_score >= ir_thr {
-                        return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: ir_score,
-                            reason: format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})") });
+                        return self.challenge_if_required(&enr, forced_consent, Outcome::grant(ir_score,
+                            format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
                     }
                     // (c) calibrated-centroid fallback (ADR-0004): the mean-
                     // template score carries no best-of-N FAR inflation, so it
@@ -1215,8 +1564,8 @@ impl Engine {
                             + irlume_core::IR_FALLBACK_MARGIN;
                         irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
                         if *cs >= cthr {
-                            return self.challenge_if_required(&enr, Outcome { granted: true, live: true, score: *cs,
-                                reason: format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})") });
+                            return self.challenge_if_required(&enr, forced_consent, Outcome::grant(*cs,
+                                format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
                         }
                     }
                 }
@@ -1224,12 +1573,11 @@ impl Engine {
             // The reason keeps the exact score: it reaches only the session's
             // own TUI/CLI (coaching a genuine false reject); the daemon redacts
             // measurements before this line touches the journal (anti-oracle).
-            return Ok(Outcome {
-                granted: false,
-                live: true,
+            return Ok(Outcome::deny_live(
+                OutcomeKind::BelowThreshold,
                 score,
-                reason: format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)"),
-            });
+                format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)"),
+            ));
         }
 
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
@@ -1243,24 +1591,25 @@ impl Engine {
                     "dark, but the enrolled IR scans are from a different IR \
                      pipeline (adapter changed); re-enroll to refresh dark unlock"
                 };
-                return Ok(Outcome {
-                    granted: false,
-                    live: false,
-                    score: 0.0,
-                    reason: reason.into(),
-                });
+                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
             irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} ambient={:.0}",
                 a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint,
                 a.signals.ir_ambient);
             if verdict != Verdict::Live {
-                return Ok(Outcome {
-                    granted: false,
-                    live: false,
-                    score: 0.0,
-                    reason: format!("dark liveness {verdict:?}: {reason}"),
-                });
+                // Dark-path kinds: Uncertain retries under grace, any Spoof
+                // does not (the retryable RGB-yes/IR-no transient cannot occur
+                // here: this path only runs when RGB saw no face).
+                let kind = if verdict == Verdict::Uncertain {
+                    OutcomeKind::Uncertain
+                } else {
+                    OutcomeKind::Spoof
+                };
+                return Ok(Outcome::deny(
+                    kind,
+                    format!("dark liveness {verdict:?}: {reason}"),
+                ));
             }
             // Per-user calibrated IR depth floor, same as the RGB primary path.
             // `evaluate_ir_only` uses the lenient global DEPTH_MIN_RATIO; the
@@ -1268,22 +1617,20 @@ impl Engine {
             // warm spoof that sits between the global ratio and this user's
             // enrolled 3D structure is caught in lit conditions but must not
             // slip through in the dark. Apply it here too before the IR match.
-            if let Some(depth_floor) = enr.ir_calibration().filter(|_| self.ir_available) {
+            if let Some(depth_floor) = enr.ir_depth_floor().filter(|_| self.ir_available) {
                 irlume_common::dlog!(
                     "gate(per-user depth floor, dark): live {:.2} vs floor {:.2}",
                     a.ir_depth,
                     depth_floor
                 );
                 if a.ir_depth < depth_floor {
-                    return Ok(Outcome {
-                        granted: false,
-                        live: false,
-                        score: 0.0,
-                        reason: format!(
+                    return Ok(Outcome::deny(
+                        OutcomeKind::Spoof,
+                        format!(
                             "IR depth {:.2} below your calibrated floor {:.2}; looks 2D (screen/photo)",
                             a.ir_depth, depth_floor
                         ),
-                    });
+                    ));
                 }
             }
             // Opt-in third-party PAD cue, deny-only (scored in assess_full on
@@ -1295,14 +1642,12 @@ impl Engine {
                     irlume_common::dlog!(
                         "thirdparty-pad('{name}'): dark path p_fake {pf:.3} >= {thr:.2}; denying"
                     );
-                    return Ok(Outcome {
-                        granted: false,
-                        live: false,
-                        score: 0.0,
-                        reason: format!(
+                    return Ok(Outcome::deny(
+                        OutcomeKind::Spoof,
+                        format!(
                             "dark liveness: third-party PAD cue '{name}' flags a spoof; use your password"
                         ),
-                    });
+                    ));
                 }
             }
             let ir_base = if self.ir_adapter.is_some() {
@@ -1324,12 +1669,8 @@ impl Engine {
             if score >= ir_thr {
                 return self.challenge_if_required(
                     &enr,
-                    Outcome {
-                        granted: true,
-                        live: true,
-                        score,
-                        reason: format!("match: {who} (ir/dark)"),
-                    },
+                    forced_consent,
+                    Outcome::grant(score, format!("match: {who} (ir/dark)")),
                 );
             }
             if let Some((cs, cwho)) = &m.centroid {
@@ -1338,42 +1679,36 @@ impl Engine {
                 if *cs >= cthr {
                     return self.challenge_if_required(
                         &enr,
-                        Outcome {
-                            granted: true,
-                            live: true,
-                            score: *cs,
-                            reason: format!("match: {cwho} (ir/dark, calibrated centroid)"),
-                        },
+                        forced_consent,
+                        Outcome::grant(
+                            *cs,
+                            format!("match: {cwho} (ir/dark, calibrated centroid)"),
+                        ),
                     );
                 }
             }
             return self.challenge_if_required(
                 &enr,
-                Outcome {
-                    granted: false,
-                    live: true,
-                    score,
-                    reason: "below threshold (ir)".into(),
-                },
+                forced_consent,
+                Outcome::deny_live(OutcomeKind::BelowThreshold, score, "below threshold (ir)"),
             );
         }
 
-        Ok(Outcome {
-            granted: false,
-            live: false,
-            score: 0.0,
-            reason: format!("no face: {}", a.reason),
-        })
+        Ok(Outcome::deny(
+            OutcomeKind::NoFace,
+            format!("no face: {}", a.reason),
+        ))
     }
 
     /// 1:N identify ("who is this?"): one live capture, matched against every
-    /// enrolled user's RGB profiles (no claimed identity). Liveness-gated like
-    /// auth; reports the best above-threshold (user, profile, score). RGB primary
-    /// path only: a diagnostic, not a dark-mode unlock.
-    /// 1:N identify across every enrolled user. Full cross-user search, an
-    /// admin/testing capability; the daemon restricts a non-root caller to
-    /// [`Self::identify_within`] so the returned score can't become a
-    /// hill-climbing oracle against other users' templates.
+    /// enrolled user's RGB profiles (no claimed identity).
+    ///
+    /// Liveness-gated like auth; reports the best above-threshold (user,
+    /// profile, score). RGB primary path only: a diagnostic, not a dark-mode
+    /// unlock. The full cross-user search is an admin/testing capability; the
+    /// daemon restricts a non-root caller to [`Self::identify_within`] so the
+    /// returned score can't become a hill-climbing oracle against other
+    /// users' templates.
     pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
         self.identify_impl(None)
     }
@@ -1490,16 +1825,16 @@ impl Engine {
             height: rgb.height,
         };
         let faces = self.det.detect(&view)?;
-        let Some(f) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
+        let Some(f) = top_detection(&faces) else {
             return Ok((
                 false,
                 "no RGB face detected; face the camera and retry".into(),
             ));
         };
         let chip = align::align_to_arcface(&view, &f.landmarks)?;
-        let a = self.emb.embed(&chip)?;
-        let b = self.emb.embed(&chip)?;
-        let cos = align::cosine(&a, &b);
+        let emb_first = self.emb.embed(&chip)?;
+        let emb_second = self.emb.embed(&chip)?;
+        let cos = align::cosine(&emb_first, &emb_second);
         Ok((
             cos > 0.999,
             format!("alignment determinism cosine {cos:.6} (want ≈ 1.000000)"),
@@ -1507,14 +1842,14 @@ impl Engine {
     }
 
     /// Capture `want` LIVE, frontal scans (best-effort, with a retry budget).
-    /// Each Live capture yields one (rgb, ir, depth, brightness, pitch). No
-    /// enrolling from a photo; the liveness gate rejects spoofs. `pitch_neutral`
-    /// centres the frontal gate on this user's camera (None on first enroll).
+    /// Each Live capture yields one [`CapturedScan`]. No enrolling from a
+    /// photo; the liveness gate rejects spoofs. `pitch_neutral` centres the
+    /// frontal gate on this user's camera (None on first enroll).
     fn capture_scans(
         &mut self,
         want: usize,
         pitch_neutral: Option<f32>,
-    ) -> irlume_common::Result<Vec<Scan>> {
+    ) -> irlume_common::Result<Vec<CapturedScan>> {
         let mut out = Vec::new();
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved) with enough
@@ -1531,13 +1866,13 @@ impl Engine {
             // the countdown. Same bounds (and neutral) the enrollment guide uses.
             if a.verdict == Verdict::Live && frontal_signals(&a.signals, pitch_neutral) {
                 if let Some(e) = a.embedding {
-                    out.push((
-                        e.to_vec(),
-                        a.ir_embedding.clone(),
-                        a.ir_depth,
-                        a.ir_brightness,
-                        a.signals.head_pitch_frac,
-                    ));
+                    out.push(CapturedScan {
+                        rgb: e.to_vec(),
+                        ir: a.ir_embedding.clone(),
+                        depth: a.ir_depth,
+                        brightness: a.ir_brightness,
+                        pitch: a.signals.head_pitch_frac,
+                    });
                 }
             }
         }
@@ -1586,7 +1921,7 @@ impl Engine {
                     "no live scan captured; check lighting and framing".into(),
                 )
             })?;
-        let goal = match enroll_merge_target(&enr, &[probe.0.as_slice()])? {
+        let goal = match enroll_merge_target(&enr, &[probe.rgb.as_slice()])? {
             Some(target) => {
                 let have = enr
                     .profiles
@@ -1617,7 +1952,7 @@ impl Engine {
         // Final disposition over the whole capture: catches a second person
         // drifting into frame after the probe, and a borderline probe that only
         // crosses the identity threshold on a later scan.
-        let rgbs: Vec<&[f32]> = captured.iter().map(|(rgb, ..)| rgb.as_slice()).collect();
+        let rgbs: Vec<&[f32]> = captured.iter().map(|s| s.rgb.as_slice()).collect();
         if let Some(target) = enroll_merge_target(&enr, &rgbs)? {
             // The face already owns a profile: merge the capture into it.
             let idx = enr
@@ -1634,18 +1969,18 @@ impl Engine {
             }
             let added = captured.len().min(room);
             let mut added_scans = Vec::with_capacity(added);
-            for (rgb, ir, d, b, pitch) in captured.into_iter().take(room) {
+            for s in captured.into_iter().take(room) {
                 let sname = enr.profiles[idx].next_scan_name();
                 added_scans.push(sname.clone());
-                let ir_space = ir.as_ref().map(|_| self.ir_space.clone());
+                let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
                 enr.profiles[idx].scans.push(FaceScan {
                     name: sname,
-                    rgb,
-                    ir,
+                    rgb: s.rgb,
+                    ir: s.ir,
                     ir_space,
-                    ir_depth: d,
-                    ir_brightness: b,
-                    pitch,
+                    ir_depth: s.depth,
+                    ir_brightness: s.brightness,
+                    pitch: s.pitch,
                 });
             }
             self.refit_profile_calib(&mut enr.profiles[idx]);
@@ -1669,17 +2004,17 @@ impl Engine {
             name: name.clone(),
             scans: Vec::new(),
         };
-        for (rgb, ir, d, b, pitch) in captured {
+        for s in captured {
             let sname = prof.next_scan_name();
-            let ir_space = ir.as_ref().map(|_| self.ir_space.clone());
+            let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
             prof.scans.push(FaceScan {
                 name: sname,
-                rgb,
-                ir,
+                rgb: s.rgb,
+                ir: s.ir,
                 ir_space,
-                ir_depth: d,
-                ir_brightness: b,
-                pitch,
+                ir_depth: s.depth,
+                ir_brightness: s.brightness,
+                pitch: s.pitch,
             });
         }
         let n = prof.scans.len();
@@ -1742,7 +2077,7 @@ impl Engine {
                 "'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans"
             )));
         }
-        let (rgb, ir, d, b, pitch) = self
+        let captured = self
             .capture_scans(1, enr.pitch_neutral())?
             .into_iter()
             .next()
@@ -1752,7 +2087,7 @@ impl Engine {
                 )
             })?;
         // Anti-mixing: reject a scan whose face belongs to a different profile.
-        if let Some((other, score)) = colliding_profile(&enr, &rgb, Some(profile_name)) {
+        if let Some((other, score)) = colliding_profile(&enr, &captured.rgb, Some(profile_name)) {
             let cnt = enr
                 .profiles
                 .iter()
@@ -1769,15 +2104,15 @@ impl Engine {
             )));
         }
         let sname = enr.profiles[idx].next_scan_name();
-        let ir_space = ir.as_ref().map(|_| self.ir_space.clone());
+        let ir_space = captured.ir.as_ref().map(|_| self.ir_space.clone());
         enr.profiles[idx].scans.push(FaceScan {
             name: sname.clone(),
-            rgb,
-            ir,
+            rgb: captured.rgb,
+            ir: captured.ir,
             ir_space,
-            ir_depth: d,
-            ir_brightness: b,
-            pitch,
+            ir_depth: captured.depth,
+            ir_brightness: captured.brightness,
+            pitch: captured.pitch,
         });
         self.refit_profile_calib(&mut enr.profiles[idx]);
         if enr.camera_binding.is_none() {
@@ -1799,9 +2134,12 @@ impl Engine {
         user: Option<&str>,
     ) -> irlume_common::Result<irlume_common::PositionReport> {
         use irlume_common::PositionReport;
+        // Face width as a fraction of frame width.
         const MIN_FRAC: f32 = 0.12;
         const MAX_FRAC: f32 = 0.55;
+        // Max face-center offset from frame center, fraction of frame size.
         const CENTER_TOL: f32 = 0.18;
+        // Mean face luma bounds, 0-255 BT.601.
         const DIM: f32 = 55.0;
         const BRIGHT: f32 = 235.0;
         // This user's calibrated pitch neutral, if any (read-only; absent = global default).
@@ -1815,11 +2153,8 @@ impl Engine {
             width: rgb.width,
             height: rgb.height,
         };
-        let top = self
-            .det
-            .detect(&view)?
-            .into_iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score));
+        let faces = self.det.detect(&view)?;
+        let top = top_detection(&faces);
         // NB: the framing guide is RGB-only so it stays fast enough to poll (the
         // IR burst would make each sample multi-second). IR readiness is checked
         // at the actual capture, not in the guide.
@@ -1840,6 +2175,11 @@ impl Engine {
         let pose = irlume_vision::head_pose(&f.landmarks);
         let brightness = luma_in_bbox(&rgb.data, rgb.width, rgb.height, &f.bbox);
 
+        // Quality starts at 100 and the first failing gate deducts by
+        // severity: 45 for too-far (smallest face, least usable capture), 30
+        // for the mid-tier framing/pose/darkness faults, 20 for over-bright
+        // (the mildest; recognition still works under glare more often than
+        // under the other faults).
         let mut q = 100i32;
         let mut guidance = "Hold still, looking good".to_string();
         let mut well = true;
@@ -2064,13 +2404,15 @@ fn colliding_profile(
     best
 }
 
+/// Minimum peak grey level (0-255) in the per-eye window to count as a
+/// corneal glint from the 850nm emitter.
+const EYE_OPEN_PEAK_MIN: f32 = 200.0;
+
 /// Per-eye open check (IR corneal-glint heuristic): an open eye reflects the
 /// 850nm emitter as a bright specular point near the eye landmark; a closed
 /// eyelid does not. Conservative: requires the glint, so an unverifiable eye
 /// reads closed (auth falls back to password). Heuristic; used only when a
 /// profile opts into the require-eyes-open gate.
-const EYE_OPEN_PEAK_MIN: f32 = 200.0;
-
 pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks5) -> bool {
     let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
@@ -2123,6 +2465,9 @@ fn rgb_luma_stats(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> (f32, f32) {
     }
 }
 
+/// Mean grey level (0-255) inside `bbox` of a `w`x`h` 8-bit IR frame; the
+/// bbox is clamped to the frame. Returns 0.0 for a degenerate region or a
+/// frame shorter than `w*h`.
 pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     // The pixel loop assumes grey.len() == w*h (the invariant the camera crate
     // upholds). Guard once so a truncated/mismatched IR frame degrades to 0.0
@@ -2148,6 +2493,11 @@ pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
+/// The IR depth cue: ratio of the center-box mean to the edge-ring mean of
+/// the IR face crop (grey 0-255). A real 3D face lit by the near-coaxial
+/// emitter is brighter at the center/nose and falls off at the rim (ratio
+/// above 1); a flat screen/photo reads ~1. Returns 0.0 on a degenerate bbox
+/// or a near-black edge (no signal, never inf).
 pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
     if bw <= 4.0 || bh <= 4.0 {
@@ -2161,6 +2511,8 @@ pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     ];
     let center = mean_in_bbox(grey, w, h, &inner);
     let whole = mean_in_bbox(grey, w, h, bbox);
+    // The 25%-per-side inset makes the center box 50%x50% = 25% of the bbox
+    // area, so whole = 0.25*center + 0.75*edge; solve for the edge-ring mean.
     let edge = (whole - center * 0.25) / 0.75;
     if edge <= 1.0 {
         0.0
@@ -2169,10 +2521,19 @@ pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
+/// Half-width (pixels) of the square search window around each eye landmark
+/// for the corneal glint peak. A fixed radius, not IOD-scaled: the glint is a
+/// point highlight near the landmark at typical login distances, and the gate
+/// consuming this cue (`GLINT_MIN`) was calibrated against it.
+const GLINT_SEARCH_RADIUS_PX: i32 = 8;
+
+/// Peak grey level (0-255) near the eye landmarks of an IR frame: the
+/// emitter's specular corneal glint. Supporting liveness cue only (feeds
+/// `Signals::ir_eye_glint`); 0.0 when the landmarks fall outside the frame.
 pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     let mut peak = 0u8;
     for &(ex, ey) in &landmarks[0..2] {
-        let r = 8i32;
+        let r = GLINT_SEARCH_RADIUS_PX;
         for dy in -r..=r {
             for dx in -r..=r {
                 let x = ex as i32 + dx;
@@ -2309,13 +2670,37 @@ mod tests {
         assert!(with_adapter.best.is_finite());
     }
 
-    fn denied(reason: &str, live: bool) -> Outcome {
+    fn denied(kind: OutcomeKind, reason: &str, live: bool) -> Outcome {
         Outcome {
             granted: false,
             live,
             score: 0.0,
             reason: reason.into(),
+            kind,
         }
+    }
+
+    /// The prefix contract `presence_retryable` used before `Outcome.kind`
+    /// existed, kept as the regression oracle: every (kind, reason) pair the
+    /// engine can produce must classify the same way under both.
+    fn legacy_prefix_retryable(o: &Outcome) -> bool {
+        !o.granted
+            && !o.live
+            && (o.reason.starts_with("no face:")
+                || o.reason.starts_with("liveness Uncertain:")
+                || o.reason.starts_with("dark liveness Uncertain:")
+                || o.reason.starts_with("liveness Spoof: no face in IR"))
+    }
+
+    /// Assert both the typed and the legacy prefix classification.
+    fn assert_retryable(o: &Outcome, expected: bool) {
+        assert_eq!(presence_retryable(o), expected, "kind path: {}", o.reason);
+        assert_eq!(
+            legacy_prefix_retryable(o),
+            expected,
+            "string<->kind drift: {}",
+            o.reason
+        );
     }
 
     #[test]
@@ -2335,56 +2720,88 @@ mod tests {
     #[test]
     fn grace_retries_only_presence_failures() {
         use irlume_liveness::Verdict;
-        // Retryable: the user simply was not usably in frame yet. The strings
-        // are built exactly as the authenticate path builds them.
-        assert!(presence_retryable(&denied(
-            "no face: no face in RGB",
-            false
-        )));
-        assert!(presence_retryable(&denied(
-            &format!("liveness {:?}: not facing the camera", Verdict::Uncertain),
-            false
-        )));
-        assert!(presence_retryable(&denied(
-            &format!("dark liveness {:?}: one-sided", Verdict::Uncertain),
-            false
-        )));
+        // Retryable: the user simply was not usably in frame yet. Strings are
+        // built exactly as the authenticate path builds them, and kinds come
+        // from the same classifier the construction sites use, so this test
+        // pins string<->kind agreement (via `assert_retryable`'s legacy
+        // prefix oracle).
+        assert_retryable(
+            &denied(OutcomeKind::NoFace, "no face: no face in RGB", false),
+            true,
+        );
+        assert_retryable(
+            &denied(
+                liveness_deny_kind(Verdict::Uncertain, "not facing the camera"),
+                &format!("liveness {:?}: not facing the camera", Verdict::Uncertain),
+                false,
+            ),
+            true,
+        );
+        assert_retryable(
+            &denied(
+                OutcomeKind::Uncertain,
+                &format!("dark liveness {:?}: one-sided", Verdict::Uncertain),
+                false,
+            ),
+            true,
+        );
         // Retryable: the RGB-yes/IR-no transient a genuine user produces while
         // settling into frame (safe: a real screen never grows an IR face).
-        assert!(presence_retryable(&denied(
-            &format!(
-                "liveness {:?}: no face in IR: a real face reflects 850nm",
-                Verdict::Spoof
+        assert_retryable(
+            &denied(
+                liveness_deny_kind(Verdict::Spoof, "no face in IR: a real face reflects 850nm"),
+                &format!(
+                    "liveness {:?}: no face in IR: a real face reflects 850nm",
+                    Verdict::Spoof
+                ),
+                false,
             ),
-            false
-        )));
+            true,
+        );
         // NEVER retryable: a real spoof verdict (flat/2D, free attack retries)...
-        assert!(!presence_retryable(&denied(
-            &format!("liveness {:?}: flat 2D surface", Verdict::Spoof),
-            false
-        )));
-        assert!(!presence_retryable(&denied(
-            &format!("dark liveness {:?}: flat", Verdict::Spoof),
-            false
-        )));
+        assert_retryable(
+            &denied(
+                liveness_deny_kind(Verdict::Spoof, "flat 2D surface"),
+                &format!("liveness {:?}: flat 2D surface", Verdict::Spoof),
+                false,
+            ),
+            false,
+        );
+        assert_retryable(
+            &denied(
+                OutcomeKind::Spoof,
+                &format!("dark liveness {:?}: flat", Verdict::Spoof),
+                false,
+            ),
+            false,
+        );
         // ...a real match verdict below threshold (FAR multiplication)...
-        assert!(!presence_retryable(&denied(
-            "below threshold (rgb 0.23, fusion+ir-fallback miss)",
-            true
-        )));
-        assert!(!presence_retryable(&denied("below threshold (ir)", true)));
+        assert_retryable(
+            &Outcome::deny_live(
+                OutcomeKind::BelowThreshold,
+                0.23,
+                "below threshold (rgb 0.23, fusion+ir-fallback miss)",
+            ),
+            false,
+        );
+        assert_retryable(
+            &Outcome::deny_live(OutcomeKind::BelowThreshold, 0.1, "below threshold (ir)"),
+            false,
+        );
         // ...pre-camera refusals and grants.
-        assert!(!presence_retryable(&denied("'u' is not enrolled", false)));
-        assert!(!presence_retryable(&denied(
-            "face disabled (fingerprint mode)",
-            false
-        )));
-        assert!(!presence_retryable(&Outcome {
-            granted: true,
-            live: true,
-            score: 0.9,
-            reason: "match: p (rgb)".into(),
-        }));
+        assert_retryable(
+            &denied(OutcomeKind::OtherDeny, "'u' is not enrolled", false),
+            false,
+        );
+        assert_retryable(
+            &denied(
+                OutcomeKind::OtherDeny,
+                "face disabled (fingerprint mode)",
+                false,
+            ),
+            false,
+        );
+        assert_retryable(&Outcome::grant(0.9, "match: p (rgb)"), false);
     }
 
     #[test]
@@ -2512,6 +2929,7 @@ mod tests {
             require_eyes_open: false,
             require_challenge: false,
             camera_binding: None,
+            closure_calibration: None,
             profiles: vec![
                 FaceProfile {
                     ir_calib: None,
@@ -3260,37 +3678,34 @@ mod engine_tests {
         let mut s = shared();
         let dir = state_sandbox("consent");
 
-        // authenticate() derives the forced flag from the service class, fresh
-        // per call: polkit-1 sets it, sudo (and None) clear it. The not-enrolled
-        // early return keeps the camera out of this test.
-        let _ = s.engine.authenticate("irlume-test-ghost", Some("polkit-1"));
-        assert!(s.engine.forced_consent);
-        let _ = s.engine.authenticate("irlume-test-ghost", Some("sudo"));
-        assert!(!s.engine.forced_consent);
+        // authenticate() derives the forced flag from the service class,
+        // fresh per call, via forced_consent_for: polkit-1 sets it, sudo (and
+        // None) do not.
+        assert!(forced_consent_for(Some("polkit-1")));
+        assert!(!forced_consent_for(Some("sudo")));
+        assert!(!forced_consent_for(None));
         // Escape hatch: IRLUME_POLKIT_GESTURE=0 turns the forcing off.
         std::env::set_var("IRLUME_POLKIT_GESTURE", "0");
-        let _ = s.engine.authenticate("irlume-test-ghost", Some("polkit-1"));
-        assert!(!s.engine.forced_consent);
+        assert!(!forced_consent_for(Some("polkit-1")));
         std::env::remove_var("IRLUME_POLKIT_GESTURE");
 
         // The shared engine runs IR-less (IRLUME_FORCE_NO_IR), where the blink
         // gate cannot run. A FORCED gate must then withdraw the grant (fail
         // closed) while the per-enrollment opt-in keeps its historical skip.
         let enr = Enrollment::new("irlume-test-consent");
-        let granted = || Outcome {
-            granted: true,
-            live: true,
-            score: 0.9,
-            reason: "match".into(),
-        };
-        s.engine.forced_consent = true;
-        let out = s.engine.challenge_if_required(&enr, granted()).unwrap();
+        let granted = || Outcome::grant(0.9, "match");
+        let out = s
+            .engine
+            .challenge_if_required(&enr, true, granted())
+            .unwrap();
         assert!(!out.granted, "forced gate must fail closed without IR");
         assert!(out.reason.contains("consent gesture"), "{}", out.reason);
-        s.engine.forced_consent = false;
         let mut opt_in = Enrollment::new("irlume-test-consent");
         opt_in.require_challenge = true;
-        let out = s.engine.challenge_if_required(&opt_in, granted()).unwrap();
+        let out = s
+            .engine
+            .challenge_if_required(&opt_in, false, granted())
+            .unwrap();
         assert!(
             out.granted,
             "opt-in path keeps its skip when the gate can't run"
@@ -3391,28 +3806,18 @@ mod engine_tests {
             e.require_challenge = flag;
             e
         };
-        let grant = || Outcome {
-            granted: true,
-            live: true,
-            score: 0.9,
-            reason: "match: p (rgb)".into(),
-        };
+        let grant = || Outcome::grant(0.9, "match: p (rgb)");
         // A denial is never escalated into a challenge.
-        let denied = Outcome {
-            granted: false,
-            live: false,
-            score: 0.0,
-            reason: "below threshold (ir)".into(),
-        };
+        let denied = Outcome::deny_live(OutcomeKind::BelowThreshold, 0.0, "below threshold (ir)");
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(true), denied)
+            .challenge_if_required(&enr_flag(true), false, denied)
             .unwrap();
         assert!(!o.granted);
         // Grant without the opt-in flag: passes through untouched.
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(false), grant())
+            .challenge_if_required(&enr_flag(false), false, grant())
             .unwrap();
         assert!(o.granted);
         // Flag on but no IR hardware (convenience tier): the blink challenge
@@ -3420,7 +3825,7 @@ mod engine_tests {
         assert!(!s.engine.ir_available);
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(true), grant())
+            .challenge_if_required(&enr_flag(true), false, grant())
             .unwrap();
         assert!(o.granted);
         // Flag on + IR + no mesh model deployed: logged skip, grant stands.
@@ -3428,7 +3833,7 @@ mod engine_tests {
         let mesh = s.engine.mesh.take();
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(true), grant())
+            .challenge_if_required(&enr_flag(true), false, grant())
             .unwrap();
         assert!(o.granted);
         // Flag on + IR + mesh loaded: the passive-liveness capture actually
@@ -3437,7 +3842,7 @@ mod engine_tests {
         s.engine.mesh = mesh;
         let err = s
             .engine
-            .challenge_if_required(&enr_flag(true), grant())
+            .challenge_if_required(&enr_flag(true), false, grant())
             .unwrap_err();
         assert!(err.to_string().contains("no camera found"), "{err}");
         s.engine.ir_available = false; // restore the shared baseline
@@ -3525,6 +3930,7 @@ mod engine_tests {
                 require_eyes_open: false,
                 require_challenge: false,
                 camera_binding: None,
+                closure_calibration: None,
                 profiles: vec![FaceProfile {
                     ir_calib: None,
                     name: "Face Profile 1".into(),

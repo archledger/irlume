@@ -67,10 +67,20 @@ pub enum Action {
     Deny,
 }
 
-/// Classify a PAM service name into an [`OperationClass`]. `warm` is true when a
-/// user session is already active (so an ambiguous service that drives both a
-/// cold greeter and a live lock screen is treated as a screen unlock).
-pub fn classify(service: &str, warm: bool) -> OperationClass {
+/// Whether the user already has a running session when the PAM conversation
+/// starts. Splits ambiguous services that drive both a cold greeter and a live
+/// lock screen (GDM's `gdm-password`, `cosmic-greeter`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    /// A session is already active; an ambiguous greeter service is a screen
+    /// unlock.
+    Warm,
+    /// No session yet; an ambiguous greeter service is a cold login.
+    Cold,
+}
+
+/// Classify a PAM service name into an [`OperationClass`].
+pub fn classify(service: &str, session: SessionState) -> OperationClass {
     let s = service.trim().to_ascii_lowercase();
     match s.as_str() {
         // Lock screens (live session).
@@ -79,16 +89,13 @@ pub fn classify(service: &str, warm: bool) -> OperationClass {
         // Display-manager greeters (cold login), incl. GDM's separate
         // fingerprint login service (`gdm-fingerprint`), same login class.
         // `cosmic-greeter` (COSMIC / Pop!_OS) uses one service for both the cold
-        // login and the live lock screen, so the warm/cold flag below is what
+        // login and the live lock screen, so the session state below is what
         // separates its login from its screen-unlock.
         "sddm" | "sddm-greeter" | "plasmalogin" | "gdm-password" | "gdm-fingerprint" | "gdm"
-        | "gdm3" | "lightdm" | "login" | "greetd" | "ly" | "cosmic-greeter" => {
-            if warm {
-                OperationClass::ScreenUnlock
-            } else {
-                OperationClass::Login
-            }
-        }
+        | "gdm3" | "lightdm" | "login" | "greetd" | "ly" | "cosmic-greeter" => match session {
+            SessionState::Warm => OperationClass::ScreenUnlock,
+            SessionState::Cold => OperationClass::Login,
+        },
         // Elevation.
         "sudo" | "sudo-i" | "su" | "su-l" | "doas" => OperationClass::Elevation,
         // polkit's agent helper hardcodes pam_start("polkit-1", ...); "polkit"
@@ -139,7 +146,10 @@ mod tests {
     #[test]
     fn screen_unlock_never_unseals() {
         assert_eq!(
-            decide(classify("kde-fingerprint", true), Tier::Secure),
+            decide(
+                classify("kde-fingerprint", SessionState::Warm),
+                Tier::Secure
+            ),
             Action::Verify
         );
     }
@@ -147,19 +157,28 @@ mod tests {
     #[test]
     fn cold_login_with_ir_unseals_but_rgb_only_denies() {
         assert_eq!(
-            decide(classify("plasmalogin", false), Tier::Secure),
+            decide(classify("plasmalogin", SessionState::Cold), Tier::Secure),
             Action::Unseal
         );
         assert_eq!(
-            decide(classify("plasmalogin", false), Tier::Convenience),
+            decide(
+                classify("plasmalogin", SessionState::Cold),
+                Tier::Convenience
+            ),
             Action::Deny
         );
     }
 
     #[test]
     fn warm_greeter_is_a_screen_unlock() {
-        assert_eq!(classify("plasmalogin", true), OperationClass::ScreenUnlock);
-        assert_eq!(classify("plasmalogin", false), OperationClass::Login);
+        assert_eq!(
+            classify("plasmalogin", SessionState::Warm),
+            OperationClass::ScreenUnlock
+        );
+        assert_eq!(
+            classify("plasmalogin", SessionState::Cold),
+            OperationClass::Login
+        );
     }
 
     #[test]
@@ -168,13 +187,16 @@ mod tests {
         // the live lock screen; the warm flag must split them, and a cold login
         // must reach Unseal on the Secure (IR) tier; else it classifies Unknown
         // and the daemon denies the face match.
-        assert_eq!(classify("cosmic-greeter", false), OperationClass::Login);
         assert_eq!(
-            classify("cosmic-greeter", true),
+            classify("cosmic-greeter", SessionState::Cold),
+            OperationClass::Login
+        );
+        assert_eq!(
+            classify("cosmic-greeter", SessionState::Warm),
             OperationClass::ScreenUnlock
         );
         assert_eq!(
-            decide(classify("cosmic-greeter", false), Tier::Secure),
+            decide(classify("cosmic-greeter", SessionState::Cold), Tier::Secure),
             Action::Unseal
         );
     }
@@ -183,25 +205,37 @@ mod tests {
     fn gdm_fingerprint_is_a_login_service() {
         // GDM's separate fingerprint login service must classify as a login /
         // unlock class, else the keyring-unseal gate (ADR-0003) refuses it.
-        assert_eq!(classify("gdm-fingerprint", false), OperationClass::Login);
         assert_eq!(
-            classify("gdm-fingerprint", true),
+            classify("gdm-fingerprint", SessionState::Cold),
+            OperationClass::Login
+        );
+        assert_eq!(
+            classify("gdm-fingerprint", SessionState::Warm),
             OperationClass::ScreenUnlock
         );
     }
 
     #[test]
     fn remote_and_unknown_always_deny() {
-        assert_eq!(decide(classify("sshd", false), Tier::Secure), Action::Deny);
         assert_eq!(
-            decide(classify("some-random-service", false), Tier::Secure),
+            decide(classify("sshd", SessionState::Cold), Tier::Secure),
+            Action::Deny
+        );
+        assert_eq!(
+            decide(
+                classify("some-random-service", SessionState::Cold),
+                Tier::Secure
+            ),
             Action::Deny
         );
     }
 
     #[test]
     fn sudo_is_elevation() {
-        assert_eq!(classify("sudo", false), OperationClass::Elevation);
+        assert_eq!(
+            classify("sudo", SessionState::Cold),
+            OperationClass::Elevation
+        );
         assert_eq!(
             decide(OperationClass::Elevation, Tier::Secure),
             Action::Unseal
@@ -213,8 +247,8 @@ mod tests {
         // The B6 stance: a polkit prompt may be satisfied by a face match
         // (verify) but must never release the TPM-sealed credential, on any
         // tier, warm or cold.
-        for warm in [false, true] {
-            assert_eq!(classify("polkit-1", warm), OperationClass::AppConsent);
+        for session in [SessionState::Cold, SessionState::Warm] {
+            assert_eq!(classify("polkit-1", session), OperationClass::AppConsent);
         }
         assert_eq!(
             decide(OperationClass::AppConsent, Tier::Secure),
@@ -228,9 +262,15 @@ mod tests {
 
     #[test]
     fn polkit_requires_the_consent_gesture_and_others_do_not() {
-        assert!(requires_consent_gesture(classify("polkit-1", false)));
+        assert!(requires_consent_gesture(classify(
+            "polkit-1",
+            SessionState::Cold
+        )));
         for svc in ["sudo", "kde", "plasmalogin", "sshd", "nonsense"] {
-            assert!(!requires_consent_gesture(classify(svc, false)), "{svc}");
+            assert!(
+                !requires_consent_gesture(classify(svc, SessionState::Cold)),
+                "{svc}"
+            );
         }
     }
 }

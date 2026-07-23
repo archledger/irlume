@@ -15,6 +15,7 @@
 //! to the shipped stack. The daemon wires an enabled model as a DENY-ONLY
 //! liveness cue and refuses to load a file whose checksum stops matching.
 
+use crate::is_root;
 use irlume_common::thirdparty::{self, ThirdPartyModel};
 use std::io::{BufRead, Write};
 use std::process::{Command, ExitCode};
@@ -232,10 +233,6 @@ fn restart_daemon() {
         .status();
 }
 
-fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
 fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(0) == 1 }
 }
@@ -259,7 +256,7 @@ pub fn doctor_line() -> String {
             .find(|m| thirdparty::model_path(m).exists())
         {
             return format!(
-                "'{}' weights installed ({}); enabled state is root-only, check with                  `sudo irlume doctor` or the daemon startup log",
+                "'{}' weights installed ({}); enabled state is root-only, check with `sudo irlume doctor` or the daemon startup log",
                 m.name,
                 file_state(m)
             );

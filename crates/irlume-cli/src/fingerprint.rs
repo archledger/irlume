@@ -26,7 +26,7 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
         }
         Some("verify") => verify(&user),
         Some("reset") => reset(&user, args),
-        Some("enable") => enable(&user),
+        Some("enable") => enable(&user, args),
         Some("disable") => disable(),
         _ => {
             eprintln!(
@@ -102,12 +102,17 @@ fn status(user: &str) -> ExitCode {
         println!("  → fix the listing first ({e}); enrollment state is unknown until then");
     } else if fingers.is_empty() {
         println!("  → reader present but no finger enrolled: run  irlume fingerprint add");
-    } else if policy::method() != Method::Fingerprint {
-        println!(
-            "  → enrolled; to make fingerprint the unlock method: sudo irlume fingerprint enable"
-        );
     } else {
-        println!("  → fingerprint is the active unlock method");
+        match policy::method() {
+            Method::Both => {
+                println!("  → active alongside face: unlock with either your face or your finger")
+            }
+            Method::Fingerprint => println!("  → fingerprint is the active unlock method"),
+            _ => println!(
+                "  → enrolled; enable it (kept alongside face if you have a camera):\n     \
+                 sudo irlume fingerprint enable   (or --fingerprint-only to disable face)"
+            ),
+        }
     }
     ExitCode::SUCCESS
 }
@@ -170,7 +175,10 @@ fn offer_verify(user: &str) {
     if !std::io::stdin().is_terminal() {
         return;
     }
-    if !confirm("[fingerprint] verify the new print now?", true) {
+    if !confirm(
+        "[fingerprint] verify the new print now?",
+        /* default_yes: */ true,
+    ) {
         return;
     }
     verify_round(user);
@@ -260,7 +268,7 @@ fn reset(user: &str, args: &[String]) -> ExitCode {
             eprintln!("[fingerprint] refusing to delete without a terminal; pass --yes to force");
             return ExitCode::FAILURE;
         }
-        if !confirm("[fingerprint] delete them?", false) {
+        if !confirm("[fingerprint] delete them?", /* default_yes: */ false) {
             println!("[fingerprint] nothing deleted");
             return ExitCode::SUCCESS;
         }
@@ -270,7 +278,12 @@ fn reset(user: &str, args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     println!("[fingerprint] ✓ deleted {} print(s)", fingers.len());
-    if std::io::stdin().is_terminal() && confirm("[fingerprint] enroll a fresh print now?", true) {
+    if std::io::stdin().is_terminal()
+        && confirm(
+            "[fingerprint] enroll a fresh print now?",
+            /* default_yes: */ true,
+        )
+    {
         if enroll_one(user) {
             offer_verify(user);
         } else {
@@ -302,7 +315,7 @@ fn effective_uid() -> u32 {
         .unwrap_or(1000)
 }
 
-fn enable(user: &str) -> ExitCode {
+fn enable(user: &str, args: &[String]) -> ExitCode {
     if !fp::available() {
         eprintln!("[fingerprint] no usable reader (need fprintd + a fingerprint reader)");
         return ExitCode::FAILURE;
@@ -310,6 +323,11 @@ fn enable(user: &str) -> ExitCode {
     if !require_root("enable") {
         return ExitCode::FAILURE;
     }
+    // COEXIST is the default when a face camera is present: face and fingerprint
+    // both stay active and the user unlocks with whichever is convenient.
+    // `--fingerprint-only` forces the old fingerprint-only mode (face disabled).
+    let fingerprint_only = args.iter().any(|a| a == "--fingerprint-only");
+    let coexist = !fingerprint_only && irlume_camera::capabilities().rgb;
     // Enroll a finger first if the user has none.
     if !fp::has_enrollment(user) {
         println!("[fingerprint] no finger enrolled yet; enrolling one now");
@@ -362,11 +380,21 @@ fn enable(user: &str) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    if let Err(e) = policy::set_method(Method::Fingerprint) {
+    let method = if coexist {
+        Method::Both
+    } else {
+        Method::Fingerprint
+    };
+    if let Err(e) = policy::set_method(method) {
         eprintln!("[fingerprint] wired, but could not record method: {e}");
         return ExitCode::FAILURE;
     }
-    println!("[fingerprint] ✓ enabled: fingerprint now unlocks; irlume face is disabled (pam_fprintd drives, password is the fallback)");
+    if coexist {
+        println!("[fingerprint] ✓ enabled alongside face: unlock with EITHER your face or your finger (password is the fallback).");
+        println!("[fingerprint] wire the face lines too if you haven't:  sudo irlume login enable --apply");
+    } else {
+        println!("[fingerprint] ✓ enabled (fingerprint-only): irlume face is disabled, pam_fprintd drives, password is the fallback.");
+    }
     ExitCode::SUCCESS
 }
 

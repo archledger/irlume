@@ -1,0 +1,24 @@
+[Unit]
+Description=Watch greeter PAM files and re-apply irlume face-auth wiring
+Documentation=https://github.com/archledger/irlume
+
+[Path]
+# A distro update (authselect, pam-auth-update, or a fresh vendor PAM file from
+# a package upgrade) can silently strip irlume's lines from a greeter stack,
+# leaving face login mysteriously dead until the next manual `login enable`.
+# Watch every PAM file irlume can wire (keep in sync with LOGIN_GREETERS +
+# FP_GREETERS + LOCKSCREEN in pamwire.rs); any modification triggers a
+# reconcile, which is a no-op unless the wiring actually went missing.
+PathModified=/etc/pam.d/gdm-password
+PathModified=/etc/pam.d/gdm-fingerprint
+PathModified=/etc/pam.d/sddm
+PathModified=/etc/pam.d/lightdm
+PathModified=/etc/pam.d/plasmalogin
+PathModified=/etc/pam.d/cosmic-greeter
+PathModified=/etc/pam.d/greetd
+PathModified=/etc/pam.d/kde
+PathModified=/etc/pam.d/polkit-1
+Unit=irlume-reconcile.service
+
+[Install]
+WantedBy=paths.target

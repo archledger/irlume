@@ -18,24 +18,37 @@ pieces:
 2. Your desktop's polkit agent (KDE or GNOME) opens its dialog, which names
    the app and the action being approved, and starts a PAM conversation on the
    `polkit-1` service.
-3. `pam_irlume` in that stack asks `irlumed` to verify your face. The daemon
-   requires a natural blink before it grants (see the security section), then
-   answers yes or no. The app learns only the verdict.
+3. `pam_irlume` in that stack asks `irlumed` to verify your face. For a polkit
+   prompt the daemon also requires a deliberate consent gesture: **nod your
+   head**, or **close your eyes for about a second then open them** — whichever
+   suits your position (see the security section). It then answers yes or no;
+   the app learns only the verdict.
 
-Both the KDE and GNOME agents start the PAM conversation the moment the
-dialog appears, so the camera fires immediately and the dialog closes itself
-on a match: no typing, no clicking.
+Both the KDE and GNOME agents start the PAM conversation the moment the dialog
+appears, so the camera fires immediately. The dialog shows "irlume: nod your
+head to approve (or close your eyes ~1s then open)"; perform either gesture and
+it approves, no typing or clicking.
 
 ## Enabling
 
+One step; the default consent gesture (a head nod) needs no setup.
+
 ```console
-sudo irlume login enable --with-polkit --apply
+sudo irlume login enable --with-polkit --apply   # wire pam_irlume into polkit-1
 ```
 
 This adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
 `/etc/pam.d/polkit-1` override of the vendor file; Debian and Arch get an
-edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable
---apply` removes it along with everything else, flag or no flag.
+edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable --apply`
+removes it along with everything else, flag or no flag.
+
+**The consent gesture is a head NOD by default** — pose-defined, so it works at
+any head angle or lighting (upright, reclined, in bed) and needs no calibration.
+If you'd also like to approve by closing your eyes, run `sudo irlume
+calibrate-closure` once (it captures your eyes-open and eyes-closed EAR); after
+that either gesture is accepted. The eye-closure path is 2D and pose-sensitive,
+so it works best sitting square-on to the camera; the nod covers every other
+position. `consent_gesture=nod|closure` in settings.conf restricts to one.
 
 Check the state any time:
 
@@ -68,12 +81,13 @@ works the same day it ships.
   config-dependent. A polkit prompt gets a yes/no and nothing else, so a
   misconfigured or malicious stack cannot use a polkit dialog to extract a
   credential.
-- **Blink required.** polkit agents run the PAM conversation with no user
-  gesture, so a bare face match would approve a prompt the user never
-  acknowledged. For polkit-class services the daemon forces the passive blink
-  gate (the same one `require-challenge` enrolls opt into) even for users who
-  did not opt in, and fails closed if the gate cannot run (no IR camera or no
-  FaceMesh model). Disable the extra blink with `polkit_gesture=0` in
+- **Deliberate gesture required.** polkit agents run the PAM conversation with
+  no user action, so a bare face match would approve a prompt the user never
+  acknowledged. For polkit-class services the daemon requires a deliberate
+  gesture — a head nod, or an eye closure — even for users who did not opt into
+  any per-enrollment liveness, and fails closed if it cannot run (no IR camera;
+  or, for the closure gesture specifically, no FaceMesh model or no stored
+  calibration). Disable the forced gesture with `polkit_gesture=0` in
   `settings.conf` if you accept that trade.
 - **IR tier only.** RGB-only (convenience) devices never satisfy polkit
   prompts; a printed photo in front of a webcam must not approve app actions.
@@ -89,9 +103,17 @@ works the same day it ships.
   the polkit row, then `sudo ausearch -m avc -ts recent | grep irlume` on
   SELinux systems; the shipped policy (1.1.0) grants the polkit helper domain
   access to the daemon socket.
-- Face matches but the prompt stays: the blink gate wants a natural blink;
-  keep looking at the dialog for a moment. `irlume logs` shows the deny
-  reason.
+- Face matches but the prompt stays: it wants the consent gesture. Nod your
+  head (a firm chin-down-and-back, a couple of times), or close your eyes for
+  about a second and open them. `irlume logs` shows the deny reason.
 - Bitwarden says biometrics are unavailable: its polkit action file is
   missing (`irlume doctor` reports this) or the desktop app needs the
-  Secret Service (GNOME Keyring / KWallet) running.
+  Secret Service (GNOME Keyring / KWallet) running. `irlume doctor` also
+  reports whether a Secret Service provider is up and the login keyring is
+  unlocked; run it as yourself (not under sudo), since it inspects your
+  session bus.
+- Face login stops working after a system update: a distro tool (authselect,
+  pam-auth-update) can rewrite a greeter's PAM file and drop irlume's lines.
+  The `irlume-reconcile.path` unit watches those files and re-applies the
+  wiring automatically once `login enable` has been run; `irlume doctor`
+  flags it if anything slips through.

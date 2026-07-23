@@ -81,6 +81,43 @@ impl std::fmt::Debug for SecretBytes {
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";
 
+/// The effective state directory, honoring the `IRLUME_STATE_DIR` sandbox
+/// override that tests and the model tooling set. Prefer this over the bare
+/// `STATE_DIR` constant whenever you resolve a real path, so one override moves
+/// every consumer together.
+pub fn state_dir() -> std::path::PathBuf {
+    std::env::var_os("IRLUME_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(STATE_DIR))
+}
+
+/// Create or truncate `path` with mode 0600 and write `bytes`, then fsync.
+///
+/// Mode-on-open (not write-then-chmod) so a secret-bearing file is never
+/// briefly readable under a lax umask. If the file pre-existed at a wider
+/// mode, open keeps its permissions, so the mode is re-asserted after the
+/// write. `sync_all` makes the bytes durable before any caller renames the
+/// file over a live one. Non-unix builds fall back to a plain write.
+pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)
+}
+
 /// Request from an (untrusted) client to the (privileged) daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -141,6 +178,18 @@ pub enum Request {
     /// Toggle the per-user "require blink challenge to unlock" gate (temporal
     /// liveness vs static prints, ADR-0002). PRIVILEGED.
     SetRequireChallenge { user: String, on: bool },
+    /// Capture a short IR sequence and return the MEDIAN eye-aspect-ratio over
+    /// it: one phase of the deliberate-closure consent calibration. The caller
+    /// prompts the user (eyes open, then eyes closed) and sends this once per
+    /// phase. Fires the camera; PRIVILEGED.
+    CaptureEarMedian { user: String },
+    /// Store the per-user eye-closure calibration `(ear_open, ear_closed)` from
+    /// the two `CaptureEarMedian` phases into the enrollment. PRIVILEGED.
+    SetClosureCalibration {
+        user: String,
+        ear_open: f32,
+        ear_closed: f32,
+    },
     /// Auto-configure the IR emitter (integrated linux-enable-ir-emitter): find
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
@@ -303,6 +352,10 @@ pub enum Response {
         profiles: Vec<ProfileSummary>,
         require_eyes_open: bool,
         require_challenge: bool,
+        /// Whether a usable eye-closure consent calibration is stored (for the
+        /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
+        #[serde(default)]
+        closure_calibrated: bool,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
@@ -342,6 +395,9 @@ pub enum Response {
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
+    /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
+    /// eye was detected in any frame.
+    EarMedian(Option<f32>),
     Error(String),
 
     // --- keyring unlock responses -------------------------------------------

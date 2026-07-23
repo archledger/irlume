@@ -220,12 +220,6 @@ pub fn preprocess_arcface(chip_rgb: &[u8]) -> Vec<f32> {
     t
 }
 
-/// Cosine similarity of two L2-normalized embeddings = dot product, clamped.
-///
-/// Written as an 8-lane unrolled fold so LLVM auto-vectorizes it to SSE/AVX
-/// under `target-cpu` / `target-feature=+avx2` (see `.cargo/config.toml`). For
-/// a 512-D vector this is already negligible vs ONNX inference; the real
-/// acceleration is the ONNX Runtime execution provider, not this loop.
 /// Horizontally mirror a 112×112×3 RGB chip (for test-time-augmentation: embed
 /// a face and its mirror, then average the two embeddings, a standard ArcFace
 /// inference trick that cuts false rejects for free, no retraining).
@@ -246,6 +240,14 @@ pub fn flip_h(chip: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Cosine similarity of two L2-normalized embeddings = dot product, clamped.
+/// Mismatched lengths return -1.0 (a definitive non-match) rather than
+/// panicking; see the guard below.
+///
+/// Written as an 8-lane unrolled fold so LLVM auto-vectorizes it to SSE/AVX
+/// under `target-cpu` / `target-feature=+avx2` (see `.cargo/config.toml`). For
+/// a 512-D vector this is already negligible vs ONNX inference; the real
+/// acceleration is the ONNX Runtime execution provider, not this loop.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     // Embeddings of different lengths are never a real match: it means a
     // swapped recognizer model (a different output dimension, which the daemon

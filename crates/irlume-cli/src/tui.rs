@@ -60,6 +60,29 @@ const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
 /// Scans captured per improve-recognition round (add to an existing profile).
 const ADD_SCANS: usize = irlume_core::storage::IMPROVE_SCANS;
 const GOOD_STREAK: u32 = 3;
+/// Full auto-refresh cadence in ms (fingerprint probe + diagnostics; spawns
+/// subprocesses, so it runs on the slow timer).
+const HEAVY_REFRESH_MS: u64 = 10_000;
+/// Light auto-refresh cadence in ms (daemon ping + camera nodes; sub-millisecond).
+const LIGHT_REFRESH_MS: u64 = 2500;
+/// Post-suspend daemon wait: up to `DAEMON_WAIT_TRIES` polls spaced
+/// `DAEMON_WAIT_POLL_MS` ms apart (10 s total), covering irlumed's ONNX model
+/// load before it binds its socket.
+const DAEMON_WAIT_TRIES: u32 = 40;
+const DAEMON_WAIT_POLL_MS: u64 = 250;
+/// Enroll-checklist "Facing the camera" bounds: the liveness frontality gate,
+/// referenced (not retyped) so the display can't drift from the daemon's
+/// verdict. The daemon's live framing guide is stricter still (irlume-auth
+/// `FRAME_YAW_ASYM_MAX` / `pitch_band`); the checklist shows the looser gate a
+/// capture must clear.
+const CHECK_YAW_ASYM_MAX: f32 = irlume_liveness::YAW_ASYM_MAX;
+const CHECK_PITCH_MIN: f32 = irlume_liveness::PITCH_FRAC_MIN;
+const CHECK_PITCH_MAX: f32 = irlume_liveness::PITCH_FRAC_MAX;
+/// Enroll-checklist "Well lit" bounds, mean face luma 0-255: mirror the
+/// private `DIM` / `BRIGHT` consts in irlume-auth's `position_sample`; keep in
+/// sync by name if either side changes.
+const CHECK_LUMA_MIN: f32 = 55.0;
+const CHECK_LUMA_MAX: f32 = 235.0;
 
 #[derive(Clone, Copy)]
 enum Row {
@@ -137,7 +160,19 @@ enum Fix {
     /// Show the user an exact command to run.
     Manual(String),
     /// Needs root: suspend the TUI and run via sudo (`apply_fix` → Suspend).
-    Root(&'static str),
+    Root(RootFix),
+}
+
+/// The root-op fixes `apply_fix` knows how to run. A dedicated enum (not a
+/// string id) so a check row can only name a fix that has a handler.
+#[derive(Clone, Copy)]
+enum RootFix {
+    IrSetup,
+    RestartDaemon,
+    RestartFprintd,
+    LoginEnable,
+    FingerprintAdd,
+    SelinuxLoad,
 }
 
 /// A parked enrollment intent: what to resume after the daemon fix brings
@@ -158,6 +193,19 @@ struct Check {
     sev: Sev,
     detail: String,
     fix: Fix,
+}
+
+/// Non-camera state that steers `compute_visible`, named so call sites read
+/// without counting positional bools. Defaults are all-false (no reader,
+/// basic view, daemon reachable).
+#[derive(Clone, Copy, Default)]
+struct VisibilityInputs {
+    /// A fingerprint reader is present.
+    fp_present: bool,
+    /// `[v]` advanced view is on.
+    advanced: bool,
+    /// The daemon is not answering Ping.
+    daemon_down: bool,
 }
 
 /// Where an async op's result should land (besides the Activity log).
@@ -244,6 +292,13 @@ struct Op {
     rx: mpsc::Receiver<(bool, String)>,
 }
 
+/// TUI state. Seven `Option` fields act as modal overlays; when several are
+/// `Some`, `on_key` consumes input in this order (first match wins):
+/// `error` (any key dismisses) > `enroll` (Esc only) > `op` (q/Esc only) >
+/// `input` (text entry) > `confirm` (y/n) > `enroll_merge` (y/n) > normal
+/// screen keys. `suspend` is not a key state: the main loop takes it after
+/// each key/tick, leaves the TUI, and runs the command. PageUp/PageDown
+/// scroll the Activity panel in every state except text entry.
 struct App {
     user: String,
     screen: usize,
@@ -344,7 +399,17 @@ impl App {
         // a fingerprint-only box never offers face/camera setup steps.
         let caps = irlume_camera::capabilities();
         let fp_present = irlume_fingerprint::available();
-        let visible = Self::compute_visible(&caps, fp_present, false, true, &[]);
+        let visible = Self::compute_visible(
+            &caps,
+            VisibilityInputs {
+                fp_present,
+                // Assume the daemon is down until the first Ping answers, so
+                // Repair starts visible rather than flickering in later.
+                daemon_down: true,
+                ..VisibilityInputs::default()
+            },
+            &[],
+        );
         let screen = visible.first().copied().unwrap_or(0);
         Self {
             user,
@@ -395,11 +460,14 @@ impl App {
     /// live behind the `[v]` advanced toggle.
     fn compute_visible(
         caps: &irlume_camera::Caps,
-        fp_present: bool,
-        advanced: bool,
-        daemon_down: bool,
+        state: VisibilityInputs,
         checks: &[Check],
     ) -> Vec<usize> {
+        let VisibilityInputs {
+            fp_present,
+            advanced,
+            daemon_down,
+        } = state;
         let needs_repair = daemon_down || checks.iter().any(|c| c.sev == Sev::Fail);
         (0..SCREENS.len())
             .filter(|&i| match i {
@@ -426,9 +494,11 @@ impl App {
     fn recompute_visible(&mut self) {
         self.visible = Self::compute_visible(
             &self.caps,
-            self.fp_present,
-            self.advanced,
-            !self.daemon_up,
+            VisibilityInputs {
+                fp_present: self.fp_present,
+                advanced: self.advanced,
+                daemon_down: !self.daemon_up,
+            },
             &self.repair,
         );
         if !self.visible.contains(&self.screen) {
@@ -510,6 +580,7 @@ impl App {
                     profiles,
                     require_eyes_open,
                     require_challenge,
+                    ..
                 }) => {
                     self.profiles = profiles;
                     self.eyes_open = require_eyes_open;
@@ -623,7 +694,7 @@ impl App {
             if up {
                 Fix::None
             } else {
-                Fix::Root("restart-daemon")
+                Fix::Root(RootFix::RestartDaemon)
             },
         ));
 
@@ -674,7 +745,7 @@ impl App {
                     "IR emitter",
                     Sev::Warn,
                     "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Root("ir-setup"),
+                    Fix::Root(RootFix::IrSetup),
                 ));
             }
         } else {
@@ -766,7 +837,7 @@ impl App {
                     "IR emitter",
                     Sev::Warn,
                     "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Root("ir-setup"),
+                    Fix::Root(RootFix::IrSetup),
                 ));
             }
         }
@@ -803,7 +874,7 @@ impl App {
                 if labeled {
                     Fix::None
                 } else {
-                    Fix::Root("selinux-load")
+                    Fix::Root(RootFix::SelinuxLoad)
                 },
             ));
         }
@@ -847,7 +918,7 @@ impl App {
                         h.version,
                         env!("CARGO_PKG_VERSION")
                     ),
-                    Fix::Root("restart-daemon"),
+                    Fix::Root(RootFix::RestartDaemon),
                 ));
             }
         }
@@ -872,7 +943,7 @@ impl App {
                     "Fingerprint reader",
                     Sev::Fail,
                     "reader is claimed by a stale session; finger prompts fail silently".into(),
-                    Fix::Root("restart-fprintd"),
+                    Fix::Root(RootFix::RestartFprintd),
                 ));
             } else {
                 v.push(mk(
@@ -913,7 +984,7 @@ impl App {
                         "Method wiring",
                         Sev::Fail,
                         "method is fingerprint but no finger is enrolled".into(),
-                        Fix::Root("fingerprint-add"),
+                        Fix::Root(RootFix::FingerprintAdd),
                     ));
                 } else {
                     v.push(mk(
@@ -945,7 +1016,7 @@ impl App {
                             "FP keyring unlock",
                             Sev::Warn,
                             "keyring armed but the login stack lacks the unlock line".into(),
-                            Fix::Root("login-enable"),
+                            Fix::Root(RootFix::LoginEnable),
                         ));
                     } else {
                         v.push(mk(
@@ -1078,44 +1149,41 @@ impl App {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
             // Emitter setup writes the persisted UVC control, a root op now.
-            Fix::Root("ir-setup") => {
+            Fix::Root(RootFix::IrSetup) => {
                 self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
             }
-            Fix::Root("restart-daemon") => {
+            Fix::Root(RootFix::RestartDaemon) => {
                 self.log(
                     '→',
                     "sudo systemctl enable --now irlumed (you'll be asked for your password)",
                 );
                 self.suspend = Some(Suspend::RestartDaemon);
             }
-            Fix::Root("restart-fprintd") => {
+            Fix::Root(RootFix::RestartFprintd) => {
                 self.log(
                     '→',
                     "sudo systemctl restart fprintd: releases a stale reader claim",
                 );
                 self.suspend = Some(Suspend::RestartFprintd);
             }
-            Fix::Root("login-enable") => {
+            Fix::Root(RootFix::LoginEnable) => {
                 self.log(
                     '→',
                     "sudo irlume login enable --apply: wires the login stack for your method",
                 );
                 self.suspend = Some(Suspend::LoginEnable);
             }
-            Fix::Root("fingerprint-add") => {
+            Fix::Root(RootFix::FingerprintAdd) => {
                 self.log('→', "enrolling a finger (interactive)");
                 self.suspend = Some(Suspend::FingerprintAdd);
             }
-            Fix::Root("selinux-load") => {
+            Fix::Root(RootFix::SelinuxLoad) => {
                 self.log(
                     '→',
                     "sudo irlume selinux load (you'll be asked for your password)",
                 );
                 self.suspend = Some(Suspend::SelinuxLoad);
-            }
-            Fix::Root(id) => {
-                self.set_error(format!("no handler for fix '{id}'; please report this"))
             }
         }
     }
@@ -1379,11 +1447,11 @@ impl App {
                 && self.input.is_none()
                 && self.confirm.is_none()
             {
-                if last_heavy.elapsed() >= Duration::from_millis(10_000) {
+                if last_heavy.elapsed() >= Duration::from_millis(HEAVY_REFRESH_MS) {
                     self.refresh(); // cheap + fingerprint + diagnostics
                     last_heavy = std::time::Instant::now();
                     last_light = std::time::Instant::now();
-                } else if last_light.elapsed() >= Duration::from_millis(2500) {
+                } else if last_light.elapsed() >= Duration::from_millis(LIGHT_REFRESH_MS) {
                     self.refresh_light(); // daemon state + cameras only
                     last_light = std::time::Instant::now();
                 }
@@ -1406,8 +1474,8 @@ impl App {
                 // irlumed binds its socket only after loading the ONNX models;
                 // give a just-started daemon a bounded moment before judging.
                 if self.resume_enroll.is_some() && !self.daemon_up {
-                    for _ in 0..40 {
-                        std::thread::sleep(Duration::from_millis(250));
+                    for _ in 0..DAEMON_WAIT_TRIES {
+                        std::thread::sleep(Duration::from_millis(DAEMON_WAIT_POLL_MS));
                         if matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong)) {
                             self.daemon_up = true;
                             break;
@@ -2374,12 +2442,15 @@ impl App {
             chk(face, "Face detected"),
             chk(r.map(|x| x.centered).unwrap_or(false), "Centered in frame"),
             chk(
-                r.map(|x| x.yaw_asym <= 0.40 && (0.20..=0.80).contains(&x.pitch_frac))
-                    .unwrap_or(false),
+                r.map(|x| {
+                    x.yaw_asym <= CHECK_YAW_ASYM_MAX
+                        && (CHECK_PITCH_MIN..=CHECK_PITCH_MAX).contains(&x.pitch_frac)
+                })
+                .unwrap_or(false),
                 "Facing the camera",
             ),
             chk(
-                r.map(|x| x.brightness >= 55.0 && x.brightness <= 235.0)
+                r.map(|x| (CHECK_LUMA_MIN..=CHECK_LUMA_MAX).contains(&x.brightness))
                     .unwrap_or(false),
                 "Well lit",
             ),
@@ -3865,7 +3936,7 @@ mod tests {
             enroll_error: None,
             health: None,
             act_scroll: 0,
-            visible: App::compute_visible(&caps, false, false, false, &[]),
+            visible: App::compute_visible(&caps, VisibilityInputs::default(), &[]),
             advanced: false,
             caps,
             fp_present: false,
@@ -4018,6 +4089,7 @@ mod tests {
             profiles: Vec::new(),
             require_eyes_open: true,
             require_challenge: false,
+            closure_calibrated: false,
         });
         assert!(ok);
         let (ok, _) = map_settings(Response::Error("boom".into()));
@@ -4546,19 +4618,20 @@ mod tests {
             ir_pair: true,
             rgb: true,
         };
+        let basic = VisibilityInputs::default();
         // No biometric hardware: only the always-on steps.
         assert_eq!(
-            App::compute_visible(&none, false, false, false, &[]),
+            App::compute_visible(&none, basic, &[]),
             vec![SC_WELCOME, SC_PAM, SC_DONE]
         );
         // RGB-only adds the face path (Profiles + Recovery), not Keyring.
         assert_eq!(
-            App::compute_visible(&rgb, false, false, false, &[]),
+            App::compute_visible(&rgb, basic, &[]),
             vec![SC_WELCOME, SC_PROFILES, SC_RECOVERY, SC_PAM, SC_DONE]
         );
         // An IR pair earns the Keyring step.
         assert_eq!(
-            App::compute_visible(&ir, false, false, false, &[]),
+            App::compute_visible(&ir, basic, &[]),
             vec![
                 SC_WELCOME,
                 SC_PROFILES,
@@ -4570,24 +4643,46 @@ mod tests {
         );
         // A fingerprint-only box gets Keyring + Fingerprint, no face tabs.
         assert_eq!(
-            App::compute_visible(&none, true, false, false, &[]),
+            App::compute_visible(
+                &none,
+                VisibilityInputs {
+                    fp_present: true,
+                    ..basic
+                },
+                &[]
+            ),
             vec![SC_WELCOME, SC_KEYRING, SC_FINGERPRINT, SC_PAM, SC_DONE]
         );
         // Advanced view on full hardware shows every screen.
         assert_eq!(
-            App::compute_visible(&ir, true, true, false, &[]),
+            App::compute_visible(
+                &ir,
+                VisibilityInputs {
+                    fp_present: true,
+                    advanced: true,
+                    ..basic
+                },
+                &[]
+            ),
             (0..SCREENS.len()).collect::<Vec<_>>()
         );
         // Repair earns its tab when the daemon is down…
         assert_eq!(
-            App::compute_visible(&none, false, false, true, &[]),
+            App::compute_visible(
+                &none,
+                VisibilityInputs {
+                    daemon_down: true,
+                    ..basic
+                },
+                &[]
+            ),
             vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_DONE]
         );
         // …or when any check fails, but not for a mere warning.
         let fail = [check_row("x", Sev::Fail, Fix::None)];
-        assert!(App::compute_visible(&none, false, false, false, &fail).contains(&SC_REPAIR));
+        assert!(App::compute_visible(&none, basic, &fail).contains(&SC_REPAIR));
         let warn = [check_row("x", Sev::Warn, Fix::None)];
-        assert!(!App::compute_visible(&none, false, false, false, &warn).contains(&SC_REPAIR));
+        assert!(!App::compute_visible(&none, basic, &warn).contains(&SC_REPAIR));
     }
 
     #[test]
@@ -5044,13 +5139,12 @@ mod tests {
         app.repair = vec![
             check_row("ok", Sev::Ok, Fix::None),
             check_row("man", Sev::Warn, Fix::Manual("run `foo --bar`".into())),
-            check_row("emitter", Sev::Warn, Fix::Root("ir-setup")),
-            check_row("daemon", Sev::Fail, Fix::Root("restart-daemon")),
-            check_row("reader", Sev::Fail, Fix::Root("restart-fprintd")),
-            check_row("wiring", Sev::Fail, Fix::Root("login-enable")),
-            check_row("finger", Sev::Fail, Fix::Root("fingerprint-add")),
-            check_row("selinux", Sev::Fail, Fix::Root("selinux-load")),
-            check_row("bogus", Sev::Fail, Fix::Root("no-such-fix")),
+            check_row("emitter", Sev::Warn, Fix::Root(RootFix::IrSetup)),
+            check_row("daemon", Sev::Fail, Fix::Root(RootFix::RestartDaemon)),
+            check_row("reader", Sev::Fail, Fix::Root(RootFix::RestartFprintd)),
+            check_row("wiring", Sev::Fail, Fix::Root(RootFix::LoginEnable)),
+            check_row("finger", Sev::Fail, Fix::Root(RootFix::FingerprintAdd)),
+            check_row("selinux", Sev::Fail, Fix::Root(RootFix::SelinuxLoad)),
         ];
         app.apply_fix(0);
         assert!(app.suspend.is_none());
@@ -5087,13 +5181,7 @@ mod tests {
             suspended_by(&mut app, 7),
             Some(Suspend::SelinuxLoad)
         ));
-        app.suspend = None;
-        app.apply_fix(8);
-        assert!(app.suspend.is_none());
-        let err = app.error.as_ref().expect("an unknown fix id must surface");
-        assert!(err.contains("no-such-fix"), "got: {err}");
         // Out of range: a no-op, not a panic.
-        app.error = None;
         let before = app.activity.len();
         app.apply_fix(99);
         assert_eq!(app.activity.len(), before);
@@ -5712,7 +5800,7 @@ mod tests {
                 Sev::Warn,
                 Fix::Manual("install the package".into()),
             ),
-            check_row("SELinux policy", Sev::Fail, Fix::Root("selinux-load")),
+            check_row("SELinux policy", Sev::Fail, Fix::Root(RootFix::SelinuxLoad)),
         ];
         app.repair_sel = 0;
         let text = draw_text(&app);
@@ -6105,7 +6193,7 @@ mod tests {
         // The socket is dead, so the Daemon row fails with the root fix…
         let daemon = find("Daemon (irlumed)");
         assert!(daemon.sev == Sev::Fail);
-        assert!(matches!(daemon.fix, Fix::Root("restart-daemon")));
+        assert!(matches!(daemon.fix, Fix::Root(RootFix::RestartDaemon)));
         // …but the daemon-reported model/camera state is still ground truth.
         let ort = find("ONNX Runtime");
         assert!(ort.sev == Sev::Ok);

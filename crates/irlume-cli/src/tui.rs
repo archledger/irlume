@@ -3008,10 +3008,15 @@ impl App {
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
-        let [list_area, info_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).areas(area);
         let (argb, air) = irlume_camera::select_pair(); // currently active pair
         let pairs = &self.pairs;
+        // Size the list to its rows (header + one row per camera/note) so the
+        // info block sits right under it instead of a stretched gap; leftover
+        // space stays empty at the bottom (content near the top).
+        let list_rows = self.nodes.len().max(pairs.len()).max(1) as u16 + 1;
+        let [list_area, info_area] =
+            Layout::vertical([Constraint::Length(list_rows + 1), Constraint::Length(9)])
+                .areas(area);
 
         // ---- selectable list of trusted (physical) Hello camera pairs ----
         // No pair ≠ no camera: an RGB-only device still serves the convenience
@@ -3087,19 +3092,23 @@ impl App {
         };
         let mut st = ListState::default()
             .with_selected(Some(self.cam_sel.min(pairs.len().saturating_sub(1))));
-        let blk = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim())
-            .title(" cameras (● = active · ↑↓ select · enter = use) ");
-        let inner = blk.inner(list_area);
-        f.render_widget(blk, list_area);
+        // No inner border (whitespace over chrome; the content panel already
+        // frames this). A section header carries what the border title did.
+        let [hdr_area, rows_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(list_area);
+        f.render_widget(
+            Paragraph::new(section(
+                "Cameras  (● = active · ↑↓ select · Enter uses one)",
+            )),
+            hdr_area,
+        );
         f.render_stateful_widget(
             List::new(items).highlight_style(
                 Style::new()
                     .bg(Color::Rgb(0x20, 0x30, 0x40))
                     .add_modifier(Modifier::BOLD),
             ),
-            inner,
+            rows_area,
             &mut st,
         );
 
@@ -3144,13 +3153,8 @@ impl App {
             Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(" probe XU controls", Style::new().dim()),
         ]));
-        let iblk = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim());
-        f.render_widget(
-            Paragraph::new(lines).block(iblk).wrap(Wrap { trim: true }),
-            info_area,
-        );
+        // Borderless (no box-in-box); the content panel is the only frame.
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info_area);
     }
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {

@@ -40,7 +40,7 @@ to +0.10; the IR path uses 0.55 native / 0.40 adapted, and calibrated RGB+IR
 fusion grants at probability ≥ 0.50), and the mandatory password fallback
 bounds the residual either way.
 
-## The recognizer trade-off: why we keep AuraFace
+## Recognizer trade-off: AuraFace vs buffalo_l
 
 A stronger recognizer narrows the gap. **buffalo_l** (InsightFace, Glint360K) on
 the identical protocol cut the spread to ≈ 4.5× and halved the worst-group FAR;

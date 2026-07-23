@@ -531,8 +531,8 @@ pub struct EarSample {
 
 /// One observation of HEAD POSE from an IR capture frame, for the head-nod
 /// consent gesture. Pose comes from the DETECTOR's 5-point landmarks (not the
-/// FaceMesh), so unlike [`EarSample`] it does not depend on eye landmarks and is
-/// robust to head angle and lighting: a nod reads the same reclined or upright.
+/// FaceMesh), so unlike [`EarSample`] it does not depend on eye landmarks and stays
+/// reliable across head angle and lighting: a nod reads the same reclined or upright.
 /// `pitch_frac`/`yaw_signed` are `None` when no face was detected in the frame.
 #[derive(Clone, Copy, Debug)]
 pub struct PoseSample {
@@ -1092,7 +1092,7 @@ pub fn calibrate_open_ear(samples: &[EarSample]) -> Option<f32> {
 /// back up past [`ClosureCalibration::reopen_threshold`]) within
 /// [`CLOSURE_REOPEN_WINDOW`] frames.
 ///
-/// The bounds and the reopen are what make this robust, learned from a hardware
+/// The bounds and the reopen are what make this hold up, learned from a hardware
 /// capture campaign 2026-07-22: a deliberately HELD SQUINT is physically the
 /// same as a held eye-closure (it goes just as deep on EAR), so neither depth
 /// nor a duration floor alone can separate them. What separates them is SHAPE: a

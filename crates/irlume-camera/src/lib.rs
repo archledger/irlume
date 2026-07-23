@@ -914,7 +914,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     // strobing emitter the frame adjacent to the brightest is an emitter-OFF
     // exposure that captured only ambient IR. Subtracting it isolates the
     // emitter's own reflected light, the same illuminated/ambient-pair step
-    // Hello uses. Its purpose is EXPOSURE ROBUSTNESS: under strong ambient IR
+    // Hello uses. Its purpose is SURVIVING EXPOSURE EXTREMES: under strong ambient IR
     // (sunlight) the pedestal would otherwise wash out the emitter reflection.
     // It is not primarily a spoof control (Hello credits spoof resistance to the
     // IR wavelength plus a separate liveness stage, which is where irlume's
@@ -1035,7 +1035,7 @@ pub mod ir_probe {
     /// ambient IR pedestal (Hello's ambient-subtraction step) so the emitter's own
     /// reflection survives a bright-ambient exposure: light present in both frames
     /// (sunlight, a screen's own IR) cancels; the emitter-lit face does not. This
-    /// is an exposure-robustness step, not a standalone spoof control. Falls back
+    /// is an exposure-compensation step, not a standalone spoof control. Falls back
     /// to `lit` on a size mismatch.
     pub fn subtract(lit: &[u8], ambient: &[u8]) -> Vec<u8> {
         if lit.len() != ambient.len() {

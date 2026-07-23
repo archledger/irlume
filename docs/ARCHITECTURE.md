@@ -138,7 +138,7 @@ discarded: with `IRLUME_IR_AMBIENT_SUBTRACT=1` the daemon subtracts the
 off-frame adjacent to the lit one, isolating the emitter's own reflected light.
 This is the same illuminated/ambient pairing Windows Hello uses.
 
-Subtraction is experimental and off by default. Its job is exposure robustness
+Subtraction is experimental and off by default. Its job is surviving exposure extremes
 under strong ambient IR (sunlight), not spoof detection; the depth and glint
 cues in the liveness gate carry that. Field captures set the gates it runs
 behind (`crates/irlume-camera/src/lib.rs`):
@@ -197,7 +197,7 @@ flowchart LR
     linkStyle default stroke:#b0b0b8,stroke-width:1.5px;
 ```
 
-## Why these choices
+## Defense-to-threat mapping
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the Windows Hello bypass classes
 (CVE-2021-34466 IR injection; ESS device-trust) each defense maps to.

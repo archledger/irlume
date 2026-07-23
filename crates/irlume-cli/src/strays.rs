@@ -51,6 +51,18 @@ fn report_strays() {
     for dir in PAM_DIRS {
         collect_strays(dir, "pam_irlume", &["pam_irlume.so"], &mut strays);
     }
+    // On merged-usr hosts two scanned directories can be the same place
+    // (Arch: /usr/lib64 -> /usr/lib), listing one file under both names;
+    // keep the first path per canonical target. Found in container E2E.
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    strays.retain(|p| {
+        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
+        if seen.contains(&canon) {
+            return false;
+        }
+        seen.push(canon);
+        true
+    });
     // Only files no package owns are leftovers; a package-owned neighbour
     // (whatever it is) is some package's business, not ours.
     strays.retain(|p| !package_owns(p).unwrap_or(false));

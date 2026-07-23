@@ -59,15 +59,37 @@ irlume doctor           # flags Bitwarden-installed-but-polkit-unwired
 
 ## Bitwarden specifics
 
-Bitwarden's desktop app needs its polkit action registered on the host. The
-non-sandboxed packages install it themselves ("set up biometric unlock" in
-Settings); the flatpak and snap cannot write to `/usr/share/polkit-1/actions`,
-so Bitwarden displays the one-time manual step in its settings. After that:
+Bitwarden's "Unlock with system authentication" is a polkit prompt for the
+action `com.bitwarden.Bitwarden.unlock` (`auth_self`), so it runs the `polkit-1`
+PAM stack that irlume wires. First wire irlume for polkit if you have not:
+
+```console
+sudo irlume login enable --with-polkit --apply
+```
+
+The non-sandboxed Bitwarden packages register their polkit action themselves.
+The **flatpak and snap cannot** write to `/usr/share/polkit-1/actions`, and the
+flatpak gives no in-product prompt for the manual step, so install the action on
+the host yourself:
+
+```console
+# Install Bitwarden's polkit action (the sandbox cannot do this itself)
+sudo wget -O /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy \
+  https://raw.githubusercontent.com/bitwarden/clients/main/apps/desktop/resources/com.bitwarden.desktop.policy
+sudo chown root:root /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy
+# Fedora / SELinux only: label it so polkit can read it
+sudo chcon system_u:object_r:usr_t:s0 /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy
+```
+
+Then in Bitwarden: **File > Settings > Security > Unlock with system
+authentication**. `irlume doctor` confirms the action is registered.
 
 - Unlock the vault once with your master password (Bitwarden holds the vault
   key in protected memory; biometrics never replace the first unlock).
 - "Unlock with system authentication" then pops the polkit dialog, which your
-  face satisfies.
+  nod satisfies. Verified on the 2026.6.1 flatpak. Flatpak builds before
+  Bitwarden 2026.5 failed here with polkit's "Unix process subject does not
+  have uid set"; if you hit that, update the flatpak or use the `.deb`/`.rpm`.
 - Browser-extension biometric unlock rides the same desktop app via native
   messaging; enable "biometric unlock in browser" in the desktop settings.
 

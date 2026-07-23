@@ -143,9 +143,10 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
         None | Some("status") => status(),
         Some("enable") => act(true, apply, with_sudo, with_polkit),
         Some("disable") => act(false, apply, with_sudo, with_polkit),
+        Some("reconcile") => reconcile(),
         _ => {
             eprintln!(
-                "usage: irlume login <status|enable|disable> [--with-sudo] [--with-polkit] [--apply]"
+                "usage: irlume login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply]"
             );
             eprintln!("  (without --apply, prints what it WOULD change: a dry run)");
             ExitCode::from(2)
@@ -183,6 +184,63 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
 /// True when any greeter or the lock screen carries the irlume wiring; the
 /// "is face login actually wired" probe for the TUI dashboard (sudo excluded:
 /// face-sudo alone doesn't make the login screen work).
+/// Path of the marker recording that `login enable` was applied, and with which
+/// flags. Its existence is the signal that irlume login *should* be wired; a
+/// distro update that strips our PAM lines does not touch this file.
+fn wired_marker_path() -> std::path::PathBuf {
+    irlume_common::state_dir().join("login.wired")
+}
+
+/// Persist (on enable) or remove (on disable) the wiring marker. The body is a
+/// tiny stable key=value record of the extra scopes so reconcile re-applies the
+/// same `--with-sudo` / `--with-polkit` choice, not a bare login wiring.
+fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
+    let path = wired_marker_path();
+    if !enable {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = format!("with_sudo={}\nwith_polkit={}\n", with_sudo, with_polkit);
+    let _ = std::fs::write(&path, body);
+}
+
+/// Re-read the marker's recorded flags. Returns `None` when login was never
+/// enabled (no marker), so reconcile does nothing on machines that opted out.
+fn read_wired_marker() -> Option<(bool, bool)> {
+    let body = std::fs::read_to_string(wired_marker_path()).ok()?;
+    let flag = |key: &str| {
+        body.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false)
+    };
+    Some((flag("with_sudo"), flag("with_polkit")))
+}
+
+/// Idempotent repair entry point, meant to run unattended from a systemd path
+/// unit watching the greeter PAM files. If login was enabled (marker present)
+/// but the PAM stack is no longer wired, re-apply the recorded configuration;
+/// otherwise exit quietly. Always root (the path unit's service runs as root).
+fn reconcile() -> ExitCode {
+    let Some((with_sudo, with_polkit)) = read_wired_marker() else {
+        // Never enabled here: nothing to maintain.
+        return ExitCode::SUCCESS;
+    };
+    if login_wired() {
+        // Still intact; the common case after a spurious file-change event.
+        return ExitCode::SUCCESS;
+    }
+    if effective_uid() != 0 {
+        eprintln!("[login] reconcile needs root; run: sudo irlume login reconcile");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
+    act(true, true, with_sudo, with_polkit)
+}
+
 pub(crate) fn login_wired() -> bool {
     for s in GREETERS
         .iter()
@@ -595,6 +653,11 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     if !apply {
         println!("[login] re-run with --apply (as root) to perform these changes.");
     } else if errs == 0 {
+        // Record the wiring intent so `irlume login reconcile` can re-apply it
+        // after a distro update rewrites a greeter's PAM file out from under us
+        // (authselect, pam-auth-update, or a package upgrade shipping a fresh
+        // vendor copy). On disable we clear the marker so reconcile stays quiet.
+        write_wired_marker(enable, with_sudo, with_polkit);
         println!("[login] done. Password remains the fallback everywhere.");
     }
     if errs == 0 {
@@ -1744,6 +1807,31 @@ mod tests {
     #[test]
     fn effective_uid_matches_the_real_euid() {
         assert_eq!(effective_uid(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn wired_marker_round_trips_flags_and_clears_on_disable() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TestDir::new("wired-marker");
+        let old = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &dir.0);
+        // No marker → reconcile has nothing to maintain.
+        assert_eq!(read_wired_marker(), None);
+        // Enable with only --with-polkit is recorded as (sudo=false, polkit=true).
+        write_wired_marker(true, false, true);
+        assert_eq!(read_wired_marker(), Some((false, true)));
+        // Re-enable with both flags overwrites cleanly.
+        write_wired_marker(true, true, true);
+        assert_eq!(read_wired_marker(), Some((true, true)));
+        // Disable clears the marker so the self-heal service stays quiet.
+        write_wired_marker(false, false, false);
+        assert_eq!(read_wired_marker(), None);
+        match old {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
     }
 
     #[test]

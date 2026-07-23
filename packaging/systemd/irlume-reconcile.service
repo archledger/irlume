@@ -1,0 +1,12 @@
+[Unit]
+Description=Re-apply irlume face-auth PAM wiring after a distro update
+Documentation=https://github.com/archledger/irlume
+# Only meaningful once login was enabled; the command self-gates on the marker
+# at /var/lib/irlume/login.wired and exits 0 when there is nothing to do.
+ConditionPathExists=/var/lib/irlume/login.wired
+
+[Service]
+Type=oneshot
+# Idempotent: re-adds only the greeter lines that went missing, using the flags
+# recorded at `login enable` time. Password stays the fallback throughout.
+ExecStart=/usr/bin/irlume login reconcile

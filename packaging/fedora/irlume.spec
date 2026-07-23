@@ -85,6 +85,11 @@ for m in glintr100 face_detection_yunet_2023mar face_landmark blaze_face_short_r
     install -Dm0644 models/$m.onnx %{buildroot}%{_datadir}/%{name}/models/$m.onnx
 done
 install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlumed.service
+# Self-heal wiring watcher: re-applies irlume's greeter PAM lines if a distro
+# update strips them (no-op unless `login enable` was run and the lines went
+# missing). Enabled by preset; harmless when login was never wired.
+install -Dm0644 packaging/systemd/irlume-reconcile.path %{buildroot}%{_unitdir}/irlume-reconcile.path
+install -Dm0644 packaging/systemd/irlume-reconcile.service %{buildroot}%{_unitdir}/irlume-reconcile.service
 # Bundled onnxruntime runtime + a drop-in pointing ORT_DYLIB_PATH at it (cp -a
 # to preserve the .so version symlinks).
 install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
@@ -96,8 +101,9 @@ install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/pack
 install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-irlume.preset
 
 %post
-# %%systemd_post honours our shipped preset → enables irlumed on first install.
-%systemd_post irlumed.service
+# %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
+# self-heal path unit on first install.
+%systemd_post irlumed.service irlume-reconcile.path
 # Also start it now so `irlume tui` works immediately after `dnf install`
 # (no-op in chroots/containers where systemd isn't running).
 if [ $1 -eq 1 ]; then
@@ -113,10 +119,11 @@ if [ $1 -gt 1 ]; then
 fi
 
 %preun
-%systemd_preun irlumed.service
+%systemd_preun irlumed.service irlume-reconcile.path
 
 %postun
 %systemd_postun_with_restart irlumed.service
+%systemd_postun irlume-reconcile.path
 
 %post selinux
 semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
@@ -148,6 +155,8 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service
 %{_unitdir}/irlumed.service.d/10-ort.conf
+%{_unitdir}/irlume-reconcile.path
+%{_unitdir}/irlume-reconcile.service
 %{_presetdir}/90-irlume.preset
 
 %files selinux

@@ -2,3 +2,7 @@
 # (irlume login enable), so the daemon being up is safe and makes the
 # first-run TUI work immediately after install.
 enable irlumed.service
+# Watches greeter PAM files and re-applies irlume wiring after a distro update
+# strips it. Self-gates on the login.wired marker, so it stays idle until
+# `irlume login enable` runs.
+enable irlume-reconcile.path

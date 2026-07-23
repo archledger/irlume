@@ -20,6 +20,7 @@
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 //!   irlume tui                                   interactive setup/management UI
 
+mod bitwarden;
 mod blinkcap;
 mod commands;
 mod fingerprint;
@@ -104,6 +105,7 @@ fn main() -> std::process::ExitCode {
         (Some("enrolldev"), _) => enrolldev(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
         (Some("recovery"), sub) => recovery::run(sub, &args),
+        (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
@@ -2582,6 +2584,15 @@ fn doctor() -> std::process::ExitCode {
     // tightening that hid /run/irlume.sock would be visible.
     if crate::pamwire::polkit_wired() == Some(true) {
         report_polkit_sandbox();
+        // The inverse of the wired-check above: face auth answers polkit, but
+        // Bitwarden is installed without its polkit action, so its biometric
+        // unlock silently falls back to the password. One command fixes it.
+        if !bitwarden_action && bitwarden::app_detected() {
+            println!(
+                "[doctor] Bitwarden is installed but its polkit action is not; its biometric \
+                 unlock\n     falls back to the password. Fix: sudo irlume bitwarden setup --apply"
+            );
+        }
     }
     // The login keyring an app like Bitwarden reads from: report whether a
     // Secret Service provider is up and the collection is unlocked. Self-gates

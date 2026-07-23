@@ -7,6 +7,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`irlume bitwarden setup`: one command replaces the copy-paste Bitwarden
+  polkit setup.** Detects how Bitwarden was installed and acts per flavor:
+  flatpak and native installs get the action file written host-side (content
+  ships inside irlume, byte-identical to bitwarden/clients' resource file, so
+  nothing is downloaded at install time); snap is left to snapd, which
+  installs the action itself on plug connect; ostree/immutable hosts get the
+  rpm-layering steps instead of a doomed write to read-only /usr. Dry-run by
+  default, `--apply` to act. An existing action file with different content
+  is never overwritten (Bitwarden's own setup may have written a newer one),
+  and after installing, the command confirms registration with polkit itself
+  (`pkaction`), catching the mislabeled-file failures a file check misses.
+  `irlume doctor` now points at the command when Bitwarden is installed with
+  polkit wired but no action registered. docs/APP-INTEGRATION.md rewritten
+  around it; the old manual wget flow also mislabeled snap as needing manual
+  setup, which snapd has handled since Bitwarden 2025.3.
+
 - **`irlume doctor` reports install-hygiene drift.** Two related checks, both
   report-only: stray irlume-named files next to the managed binaries and the
   PAM module that no package owns (the backups a manual branch install leaves

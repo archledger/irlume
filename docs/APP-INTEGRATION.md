@@ -67,19 +67,37 @@ PAM stack that irlume wires. First wire irlume for polkit if you have not:
 sudo irlume login enable --with-polkit --apply
 ```
 
-The non-sandboxed Bitwarden packages register their polkit action themselves.
-The **flatpak and snap cannot** write to `/usr/share/polkit-1/actions`, and the
-flatpak gives no in-product prompt for the manual step, so install the action on
-the host yourself:
+Then let irlume install Bitwarden's polkit action (it detects how Bitwarden
+was installed and does the right thing per flavor):
 
 ```console
-# Install Bitwarden's polkit action (the sandbox cannot do this itself)
-sudo wget -O /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy \
-  https://raw.githubusercontent.com/bitwarden/clients/main/apps/desktop/resources/com.bitwarden.desktop.policy
-sudo chown root:root /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy
-# Fedora / SELinux only: label it so polkit can read it
-sudo chcon system_u:object_r:usr_t:s0 /usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy
+irlume bitwarden status              # what is installed, what is missing
+sudo irlume bitwarden setup --apply  # dry-run first by omitting --apply
 ```
+
+What it does per install flavor:
+
+- **Flatpak**: installs the action file on the host. The flatpak bundles no
+  policy file and its sandbox cannot write `/usr/share/polkit-1/actions`, so
+  a host-side install is always required; this is the main case.
+- **Snap**: nothing. snapd installs the action itself when the snap's polkit
+  plug connects (auto-connected from the store since Bitwarden 2025.3). If
+  the action is missing there, the fix is `sudo snap connect bitwarden:polkit`.
+- **.deb / .rpm / Arch**: installs the same file the app would self-install
+  on first toggle, sparing the pkexec prompt (the app's own setup also breaks
+  on hosts without SELinux tooling; irlume's does not).
+- **ostree / immutable (Silverblue, Kinoite)**: explains instead of writing.
+  `/usr` is read-only and polkit reads actions from exactly one directory,
+  so the supported route is layering a small rpm that owns the file
+  (`rpm-ostree install --apply-live`), then restarting polkit.
+
+The policy content ships inside irlume (byte-identical to
+`apps/desktop/resources/com.bitwarden.desktop.policy` in bitwarden/clients),
+so nothing is downloaded at install time. An already-present action file with
+different content is left alone: Bitwarden's own setup may have written a
+newer one. After installing, the command asks polkit itself (`pkaction`)
+whether the action registered, which catches label problems a plain file
+check misses.
 
 Then in Bitwarden: **File > Settings > Security > Unlock with system
 authentication**. `irlume doctor` confirms the action is registered.

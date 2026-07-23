@@ -142,6 +142,9 @@ enum Suspend {
     /// suspends to `sudo irlume uninstall --yes` (the TUI already double-
     /// confirmed, so --yes skips the CLI's own prompts).
     Uninstall,
+    /// Install Bitwarden's biometric-unlock polkit action; root op, suspends
+    /// to `sudo irlume bitwarden setup --apply` (non-interactive, flavor-aware).
+    BitwardenSetup,
 }
 
 /// Severity of a Repair-tab diagnostic.
@@ -1571,6 +1574,10 @@ impl App {
                 &["irlume", "set-cameras", &rgb, &ir],
             ),
             Suspend::IrSetup => self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
+            Suspend::BitwardenSetup => self.sudo_step(
+                "install Bitwarden's polkit action",
+                &["irlume", "bitwarden", "setup", "--apply"],
+            ),
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
             // does the teardown (un-wire PAM, stop daemon, wipe data) as root
@@ -1961,6 +1968,21 @@ impl App {
             }
             // Login wiring (PAM): show status outside the alt-screen.
             (SC_PAM, KeyCode::Char('s')) => self.suspend = Some(Suspend::LoginStatus),
+            // Bitwarden app unlock: install its polkit action, only ever on
+            // explicit request and only useful when the row says so.
+            (SC_PAM, KeyCode::Char('b')) => match crate::bitwarden::tui_state() {
+                Some(crate::bitwarden::TuiState::NeedsSetup) => {
+                    self.log('→', "sudo irlume bitwarden setup --apply: installs Bitwarden's polkit action (host-side; the flatpak cannot)");
+                    self.suspend = Some(Suspend::BitwardenSetup);
+                }
+                Some(crate::bitwarden::TuiState::Ready) => {
+                    self.log('·', "Bitwarden's polkit action is already installed; enable \"unlock with system authentication\" in its settings")
+                }
+                Some(crate::bitwarden::TuiState::SnapMissing) => {
+                    self.log('·', "snap install: snapd owns that file; run: sudo snap connect bitwarden:polkit")
+                }
+                None => self.log('·', "Bitwarden is not installed on this system"),
+            },
             // Settings.
             (SC_SETTINGS, KeyCode::Enter) | (SC_SETTINGS, KeyCode::Char(' ')) => {
                 let on = !self.eyes_open;
@@ -3358,6 +3380,34 @@ impl App {
             "    closure after `sudo irlume calibrate-closure`.  See docs/APP-INTEGRATION.md",
             Style::new().dim(),
         )));
+        // Bitwarden app-unlock row: only rendered when Bitwarden is installed
+        // (invisible for everyone else), and never acts on its own — [b] is
+        // the user's explicit opt-in.
+        match crate::bitwarden::tui_state() {
+            None => {}
+            Some(crate::bitwarden::TuiState::Ready) => lines.push(Line::from(vec![
+                Span::styled("  Bitwarden ", Style::new()),
+                Span::styled("● polkit action installed", Style::new().fg(OK)),
+                Span::styled(
+                    "  (enable \"unlock with system authentication\" in its settings)",
+                    Style::new().dim(),
+                ),
+            ])),
+            Some(crate::bitwarden::TuiState::SnapMissing) => lines.push(Line::from(vec![
+                Span::styled("  Bitwarden ", Style::new()),
+                Span::styled("○ snap action missing", Style::new().fg(WARN)),
+                Span::styled(
+                    "  fix: sudo snap connect bitwarden:polkit",
+                    Style::new().dim(),
+                ),
+            ])),
+            Some(crate::bitwarden::TuiState::NeedsSetup) => lines.push(Line::from(vec![
+                Span::styled("  Bitwarden ", Style::new()),
+                Span::styled("○ biometric unlock not set up", Style::new().fg(WARN)),
+                Span::styled("  [b]", Style::new().fg(ACCENT)),
+                Span::styled(" set it up (sudo; optional)", Style::new().dim()),
+            ])),
+        }
         lines.push(Line::from(vec![
             Span::styled("  disable ", Style::new()),
             Span::styled("sudo irlume login disable --apply", Style::new().dim()),
@@ -3541,7 +3591,11 @@ impl App {
             SC_KEYRING => &[("a", "arm"), ("f", "forget")],
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
             SC_FINGERPRINT => &[("a", "enroll finger")],
-            SC_PAM => &[("w", "wire login (sudo)"), ("s", "show status")],
+            SC_PAM => &[
+                ("w", "wire login (sudo)"),
+                ("s", "show status"),
+                ("b", "app unlock"),
+            ],
             SC_SETTINGS => &[("enter", "toggle eyes-open"), ("c", "toggle blink")],
             SC_DONE => &[("w", "wire login"), ("r", "refresh")],
             _ => &[("r", "refresh")],

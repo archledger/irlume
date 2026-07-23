@@ -105,6 +105,15 @@ pub struct Enrollment {
     /// for pre-binding enrollments; enforcement only kicks in once bound.
     #[serde(default)]
     pub camera_binding: Option<CameraBinding>,
+    /// Per-user eye-closure calibration `(ear_open, ear_closed)` captured at
+    /// enroll, for the deliberate-closure consent gesture (polkit prompts). The
+    /// gesture compares EAR to an ABSOLUTE per-user threshold derived from these
+    /// extremes, not a running median (which the closure itself would pollute),
+    /// so it cannot be measured from the gesture window and must be enrolled.
+    /// `None` for enrollments captured before this existed; the consent gesture
+    /// then can't run (the daemon fails the polkit face path closed to password).
+    #[serde(default)]
+    pub closure_calibration: Option<(f32, f32)>,
 }
 
 impl Enrollment {
@@ -115,6 +124,7 @@ impl Enrollment {
             require_eyes_open: false,
             require_challenge: false,
             camera_binding: None,
+            closure_calibration: None,
         }
     }
 
@@ -331,6 +341,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
         require_eyes_open: false,
         require_challenge: false,
         camera_binding: None,
+        closure_calibration: None,
     }
 }
 
@@ -539,6 +550,7 @@ mod tests {
             require_eyes_open: true,
             require_challenge: false,
             camera_binding: None,
+            closure_calibration: None,
         }
     }
 

@@ -546,6 +546,8 @@ fn request_user(req: &Request) -> Option<&str> {
         | AddScan { user, .. }
         | SetRequireEyesOpen { user, .. }
         | SetRequireChallenge { user, .. }
+        | CaptureEarMedian { user }
+        | SetClosureCalibration { user, .. }
         | SealPassword { user, .. }
         | UnsealPassword { user, .. }
         | UnsealKeyring { user, .. }
@@ -1111,11 +1113,22 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         .collect(),
                     require_eyes_open: enr.require_eyes_open,
                     require_challenge: enr.require_challenge,
+                    closure_calibrated: enr
+                        .closure_calibration
+                        .map(|(o, c)| {
+                            irlume_liveness::ClosureCalibration {
+                                ear_open: o,
+                                ear_closed: c,
+                            }
+                            .is_usable()
+                        })
+                        .unwrap_or(false),
                 },
                 Ok(None) => Response::Enrollment {
                     profiles: vec![],
                     require_eyes_open: false,
                     require_challenge: false,
+                    closure_calibrated: false,
                 },
                 Err(e) => Response::Error(e.to_string()),
             }
@@ -1228,6 +1241,38 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Ok(format!(
                     "require-challenge {}",
                     if on { "ENABLED" } else { "disabled" }
+                ))
+            })
+        }
+        Request::CaptureEarMedian { user: _ } => {
+            // Fires the camera; root-gate like the other camera-bearing requests
+            // (on the 0666 socket fallback this is what keeps other uids out).
+            if peer.uid != 0 {
+                return Response::Error(format!(
+                    "capture_ear_median requires root (peer uid {})",
+                    peer.uid
+                ));
+            }
+            // ~3s window: enough frames for a stable median of the current eye
+            // state (open or closed, whichever the caller is prompting).
+            const CAL_FRAMES: usize = 45;
+            match engine.capture_ear_samples(CAL_FRAMES) {
+                Ok(samples) => Response::EarMedian(irlume_liveness::calibrate_open_ear(&samples)),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::SetClosureCalibration {
+            user,
+            ear_open,
+            ear_closed,
+        } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            mutate_enrollment(&user, |enr| {
+                enr.closure_calibration = Some((ear_open, ear_closed));
+                Ok(format!(
+                    "closure calibration stored (open {ear_open:.3}, closed {ear_closed:.3})"
                 ))
             })
         }
@@ -2332,6 +2377,7 @@ mod tests {
             require_eyes_open: false,
             require_challenge: false,
             camera_binding: None,
+            closure_calibration: None,
         }
     }
 
@@ -2591,6 +2637,7 @@ mod tests {
                 profiles,
                 require_eyes_open,
                 require_challenge,
+                ..
             } => {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].name, "Face Profile 1");
@@ -2864,6 +2911,7 @@ mod tests {
                 profiles,
                 require_eyes_open,
                 require_challenge,
+                ..
             } => {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].name, "Work");

@@ -580,6 +580,7 @@ pub fn status(args: &[String]) -> ExitCode {
             profiles,
             require_eyes_open,
             require_challenge,
+            ..
         }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
             println!(

@@ -570,8 +570,9 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
                 println!("  {msg}");
                 if enable && apply {
                     println!(
-                        "    polkit prompts (Bitwarden unlock, pkexec) now accept your face; \
-                         a natural blink is required before the prompt is approved."
+                        "    polkit prompts (Bitwarden unlock, pkexec) will accept your face once\n    \
+                         you calibrate the consent gesture:  sudo irlume calibrate-closure\n    \
+                         Then approve a prompt by closing your eyes for ~1s and opening them."
                     );
                 }
             }

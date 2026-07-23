@@ -1159,6 +1159,105 @@ pub(crate) fn frame_frozen(best_mean: f64, sig: &[u8], last_sig: Option<&[u8]>) 
     (10.0..245.0).contains(&best_mean) && last_sig == Some(sig)
 }
 
+/// Mean IR value at/above which a decoded frame is treated as an exposure
+/// blow-out: a saturated frame carries no detectable face, so a streaming
+/// consumer skips it rather than spend a window slot on it. Matches the upper
+/// bound of [`frame_frozen`]'s normal-exposure band.
+const IR_BLOWN_MEAN: f64 = 245.0;
+
+/// One usable IR frame delivered to a [`capture_ir_streaming`] consumer, with
+/// the decoded mean the caller would otherwise recompute (the strobe phase and
+/// framing cues both key off it).
+pub struct IrStreamFrame {
+    pub frame: Frame,
+    /// Decoded 8-bit mean of `frame.data`.
+    pub mean: f64,
+}
+
+/// Drive a single held-open IR stream, invoking `on_frame` for each USABLE frame
+/// (non-frozen, non-blown) until the consumer returns [`std::ops::ControlFlow::Break`] or
+/// the `max_frames` attempt budget is spent. Returns the break value, or `None`
+/// if the budget ran out first.
+///
+/// This is the rolling-capture core the burst helpers and the live consumers
+/// share: it owns the device, the V4L2 mmap stream, the emitter re-fire, and the
+/// frozen-stream restart, so a consumer only decides what to do with each frame
+/// and when to stop. A blink watch can therefore return the instant it sees a
+/// blink instead of always draining a fixed window, and a preview can pull
+/// frames continuously; both get the same black/blown/frozen filtering.
+///
+/// Usable = the same set [`capture_ir_sequence`] historically kept: emitter-off
+/// (dark) frames ARE delivered, because a consumer classifying the strobe needs
+/// them; only frozen and blown frames are dropped.
+pub fn capture_ir_streaming<B>(
+    device: &str,
+    max_frames: usize,
+    mut on_frame: impl FnMut(IrStreamFrame) -> std::ops::ControlFlow<B>,
+) -> irlume_common::Result<Option<B>> {
+    verify_pinned(device)?;
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!(
+            "{device}: hardware privacy switch is ON"
+        )));
+    }
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let (w, h) = (fmt.width, fmt.height);
+    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
+        .map_err(|e| map_io(device, e))?;
+    let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
+    ir_emitter::enable(dev.handle().fd(), &card);
+    // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
+    // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
+    // constant mid-grey for the rest of the window); real sensor noise never
+    // repeats exactly. Saturated and near-black frames are excluded from the
+    // check: those are optical states (exposure blow-out / emitter-off phase),
+    // not a stall, and restarting mid-settle only prolongs the settle.
+    // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
+    let (mut dead_run, mut restarts) = (0usize, 0usize);
+    let mut last_sig: Option<Vec<u8>> = None;
+    for attempt in 0..max_frames {
+        // Keep the emitter lit across the whole window (some controls self-clear).
+        if attempt % 8 == 0 {
+            ir_emitter::enable(dev.handle().fd(), &card);
+        }
+        let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        let data = decode_ir(buf, pix, w, h);
+        let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
+        let sig = frame_signature(&data);
+        let frozen = frame_frozen(mean, &sig, last_sig.as_deref());
+        last_sig = Some(sig);
+        if frozen {
+            dead_run += 1;
+            if dead_run >= FROZEN_RUN_BEFORE_RESTART && restarts < FROZEN_RESTART_BUDGET {
+                restarts += 1;
+                dead_run = 0;
+                last_sig = None;
+                drop(stream); // stop + release buffers before re-arming
+                stream =
+                    v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
+                        .map_err(|e| map_io(device, e))?;
+                ir_emitter::enable(dev.handle().fd(), &card);
+            }
+            continue;
+        }
+        dead_run = 0;
+        if mean >= IR_BLOWN_MEAN {
+            continue;
+        }
+        let frame = Frame {
+            width: w,
+            height: h,
+            spectrum: Spectrum::Ir,
+            data,
+        };
+        if let std::ops::ControlFlow::Break(b) = on_frame(IrStreamFrame { frame, mean }) {
+            return Ok(Some(b));
+        }
+    }
+    Ok(None)
+}
+
 /// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for
 /// temporal liveness (the blink challenge). Unlike [`capture_ir`], the eyes-closed
 /// dip of a blink must survive, so this returns every sample rather than only the
@@ -1166,6 +1265,10 @@ pub(crate) fn frame_frozen(best_mean: f64, sig: &[u8], last_sig: Option<&[u8]>) 
 /// mini-burst: `burst=1` yields raw frames (to reveal whether the emitter
 /// strobes); `burst>=2` de-strobes locally while keeping enough temporal
 /// resolution for a blink (the IR node is ~15 fps, so a mini-burst of 2 ≈ 133 ms).
+///
+/// This keeps its own burst/de-strobe loop rather than delegating to
+/// [`capture_ir_streaming`], which delivers raw single frames; the blink watch
+/// uses the streaming core, this stays for the `burst>=2` diagnostic path.
 pub fn capture_ir_sequence(
     device: &str,
     samples: usize,
@@ -1187,17 +1290,7 @@ pub fn capture_ir_sequence(
     );
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     ir_emitter::enable(dev.handle().fd(), &card);
-    // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
-    // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
-    // constant mid-grey for the rest of the window); real sensor noise never
-    // repeats exactly. Saturated and near-black frames are excluded from the
-    // check: those are optical states (exposure blow-out / emitter-off phase),
-    // not a stall, and restarting mid-settle only prolongs the settle.
-    // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
     let mut frames = Vec::with_capacity(samples);
-    // Attempt budget: enough spare frames to ride out the ~1 s dark-start
-    // exposure settle and a stream restart without starving the window, while
-    // bounding worst-case wall time (~2x window) when the camera stays sick.
     let max_attempts = samples * 2 + 30;
     let (mut dead_run, mut restarts) = (0usize, 0usize);
     let mut last_sig: Option<Vec<u8>> = None;
@@ -1205,7 +1298,6 @@ pub fn capture_ir_sequence(
         if frames.len() >= samples {
             break;
         }
-        // Keep the emitter lit across the whole window (some controls self-clear).
         if attempt % 8 == 0 {
             ir_emitter::enable(dev.handle().fd(), &card);
         }
@@ -1244,9 +1336,7 @@ pub fn capture_ir_sequence(
             continue;
         }
         dead_run = 0;
-        if best_mean >= 245.0 {
-            // Exposure blow-out: no face is detectable in a saturated frame;
-            // skip it rather than spend a window slot on it.
+        if best_mean >= IR_BLOWN_MEAN {
             continue;
         }
         frames.push(Frame {

@@ -18,6 +18,7 @@ irlume-liveness.workspace = true
 irlume-core.workspace = true
 irlume-auth.workspace = true
 irlume-fingerprint.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true   # restore default SIGPIPE so `irlume … | head` doesn't panic
 image = { workspace = true }

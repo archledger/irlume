@@ -1216,6 +1216,7 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
             }],
             require_eyes_open: true,
             require_challenge: false,
+            closure_calibrated: false,
         },
         Request::SetRequireEyesOpen { .. } => Response::Ok("eyes-open now ON".into()),
         _ => Response::Error("unexpected request".into()),
@@ -1241,6 +1242,7 @@ fn profiles_empty_listing_says_none_enrolled() {
         profiles: Vec::new(),
         require_eyes_open: false,
         require_challenge: false,
+        closure_calibrated: false,
     });
     // Bare `profiles` (no subcommand) defaults to the listing. Note: a flag
     // directly after `profiles` is read as the subcommand word, so --user
@@ -1355,6 +1357,7 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             }],
             require_eyes_open: false,
             require_challenge: true,
+            closure_calibrated: false,
         },
         Request::KeyringInfo { .. } => Response::KeyringInfo {
             armed: true,
@@ -1455,6 +1458,7 @@ fn setup_walks_every_step_noninteractively() {
             profiles: Vec::new(),
             require_eyes_open: false,
             require_challenge: false,
+            closure_calibrated: false,
         },
         Request::Enroll { .. } => Response::Enrolled {
             profile: "Face Profile 1".into(),

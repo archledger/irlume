@@ -432,6 +432,40 @@ pub const BLINK_V_POST_WIN: usize = 6;
 /// A brightness class needs at least this many face samples to be trusted;
 /// tiny windows (camera stream died / exposure never settled) read NoEyes.
 pub const BLINK_MIN_CLASS_SAMPLES: usize = 8;
+/// Consent gesture ([`detect_deliberate_closure`]) closure LOWER bound: the eyes
+/// must stay shut for at least this many consecutive face frames. Validated on
+/// real captures 2026-07-22: every accepted deliberate hold ran ≥11 face frames,
+/// while the one natural blink that reached the reopen test ran 10, so 11 is the
+/// clean floor (the face node runs ~7-8 fps after the strobe, so ~11 frames is
+/// ~1.5 s, well above the 100-400 ms spontaneous-blink range). Overridable via
+/// `IRLUME_CONSENT_CLOSURE_FRAMES`.
+pub const CONSENT_CLOSURE_MIN_FRAMES: usize = 11;
+/// Consent gesture closure UPPER bound: a run longer than this is a SUSTAINED
+/// hold (a held squint, eyes closed, or looking away), not a discrete ~1 s
+/// gesture. On the campaign data the deliberate holds ran ≤20 frames while the
+/// squints ran 32-38; 25 sits between them. Overridable via
+/// `IRLUME_CONSENT_CLOSURE_MAX`.
+pub const CONSENT_CLOSURE_MAX_FRAMES: usize = 25;
+/// Frames after a closure within which the eyes must reopen for it to count as a
+/// discrete gesture (a squint never reopens).
+pub const CLOSURE_REOPEN_WINDOW: usize = 4;
+/// Openness fraction the eyes must recover to after a closure to count as
+/// reopened (0 = shut, 1 = fully open). High, so easing a squint slightly does
+/// not read as a reopen.
+pub const CLOSURE_REOPEN_FRACTION: f32 = 0.6;
+/// Frames the eyes may blip back open mid-hold without ending the closure run
+/// (landmark noise tolerance).
+pub const CLOSURE_HYSTERESIS_FRAMES: usize = 2;
+/// Openness fraction (0 = fully shut, 1 = fully open) at/below which the eye
+/// counts as shut for the consent gesture. The blink-taxonomy "complete closure"
+/// level is ~0.20-0.25 (PMC11133197); this sits just above it so a genuine full
+/// hold clears it while a partial squint does not. Validated on real captures
+/// 2026-07-22 (deep threshold ~0.10 for this camera separates a held closure
+/// from a squint that hovered near 0.12).
+pub const CLOSURE_DEEP_FRACTION: f32 = 0.30;
+/// Minimum open-minus-closed EAR gap for a [`ClosureCalibration`] to be trusted;
+/// a smaller gap means the open and closed extremes were not cleanly captured.
+pub const MIN_CALIBRATION_SEPARATION: f32 = 0.05;
 /// The V's pre/post near-open samples must have frame brightness within this
 /// factor of the dip's; EAR shifts with exposure, so a dip during auto-exposure
 /// slewing (measured live 2026-07-01) must not pass as a blink.
@@ -493,6 +527,136 @@ pub struct EarSample {
     /// A live open eye spikes high and collapses on closure; a diffuse print
     /// stays flat. The second liveness cue: a real blink shows this DROP.
     pub contrast: f32,
+}
+
+/// One observation of HEAD POSE from an IR capture frame, for the head-nod
+/// consent gesture. Pose comes from the DETECTOR's 5-point landmarks (not the
+/// FaceMesh), so unlike [`EarSample`] it does not depend on eye landmarks and is
+/// robust to head angle and lighting: a nod reads the same reclined or upright.
+/// `pitch_frac`/`yaw_signed` are `None` when no face was detected in the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct PoseSample {
+    pub idx: usize,
+    /// Nose vertical position between eye and mouth lines: ~0.5 frontal, LARGER
+    /// looking down, SMALLER looking up (see `irlume_vision::HeadPose`). A nod
+    /// swings this down-and-back.
+    pub pitch_frac: Option<f32>,
+    /// Signed horizontal turn: ~0 frontal, sign = nose toward image-left/right. A
+    /// shake swings this side-to-side.
+    pub yaw_signed: Option<f32>,
+    /// Frame mean brightness (IR strobe phase), carried for parity with the
+    /// blink pipeline; the pose detector does not currently gate on it.
+    pub bri: f32,
+}
+
+/// Whether a deliberate head gesture (the consent nod) was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadGesture {
+    /// A deliberate NOD (approve).
+    Nod,
+    /// A deliberate SHAKE (reserved for a future "deny"; detected but distinct).
+    Shake,
+    /// A face was tracked but no deliberate gesture (still, drift, or noise).
+    None,
+    /// No face tracked in enough of the window to judge.
+    NoFace,
+}
+
+/// Deliberate head-nod consent gesture ([`detect_nod`]): minimum pitch RANGE
+/// (max-min of `pitch_frac`) over the window. A nod swings the head down and
+/// back; a still head barely moves. Validated on a hardware campaign 2026-07-22
+/// (upright + reclined): still heads ranged ≤0.061, deliberate nods 0.057-0.167,
+/// so 0.07 sits just above every still take with margin. Overridable via
+/// `IRLUME_NOD_PITCH_MIN`.
+pub const NOD_PITCH_MIN: f32 = 0.07;
+/// ...and maximum yaw RANGE, so idle LOOKING-AROUND (which swings yaw a lot) and
+/// a head SHAKE are not read as a nod. Campaign: nods ranged ≤0.46 in yaw while
+/// look-around ranged 0.87-6.95, so 0.6 separates them cleanly.
+pub const NOD_YAW_MAX: f32 = 0.6;
+/// Minimum pitch oscillation crossings (the pitch signal must cross above AND
+/// below its median): 1 = a single deliberate down-up nod. A drift that looks
+/// down and HOLDS never crosses back, so it stays 0 and is rejected. Set to 1
+/// (from 2) after live testing: requiring two nods pushed the gesture past the
+/// capture window and slowed grants; the campaign data shows 1 crossing accepts
+/// more genuine nods (19/21 vs 17/21) with still ZERO false accepts on
+/// still/look-around (the pitch-range and yaw gates do that work).
+pub const NOD_MIN_CROSSINGS: usize = 1;
+/// A crossing counts only when the pitch moves past this fraction of the take's
+/// pitch range from the median, so sensor noise on a near-still head is ignored.
+pub const NOD_CROSSING_AMP_FRAC: f32 = 0.25;
+/// The window must have at least this many face frames to judge a nod.
+pub const NOD_MIN_FACE_FRAMES: usize = 12;
+
+/// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
+/// pitch swings through a range of at least [`NOD_PITCH_MIN`] while the yaw stays
+/// within [`NOD_YAW_MAX`] (not a look-around or shake), oscillating up-and-down
+/// at least [`NOD_MIN_CROSSINGS`] times (not a single drift). Pose-DEFINED, so
+/// unlike the eye-closure gesture it reads the same at any head angle or
+/// lighting, which is why it survives a reclined user where EAR collapses.
+///
+/// `Nod` = the gesture was seen; `None` = a face was tracked but no nod;
+/// `NoFace` = too few face frames to judge. `Shake` is not yet detected (returns
+/// `None` for a shake) pending its own tuning data.
+pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
+    let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
+    let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
+    if pitch.len() < NOD_MIN_FACE_FRAMES {
+        return HeadGesture::NoFace;
+    }
+    let range = |v: &[f32]| -> f32 {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &x in v {
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        hi - lo
+    };
+    let pitch_range = range(&pitch);
+    let yaw_range = range(&yaw);
+    if pitch_range < nod_pitch_min() || yaw_range > NOD_YAW_MAX {
+        return HeadGesture::None;
+    }
+    if nod_crossings(&pitch, pitch_range) >= NOD_MIN_CROSSINGS {
+        HeadGesture::Nod
+    } else {
+        HeadGesture::None
+    }
+}
+
+/// Count how many times the pitch signal alternates between clearly-above and
+/// clearly-below its median (each excursion past `range * NOD_CROSSING_AMP_FRAC`
+/// counts once when it flips sign): the rhythmic up-down of a nod.
+fn nod_crossings(pitch: &[f32], pitch_range: f32) -> usize {
+    let mut sorted = pitch.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let amp = pitch_range * NOD_CROSSING_AMP_FRAC;
+    let (mut crossings, mut sign) = (0usize, 0i8);
+    for &p in pitch {
+        let s = if p > median + amp {
+            1
+        } else if p < median - amp {
+            -1
+        } else {
+            0
+        };
+        if s != 0 && s != sign {
+            if sign != 0 {
+                crossings += 1;
+            }
+            sign = s;
+        }
+    }
+    crossings
+}
+
+/// Minimum nod pitch range, overridable via `IRLUME_NOD_PITCH_MIN`.
+fn nod_pitch_min() -> f32 {
+    std::env::var("IRLUME_NOD_PITCH_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(NOD_PITCH_MIN)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,9 +761,39 @@ pub fn contrast_signature(samples: &[EarSample]) -> (f32, f32) {
 /// length and has near-open samples just before and after it. A static print's
 /// jitter is neither deep nor a coherent drop-and-recover; slow drifts (AE
 /// settling, squints) fail the pre/post near-open check or the run-length cap.
-pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
+/// Outcome of the shared blink analysis over a sample window. Both
+/// [`detect_blink`] (any blink → live) and [`detect_double_blink`] (a deliberate
+/// two-blink consent gesture) derive from this, so the anti-spoof gates and dip
+/// detection live in exactly one place.
+enum BlinkScan {
+    /// No plausibly-open eye anywhere in the window (mesh failed / print / dark).
+    NoEyes,
+    /// An anti-spoof gate (motion or corneal-contrast) rejected the window; no
+    /// dip may be trusted as a blink.
+    Gated,
+    /// Trustworthy blink closures in ascending onset order, de-duplicated so one
+    /// blink counts once. Empty means eyes were seen but no blink occurred.
+    Events(Vec<BlinkEvent>),
+}
+
+/// One detected eyelid closure: the frame index where it began and the last
+/// frame it was still closed. `end - onset` is the closure duration in frames,
+/// which distinguishes a brief spontaneous blink from a deliberately held one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlinkEvent {
+    onset: usize,
+    end: usize,
+}
+
+/// Shared blink analysis: strobe classification, per-class open baseline, the
+/// motion and corneal-contrast anti-spoof gates, and blink-onset detection
+/// (deep EAR dip and sharp-V run). Returns every detected blink onset rather
+/// than short-circuiting on the first, so a consumer can count deliberate
+/// repeats. [`detect_blink`]'s observable result is unchanged: non-empty
+/// `Events` ⇔ the old code returned `Blinked`.
+fn blink_scan(samples: &[EarSample]) -> BlinkScan {
     if samples.is_empty() {
-        return BlinkResult::NoEyes;
+        return BlinkScan::NoEyes;
     }
     // Strobe visible? Compare typical adjacent brightness jump to typical level.
     let mut bris: Vec<f32> = samples.iter().map(|s| s.bri).collect();
@@ -660,7 +854,7 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         })
         .collect();
     if ratios.is_empty() {
-        return BlinkResult::NoEyes;
+        return BlinkScan::NoEyes;
     }
     // Motion gate: a moving print/camera fakes EAR dips via landmark jitter. If
     // the face was moving through the window (median speed over threshold), we
@@ -676,7 +870,7 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
         .unwrap_or(BLINK_MOTION_MAX_MEDIAN);
     let (_, motion_med, _) = face_speeds(samples);
     if motion_med > motion_max {
-        return BlinkResult::NoBlink;
+        return BlinkScan::Gated;
     }
     // Corneal-contrast gate (second, independent cue): a real blink occludes the
     // eye's specular glint under the lid, so open-eye contrast must exceed the
@@ -711,16 +905,44 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .unwrap_or(BLINK_CONTRAST_DROP_MIN);
             if open_c / dip_c < drop_min {
-                return BlinkResult::NoBlink;
+                return BlinkScan::Gated;
             }
         }
     }
-    if ratios.iter().any(|o| o.ratio <= BLINK_EAR_DIP_RATIO) {
-        return BlinkResult::Blinked;
+    // Collect blink events from both detectors (rather than returning on the
+    // first), each with the eyelid-closure span so a caller can tell a brief
+    // spontaneous blink from a deliberately HELD closure.
+    let mut events: Vec<BlinkEvent> = Vec::new();
+    // Deep-dip detector: a closure begins on the first frame whose EAR falls to/
+    // below the dip ratio and ends when the eye REOPENS (ratio back above the
+    // open ratio). `end` tracks the last still-closed frame, so `end - onset` is
+    // the closure duration in frame indices. Requiring a genuine reopen (not a
+    // bare frame gap) is what separates two blinks from one long closure.
+    let mut cur: Option<BlinkEvent> = None;
+    for o in &ratios {
+        if o.ratio <= BLINK_EAR_DIP_RATIO {
+            match &mut cur {
+                Some(ev) => ev.end = o.idx,
+                None => {
+                    cur = Some(BlinkEvent {
+                        onset: o.idx,
+                        end: o.idx,
+                    })
+                }
+            }
+        } else if o.ratio >= BLINK_V_OPEN_RATIO {
+            if let Some(ev) = cur.take() {
+                events.push(ev);
+            }
+        }
+    }
+    if let Some(ev) = cur.take() {
+        events.push(ev);
     }
     // Sharp-V scan: maximal same-class runs of near-consecutive samples (frame
     // gap ≤ 3) at/below the run ratio. A blink spanning both classes appears as
-    // one run per class, each judged on its own.
+    // one run per class, each judged on its own. These are brief by construction
+    // (`BLINK_V_MAX_RUN`), so they register as short-closure events.
     let mut start = 0;
     while start < ratios.len() {
         if ratios[start].ratio > BLINK_V_RUN_RATIO {
@@ -761,17 +983,272 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
                     && bri_ok(o.bri)
             });
             if pre && post {
-                return BlinkResult::Blinked;
+                events.push(BlinkEvent {
+                    onset: first_idx,
+                    end: last_idx,
+                });
             }
         }
         start = end + 1;
     }
+    // A blink caught by BOTH detectors (or by overlapping runs) must count once:
+    // sort by onset and merge events whose onsets are within 3 frames, keeping
+    // the wider closure span.
+    events.sort_unstable_by_key(|e| e.onset);
+    events.dedup_by(|next, kept| {
+        if next.onset.saturating_sub(kept.onset) <= 3 {
+            kept.end = kept.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+    BlinkScan::Events(events)
+}
+
+/// True when a NATURAL blink was observed (a clear EAR dip below the open
+/// baseline) → live. Any single blink of any duration suffices. `NoBlink` = a
+/// plausibly-open eye but no blink (a static artefact, or the user didn't blink;
+/// the caller re-captures / falls back to password). `NoEyes` = no open eye
+/// anywhere (mesh failed, or a non-eye/print): the median EAR never reached the
+/// open floor.
+pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
+    match blink_scan(samples) {
+        BlinkScan::NoEyes => BlinkResult::NoEyes,
+        BlinkScan::Gated => BlinkResult::NoBlink,
+        BlinkScan::Events(events) if !events.is_empty() => BlinkResult::Blinked,
+        BlinkScan::Events(_) => BlinkResult::NoBlink,
+    }
+}
+
+/// Per-user eye-closure calibration: the enrolled open-eye and closed-eye EAR
+/// medians. Set once from an enrollment calibration (a few open frames, then a
+/// held closure), NOT from the gesture window itself.
+///
+/// The consent gesture is measured against an ABSOLUTE, per-user threshold, not
+/// a running-median baseline. That is deliberate: a running median is polluted
+/// by the very closure being detected (once the eyes are shut for most of the
+/// window the median drops to the closed value and the closure vanishes into the
+/// "baseline"), a documented failure mode of relative EAR gating. Capturing the
+/// open/closed extremes offline and comparing at a fixed midpoint (the
+/// Modified-EAR method, PeerJ CS-943 / PMC9044337) avoids it, and validated
+/// cleanly on real captures (a deliberate hold reads a 18-35 frame sub-threshold
+/// run; spontaneous blinks and squints read ≤5).
+#[derive(Debug, Clone, Copy)]
+pub struct ClosureCalibration {
+    /// Median EAR with the eyes open (the smaller eye, as [`EarSample::ear`]).
+    pub ear_open: f32,
+    /// Median EAR with the eyes deliberately shut (near 0 on a clean landmark).
+    pub ear_closed: f32,
+}
+
+impl ClosureCalibration {
+    /// The closed threshold below which the eye counts as shut for the gesture.
+    /// A DEEP fraction of the way from the user's closed extreme toward open, not
+    /// the halfway Modified-EAR point: the blink-taxonomy "complete closure"
+    /// level is an openness fraction of ~0.20-0.25 (PMC11133197), and requiring
+    /// that depth is what rejects a shallow squint that only partly closes. On
+    /// real captures the halfway point let a squint that hovered at ~0.12 count
+    /// as shut; the deep fraction (~0.10 for this camera) breaks that run while
+    /// still catching a genuine full hold (~0.05).
+    pub fn closed_threshold(&self) -> f32 {
+        self.ear_closed + CLOSURE_DEEP_FRACTION * (self.ear_open - self.ear_closed)
+    }
+
+    /// EAR at/above which the eyes count as REOPENED after a closure, confirming
+    /// a discrete gesture rather than a sustained hold. A high openness fraction
+    /// ([`CLOSURE_REOPEN_FRACTION`]) of the way back toward the open extreme, so
+    /// a partial recovery (a squint easing slightly) does not count as a reopen.
+    pub fn reopen_threshold(&self) -> f32 {
+        self.ear_closed + CLOSURE_REOPEN_FRACTION * (self.ear_open - self.ear_closed)
+    }
+
+    /// True when open and closed are far enough apart to threshold reliably; a
+    /// too-small gap means bad landmarks / pose and the calibration should be
+    /// re-taken rather than trusted.
+    pub fn is_usable(&self) -> bool {
+        self.ear_open - self.ear_closed >= MIN_CALIBRATION_SEPARATION
+    }
+}
+
+/// Median open-eye EAR over a window of samples, for the OPEN half of an
+/// enrollment calibration (the user simply looks at the camera). `None` if no
+/// eye was ever detected. Uses the median so a stray blink during the open
+/// capture does not drag it down.
+pub fn calibrate_open_ear(samples: &[EarSample]) -> Option<f32> {
+    let mut ears: Vec<f32> = samples
+        .iter()
+        .filter_map(|s| s.ear)
+        .filter(|e| e.is_finite())
+        .collect();
+    median(&mut ears)
+}
+
+/// Detect a DELIBERATE eye-closure consent gesture: a BOUNDED closure that
+/// REOPENS. The eyes must go shut (EAR below the per-user
+/// [`ClosureCalibration::closed_threshold`]) for a run of
+/// [`CONSENT_CLOSURE_MIN_FRAMES`]..=[`CONSENT_CLOSURE_MAX_FRAMES`] face frames
+/// (tolerating [`CLOSURE_HYSTERESIS_FRAMES`] dropout frames), then reopen (EAR
+/// back up past [`ClosureCalibration::reopen_threshold`]) within
+/// [`CLOSURE_REOPEN_WINDOW`] frames.
+///
+/// The bounds and the reopen are what make this robust, learned from a hardware
+/// capture campaign 2026-07-22: a deliberately HELD SQUINT is physically the
+/// same as a held eye-closure (it goes just as deep on EAR), so neither depth
+/// nor a duration floor alone can separate them. What separates them is SHAPE: a
+/// deliberate gesture is a discrete ~1 s close-and-reopen (bounded run, clear
+/// reopen), while a squint / eyes-closed / looking-away is a SUSTAINED hold that
+/// runs past the upper bound and never reopens. On the campaign data this
+/// rejected all 20 squints, all 20 look-down and every natural blink, while
+/// accepting the deliberate holds. A single spontaneous blink (100-400 ms;
+/// Bentivoglio 1997) is too SHORT to reach the lower bound.
+///
+/// `Blinked` = the gesture was seen, `NoBlink` = a face was seen but not the
+/// gesture, `NoEyes` = no face frames at all.
+pub fn detect_deliberate_closure(samples: &[EarSample], cal: &ClosureCalibration) -> BlinkResult {
+    let face_frames: Vec<f32> = samples.iter().filter_map(|s| s.ear).collect();
+    if face_frames.is_empty() {
+        return BlinkResult::NoEyes;
+    }
+    let closed = cal.closed_threshold();
+    let reopen = cal.reopen_threshold();
+    let (min, max) = (consent_closure_frames(), consent_closure_max_frames());
+    let hysteresis = CLOSURE_HYSTERESIS_FRAMES;
+
+    // Walk closure runs (consecutive frames below `closed`, tolerating a few
+    // dropout frames). A run qualifies when its length is within [min, max] AND
+    // the eyes reopen (a frame back above `reopen`) within a short window after
+    // it ends. A too-short run is a blink; a too-long run that never reopens is
+    // a sustained squint / eyes-closed.
+    let n = face_frames.len();
+    let mut i = 0;
+    while i < n {
+        if face_frames[i] >= closed {
+            i += 1;
+            continue;
+        }
+        // Extend the run over sub-threshold frames, allowing `hysteresis`
+        // consecutive above-threshold blips before it ends.
+        let (start, mut end, mut dropouts) = (i, i, 0usize);
+        let mut j = i;
+        while j < n {
+            if face_frames[j] < closed {
+                end = j;
+                dropouts = 0;
+            } else if dropouts < hysteresis {
+                dropouts += 1;
+            } else {
+                break;
+            }
+            j += 1;
+        }
+        let length = end - start + 1;
+        if length >= min && length <= max {
+            let reopened = face_frames
+                .iter()
+                .skip(end + 1)
+                .take(CLOSURE_REOPEN_WINDOW)
+                .any(|&e| e >= reopen);
+            if reopened {
+                return BlinkResult::Blinked;
+            }
+        }
+        i = j.max(end + 1);
+    }
     BlinkResult::NoBlink
+}
+
+/// Minimum closure length (consecutive face frames below the per-user closed
+/// threshold) for the consent gesture, overridable via
+/// `IRLUME_CONSENT_CLOSURE_FRAMES` for per-camera-fps tuning.
+fn consent_closure_frames() -> usize {
+    std::env::var("IRLUME_CONSENT_CLOSURE_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(CONSENT_CLOSURE_MIN_FRAMES)
+}
+
+/// Maximum closure length for the consent gesture; a longer run is a sustained
+/// hold, not a discrete gesture. Overridable via `IRLUME_CONSENT_CLOSURE_MAX`.
+fn consent_closure_max_frames() -> usize {
+    std::env::var("IRLUME_CONSENT_CLOSURE_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= consent_closure_frames())
+        .unwrap_or(CONSENT_CLOSURE_MAX_FRAMES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- head-nod consent gesture (detect_nod) ---
+    fn pose_seq(pitch: &[f32], yaw: &[f32]) -> Vec<PoseSample> {
+        pitch
+            .iter()
+            .zip(yaw)
+            .enumerate()
+            .map(|(i, (&p, &y))| PoseSample {
+                idx: i,
+                pitch_frac: Some(p),
+                yaw_signed: Some(y),
+                bri: 60.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deliberate_nod_is_detected() {
+        // Pitch swings down-up-down (a 2-nod), yaw flat. Range ~0.12, oscillates.
+        let pitch = [
+            0.53, 0.55, 0.60, 0.63, 0.58, 0.52, 0.51, 0.55, 0.62, 0.64, 0.57, 0.52, 0.53, 0.56,
+        ];
+        let yaw = [0.05; 14];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::Nod);
+    }
+
+    #[test]
+    fn still_head_is_not_a_nod() {
+        // Near-flat pitch (range ~0.02), the campaign still-take shape.
+        let pitch = [
+            0.57, 0.568, 0.571, 0.569, 0.57, 0.572, 0.568, 0.57, 0.569, 0.571, 0.57, 0.568, 0.569,
+            0.57,
+        ];
+        let yaw = [0.09; 14];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::None);
+    }
+
+    #[test]
+    fn look_around_is_not_a_nod() {
+        // Big yaw swings (idle glancing): excluded by the yaw gate even though
+        // pitch also moves.
+        let pitch = [
+            0.52, 0.58, 0.63, 0.55, 0.60, 0.51, 0.57, 0.62, 0.54, 0.59, 0.53, 0.61, 0.56, 0.58,
+        ];
+        let yaw = [
+            0.1, 1.2, -0.8, 2.0, -1.5, 0.9, -2.1, 1.8, -0.6, 1.1, -1.9, 0.7, -1.3, 1.6,
+        ];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::None);
+    }
+
+    #[test]
+    fn single_look_down_drift_is_not_a_nod() {
+        // Pitch drifts down and STAYS (looking down to read), never oscillates
+        // back up: high range but too few crossings.
+        let pitch = [
+            0.52, 0.54, 0.57, 0.60, 0.62, 0.63, 0.63, 0.64, 0.63, 0.64, 0.63, 0.64, 0.63, 0.64,
+        ];
+        let yaw = [0.05; 14];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::None);
+    }
+
+    #[test]
+    fn too_few_face_frames_is_noface() {
+        let pitch = [0.5, 0.6, 0.5];
+        let yaw = [0.0; 3];
+        assert_eq!(detect_nod(&pose_seq(&pitch, &yaw)), HeadGesture::NoFace);
+    }
 
     fn fb(cx: f32, cy: f32) -> FaceBox {
         FaceBox { cx, cy, score: 0.9 }
@@ -928,6 +1405,119 @@ mod tests {
             }
         }
         out
+    }
+
+    // --- deliberate held-closure consent gesture (detect_deliberate_closure) ---
+    // The detector compares EAR to a per-user ABSOLUTE closed threshold from an
+    // enrollment calibration, so unlike the natural-blink gate it needs no open
+    // baseline in the window (a hold that fills the window still registers). Test
+    // calibration: open 0.24 / closed 0.05 → threshold 0.145.
+
+    fn cal() -> ClosureCalibration {
+        ClosureCalibration {
+            ear_open: 0.24,
+            ear_closed: 0.05,
+        }
+    }
+
+    #[test]
+    fn deliberate_bounded_closure_that_reopens_is_the_consent_gesture() {
+        // The real gesture: open, close ~12 frames (0.05 < deep threshold), then
+        // REOPEN. Within [min, max] and reopens → accepted.
+        let mut ears = vec![0.24; 4];
+        ears.extend([0.05; 12]);
+        ears.extend([0.24; 4]);
+        let seq = flat(&ears);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::Blinked
+        );
+    }
+
+    #[test]
+    fn sustained_hold_without_reopen_is_not_the_gesture() {
+        // A held squint / eyes-closed: shut the whole window, never reopens and
+        // runs past the upper bound. This is the case that broke a pure
+        // depth+duration detector; the reopen + upper bound reject it.
+        let mut ears = vec![0.24; 4];
+        ears.extend([0.03; 34]); // held to the end: no reopen, > max
+        let seq = flat(&ears);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+    }
+
+    #[test]
+    fn brief_natural_blink_is_not_the_consent_gesture() {
+        // A spontaneous blink (~2 frames shut) and an open window: a blink but
+        // NOT consent. A passively watching person blinks, so this must not
+        // approve.
+        let seq = flat(&[0.24, 0.24, 0.24, 0.05, 0.06, 0.24, 0.24, 0.24]);
+        assert_eq!(detect_blink(&seq), BlinkResult::Blinked);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+    }
+
+    #[test]
+    fn wandering_squint_is_not_the_consent_gesture() {
+        // The real false-positive shape: a blink then a squint wandering above
+        // and below the threshold (0.05..0.13), never a sustained deep run. The
+        // absolute-threshold run breaks on the frames above 0.145, so it stays
+        // short and is rejected (the relative-baseline detector wrongly read it
+        // as one long closure).
+        let seq = flat(&[
+            0.24, 0.05, 0.09, 0.13, 0.12, 0.11, 0.13, 0.10, 0.12, 0.24, 0.24,
+        ]);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+    }
+
+    #[test]
+    fn open_eyes_are_neither_blink_nor_consent() {
+        let seq = flat(&[0.24; 12]);
+        assert_eq!(detect_blink(&seq), BlinkResult::NoBlink);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+        // No face frames at all → NoEyes.
+        assert_eq!(detect_deliberate_closure(&[], &cal()), BlinkResult::NoEyes);
+    }
+
+    #[test]
+    fn calibration_midpoint_and_usability() {
+        let c = ClosureCalibration {
+            ear_open: 0.24,
+            ear_closed: 0.05,
+        };
+        // closed + 0.30*(open-closed) = 0.05 + 0.30*0.19 = 0.107.
+        assert!((c.closed_threshold() - 0.107).abs() < 1e-6);
+        assert!(c.is_usable());
+        // Too small a gap = untrustworthy calibration.
+        assert!(!ClosureCalibration {
+            ear_open: 0.10,
+            ear_closed: 0.09
+        }
+        .is_usable());
+    }
+
+    #[test]
+    fn consent_closure_frame_threshold_is_env_overridable() {
+        // A 4-frame closure is below the default but passes with a lowered bar.
+        let seq = flat(&[0.24, 0.24, 0.05, 0.05, 0.05, 0.05, 0.24, 0.24]);
+        assert_eq!(
+            detect_deliberate_closure(&seq, &cal()),
+            BlinkResult::NoBlink
+        );
+        std::env::set_var("IRLUME_CONSENT_CLOSURE_FRAMES", "3");
+        let got = detect_deliberate_closure(&seq, &cal());
+        std::env::remove_var("IRLUME_CONSENT_CLOSURE_FRAMES");
+        assert_eq!(got, BlinkResult::Blinked);
     }
 
     #[test]

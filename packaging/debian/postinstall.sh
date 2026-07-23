@@ -13,6 +13,10 @@ systemctl daemon-reload 2>/dev/null || true
 # up the new binary/unit for a running daemon and is a no-op for a stopped one.
 if [ -z "${2:-}" ]; then
     systemctl enable --now irlumed.service 2>/dev/null || true
+    # Watches greeter PAM files and re-applies irlume wiring after a distro
+    # update strips it. Self-gates on the login.wired marker, so it stays idle
+    # until `irlume login enable` runs.
+    systemctl enable --now irlume-reconcile.path 2>/dev/null || true
 fi
 systemctl try-restart irlumed.service 2>/dev/null || true
 cat <<'EOF'

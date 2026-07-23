@@ -108,4 +108,12 @@ works the same day it ships.
   about a second and open them. `irlume logs` shows the deny reason.
 - Bitwarden says biometrics are unavailable: its polkit action file is
   missing (`irlume doctor` reports this) or the desktop app needs the
-  Secret Service (GNOME Keyring / KWallet) running.
+  Secret Service (GNOME Keyring / KWallet) running. `irlume doctor` also
+  reports whether a Secret Service provider is up and the login keyring is
+  unlocked; run it as yourself (not under sudo), since it inspects your
+  session bus.
+- Face login stops working after a system update: a distro tool (authselect,
+  pam-auth-update) can rewrite a greeter's PAM file and drop irlume's lines.
+  The `irlume-reconcile.path` unit watches those files and re-applies the
+  wiring automatically once `login enable` has been run; `irlume doctor`
+  flags it if anything slips through.

@@ -27,6 +27,7 @@ mod models;
 mod pad;
 mod pamwire;
 mod recovery;
+mod secrets;
 mod suncal;
 mod tui;
 mod uninstall;
@@ -2282,6 +2283,57 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
 /// privacy switch, and confirm models + ONNX Runtime are present.
+/// Certify that the polkit agent helper (polkit 126+ socket-activated,
+/// device-sandboxed unit) can still reach the irlume daemon socket. irlume is
+/// structurally immune to the sandbox that broke Howdy (it opens no camera in
+/// the PAM process, only `/run/irlume.sock`), UNLESS a unit override hides the
+/// socket path with a filesystem restriction. Best-effort, informative.
+fn report_polkit_sandbox() {
+    // No socket-activated helper unit → pre-126 setuid helper (runs unconfined);
+    // nothing to certify.
+    let unit = std::process::Command::new("systemctl")
+        .args(["cat", "polkit-agent-helper@.service"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let Some(unit) = unit else {
+        return;
+    };
+    // If the socket-activated helper is inactive, polkit uses the setuid helper,
+    // which runs UNCONFINED: no sandbox applies, so the socket is reachable.
+    let socket_active = std::process::Command::new("systemctl")
+        .args(["is-active", "polkit-agent-helper.socket"])
+        .output()
+        .map(|o| o.stdout.starts_with(b"active"))
+        .unwrap_or(false);
+    // Directives that HIDE /run (and thus /run/irlume.sock) from the sandboxed
+    // helper. Note what is NOT here: PrivateDevices/DeviceAllow (they gate
+    // devices, not an AF_UNIX socket) and ProtectSystem=strict (it makes /run
+    // READ-ONLY, but connect() to a socket does not write the file, so the
+    // socket stays reachable). Only chroot/hide directives actually block it.
+    let hides_run = socket_active
+        && unit.lines().any(|l| {
+            let t = l.trim();
+            (t.starts_with("RootDirectory=") && !t.ends_with('='))
+                || (t.starts_with("InaccessiblePaths=") && t.contains("/run"))
+                || (t.starts_with("TemporaryFileSystem=") && t.contains("/run"))
+        });
+    if hides_run {
+        println!(
+            "[doctor] ⚠ polkit helper sandbox may hide /run/irlume.sock; polkit face prompts\n     \
+             would fall back to the password. Add a drop-in exposing only the socket:\n     \
+             /etc/systemd/system/polkit-agent-helper@.service.d/irlume.conf with\n     \
+             [Service] then a BindReadOnlyPaths=/run/irlume.sock line."
+        );
+    } else {
+        println!(
+            "[doctor] polkit helper sandbox: OK ✓ (irlume uses the daemon socket, not the \
+             camera, so the device sandbox that breaks Howdy does not apply)"
+        );
+    }
+}
+
 fn doctor() -> std::process::ExitCode {
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
@@ -2522,6 +2574,19 @@ fn doctor() -> std::process::ExitCode {
         ),
         None => {}
     }
+    // polkit 126+ moved the agent helper into a sandboxed, socket-activated
+    // systemd unit (PrivateDevices etc.) that BROKE Howdy's polkit face path,
+    // because Howdy opens the camera inside the PAM process. irlume's PAM module
+    // opens no device: it only connects the AF_UNIX daemon socket, which the
+    // device sandbox does not block. Certify that here so a future sandbox
+    // tightening that hid /run/irlume.sock would be visible.
+    if crate::pamwire::polkit_wired() == Some(true) {
+        report_polkit_sandbox();
+    }
+    // The login keyring an app like Bitwarden reads from: report whether a
+    // Secret Service provider is up and the collection is unlocked. Self-gates
+    // on a session bus, so it stays silent under `sudo irlume doctor`.
+    crate::secrets::report_keyring_status();
 
     // --- wiring drift ------------------------------------------------------
     // If the user is enrolled but no greeter is wired, a distro tool most
@@ -2537,7 +2602,9 @@ fn doctor() -> std::process::ExitCode {
         println!(
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
              A system update (authselect / pam-auth-update) may have regenerated the\n     \
-             PAM stacks. Re-wire with: sudo irlume login enable --apply"
+             PAM stacks. The irlume-reconcile.path unit re-applies this automatically\n     \
+             once login was enabled; if it persists, re-wire with:\n     \
+             sudo irlume login enable --apply"
         );
     }
 

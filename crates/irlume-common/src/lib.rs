@@ -81,6 +81,16 @@ impl std::fmt::Debug for SecretBytes {
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";
 
+/// The effective state directory, honoring the `IRLUME_STATE_DIR` sandbox
+/// override that tests and the model tooling set. Prefer this over the bare
+/// `STATE_DIR` constant whenever you resolve a real path, so one override moves
+/// every consumer together.
+pub fn state_dir() -> std::path::PathBuf {
+    std::env::var_os("IRLUME_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(STATE_DIR))
+}
+
 /// Create or truncate `path` with mode 0600 and write `bytes`, then fsync.
 ///
 /// Mode-on-open (not write-then-chmod) so a secret-bearing file is never

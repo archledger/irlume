@@ -64,7 +64,7 @@ fn report_strays() {
     };
     println!(
         "[doctor] ⚠ stray file(s) next to the managed irlume files ({claim}likely \
-         backups\n     from a manual install — safe to remove once you no longer need them):"
+         backups\n     from a manual install; safe to remove once you no longer need them):"
     );
     for p in &strays {
         println!("       {p}");
@@ -169,7 +169,7 @@ fn report_overlay(origin: &InstallOrigin) {
 /// printed, and dpkg's only functional check IS the md5 digest (rpm(8) VERIFY
 /// OPTIONS; dpkg(1) --verify). A line whose flags lack '5' is mtime/mode
 /// drift only, and `missing` lines carry no flags at all. pacman -Qkk prints
-/// `warning: pkg: /path (<Kind>)` per finding — on STDERR, with the summary
+/// `warning: pkg: /path (<Kind>)` per finding, on STDERR, with the summary
 /// count on stdout (pacman(8) -k; src/pacman/check.c). Of its kinds, only
 /// "… checksum mismatch" and "Size mismatch" mean the file content changed;
 /// mtime/permission/owner drift does not make a file an overlay.
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn pacman_qkk_flags_content_kinds_only() {
         // Real -Qkk shapes (stderr lines carry a `warning:` prefix; a content
-        // edit emits checksum + mtime lines for the same file — dedup'd).
+        // edit emits checksum + mtime lines for the same file; dedup'd).
         let edit = "warning: irlume: /usr/bin/irlumed (SHA256 checksum mismatch)\n\
                     warning: irlume: /usr/bin/irlumed (Modification time mismatch)\n";
         assert_eq!(overlaid_paths(edit), vec!["/usr/bin/irlumed"]);

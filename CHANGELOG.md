@@ -10,11 +10,11 @@ All notable changes to irlume are documented here. This project adheres to
 - **`irlume doctor` reports install-hygiene drift.** Two related checks, both
   report-only: stray irlume-named files next to the managed binaries and the
   PAM module that no package owns (the backups a manual branch install leaves
-  behind — they outlive every later package update and a stale
+  behind: they outlive every later package update and a stale
   `pam_irlume.so.*` in the module directory muddies auth debugging), and a
   managed binary whose content no longer matches the installed package (a
   hand-installed build overlaying it, which the next package update will
-  silently replace — doctor names the file and the reinstall command). Both
+  silently replace; doctor names the file and the reinstall command). Both
   checks stay silent when the install is clean. Content drift is detected via
   the package manager's own verify (`rpm -V` / `dpkg --verify` /
   `pacman -Qkk`); mtime-only drift is ignored.

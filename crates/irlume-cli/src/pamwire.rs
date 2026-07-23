@@ -288,6 +288,14 @@ fn active_login_wired() -> bool {
     etc.exists() && file_has_module(&etc)
 }
 
+/// Whether the self-heal marker says login WAS wired but the active greeter's
+/// stack no longer carries the module (a distro PAM regeneration stripped it):
+/// exactly the condition `login reconcile` repairs. The TUI's Repair tab uses
+/// this to offer the fix.
+pub(crate) fn reconcile_needed() -> bool {
+    read_wired_marker().is_some() && !active_login_wired()
+}
+
 pub(crate) fn login_wired() -> bool {
     for s in GREETERS
         .iter()

@@ -574,9 +574,13 @@ pub const NOD_PITCH_MIN: f32 = 0.07;
 /// look-around ranged 0.87-6.95, so 0.6 separates them cleanly.
 pub const NOD_YAW_MAX: f32 = 0.6;
 /// Minimum pitch oscillation crossings (the pitch signal must cross above AND
-/// below its median, back and forth, this many times): a real nod is a rhythmic
-/// up-down, not a single look-down-and-hold drift.
-pub const NOD_MIN_CROSSINGS: usize = 2;
+/// below its median): 1 = a single deliberate down-up nod. A drift that looks
+/// down and HOLDS never crosses back, so it stays 0 and is rejected. Set to 1
+/// (from 2) after live testing: requiring two nods pushed the gesture past the
+/// capture window and slowed grants; the campaign data shows 1 crossing accepts
+/// more genuine nods (19/21 vs 17/21) with still ZERO false accepts on
+/// still/look-around (the pitch-range and yaw gates do that work).
+pub const NOD_MIN_CROSSINGS: usize = 1;
 /// A crossing counts only when the pitch moves past this fraction of the take's
 /// pitch range from the median, so sensor noise on a near-still head is ignored.
 pub const NOD_CROSSING_AMP_FRAC: f32 = 0.25;

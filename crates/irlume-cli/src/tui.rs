@@ -222,6 +222,10 @@ enum Suspend {
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
+    /// The full `irlume doctor` text readout in the cooked terminal: the
+    /// complete authoritative dump (incl. the info-only lines the Repair
+    /// checklist omits), copy-pasteable for a bug report.
+    Doctor,
 }
 
 /// What a y/n confirm modal executes on `[y]`: a daemon request (async, the
@@ -1844,6 +1848,9 @@ impl App {
             Suspend::Update => {
                 crate::commands::update(&none);
             }
+            Suspend::Doctor => {
+                let _ = crate::doctor();
+            }
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
             // does the teardown (un-wire PAM, stop daemon, wipe data) as root
@@ -2007,6 +2014,12 @@ impl App {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('?') => self.show_help = true,
+            // Home: jump back to the Welcome hub from any tab, so the "at a
+            // glance" summary is one key away instead of a Tab walk. (Home the
+            // KEY is taken by activity scroll; 'h' for home is unused globally.)
+            KeyCode::Char('h') if self.visible.contains(&SC_WELCOME) => {
+                self.screen = SC_WELCOME;
+            }
             // Release/recapture the mouse: captured, the wheel scrolls the TUI
             // but the terminal cannot select text; released, highlight-to-copy
             // works. A toggle because both are legitimate wants.
@@ -2171,6 +2184,14 @@ impl App {
                 );
                 self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
                 self.suspend = Some(Suspend::Logs);
+            }
+            // Full `irlume doctor` readout: the complete authoritative dump,
+            // including the info-only lines the Repair checklist omits, for a
+            // bug report. Runs as the user (no sudo prompt); root-only lines
+            // say so.
+            (SC_REPAIR, KeyCode::Char('d')) => {
+                self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
+                self.suspend = Some(Suspend::Doctor);
             }
             (SC_REPAIR, KeyCode::Char('l')) => self.start_async(
                 "SelfTest (IR liveness)",
@@ -3522,6 +3543,36 @@ impl App {
                 Style::new().dim(),
             )),
             Line::raw(""),
+            {
+                // A one-line health summary from the same run_checks() the
+                // Repair tab uses, so a healthy user never needs to open Repair
+                // and an unhealthy one is pointed straight at it.
+                let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
+                let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
+                if fails > 0 {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  ✗ {fails} issue(s) need attention"),
+                            Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" → open Repair (or [h] returns here)", Style::new().dim()),
+                    ])
+                } else if warns > 0 {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  ⚠ {warns} advisory item(s)"),
+                            Style::new().fg(th().warn),
+                        ),
+                        Span::styled(" → see Repair", Style::new().dim()),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        "  ✓ all checks pass",
+                        Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                    ))
+                }
+            },
+            Line::raw(""),
             section("At a glance  (↑↓ pick a section, Enter opens it)"),
             Line::from(vec![
                 Span::styled("  Recommended  ", Style::new().add_modifier(Modifier::BOLD)),
@@ -4094,6 +4145,7 @@ impl App {
             SC_REPAIR => &[
                 ("f", "fix"),
                 ("r", "re-check"),
+                ("d", "full doctor"),
                 ("l", "IR test"),
                 ("g", "logs"),
                 ("t", "debug logs"),

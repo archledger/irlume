@@ -473,7 +473,7 @@ extern "C" {
 /// wrong seal is never caught at auth time, only when ksecretd tries to open the
 /// wallet). Returns `Some(true/false)` on a verifiable hash, or `None` when it
 /// cannot verify (no `/etc/shadow` access, no such user, or a locked / empty /
-/// non-password field) — in which case the caller does NOT block, since absence
+/// non-password field), in which case the caller does NOT block, since absence
 /// of proof is not proof of a wrong password. Root-only (`/etc/shadow`).
 fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     let shadow = std::fs::read_to_string("/etc/shadow").ok()?;

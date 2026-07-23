@@ -399,7 +399,7 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
 }
 
 /// The PAM services THIS login manager actually uses, so wiring targets what the
-/// DM will really consult (and, crucially, its separate FINGERPRINT service).
+/// DM will really consult (and, above all, its separate FINGERPRINT service).
 /// Returns `(greeter_label, fingerprint_label_or_none)`.
 fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
     match dm {

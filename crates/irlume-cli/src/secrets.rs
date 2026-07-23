@@ -147,7 +147,7 @@ pub fn report_keyring_status() {
         ),
         Collection::Present { locked: true } => println!(
             "[doctor] login keyring{who}: LOCKED. A face login should unlock it {via}.\n     \
-             If it stays locked, the sealed keyring password is stale — re-run: \
+             If it stays locked, the sealed keyring password is stale; re-run: \
              sudo irlume keyring arm"
         ),
         Collection::NoProvider => println!(

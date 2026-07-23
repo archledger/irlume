@@ -20,7 +20,7 @@ pieces:
    `polkit-1` service.
 3. `pam_irlume` in that stack asks `irlumed` to verify your face. For a polkit
    prompt the daemon also requires a deliberate consent gesture: **nod your
-   head**, or **close your eyes for about a second then open them** — whichever
+   head**, or **close your eyes for about a second then open them**, whichever
    suits your position (see the security section). It then answers yes or no;
    the app learns only the verdict.
 
@@ -42,7 +42,7 @@ This adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
 edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable --apply`
 removes it along with everything else, flag or no flag.
 
-**The consent gesture is a head NOD by default** — pose-defined, so it works at
+**The consent gesture is a head NOD by default**: pose-defined, so it works at
 any head angle or lighting (upright, reclined, in bed) and needs no calibration.
 If you'd also like to approve by closing your eyes, run `sudo irlume
 calibrate-closure` once (it captures your eyes-open and eyes-closed EAR); after
@@ -106,7 +106,7 @@ works the same day it ships.
 - **Deliberate gesture required.** polkit agents run the PAM conversation with
   no user action, so a bare face match would approve a prompt the user never
   acknowledged. For polkit-class services the daemon requires a deliberate
-  gesture — a head nod, or an eye closure — even for users who did not opt into
+  gesture (a head nod, or an eye closure) even for users who did not opt into
   any per-enrollment liveness, and fails closed if it cannot run (no IR camera;
   or, for the closure gesture specifically, no FaceMesh model or no stored
   calibration). Disable the forced gesture with `polkit_gesture=0` in

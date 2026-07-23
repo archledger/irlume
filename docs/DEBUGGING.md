@@ -6,7 +6,7 @@ does what the docs claim. Nothing in this guide can weaken auth: traces log
 **numbers only** (scores, thresholds, cue values, timings), never camera
 frames, embeddings, passwords, or anything reusable.
 
-## The journal, in one view
+## Reading the journal with `irlume logs`
 
 All auth decisions land in the system journal. `irlume logs` shows the whole
 story in one stream: daemon lines, the PAM audit records that say what the

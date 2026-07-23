@@ -6,7 +6,7 @@
 //!
 //! The deliberate held-closure gate ([`irlume_liveness::detect_deliberate_closure`])
 //! has a provisional frame threshold and no on-hardware validation of its
-//! strobe / auto-exposure-settle robustness. Tuning it by re-capturing on every
+//! strobe / auto-exposure-settle behavior. Tuning it by re-capturing on every
 //! change wastes a live face each time; instead this records the exact
 //! [`irlume_liveness::EarSample`] sequence the live gate sees, tagged with the
 //! gesture performed, so the detectors can be swept against a fixed dataset.

@@ -57,7 +57,7 @@ pub fn equalize(chip: &mut [u8]) {
     if n == 0 {
         return;
     }
-    let ys: Vec<f32> = chip.chunks(3).map(|p| luma(p[0], p[1], p[2])).collect();
+    let ys: Vec<f32> = chip.chunks_exact(3).map(|p| luma(p[0], p[1], p[2])).collect();
     let mut hist = [0u32; 256];
     for &y in &ys {
         hist[y.round().clamp(0.0, 255.0) as usize] += 1;
@@ -111,7 +111,7 @@ pub fn clahe(chip: &mut [u8], side: usize, grid: usize, clip_frac: f32) {
     if side == 0 || grid == 0 || chip.len() < side * side * 3 {
         return;
     }
-    let ys: Vec<f32> = chip.chunks(3).map(|p| luma(p[0], p[1], p[2])).collect();
+    let ys: Vec<f32> = chip.chunks_exact(3).map(|p| luma(p[0], p[1], p[2])).collect();
     let tile = side as f32 / grid as f32;
     // Per-tile mapping LUTs.
     let mut maps = vec![[0f32; 256]; grid * grid];

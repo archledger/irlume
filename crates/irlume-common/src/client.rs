@@ -59,9 +59,9 @@ fn secure_env(name: &str) -> Option<std::ffi::OsString> {
 }
 
 /// Resolve the socket path. `IRLUME_SOCKET` overrides it for the daemon and
-/// dev/test, but is ignored in a setuid/secure-execution context (see
-/// [`secure_env`]) so a PAM module in a setuid stack cannot be redirected to a
-/// rogue daemon.
+/// dev/test, but is ignored in a setuid/secure-execution context (via
+/// `secure_env`/`secure_getenv`) so a PAM module in a setuid stack cannot be
+/// redirected to a rogue daemon.
 pub fn socket_path() -> PathBuf {
     secure_env("IRLUME_SOCKET")
         .map(PathBuf::from)

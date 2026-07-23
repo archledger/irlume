@@ -1453,6 +1453,7 @@ fn setup_walks_every_step_noninteractively() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),

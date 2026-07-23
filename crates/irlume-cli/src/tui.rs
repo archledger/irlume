@@ -330,6 +330,9 @@ struct HealthInfo {
     mesh: bool,
     adapter: bool,
     version: String,
+    /// Loaded third-party PAD cue name (authoritative on/off, since
+    /// settings.conf is root-only and a non-root TUI can't read it).
+    third_party_pad: Option<String>,
 }
 
 /// Template-encryption + recovery status (`RecoveryStatus`).
@@ -669,6 +672,7 @@ impl App {
                     mesh,
                     adapter,
                     version,
+                    third_party_pad,
                 }) => Some(HealthInfo {
                     tier,
                     rgb_dev,
@@ -676,6 +680,7 @@ impl App {
                     mesh,
                     adapter,
                     version,
+                    third_party_pad,
                 }),
                 _ => None, // older daemon / daemon down → Repair falls back to local probes
             };
@@ -1232,15 +1237,23 @@ impl App {
 
         // A third-party liveness model enabled but with a CHECKSUM MISMATCH: the
         // daemon refuses to load it, so the deny-only cue the user opted into is
-        // silently OFF. doctor reports this; a TUI-only user would never see it.
-        if let crate::models::TuiState::Enabled { name, detail } = crate::models::tui_state() {
-            if detail.contains("MISMATCH") {
-                v.push(mk(
-                    "Third-party model",
-                    Sev::Fail,
-                    format!("'{name}' weights fail their checksum; the daemon refuses them (cue is OFF)"),
-                    Fix::Manual("re-fetch: sudo irlume models disable, then models enable".into()),
-                ));
+        // silently OFF. Only flag it when the daemon is up and did NOT load a
+        // cue (if it loaded one, Health.third_party_pad proves the weights were
+        // fine). doctor reports this; a TUI-only user would never see it.
+        let daemon_loaded_pad = self
+            .health
+            .as_ref()
+            .is_some_and(|h| h.third_party_pad.is_some());
+        if self.daemon_up && !daemon_loaded_pad {
+            if let crate::models::TuiState::Enabled { name, detail } = crate::models::tui_state() {
+                if detail.contains("MISMATCH") {
+                    v.push(mk(
+                        "Third-party model",
+                        Sev::Fail,
+                        format!("'{name}' weights fail their checksum; the daemon refuses them (cue is OFF)"),
+                        Fix::Manual("re-fetch: sudo irlume models disable, then models enable".into()),
+                    ));
+                }
             }
         }
 
@@ -3019,21 +3032,37 @@ impl App {
                 section("Third-party liveness models"),
                 {
                     // A ●/○ status row like the sections above, not a text blob.
-                    let (icon, icon_style, label) = match crate::models::tui_state() {
-                        crate::models::TuiState::Enabled { name, detail } => (
-                            "●",
-                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                            format!("enabled: {name}   {detail}"),
-                        ),
-                        crate::models::TuiState::InstalledUnknown { name } => (
-                            "◐",
-                            Style::new().fg(th().warn),
-                            format!("{name} weights installed; on/off is root-only"),
-                        ),
-                        crate::models::TuiState::None => {
-                            ("○", Style::new().dim(), "none (default)".to_string())
-                        }
-                    };
+                    // The daemon's loaded-cue name is authoritative (it knows
+                    // what it loaded); fall back to the filesystem probe only
+                    // when the daemon can't answer, since settings.conf is
+                    // root-only and a non-root TUI can't read the flag itself.
+                    let (icon, icon_style, label) =
+                        match self.health.as_ref().and_then(|h| h.third_party_pad.clone()) {
+                            Some(name) => (
+                                "●",
+                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                format!("enabled: {name}   (loaded by the daemon, deny-only cue)"),
+                            ),
+                            None => match crate::models::tui_state() {
+                                crate::models::TuiState::Enabled { name, detail } => (
+                                    "●",
+                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                    format!("enabled: {name}   {detail}"),
+                                ),
+                                // Daemon up and reporting no cue -> authoritative off.
+                                _ if self.daemon_up => {
+                                    ("○", Style::new().dim(), "none (default)".to_string())
+                                }
+                                crate::models::TuiState::InstalledUnknown { name } => (
+                                    "◐",
+                                    Style::new().fg(th().warn),
+                                    format!("{name} weights installed; on/off is root-only"),
+                                ),
+                                crate::models::TuiState::None => {
+                                    ("○", Style::new().dim(), "none (default)".to_string())
+                                }
+                            },
+                        };
                     Line::from(vec![
                         Span::raw("  state  "),
                         Span::styled(format!("{icon} "), icon_style),
@@ -5110,6 +5139,7 @@ mod tests {
             mesh: true,
             adapter: false,
             version: "test".into(),
+            third_party_pad: None,
         });
         let start = std::time::Instant::now();
         app.refresh_light();
@@ -6661,6 +6691,7 @@ mod tests {
             mesh: false,
             adapter: false,
             version: "1.0".into(),
+            third_party_pad: None,
         });
         let text = draw_text(&app);
         assert!(
@@ -6686,6 +6717,41 @@ mod tests {
         app.eyes_open = true;
         let text = draw_text(&app);
         assert!(text.contains("● yes"), "the toggled state must show");
+    }
+
+    #[test]
+    fn settings_third_party_row_prefers_the_daemon_loaded_cue() {
+        // The daemon's loaded-cue name is authoritative: a non-root TUI can't
+        // read the root-only settings.conf flag, so a loaded cue must show as
+        // green enabled (not the ◐ "root-only" filesystem guess).
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.daemon_up = true;
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            version: "test".into(),
+            third_party_pad: Some("flir".into()),
+        });
+        let text = draw_text(&app);
+        assert!(
+            text.contains("● ") && text.contains("enabled: flir"),
+            "a daemon-loaded cue shows green enabled:\n{text}"
+        );
+        assert!(
+            !text.contains("root-only"),
+            "the authoritative state replaces the root-only guess"
+        );
+        // Daemon up, no cue loaded -> authoritative OFF, never the ◐ guess.
+        app.health.as_mut().unwrap().third_party_pad = None;
+        let text = draw_text(&app);
+        assert!(
+            !text.contains('◐'),
+            "daemon-up with no cue is a definite off"
+        );
     }
 
     #[test]
@@ -6973,6 +7039,7 @@ mod tests {
             mesh: true,
             adapter: true,
             version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
         });
         app.run_checks();
         let find = |label: &str| {
@@ -7019,6 +7086,7 @@ mod tests {
             mesh: false,
             adapter: false,
             version: "0.0.1-old".into(),
+            third_party_pad: None,
         });
         app.challenge = true;
         app.enroll_error = Some("bad ciphertext".into());

@@ -29,9 +29,41 @@ const POLL_RW_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Default read/write timeout for management requests.
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Resolve the socket path, honouring `IRLUME_SOCKET` for dev/test.
+/// Read an environment override that must NEVER be honoured in a
+/// secure-execution context. `pam_irlume` is linked into setuid-root PAM stacks
+/// (notably `/etc/pam.d/sudo` under `--with-sudo`), which inherit the invoking
+/// user's environment. If the socket path were taken from `getenv` there, a
+/// local user could run `IRLUME_SOCKET=/tmp/evil.sock sudo …`, point the module
+/// at a fake daemon that always replies "granted", and get root with no password
+/// or face. `secure_getenv` returns NULL under AT_SECURE (setuid/setgid/added
+/// capabilities), so in exactly those contexts the compiled default wins, while
+/// the daemon (a clean systemd environment) and dev/test clients keep the
+/// override.
+fn secure_env(name: &str) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    // glibc's secure_getenv; not surfaced by the `libc` crate, so declare it
+    // (the shipping targets are all glibc: Fedora, Debian/Ubuntu, Arch).
+    extern "C" {
+        fn secure_getenv(name: *const libc::c_char) -> *mut libc::c_char;
+    }
+    let key = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `key` is a valid NUL-terminated C string. secure_getenv returns a
+    // pointer into the environ block (or NULL); we copy the bytes out before
+    // returning, so the borrow of environ does not escape this function.
+    let ptr = unsafe { secure_getenv(key.as_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes().to_vec();
+    Some(std::ffi::OsString::from_vec(bytes))
+}
+
+/// Resolve the socket path. `IRLUME_SOCKET` overrides it for the daemon and
+/// dev/test, but is ignored in a setuid/secure-execution context (see
+/// [`secure_env`]) so a PAM module in a setuid stack cannot be redirected to a
+/// rogue daemon.
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("IRLUME_SOCKET")
+    secure_env("IRLUME_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(SOCKET_PATH))
 }

@@ -75,4 +75,5 @@ The audit backlog, in rough order:
 - No paid certification lab engagements (iBeta, FIDO) at hobby scale; the
   published self-tests against the same protocols stay the substitute.
 - No WebAuthn/passkey platform-authenticator role for now; the scope is
-  login, unlock, sudo, and keyring.
+  login, unlock, `sudo`, keyring, and app prompts via polkit (Bitwarden,
+  `pkexec`).

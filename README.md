@@ -4,8 +4,9 @@
 
 <br>
 
-**Face-unlock for Linux login, `sudo`, and the lock screen. Works in the dark,
-resists photo & screen spoofs, and never stores your face as an image.**
+**Your face unlocks Linux: login, `sudo`, the lock screen, and app prompts
+(Bitwarden, `pkexec`). Works in the dark, resists photo & screen spoofs, never
+stored as an image.**
 
 Works with the camera you have: an **IR (Windows Hello) camera** unlocks the full
 secure tier, a **regular webcam** gives convenient screen unlock, and a
@@ -41,13 +42,13 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 |  |  |
 |---|---|
 | 🌑 **Works in the dark** | Active **infrared** recognition (Windows-Hello cameras); no ambient light needed. |
-| 🔒 **Unlocks everything** | Login greeter, lock screen, `sudo` (opt-in via `login enable --with-sudo`), and app prompts like **Bitwarden's biometric unlock** via polkit (opt-in via `login enable --with-polkit`, [details](docs/APP-INTEGRATION.md)), with the password always as fallback (**no lockout, ever**). |
+| 🔒 **Unlocks everything** | Login greeter, lock screen, `sudo` (opt-in via `login enable --with-sudo`), and app prompts like **Bitwarden's biometric unlock** via polkit (opt-in via `login enable --with-polkit`; approve with a deliberate **nod**, [details](docs/APP-INTEGRATION.md)), with the password always as fallback (**no lockout, ever**). |
 | 🙋 **On-demand, by consent** | The camera fires only when you ask: leave the password field **empty and press Enter**. Typing a password never starts a scan. A **grace window** after the gesture (~15 s at login/lock, ~5 s for `sudo`) keeps retrying while you settle into frame, but never retries a failed match. Wiring is tailored per login manager (GDM · SDDM · Plasma Login · LightDM · greetd · COSMIC). |
 | 🗝️ **Opens your keyring** | On IR hardware a face match **TPM-unseals your login password** so the wallet unlocks at login, like Hello. |
 | 👁️ **Real liveness** | Algorithmic IR anti-spoof gate + **opt-in passive blink** detection (no prompt, no action). |
 | 🧬 **No face images stored** | Stores **512-D embeddings, never images**; on TPM hardware they're **AES-256-GCM encrypted** under a **TPM-sealed** key (without a TPM: root-only files, and the TUI says so). |
-| 🎚️ **Adapts to your hardware** | IR camera → **Secure** tier · RGB-only → **Convenience** (screen-unlock) tier · fingerprint reader → companion factor. All auto-detected. |
-| 🩺 **Self-healing** | A live TUI (`irlume tui`) detects & one-key-fixes daemon/PAM/reader/config faults. |
+| 🎚️ **Adapts to your hardware** | IR camera → **Secure** tier · RGB-only → **Convenience** (screen-unlock) tier · fingerprint reader → **face OR fingerprint** (coexist, either unlocks). All auto-detected. |
+| 🩺 **Self-healing** | A live TUI (`irlume tui`) detects & one-key-fixes daemon/PAM/reader/config faults, and a systemd watcher **re-applies the PAM wiring** if a distro update (`authselect` / `pam-auth-update`) strips it. |
 | 📦 **Self-contained** | One package per distro, all models bundled. `git clone` and go. |
 
 ## 🆚 Comparison: Windows Hello, Howdy, visage

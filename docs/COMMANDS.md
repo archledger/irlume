@@ -22,7 +22,7 @@ Conventions that apply everywhere:
 | `irlume setup` | scripted onboarding: enroll, keyring, recovery, PAM wiring, each step prompted y/N |
 | `irlume status` | health dashboard: daemon, enrollment, keyring, cameras |
 | `irlume detect` | script-friendly probe; exit `0` = ready, `10` = partial, `20` = absent |
-| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models |
+| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), and the authselect/pam-auth-update regeneration guard |
 | `irlume deps` | verify runtime dependencies (onnxruntime, models, TPM) |
 | `irlume version` | print the installed version (`--version` / `-V` also work) |
 
@@ -37,6 +37,7 @@ Conventions that apply everywhere:
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles eyes-open <on\|off>` | require eyes open to unlock |
 | `irlume profiles challenge <on\|off>` | opt-in passive blink liveness |
+| `sudo irlume calibrate-closure` | teach the eye-closure consent gesture for app prompts (captures eyes-open/closed EAR); the head nod is the default and needs no calibration |
 | `irlume identify` | 1:N "who is this?"; as root it checks all users, otherwise scoped to you |
 
 ## Keyring, TPM, and recovery
@@ -52,10 +53,10 @@ Conventions that apply everywhere:
 
 | Command | Sudo | What it does |
 |---|---|---|
-| `irlume login <status\|enable\|disable> [--with-sudo] [--with-polkit] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`, `--with-polkit` adds app prompts (Bitwarden unlock, pkexec — see docs/APP-INTEGRATION.md); without `--apply` it previews |
+| `irlume login <status\|enable\|disable\|reconcile> [--with-sudo] [--with-polkit] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`, `--with-polkit` adds app prompts (Bitwarden unlock, pkexec; see docs/APP-INTEGRATION.md); `reconcile` re-applies the wiring after a distro PAM regeneration (also run by the `irlume-reconcile.path` unit); without `--apply` it previews |
 | `irlume logs [-f] [--since T]` | sometimes | the face-auth journal in one view (daemon, PAM, keyring); `-f` follows live, `--since "10 min ago"` widens the window |
 | `irlume logs debug <on\|off>` | yes | per-stage pipeline tracing in the daemon (numbers only, never frames) |
-| `irlume fingerprint <status\|add\|enable\|disable>` | for wiring | fprintd companion factor |
+| `irlume fingerprint <status\|add\|verify\|reset\|enable\|disable> [--fingerprint-only]` | for wiring | fprintd companion; `enable` = unlock with face OR fingerprint (both), `--fingerprint-only` replaces face |
 | `irlume selinux <status\|load>` | for load | SELinux module for the login greeter (Fedora) |
 | `irlume ir-setup [--dry-run]` | yes | auto-configure the IR emitter; rarely needed, enroll runs it itself when IR frames come back dark |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |

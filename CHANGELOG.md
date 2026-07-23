@@ -7,7 +7,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- **Deliberate consent gesture for polkit prompts — head NOD or eye closure.**
+- **Deliberate consent gesture for polkit prompts: head NOD or eye closure.**
   polkit agents start the PAM conversation with no user action, so a bare face
   match would approve a prompt the user never acknowledged; the daemon now
   requires a deliberate gesture for the polkit class (verify-only, never a
@@ -33,14 +33,44 @@ All notable changes to irlume are documented here. This project adheres to
   and GNOME Software); wiring `pam_irlume` into the `polkit-1` stack lets a
   face match answer them, password fallback unchanged. The polkit class is
   verify-only at the daemon (an always-on refusal guards the TPM-sealed
-  credential, independent of tier or biopolicy config), requires the passive
-  blink gate even without the per-enrollment opt-in (polkit agents start the
-  PAM conversation with no user gesture; the blink proves a live person is
-  looking at the dialog), fails closed when the blink gate cannot run, and is
-  denied outright on RGB-only hardware. `irlume login status` gains a polkit
-  row, `irlume doctor` flags a Bitwarden polkit action with no wiring, and the
-  SELinux policy (1.1.0) grants the polkit helper domain socket access. See
-  docs/APP-INTEGRATION.md.
+  credential, independent of tier or biopolicy config), requires the deliberate
+  consent gesture above even without the per-enrollment opt-in (polkit agents
+  start the PAM conversation with no user action, so the gesture is the intent
+  signal), fails closed when the gesture cannot run, and is denied outright on
+  RGB-only hardware. `irlume login status` gains a polkit row, `irlume doctor`
+  flags a Bitwarden polkit action with no wiring, and the SELinux policy (1.1.0)
+  grants the polkit helper domain socket access. See docs/APP-INTEGRATION.md.
+
+- **Fingerprint coexistence: unlock with face OR fingerprint (`Method::Both`).**
+  `sudo irlume fingerprint enable` now defaults to Both when a camera is present,
+  keeping face on instead of standing it down; `--fingerprint-only` restores the
+  old replace-face behavior. `irlume doctor` and the TUI report the coexistence
+  as healthy rather than as a competing-modules warning.
+
+- **Distro-update self-heal for PAM wiring.** A new `irlume login reconcile`
+  subcommand plus `irlume-reconcile.path`/`.service` systemd units re-apply the
+  greeter PAM wiring if `authselect apply` / `pam-auth-update` / a package
+  upgrade strips it. `login enable` records the wiring scope in a marker; the
+  watcher is a no-op until then and loop-safe once wired. `irlume doctor` gains a
+  regeneration-guard advisory confirming the watcher is armed on managed hosts.
+
+- **`irlume doctor` login-keyring probe.** Reports whether the login keyring is
+  unlocked (what Bitwarden and other Secret Service apps read from) and names the
+  provider (ksecretd on Plasma 6, kwalletd, gnome-keyring), pointing a locked
+  keyring at the exact PAM module that unlocks it.
+
+### Fixed
+
+- **`irlume keyring arm` rejects a non-login password.** It now verifies the
+  entered password is your actual login password before sealing, so a mistyped
+  or wrong password can no longer be sealed and leave the wallet failing to
+  unlock (the ksecretd `-9` failure class).
+
+- **Bitwarden flatpak/snap setup documented.** The sandbox cannot register
+  Bitwarden's polkit action and gives no in-product prompt; docs/APP-INTEGRATION.md
+  now has the exact host commands (install the policy, Fedora SELinux label) plus
+  the Settings toggle. Verified live: the polkit dialog appears and a head nod
+  unlocks the vault on the 2026.6.1 flatpak.
 
 ### Fixed
 

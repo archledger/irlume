@@ -2979,10 +2979,29 @@ impl App {
                 )),
                 Line::raw(""),
                 section("Third-party liveness models"),
-                Line::from(vec![
-                    Span::raw("  state  "),
-                    Span::styled(crate::models::doctor_line(), Style::new().dim()),
-                ]),
+                {
+                    // A ●/○ status row like the sections above, not a text blob.
+                    let (icon, icon_style, label) = match crate::models::tui_state() {
+                        crate::models::TuiState::Enabled { name, detail } => (
+                            "●",
+                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                            format!("enabled: {name}   {detail}"),
+                        ),
+                        crate::models::TuiState::InstalledUnknown { name } => (
+                            "◐",
+                            Style::new().fg(th().warn),
+                            format!("{name} weights installed; on/off is root-only"),
+                        ),
+                        crate::models::TuiState::None => {
+                            ("○", Style::new().dim(), "none (default)".to_string())
+                        }
+                    };
+                    Line::from(vec![
+                        Span::raw("  state  "),
+                        Span::styled(format!("{icon} "), icon_style),
+                        Span::styled(label, Style::new().dim()),
+                    ])
+                },
                 Line::from(Span::styled(
                     "  Opt-in, measured, deny-only extra anti-spoof cue; fetched from the",
                     Style::new().dim(),
@@ -2991,10 +3010,13 @@ impl App {
                     "  publisher, checksum-pinned, never shipped by irlume.",
                     Style::new().dim(),
                 )),
-                Line::from(Span::styled(
-                    "  [m] enables or disables one (sudo; the license confirm runs in the terminal)",
-                    Style::new().dim(),
-                )),
+                Line::from(vec![
+                    Span::styled("  [m]", Style::new().fg(th().accent)),
+                    Span::styled(
+                        " enable or disable one (sudo; the license confirm runs in the terminal)",
+                        Style::new().dim(),
+                    ),
+                ]),
                 Line::raw(""),
                 section("Match thresholds (read-only)"),
                 Line::from(Span::styled(

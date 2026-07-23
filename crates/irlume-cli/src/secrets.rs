@@ -55,6 +55,35 @@ enum Collection {
     NoProvider,
 }
 
+/// The process backing `org.freedesktop.secrets`, as a friendly name. KDE
+/// Plasma 6 uses `ksecretd` (launched by pam_kwallet5 with `--pam-login`);
+/// older KDE uses `kwalletd6`/`kwalletd5`; GNOME uses `gnome-keyring-daemon`.
+/// Knowing which one lets the doctor line name the PAM module that unlocks it.
+fn provider_name() -> Option<String> {
+    let mut cmd = busctl_user()?;
+    let out = cmd.args(["status", SECRETS_BUS]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `busctl status` prints a `Comm=<exe>` line for the owning process.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Comm="))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Map a provider process name to the PAM module that unlocks it from the
+/// face-released password, for a precise doctor hint. `None` for an unknown
+/// provider (still a valid Secret Service, just not one we have advice for).
+fn unlock_module_for(provider: &str) -> Option<&'static str> {
+    match provider {
+        "ksecretd" | "kwalletd6" | "kwalletd5" => Some("pam_kwallet5"),
+        "gnome-keyring-d" | "gnome-keyring-daemon" => Some("pam_gnome_keyring"),
+        _ => None,
+    }
+}
+
 /// Query the default collection's `Locked` property. A successful reply means a
 /// provider is running (the query D-Bus-activates it if it is merely
 /// registered); a failure means no provider is installed or reachable.
@@ -100,14 +129,25 @@ pub fn report_keyring_status() {
     if !have_session_bus() {
         return;
     }
+    // Name the provider (ksecretd on Plasma 6, kwalletd, gnome-keyring) so the
+    // hint points at the exact PAM module carrying the face-released password.
+    let provider = provider_name();
+    let via = provider
+        .as_deref()
+        .and_then(unlock_module_for)
+        .map(|m| format!("via {m}"))
+        .unwrap_or_else(|| "via pam_gnome_keyring/pam_kwallet5".to_string());
+    let who = provider
+        .as_deref()
+        .map(|p| format!(" [{p}]"))
+        .unwrap_or_default();
     match query_collection() {
         Collection::Present { locked: false } => println!(
-            "[doctor] login keyring: unlocked ✓ (Secret Service apps like Bitwarden \
+            "[doctor] login keyring{who}: unlocked ✓ (Secret Service apps like Bitwarden \
              can read secrets after a face login)"
         ),
         Collection::Present { locked: true } => println!(
-            "[doctor] login keyring: LOCKED. A face login should unlock it via \
-             pam_gnome_keyring/pam_kwallet5.\n     \
+            "[doctor] login keyring{who}: LOCKED. A face login should unlock it {via}.\n     \
              If it stays locked, the sealed keyring password is stale — re-run: \
              sudo irlume keyring arm"
         ),
@@ -122,7 +162,7 @@ pub fn report_keyring_status() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_locked;
+    use super::{parse_locked, unlock_module_for};
 
     #[test]
     fn parse_locked_reads_the_busctl_boolean_reply() {
@@ -132,5 +172,15 @@ mod tests {
         assert_eq!(parse_locked(""), None);
         assert_eq!(parse_locked("b"), None);
         assert_eq!(parse_locked("s \"oops\""), None);
+    }
+
+    #[test]
+    fn unlock_module_maps_known_secret_service_providers() {
+        // Plasma 6 (ksecretd) and older KWallet both unlock via pam_kwallet5.
+        assert_eq!(unlock_module_for("ksecretd"), Some("pam_kwallet5"));
+        assert_eq!(unlock_module_for("kwalletd6"), Some("pam_kwallet5"));
+        assert_eq!(unlock_module_for("gnome-keyring-d"), Some("pam_gnome_keyring"));
+        // An unknown provider yields no hint rather than a wrong one.
+        assert_eq!(unlock_module_for("keepassxc"), None);
     }
 }

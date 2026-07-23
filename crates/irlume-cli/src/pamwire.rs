@@ -1207,6 +1207,11 @@ fn selinux_pp() -> Option<String> {
         }
     }
     for p in [
+        // Where the irlume-selinux rpm actually installs it (the standard
+        // SELinux packages dir). Missing here meant a Copr install could
+        // never re-load the module after `login disable` removed it; the
+        // rpm's own %post load at install time had masked the gap.
+        "/usr/share/selinux/packages/irlume.pp",
         "/usr/share/irlume/selinux/irlume.pp",
         "/usr/lib/irlume/selinux/irlume.pp",
         concat!(

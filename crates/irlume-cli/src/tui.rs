@@ -1217,6 +1217,33 @@ impl App {
             ));
         }
 
+        // Keyring PCR-drift: the seal no longer matches the current PCRs (a
+        // firmware/Secure Boot update moved them), so face login silently stops
+        // opening the wallet until re-bound. Only the Keyring tab drew this;
+        // surface it here too, with the one-key fix (reseal, added to Keyring).
+        if self.keyring_drift == Some(true) {
+            v.push(mk(
+                "Keyring seal",
+                Sev::Warn,
+                "PCRs drifted since sealing; the wallet won't auto-unlock until re-bound".into(),
+                Fix::Manual("Keyring tab → [r] reseal (re-bind to current PCRs)".into()),
+            ));
+        }
+
+        // A third-party liveness model enabled but with a CHECKSUM MISMATCH: the
+        // daemon refuses to load it, so the deny-only cue the user opted into is
+        // silently OFF. doctor reports this; a TUI-only user would never see it.
+        if let crate::models::TuiState::Enabled { name, detail } = crate::models::tui_state() {
+            if detail.contains("MISMATCH") {
+                v.push(mk(
+                    "Third-party model",
+                    Sev::Fail,
+                    format!("'{name}' weights fail their checksum; the daemon refuses them (cue is OFF)"),
+                    Fix::Manual("re-fetch: sudo irlume models disable, then models enable".into()),
+                ));
+            }
+        }
+
         if let Some(r) = self.recovery {
             if r.encrypted && !r.recovery_set {
                 v.push(mk(
@@ -3537,7 +3564,11 @@ impl App {
 
     /// Diagnostic + repair: a live checklist (✓/⚠/✗) of everything irlume needs
     /// to run, with one-key fixes, plus platform trust anchors and a live IR PAD
-    /// self-test. Mirrors `irlume doctor` + `diag` + `deps` and adds remediation.
+    /// self-test. Covers the `irlume doctor`/`diag`/`deps` checks that have a
+    /// remediation or that a TUI-only user would otherwise miss (daemon, models,
+    /// cameras, SELinux/AppArmor, wiring drift, keyring drift, recovery, TPM,
+    /// third-party-model checksum). Some advisory-only doctor lines (fingerprint
+    /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
         use irlume_common::secureboot;
         let [list_area, info_area] =
@@ -7025,5 +7056,30 @@ mod tests {
         app.repair_sel = 999;
         app.run_checks();
         assert!(app.repair_sel < app.repair.len());
+    }
+
+    #[test]
+    fn repair_surfaces_keyring_drift_with_the_reseal_fix() {
+        // A TUI-only user never runs `doctor`; PCR drift must show on Repair
+        // and point at the reseal action (the newly-added parity fix).
+        let mut app = test_app();
+        app.keyring_drift = None;
+        app.run_checks();
+        assert!(
+            !app.repair.iter().any(|c| c.label == "Keyring seal"),
+            "no drift, no row"
+        );
+        app.keyring_drift = Some(true);
+        app.run_checks();
+        let row = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Keyring seal")
+            .expect("drift must surface on Repair");
+        assert!(row.sev == Sev::Warn);
+        match &row.fix {
+            Fix::Manual(m) => assert!(m.contains("reseal"), "fix points at reseal: {m}"),
+            _ => panic!("expected a manual fix pointing at reseal"),
+        }
     }
 }

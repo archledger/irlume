@@ -7,6 +7,40 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **TUI feature parity: every CLI action is now reachable by keypress.** A
+  parity audit found nine CLI features the TUI only mentioned as
+  commands-to-type; since the TUI captures the mouse, those commands could
+  not even be copied out. All are now actions: face-sudo and app-prompt
+  wiring plus un-wire (Login wiring tab, un-wire behind a y/n confirm),
+  eye-closure calibration, fingerprint verify/enable/disable/reset (reset
+  confirmed), third-party model enable/disable (the license/provenance
+  confirm still runs, hosted in the terminal), daemon debug-log toggle
+  (Repair), the origin-aware updater (Done), and a Repair check + one-key
+  fix for PAM wiring stripped by a distro regeneration. `[M]` releases
+  mouse capture so terminal text selection works when copying is still
+  wanted. Consecutive privileged actions share sudo's tty timestamp
+  (5-minute default), so one authentication covers a TUI session's worth
+  of changes; container-verified.
+
+### Fixed
+
+- **Ctrl-C during a suspended TUI action no longer kills the TUI.** In the
+  cooked terminal, SIGINT reaches the whole foreground group; the TUI now
+  shields itself while the child runs (the child keeps the default
+  disposition, so Ctrl-C still cancels it). Found when Ctrl-C in the
+  third-party-model license prompt took the whole TUI down.
+- **Ctrl-modified letters no longer alias to plain-letter TUI actions.**
+  Ctrl-C arrives as Char('c')+CONTROL and fired the calibrate binding;
+  modifier-carrying letters are now ignored by the key dispatcher.
+- **Packaged installs can re-load the SELinux module after `login
+  disable`.** The pp lookup never searched
+  `/usr/share/selinux/packages/irlume.pp`, the irlume-selinux rpm's
+  install path, so a disable → enable cycle on a Copr install lost the
+  module ("irlume.pp not found") until a package reinstall. The rpm's
+  install-time module load had masked the gap. Found by hardware
+  validation of the TUI un-wire/re-wire round trip.
+  `IRLUME_SELINUX_PP` now also overrides the `selinux load` lookup.
+
 - **`irlume bitwarden setup`: one command replaces the copy-paste Bitwarden
   polkit setup.** Detects how Bitwarden was installed and acts per flavor:
   flatpak and native installs get the action file written host-side (content

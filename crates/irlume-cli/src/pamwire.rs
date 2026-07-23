@@ -288,6 +288,14 @@ fn active_login_wired() -> bool {
     etc.exists() && file_has_module(&etc)
 }
 
+/// Whether the self-heal marker says login WAS wired but the active greeter's
+/// stack no longer carries the module (a distro PAM regeneration stripped it):
+/// exactly the condition `login reconcile` repairs. The TUI's Repair tab uses
+/// this to offer the fix.
+pub(crate) fn reconcile_needed() -> bool {
+    read_wired_marker().is_some() && !active_login_wired()
+}
+
 pub(crate) fn login_wired() -> bool {
     for s in GREETERS
         .iter()
@@ -1199,6 +1207,11 @@ fn selinux_pp() -> Option<String> {
         }
     }
     for p in [
+        // Where the irlume-selinux rpm actually installs it (the standard
+        // SELinux packages dir). Missing here meant a Copr install could
+        // never re-load the module after `login disable` removed it; the
+        // rpm's own %post load at install time had masked the gap.
+        "/usr/share/selinux/packages/irlume.pp",
         "/usr/share/irlume/selinux/irlume.pp",
         "/usr/lib/irlume/selinux/irlume.pp",
         concat!(

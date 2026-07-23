@@ -25,6 +25,12 @@ const DROPIN_DIR: &str = "/etc/systemd/system/irlumed.service.d";
 const DROPIN: &str = "/etc/systemd/system/irlumed.service.d/50-irlume-debug.conf";
 const PATTERN: &str = "irlume|pam_kwallet|pam_gnome_keyring";
 
+/// Whether the debug-logging drop-in is active (the TUI's toggle reads this
+/// to know which way `logs debug` should flip).
+pub(crate) fn debug_active() -> bool {
+    Path::new(DROPIN).exists()
+}
+
 pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     match sub {
         Some("debug") => debug(args.get(2).map(String::as_str)),

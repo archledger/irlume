@@ -3,7 +3,7 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] - 2026-07-23
 
 ### Added
 
@@ -72,8 +72,6 @@ All notable changes to irlume are documented here. This project adheres to
   the Settings toggle. Verified live: the polkit dialog appears and a head nod
   unlocks the vault on the 2026.6.1 flatpak.
 
-### Fixed
-
 - **The "test (stable)" CI job now actually tests on stable.** Its
   `dtolnay/rust-toolchain` step was pinned to the action's `1.88.0` version
   branch, which has no `toolchain` input, so `with: toolchain: stable` was
@@ -88,6 +86,21 @@ All notable changes to irlume are documented here. This project adheres to
   the explicit, documented opt-out for installing without gpg.
 
 ### Security
+
+- **`pam_irlume` no longer trusts `IRLUME_SOCKET` in a setuid context (local
+  root fix).** The module is linked into setuid-root PAM stacks (`/etc/pam.d/sudo`
+  under `--with-sudo`), which inherit the caller's environment. It resolved the
+  daemon socket from `IRLUME_SOCKET` via `getenv`, so a local user could run
+  `IRLUME_SOCKET=/tmp/evil.sock sudo …`, point the module at a fake daemon that
+  always replies "granted", and gain root with no password or face. The override
+  is now read through `secure_getenv`, which returns NULL under AT_SECURE, so the
+  compiled socket path always wins in a setuid stack while the daemon and dev/test
+  keep the override. Found by a pre-release security audit.
+- **Self-heal marker hardened.** The `login.wired` reconcile marker is written
+  0600 root-owned and trusted only when root-owned in production, so it cannot be
+  planted by a non-root user to force `--with-sudo` wiring. reconcile also now
+  checks the active display manager's own greeter (not any greeter), so a distro
+  update that strips only the active greeter is actually repaired.
 
 - **The self-hosted preflight runner no longer has any path to running fork
   code.** It triggered on `pull_request` behind a same-repo `if:` guard, but a

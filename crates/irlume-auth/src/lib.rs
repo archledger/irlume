@@ -1015,7 +1015,7 @@ impl Engine {
         Ok(irlume_liveness::detect_blink(&samples))
     }
 
-    /// Capture a temporal IR sequence and compute the per-frame [`EarSample`]s
+    /// Capture a temporal IR sequence and compute the per-frame [`irlume_liveness::EarSample`]s
     /// that the blink / deliberate-closure detectors consume. Public so the
     /// blink-tuning capture tool records the EXACT samples the live gate sees.
     ///

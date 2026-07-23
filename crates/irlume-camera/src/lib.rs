@@ -1175,7 +1175,7 @@ pub struct IrStreamFrame {
 }
 
 /// Drive a single held-open IR stream, invoking `on_frame` for each USABLE frame
-/// (non-frozen, non-blown) until the consumer returns [`ControlFlow::Break`] or
+/// (non-frozen, non-blown) until the consumer returns [`std::ops::ControlFlow::Break`] or
 /// the `max_frames` attempt budget is spent. Returns the break value, or `None`
 /// if the budget ran out first.
 ///

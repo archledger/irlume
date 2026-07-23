@@ -588,7 +588,7 @@ pub const NOD_CROSSING_AMP_FRAC: f32 = 0.25;
 pub const NOD_MIN_FACE_FRAMES: usize = 12;
 
 /// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
-/// pitch swings through a range of at least [`nod_pitch_min`] while the yaw stays
+/// pitch swings through a range of at least [`NOD_PITCH_MIN`] while the yaw stays
 /// within [`NOD_YAW_MAX`] (not a look-around or shake), oscillating up-and-down
 /// at least [`NOD_MIN_CROSSINGS`] times (not a single drift). Pose-DEFINED, so
 /// unlike the eye-closure gesture it reads the same at any head angle or
@@ -1087,7 +1087,7 @@ pub fn calibrate_open_ear(samples: &[EarSample]) -> Option<f32> {
 /// Detect a DELIBERATE eye-closure consent gesture: a BOUNDED closure that
 /// REOPENS. The eyes must go shut (EAR below the per-user
 /// [`ClosureCalibration::closed_threshold`]) for a run of
-/// [`consent_closure_frames`]..=[`consent_closure_max_frames`] face frames
+/// [`CONSENT_CLOSURE_MIN_FRAMES`]..=[`CONSENT_CLOSURE_MAX_FRAMES`] face frames
 /// (tolerating [`CLOSURE_HYSTERESIS_FRAMES`] dropout frames), then reopen (EAR
 /// back up past [`ClosureCalibration::reopen_threshold`]) within
 /// [`CLOSURE_REOPEN_WINDOW`] frames.

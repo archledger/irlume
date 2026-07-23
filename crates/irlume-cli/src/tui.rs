@@ -2175,6 +2175,17 @@ impl App {
                     Pending::KeyringPw(None),
                 ));
             }
+            // Reseal: re-bind the sealed password to the current PCRs (the CLI
+            // `irlume reseal`). Same masked-prompt + SealPassword path as arm;
+            // the distinct entry point and copy are the discoverability the
+            // drift-recovery workflow needs.
+            (SC_KEYRING, KeyCode::Char('r')) if self.keyring_armed == Some(true) => {
+                self.input = Some((
+                    "Login password to re-seal to current PCRs (••):".into(),
+                    String::new(),
+                    Pending::KeyringPw(None),
+                ));
+            }
             (SC_KEYRING, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the TPM-sealed login password?".into(),
@@ -2880,13 +2891,13 @@ impl App {
             "  [esc] cancel",
             Style::new().dim(),
         )));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
         if self.profiles.is_empty() {
             f.render_widget(Paragraph::new("\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically.")
-                .wrap(Wrap { trim: true }).dim(), area);
+                .wrap(Wrap { trim: false }).dim(), area);
             return;
         }
         let rows = self.rows();
@@ -3024,7 +3035,7 @@ impl App {
                     Style::new().dim(),
                 )),
             ])
-            .wrap(Wrap { trim: true }),
+            .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -3176,7 +3187,7 @@ impl App {
             Span::styled(" probe XU controls", Style::new().dim()),
         ]));
         // Borderless (no box-in-box); the content panel is the only frame.
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info_area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info_area);
     }
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {
@@ -3198,41 +3209,38 @@ impl App {
             )
         };
         let mut lines = vec![
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("Reader        ", Style::new().add_modifier(Modifier::BOLD)),
-                reader,
-            ]),
-            Line::from(vec![
-                Span::styled("Enrolled      ", Style::new().add_modifier(Modifier::BOLD)),
-                enrolled,
-            ]),
-            Line::from(vec![
-                Span::styled("Active method ", Style::new().add_modifier(Modifier::BOLD)),
+            section("Fingerprint (companion factor)"),
+            state_row("reader", 14, reader),
+            state_row("enrolled", 14, enrolled),
+            state_row(
+                "active method",
+                14,
                 Span::raw(method_label(&self.fp.method)),
-            ]),
+            ),
             Line::raw(""),
         ];
         if self.fp.available {
             lines.push(Line::from(Span::styled(
-                "Fingerprint is a companion factor via stock fprintd + pam_fprintd.",
+                "  Stock fprintd + pam_fprintd; unlocks alongside face, never instead.",
                 Style::new().dim(),
             )));
-            lines.push(Line::from(Span::styled(
-                "  [a] enroll a finger · [t] test a finger · [x] wipe all enrolled fingers",
-                Style::new().dim(),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  [e] unlock with face OR fingerprint (sudo) · [d] remove fingerprint from login",
-                Style::new().dim(),
-            )));
+            lines.push(Line::raw(""));
+            lines.push(action_line(&[
+                ("a", "enroll a finger"),
+                ("t", "test a finger"),
+                ("x", "wipe all"),
+            ]));
+            lines.push(action_line(&[
+                ("e", "face OR fingerprint (sudo)"),
+                ("d", "remove from login"),
+            ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "No usable reader on this device; fingerprint unavailable.",
+                "  No usable reader on this device; fingerprint unavailable.",
                 Style::new().dim(),
             )));
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_recovery(&self, f: &mut Frame, area: Rect) {
@@ -3254,49 +3262,38 @@ impl App {
             Span::styled("○ not set", Style::new().dim())
         };
         let mut lines = vec![
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled(
-                    "Templates at rest    ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                enc,
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Recovery passphrase  ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                rec,
-            ]),
+            section("Recovery + template encryption"),
+            state_row("templates", 12, enc),
+            state_row("passphrase", 12, rec),
             Line::raw(""),
             Line::from(Span::styled(
-                "A recovery passphrase backs up the face-template key, the manual",
+                "  A recovery passphrase backs up the face-template key, the manual",
                 Style::new().dim(),
             )),
             Line::from(Span::styled(
-                "backstop after a TPM clear, firmware/dbx update, or disk move.",
+                "  backstop after a TPM clear, firmware/dbx update, or disk move.",
                 Style::new().dim(),
             )),
             Line::raw(""),
         ];
         if !r.tpm_present {
             lines.push(Line::from(Span::styled(
-                "No TPM on this host: templates stay plaintext; recovery N/A.",
+                "  No TPM on this host: templates stay plaintext; recovery N/A.",
                 Style::new().fg(th().err),
             )));
         } else if r.encrypted && !r.recovery_set {
             lines.push(Line::from(Span::styled(
-                "⚠ No backstop: set one now, or a broken seal means re-enrolling.",
+                "  ⚠ No backstop: set one now, or a broken seal means re-enrolling.",
                 Style::new().fg(th().err),
             )));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "  [s] set passphrase   [t] restore from passphrase   [f] forget",
-            Style::new().dim(),
-        )));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        lines.push(action_line(&[
+            ("s", "set passphrase"),
+            ("t", "restore"),
+            ("f", "forget"),
+        ]));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_keyring(&self, f: &mut Frame, area: Rect) {
@@ -3386,7 +3383,7 @@ impl App {
                     Style::new().fg(th().warn),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    use the Repair tab or `irlume reseal` to re-bind to current PCRs.",
+                    "    press [r] to reseal (re-bind to the current PCRs, same password).",
                     Style::new().dim(),
                 )));
             }
@@ -3402,13 +3399,22 @@ impl App {
             )));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("  [a]", Style::new().fg(th().accent)),
-            Span::styled(" arm (enter your login password)   ", Style::new().dim()),
-            Span::styled("[f]", Style::new().fg(th().accent)),
-            Span::styled(" forget", Style::new().dim()),
-        ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        // [r] reseal is shown only once armed (re-bind needs an existing seal);
+        // it re-enters the password and re-seals to the current PCRs, the CLI
+        // `irlume reseal` a keyboard-only user would otherwise have no way to run.
+        if armed {
+            lines.push(action_line(&[
+                ("a", "re-arm (new password)"),
+                ("r", "reseal (re-bind to current PCRs)"),
+                ("f", "forget"),
+            ]));
+        } else {
+            lines.push(action_line(&[
+                ("a", "arm (enter your login password)"),
+                ("f", "forget"),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     /// Hub rows for the Welcome screen: each visible section with its live
@@ -3596,11 +3602,14 @@ impl App {
             Span::styled(format!("  {ok} ok"), Style::new().fg(th().ok)),
             Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
             Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
-            Span::styled(
-                "      [f] fix selected   [r] re-check   [l] IR self-test   [g] logs",
-                Style::new().dim(),
-            ),
         ])];
+        lines.push(action_line(&[
+            ("f", "fix selected"),
+            ("r", "re-check"),
+            ("l", "IR self-test"),
+            ("g", "logs"),
+        ]));
+        lines.push(Line::raw(""));
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
                 // "no action needed" next to a non-zero fail count reads as a
@@ -3666,7 +3675,7 @@ impl App {
             .border_style(Style::new().dim())
             .title(" diagnosis ");
         f.render_widget(
-            Paragraph::new(lines).block(blk).wrap(Wrap { trim: true }),
+            Paragraph::new(lines).block(blk).wrap(Wrap { trim: false }),
             info_area,
         );
     }
@@ -3716,7 +3725,7 @@ impl App {
             Span::styled("  [i]", Style::new().fg(th().accent)),
             Span::styled(" identify now", Style::new().dim()),
         ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
@@ -3891,10 +3900,7 @@ impl App {
         let rec = self.recovery.unwrap_or_default();
         let wired = crate::pamwire::login_wired();
         let lines = vec![
-            Line::from(Span::styled(
-                "  Setup dashboard",
-                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-            )),
+            section("Setup dashboard"),
             Line::raw(""),
             Line::from(vec![
                 Span::raw("  daemon            "),
@@ -3964,7 +3970,7 @@ impl App {
                 ])
             },
         ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_activity(&self, f: &mut Frame, area: Rect) {
@@ -4040,7 +4046,7 @@ impl App {
                 ("d", "delete"),
             ],
             SC_IDENTIFY => &[("i", "identify")],
-            SC_KEYRING => &[("a", "arm"), ("f", "forget")],
+            SC_KEYRING => &[("a", "arm"), ("r", "reseal"), ("f", "forget")],
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
             SC_FINGERPRINT => &[
                 ("a", "enroll finger"),
@@ -4221,6 +4227,27 @@ fn onoff(on: bool) -> Span<'static> {
     } else {
         Span::styled("○ no", Style::new().dim())
     }
+}
+
+/// A screen state row: 2-space indent, label padded to `w`, then the value
+/// span. One shape for every status line so screens line up the same way.
+fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
+    Line::from(vec![Span::raw(format!("  {label:<w$}", w = w)), value])
+}
+
+/// An action line: accent `[key]` chips with dim labels, 2-space indent, a
+/// gap between actions. THE way action keys render, so a key is never a dim
+/// mid-sentence token or a whole dim line.
+fn action_line(items: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for (i, (k, d)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(format!("[{k}]"), Style::new().fg(th().accent)));
+        spans.push(Span::styled(format!(" {d}"), Style::new().dim()));
+    }
+    Line::from(spans)
 }
 
 /// Human label for the stored auth method string (`Method::as_str()`): the raw
@@ -5688,6 +5715,20 @@ mod tests {
                 assert!(p.masked(), "a password prompt must render masked")
             }
             _ => panic!("expected the keyring password prompt"),
+        }
+        app.input = None;
+        // [r] reseal opens the masked prompt ONLY when armed (re-bind needs an
+        // existing seal); the CLI `irlume reseal` reachable from the TUI.
+        app.keyring_armed = Some(false);
+        app.on_key(KeyCode::Char('r'));
+        assert!(app.input.is_none(), "reseal is inert when not armed");
+        app.keyring_armed = Some(true);
+        app.on_key(KeyCode::Char('r'));
+        match &app.input {
+            Some((prompt, _, p @ Pending::KeyringPw(None))) => {
+                assert!(p.masked() && prompt.contains("re-seal"), "got: {prompt}");
+            }
+            _ => panic!("expected the reseal password prompt"),
         }
         app.input = None;
         app.on_key(KeyCode::Char('f'));

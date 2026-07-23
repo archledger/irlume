@@ -2480,8 +2480,11 @@ fn doctor() -> std::process::ExitCode {
     // biometric unlock to work (its flatpak/snap can't install it themselves).
     let bitwarden_action =
         std::path::Path::new("/usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy").exists();
-    // The consent gesture needs a per-user closure calibration; wired-but-
-    // uncalibrated silently falls to the password on every polkit prompt.
+    // The consent gesture is a head NOD by default (no calibration). Only the
+    // opt-in closure gesture needs a per-user calibration; wired-but-uncalibrated
+    // then silently falls to the password on every polkit prompt.
+    let gesture_is_closure = irlume_common::config::read_kv("settings.conf", "consent_gesture")
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("closure"));
     let closure_calibrated = matches!(
         daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
         Ok(irlume_common::Response::Enrollment {
@@ -2490,13 +2493,23 @@ fn doctor() -> std::process::ExitCode {
         })
     );
     match crate::pamwire::polkit_wired() {
+        Some(true) if !gesture_is_closure => println!(
+            "[doctor] polkit app prompts: wired ✓ (NOD your head to approve Bitwarden unlock,\n     \
+             pkexec, …; no calibration needed{})",
+            if closure_calibrated {
+                " — closing your eyes ~1s also works"
+            } else {
+                ", or run calibrate-closure to also allow the eye-closure gesture"
+            }
+        ),
         Some(true) if closure_calibrated => println!(
             "[doctor] polkit app prompts: wired ✓ and calibrated ✓ (close your eyes ~1s to \
-             approve Bitwarden unlock, pkexec, …)"
+             approve; consent_gesture=closure)"
         ),
         Some(true) => println!(
-            "[doctor] polkit app prompts: wired ✓ but NOT calibrated — the consent gesture can't\n     \
-             run, so prompts fall back to the password. Calibrate: sudo irlume calibrate-closure"
+            "[doctor] polkit app prompts: wired ✓ but consent_gesture=closure and NOT calibrated —\n     \
+             prompts fall back to the password. Calibrate (sudo irlume calibrate-closure) or unset\n     \
+             consent_gesture in settings.conf to use the no-calibration head nod."
         ),
         Some(false) if bitwarden_action => println!(
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \

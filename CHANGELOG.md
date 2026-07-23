@@ -7,20 +7,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- **Deliberate eye-closure consent gesture for polkit prompts, with per-user
-  calibration.** A polkit face approval (Bitwarden unlock, `pkexec`) now
-  requires closing your eyes for about a second and reopening them, a
-  volitional act that a passively watching face, a natural blink, or a held
-  squint cannot produce (validated on a hardware capture campaign: zero false
-  accepts across squint / natural-blink / look-down / spoof captures). The
-  gesture is measured against a per-user absolute EAR threshold from a one-time
-  `sudo irlume calibrate-closure` (two prompts: eyes open, eyes closed), stored
-  in the enrollment; the daemon fails the polkit face path closed to the
-  password when no usable calibration exists. `pam_irlume` shows "close your
-  eyes for about a second, then open, to approve" on the polkit dialog, and
-  `irlume doctor` flags a wired-but-uncalibrated setup. New camera streaming
-  core (`capture_ir_streaming`) and a dev tool (`irlume blinkcap`, `IRLUME_DEV`)
-  underpin the tuning. See docs/APP-INTEGRATION.md.
+- **Deliberate consent gesture for polkit prompts — head NOD or eye closure.**
+  polkit agents start the PAM conversation with no user action, so a bare face
+  match would approve a prompt the user never acknowledged; the daemon now
+  requires a deliberate gesture for the polkit class (verify-only, never a
+  credential release, IR tier only, fails closed to the password). Approve with
+  a head NOD (the default: pose-defined, so it works at any head angle or
+  lighting, including reclined/in bed, and needs no calibration) or, after a
+  one-time `sudo irlume calibrate-closure`, by closing your eyes ~1s and
+  reopening. One capture feeds both detectors and accepts EITHER, so the user
+  does whichever suits their position; `consent_gesture=nod|closure` in
+  settings.conf restricts to one. Both were tuned and validated offline against
+  hardware capture campaigns (nod: zero false accepts across still / look-around,
+  accepts reclined nods; closure: zero across squint / natural-blink / look-down
+  / spoof, via a per-user absolute EAR threshold after the campaign showed a
+  held squint is indistinguishable from a held closure). `pam_irlume` shows the
+  gesture hint on the polkit dialog; `irlume doctor` reports the wiring and
+  gesture state. New camera streaming core (`capture_ir_streaming`), pose/EAR
+  capture, and a dev tool (`irlume blinkcap`, `IRLUME_DEV`) underpin the tuning.
+  See docs/APP-INTEGRATION.md.
 
 - **polkit app prompts can be face-approved (opt-in): `sudo irlume login
   enable --with-polkit --apply`.** Desktop apps ask polkit to verify the user

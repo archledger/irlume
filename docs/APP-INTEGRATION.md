@@ -19,33 +19,36 @@ pieces:
    the app and the action being approved, and starts a PAM conversation on the
    `polkit-1` service.
 3. `pam_irlume` in that stack asks `irlumed` to verify your face. For a polkit
-   prompt the daemon also requires a deliberate consent gesture: **close your
-   eyes for about a second, then open them** (see the security section). It
-   then answers yes or no; the app learns only the verdict.
+   prompt the daemon also requires a deliberate consent gesture: **nod your
+   head**, or **close your eyes for about a second then open them** — whichever
+   suits your position (see the security section). It then answers yes or no;
+   the app learns only the verdict.
 
 Both the KDE and GNOME agents start the PAM conversation the moment the dialog
-appears, so the camera fires immediately. The dialog shows "irlume: close your
-eyes for about a second, then open, to approve"; perform the gesture and it
-approves, no typing or clicking.
+appears, so the camera fires immediately. The dialog shows "irlume: nod your
+head to approve (or close your eyes ~1s then open)"; perform either gesture and
+it approves, no typing or clicking.
 
 ## Enabling
 
-Two steps: wire polkit, then calibrate the consent gesture.
+One step; the default consent gesture (a head nod) needs no setup.
 
 ```console
 sudo irlume login enable --with-polkit --apply   # wire pam_irlume into polkit-1
-sudo irlume calibrate-closure                     # teach it your open/closed eye shape
 ```
 
-The first adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
+This adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
 `/etc/pam.d/polkit-1` override of the vendor file; Debian and Arch get an
 edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable --apply`
 removes it along with everything else, flag or no flag.
 
-`calibrate-closure` captures your eyes-open and eyes-closed EAR in two quick
-prompts and stores them in your enrollment. The gesture is verified against
-these per-user values, so without it a polkit prompt falls back to the
-password. `irlume doctor` flags a wired-but-uncalibrated setup.
+**The consent gesture is a head NOD by default** — pose-defined, so it works at
+any head angle or lighting (upright, reclined, in bed) and needs no calibration.
+If you'd also like to approve by closing your eyes, run `sudo irlume
+calibrate-closure` once (it captures your eyes-open and eyes-closed EAR); after
+that either gesture is accepted. The eye-closure path is 2D and pose-sensitive,
+so it works best sitting square-on to the camera; the nod covers every other
+position. `consent_gesture=nod|closure` in settings.conf restricts to one.
 
 Check the state any time:
 
@@ -80,10 +83,11 @@ works the same day it ships.
   credential.
 - **Deliberate gesture required.** polkit agents run the PAM conversation with
   no user action, so a bare face match would approve a prompt the user never
-  acknowledged. For polkit-class services the daemon requires the deliberate
-  eye-closure gesture (close ~1s, then open) even for users who did not opt into
-  any per-enrollment liveness, and fails closed if it cannot run (no IR camera,
-  no FaceMesh model, or no stored calibration). Disable the forced gesture with `polkit_gesture=0` in
+  acknowledged. For polkit-class services the daemon requires a deliberate
+  gesture — a head nod, or an eye closure — even for users who did not opt into
+  any per-enrollment liveness, and fails closed if it cannot run (no IR camera;
+  or, for the closure gesture specifically, no FaceMesh model or no stored
+  calibration). Disable the forced gesture with `polkit_gesture=0` in
   `settings.conf` if you accept that trade.
 - **IR tier only.** RGB-only (convenience) devices never satisfy polkit
   prompts; a printed photo in front of a webcam must not approve app actions.
@@ -99,10 +103,9 @@ works the same day it ships.
   the polkit row, then `sudo ausearch -m avc -ts recent | grep irlume` on
   SELinux systems; the shipped policy (1.1.0) grants the polkit helper domain
   access to the daemon socket.
-- Face matches but the prompt stays: it wants the consent gesture. Close your
-  eyes for about a second, then open them. If it never accepts, check the
-  calibration with `irlume doctor` and re-run `sudo irlume calibrate-closure`.
-  `irlume logs` shows the deny reason.
+- Face matches but the prompt stays: it wants the consent gesture. Nod your
+  head (a firm chin-down-and-back, a couple of times), or close your eyes for
+  about a second and open them. `irlume logs` shows the deny reason.
 - Bitwarden says biometrics are unavailable: its polkit action file is
   missing (`irlume doctor` reports this) or the desktop app needs the
   Secret Service (GNOME Keyring / KWallet) running.

@@ -229,6 +229,34 @@ fn consent_gesture_enabled() -> bool {
     !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
 }
 
+/// Which consent gesture(s) the polkit gate accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsentGesture {
+    /// Head nod only.
+    Nod,
+    /// Eye closure only.
+    Closure,
+    /// Accept either (the default): the user does whichever suits their position.
+    Either,
+}
+
+/// The configured consent-gesture mode: `consent_gesture=nod|closure` in
+/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset / any
+/// other value accepts EITHER.
+fn consent_gesture_mode() -> ConsentGesture {
+    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+        "nod" => ConsentGesture::Nod,
+        "closure" => ConsentGesture::Closure,
+        _ => ConsentGesture::Either,
+    };
+    if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
+        return parse(&v);
+    }
+    irlume_common::config::read_kv("settings.conf", "consent_gesture")
+        .map(|v| parse(&v))
+        .unwrap_or(ConsentGesture::Either)
+}
+
 /// Whether this PAM service forces the passive blink gate even without the
 /// per-enrollment opt-in (polkit prompts; see
 /// `biopolicy::requires_consent_gesture`). Unlike the opt-in flag, a forced
@@ -1080,6 +1108,70 @@ impl Engine {
         Ok(out)
     }
 
+    /// Capture ONE IR sequence and record BOTH head pose (for the nod gesture)
+    /// and eye EAR (for the closure gesture) per frame, so the consent gate can
+    /// accept whichever gesture the user performs. Pose comes from the detector
+    /// (always); EAR from the FaceMesh (only when loaded — its samples carry
+    /// `None` ear otherwise). Two vecs, same frame indices.
+    #[allow(clippy::type_complexity)]
+    pub fn capture_consent_samples(
+        &mut self,
+        samples: usize,
+    ) -> irlume_common::Result<(
+        Vec<irlume_liveness::PoseSample>,
+        Vec<irlume_liveness::EarSample>,
+    )> {
+        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
+        let have_mesh = self.mesh.is_some();
+        let mut poses = Vec::with_capacity(frames.len());
+        let mut ears = Vec::with_capacity(frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
+            let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
+            let view = align::RgbView {
+                data: &grey_rgb,
+                width: f.width,
+                height: f.height,
+            };
+            let (mut pitch_frac, mut yaw_signed) = (None, None);
+            let mut ear = None;
+            let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
+            let faces = self.det.detect(&view)?;
+            if let Some(t) = top_detection(&faces) {
+                let pose = irlume_vision::head_pose(&t.landmarks);
+                pitch_frac = Some(pose.pitch_frac);
+                yaw_signed = Some(pose.yaw_signed);
+                cx = (t.bbox[0] + t.bbox[2]) * 0.5;
+                cy = (t.bbox[1] + t.bbox[3]) * 0.5;
+                fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
+                if have_mesh {
+                    let mesh = self.mesh.as_mut().expect("mesh present (checked)");
+                    let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
+                    let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
+                    let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
+                    ear = Some(l.min(r));
+                    contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                }
+            }
+            poses.push(irlume_liveness::PoseSample {
+                idx: i,
+                pitch_frac,
+                yaw_signed,
+                bri,
+            });
+            ears.push(irlume_liveness::EarSample {
+                idx: i,
+                ear,
+                bri,
+                cx,
+                cy,
+                fsize,
+                contrast,
+            });
+        }
+        Ok((poses, ears))
+    }
+
     /// If the passive blink gate is wanted and we're about to grant, require a
     /// natural blink before releasing anything. Wanted = the user's enrollment
     /// opted in (`require_challenge`) OR the current service forces it
@@ -1131,19 +1223,27 @@ impl Engine {
         })
     }
 
-    /// The forced consent gate: require the deliberate eye-closure gesture
-    /// ("close your eyes ~1s, then open") using the user's enrolled calibration.
-    /// FAILS CLOSED (grant withdrawn, PAM cascades to the password) whenever the
-    /// gesture cannot be run or verified: no IR / no FaceMesh model, no stored
-    /// calibration, an untrustworthy calibration, or no gesture in the window.
+    /// The forced consent gate: require a DELIBERATE gesture before approving a
+    /// polkit prompt, accepting EITHER a head NOD or an eye CLOSURE so the user
+    /// does whichever suits their position. One capture feeds both detectors:
+    ///
+    /// * A head nod (pose-defined) always works and needs no calibration, so it
+    ///   is the universal path, including reclined where EAR collapses.
+    /// * An eye closure ("close ~1s, then open") is ALSO accepted when the user
+    ///   has calibrated it and the FaceMesh is loaded, for those who prefer it
+    ///   sitting upright. It cannot false-fire reclined (EAR stays flat, no
+    ///   reopen), so accepting it is safe.
+    ///
+    /// `consent_gesture=nod` or `=closure` in settings.conf restricts to one;
+    /// unset accepts either. FAILS CLOSED (PAM cascades to the password) when no
+    /// accepted gesture is seen.
     fn consent_gesture_gate(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         outcome: Outcome,
     ) -> irlume_common::Result<Outcome> {
         // ~5s window: room for the user to read the prompt and perform the
-        // close-and-open. (A future rolling watch can return the instant the
-        // gesture completes; this fixed window is the simple, correct form.)
+        // gesture. (A future rolling watch can return the instant it completes.)
         const CONSENT_WINDOW: usize = 75;
         let (live, score) = (outcome.live, outcome.score);
         let deny = |reason: &str| Outcome {
@@ -1153,33 +1253,44 @@ impl Engine {
             reason: reason.into(),
             kind: OutcomeKind::OtherDeny,
         };
-        if !self.ir_available || self.mesh.is_none() {
+        if !self.ir_available {
             return Ok(deny(
-                "consent gesture required but IR / face_landmark.onnx is missing; use your password",
+                "consent gesture required but no IR camera; use your password",
             ));
         }
-        let Some((ear_open, ear_closed)) = enr.closure_calibration else {
-            return Ok(deny(
-                "no consent calibration for this account; run `sudo irlume calibrate-closure`, or use your password",
-            ));
-        };
-        let cal = irlume_liveness::ClosureCalibration {
-            ear_open,
-            ear_closed,
-        };
-        if !cal.is_usable() {
-            return Ok(deny(
-                "consent calibration is unreliable (open/closed EAR too close); re-run `irlume calibrate-closure`",
-            ));
+        let mode = consent_gesture_mode();
+        let (poses, ears) = self.capture_consent_samples(CONSENT_WINDOW)?;
+
+        // NOD (unless restricted to closure).
+        if mode != ConsentGesture::Closure
+            && irlume_liveness::detect_nod(&poses) == irlume_liveness::HeadGesture::Nod
+        {
+            return Ok(outcome);
         }
-        let samples = self.capture_ear_samples(CONSENT_WINDOW)?;
-        use irlume_liveness::BlinkResult;
-        Ok(
-            match irlume_liveness::detect_deliberate_closure(&samples, &cal) {
-                BlinkResult::Blinked => outcome,
-                _ => deny("close your eyes for about a second, then open, to approve"),
-            },
-        )
+        // EYE CLOSURE (unless restricted to nod), when calibrated + mesh loaded.
+        if mode != ConsentGesture::Nod && self.mesh.is_some() {
+            if let Some((ear_open, ear_closed)) = enr.closure_calibration {
+                let cal = irlume_liveness::ClosureCalibration {
+                    ear_open,
+                    ear_closed,
+                };
+                if cal.is_usable()
+                    && irlume_liveness::detect_deliberate_closure(&ears, &cal)
+                        == irlume_liveness::BlinkResult::Blinked
+                {
+                    return Ok(outcome);
+                }
+            }
+        }
+        Ok(deny(match mode {
+            ConsentGesture::Nod => "nod your head to approve",
+            ConsentGesture::Closure => {
+                "close your eyes for about a second, then open, to approve"
+            }
+            ConsentGesture::Either => {
+                "nod your head to approve (or, if you've calibrated it, close your eyes ~1s then open)"
+            }
+        }))
     }
 
     /// Authenticate `user`: liveness gate FIRST (a spoof never reaches matching),

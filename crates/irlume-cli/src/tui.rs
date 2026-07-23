@@ -1028,17 +1028,32 @@ impl App {
                     }
                 }
             }
-            // Competing prompts need a reader that actually answers: a vendor
-            // pam_fprintd line with NO fingerprint hardware fails instantly and
-            // PAM moves on; warning about it would alarm every reader-less box.
+            // Coexistence is the intended state since 0.5.0: `both` (explicit)
+            // and `auto` (hardware-led) both mean "unlock with face OR
+            // fingerprint", so a reader wired alongside face is CORRECT, not a
+            // misconfiguration. Report it as healthy.
+            "both" | "auto" if fprintd_wired && enrolled && self.fp.available => {
+                v.push(mk(
+                    "Method wiring",
+                    Sev::Ok,
+                    "face + fingerprint both wired; unlock with either".into(),
+                    Fix::None,
+                ));
+            }
+            // An EXPLICIT face-only method with a reader still wired: not harmful
+            // (the fingerprint just works too), but it contradicts the chosen
+            // method, so point at the two ways to resolve it. A vendor
+            // pam_fprintd line with NO reader fails instantly and PAM moves on,
+            // so the `self.fp.available` guard keeps this off reader-less boxes.
             _ if fprintd_wired && enrolled && self.fp.available => {
                 v.push(mk(
                     "Method wiring",
                     Sev::Warn,
-                    "fingerprint (pam_fprintd) AND face are both wired; prompts compete/intercept"
+                    "method is face-only but a fingerprint reader is also wired; both will unlock"
                         .into(),
                     Fix::Manual(
-                        "pick one: `sudo irlume fingerprint enable` or `... disable`".into(),
+                        "`sudo irlume fingerprint enable` (face OR fingerprint) or `... disable`"
+                            .into(),
                     ),
                 ));
             }
@@ -2775,7 +2790,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::styled("Active method ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(self.fp.method.clone()),
+                Span::raw(method_label(&self.fp.method)),
             ]),
             Line::raw(""),
         ];
@@ -2785,11 +2800,11 @@ impl App {
                 Style::new().dim(),
             )));
             lines.push(Line::from(Span::styled(
-                "  [a] enroll a finger (interactive).  To make it the unlock method:",
+                "  [a] enroll a finger (interactive).  To unlock with face OR fingerprint:",
                 Style::new().dim(),
             )));
             lines.push(Line::from(Span::styled(
-                "  sudo irlume fingerprint enable",
+                "  sudo irlume fingerprint enable      (add --fingerprint-only to replace face)",
                 Style::new().fg(ACCENT),
             )));
         } else {
@@ -3329,6 +3344,21 @@ impl App {
             ),
         ]));
         lines.push(Line::from(vec![
+            Span::styled("  app prompts ", Style::new()),
+            Span::styled(
+                "opt-in: sudo irlume login enable --with-polkit --apply  (face approves Bitwarden/pkexec)",
+                Style::new().dim(),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "    an app prompt needs a deliberate NOD to approve (no calibration); or an eye",
+            Style::new().dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "    closure after `sudo irlume calibrate-closure`.  See docs/APP-INTEGRATION.md",
+            Style::new().dim(),
+        )));
+        lines.push(Line::from(vec![
             Span::styled("  disable ", Style::new()),
             Span::styled("sudo irlume login disable --apply", Style::new().dim()),
         ]));
@@ -3355,7 +3385,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  auth method       "),
-                Span::styled(self.fp.method.clone(), Style::new().fg(ACCENT)),
+                Span::styled(method_label(&self.fp.method), Style::new().fg(ACCENT)),
             ]),
             Line::from(vec![
                 Span::raw("  enrollment        "),
@@ -3627,6 +3657,18 @@ fn onoff(on: bool) -> Span<'static> {
         Span::styled("● yes", Style::new().fg(OK).add_modifier(Modifier::BOLD))
     } else {
         Span::styled("○ no", Style::new().dim())
+    }
+}
+
+/// Human label for the stored auth method string (`Method::as_str()`): the raw
+/// `"both"` reads as opaque, so spell out the coexistence.
+fn method_label(method: &str) -> String {
+    match method {
+        "both" => "face + fingerprint (either)".to_string(),
+        "auto" => "auto (face; fingerprint if present)".to_string(),
+        "fingerprint" => "fingerprint".to_string(),
+        "face" => "face".to_string(),
+        other => other.to_string(),
     }
 }
 

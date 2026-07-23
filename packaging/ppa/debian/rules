@@ -49,6 +49,13 @@ override_dh_auto_install:
 		debian/irlume/usr/lib/systemd/system/irlumed.service
 	install -D -m0644 debian/10-ort.conf \
 		debian/irlume/usr/lib/systemd/system/irlumed.service.d/10-ort.conf
+	# Self-heal watcher: re-applies irlume's greeter PAM wiring if pam-auth-update
+	# strips it. dh_installsystemd (via #DEBHELPER# in postinst) enables the .path
+	# the same way it enables irlumed.service. Parity with the other packagers.
+	install -D -m0644 packaging/systemd/irlume-reconcile.path \
+		debian/irlume/usr/lib/systemd/system/irlume-reconcile.path
+	install -D -m0644 packaging/systemd/irlume-reconcile.service \
+		debian/irlume/usr/lib/systemd/system/irlume-reconcile.service
 	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
 		debian/irlume/etc/apparmor.d/usr.bin.irlumed
 

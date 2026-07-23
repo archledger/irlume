@@ -31,6 +31,16 @@ pub mod template_key;
 pub mod tpm;
 pub mod tpm_pcrlock;
 
+/// A per-process-unique `/tmp` path for a test that writes to a state dir. A
+/// fixed path collides across users on a shared host: a CI run as one user
+/// leaves the dir owned by them, so a later run as a different user gets EACCES
+/// on remove/create (observed on a self-hosted runner box). The process id
+/// makes each run's dir distinct; ENV_LOCK still serializes within a process.
+#[cfg(test)]
+pub(crate) fn test_tmp_dir(name: &str) -> String {
+    format!("/tmp/irlume-test-{name}-{}", std::process::id())
+}
+
 /// RGB (visible-light) match threshold. Measured FAR: real faces (LFW, 13,233
 /// images, 87M impostor pairs, same pipeline as production) give FAR 2.3e-3 @
 /// 0.50 and 2.0e-3 @ 0.55; synthetic (SFHQ, 112M pairs) 9.8e-5 @ 0.50 (cleaner

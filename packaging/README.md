@@ -12,7 +12,7 @@ own recipe. Everything the daemon does at *runtime* stays capability-detected.
 | `irlumed`, `irlume` | `/usr/bin/` |
 | `pam_irlume.so` | Fedora `/usr/lib64/security/` · Debian `/usr/lib/x86_64-linux-gnu/security/` · Arch `/usr/lib/security/` |
 | models (LFS, bundled) | `/usr/share/irlume/models/*.onnx` |
-| systemd unit | `/usr/lib/systemd/system/irlumed.service` (from `systemd/irlumed.service`) |
+| systemd units | `/usr/lib/systemd/system/irlumed.service` + `irlume-reconcile.path`/`.service` (self-heal watcher; all families incl. PPA enable the `.path`) |
 | LSM policy | Fedora SELinux module · Debian `apparmor/usr.bin.irlumed` (path-adjusted) · Arch none |
 
 Models are bundled (Git LFS); there is no fetch step. Packages that build from a git

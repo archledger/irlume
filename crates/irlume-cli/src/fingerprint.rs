@@ -30,7 +30,7 @@ pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
         Some("disable") => disable(),
         _ => {
             eprintln!(
-                "usage: irlume fingerprint [--user U] <status|add|verify|reset|enable|disable>"
+                "usage: irlume fingerprint [--user U] <status|add|verify|reset|enable|disable> [--fingerprint-only]\n  (enable adds fingerprint ALONGSIDE face = unlock with either; --fingerprint-only replaces face)"
             );
             ExitCode::from(2)
         }

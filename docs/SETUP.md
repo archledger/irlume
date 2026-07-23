@@ -145,10 +145,12 @@ every login, which is half the point.
 irlume keyring arm
 ```
 
-It prompts for your **login password** (typed twice, to catch a typo), which it
-seals in the TPM; the password is never stored in plaintext. Re-run it after you change your
-login password. On a fingerprint machine a fingerprint login unseals the wallet
-the same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
+It prompts for your **login password** (typed twice, to catch a typo) and
+verifies it is actually your login password before sealing it in the TPM, so a
+mistyped password can't be sealed and leave the wallet failing to unlock; the
+password is never stored in plaintext. Re-run it after you change your login
+password. On a fingerprint machine a fingerprint login unseals the wallet the
+same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
 ### 5. Recovery passphrase: recommended
 
@@ -190,9 +192,11 @@ sudo irlume login enable --with-polkit --apply
 ```
 
 The daemon treats polkit as verify-only (it never releases the TPM-sealed
-credential to it) and requires a deliberate eye-closure gesture (close your
-eyes ~1s, then open) before approving, because the prompt starts scanning
-without any action from you. Calibrate it once with `sudo irlume calibrate-closure`. Full walkthrough,
+credential to it) and requires a deliberate consent gesture before approving,
+because the prompt starts scanning without any action from you. The default
+gesture is a **head nod** (no calibration; works at any angle or lighting). If
+you prefer to approve by closing your eyes for about a second, run `sudo irlume
+calibrate-closure` once and either gesture is accepted. Full walkthrough,
 Bitwarden setup, and the security stance: [APP-INTEGRATION.md](APP-INTEGRATION.md).
 
 ## Fingerprint companion (optional)
@@ -202,7 +206,8 @@ On a laptop with a fingerprint reader, add it as a second factor:
 ```sh
 irlume fingerprint status
 irlume fingerprint add           # enroll a finger via fprintd
-sudo irlume fingerprint enable   # make fingerprint the method (face stands down)
+sudo irlume fingerprint enable   # unlock with face OR fingerprint (keeps face on)
+# add --fingerprint-only to replace face with fingerprint instead
 ```
 
 ## IR emitter (rarely needed)
@@ -253,9 +258,9 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in model | TUI Settings; `sudo irlume models enable/disable` |
+| `/etc/irlume/settings.conf` | `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in model; `consent_gesture=nod\|closure` restricts the polkit consent gesture (unset = either) | TUI Settings; `sudo irlume models enable/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
-| `/etc/irlume/method` | one line: the active auth method | `irlume fingerprint enable/disable` |
+| `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter (optional second line: a brightness-boost control) | `irlume ir-setup` / enrollment auto-setup |
 
 Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env

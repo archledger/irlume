@@ -14,8 +14,9 @@
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
-//!   irlume fingerprint <status|add|enable|disable> fprintd companion factor
-//!   irlume login <status|enable|disable>         wire face auth into PAM (dry-run)
+//!   irlume calibrate-closure                     teach the eye-closure consent gesture
+//!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
+//!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 //!   irlume tui                                   interactive setup/management UI
 
@@ -2607,8 +2608,64 @@ fn doctor() -> std::process::ExitCode {
              sudo irlume login enable --apply"
         );
     }
+    // authselect / pam-auth-update awareness: on hosts where a distro tool owns
+    // the PAM stacks, confirm the self-heal watcher is in place so the user
+    // knows a future `authselect apply` / `pam-auth-update` won't silently kill
+    // face login (the reconcile.path re-applies it). Only meaningful once wired.
+    if crate::pamwire::login_wired() {
+        report_pam_regeneration_guard();
+    }
 
     std::process::ExitCode::SUCCESS
+}
+
+/// Whether a PAM-regenerating distro tool manages this host's stacks, as a
+/// human label: authselect (Fedora/RHEL) or pam-auth-update (Debian/Ubuntu).
+/// `None` on a host where PAM files are hand-managed, so the guard advisory
+/// stays quiet (nothing periodically rewrites the stack there).
+fn pam_regenerator() -> Option<&'static str> {
+    // authselect only "manages" a host when a profile is selected; `current`
+    // exits non-zero on a host that opted out (e.g. custom /etc/pam.d).
+    let authselect_active = std::process::Command::new("authselect")
+        .arg("current")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if authselect_active {
+        return Some("authselect");
+    }
+    if std::path::Path::new("/usr/sbin/pam-auth-update").exists() {
+        return Some("pam-auth-update");
+    }
+    None
+}
+
+/// Confirm the reconcile.path self-heal is armed on hosts whose PAM stacks a
+/// distro tool regenerates. Prints a green line when protected, or a warning
+/// (with the fix) when the tool is present but the watcher is not active.
+fn report_pam_regeneration_guard() {
+    let Some(tool) = pam_regenerator() else {
+        return;
+    };
+    let watcher_active = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "irlume-reconcile.path"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if watcher_active {
+        println!(
+            "[doctor] PAM regeneration guard: OK ✓ ({tool} manages this host; \
+             irlume-reconcile.path will re-apply face-auth wiring if it gets stripped)"
+        );
+    } else {
+        println!(
+            "[doctor] ⚠ {tool} manages this host's PAM stacks, but the irlume-reconcile.path\n     \
+             self-heal watcher is not active — a future regeneration could silently drop\n     \
+             face login. Enable it: sudo systemctl enable --now irlume-reconcile.path"
+        );
+    }
 }
 
 /// Full live pipeline on one camera frame: capture RGB → YuNet detect → align

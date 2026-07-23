@@ -77,6 +77,14 @@ fn is_remote_session(pamh: &Pam) -> bool {
             return true;
         }
     }
+    // KNOWN LIMITATION: a non-SSH remote desktop (xrdp / VNC / xpra) that sets
+    // neither PAM_RHOST nor the SSH_* markers is not detected here, so the local
+    // camera could fire for it and whoever is physically at the machine could
+    // grant the remote session. Most display managers set PAM_RHOST for a remote
+    // login; auto-detecting the rest reliably is not possible without risking a
+    // false positive that blocks a legitimate local login (there is no portable
+    // "is this session remote" signal). Documented in docs/THREAT_MODEL.md; the
+    // mitigation for a remote-desktop deployment is to not wire face auth there.
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 

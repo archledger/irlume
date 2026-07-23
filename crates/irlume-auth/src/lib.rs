@@ -1163,27 +1163,6 @@ impl Engine {
         ))
     }
 
-    /// Capture ONE IR sequence and record BOTH head pose and eye EAR per frame,
-    /// so the consent gate can accept whichever gesture the user performs.
-    #[allow(clippy::type_complexity)]
-    pub fn capture_consent_samples(
-        &mut self,
-        samples: usize,
-    ) -> irlume_common::Result<(
-        Vec<irlume_liveness::PoseSample>,
-        Vec<irlume_liveness::EarSample>,
-    )> {
-        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
-        let mut poses = Vec::with_capacity(frames.len());
-        let mut ears = Vec::with_capacity(frames.len());
-        for (i, f) in frames.iter().enumerate() {
-            let (pose, ear) = self.frame_to_consent_samples(f, i)?;
-            poses.push(pose);
-            ears.push(ear);
-        }
-        Ok((poses, ears))
-    }
-
     /// Rolling consent watch: drive a held-open IR stream, process each frame,
     /// and return as SOON as an accepted gesture is seen (`nod` or, when
     /// `check_closure` supplies a usable calibration, an eye closure), instead of

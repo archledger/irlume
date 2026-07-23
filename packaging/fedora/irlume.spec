@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -163,6 +163,13 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Thu Jul 23 2026 archledger <archledger236@gmail.com> - 0.6.0-1
+- Face-approve app prompts via polkit (Bitwarden biometric unlock, pkexec) with
+  a deliberate consent gesture (head nod, or eye closure after calibrate-closure);
+  fingerprint coexistence (face OR fingerprint); distro-update PAM self-heal
+  (login reconcile + irlume-reconcile.path); doctor login-keyring probe.
+- Security: pam_irlume ignores IRLUME_SOCKET in setuid contexts (local root fix).
+
 * Tue Jul 21 2026 archledger <archledger236@gmail.com> - 0.5.0-1
 - Field-hardening release: Tier-1 signed-PCR sealing fix with automatic
   tier upgrade, fingerprint robustness batch, IR format negotiation

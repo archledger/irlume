@@ -857,6 +857,22 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     "face auth disabled: the configured method is fingerprint".into(),
                 );
             }
+            // ALWAYS-ON: a polkit prompt never releases the sealed credential,
+            // independent of the tier and the opt-in biopolicy below. The
+            // polkit agent runs its PAM conversation with no user gesture, so a
+            // `unseal`-arg line (mis)wired into polkit-1 must not be able to
+            // pull the login password out of the TPM; polkit gets verify-only
+            // (Authenticate).
+            {
+                use irlume_core::biopolicy::{classify, OperationClass};
+                let svc = service.as_deref().unwrap_or("");
+                if classify(svc, false) == OperationClass::AppConsent {
+                    eprintln!("irlumed: UnsealPassword refused for polkit service '{svc}' (verify-only class)");
+                    return Response::Error(format!(
+                        "'{svc}' is verify-only: a polkit prompt never releases the credential"
+                    ));
+                }
+            }
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
@@ -3053,6 +3069,28 @@ mod tests {
                 "RGB-only convenience: face cannot release the login credential"
             ),
             other => panic!("convenience tier must refuse unseal, got {other:?}"),
+        }
+        // A polkit service NEVER releases the credential, on any tier, with or
+        // without the opt-in biopolicy: the polkit agent starts its PAM
+        // conversation with no user gesture, so this fires before every other
+        // consideration except root and method.
+        for svc in ["polkit-1", "polkit"] {
+            match dispatch(
+                Request::UnsealPassword {
+                    user: "carol".into(),
+                    service: Some(svc.into()),
+                },
+                &peer(0),
+                &mut e,
+            ) {
+                Response::Error(msg) => assert_eq!(
+                    msg,
+                    format!(
+                        "'{svc}' is verify-only: a polkit prompt never releases the credential"
+                    )
+                ),
+                other => panic!("polkit unseal must be refused, got {other:?}"),
+            }
         }
     }
 

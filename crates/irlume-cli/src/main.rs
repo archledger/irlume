@@ -2360,6 +2360,30 @@ fn doctor() -> std::process::ExitCode {
         _ => println!("[doctor] templates ({user}): unknown (daemon not reachable; run `irlume recovery status`)"),
     }
 
+    // --- polkit app prompts ------------------------------------------------
+    // Apps like Bitwarden implement "biometric unlock" on Linux as a polkit
+    // prompt; wiring pam_irlume into polkit-1 is what lets a face satisfy it.
+    // Bitwarden's polkit action file doubles as the tell that the user expects
+    // biometric unlock to work (its flatpak/snap can't install it themselves).
+    let bitwarden_action =
+        std::path::Path::new("/usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy").exists();
+    match crate::pamwire::polkit_wired() {
+        Some(true) => println!(
+            "[doctor] polkit app prompts: wired ✓ (face + blink can approve Bitwarden unlock, \
+             pkexec, …)"
+        ),
+        Some(false) if bitwarden_action => println!(
+            "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
+             Its biometric unlock will fall back to the password prompt. Enable with:\n     \
+             sudo irlume login enable --with-polkit --apply"
+        ),
+        Some(false) => println!(
+            "[doctor] polkit app prompts: not wired (opt-in: sudo irlume login enable \
+             --with-polkit --apply)"
+        ),
+        None => {}
+    }
+
     // --- wiring drift ------------------------------------------------------
     // If the user is enrolled but no greeter is wired, a distro tool most
     // likely regenerated the PAM stacks (authselect apply on Fedora,

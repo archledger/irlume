@@ -52,7 +52,7 @@ Conventions that apply everywhere:
 
 | Command | Sudo | What it does |
 |---|---|---|
-| `irlume login <status\|enable\|disable> [--with-sudo] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`; without `--apply` it previews |
+| `irlume login <status\|enable\|disable> [--with-sudo] [--with-polkit] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`, `--with-polkit` adds app prompts (Bitwarden unlock, pkexec — see docs/APP-INTEGRATION.md); without `--apply` it previews |
 | `irlume logs [-f] [--since T]` | sometimes | the face-auth journal in one view (daemon, PAM, keyring); `-f` follows live, `--since "10 min ago"` widens the window |
 | `irlume logs debug <on\|off>` | yes | per-stage pipeline tracing in the daemon (numbers only, never frames) |
 | `irlume fingerprint <status\|add\|enable\|disable>` | for wiring | fprintd companion factor |

@@ -3,7 +3,8 @@
 
 //! `irlume login <status|enable|disable>`: wire face auth into the login
 //! greeters (GDM/SDDM/LightDM/plasmalogin), the KDE lock screen, and (opt-in)
-//! sudo. The Rust replacement for scripts/deploy-keyring-unlock.sh. Ported from
+//! sudo and polkit. The Rust replacement for scripts/deploy-keyring-unlock.sh.
+//! Ported from
 //! linhello's pamwire framework, adapted to irlume's keyring-unlock greeter
 //! BLOCK (unseal + a pam_permit landing for the success=1 jump + a reseal
 //! self-heal) and the `wait` lock stanza.
@@ -60,6 +61,12 @@ const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so
 const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
 const SUDO_STANZA: &str = "auth       sufficient                   pam_irlume.so";
+/// polkit prompts (Bitwarden vault unlock, pkexec, systemd unit control) get the
+/// same plain verify stanza as sudo: no `unseal` (the daemon refuses credential
+/// release for the polkit class anyway) and no mode arg (the polkit agent runs
+/// the conversation as soon as its dialog opens, which IS the face-first
+/// trigger; the daemon adds the forced blink gate on top).
+const POLKIT_STANZA: &str = SUDO_STANZA;
 
 /// A PAM service to wire. `vendor=Some` → materialize an /etc override from the
 /// vendor copy; `vendor=None` → back up and edit the real /etc file.
@@ -116,18 +123,30 @@ const FP_GREETERS: &[Svc] = &[Svc {
     vendor: None,
 }];
 const SUDO: &str = "/etc/pam.d/sudo";
+/// polkit's agent helper always authenticates through the `polkit-1` PAM
+/// service. Debian/Arch ship a real /etc file (edit-in-place with backup);
+/// Fedora ships only the vendor copy (materialize an /etc override from it,
+/// like plasmalogin). Opt-in via `--with-polkit`; this is what lets a face
+/// match satisfy app prompts such as Bitwarden's biometric unlock.
+const POLKIT: Svc = Svc {
+    etc: "/etc/pam.d/polkit-1",
+    vendor: Some("/usr/lib/pam.d/polkit-1"),
+};
 
 // ---- CLI entry ---------------------------------------------------------------
 
 pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
+    let with_polkit = args.iter().any(|a| a == "--with-polkit");
     match action {
         None | Some("status") => status(),
-        Some("enable") => act(true, apply, with_sudo),
-        Some("disable") => act(false, apply, with_sudo),
+        Some("enable") => act(true, apply, with_sudo, with_polkit),
+        Some("disable") => act(false, apply, with_sudo, with_polkit),
         _ => {
-            eprintln!("usage: irlume login <status|enable|disable> [--with-sudo] [--apply]");
+            eprintln!(
+                "usage: irlume login <status|enable|disable> [--with-sudo] [--with-polkit] [--apply]"
+            );
             eprintln!("  (without --apply, prints what it WOULD change: a dry run)");
             ExitCode::from(2)
         }
@@ -154,6 +173,10 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
         sudo.exists(),
         sudo.exists() && file_has_module(sudo),
     ));
+    match service_present(&POLKIT) {
+        Some(p) => out.push(("polkit".into(), true, file_has_module(&p))),
+        None => out.push(("polkit".into(), false, false)),
+    }
     out
 }
 
@@ -173,6 +196,12 @@ pub(crate) fn login_wired() -> bool {
         }
     }
     false
+}
+
+/// polkit-1 wiring state for doctor: `None` when the service file is absent
+/// (no polkit on this host), else whether it carries the irlume line.
+pub(crate) fn polkit_wired() -> Option<bool> {
+    service_present(&POLKIT).map(|p| file_has_module(&p))
 }
 
 /// Short label from an /etc/pam.d path (e.g. "/etc/pam.d/gdm-password" → "gdm-password").
@@ -376,6 +405,18 @@ fn status() -> ExitCode {
             }
         );
     }
+    if let Some(p) = service_present(&POLKIT) {
+        let wired = file_has_module(&p);
+        println!(
+            "  {:<34} {}",
+            p.display(),
+            if wired {
+                "● wired (polkit app prompts)"
+            } else {
+                "○ not wired (polkit app prompts)"
+            }
+        );
+    }
     if any_ondemand {
         println!("  on-demand: {ONDEMAND_HINT}");
     }
@@ -389,13 +430,14 @@ fn status() -> ExitCode {
     );
     if !any {
         println!(
-            "  → enable with:  sudo irlume login enable --apply   (add --with-sudo for face-sudo)"
+            "  → enable with:  sudo irlume login enable --apply   (add --with-sudo for face-sudo, \
+             --with-polkit for app prompts like Bitwarden)"
         );
     }
     ExitCode::SUCCESS
 }
 
-fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
+fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
     if apply && effective_uid() != 0 {
         eprintln!(
             "[login] applying changes needs root; run: sudo irlume login {} --apply",
@@ -522,6 +564,23 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
             }
         }
     }
+    if polkit_in_scope(enable, with_polkit) {
+        match wire_service(&POLKIT, enable, apply, &wire_polkit) {
+            Ok(msg) => {
+                println!("  {msg}");
+                if enable && apply {
+                    println!(
+                        "    polkit prompts (Bitwarden unlock, pkexec) now accept your face; \
+                         a natural blink is required before the prompt is approved."
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("  ✗ {e}");
+                errs += 1;
+            }
+        }
+    }
     // SELinux (Fedora): the confined GDM/greeter needs the policy to reach the socket.
     if matches!(distro_family(), DistroFamily::Fedora) {
         match selinux(enable, apply) {
@@ -551,6 +610,12 @@ fn act(enable: bool, apply: bool, with_sudo: bool) -> ExitCode {
 /// inline in `act`) so the promise stays unit-testable.
 fn sudo_in_scope(enable: bool, with_sudo: bool) -> bool {
     with_sudo || !enable
+}
+
+/// Same promise for the polkit stack: opt-in on enable (`--with-polkit`),
+/// always unwired on disable.
+fn polkit_in_scope(enable: bool, with_polkit: bool) -> bool {
+    with_polkit || !enable
 }
 
 /// Wire (or unwire) one service, choosing override-materialize vs edit-in-place.
@@ -900,6 +965,33 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
 }
 fn wire_sudo(content: &str) -> (String, bool) {
     wire_single(content, SUDO_STANZA)
+}
+/// Wire the polkit-1 stack: the verify stanza goes ABOVE the first auth-phase
+/// line, whether that is Fedora's `auth include system-auth` or Debian's
+/// `@include common-auth` (which `wire_single`'s auth-token anchor misses; an
+/// appended-at-end line would run after the password modules). No anchor →
+/// no wiring: appending to a file with no auth phase would leave pam_irlume as
+/// the only auth module, and its IGNORE on a failed face would then fail the
+/// whole prompt instead of falling back to the password.
+fn wire_polkit(content: &str) -> (String, bool) {
+    if content_has_module(content) {
+        return (content.to_string(), false);
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let anchor = lines
+        .iter()
+        .position(|l| is_include_auth_layout(l) || is_auth_directive(l));
+    let Some(anchor) = anchor else {
+        return (content.to_string(), false);
+    };
+    let mut out = Vec::with_capacity(lines.len() + 1);
+    for (i, l) in lines.iter().enumerate() {
+        if i == anchor {
+            out.push(POLKIT_STANZA.to_string());
+        }
+        out.push((*l).to_string());
+    }
+    (format!("{}\n", out.join("\n")), true)
 }
 
 /// Remove every irlume line AND the pam_permit landing we added (used only when
@@ -1317,6 +1409,70 @@ mod tests {
         assert!(!sudo_in_scope(true, false)); // enable stays opt-in
     }
 
+    #[test]
+    fn disable_always_unwires_polkit_even_without_the_flag() {
+        assert!(polkit_in_scope(false, false));
+        assert!(polkit_in_scope(false, true));
+        assert!(polkit_in_scope(true, true));
+        assert!(!polkit_in_scope(true, false)); // enable stays opt-in
+    }
+
+    #[test]
+    fn wire_polkit_inserts_the_verify_stanza_before_the_first_auth_line() {
+        // Fedora vendor layout (include system-auth) and Debian's @include
+        // layout both anchor on the first auth directive; the stanza must land
+        // above it so the face runs before the password modules, and the line
+        // must be plain verify: no `unseal` (the daemon refuses credential
+        // release for polkit anyway) and no mode arg.
+        for stock in [
+            "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n",
+            "#%PAM-1.0\n@include common-auth\n@include common-account\n",
+        ] {
+            let (wired, changed) = wire_polkit(stock);
+            assert!(changed, "{stock:?}");
+            let face = wired
+                .lines()
+                .position(|l| l.contains(MODULE))
+                .expect("stanza present");
+            let first_auth = wired
+                .lines()
+                .position(|l| {
+                    !l.contains(MODULE) && (l.starts_with("auth") || l.starts_with("@include"))
+                })
+                .unwrap();
+            assert!(face < first_auth, "{wired}");
+            let line = wired.lines().nth(face).unwrap();
+            assert!(
+                !line.contains("unseal") && !line.contains("ondemand"),
+                "{line}"
+            );
+            // Idempotent and fully reversible.
+            assert!(!wire_polkit(&wired).1);
+            let (back, undone) = unwire_lines(&wired);
+            assert!(undone && !content_has_module(&back));
+        }
+    }
+
+    #[test]
+    fn wire_polkit_skips_a_file_with_no_auth_phase() {
+        // With no auth anchor the stanza would become the ONLY auth module, and
+        // a failed face (IGNORE) would then fail the prompt outright instead of
+        // cascading to the password. Must skip, not append.
+        let stock = "#%PAM-1.0\nsession    include      system-auth\n";
+        let (out, changed) = wire_polkit(stock);
+        assert!(!changed);
+        assert_eq!(out, stock);
+    }
+
+    #[test]
+    fn polkit_service_carries_the_fedora_vendor_path() {
+        // Fedora ships polkit-1 only in /usr/lib/pam.d; without the vendor
+        // path, wire_service would skip it there instead of materializing the
+        // /etc override.
+        assert_eq!(POLKIT.etc, "/etc/pam.d/polkit-1");
+        assert_eq!(POLKIT.vendor, Some("/usr/lib/pam.d/polkit-1"));
+    }
+
     // Regression: 7ec33fa. Arch/Plasma ships the locker service only in
     // /usr/lib/pam.d, and LOCKSCREEN had vendor: None, so the lock screen was
     // skipped entirely on the Arch layout. The vendor path is what lets
@@ -1560,7 +1716,8 @@ mod tests {
     #[test]
     fn status_report_labels_and_login_wired_agree() {
         // The report's rows are the greeters, the fingerprint service, the lock
-        // screen, then sudo, in that order; labels come from the constant paths.
+        // screen, then sudo and polkit, in that order; labels come from the
+        // constant paths.
         let rows = status_report();
         let labels: Vec<&str> = rows.iter().map(|(l, _, _)| l.as_str()).collect();
         assert_eq!(
@@ -1575,6 +1732,7 @@ mod tests {
                 "gdm-fingerprint",
                 "kde",
                 "sudo",
+                "polkit",
             ]
         );
         // login_wired is exactly "any non-sudo row is wired" (sudo excluded).

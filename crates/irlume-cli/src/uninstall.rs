@@ -251,7 +251,8 @@ fn remove_repo_files(dir: &str) {
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI
 /// calls the identical sequence behind its own confirmation.
 pub fn perform_teardown(keep_data: bool) -> TeardownReport {
-    // 1. PAM FIRST. Un-wire every greeter, the lock screen, and sudo so no
+    // 1. PAM FIRST. Un-wire every greeter, the lock screen, sudo, and polkit
+    //    (disable puts the opt-in stacks in scope regardless of flags) so no
     //    stack references pam_irlume.so once the module is removed.
     let _ = pamwire::run(
         Some("disable"),

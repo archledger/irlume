@@ -1,4 +1,4 @@
-policy_module(irlume, 1.0.0)
+policy_module(irlume, 1.1.0)
 
 ########################################
 #
@@ -23,6 +23,7 @@ policy_module(irlume, 1.0.0)
 
 require {
 	type xdm_t;
+	type policykit_auth_t;
 	type unconfined_service_t;
 	type var_run_t;
 	class sock_file { create write unlink getattr setattr };
@@ -43,3 +44,13 @@ allow unconfined_service_t irlume_runtime_t:sock_file { create write unlink geta
 # The display manager / greeter may connect to irlumed to do face auth at login.
 allow xdm_t irlume_runtime_t:sock_file write;
 allow xdm_t unconfined_service_t:unix_stream_socket connectto;
+
+# polkit's PAM helper (polkit-agent-helper-1, domain policykit_auth_t) may
+# connect so a polkit prompt (Bitwarden unlock, pkexec) can be satisfied by
+# face verify. Same scoped grant as xdm_t: only irlume's socket, nothing else.
+# NOTE: when the helper is spawned setuid from an unconfined user session it
+# may stay unconfined (already allowed); this rule covers the confined domain
+# Fedora assigns it under the socket-activated polkit-agent-helper@.service
+# and any domtrans a future policy adds.
+allow policykit_auth_t irlume_runtime_t:sock_file write;
+allow policykit_auth_t unconfined_service_t:unix_stream_socket connectto;

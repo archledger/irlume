@@ -203,7 +203,7 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body = format!("with_sudo={}\nwith_polkit={}\n", with_sudo, with_polkit);
+    let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\n");
     let _ = std::fs::write(&path, body);
 }
 

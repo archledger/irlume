@@ -23,11 +23,61 @@ use std::time::Duration;
 
 use irlume_common::{PositionReport, ProfileSummary, Request, Response};
 
-const ACCENT: Color = Color::Rgb(0x6c, 0xb6, 0xff);
-const BLUE: Color = Color::Rgb(0x4a, 0x90, 0xd9);
-const OK: Color = Color::Rgb(0x73, 0xc9, 0x91);
-const ERR: Color = Color::Rgb(0xe8, 0x7a, 0x7a);
-const WARN: Color = Color::Rgb(0xe6, 0xc0, 0x7a);
+/// Semantic color slots, resolved once at startup down a capability ladder:
+/// NO_COLOR (no-color.org) gets none and the glyphs carry all state; plain
+/// terminals get ANSI names so the USER'S terminal theme is the palette
+/// (light themes stay readable); truecolor terminals get the soft irlume
+/// palette as polish. Every use is a semantic slot (accent/ok/warn/err),
+/// never decoration, so the ladder degrades without losing information.
+struct Theme {
+    accent: Color,
+    blue: Color,
+    ok: Color,
+    err: Color,
+    warn: Color,
+    /// Key-chip style for the footer ([w], [?]…): colored chip normally,
+    /// REVERSED under NO_COLOR (a black-on-Reset chip would be invisible).
+    chip: Style,
+}
+
+fn th() -> &'static Theme {
+    static T: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Theme {
+                accent: Color::Reset,
+                blue: Color::Reset,
+                ok: Color::Reset,
+                err: Color::Reset,
+                warn: Color::Reset,
+                chip: Style::new().add_modifier(Modifier::REVERSED),
+            };
+        }
+        let truecolor = std::env::var("COLORTERM")
+            .map(|v| v.contains("truecolor") || v.contains("24bit"))
+            .unwrap_or(false);
+        if truecolor {
+            let accent = Color::Rgb(0x6c, 0xb6, 0xff);
+            Theme {
+                accent,
+                blue: Color::Rgb(0x4a, 0x90, 0xd9),
+                ok: Color::Rgb(0x73, 0xc9, 0x91),
+                err: Color::Rgb(0xe8, 0x7a, 0x7a),
+                warn: Color::Rgb(0xe6, 0xc0, 0x7a),
+                chip: Style::new().fg(Color::Black).bg(accent),
+            }
+        } else {
+            Theme {
+                accent: Color::Cyan,
+                blue: Color::Blue,
+                ok: Color::Green,
+                err: Color::Red,
+                warn: Color::Yellow,
+                chip: Style::new().fg(Color::Black).bg(Color::Cyan),
+            }
+        }
+    })
+}
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SCREENS: [&str; 11] = [
     "Welcome",
@@ -363,6 +413,8 @@ struct App {
     /// True while mouse capture is released so the terminal's own selection
     /// works (the `[M]` toggle); wheel scroll is unavailable meanwhile.
     mouse_select: bool,
+    /// The [?] full-keymap overlay (tier two of the disclosure ladder).
+    show_help: bool,
     op: Option<Op>,
     enroll: Option<EnrollUi>,
     /// A pending merge confirmation (scan 1 matched an existing profile).
@@ -471,6 +523,7 @@ impl App {
             input: None,
             confirm: None,
             mouse_select: false,
+            show_help: false,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -1895,8 +1948,17 @@ impl App {
             }
             return;
         }
+        if self.show_help {
+            // Any of the closers dismisses; other keys are ignored so the
+            // overlay can't trigger actions the user can't see.
+            if matches!(code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
+                self.show_help = false;
+            }
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('?') => self.show_help = true,
             // Release/recapture the mouse: captured, the wheel scrolls the TUI
             // but the terminal cannot select text; released, highlight-to-copy
             // works. A toggle because both are legitimate wants.
@@ -2563,6 +2625,11 @@ impl App {
             );
             self.modal(f, "Already enrolled", &body);
         }
+        // Tier two of the key-disclosure ladder; drawn last so it sits above
+        // everything except nothing (help is always answerable).
+        if self.show_help {
+            self.modal(f, "Keys  ([?] or Esc to close)", &self.help_body());
+        }
     }
 
     /// A red, dismissible error banner centred on screen.
@@ -2580,11 +2647,11 @@ impl App {
         let blk = Block::bordered()
             .title(" ⚠ Problem ")
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ERR).add_modifier(Modifier::BOLD))
+            .border_style(Style::new().fg(th().err).add_modifier(Modifier::BOLD))
             .padding(ratatui::widgets::Padding::horizontal(1));
         let body = vec![
             Line::raw(""),
-            Line::from(Span::styled(msg.to_string(), Style::new().fg(ERR))),
+            Line::from(Span::styled(msg.to_string(), Style::new().fg(th().err))),
             Line::raw(""),
             Line::from(Span::styled("[any key] dismiss", Style::new().dim())),
         ];
@@ -2603,7 +2670,7 @@ impl App {
                 " irlume ",
                 Style::new()
                     .fg(Color::Black)
-                    .bg(ACCENT)
+                    .bg(th().accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
@@ -2620,7 +2687,7 @@ impl App {
             ),
             Span::styled(
                 SCREENS[self.screen],
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
             ),
         ]);
         let right =
@@ -2667,8 +2734,11 @@ impl App {
             }
         };
         let line = Line::from(vec![
-            Span::styled("  ℹ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(text, Style::new().fg(ACCENT)),
+            Span::styled(
+                "  ℹ ",
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::new().fg(th().accent)),
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -2677,8 +2747,10 @@ impl App {
         let blk = Block::bordered()
             .title(format!(" {} ", SCREENS[self.screen]))
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ACCENT))
-            .padding(ratatui::widgets::Padding::horizontal(1));
+            .border_style(Style::new().fg(th().accent))
+            // Breathing room (whitespace over chrome): content never touches
+            // the frame.
+            .padding(ratatui::widgets::Padding::new(2, 2, 1, 0));
         let inner = blk.inner(area);
         f.render_widget(blk, area);
         if self.enroll.is_some() {
@@ -2709,7 +2781,7 @@ impl App {
                 Span::styled(
                     if ok { "  ✓ " } else { "  ○ " },
                     if ok {
-                        Style::new().fg(OK)
+                        Style::new().fg(th().ok)
                     } else {
                         Style::new().dim()
                     },
@@ -2736,7 +2808,7 @@ impl App {
                 Span::raw("  Quality  "),
                 Span::styled(
                     quality_bar(q),
-                    Style::new().fg(if q >= 70 { OK } else { ACCENT }),
+                    Style::new().fg(if q >= 70 { th().ok } else { th().accent }),
                 ),
             ]),
             Line::raw(""),
@@ -2760,14 +2832,14 @@ impl App {
         if let Some(c) = e.count {
             lines.push(Line::from(Span::styled(
                 format!("  ● Hold still; capturing in {c}…",),
-                Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             )));
         } else {
             let g = r
                 .map(|x| x.guidance.clone())
                 .unwrap_or_else(|| "Starting camera…".into());
             lines.push(Line::from(vec![
-                Span::styled("  → ", Style::new().fg(ACCENT)),
+                Span::styled("  → ", Style::new().fg(th().accent)),
                 Span::styled(g, Style::new().add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -2794,7 +2866,7 @@ impl App {
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             format!("● {}", p.name),
-                            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(format!("   ({} scans)", p.scans.len()), Style::new().dim()),
                     ]))
@@ -2845,7 +2917,7 @@ impl App {
                     Style::new().dim(),
                 )),
                 Line::from(vec![
-                    Span::styled("  [enter]", Style::new().fg(ACCENT)),
+                    Span::styled("  [enter]", Style::new().fg(th().accent)),
                     Span::styled(" toggle", Style::new().dim()),
                 ]),
                 Line::raw(""),
@@ -2855,7 +2927,7 @@ impl App {
                     if bio {
                         Span::styled(
                             "● ENFORCING",
-                            Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                         )
                     } else {
                         Span::styled("○ off (default)", Style::new().dim())
@@ -2917,7 +2989,7 @@ impl App {
             for (path, role) in &self.nodes {
                 if matches!(role, irlume_camera::Role::Rgb) {
                     v.push(ListItem::new(Line::from(vec![
-                        Span::styled(" ● ", Style::new().fg(OK)),
+                        Span::styled(" ● ", Style::new().fg(th().ok)),
                         Span::styled(
                             format!("{:<16}", path.trim_start_matches("/dev/")),
                             Style::new().add_modifier(Modifier::BOLD),
@@ -2953,7 +3025,7 @@ impl App {
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
-                            Style::new().fg(if active { OK } else { Color::DarkGray }),
+                            Style::new().fg(if active { th().ok } else { Color::DarkGray }),
                         ),
                         Span::styled(
                             format!(
@@ -2970,10 +3042,10 @@ impl App {
                                 Style::new()
                             },
                         ),
-                        Span::styled(format!("{kind:<10}"), Style::new().fg(ACCENT)),
+                        Span::styled(format!("{kind:<10}"), Style::new().fg(th().accent)),
                         Span::styled(format!("[{id}]"), Style::new().dim()),
                         if priv_on {
-                            Span::styled("  ⚠ privacy ON", Style::new().fg(ERR))
+                            Span::styled("  ⚠ privacy ON", Style::new().fg(th().err))
                         } else {
                             Span::raw("")
                         },
@@ -3010,14 +3082,17 @@ impl App {
         };
         let mut lines = vec![Line::from(vec![
             Span::styled("  active   ", Style::new().dim()),
-            Span::styled(active, Style::new().fg(OK).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                active,
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            ),
         ])];
         if let Some(p) = pairs.get(self.cam_sel) {
             if p.rgb != argb || p.ir != air {
                 lines.push(Line::from(vec![
                     Span::styled("  selected ", Style::new().dim()),
                     Span::styled(format!("{} + {}", p.rgb, p.ir), Style::new()),
-                    Span::styled("   [enter] to switch", Style::new().fg(ACCENT)),
+                    Span::styled("   [enter] to switch", Style::new().fg(th().accent)),
                 ]));
             }
         }
@@ -3032,9 +3107,9 @@ impl App {
             Style::new().dim(),
         )));
         lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(ACCENT)),
+            Span::styled("  [s]", Style::new().fg(th().accent)),
             Span::styled(" auto-setup emitter   ", Style::new().dim()),
-            Span::styled("[p]", Style::new().fg(ACCENT)),
+            Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(" probe XU controls", Style::new().dim()),
         ]));
         let iblk = Block::bordered()
@@ -3048,8 +3123,8 @@ impl App {
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {
         let reader = match (&self.fp.device, self.fp.available) {
-            (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(OK)),
-            (None, true) => Span::styled("● present (unnamed)", Style::new().fg(OK)),
+            (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(th().ok)),
+            (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
             (None, false) => Span::styled("○ none detected", Style::new().dim()),
         };
         let enrolled = if self.fp.enrolled.is_empty() {
@@ -3061,7 +3136,7 @@ impl App {
                     self.fp.enrolled.len(),
                     self.fp.enrolled.join(", ")
                 ),
-                Style::new().fg(OK),
+                Style::new().fg(th().ok),
             )
         };
         let mut lines = vec![
@@ -3107,13 +3182,16 @@ impl App {
         let enc = if r.encrypted {
             Span::styled(
                 "● encrypted",
-                Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled("○ plaintext at rest", Style::new().dim())
         };
         let rec = if r.recovery_set {
-            Span::styled("● set", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "● set",
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled("○ not set", Style::new().dim())
         };
@@ -3147,12 +3225,12 @@ impl App {
         if !r.tpm_present {
             lines.push(Line::from(Span::styled(
                 "No TPM on this host: templates stay plaintext; recovery N/A.",
-                Style::new().fg(ERR),
+                Style::new().fg(th().err),
             )));
         } else if r.encrypted && !r.recovery_set {
             lines.push(Line::from(Span::styled(
                 "⚠ No backstop: set one now, or a broken seal means re-enrolling.",
-                Style::new().fg(ERR),
+                Style::new().fg(th().err),
             )));
         }
         lines.push(Line::raw(""));
@@ -3166,7 +3244,10 @@ impl App {
     fn draw_keyring(&self, f: &mut Frame, area: Rect) {
         let armed = self.keyring_armed.unwrap_or(false);
         let status = match self.keyring_armed {
-            Some(true) => Span::styled("● armed", Style::new().fg(OK).add_modifier(Modifier::BOLD)),
+            Some(true) => Span::styled(
+                "● armed",
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            ),
             Some(false) => Span::styled("○ not armed", Style::new().dim()),
             None => Span::styled("unknown (daemon unreachable)", Style::new().dim()),
         };
@@ -3180,7 +3261,7 @@ impl App {
                 Span::raw("  PCRs     "),
                 Span::styled(
                     "drifted since sealing; re-arm to rebind",
-                    Style::new().fg(WARN),
+                    Style::new().fg(th().warn),
                 ),
             ]));
         }
@@ -3195,9 +3276,9 @@ impl App {
             Line::from(vec![
                 Span::raw("  TPM      "),
                 if tpm {
-                    Span::styled("● present", Style::new().fg(OK))
+                    Span::styled("● present", Style::new().fg(th().ok))
                 } else {
-                    Span::styled("✗ none", Style::new().fg(ERR))
+                    Span::styled("✗ none", Style::new().fg(th().err))
                 },
             ]),
             Line::from(vec![
@@ -3244,7 +3325,7 @@ impl App {
             } else {
                 lines.push(Line::from(Span::styled(
                     "  ⚠ if a firmware/dbx update moves the bound PCRs, unseal fails →",
-                    Style::new().fg(WARN),
+                    Style::new().fg(th().warn),
                 )));
                 lines.push(Line::from(Span::styled(
                     "    use the Repair tab or `irlume reseal` to re-bind to current PCRs.",
@@ -3264,9 +3345,9 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  [a]", Style::new().fg(ACCENT)),
+            Span::styled("  [a]", Style::new().fg(th().accent)),
             Span::styled(" arm (enter your login password)   ", Style::new().dim()),
-            Span::styled("[f]", Style::new().fg(ACCENT)),
+            Span::styled("[f]", Style::new().fg(th().accent)),
             Span::styled(" forget", Style::new().dim()),
         ]));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
@@ -3278,7 +3359,7 @@ impl App {
         let lines = vec![
             Line::from(Span::styled(
                 "  irlume - local face authentication",
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "  IR + lume · clean-BOM · TPM-sealed · privacy by design",
@@ -3309,7 +3390,7 @@ impl App {
             Line::raw(""),
             Line::from(vec![
                 Span::styled("  Recommended  ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::styled(self.recommended(), Style::new().fg(OK)),
+                Span::styled(self.recommended(), Style::new().fg(th().ok)),
             ]),
             Line::from(Span::styled(
                 "  (you can change the method any time; [v] shows every tab)",
@@ -3318,20 +3399,20 @@ impl App {
             Line::raw(""),
             if self.visible.contains(&SC_IDENTIFY) {
                 Line::from(vec![
-                    Span::styled("  [e]", Style::new().fg(ACCENT)),
+                    Span::styled("  [e]", Style::new().fg(th().accent)),
                     Span::styled(" enroll now   ", Style::new().dim()),
-                    Span::styled("[i]", Style::new().fg(ACCENT)),
+                    Span::styled("[i]", Style::new().fg(th().accent)),
                     Span::styled(" identify   ", Style::new().dim()),
-                    Span::styled("Tab", Style::new().fg(ACCENT)),
+                    Span::styled("Tab", Style::new().fg(th().accent)),
                     Span::styled(" walk the steps", Style::new().dim()),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled("  [e]", Style::new().fg(ACCENT)),
+                    Span::styled("  [e]", Style::new().fg(th().accent)),
                     Span::styled(" enroll now   ", Style::new().dim()),
-                    Span::styled("Tab", Style::new().fg(ACCENT)),
+                    Span::styled("Tab", Style::new().fg(th().accent)),
                     Span::styled(" walk the steps   ", Style::new().dim()),
-                    Span::styled("[v]", Style::new().fg(ACCENT)),
+                    Span::styled("[v]", Style::new().fg(th().accent)),
                     Span::styled(" all tabs", Style::new().dim()),
                 ])
             },
@@ -3360,9 +3441,9 @@ impl App {
             .iter()
             .map(|c| {
                 let (icon, color) = match c.sev {
-                    Sev::Ok => ("✓", OK),
-                    Sev::Warn => ("⚠", WARN),
-                    Sev::Fail => ("✗", ERR),
+                    Sev::Ok => ("✓", th().ok),
+                    Sev::Warn => ("⚠", th().warn),
+                    Sev::Fail => ("✗", th().err),
                 };
                 let tag = match &c.fix {
                     Fix::None => "",
@@ -3379,7 +3460,7 @@ impl App {
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(c.detail.clone(), Style::new().dim()),
-                    Span::styled(tag.to_string(), Style::new().fg(ACCENT)),
+                    Span::styled(tag.to_string(), Style::new().fg(th().accent)),
                 ]))
             })
             .collect();
@@ -3398,18 +3479,18 @@ impl App {
 
         // ---- info / platform / live test --------------------------------
         let sb = if secureboot::is_secure_boot_enabled() {
-            ("enabled", OK)
+            ("enabled", th().ok)
         } else if secureboot::is_setup_mode() {
-            ("setup mode", WARN)
+            ("setup mode", th().warn)
         } else if secureboot::secure_boot_present() {
-            ("disabled", WARN)
+            ("disabled", th().warn)
         } else {
-            ("n/a", WARN)
+            ("n/a", th().warn)
         };
         let mut lines = vec![Line::from(vec![
-            Span::styled(format!("  {ok} ok"), Style::new().fg(OK)),
-            Span::styled(format!("   {warn} warn"), Style::new().fg(WARN)),
-            Span::styled(format!("   {fail} fail"), Style::new().fg(ERR)),
+            Span::styled(format!("  {ok} ok"), Style::new().fg(th().ok)),
+            Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
+            Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
             Span::styled(
                 "      [f] fix selected   [r] re-check   [l] IR self-test   [g] logs",
                 Style::new().dim(),
@@ -3427,7 +3508,7 @@ impl App {
                 Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
             };
             lines.push(Line::from(vec![
-                Span::styled("  → ", Style::new().fg(ACCENT)),
+                Span::styled("  → ", Style::new().fg(th().accent)),
                 Span::styled(hint, Style::new()),
             ]));
         }
@@ -3465,7 +3546,10 @@ impl App {
         match &self.selftest_result {
             Some((ok, d)) => lines.push(Line::from(vec![
                 Span::styled("  IR test   ", Style::new().dim()),
-                Span::styled(d.clone(), Style::new().fg(if *ok { OK } else { ERR })),
+                Span::styled(
+                    d.clone(),
+                    Style::new().fg(if *ok { th().ok } else { th().err }),
+                ),
             ])),
             None => lines.push(Line::from(Span::styled(
                 "  IR test    press [l] to run the IR PAD self-test (look at the camera)",
@@ -3505,7 +3589,7 @@ impl App {
                     Span::styled("  │ ", Style::new().dim()),
                     Span::styled(
                         who.clone(),
-                        Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                        Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 lines.push(Line::from(Span::styled(
@@ -3514,8 +3598,8 @@ impl App {
                 )));
             }
             Some((false, why)) => lines.push(Line::from(vec![
-                Span::styled("  ✗ ", Style::new().fg(ERR)),
-                Span::styled(why.clone(), Style::new().fg(ERR)),
+                Span::styled("  ✗ ", Style::new().fg(th().err)),
+                Span::styled(why.clone(), Style::new().fg(th().err)),
             ])),
             None => lines.push(Line::from(Span::styled(
                 "  press [i] and look at the camera",
@@ -3524,7 +3608,7 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  [i]", Style::new().fg(ACCENT)),
+            Span::styled("  [i]", Style::new().fg(th().accent)),
             Span::styled(" identify now", Style::new().dim()),
         ]));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
@@ -3537,7 +3621,10 @@ impl App {
             let val = if !present {
                 Span::styled("(not present)", Style::new().dim())
             } else if wired {
-                Span::styled("● wired", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    "● wired",
+                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled("○ not wired", Style::new().dim())
             };
@@ -3548,8 +3635,8 @@ impl App {
         // SELinux row on a non-SELinux system reads as a fault that isn't one.
         if std::path::Path::new("/sys/fs/selinux").exists() {
             let sel = match crate::pamwire::selinux_state() {
-                Some(true) => Span::styled("● loaded", Style::new().fg(OK)),
-                Some(false) => Span::styled("✗ not loaded", Style::new().fg(ERR)),
+                Some(true) => Span::styled("● loaded", Style::new().fg(th().ok)),
+                Some(false) => Span::styled("✗ not loaded", Style::new().fg(th().err)),
                 None => Span::styled("unknown (needs root)", Style::new().dim()),
             };
             lines.push(Line::from(vec![
@@ -3564,7 +3651,7 @@ impl App {
             lines.push(Line::from(vec![
                 Span::raw(format!("  {:<16}", "AppArmor")),
                 if profiled {
-                    Span::styled("● irlume profile installed", Style::new().fg(OK))
+                    Span::styled("● irlume profile installed", Style::new().fg(th().ok))
                 } else {
                     Span::styled(
                         "active; irlume unconfined (profile optional)",
@@ -3612,7 +3699,7 @@ impl App {
         lines.push(Line::raw(""));
         lines.push(section("Change (root)"));
         lines.push(Line::from(vec![
-            Span::styled("  [w]", Style::new().fg(ACCENT)),
+            Span::styled("  [w]", Style::new().fg(th().accent)),
             Span::styled(
                 " wire the login stack now (runs sudo irlume login enable --apply)",
                 Style::new(),
@@ -3624,7 +3711,7 @@ impl App {
         )));
         lines.push(Line::from(vec![
             Span::styled("  face-sudo ", Style::new()),
-            Span::styled("[u]", Style::new().fg(ACCENT)),
+            Span::styled("[u]", Style::new().fg(th().accent)),
             Span::styled(
                 " wire it (opt-in, not part of [w]; face approves sudo prompts)",
                 Style::new().dim(),
@@ -3632,7 +3719,7 @@ impl App {
         ]));
         lines.push(Line::from(vec![
             Span::styled("  app prompts ", Style::new()),
-            Span::styled("[p]", Style::new().fg(ACCENT)),
+            Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(
                 " wire them (opt-in; face approves Bitwarden/pkexec)",
                 Style::new().dim(),
@@ -3653,7 +3740,7 @@ impl App {
             None => {}
             Some(crate::bitwarden::TuiState::Ready) => lines.push(Line::from(vec![
                 Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("● polkit action installed", Style::new().fg(OK)),
+                Span::styled("● polkit action installed", Style::new().fg(th().ok)),
                 Span::styled(
                     "  (enable \"unlock with system authentication\" in its settings)",
                     Style::new().dim(),
@@ -3661,7 +3748,7 @@ impl App {
             ])),
             Some(crate::bitwarden::TuiState::SnapMissing) => lines.push(Line::from(vec![
                 Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("○ snap action missing", Style::new().fg(WARN)),
+                Span::styled("○ snap action missing", Style::new().fg(th().warn)),
                 Span::styled(
                     "  fix: sudo snap connect bitwarden:polkit",
                     Style::new().dim(),
@@ -3669,21 +3756,21 @@ impl App {
             ])),
             Some(crate::bitwarden::TuiState::NeedsSetup) => lines.push(Line::from(vec![
                 Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("○ biometric unlock not set up", Style::new().fg(WARN)),
-                Span::styled("  [b]", Style::new().fg(ACCENT)),
+                Span::styled("○ biometric unlock not set up", Style::new().fg(th().warn)),
+                Span::styled("  [b]", Style::new().fg(th().accent)),
                 Span::styled(" set it up (sudo; optional)", Style::new().dim()),
             ])),
         }
         lines.push(Line::from(vec![
             Span::styled("  disable ", Style::new()),
-            Span::styled("[x]", Style::new().fg(ACCENT)),
+            Span::styled("[x]", Style::new().fg(th().accent)),
             Span::styled(
                 " un-wires face auth everywhere (confirmed first)",
                 Style::new().dim(),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(ACCENT)),
+            Span::styled("  [s]", Style::new().fg(th().accent)),
             Span::styled(" open full status in a console view", Style::new().dim()),
         ]));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
@@ -3696,7 +3783,7 @@ impl App {
         let lines = vec![
             Line::from(Span::styled(
                 "  Setup dashboard",
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
             )),
             Line::raw(""),
             Line::from(vec![
@@ -3705,7 +3792,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  auth method       "),
-                Span::styled(method_label(&self.fp.method), Style::new().fg(ACCENT)),
+                Span::styled(method_label(&self.fp.method), Style::new().fg(th().accent)),
             ]),
             Line::from(vec![
                 Span::raw("  enrollment        "),
@@ -3757,12 +3844,12 @@ impl App {
             )),
             if !self.profiles.is_empty() && !wired {
                 Line::from(vec![
-                    Span::styled("  [w]", Style::new().fg(ACCENT)),
+                    Span::styled("  [w]", Style::new().fg(th().accent)),
                     Span::styled(" wire login    [r] refresh    [q] quit", Style::new().dim()),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled("  [r]", Style::new().fg(ACCENT)),
+                    Span::styled("  [r]", Style::new().fg(th().accent)),
                     Span::styled(" refresh    [q] quit", Style::new().dim()),
                 ])
             },
@@ -3783,7 +3870,7 @@ impl App {
         let blk = Block::bordered()
             .title(title)
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(if scrolled { ACCENT } else { BLUE }));
+            .border_style(Style::new().fg(if scrolled { th().accent } else { th().blue }));
         let inner = blk.inner(area);
         f.render_widget(blk, area);
         let h = inner.height as usize;
@@ -3794,9 +3881,9 @@ impl App {
             .iter()
             .map(|(g, m)| {
                 let gs = match g {
-                    '→' => Style::new().fg(ACCENT),
-                    '✓' => Style::new().fg(OK),
-                    '✗' => Style::new().fg(ERR),
+                    '→' => Style::new().fg(th().accent),
+                    '✓' => Style::new().fg(th().ok),
+                    '✗' => Style::new().fg(th().err),
                     _ => Style::new().dim(),
                 };
                 Line::from(vec![
@@ -3808,36 +3895,10 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let key =
-            |k: &str| Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT));
-        // Guided enrollment swallows every key but Esc; show only that, so the
-        // footer doesn't advertise dead nav/action keys during a capture.
-        if self.enroll.is_some() {
-            let spans = vec![
-                key("esc"),
-                Span::styled(" cancel enrollment", Style::new().dim()),
-            ];
-            let blk = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().dim());
-            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
-            return;
-        }
-        // A running op (Identify / IR self-test) also swallows every key but
-        // q/Esc, so don't advertise the live nav/action keys during it.
-        if self.op.is_some() {
-            let spans = vec![
-                key("q / esc"),
-                Span::styled(" cancel · working…", Style::new().dim()),
-            ];
-            let blk = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().dim());
-            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
-            return;
-        }
-        let actions: &[(&str, &str)] = match self.screen {
+    /// Per-screen action keys, ordered primary-first: the footer shows
+    /// the first three, the [?] overlay shows them all.
+    fn screen_actions(&self) -> &'static [(&'static str, &'static str)] {
+        match self.screen {
             SC_WELCOME => &[
                 ("e", "enroll"),
                 ("i", "identify"),
@@ -3884,34 +3945,74 @@ impl App {
             ],
             SC_DONE => &[("w", "wire login"), ("u", "update"), ("r", "refresh")],
             _ => &[("r", "refresh")],
-        };
-        let mut spans = vec![
-            key("Tab / ← →"),
-            Span::styled(" switch tab  ", Style::new().dim()),
-            key("↑↓"),
-            Span::styled(" select  ", Style::new().dim()),
-            key("v"),
-            Span::styled(
-                if self.advanced {
-                    " basic  "
-                } else {
-                    " all tabs  "
-                },
-                Style::new().dim(),
-            ),
-            key("PgUp/Dn"),
-            Span::styled(" activity  ", Style::new().dim()),
-            key("q"),
-            Span::styled(" quit    ", Style::new().dim()),
-        ];
-        for (k, d) in actions {
-            spans.push(key(k));
-            spans.push(Span::styled(format!(" {d}  "), Style::new().dim()));
         }
+    }
+
+    fn draw_footer(&self, f: &mut Frame, area: Rect) {
+        let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
+        // Guided enrollment swallows every key but Esc; show only that, so the
+        // footer doesn't advertise dead nav/action keys during a capture.
+        if self.enroll.is_some() {
+            let spans = vec![
+                key("esc"),
+                Span::styled(" cancel enrollment", Style::new().dim()),
+            ];
+            let blk = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().dim());
+            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
+            return;
+        }
+        // A running op (Identify / IR self-test) also swallows every key but
+        // q/Esc, so don't advertise the live nav/action keys during it.
+        if self.op.is_some() {
+            let spans = vec![
+                key("q / esc"),
+                Span::styled(" cancel · working…", Style::new().dim()),
+            ];
+            let blk = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().dim());
+            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
+            return;
+        }
+        let actions = self.screen_actions();
+        // Three-tier disclosure (GNOME HIG): the footer shows the primary
+        // action plus at most two more; [?] opens the full keymap overlay;
+        // docs hold the rest. The first action is THE action for the screen,
+        // so it alone gets the emphasized label.
+        let mut spans = vec![key("Tab"), Span::styled(" tabs  ", Style::new().dim())];
+        for (i, (k, d)) in actions.iter().take(3).enumerate() {
+            spans.push(key(k));
+            if i == 0 {
+                spans.push(Span::styled(
+                    format!(" {d}  "),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(format!(" {d}  "), Style::new().dim()));
+            }
+        }
+        spans.push(key("?"));
+        spans.push(Span::styled(" all keys  ", Style::new().dim()));
+        spans.push(key("q"));
+        spans.push(Span::styled(" quit", Style::new().dim()));
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
         f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
+    }
+
+    /// The full keymap for the [?] overlay: the global keys plus every action
+    /// of the CURRENT screen (tier two of the disclosure ladder).
+    fn help_body(&self) -> String {
+        let mut b = String::from(
+            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
+        );
+        for (k, d) in self.screen_actions() {
+            b.push_str(&format!("  {k:<7} {d}\n"));
+        }
+        b
     }
 
     fn modal(&self, f: &mut Frame, title: &str, body: &str) {
@@ -3932,7 +4033,7 @@ impl App {
         let blk = Block::bordered()
             .title(format!(" {title} "))
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ACCENT))
+            .border_style(Style::new().fg(th().accent))
             .padding(ratatui::widgets::Padding::horizontal(1));
         f.render_widget(
             Paragraph::new(body.to_string())
@@ -3986,14 +4087,17 @@ fn quality_bar(q: u8) -> String {
 fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         title.to_string(),
-        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
     ))
 }
 
 /// Green ● ON / dim ○ off badge.
 fn onoff(on: bool) -> Span<'static> {
     if on {
-        Span::styled("● yes", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+        Span::styled(
+            "● yes",
+            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::styled("○ no", Style::new().dim())
     }
@@ -4018,7 +4122,7 @@ fn count_badge(profiles: usize, scans: usize) -> Span<'static> {
     } else {
         Span::styled(
             format!("● {profiles} profile(s), {scans} scan(s)"),
-            Style::new().fg(OK).add_modifier(Modifier::BOLD),
+            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -4301,6 +4405,7 @@ mod tests {
             input: None,
             confirm: None,
             mouse_select: false,
+            show_help: false,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -4703,10 +4808,12 @@ mod tests {
             !text.contains("switch tab"),
             "footer advertises dead nav keys during an op:\n{text}"
         );
-        // Sanity: the full footer returns once the op is gone.
+        // Sanity: the normal footer returns once the op is gone (trimmed
+        // design: tabs hint + primary action + the [?] disclosure chip).
         app.op = None;
         term.draw(|f| app.draw_footer(f, f.area())).unwrap();
-        assert!(rendered(&term).contains("switch tab"));
+        let text = rendered(&term);
+        assert!(text.contains("tabs") && text.contains("all keys"), "{text}");
     }
 
     // Regression: cae2eea. caps/fp_present were captured once at startup, so a
@@ -6482,35 +6589,41 @@ mod tests {
             term.draw(|f| app.draw_footer(f, f.area())).unwrap();
             rendered(&term)
         };
-        let cases: [(usize, &str); 11] = [
-            (SC_WELCOME, "uninstall"),
-            (SC_REPAIR, "IR test"),
-            (SC_CAMERAS, "setup emitter"),
-            (SC_PROFILES, "add scan"),
-            (SC_IDENTIFY, "identify"),
-            (SC_KEYRING, "arm"),
-            (SC_RECOVERY, "restore"),
-            (SC_FINGERPRINT, "enroll finger"),
-            (SC_PAM, "wire login (sudo)"),
-            (SC_SETTINGS, "toggle eyes-open"),
-            (SC_DONE, "wire login"),
+        // Footer = primary action only (trimmed, three-tier disclosure);
+        // the [?] overlay must list EVERY action of the screen.
+        let cases: [(usize, &str, &str); 11] = [
+            (SC_WELCOME, "enroll", "uninstall"),
+            (SC_REPAIR, "fix", "debug logs"),
+            (SC_CAMERAS, "use", "probe"),
+            (SC_PROFILES, "enroll", "delete"),
+            (SC_IDENTIFY, "identify", "identify"),
+            (SC_KEYRING, "arm", "forget"),
+            (SC_RECOVERY, "set", "forget"),
+            (SC_FINGERPRINT, "enroll finger", "reset"),
+            (SC_PAM, "wire login (sudo)", "un-wire"),
+            (SC_SETTINGS, "toggle eyes-open", "3rd-party model"),
+            (SC_DONE, "wire login", "refresh"),
         ];
         let mut app = app;
-        for (screen, needle) in cases {
+        for (screen, primary, in_overlay) in cases {
             app.screen = screen;
+            assert!(
+                app.help_body().contains(in_overlay),
+                "[?] overlay for screen {screen} misses '{in_overlay}':\n{}",
+                app.help_body()
+            );
+            let needle = primary;
             let text = footer(&app);
             assert!(
                 text.contains(needle),
                 "footer for {} must advertise '{needle}', got:\n{text}",
                 SCREENS[screen]
             );
-            assert!(text.contains("switch tab"), "global nav keys always show");
+            assert!(
+                text.contains("all keys"),
+                "the [?] disclosure chip always shows"
+            );
         }
-        // The [v] label flips with the view mode.
-        app.screen = SC_WELCOME;
-        assert!(footer(&app).contains("all tabs"));
-        app.advanced = true;
-        assert!(footer(&app).contains("basic"));
         // Guided enrollment swallows everything but Esc: only that shows.
         let (_tx, enroll) = fake_enroll(0, 4);
         app.enroll = Some(enroll);

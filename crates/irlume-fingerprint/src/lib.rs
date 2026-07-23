@@ -170,7 +170,7 @@ pub fn available() -> bool {
 
 /// What `fprintd-list` actually said, beyond "a list of fingers". `fprintd-list`
 /// exits 0 even with no reader ("No devices available"), and a claim or polkit
-/// failure otherwise reads as "no fingers enrolled" — the wrong advice follows.
+/// failure otherwise reads as "no fingers enrolled", and the wrong advice follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListOutcome {
     Fingers(Vec<String>),
@@ -414,7 +414,7 @@ fn classify_enroll(run: &StreamedRun) -> EnrollOutcome {
     match run.status {
         None => EnrollOutcome::Failed(format!(
             "no completion from the reader within {}s; the sensor or its claim may be \
-             wedged — try: sudo systemctl restart fprintd, then re-run",
+             wedged; try: sudo systemctl restart fprintd, then re-run",
             ENROLL_DEADLINE.as_secs()
         )),
         Some(s) if s.success() => EnrollOutcome::Enrolled,
@@ -509,7 +509,7 @@ pub fn verify_once(user: &str) -> VerifyOutcome {
 /// Delete ALL of `user`'s enrolled prints (`fprintd-delete <user>`): the remedy
 /// for chip/host template desync, where the sensor's on-chip storage holds
 /// prints the host database no longer matches (dual-boot Windows enrollment,
-/// OS reinstall, BIOS "clear fingerprints" — libfprint#301, fprintd#126).
+/// OS reinstall, BIOS "clear fingerprints"; libfprint#301, fprintd#126).
 pub fn delete_all(user: &str) -> Result<(), String> {
     let Some(del) = tool("fprintd-delete") else {
         return Err("fprintd-delete not installed".into());

@@ -682,7 +682,7 @@ pub(crate) enum IrPixel {
     Grey8,
     /// Y16 / Y10 / Y12: 16-bit little-endian words, sample data LSB-aligned
     /// (per the V4L2 spec, which also allows Y16 to carry fewer than 16 real
-    /// bits — a 10-bit sensor delivers 0..1023 in Y16).
+    /// bits; a 10-bit sensor delivers 0..1023 in Y16).
     Grey16,
     /// NV12: the leading `w*h` bytes are a plain 8-bit luma plane; an IR sensor
     /// behind bridge firmware that only speaks NV12 is fully usable through it.

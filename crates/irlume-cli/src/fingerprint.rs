@@ -85,7 +85,7 @@ fn status(user: &str) -> ExitCode {
             println!("[fingerprint] enrolled       : (fprintd reports no reader)");
         }
         fp::ListOutcome::Error(e) => {
-            println!("[fingerprint] enrolled       : could not list — {e}");
+            println!("[fingerprint] enrolled       : could not list: {e}");
             list_error = Some(e.clone());
         }
     }

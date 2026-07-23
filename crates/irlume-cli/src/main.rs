@@ -425,7 +425,7 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
 
     // Capture one phase, returning the median EAR or a printed error.
     let capture_phase = |label: &str| -> Result<f32, String> {
-        print!("[calibrate] {label} — hold still, capturing in 3");
+        print!("[calibrate] {label}: hold still, capturing in 3");
         let _ = std::io::Write::flush(&mut std::io::stdout());
         for n in [2, 1] {
             std::thread::sleep(std::time::Duration::from_millis(800));
@@ -2491,7 +2491,7 @@ fn doctor() -> std::process::ExitCode {
         if irlume_fingerprint::reader_stuck(&user) {
             println!(
                 "  ⚠ the reader is held by a stale fprintd claim (finger prompts will not \
-                 appear; common after suspend/resume) — fix: sudo systemctl restart fprintd"
+                 appear; common after suspend/resume); fix: sudo systemctl restart fprintd"
             );
         }
         let pam_dir = std::path::Path::new("/etc/pam.d");
@@ -2549,7 +2549,7 @@ fn doctor() -> std::process::ExitCode {
             "[doctor] polkit app prompts: wired ✓ (NOD your head to approve Bitwarden unlock,\n     \
              pkexec, …; no calibration needed{})",
             if closure_calibrated {
-                " — closing your eyes ~1s also works"
+                "; closing your eyes ~1s also works"
             } else {
                 ", or run calibrate-closure to also allow the eye-closure gesture"
             }
@@ -2559,7 +2559,7 @@ fn doctor() -> std::process::ExitCode {
              approve; consent_gesture=closure)"
         ),
         Some(true) => println!(
-            "[doctor] polkit app prompts: wired ✓ but consent_gesture=closure and NOT calibrated —\n     \
+            "[doctor] polkit app prompts: wired ✓ but consent_gesture=closure and NOT calibrated;\n     \
              prompts fall back to the password. Calibrate (sudo irlume calibrate-closure) or unset\n     \
              consent_gesture in settings.conf to use the no-calibration head nod."
         ),
@@ -2664,7 +2664,7 @@ fn report_pam_regeneration_guard() {
     } else {
         println!(
             "[doctor] ⚠ {tool} manages this host's PAM stacks, but the irlume-reconcile.path\n     \
-             self-heal watcher is not active — a future regeneration could silently drop\n     \
+             self-heal watcher is not active; a future regeneration could silently drop\n     \
              face login. Enable it: sudo systemctl enable --now irlume-reconcile.path"
         );
     }

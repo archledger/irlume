@@ -55,6 +55,7 @@ PAM changes.
 | LightDM (gtk and slick greeters, X11) | wired and exercised in the login-manager matrix |
 | greetd (tuigreet) | wired and exercised in the login-manager matrix |
 | COSMIC greeter | wired and exercised in the login-manager matrix |
+| polkit-1 (app prompts: Bitwarden, pkexec) | validated live: Bitwarden flatpak biometric unlock approved by a head nod |
 
 ## Not tested yet, reports welcome
 

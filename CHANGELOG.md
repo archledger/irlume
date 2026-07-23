@@ -32,6 +32,14 @@ All notable changes to irlume are documented here. This project adheres to
 - **Ctrl-modified letters no longer alias to plain-letter TUI actions.**
   Ctrl-C arrives as Char('c')+CONTROL and fired the calibrate binding;
   modifier-carrying letters are now ignored by the key dispatcher.
+- **Packaged installs can re-load the SELinux module after `login
+  disable`.** The pp lookup never searched
+  `/usr/share/selinux/packages/irlume.pp`, the irlume-selinux rpm's
+  install path, so a disable → enable cycle on a Copr install lost the
+  module ("irlume.pp not found") until a package reinstall. The rpm's
+  install-time module load had masked the gap. Found by hardware
+  validation of the TUI un-wire/re-wire round trip.
+  `IRLUME_SELINUX_PP` now also overrides the `selinux load` lookup.
 
 - **`irlume bitwarden setup`: one command replaces the copy-paste Bitwarden
   polkit setup.** Detects how Bitwarden was installed and acts per flavor:

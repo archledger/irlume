@@ -346,8 +346,12 @@ fn diag_reports_sealed_state_from_daemon_when_envelope_unreadable() {
 #[test]
 fn selinux_load_handles_missing_module_and_semodule_outcomes() {
     let sb = Sandbox::new("selinuxload");
-    // No irlume.pp anywhere reachable: the not-found guard fires.
-    let (code, _, err) = run(&mut sb.cmd(&["selinux", "load"]), "selinux load");
+    // No irlume.pp anywhere reachable: the not-found guard fires. Pin the
+    // lookup with the env override so a host that really has the packaged
+    // .pp installed (/usr/share/selinux/packages) cannot satisfy it.
+    let mut miss = sb.cmd(&["selinux", "load"]);
+    miss.env("IRLUME_SELINUX_PP", sb.path("does-not-exist.pp"));
+    let (code, _, err) = run(&mut miss, "selinux load");
     assert_eq!(code, 1);
     assert!(err.contains("irlume.pp not found"), "{err}");
 

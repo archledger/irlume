@@ -890,19 +890,30 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("load") => {
-            let pp = [
-                "packaging/selinux/irlume.pp",
-                "/usr/share/irlume/selinux/irlume.pp",
-            ]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists());
+            // An explicit override wins outright, and a set-but-missing
+            // override is an error rather than a silent fallback (this also
+            // keeps the lookup testable on hosts where the packaged .pp
+            // really exists).
+            let pp = match std::env::var("IRLUME_SELINUX_PP") {
+                Ok(p) => std::path::Path::new(&p).exists().then_some(p),
+                Err(_) => [
+                    "packaging/selinux/irlume.pp",
+                    // The irlume-selinux rpm's install location; without it a
+                    // packaged install could not re-load after `login disable`.
+                    "/usr/share/selinux/packages/irlume.pp",
+                    "/usr/share/irlume/selinux/irlume.pp",
+                ]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .map(String::from),
+            };
             let Some(pp) = pp else {
                 eprintln!("[selinux] irlume.pp not found; build it: make -f /usr/share/selinux/devel/Makefile -C packaging/selinux irlume.pp");
                 return ExitCode::FAILURE;
             };
             eprintln!("[selinux] semodule -i {pp} (needs root)…");
             let st = std::process::Command::new("semodule")
-                .args(["-i", pp])
+                .args(["-i", &pp])
                 .status();
             match st {
                 Ok(s) if s.success() => {

@@ -1271,6 +1271,9 @@ SYSTEM INTEGRATION
   fingerprint <status|add|verify|reset|enable|disable> [--fingerprint-only]
                         fprintd companion; enable = face OR fingerprint (both),
                         --fingerprint-only replaces face with fingerprint
+  bitwarden <status|setup> [--apply]
+                        install Bitwarden's biometric-unlock polkit action
+                        (flatpak/native; snap is handled by snapd already)
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely
                         needed; enroll auto-runs it when IR frames are dark)

@@ -8,7 +8,7 @@
 - [IR capture: strobe and ambient subtraction](#ir-capture-strobe-and-ambient-subtraction)
 - [Face login → keyring unlock](#face-login--keyring-unlock): the
   TPM-sealed-password path
-- [Why these choices](#why-these-choices)
+- [Defense-to-threat mapping](#defense-to-threat-mapping)
 
 ## Privilege separation
 

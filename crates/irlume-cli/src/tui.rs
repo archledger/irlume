@@ -3777,82 +3777,87 @@ impl App {
         )));
         lines.push(Line::raw(""));
         lines.push(section("Change (root)"));
-        lines.push(Line::from(vec![
-            Span::styled("  [w]", Style::new().fg(th().accent)),
-            Span::styled(
-                " wire the login stack now (runs sudo irlume login enable --apply)",
-                Style::new(),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "  empty password + Enter fires face (greeter login = IR/secure tier; RGB-only = lock screen only)",
-            Style::new().dim(),
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("  face-sudo ", Style::new()),
-            Span::styled("[u]", Style::new().fg(th().accent)),
-            Span::styled(
-                " wire it (opt-in, not part of [w]; face approves sudo prompts)",
-                Style::new().dim(),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  app prompts ", Style::new()),
-            Span::styled("[p]", Style::new().fg(th().accent)),
-            Span::styled(
-                " wire them (opt-in; face approves Bitwarden/pkexec)",
-                Style::new().dim(),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "    an app prompt needs a deliberate NOD to approve (no calibration); or an eye",
-            Style::new().dim(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "    closure, taught once with [c].  See docs/APP-INTEGRATION.md",
-            Style::new().dim(),
-        )));
-        // Bitwarden app-unlock row: only rendered when Bitwarden is installed
-        // (invisible for everyone else), and never acts on its own — [b] is
-        // the user's explicit opt-in.
-        match crate::bitwarden::tui_state() {
-            None => {}
-            Some(crate::bitwarden::TuiState::Ready) => lines.push(Line::from(vec![
-                Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("● polkit action installed", Style::new().fg(th().ok)),
-                Span::styled(
-                    "  (enable \"unlock with system authentication\" in its settings)",
-                    Style::new().dim(),
-                ),
-            ])),
-            Some(crate::bitwarden::TuiState::SnapMissing) => lines.push(Line::from(vec![
-                Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("○ snap action missing", Style::new().fg(th().warn)),
-                Span::styled(
-                    "  fix: sudo snap connect bitwarden:polkit",
-                    Style::new().dim(),
-                ),
-            ])),
-            Some(crate::bitwarden::TuiState::NeedsSetup) => lines.push(Line::from(vec![
-                Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("○ biometric unlock not set up", Style::new().fg(th().warn)),
-                Span::styled("  [b]", Style::new().fg(th().accent)),
-                Span::styled(" set it up (sudo; optional)", Style::new().dim()),
-            ])),
+        // One consistent shape per action: [key] in a fixed accent column, a
+        // verb-first label padded to a common width, then a dim detail column.
+        // Scannable as a command list instead of a paragraph; the key never
+        // wanders into the middle of a sentence.
+        let act = |key: &str, label: &str, detail: &str| {
+            Line::from(vec![
+                Span::styled(format!("  {key:<4}"), Style::new().fg(th().accent)),
+                Span::styled(format!("{label:<22}"), Style::new()),
+                Span::styled(detail.to_string(), Style::new().dim()),
+            ])
+        };
+        lines.push(act(
+            "[w]",
+            "Wire login + lock",
+            "the core action; leave the password empty then Enter to use your face",
+        ));
+        lines.push(act(
+            "[u]",
+            "Wire face-sudo",
+            "opt-in; face approves sudo prompts",
+        ));
+        lines.push(act(
+            "[p]",
+            "Wire app prompts",
+            "opt-in; face approves Bitwarden and pkexec",
+        ));
+        lines.push(act(
+            "[c]",
+            "Calibrate gesture",
+            "approve app prompts by closing your eyes ~1s (the nod needs none)",
+        ));
+        // [b] is an ACTION only when Bitwarden is installed without its polkit
+        // action; otherwise its state shows as a status line below.
+        if matches!(
+            crate::bitwarden::tui_state(),
+            Some(crate::bitwarden::TuiState::NeedsSetup)
+        ) {
+            lines.push(act(
+                "[b]",
+                "Set up Bitwarden",
+                "installs its polkit action so your face unlocks the vault",
+            ));
         }
-        lines.push(Line::from(vec![
-            Span::styled("  disable ", Style::new()),
-            Span::styled("[x]", Style::new().fg(th().accent)),
-            Span::styled(
-                " un-wires face auth everywhere (confirmed first)",
-                Style::new().dim(),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(th().accent)),
-            Span::styled(" open full status in a console view", Style::new().dim()),
-        ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        lines.push(act(
+            "[x]",
+            "Un-wire everything",
+            "removes face auth from login/lock/sudo/apps; asks first",
+        ));
+        lines.push(act(
+            "[s]",
+            "Show full status",
+            "opens the detailed console status view",
+        ));
+        // Bitwarden status line (not an action): only when installed and the
+        // action is present or snapd owns it. Set apart by a blank line.
+        match crate::bitwarden::tui_state() {
+            Some(crate::bitwarden::TuiState::Ready) => {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Bitwarden   "),
+                    Span::styled("● polkit action installed", Style::new().fg(th().ok)),
+                    Span::styled(
+                        "  (turn on \"unlock with system authentication\" in its settings)",
+                        Style::new().dim(),
+                    ),
+                ]));
+            }
+            Some(crate::bitwarden::TuiState::SnapMissing) => {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Bitwarden   "),
+                    Span::styled("○ snap action missing", Style::new().fg(th().warn)),
+                    Span::styled(
+                        "  run: sudo snap connect bitwarden:polkit",
+                        Style::new().dim(),
+                    ),
+                ]));
+            }
+            _ => {}
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_done(&self, f: &mut Frame, area: Rect) {
@@ -6548,7 +6553,9 @@ mod tests {
             text.contains("tier unknown (daemon unreachable)"),
             "no tier claim without the daemon"
         );
-        assert!(text.contains("wire the login stack now"));
+        // The aligned action list: the primary wire action plus the un-wire.
+        assert!(text.contains("[w]") && text.contains("Wire login + lock"));
+        assert!(text.contains("[x]") && text.contains("Un-wire everything"));
         app.health = Some(HealthInfo {
             tier: "convenience".into(),
             rgb_dev: Some("/dev/video0".into()),

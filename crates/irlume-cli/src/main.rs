@@ -29,6 +29,7 @@ mod pad;
 mod pamwire;
 mod recovery;
 mod secrets;
+mod strays;
 mod suncal;
 mod tui;
 mod uninstall;
@@ -2342,10 +2343,8 @@ fn doctor() -> std::process::ExitCode {
         "[doctor] platform: {}",
         irlume_common::platform::distro_family().as_str()
     );
-    println!(
-        "[doctor] install origin: {}",
-        commands::install_origin().describe()
-    );
+    let origin = commands::install_origin();
+    println!("[doctor] install origin: {}", origin.describe());
     match tpm_device() {
         Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
         None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗; required for sealing"),
@@ -2615,6 +2614,9 @@ fn doctor() -> std::process::ExitCode {
     if crate::pamwire::login_wired() {
         report_pam_regeneration_guard();
     }
+    // Leftover backups next to the managed binaries, and hand-installed builds
+    // overlaying the packaged ones (silent when clean).
+    strays::report(&origin);
 
     std::process::ExitCode::SUCCESS
 }

@@ -22,7 +22,7 @@ Conventions that apply everywhere:
 | `irlume setup` | scripted onboarding: enroll, keyring, recovery, PAM wiring, each step prompted y/N |
 | `irlume status` | health dashboard: daemon, enrollment, keyring, cameras |
 | `irlume detect` | script-friendly probe; exit `0` = ready, `10` = partial, `20` = absent |
-| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), and the authselect/pam-auth-update regeneration guard |
+| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones) |
 | `irlume deps` | verify runtime dependencies (onnxruntime, models, TPM) |
 | `irlume version` | print the installed version (`--version` / `-V` also work) |
 

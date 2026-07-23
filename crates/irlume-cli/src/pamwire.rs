@@ -204,13 +204,40 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\n");
-    let _ = std::fs::write(&path, body);
+    // 0600, root-owned (enable/reconcile run as root): the marker must not be
+    // plantable by a non-root user, since reconcile trusts its with_sudo flag.
+    // A silent failure would leave self-heal disabled without the user knowing,
+    // so warn rather than swallow it.
+    if let Err(e) = irlume_common::write_0600(&path, body.as_bytes()) {
+        eprintln!(
+            "[login] warning: could not write the self-heal marker {}: {e}\n\
+             [login] automatic re-wiring after a distro PAM update will not run.",
+            path.display()
+        );
+    }
 }
 
 /// Re-read the marker's recorded flags. Returns `None` when login was never
 /// enabled (no marker), so reconcile does nothing on machines that opted out.
 fn read_wired_marker() -> Option<(bool, bool)> {
-    let body = std::fs::read_to_string(wired_marker_path()).ok()?;
+    let path = wired_marker_path();
+    // In production (default state dir) the marker must be root-owned: reconcile
+    // acts on its with_sudo flag as root, so a marker a non-root user could plant
+    // (were /var/lib/irlume perms ever to slip) must not drive wiring. Skipped
+    // under an IRLUME_STATE_DIR sandbox (tests/dev), where it is user-owned and
+    // reconcile never runs from the system path unit anyway.
+    if std::env::var_os("IRLUME_STATE_DIR").is_none() {
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata(&path).ok()?.uid();
+        if uid != 0 {
+            eprintln!(
+                "[login] ignoring self-heal marker not owned by root (uid {uid}): {}",
+                path.display()
+            );
+            return None;
+        }
+    }
+    let body = std::fs::read_to_string(&path).ok()?;
     let flag = |key: &str| {
         body.lines()
             .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
@@ -229,7 +256,7 @@ fn reconcile() -> ExitCode {
         // Never enabled here: nothing to maintain.
         return ExitCode::SUCCESS;
     };
-    if login_wired() {
+    if active_login_wired() {
         // Still intact; the common case after a spurious file-change event.
         return ExitCode::SUCCESS;
     }
@@ -239,6 +266,26 @@ fn reconcile() -> ExitCode {
     }
     eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
     act(true, true, with_sudo, with_polkit)
+}
+
+/// Whether the ACTIVE display manager's own greeter service carries the module.
+/// [`login_wired`] is any-of (true if any greeter/lock file has the line), which
+/// gives reconcile a blind spot: a distro update that strips only the active
+/// greeter while a stale/inactive greeter file keeps the line would leave
+/// `login_wired()` true and the real login broken. This checks the greeter the
+/// active DM actually consults, so reconcile repairs the login that matters. An
+/// absent active-greeter file counts as not-wired too (a deleted /etc override).
+/// Falls back to `login_wired()` when the active DM is unknown/absent.
+fn active_login_wired() -> bool {
+    let Some(dm) = active_display_manager() else {
+        return login_wired();
+    };
+    let (primary, _fp) = dm_pam_services(&dm);
+    if primary == "(unknown)" {
+        return login_wired();
+    }
+    let etc = PathBuf::from(format!("/etc/pam.d/{primary}"));
+    etc.exists() && file_has_module(&etc)
 }
 
 pub(crate) fn login_wired() -> bool {

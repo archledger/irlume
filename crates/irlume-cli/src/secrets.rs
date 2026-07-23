@@ -1,0 +1,136 @@
+//! Secret Service (login keyring) diagnostics for `irlume doctor`.
+//!
+//! Bitwarden's biometric unlock, and any app that stores secrets, needs a
+//! Secret Service provider (GNOME Keyring or KWallet) running on the session
+//! bus with the login collection unlocked. When face login releases the
+//! TPM-sealed password through PAM, `pam_gnome_keyring` / `pam_kwallet5` unlock
+//! that collection automatically; if the collection is still locked after a
+//! face login, the keyring password did not match the login password (a stale
+//! `irlume keyring arm`) and secrets fall back to a manual unlock prompt.
+//!
+//! This probe shells out to `busctl --user` rather than linking a D-Bus client,
+//! matching how irlume-fingerprint talks to fprintd. It only inspects the
+//! caller's own session bus, so it is meaningful only for the current user.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+/// The default (login) collection alias every Secret Service provider exposes.
+const DEFAULT_COLLECTION: &str = "/org/freedesktop/secrets/aliases/default";
+const SECRETS_BUS: &str = "org.freedesktop.secrets";
+
+/// Locale-pinned `busctl --user`, or `None` when busctl is not installed.
+fn busctl_user() -> Option<Command> {
+    let path = which_busctl()?;
+    let mut c = Command::new(path);
+    c.env("LC_ALL", "C").env("LANG", "C").arg("--user");
+    Some(c)
+}
+
+/// Resolve `busctl` on PATH without assuming a fixed location (it lives in
+/// /usr/bin on most distros but /bin elsewhere).
+fn which_busctl() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join("busctl"))
+        .find(|p| p.exists())
+}
+
+/// Whether the current process has a session bus to talk to at all. Under
+/// `sudo irlume doctor` there is none, so the probe stays silent instead of
+/// reporting a misleading "keyring unavailable".
+fn have_session_bus() -> bool {
+    std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+        || std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|r| {
+            std::path::Path::new(&r).join("bus").exists()
+        })
+}
+
+/// Lock state of the login keyring collection.
+enum Collection {
+    /// A provider answered; the login collection is unlocked (`false`) or
+    /// locked (`true`).
+    Present { locked: bool },
+    /// No provider owns `org.freedesktop.secrets` on this bus.
+    NoProvider,
+}
+
+/// Query the default collection's `Locked` property. A successful reply means a
+/// provider is running (the query D-Bus-activates it if it is merely
+/// registered); a failure means no provider is installed or reachable.
+fn query_collection() -> Collection {
+    let Some(mut cmd) = busctl_user() else {
+        return Collection::NoProvider;
+    };
+    let out = cmd
+        .args([
+            "get-property",
+            SECRETS_BUS,
+            DEFAULT_COLLECTION,
+            "org.freedesktop.Secret.Collection",
+            "Locked",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => match parse_locked(&String::from_utf8_lossy(&o.stdout)) {
+            Some(locked) => Collection::Present { locked },
+            None => Collection::NoProvider,
+        },
+        _ => Collection::NoProvider,
+    }
+}
+
+/// Parse a `busctl get-property … Locked` reply. The wire form is `b true` or
+/// `b false`; anything else (empty, malformed) yields `None`.
+fn parse_locked(reply: &str) -> Option<bool> {
+    let mut it = reply.split_whitespace();
+    if it.next()? != "b" {
+        return None;
+    }
+    match it.next()? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Print one doctor line about the login keyring, or nothing when there is no
+/// session bus to inspect (e.g. under sudo). Only call for the current user.
+pub fn report_keyring_status() {
+    if !have_session_bus() {
+        return;
+    }
+    match query_collection() {
+        Collection::Present { locked: false } => println!(
+            "[doctor] login keyring: unlocked ✓ (Secret Service apps like Bitwarden \
+             can read secrets after a face login)"
+        ),
+        Collection::Present { locked: true } => println!(
+            "[doctor] login keyring: LOCKED. A face login should unlock it via \
+             pam_gnome_keyring/pam_kwallet5.\n     \
+             If it stays locked, the sealed keyring password is stale — re-run: \
+             sudo irlume keyring arm"
+        ),
+        Collection::NoProvider => println!(
+            "[doctor] login keyring: no Secret Service provider running \
+             (GNOME Keyring / KWallet).\n     \
+             Bitwarden and other secret-storing apps need one; your desktop \
+             normally starts it at login."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_locked;
+
+    #[test]
+    fn parse_locked_reads_the_busctl_boolean_reply() {
+        assert_eq!(parse_locked("b true\n"), Some(true));
+        assert_eq!(parse_locked("b false\n"), Some(false));
+        // A missing or malformed reply is not a false "unlocked" signal.
+        assert_eq!(parse_locked(""), None);
+        assert_eq!(parse_locked("b"), None);
+        assert_eq!(parse_locked("s \"oops\""), None);
+    }
+}

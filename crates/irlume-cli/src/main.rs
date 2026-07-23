@@ -27,6 +27,7 @@ mod models;
 mod pad;
 mod pamwire;
 mod recovery;
+mod secrets;
 mod suncal;
 mod tui;
 mod uninstall;
@@ -2582,6 +2583,10 @@ fn doctor() -> std::process::ExitCode {
     if crate::pamwire::polkit_wired() == Some(true) {
         report_polkit_sandbox();
     }
+    // The login keyring an app like Bitwarden reads from: report whether a
+    // Secret Service provider is up and the collection is unlocked. Self-gates
+    // on a session bus, so it stays silent under `sudo irlume doctor`.
+    crate::secrets::report_keyring_status();
 
     // --- wiring drift ------------------------------------------------------
     // If the user is enrolled but no greeter is wired, a distro tool most
@@ -2597,7 +2602,9 @@ fn doctor() -> std::process::ExitCode {
         println!(
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
              A system update (authselect / pam-auth-update) may have regenerated the\n     \
-             PAM stacks. Re-wire with: sudo irlume login enable --apply"
+             PAM stacks. The irlume-reconcile.path unit re-applies this automatically\n     \
+             once login was enabled; if it persists, re-wire with:\n     \
+             sudo irlume login enable --apply"
         );
     }
 

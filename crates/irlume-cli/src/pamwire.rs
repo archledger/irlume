@@ -175,8 +175,8 @@ pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
         sudo.exists() && file_has_module(sudo),
     ));
     match service_present(&POLKIT) {
-        Some(p) => out.push(("polkit".into(), true, file_has_module(&p))),
-        None => out.push(("polkit".into(), false, false)),
+        Some(p) => out.push(("polkit (apps)".into(), true, file_has_module(&p))),
+        None => out.push(("polkit (apps)".into(), false, false)),
     }
     out
 }
@@ -1796,7 +1796,7 @@ mod tests {
                 "gdm-fingerprint",
                 "kde",
                 "sudo",
-                "polkit",
+                "polkit (apps)",
             ]
         );
         // login_wired is exactly "any non-sudo row is wired" (sudo excluded).

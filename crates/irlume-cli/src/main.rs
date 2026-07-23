@@ -14,8 +14,9 @@
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
-//!   irlume fingerprint <status|add|enable|disable> fprintd companion factor
-//!   irlume login <status|enable|disable>         wire face auth into PAM (dry-run)
+//!   irlume calibrate-closure                     teach the eye-closure consent gesture
+//!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
+//!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 //!   irlume tui                                   interactive setup/management UI
 

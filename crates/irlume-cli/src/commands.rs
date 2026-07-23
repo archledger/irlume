@@ -1251,6 +1251,8 @@ ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
   profiles [list|add-scan|rename|delete|eyes-open|challenge <on|off>]   manage profiles
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
+  calibrate-closure     teach the eye-closure consent gesture for app prompts
+                        (sudo; the head nod is the default and needs no calibration)
 
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed login password for wallet unlock
@@ -1260,10 +1262,15 @@ KEYRING / TPM
   diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)
 
 SYSTEM INTEGRATION
-  login <status|enable|disable> [--with-sudo] [--apply]   PAM wiring for greeters + lock screen
+  login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply]
+                        PAM wiring: greeters, lock screen, sudo, and app prompts
+                        (--with-polkit lets your face approve Bitwarden/pkexec);
+                        reconcile re-applies it after a distro PAM regeneration
   logs [-f] [--since T]           the face-auth journal in one view (daemon, PAM, keyring)
   logs debug <on|off>             per-stage pipeline tracing in the daemon (sudo)
-  fingerprint <status|add|enable|disable>   fprintd companion factor
+  fingerprint <status|add|verify|reset|enable|disable> [--fingerprint-only]
+                        fprintd companion; enable = face OR fingerprint (both),
+                        --fingerprint-only replaces face with fingerprint
   selinux <status|load>           SELinux module for the login greeter
   ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely
                         needed; enroll auto-runs it when IR frames are dark)

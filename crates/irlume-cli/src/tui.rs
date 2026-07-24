@@ -1730,7 +1730,24 @@ impl App {
                     ratatui::crossterm::event::DisableMouseCapture
                 );
                 ratatui::restore();
+                // Cooked terminal here: Ctrl-C raises SIGINT to the whole
+                // foreground group, and the TUI parent has the default (fatal)
+                // disposition. Install a no-op HANDLER around every suspended
+                // flow so the TUI survives an abort during the in-process arms
+                // too (fingerprint prompt, update, doctor, login status), not
+                // just the sudo_step ones. A caught signal is reset to the
+                // default across exec, so a child (sudo, dnf, the prompt) still
+                // gets SIGINT and is cancelled; only the parent is shielded.
+                extern "C" fn noop_sigint(_: libc::c_int) {}
+                // Cast through a fn pointer then a data pointer: a direct
+                // fn-item-to-integer cast trips clippy::fn_to_numeric_cast_any.
+                let handler =
+                    noop_sigint as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+                let old_int = unsafe { libc::signal(libc::SIGINT, handler) };
                 self.run_suspended(s);
+                unsafe {
+                    libc::signal(libc::SIGINT, old_int);
+                }
                 *terminal = ratatui::init();
                 if !self.mouse_select {
                     let _ = ratatui::crossterm::execute!(
@@ -1797,19 +1814,31 @@ impl App {
     /// look like success: `refresh()` re-probes what it can, but a one-shot like
     /// `ir-setup` leaves no re-checkable state, so we log ✓ on success and raise
     /// the error banner on failure.
+    /// Absolute path to the running binary, for re-invoking ourselves as root
+    /// instead of whatever `irlume` PATH resolves to (a running TUI must not
+    /// shell out to a different, older installed build for its privileged half).
+    /// Falls back to the PATH name `irlume` when the path can't be resolved, or
+    /// when an in-session `update` replaced the binary and `/proc/self/exe` now
+    /// points at the unlinked inode (a "(deleted)" path that would fail to exec).
+    fn self_exe() -> String {
+        std::env::current_exe()
+            .ok()
+            .filter(|p| p.exists())
+            .and_then(|p| p.to_str().map(String::from))
+            .filter(|s| !s.ends_with(" (deleted)"))
+            .unwrap_or_else(|| "irlume".to_string())
+    }
+
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
         // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
-        // to: a running TUI must not shell out to a different (older) installed
-        // build for its privileged half. Resolve the first "irlume" arg to the
-        // current exe; leave non-irlume commands (systemd-pcrlock, sh -c) as is.
-        let self_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from));
+        // to. Resolve the first "irlume" arg to the current exe; leave
+        // non-irlume commands (systemd-pcrlock, sh -c) as is.
+        let self_exe = Self::self_exe();
         let resolved: Vec<String> = args
             .iter()
             .enumerate()
-            .map(|(i, &a)| match (i, a, &self_exe) {
-                (0, "irlume", Some(exe)) => exe.clone(),
+            .map(|(i, &a)| match (i, a) {
+                (0, "irlume") => self_exe.clone(),
                 _ => a.to_string(),
             })
             .collect();
@@ -1989,14 +2018,21 @@ impl App {
             // Load the policy AND restart the daemon so the socket relabels to
             // irlume_runtime_t; otherwise the existing socket keeps its old label
             // and the check would still fail.
-            Suspend::SelinuxLoad => self.sudo_step(
-                "load the SELinux module + relabel the socket",
-                &[
-                    "sh",
-                    "-c",
-                    "irlume selinux load && systemctl restart irlumed",
-                ],
-            ),
+            Suspend::SelinuxLoad => {
+                // args[0] is "sh", so sudo_step's self-exe rewrite can't reach
+                // the embedded `irlume`; splice the running binary into the
+                // command ourselves so the rpm-path .pp lookup this build ships
+                // is the one that runs, not an older PATH `irlume`.
+                let exe = Self::self_exe();
+                self.sudo_step(
+                    "load the SELinux module + relabel the socket",
+                    &[
+                        "sh",
+                        "-c",
+                        &format!("'{exe}' selinux load && systemctl restart irlumed"),
+                    ],
+                );
+            }
         }
         eprint!("\nPress Enter to return to the TUI… ");
         let _ = std::io::Write::flush(&mut std::io::stderr());

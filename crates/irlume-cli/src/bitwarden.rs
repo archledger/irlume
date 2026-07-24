@@ -148,11 +148,42 @@ fn detection_home() -> Option<PathBuf> {
     if crate::is_root() {
         if let Ok(u) = std::env::var("SUDO_USER") {
             if !u.is_empty() {
-                return Some(PathBuf::from(format!("/home/{u}")));
+                // Resolve the real home from passwd, not `/home/{u}`: LDAP/AD
+                // accounts (/home/DOMAIN/user), relocated homes, and non-/home
+                // layouts would otherwise be looked up at the wrong path and
+                // the per-user flatpak install missed.
+                if let Some(h) = passwd_home(&u) {
+                    return Some(h);
+                }
             }
         }
     }
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The home directory (passwd field 6) for `user`, via `getent passwd`, or
+/// `None` when getent is absent or the user is unknown.
+fn passwd_home(user: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("getent")
+        .args(["passwd", user])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_passwd_home(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The home field (index 5) of a `getent passwd` line, or `None` if the line is
+/// malformed or the field is empty. Split out from the command call so the
+/// LDAP/relocated-home parsing is unit-testable.
+fn parse_passwd_home(getent_line: &str) -> Option<PathBuf> {
+    getent_line
+        .trim_end()
+        .split(':')
+        .nth(5)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 // ---- policy-file state -------------------------------------------------------
@@ -179,6 +210,15 @@ fn classify_policy(existing: Option<&str>) -> PolicyState {
 fn read_policy_state(actions_dir: &Path) -> PolicyState {
     let existing = std::fs::read_to_string(actions_dir.join(POLICY_FILE)).ok();
     classify_policy(existing.as_deref())
+}
+
+/// True when a host-side polkit action for Bitwarden's unlock is already present
+/// under EITHER the name Bitwarden's own setup writes or the one snapd installs.
+/// doctor keys on this so a snap-managed action counts as installed instead of
+/// advising a `bitwarden setup` that would then refuse (snapd owns its file).
+pub(crate) fn action_present() -> bool {
+    let dir = Path::new(ACTIONS_DIR);
+    dir.join(POLICY_FILE).exists() || dir.join(SNAPD_POLICY_FILE).exists()
 }
 
 /// Whether this boot is an ostree/immutable system (Silverblue, Kinoite…),
@@ -248,20 +288,26 @@ fn setup(apply: bool) -> ExitCode {
         );
     }
 
-    // Snap-only: snapd owns the host-side action; installing our copy too
-    // would leave two files declaring overlapping intent. Report and stop.
+    // snapd installs its own host-side action (SNAPD_POLICY_FILE) that already
+    // declares com.bitwarden.Bitwarden.unlock. If it is present, writing our
+    // copy would leave two files declaring the same action id, so stop here
+    // whatever else is installed (a snap alongside a flatpak or native package,
+    // not just a snap-only host). This is the coexistence case the old
+    // `flavors == [Snap]` guard missed.
+    if Path::new(ACTIONS_DIR).join(SNAPD_POLICY_FILE).exists() {
+        println!("[bitwarden] snapd already installed the polkit action ✓");
+        print_app_steps();
+        return ExitCode::SUCCESS;
+    }
+    // A snap-only host whose snapd action is still missing: only snapd can
+    // install it (that file is snapd's to own), so point at the plug connect
+    // rather than writing our own copy.
     if flavors == [Flavor::Snap] {
-        return if Path::new(ACTIONS_DIR).join(SNAPD_POLICY_FILE).exists() {
-            println!("[bitwarden] snap install: snapd already installed the polkit action ✓");
-            print_app_steps();
-            ExitCode::SUCCESS
-        } else {
-            println!(
-                "[bitwarden] snap install, but snapd's action file is missing. irlume does \
-                 not write it (snapd owns that file); try: sudo snap connect bitwarden:polkit"
-            );
-            ExitCode::FAILURE
-        };
+        println!(
+            "[bitwarden] snap install, but snapd's action file is missing. irlume does \
+             not write it (snapd owns that file); try: sudo snap connect bitwarden:polkit"
+        );
+        return ExitCode::FAILURE;
     }
 
     match read_policy_state(Path::new(ACTIONS_DIR)) {
@@ -310,15 +356,23 @@ fn setup(apply: bool) -> ExitCode {
     }
 
     let target = Path::new(ACTIONS_DIR).join(POLICY_FILE);
-    if let Err(e) = std::fs::write(&target, POLICY) {
+    // Write to a sibling temp then rename, so polkitd's directory monitor never
+    // sees a half-written (invalid) policy and a mid-write ENOSPC cannot leave a
+    // truncated file in place. Same directory keeps the rename atomic.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = Path::new(ACTIONS_DIR).join(".com.bitwarden.Bitwarden.policy.irlume-tmp");
+    // polkitd runs unprivileged (User=polkitd) and silently skips files it
+    // cannot read, so 0644 is a requirement, set explicitly rather than
+    // trusting the caller's umask; set it on the temp before the rename so the
+    // file is never briefly mode-0600 at its final path.
+    if let Err(e) = std::fs::write(&tmp, POLICY)
+        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)))
+        .and_then(|_| std::fs::rename(&tmp, &target))
+    {
+        let _ = std::fs::remove_file(&tmp);
         eprintln!("[bitwarden] writing {} failed: {e}", target.display());
         return ExitCode::FAILURE;
     }
-    // polkitd runs unprivileged (User=polkitd) and silently skips files it
-    // cannot read, so 0644 is a requirement, set explicitly rather than
-    // trusting the caller's umask.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644));
     // SELinux: a file CREATED in this directory inherits the default usr_t
     // label already; restorecon covers the remaining edge (a pre-staged file
     // moved into place keeps its old label, which makes polkitd skip it).
@@ -334,21 +388,37 @@ fn setup(apply: bool) -> ExitCode {
     );
     // Confirm from polkitd's side, not the filesystem's: pkaction resolves
     // the action only if the daemon parsed and registered the file. Catches
-    // the file-present-but-unreadable/mislabeled class of failure.
-    match std::process::Command::new("pkaction")
-        .args(["--action-id", "com.bitwarden.Bitwarden.unlock"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            println!("[bitwarden] polkit registered the action ✓ (pkaction sees it)")
+    // the file-present-but-unreadable/mislabeled class of failure. polkitd
+    // reloads the actions directory asynchronously (GFileMonitor), so a query
+    // fired immediately can miss a just-written file; poll for up to ~1s before
+    // warning, so a correct install does not print a false "not registered".
+    let probe = || {
+        std::process::Command::new("pkaction")
+            .args(["--action-id", "com.bitwarden.Bitwarden.unlock"])
+            .output()
+    };
+    // Err => pkaction not installed; skip the verification quietly.
+    if let Ok(mut out) = probe() {
+        for _ in 0..5 {
+            if out.status.success() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            match probe() {
+                Ok(next) => out = next,
+                Err(_) => break,
+            }
         }
-        Ok(_) => println!(
-            "[bitwarden] ⚠ polkit has not registered the action yet. Remedies: \
-             sudo systemctl restart polkit; on SELinux hosts check the label \
-             (restorecon -v {})",
-            target.display()
-        ),
-        Err(_) => {} // pkaction not installed; skip the verification quietly
+        if out.status.success() {
+            println!("[bitwarden] polkit registered the action ✓ (pkaction sees it)");
+        } else {
+            println!(
+                "[bitwarden] ⚠ polkit has not registered the action yet. Remedies: \
+                 sudo systemctl restart polkit; on SELinux hosts check the label \
+                 (restorecon -v {})",
+                target.display()
+            );
+        }
     }
 
     if crate::pamwire::polkit_wired() != Some(true) {
@@ -392,6 +462,30 @@ mod tests {
             classify_policy(Some("<policyconfig/>")),
             PolicyState::Differs
         );
+    }
+
+    #[test]
+    fn passwd_home_parses_relocated_and_ldap_layouts() {
+        use super::parse_passwd_home;
+        use std::path::PathBuf;
+        // Standard /home.
+        assert_eq!(
+            parse_passwd_home("alice:x:1000:1000:Alice:/home/alice:/bin/bash\n"),
+            Some(PathBuf::from("/home/alice"))
+        );
+        // LDAP/AD layout the old `/home/{u}` guess got wrong.
+        assert_eq!(
+            parse_passwd_home("bob:x:1234:1234::/home/CORP/bob:/bin/zsh\n"),
+            Some(PathBuf::from("/home/CORP/bob"))
+        );
+        // Relocated home on a custom mount.
+        assert_eq!(
+            parse_passwd_home("svc:x:900:900::/srv/svc:/usr/sbin/nologin"),
+            Some(PathBuf::from("/srv/svc"))
+        );
+        // Malformed / empty-home lines yield None (fall back to $HOME).
+        assert_eq!(parse_passwd_home("garbage"), None);
+        assert_eq!(parse_passwd_home("u:x:1:1:::/bin/sh"), None);
     }
 
     #[test]

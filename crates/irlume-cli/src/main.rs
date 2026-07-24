@@ -2538,8 +2538,10 @@ fn doctor() -> std::process::ExitCode {
     // prompt; wiring pam_irlume into polkit-1 is what lets a face satisfy it.
     // Bitwarden's polkit action file doubles as the tell that the user expects
     // biometric unlock to work (its flatpak/snap can't install it themselves).
-    let bitwarden_action =
-        std::path::Path::new("/usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy").exists();
+    // Counts both the filename Bitwarden's own setup writes AND the one snapd
+    // installs for a snap; keying on only the former made doctor tell snap users
+    // to run `bitwarden setup`, which then refuses (snapd owns that file).
+    let bitwarden_action = bitwarden::action_present();
     // The consent gesture is a head NOD by default (no calibration). Only the
     // opt-in closure gesture needs a per-user calibration; wired-but-uncalibrated
     // then silently falls to the password on every polkit prompt.

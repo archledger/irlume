@@ -38,6 +38,34 @@ const PAM_DIRS: &[&str] = &[
 pub fn report(origin: &InstallOrigin) {
     report_strays();
     report_overlay(origin);
+    report_shadow(origin);
+}
+
+/// A hand-built binary in a PATH-earlier directory (`/usr/local/bin`) shadowing
+/// the packaged one (`/usr/bin`): `irlume` on PATH runs the local copy, while
+/// the package manager verifies only its own path, so `report_overlay` can never
+/// see it. This is the more dangerous variant of the overlay it does catch (a
+/// PATH shadow, not an in-place overwrite), so flag it with the one-line fix.
+fn report_shadow(origin: &InstallOrigin) {
+    // A source install has no package to be shadowed; the local build IS it.
+    if matches!(origin, InstallOrigin::Source) {
+        return;
+    }
+    for name in ["irlume", "irlumed"] {
+        let local = format!("/usr/local/bin/{name}");
+        let packaged = format!("/usr/bin/{name}");
+        // Both present, and the local copy is not itself package-owned (some
+        // distros do package into /usr/local): that is a genuine shadow.
+        if std::path::Path::new(&local).exists()
+            && std::path::Path::new(&packaged).exists()
+            && package_owns(&local) != Some(true)
+        {
+            println!(
+                "[doctor] ⚠ {local} shadows the packaged {packaged} on PATH: `{name}` runs the\n     \
+                 hand-installed copy, not the package. Remove {local} to run the packaged build."
+            );
+        }
+    }
 }
 
 /// Stray = a file whose name starts with an irlume prefix, in a directory we
@@ -222,7 +250,18 @@ fn overlaid_paths(verify_output: &str) -> Vec<String> {
 /// --verify exits 0 even with failing files, so presence of parseable lines
 /// is the only signal.
 fn cmd_output_lossy(prog: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(prog).args(args).output().ok()?;
+    // Force the C locale: pacman runs its `warning:` prefix and the
+    // `(Size mismatch)` kind strings through gettext, so on a German or French
+    // host the overlay parser (which matches the English tokens) would miss
+    // every drift. rpm/dpkg use a fixed ASCII flag column, but pinning the
+    // locale for all three keeps the parsing language-independent. Matches the
+    // LC_ALL=C convention already used for keyring queries in secrets.rs.
+    let out = std::process::Command::new(prog)
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+        .ok()?;
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (!s.trim().is_empty()).then_some(s)

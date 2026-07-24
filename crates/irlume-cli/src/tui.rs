@@ -780,11 +780,11 @@ impl App {
         }
     }
 
-    /// Diagnostics without the slow profile poll: fast daemon reads + hardware
-    /// caps + fingerprint + the Repair checks. Tab switches use this so moving
-    /// between tabs never pays the ListProfiles TPM-unseal cost.
-    fn refresh_diagnostics(&mut self) {
-        self.refresh_light();
+    /// Re-derive hardware caps + fingerprint + the Repair checklist from the
+    /// CURRENT state (daemon reads + self.profiles). Split out so both refresh
+    /// paths run it AFTER their state reads, and run_checks never sees stale
+    /// profiles (a startup ordering bug showed a spurious "no enrollment" warn).
+    fn recompute_checks(&mut self) {
         // Re-derive hardware capabilities so a camera or reader hot-plugged
         // after launch reveals its tabs (caps/fp_present drive `visible` and the
         // Welcome gates, and were otherwise frozen at startup).
@@ -802,11 +802,23 @@ impl App {
         self.recompute_visible();
     }
 
+    /// Diagnostics without the slow profile poll: fast daemon reads + hardware
+    /// caps + fingerprint + the Repair checks (with the CACHED profile list).
+    /// Tab switches use this so moving between tabs never pays the ListProfiles
+    /// TPM-unseal cost.
+    fn refresh_diagnostics(&mut self) {
+        self.refresh_light();
+        self.recompute_checks();
+    }
+
     /// Full refresh incl. the slow profile poll: startup, after mutations, and
-    /// the heavy timer. Callers that just switched tabs use refresh_diagnostics.
+    /// suspend-return. Order matters: refresh_light sets `daemon_up` (which
+    /// refresh_profiles needs), profiles load, THEN recompute_checks runs so
+    /// run_checks sees the fresh profile list (not the stale/empty one).
     fn refresh(&mut self) {
+        self.refresh_light();
         self.refresh_profiles();
-        self.refresh_diagnostics();
+        self.recompute_checks();
     }
 
     /// Build the Repair-tab diagnostics from current state + quick local probes.

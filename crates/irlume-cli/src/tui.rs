@@ -588,7 +588,13 @@ impl App {
             advanced,
             daemon_down,
         } = state;
-        let needs_repair = daemon_down || checks.iter().any(|c| c.sev == Sev::Fail);
+        // Repair surfaces whenever there is ANYTHING to report (a failure OR an
+        // advisory), so the Welcome health summary's "→ see checks & repair"
+        // pointer is always reachable — a warning used to point at a hidden tab.
+        let needs_repair = daemon_down
+            || checks
+                .iter()
+                .any(|c| c.sev == Sev::Fail || c.sev == Sev::Warn);
         (0..SCREENS.len())
             .filter(|&i| match i {
                 // Essential face path requires a camera.
@@ -3681,13 +3687,16 @@ impl App {
                 // and an unhealthy one is pointed straight at it.
                 let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
                 let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
+                // needs_repair (compute_visible) surfaces the "checks & repair"
+                // hub row on any warn/fail, so this always points at a row that
+                // is right below and Enter-openable — no "switch to advanced" step.
                 if fails > 0 {
                     Line::from(vec![
                         Span::styled(
                             format!("  ✗ {fails} issue(s) need attention"),
                             Style::new().fg(th().err).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(" → open Repair (or [h] returns here)", Style::new().dim()),
+                        Span::styled(" → open \"checks & repair\" below", Style::new().dim()),
                     ])
                 } else if warns > 0 {
                     Line::from(vec![
@@ -3695,7 +3704,7 @@ impl App {
                             format!("  ⚠ {warns} advisory item(s)"),
                             Style::new().fg(th().warn),
                         ),
-                        Span::styled(" → see Repair", Style::new().dim()),
+                        Span::styled(" → open \"checks & repair\" below", Style::new().dim()),
                     ])
                 } else {
                     Line::from(Span::styled(
@@ -5681,11 +5690,15 @@ mod tests {
             ),
             vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_DONE]
         );
-        // …or when any check fails, but not for a mere warning.
+        // …and when anything needs reporting — a failure OR an advisory — so the
+        // Welcome health summary's "→ open checks & repair" pointer is reachable.
         let fail = [check_row("x", Sev::Fail, Fix::None)];
         assert!(App::compute_visible(&none, basic, &fail).contains(&SC_REPAIR));
         let warn = [check_row("x", Sev::Warn, Fix::None)];
-        assert!(!App::compute_visible(&none, basic, &warn).contains(&SC_REPAIR));
+        assert!(App::compute_visible(&none, basic, &warn).contains(&SC_REPAIR));
+        // But an all-clear basic view hides it.
+        let ok = [check_row("x", Sev::Ok, Fix::None)];
+        assert!(!App::compute_visible(&none, basic, &ok).contains(&SC_REPAIR));
     }
 
     #[test]

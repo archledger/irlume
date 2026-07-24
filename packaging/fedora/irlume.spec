@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.6.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -184,6 +184,15 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Thu Jul 24 2026 archledger <archledger236@gmail.com> - 0.6.1-1
+- Update resilience: login self-heal survives an inactive watcher and a
+  pre-marker upgrade; doctor warns on an unrecognized display manager; a pinned
+  camera pair re-anchors by device identity after a udev renumber.
+- Pre-release audit hardening (bitwarden setup, doctor install-hygiene, TUI
+  Ctrl-C, recovery passphrase floor) and liveness fail-closed on a missing
+  challenge model.
+- Model weights are fetched from the models-v1 release (Source2-5), off Git LFS.
+
 * Thu Jul 23 2026 archledger <archledger236@gmail.com> - 0.6.0-1
 - Face-approve app prompts via polkit (Bitwarden biometric unlock, pkexec) with
   a deliberate consent gesture (head nod, or eye closure after calibrate-closure);

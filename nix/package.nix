@@ -57,7 +57,9 @@
 
 rustPlatform.buildRustPackage {
   pname = "irlume";
-  version = "0.4.0";
+  # Derive from Cargo.toml so it never lags the released version (it had gone
+  # stale at 0.4.0). The workspace crates all use version.workspace = true.
+  version = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
   inherit src;
 
   # Vendored via importCargoLock. The two tss-esapi crates come from our

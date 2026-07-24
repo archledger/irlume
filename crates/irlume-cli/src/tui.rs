@@ -1256,14 +1256,18 @@ impl App {
                 "moiré screen-detector active; if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
                 Fix::None));
         }
-        // AppArmor: only on Debian-family, where irlume ships the profile
-        // (Fedora uses the SELinux module; Arch ships no LSM policy, so the
-        // securityfs node existing there is not a reason to nag). The installed
-        // profile is `usr.bin.irlumed` (what the .deb's postinst loads), not
-        // `usr.local.bin.*`.
-        if irlume_common::platform::distro_family() == irlume_common::platform::DistroFamily::Debian
-            && std::path::Path::new("/sys/kernel/security/apparmor").exists()
-        {
+        // AppArmor: only when it is ACTUALLY enabled on this boot, on any distro.
+        // Gating on distro was wrong (a user runs AppArmor on Arch too); gating on
+        // the securityfs node was too broad (it exists whenever the kernel built
+        // AppArmor, enabled or not). `/sys/module/apparmor/parameters/enabled` is
+        // "Y" only when AppArmor is live. irlume ships the profile as
+        // /etc/apparmor.d/usr.bin.irlumed on every packaged install (the daemon
+        // binary is /usr/bin/irlumed everywhere), so the confined-or-not check is
+        // the same path on all families.
+        let apparmor_enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+            .map(|s| s.trim() == "Y")
+            .unwrap_or(false);
+        if apparmor_enabled {
             let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists();
             v.push(mk(
                 "AppArmor",
@@ -1271,7 +1275,7 @@ impl App {
                 if profiled {
                     "irlume profile installed".into()
                 } else {
-                    "daemon unconfined; the .deb's AppArmor profile is not loaded".into()
+                    "daemon unconfined; the AppArmor hardening profile is not loaded".into()
                 },
                 if profiled {
                     Fix::None

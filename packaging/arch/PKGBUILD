@@ -62,6 +62,12 @@ package() {
     # The `irlume` system group (socket 0660 root:irlume); irlume.install runs
     # systemd-sysusers to create it.
     install -Dm0644 packaging/systemd/irlume.sysusers "$pkgdir/usr/lib/sysusers.d/irlume.conf"
+    # AppArmor profile for the daemon. Arch does not run AppArmor by default, so
+    # it sits inert unless the user boots with `lsm=...,apparmor`; irlume.install
+    # loads it only when apparmor_parser is present. The profile confines the
+    # /usr/bin/irlumed binary (same path Arch installs to) and already covers the
+    # system onnxruntime under /usr/lib, so no Arch-specific variant is needed.
+    install -Dm0644 packaging/apparmor/usr.bin.irlumed "$pkgdir/etc/apparmor.d/usr.bin.irlumed"
     install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

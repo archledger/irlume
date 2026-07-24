@@ -278,8 +278,11 @@ fn reconcile() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
-    if active_login_wired() {
+    if active_login_wired() && !lockscreen_regressed() {
         // Still intact; the common case after a spurious file-change event.
+        // Also re-apply when only the KDE lock screen regressed (its file is
+        // watched too, but active_login_wired alone would treat the login
+        // greeter staying wired as "nothing to do").
         return ExitCode::SUCCESS;
     }
     if effective_uid() != 0 {
@@ -310,12 +313,30 @@ fn active_login_wired() -> bool {
     etc.exists() && file_has_module(&etc)
 }
 
-/// Whether the self-heal marker says login WAS wired but the active greeter's
-/// stack no longer carries the module (a distro PAM regeneration stripped it):
-/// exactly the condition `login reconcile` repairs. The TUI's Repair tab uses
-/// this to offer the fix.
+/// Whether the KDE lock-screen face line regressed: the /etc/pam.d/kde override
+/// exists (so `login enable` materialized it) but no longer carries the module.
+/// A pambase / pam-auth-update regeneration can strip only the lock-screen file
+/// while leaving the DM's login greeter intact, which `active_login_wired`
+/// (login greeter only) would miss. A missing /etc file, or a non-KDE box, is
+/// not a regression — there is no lock-screen wiring there to maintain.
+fn lockscreen_regressed() -> bool {
+    path_regressed(Path::new(LOCKSCREEN.etc))
+}
+
+/// A wired PAM file that regressed: it still exists (so it WAS materialized/
+/// wired) but no longer carries the module. Split out from `lockscreen_regressed`
+/// for testability against a temp path.
+fn path_regressed(etc: &Path) -> bool {
+    etc.exists() && !file_has_module(etc)
+}
+
+/// Whether the self-heal marker says login WAS wired but the wiring no longer
+/// holds: either the active greeter's stack lost the module (a distro PAM
+/// regeneration stripped it) OR the KDE lock screen regressed. Exactly the
+/// condition `login reconcile` repairs. The TUI's Repair tab uses this to offer
+/// the fix.
 pub(crate) fn reconcile_needed() -> bool {
-    read_wired_marker().is_some() && !active_login_wired()
+    read_wired_marker().is_some() && (!active_login_wired() || lockscreen_regressed())
 }
 
 pub(crate) fn login_wired() -> bool {
@@ -1326,6 +1347,25 @@ mod tests {
 
     // Fedora gdm-password layout (real /etc file, the GDM greeter).
     const GDM: &str = "#%PAM-1.0\nauth     [success=done ...] pam_selinux_permit.so\nauth     substack      password-auth\nauth     optional      pam_gnome_keyring.so\naccount  include       password-auth\nsession  include       password-auth\nsession  optional      pam_gnome_keyring.so auto_start\n";
+
+    #[test]
+    fn path_regressed_flags_only_a_stripped_existing_file() {
+        let dir = std::env::temp_dir().join("irlume-pamwire-regress-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let wired = dir.join("kde-wired");
+        let stripped = dir.join("kde-stripped");
+        let absent = dir.join("kde-absent");
+        std::fs::write(&wired, "auth sufficient pam_irlume.so unseal ondemand\n").unwrap();
+        std::fs::write(&stripped, "auth include system-local-login\n").unwrap();
+        let _ = std::fs::remove_file(&absent);
+        // Stripped: the file is there (it was wired) but lost the module -> repair.
+        assert!(path_regressed(&stripped));
+        // Still wired: not a regression.
+        assert!(!path_regressed(&wired));
+        // Absent (non-KDE box / never wired): nothing to maintain, not a regression.
+        assert!(!path_regressed(&absent));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn greeter_block_wraps_password_substack() {

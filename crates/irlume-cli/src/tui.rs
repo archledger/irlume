@@ -5025,6 +5025,7 @@ mod tests {
             require_eyes_open: true,
             require_challenge: false,
             closure_calibrated: false,
+            ir_depth_floored: false,
         });
         assert!(ok);
         let (ok, _) = map_settings(Response::Error("boom".into()));

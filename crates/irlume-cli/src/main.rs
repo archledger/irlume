@@ -2613,10 +2613,26 @@ fn doctor() -> std::process::ExitCode {
     // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
     // back to the password, so this is not a lockout, but face login silently
     // stopped working. Surface it with the one-command fix.
-    let enrolled = matches!(
-        daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
-        Ok(irlume_common::Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()
-    );
+    let (enrolled, ir_depth_floored) =
+        match daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }) {
+            Ok(irlume_common::Response::Enrollment {
+                ref profiles,
+                ir_depth_floored,
+                ..
+            }) => (!profiles.is_empty(), ir_depth_floored),
+            _ => (false, false),
+        };
+    // An IR enrollment made before the per-user depth floor existed carries no
+    // recorded IR depth, so the personalized anti-print 3D-structure check never
+    // engages (new IR enrollments fit it automatically). Nudge a re-enroll to
+    // activate it. Secure/IR hardware only, and only when actually enrolled.
+    if enrolled && !ir_depth_floored && irlume_camera::capabilities().ir_pair {
+        println!(
+            "[doctor] {user}'s face enrollment predates the per-user IR depth floor (an\n     \
+             anti-print 3D-structure check that new IR enrollments fit automatically).\n     \
+             Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
+        );
+    }
     if enrolled && !crate::pamwire::login_wired() {
         println!(
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \

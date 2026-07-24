@@ -1223,9 +1223,9 @@ impl Engine {
     /// opted in (`require_challenge`) OR the current service forces it
     /// (`forced_consent`, polkit prompts). Failure downgrades to a non-grant
     /// with an Uncertain-style reason (PAM cascades to the password fallback,
-    /// never a lockout). When IR or the FaceMesh model is missing the opt-in
-    /// path logs and skips (never lock a user out of an undeployed model); the
-    /// forced path fails closed instead.
+    /// never a lockout). When IR or the FaceMesh model is missing, BOTH the
+    /// opt-in and the forced path fail closed to the password: a user who asked
+    /// for the challenge should not get a weaker grant when it cannot run.
     fn challenge_if_required(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
@@ -1248,10 +1248,26 @@ impl Engine {
             return Ok(outcome);
         }
         if !self.ir_available || self.mesh.is_none() {
-            if self.ir_available {
-                eprintln!("irlumed: passive liveness (require-challenge) is on but face_landmark.onnx is not loaded; skipping (set IRLUME_MESH_MODEL)");
-            }
-            return Ok(outcome);
+            // The user OPTED INTO the challenge, but it cannot run here (no IR,
+            // or face_landmark.onnx is not deployed). Fail CLOSED to the
+            // password rather than grant a face match weaker than they asked
+            // for. The password always works, so this is a fallback, not a
+            // lockout. (Was a silent skip-and-grant; the security audit flagged
+            // it as failing open on an explicit security opt-in.)
+            let why = if self.mesh.is_none() {
+                "face_landmark.onnx is not loaded (set IRLUME_MESH_MODEL)"
+            } else {
+                "this camera has no IR"
+            };
+            eprintln!(
+                "irlumed: passive liveness (require-challenge) is on but {why}; \
+                 denying, use your password"
+            );
+            return Ok(Outcome::deny_live(
+                OutcomeKind::OtherDeny,
+                outcome.score,
+                "passive liveness is required for this profile but cannot run here; use your password",
+            ));
         }
         use irlume_liveness::BlinkResult;
         Ok(match self.run_passive_liveness()? {
@@ -3671,8 +3687,8 @@ mod engine_tests {
         std::env::remove_var("IRLUME_POLKIT_GESTURE");
 
         // The shared engine runs IR-less (IRLUME_FORCE_NO_IR), where the blink
-        // gate cannot run. A FORCED gate must then withdraw the grant (fail
-        // closed) while the per-enrollment opt-in keeps its historical skip.
+        // gate cannot run. BOTH a FORCED gate and the per-enrollment opt-in must
+        // then withdraw the grant (fail closed to the password).
         let enr = Enrollment::new("irlume-test-consent");
         let granted = || Outcome::grant(0.9, "match");
         let out = s
@@ -3688,8 +3704,8 @@ mod engine_tests {
             .challenge_if_required(&opt_in, false, granted())
             .unwrap();
         assert!(
-            out.granted,
-            "opt-in path keeps its skip when the gate can't run"
+            !out.granted,
+            "opt-in path also fails closed when the gate can't run"
         );
 
         teardown_sandbox(&dir);
@@ -3802,21 +3818,22 @@ mod engine_tests {
             .unwrap();
         assert!(o.granted);
         // Flag on but no IR hardware (convenience tier): the blink challenge
-        // cannot run; the grant stands.
+        // cannot run, so it FAILS CLOSED to the password (a user who opted into
+        // the challenge does not get a weaker grant when it cannot run).
         assert!(!s.engine.ir_available);
         let o = s
             .engine
             .challenge_if_required(&enr_flag(true), false, grant())
             .unwrap();
-        assert!(o.granted);
-        // Flag on + IR + no mesh model deployed: logged skip, grant stands.
+        assert!(!o.granted, "no-IR + require-challenge must fail closed");
+        // Flag on + IR + no mesh model deployed: also fails closed to password.
         s.engine.ir_available = true;
         let mesh = s.engine.mesh.take();
         let o = s
             .engine
             .challenge_if_required(&enr_flag(true), false, grant())
             .unwrap();
-        assert!(o.granted);
+        assert!(!o.granted, "require-challenge + no mesh must fail closed");
         // Flag on + IR + mesh loaded: the passive-liveness capture actually
         // runs, and fails hard without a camera (a grant is never released on
         // an unverifiable challenge).

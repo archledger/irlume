@@ -356,6 +356,12 @@ pub enum Response {
         /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
         #[serde(default)]
         closure_calibrated: bool,
+        /// Whether this enrollment has a per-user IR depth floor fitted (>=2
+        /// scans carry recorded IR depth). False for enrollments made before the
+        /// depth-floor feature; surfaced so `doctor` can nudge a re-enroll to
+        /// activate the anti-print depth tightening.
+        #[serde(default)]
+        ir_depth_floored: bool,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),

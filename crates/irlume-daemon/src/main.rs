@@ -1198,12 +1198,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             .is_usable()
                         })
                         .unwrap_or(false),
+                    ir_depth_floored: enr.ir_depth_floor().is_some(),
                 },
                 Ok(None) => Response::Enrollment {
                     profiles: vec![],
                     require_eyes_open: false,
                     require_challenge: false,
                     closure_calibrated: false,
+                    ir_depth_floored: false,
                 },
                 Err(e) => Response::Error(e.to_string()),
             }

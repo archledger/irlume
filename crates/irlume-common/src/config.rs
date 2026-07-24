@@ -101,7 +101,19 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
         out.push_str(&format!("{key}={val}\n"));
     }
 
-    std::fs::write(&path, out)?;
+    // Create with mode 0600 so the file is never briefly world-readable in the
+    // window between write and chmod (umask can only clear bits, so 0600 stays
+    // at most 0600); set_permissions still normalizes an already-existing file.
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    f.write_all(out.as_bytes())?;
+    f.flush()?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }

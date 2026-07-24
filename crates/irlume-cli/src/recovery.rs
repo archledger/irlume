@@ -165,13 +165,25 @@ fn forget(user: &str) -> ExitCode {
 fn read_passphrase_confirmed() -> Option<String> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let first = rpassword::prompt_password("Recovery passphrase: ").ok()?;
-        let confirm = rpassword::prompt_password("Confirm recovery passphrase: ").ok()?;
-        if first != confirm {
+        let mut confirm = rpassword::prompt_password("Confirm recovery passphrase: ").ok()?;
+        let matched = first == confirm;
+        // Wipe the extra plaintext copy of the passphrase; the accepted one is
+        // zeroized downstream once wrapped in SecretBytes.
+        use zeroize::Zeroize;
+        confirm.zeroize();
+        if !matched {
             eprintln!("[recovery] passphrases do not match; aborted (nothing set).");
             return None;
         }
-        if first.is_empty() {
-            eprintln!("[recovery] empty passphrase; aborted.");
+        // Strength floor: this passphrase is the only barrier on the recovery
+        // envelope against an offline attacker with the disk, so reject a trivial
+        // one (a `1`). It is a recovery key, not a login PIN; length is the cheap,
+        // language-neutral proxy for entropy.
+        if first.chars().count() < MIN_RECOVERY_PASSPHRASE_CHARS {
+            eprintln!(
+                "[recovery] passphrase too short (minimum {MIN_RECOVERY_PASSPHRASE_CHARS} \
+                 characters); aborted (nothing set)."
+            );
             return None;
         }
         Some(first)
@@ -179,6 +191,11 @@ fn read_passphrase_confirmed() -> Option<String> {
         read_piped_line()
     }
 }
+
+/// Minimum recovery-passphrase length. A recovery key protects the template-key
+/// envelope against an offline/stolen-disk attacker, so it should not be a PIN;
+/// 12 characters is a modest floor that still allows a memorable phrase.
+const MIN_RECOVERY_PASSPHRASE_CHARS: usize = 12;
 
 fn read_passphrase_once(prompt: &str) -> Option<String> {
     let pass = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {

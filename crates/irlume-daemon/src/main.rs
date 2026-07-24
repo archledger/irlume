@@ -273,7 +273,19 @@ fn main() {
                 eprintln!("irlumed: socket restricted to root:irlume (0660)");
             }
         }
-        None => set_mode(&socket, 0o666),
+        None => {
+            // No `irlume` group: the socket is world-connectable. Privileged ops
+            // still require the peer-credential check, but the unprivileged
+            // endpoints (health tier, self-scoped identify) are now open to any
+            // local uid. A normal packaged install creates the group; warn loudly
+            // so a hand-rolled deployment notices it skipped that step.
+            eprintln!(
+                "irlumed: WARNING: no `irlume` group; socket left world-connectable (0666). \
+                 Create the group and restart so only greeters/users can connect: \
+                 groupadd -r irlume"
+            );
+            set_mode(&socket, 0o666);
+        }
     }
     eprintln!("irlumed: listening on {socket}");
     if irlume_common::dbglog::on() {

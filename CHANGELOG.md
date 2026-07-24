@@ -35,14 +35,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
-- **Ctrl-C during a suspended TUI action no longer kills the TUI.** In the
-  cooked terminal, SIGINT reaches the whole foreground group; the TUI now
-  shields itself while the child runs (the child keeps the default
-  disposition, so Ctrl-C still cancels it). Found when Ctrl-C in the
-  third-party-model license prompt took the whole TUI down.
+- **Ctrl-C during any suspended TUI action no longer kills the TUI.** In the
+  cooked terminal, SIGINT reaches the whole foreground group and the TUI had
+  the default (fatal) disposition. A no-op SIGINT handler now shields the TUI
+  around every suspended flow, including the in-place fingerprint, update, and
+  doctor actions, not only the sudo ones; a caught signal resets to the default
+  across exec, so a child (sudo, dnf, a prompt) still gets Ctrl-C. Found when
+  Ctrl-C in the third-party-model license prompt took the whole TUI down.
 - **Ctrl-modified letters no longer alias to plain-letter TUI actions.**
   Ctrl-C arrives as Char('c')+CONTROL and fired the calibrate binding;
   modifier-carrying letters are now ignored by the key dispatcher.
+- **The TUI runs its own binary for privileged steps, even shell-wrapped
+  ones.** The self-exe substitution only rewrote a bare `irlume` argument, so
+  the `sh -c "irlume selinux load && ..."` action resolved `irlume` from root's
+  PATH, a possibly older installed build. It now splices the running binary into
+  the command, and falls back to the PATH name only when an in-session update has
+  replaced the on-disk binary.
 - **Packaged installs can re-load the SELinux module after `login
   disable`.** The pp lookup never searched
   `/usr/share/selinux/packages/irlume.pp`, the irlume-selinux rpm's
@@ -66,7 +74,15 @@ All notable changes to irlume are documented here. This project adheres to
   `irlume doctor` now points at the command when Bitwarden is installed with
   polkit wired but no action registered. docs/APP-INTEGRATION.md rewritten
   around it; the old manual wget flow also mislabeled snap as needing manual
-  setup, which snapd has handled since Bitwarden 2025.3.
+  setup, which snapd has handled since Bitwarden 2025.3. Hardened for machines
+  with more than one Bitwarden: when snapd already owns the polkit action,
+  `setup` no longer writes a second file for the same action id (a snap next to
+  a flatpak or native package), and doctor no longer tells that working snap
+  install to run a command that would refuse. Per-user flatpak detection under
+  `sudo` resolves the real home from `getent passwd` instead of assuming
+  `/home/<name>`; the polkit confirmation polls up to a second so a correct
+  install is not misreported as unregistered; and the file is written via a
+  temp-then-rename so polkit never sees a half-written policy.
 
 - **`irlume doctor` reports install-hygiene drift.** Two related checks, both
   report-only: stray irlume-named files next to the managed binaries and the
@@ -78,7 +94,10 @@ All notable changes to irlume are documented here. This project adheres to
   silently replace; doctor names the file and the reinstall command). Both
   checks stay silent when the install is clean. Content drift is detected via
   the package manager's own verify (`rpm -V` / `dpkg --verify` /
-  `pacman -Qkk`); mtime-only drift is ignored.
+  `pacman -Qkk`), run in the C locale so a non-English `pacman` does not slip a
+  drift past the English-token parser; mtime-only drift is ignored. A hand-built
+  `/usr/local/bin/irlume` shadowing the packaged binary on `PATH` is also
+  flagged, since the package verify only checks its own path.
 
 - **Face-login self-heal survives an inactive watcher and an upgrade from a
   pre-marker install.** The 0.6.0 PAM-strip self-heal (`irlume-reconcile.path`)
@@ -108,6 +127,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 - NixOS now appears in the packaged badge and the comparison table's "Runs on"
   row (the `nixosModules.irlume` flake target already shipped).
+- The `irlume biopolicy <on|off|status>` operation-class toggle is now in
+  docs/COMMANDS.md (it was reachable in the CLI and TUI but undocumented).
 
 ### Security
 
@@ -121,6 +142,15 @@ All notable changes to irlume are documented here. This project adheres to
 - `cameras.conf` / `settings.conf` are created mode 0600 instead of
   written-then-chmod, closing the brief window where a new file was
   world-readable.
+- A profile that opted into the passive-blink liveness challenge now fails
+  closed to the password when the challenge cannot run (no IR camera, or the
+  FaceMesh model is not deployed), instead of granting without it. The password
+  always works, so this is a fallback, not a lockout; it was previously a silent
+  skip-and-grant.
+- The per-user IR depth floor (an anti-print 3D-structure check, fitted
+  automatically at every IR enrollment and enforced on both IR paths) is now
+  surfaced by doctor: on IR hardware, an enrollment made before the feature
+  existed carries no recorded depth, so doctor nudges a re-enroll to activate it.
 
 ## [0.6.0] - 2026-07-23
 

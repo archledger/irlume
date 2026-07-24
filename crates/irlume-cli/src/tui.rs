@@ -1130,7 +1130,7 @@ impl App {
                         "Method wiring",
                         Sev::Fail,
                         "method is fingerprint but pam_fprintd is not wired".into(),
-                        Fix::Manual("sudo irlume fingerprint enable --user <you>".into()),
+                        Fix::Manual("Fingerprint tab → [e] unlock with face OR fingerprint".into()),
                     ));
                 } else if self.fp.enrolled.is_empty() {
                     v.push(mk(
@@ -1313,7 +1313,7 @@ impl App {
                         "Third-party model",
                         Sev::Fail,
                         format!("'{name}' weights fail their checksum; the daemon refuses them (cue is OFF)"),
-                        Fix::Manual("re-fetch: sudo irlume models disable, then models enable".into()),
+                        Fix::Manual("Settings tab → [m] disable then re-enable the model".into()),
                     ));
                 }
             }
@@ -1325,7 +1325,7 @@ impl App {
                     "Recovery backstop",
                     Sev::Warn,
                     "templates encrypted but no recovery passphrase".into(),
-                    Fix::Manual("run `irlume recovery setup`".into()),
+                    Fix::Manual("Recovery tab → [s] set a recovery passphrase".into()),
                 ));
             } else {
                 v.push(mk(

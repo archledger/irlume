@@ -2054,6 +2054,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_saved_pair_with_unmatched_ids_falls_through() {
+        // Identities recorded, but the saved nodes carry no USB descriptor
+        // (device_identity -> None) and no discovered node matches the bogus
+        // ids: resolve re-searches by identity, finds nothing, and returns None
+        // so select_pair falls through to auto-discovery instead of opening the
+        // wrong sensor. Exercises the identity branch and find_node_by_identity.
+        assert_eq!(
+            resolve_saved_pair(
+                "/dev/null",
+                "/dev/zero",
+                Some("dead:beef:rgb"),
+                Some("dead:beef:ir")
+            ),
+            None
+        );
+        // A bogus identity never matches a real node either.
+        assert_eq!(find_node_by_identity("dead:beef:none", Role::Ir), None);
+    }
+
+    #[test]
     fn classify_unreadable_or_non_video_nodes_as_other() {
         assert_eq!(classify("/dev/irlume-test-missing"), Role::Other);
         // /dev/null opens but answers no V4L2 format ioctls.

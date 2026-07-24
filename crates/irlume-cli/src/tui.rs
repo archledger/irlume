@@ -233,6 +233,9 @@ enum Suspend {
     /// Toggle the opt-in biopolicy operation-class gate (the bool is the target
     /// state). Root op; the daemon reads it live, no restart.
     Biopolicy(bool),
+    /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
+    /// root-gates it; the raw measurements are a spoof-tuning oracle).
+    SelfTestLiveness,
 }
 
 /// What a y/n confirm modal executes on `[y]`: a daemon request (async, the
@@ -320,7 +323,6 @@ struct VisibilityInputs {
 enum OpTag {
     Generic,
     Identify,
-    Calibrate,
 }
 
 /// Fingerprint snapshot for the Fingerprint screen.
@@ -449,7 +451,6 @@ struct App {
     /// Last 1:N identify result, shown as a card on the Identify screen.
     identify_result: Option<(bool, String)>,
     /// Last IR liveness self-test result, shown on the Repair screen.
-    selftest_result: Option<(bool, String)>,
     /// Repair-tab diagnostics + selection.
     repair: Vec<Check>,
     repair_sel: usize,
@@ -554,7 +555,6 @@ impl App {
             suspend: None,
             resume_enroll: None,
             identify_result: None,
-            selftest_result: None,
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
@@ -1591,14 +1591,13 @@ impl App {
                 // camera). Identify/Generic keep the modal on failure.
                 if ok {
                     self.log('✓', msg.clone());
-                } else if !matches!(tag, OpTag::Calibrate | OpTag::Identify) {
+                } else if !matches!(tag, OpTag::Identify) {
                     self.set_error(msg.clone());
                 } else {
                     self.log('·', msg.clone());
                 }
                 match tag {
                     OpTag::Identify => self.identify_result = Some((ok, msg)),
-                    OpTag::Calibrate => self.selftest_result = Some((ok, msg)),
                     OpTag::Generic => {}
                 }
                 self.op = None;
@@ -1937,6 +1936,10 @@ impl App {
                     "disable the biopolicy gate"
                 },
                 &["irlume", "biopolicy", if on { "on" } else { "off" }],
+            ),
+            Suspend::SelfTestLiveness => self.sudo_step(
+                "run the IR liveness self-test",
+                &["irlume", "selftest", "liveness"],
             ),
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
@@ -2289,14 +2292,14 @@ impl App {
                 self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
                 self.suspend = Some(Suspend::Doctor);
             }
-            (SC_REPAIR, KeyCode::Char('l')) => self.start_async(
-                "SelfTest (IR liveness)",
-                OpTag::Calibrate,
-                Request::SelfTest {
-                    kind: irlume_common::SelfTestKind::Liveness,
-                },
-                map_selftest,
-            ),
+            // IR liveness self-test: the daemon root-gates it (the raw
+            // measurements are a spoof-tuning oracle), so like every other root
+            // action it suspends to sudo instead of failing with a peer-uid
+            // error on the direct socket call.
+            (SC_REPAIR, KeyCode::Char('l')) => {
+                self.log('→', "sudo irlume selftest liveness: fires the IR camera through the daemon and reports the liveness measurements");
+                self.suspend = Some(Suspend::SelfTestLiveness);
+            }
             // Cameras: IR emitter auto-setup (root; writes the persisted UVC
             // control) suspends to sudo; the [p] probe below is read-only.
             (SC_CAMERAS, KeyCode::Char('s')) => {
@@ -3915,19 +3918,10 @@ impl App {
                 Style::new().dim(),
             ),
         ]));
-        match &self.selftest_result {
-            Some((ok, d)) => lines.push(Line::from(vec![
-                Span::styled("  IR test   ", Style::new().dim()),
-                Span::styled(
-                    d.clone(),
-                    Style::new().fg(if *ok { th().ok } else { th().err }),
-                ),
-            ])),
-            None => lines.push(Line::from(Span::styled(
-                "  IR test    press [l] to run the IR PAD self-test (look at the camera)",
-                Style::new().dim(),
-            ))),
-        }
+        lines.push(Line::from(Span::styled(
+            "  IR test    press [l] to run the IR PAD self-test (sudo; look at the camera)",
+            Style::new().dim(),
+        )));
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim())
@@ -4583,14 +4577,6 @@ fn map_identify(resp: Response) -> (bool, String) {
     }
 }
 
-fn map_selftest(resp: Response) -> (bool, String) {
-    match resp {
-        Response::SelfTest { passed, detail } => (passed, detail),
-        Response::Error(e) => (false, e),
-        o => (false, format!("unexpected: {o:?}")),
-    }
-}
-
 /// Confirm-flow ops (delete profile/scan, forget keyring/recovery). Delete and
 /// recovery-forget ack with `Ok`; keyring-forget acks with `PasswordForgotten`.
 fn map_confirm(resp: Response) -> (bool, String) {
@@ -4825,7 +4811,6 @@ mod tests {
             suspend: None,
             resume_enroll: None,
             identify_result: None,
-            selftest_result: None,
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
@@ -5528,24 +5513,6 @@ mod tests {
     }
 
     #[test]
-    fn map_selftest_passes_through_verdict() {
-        assert_eq!(
-            map_selftest(Response::SelfTest {
-                passed: true,
-                detail: "depth 0.7".into()
-            }),
-            (true, "depth 0.7".into())
-        );
-        assert_eq!(
-            map_selftest(Response::SelfTest {
-                passed: false,
-                detail: "too flat".into()
-            }),
-            (false, "too flat".into())
-        );
-    }
-
-    #[test]
     fn map_confirm_accepts_ok_and_password_forgotten() {
         assert!(map_confirm(Response::Ok("deleted".into())).0);
         let (ok, msg) = map_confirm(Response::PasswordForgotten);
@@ -6169,22 +6136,15 @@ mod tests {
     }
 
     #[test]
-    fn repair_ir_selftest_lands_on_the_card_without_the_error_modal() {
-        let _sock = dead_socket();
+    fn repair_ir_selftest_suspends_to_sudo_not_a_direct_daemon_call() {
+        // The daemon root-gates SelfTest (spoof-tuning oracle), so [l] must run
+        // it via sudo like every other root action, not fail on a peer-uid
+        // error from a direct socket call.
         let mut app = test_app();
         app.screen = SC_REPAIR;
         app.on_key(KeyCode::Char('l'));
-        assert!(app.op.is_some());
-        wait_op_done(&mut app);
-        let (ok, _) = app
-            .selftest_result
-            .as_ref()
-            .expect("the self-test verdict must land on the Repair card");
-        assert!(!ok);
-        assert!(
-            app.error.is_none(),
-            "a self-test miss is a card result, not an error modal"
-        );
+        assert!(matches!(app.suspend, Some(Suspend::SelfTestLiveness)));
+        assert!(app.op.is_none() && app.error.is_none());
     }
 
     #[test]
@@ -6881,11 +6841,9 @@ mod tests {
         app.repair_sel = 2;
         let text = draw_text(&app);
         assert!(text.contains("press [f]: irlume runs the fix with sudo"));
-        // The IR self-test card: idle prompt, then the verdict.
+        // The IR self-test prompt (the result now shows in the terminal, run
+        // via sudo, so the card is a static "press [l]" prompt).
         assert!(text.contains("press [l] to run the IR PAD self-test"));
-        app.selftest_result = Some((true, "PAD pass: depth 0.71".into()));
-        let text = draw_text(&app);
-        assert!(text.contains("PAD pass: depth 0.71"));
     }
 
     #[test]

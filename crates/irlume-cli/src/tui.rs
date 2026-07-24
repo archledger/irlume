@@ -4502,7 +4502,7 @@ fn onoff(on: bool) -> Span<'static> {
 /// A screen state row: 2-space indent, label padded to `w`, then the value
 /// span. One shape for every status line so screens line up the same way.
 fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
-    Line::from(vec![Span::raw(format!("  {label:<w$}", w = w)), value])
+    Line::from(vec![Span::raw(format!("  {label:<w$}")), value])
 }
 
 /// An action line: accent `[key]` chips with dim labels, 2-space indent, a

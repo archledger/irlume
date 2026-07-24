@@ -109,6 +109,19 @@ All notable changes to irlume are documented here. This project adheres to
 - NixOS now appears in the packaged badge and the comparison table's "Runs on"
   row (the `nixosModules.irlume` flake target already shipped).
 
+### Security
+
+- The recovery passphrase now has a 12-character minimum at setup. It is the
+  only barrier on the template-key envelope against an offline attacker with the
+  disk, so a trivial passphrase is refused; the confirmation copy is zeroized
+  rather than left in the heap as plaintext.
+- `irlumed` warns loudly when no `irlume` group exists and it leaves the socket
+  world-connectable, instead of falling back to 0666 silently. Privileged
+  operations stay gated by the peer-credential check regardless.
+- `cameras.conf` / `settings.conf` are created mode 0600 instead of
+  written-then-chmod, closing the brief window where a new file was
+  world-readable.
+
 ## [0.6.0] - 2026-07-23
 
 ### Added

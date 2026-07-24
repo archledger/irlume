@@ -324,10 +324,18 @@ mod tests {
         // not panic the root daemon: clamp(0, -1) would invert its bounds and the
         // index would run past the slice. Sampling reads black instead, so the
         // detector finds no face and PAM falls back to the password.
-        let zero = RgbView { data: &[], width: 0, height: 0 };
+        let zero = RgbView {
+            data: &[],
+            width: 0,
+            height: 0,
+        };
         assert_eq!(zero.sample_bilinear(5.0, 5.0), [0.0; 3]);
         // Non-zero dims but a data buffer far too short for width*height*3.
-        let short = RgbView { data: &[10, 20, 30], width: 64, height: 48 };
+        let short = RgbView {
+            data: &[10, 20, 30],
+            width: 64,
+            height: 48,
+        };
         assert_eq!(short.sample_bilinear(40.0, 30.0), [0.0; 3]);
     }
 

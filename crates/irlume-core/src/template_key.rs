@@ -284,7 +284,10 @@ mod tests {
         // GCM auth failure surfaces as a decrypt error (Error::Policy), not a panic.
         let msg = format!("{err}");
         assert!(msg.contains("wrong recovery passphrase"), "got: {msg}");
-        assert!(!has_key("rt"), "a failed restore must not create a key file");
+        assert!(
+            !has_key("rt"),
+            "a failed restore must not create a key file"
+        );
 
         forget_recovery("rt").unwrap();
         std::env::remove_var("IRLUME_RECOVERY_DIR");

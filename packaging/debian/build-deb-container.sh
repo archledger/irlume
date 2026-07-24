@@ -33,12 +33,9 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${OUT:-$REPO}"
 
 command -v podman >/dev/null || { echo "need podman"; exit 1; }
-# Models must be real weights, not LFS pointer stubs (bundled into the .deb).
-for m in "$REPO"/models/*.onnx; do
-    if [ "$(stat -c%s "$m")" -lt 1000000 ] && grep -q git-lfs "$m" 2>/dev/null; then
-        echo "$m is an LFS pointer; run: git lfs pull"; exit 1
-    fi
-done
+# Models are hosted as release assets (not Git LFS); fetch + verify them so a
+# fresh checkout (CI, a clean clone) has real weights to bundle into the .deb.
+bash "$REPO/scripts/fetch-models.sh"
 
 echo "==> building universal .deb in $BASE (rustup $RUST_VER)"
 podman run --rm \
@@ -50,7 +47,7 @@ podman run --rm \
     apt-get update -qq
     # clang/libclang-dev: bindgen (v4l2-sys-mit) needs libclang at build time.
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
-        libtss2-dev libpam0g-dev clang libclang-dev git git-lfs xz-utils >/dev/null
+        libtss2-dev libpam0g-dev clang libclang-dev git xz-utils >/dev/null
     curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain '"$RUST_VER"' --profile minimal >/dev/null
     . "$HOME/.cargo/env"
     # Pinned nfpm, verified against its published (goreleaser-signed) checksums.
@@ -61,7 +58,6 @@ podman run --rm \
       [ -n "$want" ] && [ "$want" = "$got" ] || { echo "nfpm checksum mismatch"; exit 1; } )
     apt-get install -y -qq /tmp/nfpm.deb >/dev/null
     cp -r /src /build && cd /build
-    sed -i "/git lfs pull/d" packaging/debian/build-deb.sh   # models are already real in the mount
     bash packaging/debian/build-deb.sh
     cp -v *.deb /out/
   '

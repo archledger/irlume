@@ -41,8 +41,9 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
   template).
 - **Side channels**: the match comparison is value-independent in timing so a
   similarity score cannot be inferred from response time.
-- **Model integrity**: model weights are content-addressed in Git LFS
-  (SHA-256 object ids pinned in the repo) and ship inside the distro packages,
+- **Model integrity**: model weights are pinned by SHA-256 (committed in
+  `models/SHA256SUMS`; `scripts/fetch-models.sh` verifies each release-hosted
+  weight against its hash before use) and ship inside the distro packages,
   whose own integrity checking covers them; only the permissive, audited BOM is
   shipped. At startup the daemon re-hashes each configured model against the
   release manifest (`models/SHA256SUMS`, embedded at build time) and logs a

@@ -3,9 +3,10 @@
 #
 # Launchpad builders have NO network, so the orig tarball must be
 # self-contained: vendored crates (cargo vendor), the bundled onnxruntime
-# release libs, and the real ONNX model weights (not LFS pointers).
+# release libs, and the real ONNX model weights (fetched from the models-v1
+# release, see scripts/fetch-models.sh).
 #
-# Run on an Ubuntu/Debian box from a repo checkout with real LFS models.
+# Run on an Ubuntu/Debian box from a repo checkout (the script fetches models).
 #
 # The PPA targets ONLY the current Ubuntu LTS (its cargo is new enough for our
 # ort/edition-2024 deps). Older LTSs like noble (24.04, cargo 1.75) can't build
@@ -40,12 +41,8 @@ for tool in rsync cargo dpkg-buildpackage curl; do
     command -v "$tool" >/dev/null || { echo "need $tool"; exit 1; }
 done
 
-# Models must be real weights, not LFS pointer stubs.
-for m in "$REPO"/models/*.onnx; do
-    if [ "$(stat -c%s "$m")" -lt 1000000 ] && grep -q git-lfs "$m" 2>/dev/null; then
-        echo "$m is an LFS pointer - run: git lfs pull"; exit 1
-    fi
-done
+# Models are release assets (not Git LFS); fetch + verify them.
+bash "$REPO/scripts/fetch-models.sh"
 
 echo "==> staging source tree $TREE (irlume $DEBVER)"
 mkdir -p "$BUILDROOT"

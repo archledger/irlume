@@ -15,8 +15,8 @@ cd "$REPO"
 
 command -v nfpm >/dev/null || { echo "need nfpm (https://nfpm.goreleaser.com)"; exit 1; }
 
-# Real model weights, not LFS pointers.
-git lfs pull
+# Real model weights (from the models-v1 release, not Git LFS).
+bash "$REPO/scripts/fetch-models.sh"
 
 cargo build --release --locked
 

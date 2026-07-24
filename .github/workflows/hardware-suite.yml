@@ -35,21 +35,14 @@ jobs:
         with:
           persist-credentials: false
 
-      # No actions/cache here: on a self-hosted runner the repo's .git (with
-      # its LFS objects) persists in the runner work directory between runs,
-      # so this pull is a no-op after the first run; a round-trip to the
-      # Actions cache service would be pure overhead. Incremental build state
+      # No actions/cache here: on a self-hosted runner the fetched models/
+      # (gitignored, so a clean checkout leaves them) persist in the runner work
+      # directory between runs, so fetch-models.sh is a no-op after the first
+      # run; a round-trip to the Actions cache service would be pure overhead. Incremental build state
       # likewise persists via the runner-level CARGO_TARGET_DIR (set in the
       # runner's .env, outside the work dir so checkout's clean never wipes it).
-      - name: Pull model weights (Git LFS)
-        run: |
-          git lfs pull
-          # Guard against silent smudge-skip (exit 0 with pointer files left in
-          # the tree) — the failure mode of an unconfigured runner user.
-          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
-            echo "::error::model weights are LFS pointers — run 'git lfs install' for the runner user"
-            exit 1
-          fi
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: build (system rust, rolling Arch)
         run: cargo build --workspace --locked
@@ -125,13 +118,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Pull model weights (Git LFS)
-        run: |
-          git lfs pull
-          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
-            echo "::error::model weights are LFS pointers — run 'git lfs install' for the runner user"
-            exit 1
-          fi
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: Coverage (workspace + real-TPM + loopback cameras + PAM FFI)
         env:

@@ -1,15 +1,19 @@
 # Models
 
-irlume bundles a **permissive, GPLv3-compatible** model stack. All weights are
-committed to this repo via **Git LFS** (see `../.gitattributes`) and loaded from
-`/usr/share/irlume/models/` (packages) or this dir (dev); a clone or package is
-self-contained, no runtime download or fetch step. After cloning, run
-`git lfs pull` if your client didn't fetch LFS objects automatically.
+irlume bundles a **permissive, GPLv3-compatible** model stack. The weights are
+hosted as release assets on the version-independent `models-v1` release (kept
+OUT of Git LFS so builds do not consume the account's LFS bandwidth quota) and
+loaded from `/usr/share/irlume/models/` (packages) or this dir (dev). After a
+clone, fetch and sha256-verify them with `bash ../scripts/fetch-models.sh`; a
+distro package bundles them, so an installed system needs no download.
 
 `SHA256SUMS` holds the release checksums; the daemon embeds it at build time
 and warns at startup when a loaded model doesn't match (see ../SECURITY.md).
-After changing any shipped model, regenerate it and commit both:
-`cd models && sha256sum face_detection_yunet_2023mar.onnx face_landmark.onnx glintr100.onnx blaze_face_short_range.onnx > SHA256SUMS`.
+The same hashes are pinned in `scripts/fetch-models.sh`, the Fedora spec, the
+Arch PKGBUILD, and `flake.nix`. To change a shipped model: upload the new file
+to a fresh `models-vN` release, regenerate `SHA256SUMS`
+(`cd models && sha256sum *.onnx > SHA256SUMS`), and update the hash in all four
+places above plus the `models-vN` reference.
 
 | File | Stage | Source | License | Notes |
 |---|---|---|---|---|

@@ -68,8 +68,9 @@
         };
       in {
         # `nix build` / `nix run .#irlume`: build irlume from source. The model
-        # weights (Git LFS) install into the result; the NixOS module points the
-        # daemon at them. `src = self` uses the flake's own tree.
+        # weights are fetched by hash inside nix/package.nix (from the models-v1
+        # release, not Git LFS) and install into the result; the NixOS module
+        # points the daemon at them. `src = self` uses the flake's own tree.
         packages.default = pkgs.callPackage ./nix/package.nix { src = self; };
         packages.irlume = self.packages.${system}.default;
         # Exposed so CI can realize this fixed-output fetch and catch a stale

@@ -40,20 +40,19 @@ jobs:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        # Credentials stay persisted on this job only: `git lfs pull` below
-        # needs them on a cache miss. The token is contents:read.
 
-      # The ONNX models are ~257 MB of Git LFS objects; cache them keyed on
-      # models/SHA256SUMS (changes exactly when the weights do) instead of
-      # re-downloading against the LFS bandwidth quota every run.
-      - name: Cache Git LFS objects (ONNX model weights)
+      # The ONNX weights (~257 MB) are fetched from the models-v1 release, not
+      # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
+      # weights do) so a warm run skips the download (fetch-models.sh verifies
+      # the cached copies and no-ops).
+      - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .git/lfs
-          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
 
-      - name: Pull model weights (Git LFS)
-        run: git lfs pull
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: Install system build dependencies
         run: |
@@ -182,14 +181,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Cache Git LFS objects (ONNX model weights)
+      - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .git/lfs
-          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
 
-      - name: Pull model weights (Git LFS)
-        run: git lfs pull
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: Install system build dependencies
         run: |
@@ -236,14 +235,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Cache Git LFS objects (ONNX model weights)
+      - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .git/lfs
-          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
 
-      - name: Pull model weights (Git LFS)
-        run: git lfs pull
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: Install system build dependencies
         run: |
@@ -369,10 +368,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      # No lfs: true here. flake check --no-build only evaluates the outputs
+      # No model fetch here: flake check --no-build only evaluates the outputs
       # (flake structure, the package derivation, the NixOS module, the dev
-      # shell); it never reads the ONNX model contents, so the LFS pointer
-      # files left by a plain checkout are enough and the job stays fast.
+      # shell); it never reads the ONNX model contents, so a checkout without
+      # the weights (they are fetched by the build, not committed) is enough
+      # and the job stays fast.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

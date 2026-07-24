@@ -1,18 +1,11 @@
 # Packit: build irlume RPMs in Copr from signed GitHub tags (the linhello
-# pipeline). Models are Git LFS; Copr's srpm build must pull them.
+# pipeline). Model weights are release assets (Source2-5 in the spec, fetched
+# with net-on), not Git LFS, so there is nothing to pull at clone time.
 specfile_path: packaging/fedora/irlume.spec
 upstream_package_name: irlume
 downstream_package_name: irlume
 # Tags are v-prefixed (v0.1.1); without this the RPM Version keeps the "v".
 upstream_tag_template: "v{version}"
-
-srpm_build_deps:
-  - git-lfs
-
-actions:
-  post-upstream-clone:
-    - git lfs install
-    - git lfs pull
 
 jobs:
   - job: copr_build

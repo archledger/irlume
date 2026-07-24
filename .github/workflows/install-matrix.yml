@@ -23,16 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Same LFS cache as ci.yml (shared key): the model weights are ~257 MB
-      # and the LFS bandwidth quota is the reason ci.yml caches them.
-      - name: Cache Git LFS objects (ONNX model weights)
+      # Same model cache as ci.yml (shared key): the ~257 MB weights are
+      # fetched from the models-v1 release, cached so warm runs skip the pull.
+      - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .git/lfs
-          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
 
-      - name: Pull model weights (Git LFS)
-        run: git lfs pull
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: Build the .deb (packaging/debian/build-deb-container.sh)
         run: bash packaging/debian/build-deb-container.sh
@@ -87,33 +87,24 @@ jobs:
       - name: Install toolchain and system deps
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel git git-lfs rust clang pam tpm2-tss curl ca-certificates
+            base-devel git rust clang pam tpm2-tss curl ca-certificates
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Cache Git LFS objects (ONNX model weights)
+      - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .git/lfs
-          key: lfs-${{ hashFiles('models/SHA256SUMS') }}
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
 
-      - name: Pull model weights (Git LFS)
+      - name: Fetch model weights (models-v1 release, sha256-verified)
         run: |
           # Container job: checkout writes safe.directory into a temporary
-          # HOME, so later steps' git sees "dubious ownership" and git-lfs
-          # reports it as "Not in a Git repository" (first dispatch failed
+          # HOME, so later steps' git sees "dubious ownership" and git
+          # operations report "Not in a Git repository" (first dispatch failed
           # exactly here). Re-assert it in this step's real HOME.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          # Arch's git-lfs package does not preconfigure the smudge filters
-          # (Ubuntu runner images do), so a bare pull downloads objects but
-          # SKIPS checkout with exit 0 — pointer files remain and the engine
-          # tests fail with a cryptic protobuf error (second dispatch).
-          git lfs install --skip-repo
-          git lfs pull
-          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
-            echo "::error::model weights are still LFS pointers after pull"
-            exit 1
-          fi
+          bash scripts/fetch-models.sh
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 

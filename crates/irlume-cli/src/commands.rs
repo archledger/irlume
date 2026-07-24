@@ -124,7 +124,7 @@ pub fn update(args: &[String]) -> ExitCode {
                 "    git -C <clone> fetch --tags && git checkout {}",
                 latest.as_deref().unwrap_or("<latest>")
             );
-            println!("    git lfs pull && cargo build --release && sudo bash scripts/install-host.sh --ort <libonnxruntime.so>");
+            println!("    bash scripts/fetch-models.sh && cargo build --release && sudo bash scripts/install-host.sh --ort <libonnxruntime.so>");
         }
     }
     println!("  Release notes: https://github.com/archledger/irlume/releases");

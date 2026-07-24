@@ -40,16 +40,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Pull model weights (Git LFS, local no-op after first run)
-        run: |
-          git lfs pull
-          # `git lfs pull` exits 0 even when smudging was skipped ("Git LFS is
-          # not installed for this repository" — bitten on the first live run);
-          # a pointer file then fails 175 tests with a cryptic protobuf error.
-          if head -c 40 models/glintr100.onnx | grep -q "git-lfs"; then
-            echo "::error::model weights are LFS pointers — run 'git lfs install' for the runner user"
-            exit 1
-          fi
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
 
       - name: rustfmt
         run: cargo fmt --all --check

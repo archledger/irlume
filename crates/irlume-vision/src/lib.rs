@@ -11,7 +11,7 @@
 //!
 //! The weights ship inside the distro packages (installed to
 //! /usr/share/irlume/models and loaded from disk at daemon start; a git clone
-//! carries them via Git LFS, so there is no fetch-models step). Do NOT swap
+//! fetches them from the models-v1 release via scripts/fetch-models.sh). Do NOT swap
 //! in InsightFace buffalo_l/antelopev2 or YuNet's bundled SCRFD: their weights
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 
@@ -814,8 +814,8 @@ pub use onnx::{
     PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
-/// Model-backed pipeline tests: run the REAL shipped ONNX models (Git LFS,
-/// under `models/` at the repo root) on synthetic frames, asserting output
+/// Model-backed pipeline tests: run the REAL shipped ONNX models (fetched to
+/// `models/` at the repo root by scripts/fetch-models.sh) on synthetic frames, asserting output
 /// dimensions, value ranges, and determinism. Session creation is expensive, so
 /// each model is built once per test binary and shared behind a `OnceLock`.
 #[cfg(all(test, feature = "onnx"))]

@@ -144,19 +144,12 @@ headless SPICE host.
 
 ## Model weights and building from a remote flake
 
-The four ONNX model files ship in the repository through Git LFS, and the
-package installs them from the source tree into
-`$out/share/irlume/models/`. Building from a local checkout works as long as the
-LFS objects are present (`git lfs pull`), which they are after a normal clone
-with git-lfs installed.
-
-Fetching the flake straight from GitHub is the one case to watch: nix reads the
-git tree without running the LFS smudge filter, so a `nix build github:archledger/irlume`
-can land LFS pointer files instead of the real weights. Build from a checkout
-that has run `git lfs pull`, or add the model files to your own flake inputs, if
-you hit that. The daemon refuses to start on a truncated model when
-`IRLUME_MODELS_STRICT=1` is set, so a pointer file fails loudly rather than
-silently.
+The four ONNX model files are fetched by the flake from the `models-v1` GitHub
+release as hash-pinned `fetchurl` inputs, and the package installs them into
+`$out/share/irlume/models/`. Because they are fixed-output fetches keyed by
+sha256 (not Git LFS), `nix build github:archledger/irlume` gets the real weights
+with no smudge-filter caveat and no LFS bandwidth cost. The daemon still refuses
+to start on a truncated model when `IRLUME_MODELS_STRICT=1` is set.
 
 ## What was validated
 

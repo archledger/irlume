@@ -55,7 +55,7 @@ fn daemon_exits_promptly_on_sigterm() {
         return;
     };
     if !det.exists() || !model.exists() {
-        eprintln!("SKIP: models not present (git lfs pull)");
+        eprintln!("SKIP: models not present (bash scripts/fetch-models.sh)");
         return;
     }
 

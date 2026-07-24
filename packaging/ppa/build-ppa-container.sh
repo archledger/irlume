@@ -37,12 +37,9 @@ TAG="v${VERSION}"
 command -v podman >/dev/null || { echo "need podman"; exit 1; }
 git -C "$REPO" rev-parse "$TAG" >/dev/null 2>&1 || { echo "no git tag $TAG in $REPO"; exit 1; }
 
-# Models must be real weights (they ride in the orig tarball), not LFS pointers.
-for m in "$REPO"/models/*.onnx; do
-    if [ "$(stat -c%s "$m")" -lt 1000000 ] && grep -q git-lfs "$m" 2>/dev/null; then
-        echo "$m is an LFS pointer; run: git lfs pull"; exit 1
-    fi
-done
+# Models are release assets (not Git LFS); fetch + verify them so the orig
+# tarball carries real weights.
+bash "$REPO/scripts/fetch-models.sh"
 
 # Deterministic mtime for the orig tarball: the tag's commit date, same value a
 # native build derives, so re-runs on the same host are byte-identical.

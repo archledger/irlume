@@ -7,9 +7,11 @@
 *.embedding
 *.template
 
-# Model weights are ALL bundled in-repo via Git LFS (see .gitattributes +
-# models/README.md) so a clone/package is self-contained. The exceptions:
-# superseded model backups, kept locally for revert, never shipped.
+# Model weights are fetched from the models-v1 GitHub release
+# (scripts/fetch-models.sh, sha256-verified), NOT committed, so a clone stays
+# small and no build touches the Git LFS bandwidth quota. Ignore the downloaded
+# weights and the superseded backups kept locally for revert.
+models/*.onnx
 models/ir_adapter.onnx.v1-256
 models/face_landmark.onnx.legacy-192
 .deb-staging

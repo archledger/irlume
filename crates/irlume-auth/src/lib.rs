@@ -3327,7 +3327,8 @@ mod thirdparty_cue_tests {
     }
 }
 
-/// Engine tests against the REAL shipped models (Git LFS under `models/`), with
+/// Engine tests against the REAL shipped models (fetched under `models/` by
+/// scripts/fetch-models.sh), with
 /// the camera devices pointed at nonexistent nodes so no capture can ever run:
 /// everything from the capture boundary inward errors with "no camera found",
 /// and everything decided BEFORE the camera (enrollment state, bindings,

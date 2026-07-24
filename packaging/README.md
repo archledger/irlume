@@ -15,8 +15,10 @@ own recipe. Everything the daemon does at *runtime* stays capability-detected.
 | systemd units | `/usr/lib/systemd/system/irlumed.service` + `irlume-reconcile.path`/`.service` (self-heal watcher; all families incl. PPA enable the `.path`) |
 | LSM policy | Fedora SELinux module · Debian `apparmor/usr.bin.irlumed` (path-adjusted) · Arch none |
 
-Models are bundled (Git LFS); there is no fetch step. Packages that build from a git
-checkout must `git lfs pull` first so the real weights (not pointers) are staged.
+Models are hosted as release assets (the `models-v1` release), not Git LFS; each
+lane fetches and sha256-verifies them at build time (`scripts/fetch-models.sh`,
+or the Source URLs in the spec / PKGBUILD / flake). An installed package bundles
+the weights, so a running system needs no download.
 
 ## Per-family
 

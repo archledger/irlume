@@ -73,7 +73,7 @@ sudo systemctl revert irlumed && sudo systemctl restart irlumed
 
 ```sh
 git clone https://github.com/archledger/irlume
-cd irlume && git lfs pull
+cd irlume && bash scripts/fetch-models.sh
 cargo test --workspace
 ```
 

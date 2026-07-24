@@ -13,7 +13,7 @@ anywhere not listed, an issue report with your distro, camera, and
 | Fedora, current stable releases + rawhide | Copr `archledger/irlume` (`dnf copr enable` + `dnf install irlume`) | SELinux module ships as the `irlume-selinux` subpackage |
 | Ubuntu, current LTS | PPA `ppa:archledger/irlume` | the PPA carries the current LTS only |
 | Debian 12+, Ubuntu derivatives (Mint, Pop!\_OS, Zorin, elementary), older Ubuntu LTS | `.deb` from [Releases](https://github.com/archledger/irlume/releases) | needs glibc 2.35+; the package refuses anything older |
-| Arch | AUR package [`irlume`](https://aur.archlinux.org/packages/irlume) | builds from the signed release tag; models come via Git LFS |
+| Arch | AUR package [`irlume`](https://aur.archlinux.org/packages/irlume) | builds from the signed release tag; models come from the models-v1 release |
 | NixOS | `nixosModules.irlume` from this flake | declarative daemon + PAM wiring, see [NIXOS.md](NIXOS.md) |
 | anything else | from source | see [DEVELOPMENT.md](DEVELOPMENT.md); Rust 1.88+, onnxruntime 1.24+ |
 

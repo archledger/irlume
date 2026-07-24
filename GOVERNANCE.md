@@ -35,7 +35,7 @@ body. If the project grows more maintainers, this file changes first.
 ## Continuity
 
 Everything needed to continue the project is public: the source, the model
-weights (Git LFS in this repository), the packaging for every distribution
+weights (the models-v1 release assets), the packaging for every distribution
 lane (`packaging/`), the release process (`scripts/`), and the documentation.
 The license (GPL-3.0-or-later) permits anyone to fork and carry on. The only
 things a successor cannot inherit are the maintainer's accounts and signing

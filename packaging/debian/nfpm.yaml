@@ -43,7 +43,7 @@ contents:
     dst: /usr/bin/irlume
   - src: ../../target/release/libpam_irlume.so
     dst: /usr/lib/x86_64-linux-gnu/security/pam_irlume.so
-  # Bundled models (Git LFS pulled before build)
+  # Bundled models (fetched from the models-v1 release by build-deb.sh)
   - src: ../../models/glintr100.onnx
     dst: /usr/share/irlume/models/glintr100.onnx
   - src: ../../models/face_detection_yunet_2023mar.onnx

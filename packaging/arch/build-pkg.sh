@@ -15,11 +15,8 @@ cd "$REPO"
 
 command -v makepkg >/dev/null || { echo "run on Arch (needs makepkg)"; exit 1; }
 
-# Ensure real model weights (LFS). Tolerate a non-git export where they're
-# already present as real files.
-git lfs pull 2>/dev/null || true
-[ "$(stat -c%s models/glintr100.onnx 2>/dev/null || echo 0)" -gt 1000000 ] \
-  || { echo "models/glintr100.onnx missing/pointer; run 'git lfs pull' first"; exit 1; }
+# Fetch + verify the release-hosted model weights (not Git LFS).
+bash scripts/fetch-models.sh
 cargo build --release --locked 2>/dev/null || cargo build --release
 
 rm -rf "$BUILD"; mkdir -p "$BUILD"

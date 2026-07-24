@@ -18,15 +18,15 @@ biometric-data and model-license policy, PAD self-tests), read
 
 ## Get the source (with model weights)
 
-The ONNX models live in **Git LFS**, so a plain clone gives you pointer stubs,
-not real weights. You need the weights to *run* irlume or run tests that load a
-model (you can compile without them).
+The ONNX models are hosted as release assets (on the version-independent
+`models-v1` release), not committed to the repo, so a plain clone stays small
+and a fetch pulls the real weights. You need them to *run* irlume or run tests
+that load a model (you can compile without them).
 
 ```sh
 git clone https://github.com/archledger/irlume.git
 cd irlume
-git lfs install
-git lfs pull            # fetch the real models/*.onnx
+bash scripts/fetch-models.sh   # download + sha256-verify models/*.onnx
 ```
 
 ## Option A: Nix (recommended)
@@ -83,7 +83,7 @@ Install the build dependencies, then use `cargo` as usual.
 
 ```sh
 sudo dnf install cargo rust clang-devel pkgconf-pkg-config gcc \
-    pam-devel tpm2-tss-devel kernel-headers git-lfs
+    pam-devel tpm2-tss-devel kernel-headers curl
 ```
 
 **Ubuntu / Debian**: the archive's `rustc` is usually too old (the `ort`
@@ -92,14 +92,14 @@ binding needs Rust ≥ 1.88), so install the toolchain with
 
 ```sh
 sudo apt install build-essential pkg-config clang libclang-dev \
-    libpam0g-dev libtss2-dev git-lfs
+    libpam0g-dev libtss2-dev curl
 rustup toolchain install 1.88.0   # or newer stable
 ```
 
 **Arch**
 
 ```sh
-sudo pacman -S --needed base-devel rust clang tpm2-tss pam onnxruntime-cpu git-lfs
+sudo pacman -S --needed base-devel rust clang tpm2-tss pam onnxruntime-cpu curl
 ```
 
 ### ONNX runtime (non-Nix)
@@ -243,7 +243,7 @@ load-failure message re-enters the API lock being initialized.
 ### Using landmark_dump
 
 ```sh
-git lfs pull                                     # real model weights
+bash scripts/fetch-models.sh                                     # real model weights
 export ORT_DYLIB_PATH=/path/to/libonnxruntime.so # see above
 cargo run --release -p irlume-auth --example landmark_dump -- \
   models/face_detection_yunet_2023mar.onnx models/face_landmark.onnx \

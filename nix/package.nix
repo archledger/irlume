@@ -18,10 +18,41 @@
   tpm2-tss,
   linux-pam,
   linuxHeaders,
+  fetchurl,
+  runCommand,
   # Source tree. The flake passes `self`; a plain `nix-build` falls back to a
-  # cleaned copy of the repo root (drops target/ and .git, keeps the LFS-pulled
-  # models/ which the package installs).
+  # cleaned copy of the repo root (drops target/ and .git).
   src ? lib.cleanSource ../.,
+  # The ONNX model weights are NOT in the source tree (moved out of Git LFS so
+  # builds do not consume the account's LFS bandwidth quota); fetch them by hash
+  # from the models-v1 release. A directory of the four *.onnx files that
+  # postInstall copies into the result. Keep these hashes in step with
+  # models/SHA256SUMS (nix prints the correct hash on a mismatch).
+  models ?
+    runCommand "irlume-models" {
+      glintr100 = fetchurl {
+        url = "https://github.com/archledger/irlume/releases/download/models-v1/glintr100.onnx";
+        sha256 = "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60";
+      };
+      yunet = fetchurl {
+        url = "https://github.com/archledger/irlume/releases/download/models-v1/face_detection_yunet_2023mar.onnx";
+        sha256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4";
+      };
+      landmark = fetchurl {
+        url = "https://github.com/archledger/irlume/releases/download/models-v1/face_landmark.onnx";
+        sha256 = "821683be088447839638f79d64268bd501bdb72e5d9e262ec981c7e252956caf";
+      };
+      blaze = fetchurl {
+        url = "https://github.com/archledger/irlume/releases/download/models-v1/blaze_face_short_range.onnx";
+        sha256 = "c5453678015f6289c1d77bda88a8ba9c87574f01de1a05ba1909b9a7e08b237b";
+      };
+    } ''
+      mkdir -p "$out"
+      cp "$glintr100" "$out/glintr100.onnx"
+      cp "$yunet" "$out/face_detection_yunet_2023mar.onnx"
+      cp "$landmark" "$out/face_landmark.onnx"
+      cp "$blaze" "$out/blaze_face_short_range.onnx"
+    '',
 }:
 
 rustPlatform.buildRustPackage {
@@ -71,7 +102,7 @@ rustPlatform.buildRustPackage {
       "$out/lib/security/pam_irlume.so"
 
     install -d "$out/share/irlume/models"
-    install -m0644 models/*.onnx "$out/share/irlume/models/"
+    install -m0644 ${models}/*.onnx "$out/share/irlume/models/"
   '';
 
   meta = {

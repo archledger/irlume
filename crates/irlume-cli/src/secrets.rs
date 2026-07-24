@@ -124,6 +124,21 @@ fn parse_locked(reply: &str) -> Option<bool> {
 
 /// Print one doctor line about the login keyring, or nothing when there is no
 /// session bus to inspect (e.g. under sudo). Only call for the current user.
+/// For the TUI Repair check: `Some(true)` when a Secret Service provider is up
+/// but the login collection is LOCKED (apps like Bitwarden can't read secrets),
+/// `Some(false)` when unlocked, `None` when there's no session bus or provider
+/// to judge (so Repair stays quiet rather than warning on a headless/no-wallet
+/// box). Only meaningful run as the user (a session bus), like the report.
+pub(crate) fn login_keyring_locked() -> Option<bool> {
+    if !have_session_bus() {
+        return None;
+    }
+    match query_collection() {
+        Collection::Present { locked } => Some(locked),
+        Collection::NoProvider => None,
+    }
+}
+
 pub fn report_keyring_status() {
     if !have_session_bus() {
         return;

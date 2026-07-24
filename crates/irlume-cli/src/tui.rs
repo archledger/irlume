@@ -1248,6 +1248,26 @@ impl App {
             ));
         }
 
+        // Login keyring LOCKED: a Secret Service provider is up but its login
+        // collection is locked, so apps (Bitwarden, browsers) can't read their
+        // secrets even after a face login. Only flag it when the keyring is
+        // armed (else it's expected) and a provider actually answered. The TUI
+        // runs as the user, so unlike `sudo doctor` it can see the session bus.
+        if self.keyring_armed == Some(true) {
+            if let Some(true) = crate::secrets::login_keyring_locked() {
+                v.push(mk(
+                    "Login keyring",
+                    Sev::Warn,
+                    "the wallet is locked; apps (Bitwarden, browsers) can't read secrets yet"
+                        .into(),
+                    Fix::Manual(
+                        "unlock it by logging in with your face, or `sudo irlume keyring arm`"
+                            .into(),
+                    ),
+                ));
+            }
+        }
+
         // Keyring PCR-drift: the seal no longer matches the current PCRs (a
         // firmware/Secure Boot update moved them), so face login silently stops
         // opening the wallet until re-bound. Only the Keyring tab drew this;
@@ -3681,8 +3701,10 @@ impl App {
     /// to run, with one-key fixes, plus platform trust anchors and a live IR PAD
     /// self-test. Covers the `irlume doctor`/`diag`/`deps` checks that have a
     /// remediation or that a TUI-only user would otherwise miss (daemon, models,
-    /// cameras, SELinux/AppArmor, wiring drift, keyring drift, recovery, TPM,
-    /// third-party-model checksum). Some advisory-only doctor lines (fingerprint
+    /// cameras, SELinux/AppArmor, wiring drift, keyring drift, login-keyring
+    /// locked, recovery, TPM, third-party-model checksum). The full text
+    /// readout (incl. info-only lines) is one key away via the `[d]` key. Some
+    /// advisory-only doctor lines (fingerprint
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
         use irlume_common::secureboot;

@@ -688,26 +688,6 @@ impl App {
                 }),
                 _ => None, // older daemon / daemon down → Repair falls back to local probes
             };
-            match crate::daemon_poll(&Request::ListProfiles {
-                user: self.user.clone(),
-            }) {
-                Ok(Response::Enrollment {
-                    profiles,
-                    require_eyes_open,
-                    require_challenge,
-                    ..
-                }) => {
-                    self.profiles = profiles;
-                    self.eyes_open = require_eyes_open;
-                    self.challenge = require_challenge;
-                    self.enroll_error = None;
-                }
-                // A corrupt/unreadable enrollment (or a missing template key for an
-                // encrypted file) surfaces as an Error, not empty; don't silently
-                // show "no face enrolled"; capture it so Repair can flag+fix it.
-                Ok(Response::Error(e)) => self.enroll_error = Some(e),
-                _ => {}
-            }
             // KeyringInfo adds the seal tier and PCR drift; an older daemon
             // answers it with an error, so fall back to the plain armed bit.
             match crate::daemon_poll(&Request::KeyringInfo {
@@ -768,7 +748,42 @@ impl App {
     /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
     /// on demand (`[r]`), after an op, and when opening Repair/Fingerprint, but
     /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
-    fn refresh(&mut self) {
+    /// Poll the enrollment list. This is the ONE slow read (a ListProfiles
+    /// triggers a TPM unseal of the template key to decrypt the profiles,
+    /// ~350ms measured), so it is kept OUT of the frequent refresh paths and
+    /// out of tab switches. Called only where a change can have happened: at
+    /// startup, after a TUI mutation, when entering the Profiles tab, and on
+    /// the slow heavy timer (for external `irlume enroll` changes).
+    fn refresh_profiles(&mut self) {
+        if !self.daemon_up {
+            return;
+        }
+        match crate::daemon_poll(&Request::ListProfiles {
+            user: self.user.clone(),
+        }) {
+            Ok(Response::Enrollment {
+                profiles,
+                require_eyes_open,
+                require_challenge,
+                ..
+            }) => {
+                self.profiles = profiles;
+                self.eyes_open = require_eyes_open;
+                self.challenge = require_challenge;
+                self.enroll_error = None;
+            }
+            // A corrupt/unreadable enrollment (or a missing template key for an
+            // encrypted file) surfaces as an Error, not empty; don't silently
+            // show "no face enrolled"; capture it so Repair can flag+fix it.
+            Ok(Response::Error(e)) => self.enroll_error = Some(e),
+            _ => {}
+        }
+    }
+
+    /// Diagnostics without the slow profile poll: fast daemon reads + hardware
+    /// caps + fingerprint + the Repair checks. Tab switches use this so moving
+    /// between tabs never pays the ListProfiles TPM-unseal cost.
+    fn refresh_diagnostics(&mut self) {
         self.refresh_light();
         // Re-derive hardware capabilities so a camera or reader hot-plugged
         // after launch reveals its tabs (caps/fp_present drive `visible` and the
@@ -785,6 +800,13 @@ impl App {
         // Visibility is state-driven (Repair appears when something fails);
         // re-derive it from the fresh diagnostics.
         self.recompute_visible();
+    }
+
+    /// Full refresh incl. the slow profile poll: startup, after mutations, and
+    /// the heavy timer. Callers that just switched tabs use refresh_diagnostics.
+    fn refresh(&mut self) {
+        self.refresh_profiles();
+        self.refresh_diagnostics();
     }
 
     /// Build the Repair-tab diagnostics from current state + quick local probes.
@@ -1641,7 +1663,11 @@ impl App {
                 && self.confirm.is_none()
             {
                 if last_heavy.elapsed() >= Duration::from_millis(HEAVY_REFRESH_MS) {
-                    self.refresh(); // cheap + fingerprint + diagnostics
+                    // Diagnostics only, NOT the slow profile poll: keeping the
+                    // ListProfiles TPM-unseal off every timer tick is what makes
+                    // the UI stay smooth. Profiles refresh on mutation / Profiles
+                    // tab / startup instead.
+                    self.refresh_diagnostics();
                     last_heavy = std::time::Instant::now();
                     last_light = std::time::Instant::now();
                 } else if last_light.elapsed() >= Duration::from_millis(LIGHT_REFRESH_MS) {
@@ -2069,8 +2095,13 @@ impl App {
         let new_pos = (((pos + d) % n + n) % n) as usize;
         self.screen = self.visible[new_pos];
         self.sel = 0;
+        // Fast diagnostics on entering Repair/Fingerprint (no slow profile
+        // poll, so the switch is instant); a fresh profile poll only when
+        // landing on Profiles, where an external `irlume enroll` should show.
         if self.screen == SC_REPAIR || self.screen == SC_FINGERPRINT {
-            self.refresh();
+            self.refresh_diagnostics();
+        } else if self.screen == SC_PROFILES {
+            self.refresh_profiles();
         }
     }
 
@@ -2098,8 +2129,12 @@ impl App {
                 if let Some((_, _, target)) = self.hub_rows().get(self.hub_sel).copied() {
                     self.screen = target;
                     self.sel = 0;
+                    // Same fast paths as a Tab switch: diagnostics for
+                    // Repair/Fingerprint, a fresh profile poll for Profiles.
                     if target == SC_REPAIR || target == SC_FINGERPRINT {
-                        self.refresh();
+                        self.refresh_diagnostics();
+                    } else if target == SC_PROFILES {
+                        self.refresh_profiles();
                     }
                 }
             }

@@ -454,6 +454,20 @@ fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
     }
 }
 
+/// The active display manager and whether irlume has a PAM-service mapping for
+/// it. `None` when no display-manager.service is set (headless / a non-DM
+/// greeter). Doctor uses the `false` case to warn: `active_display_manager`
+/// still resolves the symlink, but a brand-new or renamed DM has no
+/// `dm_pam_services` entry, so `login enable` can't target it and face login
+/// silently stays on the password. This is the proactive counterpart to the
+/// biopolicy `Unknown` deny: catch the unmapped DM at `doctor` time instead of
+/// at a failed unlock.
+pub(crate) fn active_dm_recognized() -> Option<(String, bool)> {
+    let dm = active_display_manager()?;
+    let recognized = dm_pam_services(&dm).0 != "(unknown)";
+    Some((dm, recognized))
+}
+
 /// SELinux module load state for the TUI (None = can't tell without root).
 pub(crate) fn selinux_state() -> Option<bool> {
     selinux_loaded()

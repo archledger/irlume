@@ -601,7 +601,11 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                SC_SETTINGS => advanced,
+                // Settings holds user preferences (eyes-open, blink, biopolicy,
+                // third-party models), not diagnostics, so it is always
+                // reachable — hiding config behind "advanced" both buries it and
+                // creates dead-end pointers (a Repair fix references Settings).
+                SC_SETTINGS => true,
                 // Repair: only when something needs attention (or advanced view).
                 SC_REPAIR => advanced || needs_repair,
                 // Keyring unlock: an IR camera (face releases the credential) OR a
@@ -5634,12 +5638,19 @@ mod tests {
         // No biometric hardware: only the always-on steps.
         assert_eq!(
             App::compute_visible(&none, basic, &[]),
-            vec![SC_WELCOME, SC_PAM, SC_DONE]
+            vec![SC_WELCOME, SC_PAM, SC_SETTINGS, SC_DONE]
         );
         // RGB-only adds the face path (Profiles + Recovery), not Keyring.
         assert_eq!(
             App::compute_visible(&rgb, basic, &[]),
-            vec![SC_WELCOME, SC_PROFILES, SC_RECOVERY, SC_PAM, SC_DONE]
+            vec![
+                SC_WELCOME,
+                SC_PROFILES,
+                SC_RECOVERY,
+                SC_PAM,
+                SC_SETTINGS,
+                SC_DONE
+            ]
         );
         // An IR pair earns the Keyring step.
         assert_eq!(
@@ -5650,6 +5661,7 @@ mod tests {
                 SC_KEYRING,
                 SC_RECOVERY,
                 SC_PAM,
+                SC_SETTINGS,
                 SC_DONE
             ]
         );
@@ -5663,7 +5675,14 @@ mod tests {
                 },
                 &[]
             ),
-            vec![SC_WELCOME, SC_KEYRING, SC_FINGERPRINT, SC_PAM, SC_DONE]
+            vec![
+                SC_WELCOME,
+                SC_KEYRING,
+                SC_FINGERPRINT,
+                SC_PAM,
+                SC_SETTINGS,
+                SC_DONE
+            ]
         );
         // Advanced view on full hardware shows every screen.
         assert_eq!(
@@ -5688,7 +5707,7 @@ mod tests {
                 },
                 &[]
             ),
-            vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_DONE]
+            vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_SETTINGS, SC_DONE]
         );
         // …and when anything needs reporting — a failure OR an advisory — so the
         // Welcome health summary's "→ open checks & repair" pointer is reachable.
@@ -5731,12 +5750,17 @@ mod tests {
         let mut app = test_app();
         app.advanced = true;
         app.recompute_visible();
-        app.screen = SC_SETTINGS;
+        // Identify is advanced-only; leaving advanced view must snap off it.
+        app.screen = SC_IDENTIFY;
         app.advanced = false;
         app.recompute_visible();
-        assert_eq!(
-            app.screen, SC_PAM,
-            "leaving advanced view must land on the nearest visible step"
+        assert_ne!(
+            app.screen, SC_IDENTIFY,
+            "leaving advanced view must land on a still-visible step"
+        );
+        assert!(
+            app.visible.contains(&app.screen),
+            "the landed screen is visible"
         );
     }
 
@@ -7099,11 +7123,11 @@ mod tests {
 
     #[test]
     fn header_counts_steps_over_visible_screens_only() {
-        let mut app = test_app(); // visible: Welcome, Login wiring, Done
+        let mut app = test_app(); // visible: Welcome, Login wiring, Settings, Done
         app.screen = SC_PAM;
         let text = draw_text(&app);
         assert!(
-            text.contains("step 2/3: Login wiring"),
+            text.contains("step 2/4: Login wiring"),
             "the step counter must track visible tabs, got:\n{text}"
         );
         assert!(text.contains("testuser"), "the managed user is shown");

@@ -7,6 +7,9 @@ set -e
 if command -v apparmor_parser >/dev/null 2>&1; then
     apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>/dev/null || true
 fi
+# Create the `irlume` system group so the daemon can restrict its socket to
+# 0660 root:irlume (Debian/Ubuntu do not run sysusers.d automatically).
+systemd-sysusers /usr/lib/sysusers.d/irlume.conf 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 # Enable + start ONLY on first install ($2 empty). On an upgrade, re-enabling
 # would override a unit the user deliberately disabled; try-restart below picks

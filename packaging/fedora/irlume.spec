@@ -105,6 +105,9 @@ install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlume
 # missing). Enabled by preset; harmless when login was never wired.
 install -Dm0644 packaging/systemd/irlume-reconcile.path %{buildroot}%{_unitdir}/irlume-reconcile.path
 install -Dm0644 packaging/systemd/irlume-reconcile.service %{buildroot}%{_unitdir}/irlume-reconcile.service
+# The `irlume` system group (socket 0660 root:irlume). The systemd file trigger
+# runs systemd-sysusers on install to create it.
+install -Dm0644 packaging/systemd/irlume.sysusers %{buildroot}%{_sysusersdir}/irlume.conf
 # Bundled onnxruntime runtime + a drop-in pointing ORT_DYLIB_PATH at it (cp -a
 # to preserve the .so version symlinks).
 install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
@@ -178,6 +181,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_unitdir}/irlumed.service.d/10-ort.conf
 %{_unitdir}/irlume-reconcile.path
 %{_unitdir}/irlume-reconcile.service
+%{_sysusersdir}/irlume.conf
 %{_presetdir}/90-irlume.preset
 
 %files selinux

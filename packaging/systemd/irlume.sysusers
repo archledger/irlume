@@ -1,0 +1,5 @@
+# Create the `irlume` system group. The daemon restricts its control socket to
+# 0660 root:irlume when this group exists (only greeters and members can connect;
+# SO_PEERCRED is still the real authorization boundary). Without the group the
+# socket falls back to 0666 (world-connectable) and irlumed warns at startup.
+g irlume -

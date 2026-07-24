@@ -1256,22 +1256,29 @@ impl App {
                 "moiré screen-detector active; if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
                 Fix::None));
         }
-        // AppArmor (Debian-family) parity with the SELinux check.
-        if std::path::Path::new("/sys/kernel/security/apparmor").exists() {
-            let profiled = std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
+        // AppArmor: only on Debian-family, where irlume ships the profile
+        // (Fedora uses the SELinux module; Arch ships no LSM policy, so the
+        // securityfs node existing there is not a reason to nag). The installed
+        // profile is `usr.bin.irlumed` (what the .deb's postinst loads), not
+        // `usr.local.bin.*`.
+        if irlume_common::platform::distro_family() == irlume_common::platform::DistroFamily::Debian
+            && std::path::Path::new("/sys/kernel/security/apparmor").exists()
+        {
+            let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists();
             v.push(mk(
                 "AppArmor",
                 if profiled { Sev::Ok } else { Sev::Warn },
                 if profiled {
                     "irlume profile installed".into()
                 } else {
-                    "daemon unconfined; optional hardening profile available".into()
+                    "daemon unconfined; the .deb's AppArmor profile is not loaded".into()
                 },
                 if profiled {
                     Fix::None
                 } else {
                     Fix::Manual(
-                        "install packaging/apparmor/usr.local.bin.irlumed (see repo)".into(),
+                        "reinstall the package, or: apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed"
+                            .into(),
                     )
                 },
             ));

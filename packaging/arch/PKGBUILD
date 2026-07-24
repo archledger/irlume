@@ -59,6 +59,9 @@ package() {
     # them. No-op until `irlume login enable` writes its marker.
     install -Dm0644 packaging/systemd/irlume-reconcile.path "$pkgdir/usr/lib/systemd/system/irlume-reconcile.path"
     install -Dm0644 packaging/systemd/irlume-reconcile.service "$pkgdir/usr/lib/systemd/system/irlume-reconcile.service"
+    # The `irlume` system group (socket 0660 root:irlume); irlume.install runs
+    # systemd-sysusers to create it.
+    install -Dm0644 packaging/systemd/irlume.sysusers "$pkgdir/usr/lib/sysusers.d/irlume.conf"
     install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

@@ -1,5 +1,8 @@
 post_install() {
     systemctl daemon-reload
+    # Create the `irlume` system group so the daemon restricts its socket to
+    # 0660 root:irlume instead of falling back to 0666.
+    systemd-sysusers 2>/dev/null || true
     systemctl enable --now irlumed.service 2>/dev/null || true
     # Watches greeter PAM files and re-applies irlume wiring after a distro
     # update strips it; idle until `irlume login enable` runs. The .service also
@@ -13,13 +16,15 @@ irlume installed. Next steps:
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
 (enrollment auto-enables the 850nm IR emitter when IR frames are black;
  manual fallback for IR cameras: sudo irlume ir-setup)
-Arch has no SELinux/AppArmor by default; the SO_PEERCRED + socket-group
-boundary is the daemon's protection. Password is always the fallback.
+Arch has no SELinux/AppArmor by default; SO_PEERCRED plus the 0660 root:irlume
+socket group are the daemon's protection. Password is always the fallback.
 EOF
 }
 
 post_upgrade() {
     systemctl daemon-reload
+    # Create the `irlume` group if an older version predated it (idempotent).
+    systemd-sysusers 2>/dev/null || true
     systemctl try-restart irlumed.service 2>/dev/null || true
     # Ensure the self-heal units are enabled and run one reconcile: adopts an
     # already-wired install (upgrades from a pre-marker version) into the marker.

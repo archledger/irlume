@@ -22,6 +22,17 @@ All notable changes to irlume are documented here. This project adheres to
   (5-minute default), so one authentication covers a TUI session's worth
   of changes; container-verified.
 
+- **`irlume doctor` warns when the active display manager is not
+  recognized.** biopolicy classifies an unmapped login or lock service as
+  deny, and `login enable` cannot wire a display manager irlume has no PAM
+  mapping for, so a display manager that is new or was renamed by an update
+  drops face login back to the password with no signal. doctor now resolves
+  the active `display-manager.service`; when there is no mapping for it, it
+  names the DM and links the issue tracker. Silent on recognized DMs and on
+  headless hosts. Validated on plasmalogin, sddm, and lightdm (no warning)
+  and against an unmapped name (warning fires) on hardware and in a
+  container.
+
 ### Fixed
 
 - **Ctrl-C during a suspended TUI action no longer kills the TUI.** In the
@@ -68,6 +79,35 @@ All notable changes to irlume are documented here. This project adheres to
   checks stay silent when the install is clean. Content drift is detected via
   the package manager's own verify (`rpm -V` / `dpkg --verify` /
   `pacman -Qkk`); mtime-only drift is ignored.
+
+- **Face-login self-heal survives an inactive watcher and an upgrade from a
+  pre-marker install.** The 0.6.0 PAM-strip self-heal (`irlume-reconcile.path`)
+  was edge-triggered inotify and gated on the `login.wired` marker that only
+  `login enable` writes, so a strip during an offline `dnf`/`apt` run, or an
+  upgrade from a version that predates the marker (0.5.0 and earlier), never
+  re-applied the wiring. Two changes close that: `login reconcile` with no
+  marker but login already wired now adopts the existing wiring into a marker
+  (inferring the sudo and polkit flags from the live PAM files), and
+  `irlume-reconcile.service` also runs at boot (`WantedBy=multi-user.target`,
+  self-gating) to catch a strip that landed while the watcher was down.
+  Packaging enables and starts it on install and upgrade across Fedora, Arch,
+  and Debian/Ubuntu. Validated end to end on sddm (Arch) and lightdm (Debian):
+  adopt, strip, re-apply byte-identical, and a clean boot run.
+
+- **A pinned camera pair survives a `/dev/videoN` renumber.** A pair chosen in
+  the TUI Cameras tab was stored in `cameras.conf` as bare `/dev/videoN` paths
+  and only checked for existence, so a kernel or udev update that renumbered
+  the video nodes could open a different sensor. `set-cameras` now records each
+  node's stable device identity (`vid:pid:serial`), and `select_pair` keeps the
+  saved path only while it still resolves to that identity, otherwise re-finds
+  the node that now carries it. A pin with no recorded identity keeps the
+  earlier path-exists behavior. Validated on a real NexiGo N930W: a stale path
+  re-anchored to the right node by identity and role.
+
+### Changed
+
+- NixOS now appears in the packaged badge and the comparison table's "Runs on"
+  row (the `nixosModules.irlume` flake target already shipped).
 
 ## [0.6.0] - 2026-07-23
 

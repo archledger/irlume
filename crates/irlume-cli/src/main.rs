@@ -110,6 +110,7 @@ fn main() -> std::process::ExitCode {
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),
+        (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
         (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),

@@ -1047,6 +1047,51 @@ pub fn deps(_args: &[String]) -> ExitCode {
 /// stale seal can never be silently overwritten with a typo (the daemon's
 /// automatic reseal only runs in the post-auth session phase for the same
 /// reason). Functionally a re-arm against today's PCRs.
+/// `irlume biopolicy <on|off|status>`: toggle the opt-in operation-class gate
+/// (`enforce_biopolicy` in settings.conf). The daemon reads it live per request,
+/// so no restart is needed. Reversible; the password is always the fallback,
+/// so enabling it can restrict which services a face may satisfy but never
+/// locks anyone out.
+pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
+    let on = irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    match sub {
+        None | Some("status") => {
+            println!(
+                "[biopolicy] operation-class gate: {}",
+                if on { "ENFORCING" } else { "off (default)" }
+            );
+            ExitCode::SUCCESS
+        }
+        Some(v @ ("on" | "off")) => {
+            if !crate::is_root() {
+                eprintln!("[biopolicy] needs root: sudo irlume biopolicy {v}");
+                return ExitCode::FAILURE;
+            }
+            let val = if v == "on" { "1" } else { "0" };
+            match irlume_common::config::write_kv("settings.conf", "enforce_biopolicy", val) {
+                Ok(()) => {
+                    println!(
+                        "[biopolicy] operation-class gate {} (takes effect on the next face auth; \
+                         the password is always available).",
+                        if v == "on" { "ENABLED" } else { "disabled" }
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("[biopolicy] could not update settings.conf: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("[biopolicy] usage: irlume biopolicy <on|off|status> (got '{other}')");
+            ExitCode::from(2)
+        }
+    }
+}
+
 pub fn reseal(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     // Only meaningful if already armed (we never auto-arm from here).
@@ -1292,6 +1337,8 @@ SYSTEM INTEGRATION
                         camera picker runs this for you)
   models [enable|disable]         opt-in third-party liveness models: measured,
                         checksum-pinned, deny-only; fetched, never shipped
+  biopolicy <on|off|status>       opt-in operation-class gate: restrict which
+                        services a face may satisfy (advanced; password unaffected)
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   uninstall [--keep-data]         un-wire PAM, stop the daemon, wipe enrolled

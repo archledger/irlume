@@ -230,6 +230,9 @@ enum Suspend {
     /// so a Tier-2 seal keeps validating. Idempotent (re-predicts the current
     /// PCRs); a system operation, so it is root-gated and clearly labeled.
     PcrlockMakePolicy,
+    /// Toggle the opt-in biopolicy operation-class gate (the bool is the target
+    /// state). Root op; the daemon reads it live, no restart.
+    Biopolicy(bool),
 }
 
 /// What a y/n confirm modal executes on `[y]`: a daemon request (async, the
@@ -1917,6 +1920,14 @@ impl App {
                 "refresh the pcrlock policy (re-predict the boot measurements)",
                 &["systemd-pcrlock", "make-policy"],
             ),
+            Suspend::Biopolicy(on) => self.sudo_step(
+                if on {
+                    "enable the biopolicy gate"
+                } else {
+                    "disable the biopolicy gate"
+                },
+                &["irlume", "biopolicy", if on { "on" } else { "off" }],
+            ),
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
             // does the teardown (un-wire PAM, stop daemon, wipe data) as root
@@ -2476,6 +2487,23 @@ impl App {
                     },
                     map_settings,
                 );
+            }
+            // Biopolicy gate: enabling changes the security posture (restricts
+            // which services a face may satisfy), so it is confirmed; disabling
+            // just relaxes back to default and goes straight through.
+            (SC_SETTINGS, KeyCode::Char('b')) => {
+                if biopolicy_on() {
+                    self.log('→', "sudo irlume biopolicy off: relax back to the default (all services may verify)");
+                    self.suspend = Some(Suspend::Biopolicy(false));
+                } else {
+                    self.confirm = Some((
+                        "Enable the biopolicy gate? Only Login/Elevation may then release the \
+                         keyring; lock-screen becomes verify-only. Password stays available."
+                            .into(),
+                        "Enable",
+                        ConfirmAct::Sus(Suspend::Biopolicy(true)),
+                    ));
+                }
             }
             // Third-party PAD model toggle. settings.conf is root-only, so the
             // readable proxy for "enabled" is installed weights (disable
@@ -3129,13 +3157,24 @@ impl App {
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  is verify-only; remote/unknown services are denied.",
+                    "  is verify-only; remote/unknown services are denied. Advanced; the",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  Toggle (root): set enforce_biopolicy=1 in /etc/irlume/settings.conf.",
+                    "  password is always available, so this can restrict but never lock out.",
                     Style::new().dim(),
                 )),
+                Line::from(vec![
+                    Span::styled("  [b]", Style::new().fg(th().accent)),
+                    Span::styled(
+                        if bio {
+                            " turn it off (sudo)"
+                        } else {
+                            " turn it on (sudo; asks first)"
+                        },
+                        Style::new().dim(),
+                    ),
+                ]),
                 Line::raw(""),
                 section("Third-party liveness models"),
                 {
@@ -4272,8 +4311,9 @@ impl App {
                 ("s", "show status"),
             ],
             SC_SETTINGS => &[
-                ("enter", "toggle eyes-open"),
-                ("c", "toggle blink"),
+                ("enter", "eyes-open"),
+                ("c", "blink"),
+                ("b", "biopolicy"),
                 ("m", "3rd-party model"),
             ],
             SC_DONE => &[("w", "wire login"), ("u", "update"), ("r", "refresh")],
@@ -5051,6 +5091,24 @@ mod tests {
         app.screen = SC_DONE;
         app.on_key(KeyCode::Char('u'));
         assert!(matches!(app.suspend, Some(Suspend::Update)));
+        app.suspend = None;
+
+        // Biopolicy [b]: enabling (from off) is confirm-gated; the confirm's
+        // affirmative names the specific verb and carries the enable suspend.
+        app.screen = SC_SETTINGS;
+        app.on_key(KeyCode::Char('b'));
+        assert!(
+            app.suspend.is_none(),
+            "enabling biopolicy must confirm first"
+        );
+        match &app.confirm {
+            Some((q, verb, ConfirmAct::Sus(Suspend::Biopolicy(true)))) => {
+                assert!(q.contains("biopolicy") && *verb == "Enable");
+            }
+            _ => panic!("expected the biopolicy-enable confirm"),
+        }
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::Biopolicy(true))));
         app.suspend = None;
 
         // The mouse toggle flips state and logs; second press restores.
@@ -7058,7 +7116,7 @@ mod tests {
             (SC_RECOVERY, "set", "forget"),
             (SC_FINGERPRINT, "enroll finger", "reset"),
             (SC_PAM, "wire login (sudo)", "un-wire"),
-            (SC_SETTINGS, "toggle eyes-open", "3rd-party model"),
+            (SC_SETTINGS, "eyes-open", "3rd-party model"),
             (SC_DONE, "wire login", "refresh"),
         ];
         let mut app = app;

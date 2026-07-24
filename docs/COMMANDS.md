@@ -59,6 +59,7 @@ Conventions that apply everywhere:
 | `irlume fingerprint <status\|add\|verify\|reset\|enable\|disable> [--fingerprint-only]` | for wiring | fprintd companion; `enable` = unlock with face OR fingerprint (both), `--fingerprint-only` replaces face |
 | `irlume bitwarden <status\|setup> [--apply]` | for setup | install Bitwarden's biometric-unlock polkit action, flavor-aware (flatpak/native install it; snap is snapd's job; ostree gets the layering steps); see docs/APP-INTEGRATION.md |
 | `irlume selinux <status\|load>` | for load | SELinux module for the login greeter (Fedora) |
+| `sudo irlume biopolicy <on\|off\|status>` | for on/off | the operation-class gate: when ENFORCING, a face match is accepted only for the operations its camera tier is trusted for (login and sudo require the Secure IR tier; screen unlock and app prompts stay allowed); off by default, and the password is always available either way |
 | `irlume ir-setup [--dry-run]` | yes | auto-configure the IR emitter; rarely needed, enroll runs it itself when IR frames come back dark |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume models [list]` | no | show the opt-in third-party liveness models and their checksum state |

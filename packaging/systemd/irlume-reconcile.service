@@ -1,12 +1,18 @@
 [Unit]
 Description=Re-apply irlume face-auth PAM wiring after a distro update
 Documentation=https://github.com/archledger/irlume
-# Only meaningful once login was enabled; the command self-gates on the marker
-# at /var/lib/irlume/login.wired and exits 0 when there is nothing to do.
-ConditionPathExists=/var/lib/irlume/login.wired
+# Runs from TWO triggers: the irlume-reconcile.path unit (a greeter PAM file
+# changed) AND at boot (WantedBy below), so a strip that landed while the path
+# watcher was inactive (an offline dnf/apt upgrade, or before paths.target on a
+# first install) is still caught on the next boot. No ConditionPathExists: the
+# command self-gates. With no marker it either ADOPTS an existing wiring into a
+# marker (an upgrade from a pre-marker version) or exits; with a marker it
+# re-adds only the greeter lines that went missing. Idempotent; the password
+# stays the fallback throughout.
 
 [Service]
 Type=oneshot
-# Idempotent: re-adds only the greeter lines that went missing, using the flags
-# recorded at `login enable` time. Password stays the fallback throughout.
 ExecStart=/usr/bin/irlume login reconcile
+
+[Install]
+WantedBy=multi-user.target

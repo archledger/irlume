@@ -103,12 +103,18 @@ install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-i
 %post
 # %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
 # self-heal path unit on first install.
-%systemd_post irlumed.service irlume-reconcile.path
+%systemd_post irlumed.service irlume-reconcile.path irlume-reconcile.service
 # Also start it now so `irlume tui` works immediately after `dnf install`
 # (no-op in chroots/containers where systemd isn't running).
 if [ $1 -eq 1 ]; then
     systemctl start irlumed.service &>/dev/null || :
 fi
+# Start the PAM-file watcher now (else it only becomes active at the next boot),
+# and run one reconcile: on an upgrade this adopts an already-wired install into
+# the self-heal marker, and re-applies wiring a same-transaction strip removed.
+# Both self-gate and no-op on a fresh/un-wired box.
+systemctl start irlume-reconcile.path &>/dev/null || :
+systemctl start irlume-reconcile.service &>/dev/null || :
 # PAM wiring is opt-in (irlume login enable); never auto-wire auth on install.
 # Upgrade from a version that shipped the IR adapter (< 0.2.0): dark/dim IR
 # login needs a re-enroll (RGB login keeps working). Bright-line the notice.
@@ -119,11 +125,11 @@ if [ $1 -gt 1 ]; then
 fi
 
 %preun
-%systemd_preun irlumed.service irlume-reconcile.path
+%systemd_preun irlumed.service irlume-reconcile.path irlume-reconcile.service
 
 %postun
 %systemd_postun_with_restart irlumed.service
-%systemd_postun irlume-reconcile.path
+%systemd_postun irlume-reconcile.path irlume-reconcile.service
 
 %post selinux
 semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :

@@ -11,10 +11,12 @@
 use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
 
-/// Auto-select the RGB+IR camera pair (built-in or external Hello webcam).
-/// Re-exported so the daemon can pick devices without depending on the camera
-/// crate directly. See [`irlume_camera::select_pair`].
-pub use irlume_camera::{capabilities, select_pair};
+/// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
+/// the stable per-device identity the daemon records alongside a persisted pair
+/// so select_pair can survive a udev renumber. Re-exported so the daemon can pick
+/// devices without depending on the camera crate directly. See
+/// [`irlume_camera::select_pair`].
+pub use irlume_camera::{capabilities, device_identity, select_pair};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{ensure_ir_emitter, list_ir_controls, setup_ir_emitter};

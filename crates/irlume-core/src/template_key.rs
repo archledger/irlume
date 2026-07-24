@@ -262,6 +262,109 @@ mod tests {
         std::env::remove_var("IRLUME_RECOVERY_DIR");
     }
 
+    /// A wrong recovery passphrase must fail the restore WITHOUT materialising a
+    /// key file: a bogus key would let the daemon "unseal" garbage and silently
+    /// destroy the encrypted templates. No TPM needed (unwrap fails before the
+    /// re-seal), so this seeds the envelope directly via save_recovery.
+    #[test]
+    fn recovery_restore_rejects_wrong_passphrase() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let rec = crate::test_tmp_dir("rec-wrongpass");
+        let tk = crate::test_tmp_dir("tk-wrongpass");
+        let _ = std::fs::remove_dir_all(&rec);
+        let _ = std::fs::remove_dir_all(&tk);
+        std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &tk);
+
+        let key = crypto::generate_key();
+        let env = crate::recovery::wrap(b"correct horse battery", &key).unwrap();
+        save_recovery("rt", &env).unwrap();
+
+        let err = restore_from_recovery("rt", b"wrong passphrase").unwrap_err();
+        // GCM auth failure surfaces as a decrypt error (Error::Policy), not a panic.
+        let msg = format!("{err}");
+        assert!(msg.contains("wrong recovery passphrase"), "got: {msg}");
+        assert!(!has_key("rt"), "a failed restore must not create a key file");
+
+        forget_recovery("rt").unwrap();
+        std::env::remove_var("IRLUME_RECOVERY_DIR");
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+    }
+
+    /// Restore with no envelope on disk errors with the guidance message rather
+    /// than a bare not-found, so the greeter/CLI can tell the user what to do.
+    #[test]
+    fn recovery_restore_errors_without_envelope() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let rec = crate::test_tmp_dir("rec-none");
+        let _ = std::fs::remove_dir_all(&rec);
+        std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
+
+        let err = restore_from_recovery("nobody", b"whatever").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no recovery passphrase set"), "got: {msg}");
+
+        std::env::remove_var("IRLUME_RECOVERY_DIR");
+    }
+
+    /// A truncated / hand-edited recovery file must error out of the JSON parse,
+    /// never panic: a corrupt backstop should degrade to "use your password",
+    /// not crash the daemon mid-login.
+    #[test]
+    fn recovery_restore_rejects_corrupt_envelope() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let rec = crate::test_tmp_dir("rec-corrupt");
+        let _ = std::fs::remove_dir_all(&rec);
+        std::fs::create_dir_all(&rec).unwrap();
+        std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
+
+        std::fs::write(recovery_path("rt"), b"{ not valid json ").unwrap();
+        let err = restore_from_recovery("rt", b"x").unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+
+        std::env::remove_var("IRLUME_RECOVERY_DIR");
+    }
+
+    /// The core recovery promise on real hardware: if the sealed key on disk can
+    /// no longer be unsealed (here a bit-flip in the TPM-sealed private blob,
+    /// standing in for a PCR move / dbx update), load_key FAILS (auth falls back
+    /// to the password) and `recovery restore` heals it back to the ORIGINAL key
+    /// so already-encrypted templates decrypt again.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn tpm_tampered_seal_falls_back_then_recovery_heals() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tk = "/tmp/irlume-tk-tamper";
+        let rec = "/tmp/irlume-rec-tamper";
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", tk);
+        std::env::set_var("IRLUME_RECOVERY_DIR", rec);
+        let _ = std::fs::remove_dir_all(tk);
+        let _ = std::fs::remove_dir_all(rec);
+
+        let original = ensure_key("rt").unwrap();
+        setup_recovery("rt", b"my recovery passphrase").unwrap();
+
+        // Corrupt the sealed private blob so the TPM can no longer unseal it.
+        let mut env = SealedEnvelope::load(&key_path("rt")).unwrap();
+        assert!(!env.private.is_empty());
+        env.private[0] ^= 0xff;
+        env.save(&key_path("rt")).unwrap();
+        assert!(load_key("rt").is_err(), "a tampered seal must not unseal");
+
+        // Recovery heals it: unwrap under the passphrase, re-seal to current PCRs.
+        restore_from_recovery("rt", b"my recovery passphrase").unwrap();
+        assert_eq!(
+            &*load_key("rt").unwrap(),
+            &*original,
+            "recovered key must match the original that encrypted the templates"
+        );
+
+        forget_key("rt").unwrap();
+        forget_recovery("rt").unwrap();
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::env::remove_var("IRLUME_RECOVERY_DIR");
+    }
+
     /// On signed-UKI hardware, a template key sealed under a weaker tier
     /// auto-upgrades to Tier 1 the next time it is loaded (i.e. the next face
     /// match), with no re-enroll. Companion to the keyring reseal upgrade.

@@ -311,8 +311,26 @@ fn main() {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                if let Err(e) = handle(stream, &mut engine) {
-                    eprintln!("irlumed: connection error: {e}");
+                // Isolate each connection behind catch_unwind. A panic deep in
+                // frame decode or inference (e.g. a V4L2 driver echoing back a
+                // 0-dimension or short-buffered frame) must deny THIS one request
+                // and let PAM fall back to the password, never unwind out of the
+                // single-threaded accept loop and take down all face auth for
+                // every user. The engine is effectively per-request stateless
+                // (fresh capture each call; its locks recover from poisoning via
+                // into_inner), so reusing it after a caught unwind is safe. The
+                // panicking handler dropped the stream, so the client sees EOF
+                // and PAM treats it as a fail-safe decline.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle(stream, &mut engine)
+                }));
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("irlumed: connection error: {e}"),
+                    Err(_) => eprintln!(
+                        "irlumed: connection handler panicked; this request was denied \
+                         (PAM falls back to the password), daemon continues"
+                    ),
                 }
             }
             Err(e) => eprintln!("irlumed: accept error: {e}"),

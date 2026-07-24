@@ -148,14 +148,21 @@ pub struct RgbView<'a> {
 impl RgbView<'_> {
     #[inline]
     fn pixel(&self, x: i32, y: i32) -> [f32; 3] {
+        // A degenerate frame (0 width/height, or a data buffer shorter than
+        // width*height*3, from a misbehaving V4L2 driver) would otherwise panic
+        // here: clamp(0, -1) inverts its bounds, and the index runs past the
+        // slice. Both guard to black, so a bad frame degrades to "no face" (the
+        // password fallback) instead of crashing the root daemon.
+        if self.width == 0 || self.height == 0 {
+            return [0.0; 3];
+        }
         let x = x.clamp(0, self.width as i32 - 1) as usize;
         let y = y.clamp(0, self.height as i32 - 1) as usize;
         let i = (y * self.width as usize + x) * 3;
-        [
-            self.data[i] as f32,
-            self.data[i + 1] as f32,
-            self.data[i + 2] as f32,
-        ]
+        match self.data.get(i..i + 3) {
+            Some(px) => [px[0] as f32, px[1] as f32, px[2] as f32],
+            None => [0.0; 3],
+        }
     }
 
     /// Bilinear-sample the RGB image at fractional (x, y), edge-clamped.
@@ -309,6 +316,19 @@ mod tests {
         assert_eq!(cosine(&a, &b), -1.0);
         assert_eq!(cosine(&b, &a), -1.0);
         assert_eq!(cosine(&a, &[]), -1.0);
+    }
+
+    #[test]
+    fn rgbview_sampling_survives_a_degenerate_frame() {
+        // A V4L2 driver echoing back a 0-dimension or short-buffered frame must
+        // not panic the root daemon: clamp(0, -1) would invert its bounds and the
+        // index would run past the slice. Sampling reads black instead, so the
+        // detector finds no face and PAM falls back to the password.
+        let zero = RgbView { data: &[], width: 0, height: 0 };
+        assert_eq!(zero.sample_bilinear(5.0, 5.0), [0.0; 3]);
+        // Non-zero dims but a data buffer far too short for width*height*3.
+        let short = RgbView { data: &[10, 20, 30], width: 64, height: 48 };
+        assert_eq!(short.sample_bilinear(40.0, 30.0), [0.0; 3]);
     }
 
     #[test]

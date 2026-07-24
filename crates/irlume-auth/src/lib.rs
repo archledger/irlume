@@ -2528,6 +2528,13 @@ const GLINT_SEARCH_RADIUS_PX: i32 = 8;
 /// emitter's specular corneal glint. Supporting liveness cue only (feeds
 /// `Signals::ir_eye_glint`); 0.0 when the landmarks fall outside the frame.
 pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
+    // The in-bounds test below is against the logical w/h, so a frame buffer
+    // shorter than w*h would still index past the slice. Same guard as
+    // mean_in_bbox: a truncated IR frame degrades to 0.0 (no glint cue, a safe
+    // fail-closed for liveness) instead of panicking the root daemon.
+    if grey.len() < (w as usize).saturating_mul(h as usize) {
+        return 0.0;
+    }
     let mut peak = 0u8;
     for &(ex, ey) in &landmarks[0..2] {
         let r = GLINT_SEARCH_RADIUS_PX;
@@ -2552,6 +2559,11 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
 /// spike (hence contrast) collapses. Live-validated 2026-06-30: genuine open-eye
 /// contrast ≈120, a static vinyl banner ≈70 (flat).
 pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
+    // See eye_glint: guard the w*h invariant so a truncated IR frame returns 0.0
+    // (flat contrast, fail-closed) rather than indexing past the slice.
+    if grey.len() < (w as usize).saturating_mul(h as usize) {
+        return 0.0;
+    }
     let iod = ((landmarks[1].0 - landmarks[0].0).powi(2)
         + (landmarks[1].1 - landmarks[0].1).powi(2))
     .sqrt();
@@ -3298,6 +3310,18 @@ mod tests {
         let dull = eye_glint_contrast(&flat, 64, 48, &lm);
         assert_eq!(dull, 0.0);
         assert!(sharp > dull, "blink/liveness signal must be monotonic");
+    }
+
+    /// A truncated IR frame (buffer shorter than w*h, from a driver reporting a
+    /// short sizeimage) must degrade both glint cues to 0.0, not panic the root
+    /// daemon on an out-of-bounds index. The landmarks sit deep in the frame, so
+    /// an unguarded index would run past the short slice.
+    #[test]
+    fn glint_cues_survive_a_truncated_ir_frame() {
+        let (grey, lm) = ir_frame_with_glints(true, true);
+        let short = &grey[..grey.len() / 4]; // buffer well under w*h
+        assert_eq!(eye_glint(short, 64, 48, &lm), 0.0);
+        assert_eq!(eye_glint_contrast(short, 64, 48, &lm), 0.0);
     }
 }
 

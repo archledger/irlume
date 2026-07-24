@@ -3131,16 +3131,18 @@ impl App {
                                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                                 format!("enabled: {name}   (loaded by the daemon, deny-only cue)"),
                             ),
+                            // No daemon-reported cue: could be a daemon too old
+                            // to report the field (0.6.0 and earlier) OR genuinely
+                            // none. We can't tell the two apart (both deserialize
+                            // to None), so trust the filesystem probe rather than
+                            // claim "off" — an older daemon with flir loaded must
+                            // not read as ○ none (regression fixed here).
                             None => match crate::models::tui_state() {
                                 crate::models::TuiState::Enabled { name, detail } => (
                                     "●",
                                     Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                                     format!("enabled: {name}   {detail}"),
                                 ),
-                                // Daemon up and reporting no cue -> authoritative off.
-                                _ if self.daemon_up => {
-                                    ("○", Style::new().dim(), "none (default)".to_string())
-                                }
                                 crate::models::TuiState::InstalledUnknown { name } => (
                                     "◐",
                                     Style::new().fg(th().warn),
@@ -6866,13 +6868,25 @@ mod tests {
             !text.contains("root-only"),
             "the authoritative state replaces the root-only guess"
         );
-        // Daemon up, no cue loaded -> authoritative OFF, never the ◐ guess.
+        // No daemon-reported cue: fall back to the filesystem probe (we can't
+        // tell "old daemon didn't report" from "new daemon reports none"). With
+        // no weights on disk (empty state dir) that is a clean ○ none. This also
+        // proves an older daemon with weights present is NOT falsely shown off.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let empty = std::env::temp_dir().join(format!("irlume-tp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let old = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &empty);
         app.health.as_mut().unwrap().third_party_pad = None;
         let text = draw_text(&app);
-        assert!(
-            !text.contains('◐'),
-            "daemon-up with no cue is a definite off"
-        );
+        assert!(text.contains("none (default)"), "empty state dir -> ○ none");
+        match old {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]

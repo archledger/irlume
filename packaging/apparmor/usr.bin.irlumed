@@ -15,10 +15,17 @@
 abi <abi/4.0>,
 include <tunables/global>
 
-profile irlumed /usr/bin/irlumed {
+profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   include <abstractions/base>
   # uid→name lookups for SO_PEERCRED authz (/etc/nsswitch.conf, passwd, group).
   include <abstractions/nameservice>
+  # On systemd-userdbd systems (Ubuntu 26.04+, systemd-homed) glibc's `systemd`
+  # NSS module resolves uid→name through the userdb varlink socket. Without this
+  # every SO_PEERCRED lookup logs an AppArmor denial (files still resolves a
+  # normal /etc/passwd user, but a userdb-only/homed user would fail authz). The
+  # nameservice abstraction predates userdb and does not cover it.
+  /run/systemd/userdb/ r,
+  /run/systemd/userdb/* rw,
 
   /usr/bin/irlumed mr,
 

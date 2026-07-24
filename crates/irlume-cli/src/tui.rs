@@ -226,6 +226,10 @@ enum Suspend {
     /// complete authoritative dump (incl. the info-only lines the Repair
     /// checklist omits), copy-pasteable for a bug report.
     Doctor,
+    /// Refresh the systemd-pcrlock policy after a firmware/Secure Boot change
+    /// so a Tier-2 seal keeps validating. Idempotent (re-predicts the current
+    /// PCRs); a system operation, so it is root-gated and clearly labeled.
+    PcrlockMakePolicy,
 }
 
 /// What a y/n confirm modal executes on `[y]`: a daemon request (async, the
@@ -1909,6 +1913,10 @@ impl App {
             Suspend::Doctor => {
                 let _ = crate::doctor();
             }
+            Suspend::PcrlockMakePolicy => self.sudo_step(
+                "refresh the pcrlock policy (re-predict the boot measurements)",
+                &["systemd-pcrlock", "make-policy"],
+            ),
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
             // does the teardown (un-wire PAM, stop daemon, wipe data) as root
@@ -2302,6 +2310,18 @@ impl App {
                     String::new(),
                     Pending::KeyringPw(None),
                 ));
+            }
+            // Refresh the pcrlock policy (Tier-2 only): re-predict the boot
+            // measurements after a firmware/Secure Boot change so the seal keeps
+            // validating. Root op; idempotent, so no confirm.
+            (SC_KEYRING, KeyCode::Char('p'))
+                if self
+                    .keyring_policy
+                    .as_deref()
+                    .is_some_and(|p| p.contains("Tier 2")) =>
+            {
+                self.log('→', "sudo systemd-pcrlock make-policy: refreshes the boot-measurement policy your seal is bound to");
+                self.suspend = Some(Suspend::PcrlockMakePolicy);
             }
             // Reseal: re-bind the sealed password to the current PCRs (the CLI
             // `irlume reseal`). Same masked-prompt + SealPassword path as arm;
@@ -3516,11 +3536,15 @@ impl App {
                 .is_some_and(|p| p.contains("Tier 2"));
             if tier2 {
                 lines.push(Line::from(Span::styled(
-                    "  after a firmware/Secure Boot update, re-run `systemd-pcrlock",
+                    "  Tier 2 seal (survives kernel updates). After a firmware or Secure",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "  make-policy` as root; the seal keeps working with no re-arm.",
+                    "  Boot change, the boot measurements move; press [p] to refresh the",
+                    Style::new().dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  pcrlock policy so face-unlock keeps working (no re-arm needed).",
                     Style::new().dim(),
                 )));
             } else {
@@ -3570,7 +3594,7 @@ impl App {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         let rec = self.recovery.unwrap_or_default();
         let all: [(&'static str, bool, usize); 7] = [
-            ("daemon + checks", self.daemon_up, SC_REPAIR),
+            ("checks & repair", self.daemon_up, SC_REPAIR),
             ("cameras", self.caps.rgb, SC_CAMERAS),
             ("enrollment", scans > 0, SC_PROFILES),
             (
@@ -3877,19 +3901,19 @@ impl App {
         ];
         match &self.identify_result {
             Some((true, who)) => {
-                lines.push(Line::from(Span::styled(
-                    "  ┌─ result ───────────────────────────",
-                    Style::new().dim(),
-                )));
                 lines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::new().dim()),
                     Span::styled(
-                        who.clone(),
+                        "  ✓ Recognized  ",
                         Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled(who.clone(), Style::new().fg(th().ok)),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    "  └────────────────────────────────────",
+                    "    confidence is 0.00-1.00 (higher = surer); this cleared your match",
+                    Style::new().dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    threshold. Identify is a diagnostic check, not a login.",
                     Style::new().dim(),
                 )));
             }
@@ -4483,7 +4507,10 @@ fn map_identify(resp: Response) -> (bool, String) {
             ..
         } => (
             true,
-            format!("{u} · {} · score {score:.3}", profile.unwrap_or_default()),
+            format!(
+                "{u} · {} · confidence {score:.3}",
+                profile.unwrap_or_default()
+            ),
         ),
         Response::Identified {
             user: None,
@@ -5407,7 +5434,7 @@ mod tests {
             reason: String::new(),
         });
         assert!(ok);
-        assert_eq!(msg, "alice · Face Profile 1 · score 0.812");
+        assert_eq!(msg, "alice · Face Profile 1 · confidence 0.812");
         let (ok, msg) = map_identify(Response::Identified {
             user: None,
             profile: None,
@@ -6631,8 +6658,8 @@ mod tests {
         assert!(text.contains("drifted since sealing"));
         assert!(text.contains("pcrlock NV 0x1a2b (Tier 2)"));
         assert!(
-            text.contains("systemd-pcrlock"),
-            "Tier 2 gets the make-policy guidance, not the re-arm warning"
+            text.contains("press [p]") && text.contains("pcrlock policy"),
+            "Tier 2 offers the [p] pcrlock-refresh action, not the re-arm warning"
         );
         assert!(text.contains("At a face login"));
         // Armed on the plain PCR-7 tier: the dbx re-arm warning instead.
@@ -6712,12 +6739,12 @@ mod tests {
         app.screen = SC_IDENTIFY;
         let text = draw_text(&app);
         assert!(text.contains("press [i] and look at the camera"));
-        app.identify_result = Some((true, "alice · Face Profile 1 · score 0.912".into()));
+        app.identify_result = Some((true, "alice · Face Profile 1 · confidence 0.912".into()));
         let text = draw_text(&app);
-        assert!(text.contains("alice · Face Profile 1 · score 0.912"));
+        assert!(text.contains("alice · Face Profile 1 · confidence 0.912"));
         assert!(
-            text.contains("result"),
-            "the hit renders in the result card"
+            text.contains("✓ Recognized") && text.contains("confidence is 0.00-1.00"),
+            "the hit shows a plain verdict + the confidence scale"
         );
         app.identify_result = Some((false, "no live face (flat depth)".into()));
         let text = draw_text(&app);

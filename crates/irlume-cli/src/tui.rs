@@ -1798,6 +1798,22 @@ impl App {
     /// `ir-setup` leaves no re-checkable state, so we log ✓ on success and raise
     /// the error banner on failure.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
+        // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
+        // to: a running TUI must not shell out to a different (older) installed
+        // build for its privileged half. Resolve the first "irlume" arg to the
+        // current exe; leave non-irlume commands (systemd-pcrlock, sh -c) as is.
+        let self_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from));
+        let resolved: Vec<String> = args
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| match (i, a, &self_exe) {
+                (0, "irlume", Some(exe)) => exe.clone(),
+                _ => a.to_string(),
+            })
+            .collect();
+        let args: Vec<&str> = resolved.iter().map(String::as_str).collect();
         eprintln!("\n{what}; running: sudo {}…", args.join(" "));
         // In the cooked terminal, Ctrl-C goes to the whole foreground group:
         // a user aborting the CHILD (a sudo prompt, the models license flow)

@@ -4072,10 +4072,15 @@ impl App {
                 Span::raw(format!("  {:<16}", "SELinux module")),
                 sel,
             ]));
-        } else if std::path::Path::new("/sys/kernel/security/apparmor").exists() {
-            let profiled = std::fs::read_to_string("/proc/self/attr/apparmor/current")
-                .map(|s| s.contains("irlume"))
-                .unwrap_or(false)
+        } else if std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+            .map(|s| s.trim() == "Y")
+            .unwrap_or(false)
+        {
+            // Whether the irlumed profile is installed. Checking /proc/self here
+            // would read the CLI's own (unconfined) label, not the daemon's, so
+            // key off the on-disk profile the package ships: usr.bin.irlumed for
+            // a packaged install, usr.local.bin.irlumed for a source build.
+            let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
                 || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
             lines.push(Line::from(vec![
                 Span::raw(format!("  {:<16}", "AppArmor")),

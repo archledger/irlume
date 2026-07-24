@@ -590,7 +590,7 @@ impl App {
         } = state;
         // Repair surfaces whenever there is ANYTHING to report (a failure OR an
         // advisory), so the Welcome health summary's "→ see checks & repair"
-        // pointer is always reachable — a warning used to point at a hidden tab.
+        // pointer is always reachable; a warning used to point at a hidden tab.
         let needs_repair = daemon_down
             || checks
                 .iter()
@@ -603,7 +603,7 @@ impl App {
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
                 // Settings holds user preferences (eyes-open, blink, biopolicy,
                 // third-party models), not diagnostics, so it is always
-                // reachable — hiding config behind "advanced" both buries it and
+                // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
                 SC_SETTINGS => true,
                 // Repair: only when something needs attention (or advanced view).
@@ -1226,8 +1226,8 @@ impl App {
             _ => {}
         }
         // Wiring drift: login WAS enabled (marker) but the active greeter's
-        // stack lost the module — authselect/pam-auth-update regenerated the
-        // PAM files. Face silently falls back to password until re-applied.
+        // stack lost the module (authselect/pam-auth-update regenerated the
+        // PAM files). Face silently falls back to password until re-applied.
         if crate::pamwire::reconcile_needed() {
             v.push(mk(
                 "Login wiring",
@@ -3223,7 +3223,7 @@ impl App {
                             // to report the field (0.6.0 and earlier) OR genuinely
                             // none. We can't tell the two apart (both deserialize
                             // to None), so trust the filesystem probe rather than
-                            // claim "off" — an older daemon with flir loaded must
+                            // claim "off": an older daemon with flir loaded must
                             // not read as ○ none (regression fixed here).
                             None => match crate::models::tui_state() {
                                 crate::models::TuiState::Enabled { name, detail } => (
@@ -3712,7 +3712,7 @@ impl App {
                 let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
                 // needs_repair (compute_visible) surfaces the "checks & repair"
                 // hub row on any warn/fail, so this always points at a row that
-                // is right below and Enter-openable — no "switch to advanced" step.
+                // is right below and Enter-openable, no "switch to advanced" step.
                 if fails > 0 {
                     Line::from(vec![
                         Span::styled(
@@ -5692,7 +5692,7 @@ mod tests {
             ),
             vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_SETTINGS, SC_DONE]
         );
-        // …and when anything needs reporting — a failure OR an advisory — so the
+        // …and when anything needs reporting (a failure OR an advisory), so the
         // Welcome health summary's "→ open checks & repair" pointer is reachable.
         let fail = [check_row("x", Sev::Fail, Fix::None)];
         assert!(App::compute_visible(&none, basic, &fail).contains(&SC_REPAIR));

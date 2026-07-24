@@ -2777,7 +2777,7 @@ pub(crate) mod testenv {
 /// `irlume selftest liveness`: run the daemon's IR liveness self-test (fires
 /// the camera through the running daemon, so no camera contention). The daemon
 /// root-gates it (the raw measurements are a spoof-tuning oracle), so this must
-/// run as root — the TUI reaches it via `sudo irlume selftest liveness`.
+/// run as root; the TUI reaches it via `sudo irlume selftest liveness`.
 fn selftest_liveness() -> std::process::ExitCode {
     use irlume_common::{Request, Response, SelfTestKind};
     match daemon_request(&Request::SelfTest {

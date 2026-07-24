@@ -637,6 +637,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 mesh: engine.has_mesh(),
                 adapter: engine.has_ir_adapter(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                // Authoritative loaded-cue name so a non-root TUI can show the
+                // real on/off state (settings.conf is root-only).
+                third_party_pad: engine.thirdparty_pad_name().map(String::from),
             }
         }
         // Only tune the band to a user the peer may act for (root, or their own
@@ -2505,6 +2508,7 @@ mod tests {
                 mesh,
                 adapter,
                 version,
+                third_party_pad,
                 ..
             } => {
                 // IRLUME_FORCE_NO_IR=1 (set by the shared engine init) forces
@@ -2514,6 +2518,9 @@ mod tests {
                 assert_eq!(ir_dev, None);
                 // The bare shared engine loaded no optional models.
                 assert!(!mesh && !adapter);
+                // No opt-in PAD cue loaded -> Health reports None (the field
+                // the TUI uses for the authoritative on/off state).
+                assert_eq!(third_party_pad, None);
                 assert_eq!(version, env!("CARGO_PKG_VERSION"));
             }
             other => panic!("Health must answer Response::Health, got {other:?}"),

@@ -23,11 +23,61 @@ use std::time::Duration;
 
 use irlume_common::{PositionReport, ProfileSummary, Request, Response};
 
-const ACCENT: Color = Color::Rgb(0x6c, 0xb6, 0xff);
-const BLUE: Color = Color::Rgb(0x4a, 0x90, 0xd9);
-const OK: Color = Color::Rgb(0x73, 0xc9, 0x91);
-const ERR: Color = Color::Rgb(0xe8, 0x7a, 0x7a);
-const WARN: Color = Color::Rgb(0xe6, 0xc0, 0x7a);
+/// Semantic color slots, resolved once at startup down a capability ladder:
+/// NO_COLOR (no-color.org) gets none and the glyphs carry all state; plain
+/// terminals get ANSI names so the USER'S terminal theme is the palette
+/// (light themes stay readable); truecolor terminals get the soft irlume
+/// palette as polish. Every use is a semantic slot (accent/ok/warn/err),
+/// never decoration, so the ladder degrades without losing information.
+struct Theme {
+    accent: Color,
+    blue: Color,
+    ok: Color,
+    err: Color,
+    warn: Color,
+    /// Key-chip style for the footer (`[w]`, `[?]`…): colored chip normally,
+    /// REVERSED under NO_COLOR (a black-on-Reset chip would be invisible).
+    chip: Style,
+}
+
+fn th() -> &'static Theme {
+    static T: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Theme {
+                accent: Color::Reset,
+                blue: Color::Reset,
+                ok: Color::Reset,
+                err: Color::Reset,
+                warn: Color::Reset,
+                chip: Style::new().add_modifier(Modifier::REVERSED),
+            };
+        }
+        let truecolor = std::env::var("COLORTERM")
+            .map(|v| v.contains("truecolor") || v.contains("24bit"))
+            .unwrap_or(false);
+        if truecolor {
+            let accent = Color::Rgb(0x6c, 0xb6, 0xff);
+            Theme {
+                accent,
+                blue: Color::Rgb(0x4a, 0x90, 0xd9),
+                ok: Color::Rgb(0x73, 0xc9, 0x91),
+                err: Color::Rgb(0xe8, 0x7a, 0x7a),
+                warn: Color::Rgb(0xe6, 0xc0, 0x7a),
+                chip: Style::new().fg(Color::Black).bg(accent),
+            }
+        } else {
+            Theme {
+                accent: Color::Cyan,
+                blue: Color::Blue,
+                ok: Color::Green,
+                err: Color::Red,
+                warn: Color::Yellow,
+                chip: Style::new().fg(Color::Black).bg(Color::Cyan),
+            }
+        }
+    })
+}
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SCREENS: [&str; 11] = [
     "Welcome",
@@ -172,6 +222,20 @@ enum Suspend {
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
+    /// The full `irlume doctor` text readout in the cooked terminal: the
+    /// complete authoritative dump (incl. the info-only lines the Repair
+    /// checklist omits), copy-pasteable for a bug report.
+    Doctor,
+    /// Refresh the systemd-pcrlock policy after a firmware/Secure Boot change
+    /// so a Tier-2 seal keeps validating. Idempotent (re-predicts the current
+    /// PCRs); a system operation, so it is root-gated and clearly labeled.
+    PcrlockMakePolicy,
+    /// Toggle the opt-in biopolicy operation-class gate (the bool is the target
+    /// state). Root op; the daemon reads it live, no restart.
+    Biopolicy(bool),
+    /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
+    /// root-gates it; the raw measurements are a spoof-tuning oracle).
+    SelfTestLiveness,
 }
 
 /// What a y/n confirm modal executes on `[y]`: a daemon request (async, the
@@ -181,6 +245,11 @@ enum ConfirmAct {
     Daemon(Request),
     Sus(Suspend),
 }
+
+/// A y/n confirm with a SPECIFIC verb on the affirmative (GNOME HIG: "Label
+/// the affirmative button with a specific imperative verb… clearer than a
+/// generic label"): question, verb, action.
+type Confirm = (String, &'static str, ConfirmAct);
 
 /// Severity of a Repair-tab diagnostic.
 #[derive(Clone, Copy, PartialEq)]
@@ -254,7 +323,6 @@ struct VisibilityInputs {
 enum OpTag {
     Generic,
     Identify,
-    Calibrate,
 }
 
 /// Fingerprint snapshot for the Fingerprint screen.
@@ -275,6 +343,9 @@ struct HealthInfo {
     mesh: bool,
     adapter: bool,
     version: String,
+    /// Loaded third-party PAD cue name (authoritative on/off, since
+    /// settings.conf is root-only and a non-root TUI can't read it).
+    third_party_pad: Option<String>,
 }
 
 /// Template-encryption + recovery status (`RecoveryStatus`).
@@ -359,10 +430,14 @@ struct App {
     pairs: Vec<irlume_camera::CameraPair>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
-    confirm: Option<(String, ConfirmAct)>,
+    confirm: Option<Confirm>,
     /// True while mouse capture is released so the terminal's own selection
     /// works (the `[M]` toggle); wheel scroll is unavailable meanwhile.
     mouse_select: bool,
+    /// The [?] full-keymap overlay (tier two of the disclosure ladder).
+    show_help: bool,
+    /// Selected row of the Welcome hub (Enter jumps to its screen).
+    hub_sel: usize,
     op: Option<Op>,
     enroll: Option<EnrollUi>,
     /// A pending merge confirmation (scan 1 matched an existing profile).
@@ -376,7 +451,6 @@ struct App {
     /// Last 1:N identify result, shown as a card on the Identify screen.
     identify_result: Option<(bool, String)>,
     /// Last IR liveness self-test result, shown on the Repair screen.
-    selftest_result: Option<(bool, String)>,
     /// Repair-tab diagnostics + selection.
     repair: Vec<Check>,
     repair_sel: usize,
@@ -471,6 +545,8 @@ impl App {
             input: None,
             confirm: None,
             mouse_select: false,
+            show_help: false,
+            hub_sel: 0,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -479,7 +555,6 @@ impl App {
             suspend: None,
             resume_enroll: None,
             identify_result: None,
-            selftest_result: None,
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
@@ -513,14 +588,24 @@ impl App {
             advanced,
             daemon_down,
         } = state;
-        let needs_repair = daemon_down || checks.iter().any(|c| c.sev == Sev::Fail);
+        // Repair surfaces whenever there is ANYTHING to report (a failure OR an
+        // advisory), so the Welcome health summary's "→ see checks & repair"
+        // pointer is always reachable; a warning used to point at a hidden tab.
+        let needs_repair = daemon_down
+            || checks
+                .iter()
+                .any(|c| c.sev == Sev::Fail || c.sev == Sev::Warn);
         (0..SCREENS.len())
             .filter(|&i| match i {
                 // Essential face path requires a camera.
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                SC_SETTINGS => advanced,
+                // Settings holds user preferences (eyes-open, blink, biopolicy,
+                // third-party models), not diagnostics, so it is always
+                // reachable; hiding config behind "advanced" both buries it and
+                // creates dead-end pointers (a Repair fix references Settings).
+                SC_SETTINGS => true,
                 // Repair: only when something needs attention (or advanced view).
                 SC_REPAIR => advanced || needs_repair,
                 // Keyring unlock: an IR camera (face releases the credential) OR a
@@ -608,6 +693,7 @@ impl App {
                     mesh,
                     adapter,
                     version,
+                    third_party_pad,
                 }) => Some(HealthInfo {
                     tier,
                     rgb_dev,
@@ -615,29 +701,10 @@ impl App {
                     mesh,
                     adapter,
                     version,
+                    third_party_pad,
                 }),
                 _ => None, // older daemon / daemon down → Repair falls back to local probes
             };
-            match crate::daemon_poll(&Request::ListProfiles {
-                user: self.user.clone(),
-            }) {
-                Ok(Response::Enrollment {
-                    profiles,
-                    require_eyes_open,
-                    require_challenge,
-                    ..
-                }) => {
-                    self.profiles = profiles;
-                    self.eyes_open = require_eyes_open;
-                    self.challenge = require_challenge;
-                    self.enroll_error = None;
-                }
-                // A corrupt/unreadable enrollment (or a missing template key for an
-                // encrypted file) surfaces as an Error, not empty; don't silently
-                // show "no face enrolled"; capture it so Repair can flag+fix it.
-                Ok(Response::Error(e)) => self.enroll_error = Some(e),
-                _ => {}
-            }
             // KeyringInfo adds the seal tier and PCR drift; an older daemon
             // answers it with an error, so fall back to the plain armed bit.
             match crate::daemon_poll(&Request::KeyringInfo {
@@ -698,8 +765,43 @@ impl App {
     /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
     /// on demand (`[r]`), after an op, and when opening Repair/Fingerprint, but
     /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
-    fn refresh(&mut self) {
-        self.refresh_light();
+    /// Poll the enrollment list. This is the ONE slow read (a ListProfiles
+    /// triggers a TPM unseal of the template key to decrypt the profiles,
+    /// ~350ms measured), so it is kept OUT of the frequent refresh paths and
+    /// out of tab switches. Called only where a change can have happened: at
+    /// startup, after a TUI mutation, when entering the Profiles tab, and on
+    /// the slow heavy timer (for external `irlume enroll` changes).
+    fn refresh_profiles(&mut self) {
+        if !self.daemon_up {
+            return;
+        }
+        match crate::daemon_poll(&Request::ListProfiles {
+            user: self.user.clone(),
+        }) {
+            Ok(Response::Enrollment {
+                profiles,
+                require_eyes_open,
+                require_challenge,
+                ..
+            }) => {
+                self.profiles = profiles;
+                self.eyes_open = require_eyes_open;
+                self.challenge = require_challenge;
+                self.enroll_error = None;
+            }
+            // A corrupt/unreadable enrollment (or a missing template key for an
+            // encrypted file) surfaces as an Error, not empty; don't silently
+            // show "no face enrolled"; capture it so Repair can flag+fix it.
+            Ok(Response::Error(e)) => self.enroll_error = Some(e),
+            _ => {}
+        }
+    }
+
+    /// Re-derive hardware caps + fingerprint + the Repair checklist from the
+    /// CURRENT state (daemon reads + self.profiles). Split out so both refresh
+    /// paths run it AFTER their state reads, and run_checks never sees stale
+    /// profiles (a startup ordering bug showed a spurious "no enrollment" warn).
+    fn recompute_checks(&mut self) {
         // Re-derive hardware capabilities so a camera or reader hot-plugged
         // after launch reveals its tabs (caps/fp_present drive `visible` and the
         // Welcome gates, and were otherwise frozen at startup).
@@ -715,6 +817,25 @@ impl App {
         // Visibility is state-driven (Repair appears when something fails);
         // re-derive it from the fresh diagnostics.
         self.recompute_visible();
+    }
+
+    /// Diagnostics without the slow profile poll: fast daemon reads + hardware
+    /// caps + fingerprint + the Repair checks (with the CACHED profile list).
+    /// Tab switches use this so moving between tabs never pays the ListProfiles
+    /// TPM-unseal cost.
+    fn refresh_diagnostics(&mut self) {
+        self.refresh_light();
+        self.recompute_checks();
+    }
+
+    /// Full refresh incl. the slow profile poll: startup, after mutations, and
+    /// suspend-return. Order matters: refresh_light sets `daemon_up` (which
+    /// refresh_profiles needs), profiles load, THEN recompute_checks runs so
+    /// run_checks sees the fresh profile list (not the stale/empty one).
+    fn refresh(&mut self) {
+        self.refresh_light();
+        self.refresh_profiles();
+        self.recompute_checks();
     }
 
     /// Build the Repair-tab diagnostics from current state + quick local probes.
@@ -1022,7 +1143,7 @@ impl App {
                         "Method wiring",
                         Sev::Fail,
                         "method is fingerprint but pam_fprintd is not wired".into(),
-                        Fix::Manual("sudo irlume fingerprint enable --user <you>".into()),
+                        Fix::Manual("Fingerprint tab → [e] unlock with face OR fingerprint".into()),
                     ));
                 } else if self.fp.enrolled.is_empty() {
                     v.push(mk(
@@ -1105,8 +1226,8 @@ impl App {
             _ => {}
         }
         // Wiring drift: login WAS enabled (marker) but the active greeter's
-        // stack lost the module — authselect/pam-auth-update regenerated the
-        // PAM files. Face silently falls back to password until re-applied.
+        // stack lost the module (authselect/pam-auth-update regenerated the
+        // PAM files). Face silently falls back to password until re-applied.
         if crate::pamwire::reconcile_needed() {
             v.push(mk(
                 "Login wiring",
@@ -1156,13 +1277,68 @@ impl App {
             ));
         }
 
+        // Login keyring LOCKED: a Secret Service provider is up but its login
+        // collection is locked, so apps (Bitwarden, browsers) can't read their
+        // secrets even after a face login. Only flag it when the keyring is
+        // armed (else it's expected) and a provider actually answered. The TUI
+        // runs as the user, so unlike `sudo doctor` it can see the session bus.
+        if self.keyring_armed == Some(true) {
+            if let Some(true) = crate::secrets::login_keyring_locked() {
+                v.push(mk(
+                    "Login keyring",
+                    Sev::Warn,
+                    "the wallet is locked; apps (Bitwarden, browsers) can't read secrets yet"
+                        .into(),
+                    Fix::Manual(
+                        "unlock it by logging in with your face, or `sudo irlume keyring arm`"
+                            .into(),
+                    ),
+                ));
+            }
+        }
+
+        // Keyring PCR-drift: the seal no longer matches the current PCRs (a
+        // firmware/Secure Boot update moved them), so face login silently stops
+        // opening the wallet until re-bound. Only the Keyring tab drew this;
+        // surface it here too, with the one-key fix (reseal, added to Keyring).
+        if self.keyring_drift == Some(true) {
+            v.push(mk(
+                "Keyring seal",
+                Sev::Warn,
+                "PCRs drifted since sealing; the wallet won't auto-unlock until re-bound".into(),
+                Fix::Manual("Keyring tab → [r] reseal (re-bind to current PCRs)".into()),
+            ));
+        }
+
+        // A third-party liveness model enabled but with a CHECKSUM MISMATCH: the
+        // daemon refuses to load it, so the deny-only cue the user opted into is
+        // silently OFF. Only flag it when the daemon is up and did NOT load a
+        // cue (if it loaded one, Health.third_party_pad proves the weights were
+        // fine). doctor reports this; a TUI-only user would never see it.
+        let daemon_loaded_pad = self
+            .health
+            .as_ref()
+            .is_some_and(|h| h.third_party_pad.is_some());
+        if self.daemon_up && !daemon_loaded_pad {
+            if let crate::models::TuiState::Enabled { name, detail } = crate::models::tui_state() {
+                if detail.contains("MISMATCH") {
+                    v.push(mk(
+                        "Third-party model",
+                        Sev::Fail,
+                        format!("'{name}' weights fail their checksum; the daemon refuses them (cue is OFF)"),
+                        Fix::Manual("Settings tab → [m] disable then re-enable the model".into()),
+                    ));
+                }
+            }
+        }
+
         if let Some(r) = self.recovery {
             if r.encrypted && !r.recovery_set {
                 v.push(mk(
                     "Recovery backstop",
                     Sev::Warn,
                     "templates encrypted but no recovery passphrase".into(),
-                    Fix::Manual("run `irlume recovery setup`".into()),
+                    Fix::Manual("Recovery tab → [s] set a recovery passphrase".into()),
                 ));
             } else {
                 v.push(mk(
@@ -1415,14 +1591,13 @@ impl App {
                 // camera). Identify/Generic keep the modal on failure.
                 if ok {
                     self.log('✓', msg.clone());
-                } else if !matches!(tag, OpTag::Calibrate | OpTag::Identify) {
+                } else if !matches!(tag, OpTag::Identify) {
                     self.set_error(msg.clone());
                 } else {
                     self.log('·', msg.clone());
                 }
                 match tag {
                     OpTag::Identify => self.identify_result = Some((ok, msg)),
-                    OpTag::Calibrate => self.selftest_result = Some((ok, msg)),
                     OpTag::Generic => {}
                 }
                 self.op = None;
@@ -1536,7 +1711,11 @@ impl App {
                 && self.confirm.is_none()
             {
                 if last_heavy.elapsed() >= Duration::from_millis(HEAVY_REFRESH_MS) {
-                    self.refresh(); // cheap + fingerprint + diagnostics
+                    // Diagnostics only, NOT the slow profile poll: keeping the
+                    // ListProfiles TPM-unseal off every timer tick is what makes
+                    // the UI stay smooth. Profiles refresh on mutation / Profiles
+                    // tab / startup instead.
+                    self.refresh_diagnostics();
                     last_heavy = std::time::Instant::now();
                     last_light = std::time::Instant::now();
                 } else if last_light.elapsed() >= Duration::from_millis(LIGHT_REFRESH_MS) {
@@ -1619,6 +1798,22 @@ impl App {
     /// `ir-setup` leaves no re-checkable state, so we log ✓ on success and raise
     /// the error banner on failure.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
+        // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
+        // to: a running TUI must not shell out to a different (older) installed
+        // build for its privileged half. Resolve the first "irlume" arg to the
+        // current exe; leave non-irlume commands (systemd-pcrlock, sh -c) as is.
+        let self_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from));
+        let resolved: Vec<String> = args
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| match (i, a, &self_exe) {
+                (0, "irlume", Some(exe)) => exe.clone(),
+                _ => a.to_string(),
+            })
+            .collect();
+        let args: Vec<&str> = resolved.iter().map(String::as_str).collect();
         eprintln!("\n{what}; running: sudo {}…", args.join(" "));
         // In the cooked terminal, Ctrl-C goes to the whole foreground group:
         // a user aborting the CHILD (a sudo prompt, the models license flow)
@@ -1743,6 +1938,25 @@ impl App {
             Suspend::Update => {
                 crate::commands::update(&none);
             }
+            Suspend::Doctor => {
+                let _ = crate::doctor();
+            }
+            Suspend::PcrlockMakePolicy => self.sudo_step(
+                "refresh the pcrlock policy (re-predict the boot measurements)",
+                &["systemd-pcrlock", "make-policy"],
+            ),
+            Suspend::Biopolicy(on) => self.sudo_step(
+                if on {
+                    "enable the biopolicy gate"
+                } else {
+                    "disable the biopolicy gate"
+                },
+                &["irlume", "biopolicy", if on { "on" } else { "off" }],
+            ),
+            Suspend::SelfTestLiveness => self.sudo_step(
+                "run the IR liveness self-test",
+                &["irlume", "selftest", "liveness"],
+            ),
             Suspend::Logs => self.sudo_step("show the face-auth journal", &["irlume", "logs"]),
             // The TUI already double-confirmed, so pass --yes; the CLI still
             // does the teardown (un-wire PAM, stop daemon, wipe data) as root
@@ -1858,7 +2072,7 @@ impl App {
         if self.confirm.is_some() {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let (_, act) = self.confirm.take().unwrap();
+                    let (_, _, act) = self.confirm.take().unwrap();
                     match act {
                         // Async so the UI keeps animating; poll() logs the
                         // result (✓/error banner) and refreshes. map_confirm
@@ -1895,8 +2109,23 @@ impl App {
             }
             return;
         }
+        if self.show_help {
+            // Any of the closers dismisses; other keys are ignored so the
+            // overlay can't trigger actions the user can't see.
+            if matches!(code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
+                self.show_help = false;
+            }
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('?') => self.show_help = true,
+            // Home: jump back to the Welcome hub from any tab, so the "at a
+            // glance" summary is one key away instead of a Tab walk. (Home the
+            // KEY is taken by activity scroll; 'h' for home is unused globally.)
+            KeyCode::Char('h') if self.visible.contains(&SC_WELCOME) => {
+                self.screen = SC_WELCOME;
+            }
             // Release/recapture the mouse: captured, the wheel scrolls the TUI
             // but the terminal cannot select text; released, highlight-to-copy
             // works. A toggle because both are legitimate wants.
@@ -1946,8 +2175,13 @@ impl App {
         let new_pos = (((pos + d) % n + n) % n) as usize;
         self.screen = self.visible[new_pos];
         self.sel = 0;
+        // Fast diagnostics on entering Repair/Fingerprint (no slow profile
+        // poll, so the switch is instant); a fresh profile poll only when
+        // landing on Profiles, where an external `irlume enroll` should show.
         if self.screen == SC_REPAIR || self.screen == SC_FINGERPRINT {
-            self.refresh();
+            self.refresh_diagnostics();
+        } else if self.screen == SC_PROFILES {
+            self.refresh_profiles();
         }
     }
 
@@ -1955,12 +2189,14 @@ impl App {
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
+            SC_WELCOME => self.hub_rows().len(),
             _ => self.rows().len(),
         };
         let n = len.max(1) as i32;
         let cur = match self.screen {
             SC_REPAIR => &mut self.repair_sel,
             SC_CAMERAS => &mut self.cam_sel,
+            SC_WELCOME => &mut self.hub_sel,
             _ => &mut self.sel,
         };
         *cur = (((*cur as i32 + d) % n + n) % n) as usize;
@@ -1968,6 +2204,20 @@ impl App {
 
     fn on_action(&mut self, code: KeyCode) {
         match (self.screen, code) {
+            // Hub: Enter opens the selected section (the summary IS the nav).
+            (SC_WELCOME, KeyCode::Enter) => {
+                if let Some((_, _, target)) = self.hub_rows().get(self.hub_sel).copied() {
+                    self.screen = target;
+                    self.sel = 0;
+                    // Same fast paths as a Tab switch: diagnostics for
+                    // Repair/Fingerprint, a fresh profile poll for Profiles.
+                    if target == SC_REPAIR || target == SC_FINGERPRINT {
+                        self.refresh_diagnostics();
+                    } else if target == SC_PROFILES {
+                        self.refresh_profiles();
+                    }
+                }
+            }
             // Welcome / Done: refresh the whole snapshot.
             (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) => {
                 self.log('·', "refreshing status…");
@@ -2050,14 +2300,22 @@ impl App {
                 self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
                 self.suspend = Some(Suspend::Logs);
             }
-            (SC_REPAIR, KeyCode::Char('l')) => self.start_async(
-                "SelfTest (IR liveness)",
-                OpTag::Calibrate,
-                Request::SelfTest {
-                    kind: irlume_common::SelfTestKind::Liveness,
-                },
-                map_selftest,
-            ),
+            // Full `irlume doctor` readout: the complete authoritative dump,
+            // including the info-only lines the Repair checklist omits, for a
+            // bug report. Runs as the user (no sudo prompt); root-only lines
+            // say so.
+            (SC_REPAIR, KeyCode::Char('d')) => {
+                self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
+                self.suspend = Some(Suspend::Doctor);
+            }
+            // IR liveness self-test: the daemon root-gates it (the raw
+            // measurements are a spoof-tuning oracle), so like every other root
+            // action it suspends to sudo instead of failing with a peer-uid
+            // error on the direct socket call.
+            (SC_REPAIR, KeyCode::Char('l')) => {
+                self.log('→', "sudo irlume selftest liveness: fires the IR camera through the daemon and reports the liveness measurements");
+                self.suspend = Some(Suspend::SelfTestLiveness);
+            }
             // Cameras: IR emitter auto-setup (root; writes the persisted UVC
             // control) suspends to sudo; the [p] probe below is read-only.
             (SC_CAMERAS, KeyCode::Char('s')) => {
@@ -2093,9 +2351,33 @@ impl App {
                     Pending::KeyringPw(None),
                 ));
             }
+            // Refresh the pcrlock policy (Tier-2 only): re-predict the boot
+            // measurements after a firmware/Secure Boot change so the seal keeps
+            // validating. Root op; idempotent, so no confirm.
+            (SC_KEYRING, KeyCode::Char('p'))
+                if self
+                    .keyring_policy
+                    .as_deref()
+                    .is_some_and(|p| p.contains("Tier 2")) =>
+            {
+                self.log('→', "sudo systemd-pcrlock make-policy: refreshes the boot-measurement policy your seal is bound to");
+                self.suspend = Some(Suspend::PcrlockMakePolicy);
+            }
+            // Reseal: re-bind the sealed password to the current PCRs (the CLI
+            // `irlume reseal`). Same masked-prompt + SealPassword path as arm;
+            // the distinct entry point and copy are the discoverability the
+            // drift-recovery workflow needs.
+            (SC_KEYRING, KeyCode::Char('r')) if self.keyring_armed == Some(true) => {
+                self.input = Some((
+                    "Login password to re-seal to current PCRs (••):".into(),
+                    String::new(),
+                    Pending::KeyringPw(None),
+                ));
+            }
             (SC_KEYRING, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the TPM-sealed login password?".into(),
+                    "Erase",
                     ConfirmAct::Daemon(Request::ForgetPassword {
                         user: self.user.clone(),
                     }),
@@ -2119,6 +2401,7 @@ impl App {
             (SC_RECOVERY, KeyCode::Char('f')) => {
                 self.confirm = Some((
                     "Erase the recovery passphrase? (templates stay encrypted)".into(),
+                    "Erase",
                     ConfirmAct::Daemon(Request::RecoveryForget {
                         user: self.user.clone(),
                     }),
@@ -2152,6 +2435,7 @@ impl App {
             (SC_FINGERPRINT, KeyCode::Char('x')) => {
                 self.confirm = Some((
                     "Delete ALL enrolled fingerprints from the reader?".into(),
+                    "Delete",
                     ConfirmAct::Sus(Suspend::FingerprintReset),
                 ));
             }
@@ -2186,6 +2470,7 @@ impl App {
                 self.confirm = Some((
                     "Un-wire face auth from login/lock/sudo/apps? (password logins are untouched)"
                         .into(),
+                    "Un-wire",
                     ConfirmAct::Sus(Suspend::LoginDisable),
                 ));
             }
@@ -2232,6 +2517,23 @@ impl App {
                     map_settings,
                 );
             }
+            // Biopolicy gate: enabling changes the security posture (restricts
+            // which services a face may satisfy), so it is confirmed; disabling
+            // just relaxes back to default and goes straight through.
+            (SC_SETTINGS, KeyCode::Char('b')) => {
+                if biopolicy_on() {
+                    self.log('→', "sudo irlume biopolicy off: relax back to the default (all services may verify)");
+                    self.suspend = Some(Suspend::Biopolicy(false));
+                } else {
+                    self.confirm = Some((
+                        "Enable the biopolicy gate? Only Login/Elevation may then release the \
+                         keyring; lock-screen becomes verify-only. Password stays available."
+                            .into(),
+                        "Enable",
+                        ConfirmAct::Sus(Suspend::Biopolicy(true)),
+                    ));
+                }
+            }
             // Third-party PAD model toggle. settings.conf is root-only, so the
             // readable proxy for "enabled" is installed weights (disable
             // deletes them). Enabling runs the CLI's own license/provenance
@@ -2249,6 +2551,7 @@ impl App {
                                 "Disable third-party model '{}'? (its weights are deleted)",
                                 m.name
                             ),
+                            "Disable",
                             ConfirmAct::Sus(Suspend::ModelsDisable),
                         ));
                     }
@@ -2361,6 +2664,7 @@ impl App {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
                     format!("Delete profile '{p}' and all its scans?"),
+                    "Delete",
                     ConfirmAct::Daemon(Request::DeleteProfile {
                         user: self.user.clone(),
                         profile: p,
@@ -2374,6 +2678,7 @@ impl App {
                 );
                 self.confirm = Some((
                     format!("Delete scan '{s}' from '{p}'?"),
+                    "Delete",
                     ConfirmAct::Daemon(Request::DeleteScan {
                         user: self.user.clone(),
                         profile: p,
@@ -2549,10 +2854,15 @@ impl App {
             // Prompt in the wrapping body (a long name/prompt would truncate as a
             // border title); the typed field on its own line below it.
             self.modal(f, "Input", &format!("{prompt}\n{shown}▏"));
-        } else if let Some((what, _)) = &self.confirm {
+        } else if let Some((what, _, _)) = &self.confirm {
             // Question in the body so a long target name isn't clipped by the
             // single-line border title.
-            self.modal(f, "Confirm", &format!("{what}\n[y] yes    [n] no"));
+            let verb = self.confirm.as_ref().map(|c| c.1).unwrap_or("Confirm");
+            self.modal(
+                f,
+                "Confirm",
+                &format!("{what}\n[n]/Esc Cancel    [y] {verb}"),
+            );
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
@@ -2562,6 +2872,11 @@ impl App {
                 mc.profile
             );
             self.modal(f, "Already enrolled", &body);
+        }
+        // Tier two of the key-disclosure ladder; drawn last so it sits above
+        // everything except nothing (help is always answerable).
+        if self.show_help {
+            self.modal(f, "Keys  ([?] or Esc to close)", &self.help_body());
         }
     }
 
@@ -2580,11 +2895,11 @@ impl App {
         let blk = Block::bordered()
             .title(" ⚠ Problem ")
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ERR).add_modifier(Modifier::BOLD))
+            .border_style(Style::new().fg(th().err).add_modifier(Modifier::BOLD))
             .padding(ratatui::widgets::Padding::horizontal(1));
         let body = vec![
             Line::raw(""),
-            Line::from(Span::styled(msg.to_string(), Style::new().fg(ERR))),
+            Line::from(Span::styled(msg.to_string(), Style::new().fg(th().err))),
             Line::raw(""),
             Line::from(Span::styled("[any key] dismiss", Style::new().dim())),
         ];
@@ -2603,7 +2918,7 @@ impl App {
                 " irlume ",
                 Style::new()
                     .fg(Color::Black)
-                    .bg(ACCENT)
+                    .bg(th().accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
@@ -2620,7 +2935,7 @@ impl App {
             ),
             Span::styled(
                 SCREENS[self.screen],
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
             ),
         ]);
         let right =
@@ -2667,8 +2982,11 @@ impl App {
             }
         };
         let line = Line::from(vec![
-            Span::styled("  ℹ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(text, Style::new().fg(ACCENT)),
+            Span::styled(
+                "  ℹ ",
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::new().fg(th().accent)),
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -2677,8 +2995,10 @@ impl App {
         let blk = Block::bordered()
             .title(format!(" {} ", SCREENS[self.screen]))
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ACCENT))
-            .padding(ratatui::widgets::Padding::horizontal(1));
+            .border_style(Style::new().fg(th().accent))
+            // Breathing room (whitespace over chrome): content never touches
+            // the frame.
+            .padding(ratatui::widgets::Padding::new(2, 2, 1, 0));
         let inner = blk.inner(area);
         f.render_widget(blk, area);
         if self.enroll.is_some() {
@@ -2709,7 +3029,7 @@ impl App {
                 Span::styled(
                     if ok { "  ✓ " } else { "  ○ " },
                     if ok {
-                        Style::new().fg(OK)
+                        Style::new().fg(th().ok)
                     } else {
                         Style::new().dim()
                     },
@@ -2736,7 +3056,7 @@ impl App {
                 Span::raw("  Quality  "),
                 Span::styled(
                     quality_bar(q),
-                    Style::new().fg(if q >= 70 { OK } else { ACCENT }),
+                    Style::new().fg(if q >= 70 { th().ok } else { th().accent }),
                 ),
             ]),
             Line::raw(""),
@@ -2760,14 +3080,14 @@ impl App {
         if let Some(c) = e.count {
             lines.push(Line::from(Span::styled(
                 format!("  ● Hold still; capturing in {c}…",),
-                Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             )));
         } else {
             let g = r
                 .map(|x| x.guidance.clone())
                 .unwrap_or_else(|| "Starting camera…".into());
             lines.push(Line::from(vec![
-                Span::styled("  → ", Style::new().fg(ACCENT)),
+                Span::styled("  → ", Style::new().fg(th().accent)),
                 Span::styled(g, Style::new().add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -2776,13 +3096,13 @@ impl App {
             "  [esc] cancel",
             Style::new().dim(),
         )));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
         if self.profiles.is_empty() {
             f.render_widget(Paragraph::new("\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically.")
-                .wrap(Wrap { trim: true }).dim(), area);
+                .wrap(Wrap { trim: false }).dim(), area);
             return;
         }
         let rows = self.rows();
@@ -2794,7 +3114,7 @@ impl App {
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             format!("● {}", p.name),
-                            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(format!("   ({} scans)", p.scans.len()), Style::new().dim()),
                     ]))
@@ -2845,7 +3165,7 @@ impl App {
                     Style::new().dim(),
                 )),
                 Line::from(vec![
-                    Span::styled("  [enter]", Style::new().fg(ACCENT)),
+                    Span::styled("  [enter]", Style::new().fg(th().accent)),
                     Span::styled(" toggle", Style::new().dim()),
                 ]),
                 Line::raw(""),
@@ -2855,7 +3175,7 @@ impl App {
                     if bio {
                         Span::styled(
                             "● ENFORCING",
-                            Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                         )
                     } else {
                         Span::styled("○ off (default)", Style::new().dim())
@@ -2866,19 +3186,67 @@ impl App {
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  is verify-only; remote/unknown services are denied.",
+                    "  is verify-only; remote/unknown services are denied. Advanced; the",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  Toggle (root): set enforce_biopolicy=1 in /etc/irlume/settings.conf.",
+                    "  password is always available, so this can restrict but never lock out.",
                     Style::new().dim(),
                 )),
+                Line::from(vec![
+                    Span::styled("  [b]", Style::new().fg(th().accent)),
+                    Span::styled(
+                        if bio {
+                            " turn it off (sudo)"
+                        } else {
+                            " turn it on (sudo; asks first)"
+                        },
+                        Style::new().dim(),
+                    ),
+                ]),
                 Line::raw(""),
                 section("Third-party liveness models"),
-                Line::from(vec![
-                    Span::raw("  state  "),
-                    Span::styled(crate::models::doctor_line(), Style::new().dim()),
-                ]),
+                {
+                    // A ●/○ status row like the sections above, not a text blob.
+                    // The daemon's loaded-cue name is authoritative (it knows
+                    // what it loaded); fall back to the filesystem probe only
+                    // when the daemon can't answer, since settings.conf is
+                    // root-only and a non-root TUI can't read the flag itself.
+                    let (icon, icon_style, label) =
+                        match self.health.as_ref().and_then(|h| h.third_party_pad.clone()) {
+                            Some(name) => (
+                                "●",
+                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                format!("enabled: {name}   (loaded by the daemon, deny-only cue)"),
+                            ),
+                            // No daemon-reported cue: could be a daemon too old
+                            // to report the field (0.6.0 and earlier) OR genuinely
+                            // none. We can't tell the two apart (both deserialize
+                            // to None), so trust the filesystem probe rather than
+                            // claim "off": an older daemon with flir loaded must
+                            // not read as ○ none (regression fixed here).
+                            None => match crate::models::tui_state() {
+                                crate::models::TuiState::Enabled { name, detail } => (
+                                    "●",
+                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                    format!("enabled: {name}   {detail}"),
+                                ),
+                                crate::models::TuiState::InstalledUnknown { name } => (
+                                    "◐",
+                                    Style::new().fg(th().warn),
+                                    format!("{name} weights installed; on/off is root-only"),
+                                ),
+                                crate::models::TuiState::None => {
+                                    ("○", Style::new().dim(), "none (default)".to_string())
+                                }
+                            },
+                        };
+                    Line::from(vec![
+                        Span::raw("  state  "),
+                        Span::styled(format!("{icon} "), icon_style),
+                        Span::styled(label, Style::new().dim()),
+                    ])
+                },
                 Line::from(Span::styled(
                     "  Opt-in, measured, deny-only extra anti-spoof cue; fetched from the",
                     Style::new().dim(),
@@ -2887,10 +3255,13 @@ impl App {
                     "  publisher, checksum-pinned, never shipped by irlume.",
                     Style::new().dim(),
                 )),
-                Line::from(Span::styled(
-                    "  [m] enables or disables one (sudo; the license confirm runs in the terminal)",
-                    Style::new().dim(),
-                )),
+                Line::from(vec![
+                    Span::styled("  [m]", Style::new().fg(th().accent)),
+                    Span::styled(
+                        " enable or disable one (sudo; the license confirm runs in the terminal)",
+                        Style::new().dim(),
+                    ),
+                ]),
                 Line::raw(""),
                 section("Match thresholds (read-only)"),
                 Line::from(Span::styled(
@@ -2898,16 +3269,21 @@ impl App {
                     Style::new().dim(),
                 )),
             ])
-            .wrap(Wrap { trim: true }),
+            .wrap(Wrap { trim: false }),
             area,
         );
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
-        let [list_area, info_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).areas(area);
         let (argb, air) = irlume_camera::select_pair(); // currently active pair
         let pairs = &self.pairs;
+        // Size the list to its rows (header + one row per camera/note) so the
+        // info block sits right under it instead of a stretched gap; leftover
+        // space stays empty at the bottom (content near the top).
+        let list_rows = self.nodes.len().max(pairs.len()).max(1) as u16 + 1;
+        let [list_area, info_area] =
+            Layout::vertical([Constraint::Length(list_rows + 1), Constraint::Length(9)])
+                .areas(area);
 
         // ---- selectable list of trusted (physical) Hello camera pairs ----
         // No pair ≠ no camera: an RGB-only device still serves the convenience
@@ -2917,7 +3293,7 @@ impl App {
             for (path, role) in &self.nodes {
                 if matches!(role, irlume_camera::Role::Rgb) {
                     v.push(ListItem::new(Line::from(vec![
-                        Span::styled(" ● ", Style::new().fg(OK)),
+                        Span::styled(" ● ", Style::new().fg(th().ok)),
                         Span::styled(
                             format!("{:<16}", path.trim_start_matches("/dev/")),
                             Style::new().add_modifier(Modifier::BOLD),
@@ -2953,7 +3329,7 @@ impl App {
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
-                            Style::new().fg(if active { OK } else { Color::DarkGray }),
+                            Style::new().fg(if active { th().ok } else { Color::DarkGray }),
                         ),
                         Span::styled(
                             format!(
@@ -2970,10 +3346,10 @@ impl App {
                                 Style::new()
                             },
                         ),
-                        Span::styled(format!("{kind:<10}"), Style::new().fg(ACCENT)),
+                        Span::styled(format!("{kind:<10}"), Style::new().fg(th().accent)),
                         Span::styled(format!("[{id}]"), Style::new().dim()),
                         if priv_on {
-                            Span::styled("  ⚠ privacy ON", Style::new().fg(ERR))
+                            Span::styled("  ⚠ privacy ON", Style::new().fg(th().err))
                         } else {
                             Span::raw("")
                         },
@@ -2983,19 +3359,23 @@ impl App {
         };
         let mut st = ListState::default()
             .with_selected(Some(self.cam_sel.min(pairs.len().saturating_sub(1))));
-        let blk = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim())
-            .title(" cameras (● = active · ↑↓ select · enter = use) ");
-        let inner = blk.inner(list_area);
-        f.render_widget(blk, list_area);
+        // No inner border (whitespace over chrome; the content panel already
+        // frames this). A section header carries what the border title did.
+        let [hdr_area, rows_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(list_area);
+        f.render_widget(
+            Paragraph::new(section(
+                "Cameras  (● = active · ↑↓ select · Enter uses one)",
+            )),
+            hdr_area,
+        );
         f.render_stateful_widget(
             List::new(items).highlight_style(
                 Style::new()
                     .bg(Color::Rgb(0x20, 0x30, 0x40))
                     .add_modifier(Modifier::BOLD),
             ),
-            inner,
+            rows_area,
             &mut st,
         );
 
@@ -3010,14 +3390,17 @@ impl App {
         };
         let mut lines = vec![Line::from(vec![
             Span::styled("  active   ", Style::new().dim()),
-            Span::styled(active, Style::new().fg(OK).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                active,
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            ),
         ])];
         if let Some(p) = pairs.get(self.cam_sel) {
             if p.rgb != argb || p.ir != air {
                 lines.push(Line::from(vec![
                     Span::styled("  selected ", Style::new().dim()),
                     Span::styled(format!("{} + {}", p.rgb, p.ir), Style::new()),
-                    Span::styled("   [enter] to switch", Style::new().fg(ACCENT)),
+                    Span::styled("   [enter] to switch", Style::new().fg(th().accent)),
                 ]));
             }
         }
@@ -3032,24 +3415,19 @@ impl App {
             Style::new().dim(),
         )));
         lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(ACCENT)),
+            Span::styled("  [s]", Style::new().fg(th().accent)),
             Span::styled(" auto-setup emitter   ", Style::new().dim()),
-            Span::styled("[p]", Style::new().fg(ACCENT)),
+            Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(" probe XU controls", Style::new().dim()),
         ]));
-        let iblk = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim());
-        f.render_widget(
-            Paragraph::new(lines).block(iblk).wrap(Wrap { trim: true }),
-            info_area,
-        );
+        // Borderless (no box-in-box); the content panel is the only frame.
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info_area);
     }
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {
         let reader = match (&self.fp.device, self.fp.available) {
-            (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(OK)),
-            (None, true) => Span::styled("● present (unnamed)", Style::new().fg(OK)),
+            (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(th().ok)),
+            (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
             (None, false) => Span::styled("○ none detected", Style::new().dim()),
         };
         let enrolled = if self.fp.enrolled.is_empty() {
@@ -3061,45 +3439,42 @@ impl App {
                     self.fp.enrolled.len(),
                     self.fp.enrolled.join(", ")
                 ),
-                Style::new().fg(OK),
+                Style::new().fg(th().ok),
             )
         };
         let mut lines = vec![
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("Reader        ", Style::new().add_modifier(Modifier::BOLD)),
-                reader,
-            ]),
-            Line::from(vec![
-                Span::styled("Enrolled      ", Style::new().add_modifier(Modifier::BOLD)),
-                enrolled,
-            ]),
-            Line::from(vec![
-                Span::styled("Active method ", Style::new().add_modifier(Modifier::BOLD)),
+            section("Fingerprint (companion factor)"),
+            state_row("reader", 14, reader),
+            state_row("enrolled", 14, enrolled),
+            state_row(
+                "active method",
+                14,
                 Span::raw(method_label(&self.fp.method)),
-            ]),
+            ),
             Line::raw(""),
         ];
         if self.fp.available {
             lines.push(Line::from(Span::styled(
-                "Fingerprint is a companion factor via stock fprintd + pam_fprintd.",
+                "  Stock fprintd + pam_fprintd; unlocks alongside face, never instead.",
                 Style::new().dim(),
             )));
-            lines.push(Line::from(Span::styled(
-                "  [a] enroll a finger · [t] test a finger · [x] wipe all enrolled fingers",
-                Style::new().dim(),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  [e] unlock with face OR fingerprint (sudo) · [d] remove fingerprint from login",
-                Style::new().dim(),
-            )));
+            lines.push(Line::raw(""));
+            lines.push(action_line(&[
+                ("a", "enroll a finger"),
+                ("t", "test a finger"),
+                ("x", "wipe all"),
+            ]));
+            lines.push(action_line(&[
+                ("e", "face OR fingerprint (sudo)"),
+                ("d", "remove from login"),
+            ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "No usable reader on this device; fingerprint unavailable.",
+                "  No usable reader on this device; fingerprint unavailable.",
                 Style::new().dim(),
             )));
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_recovery(&self, f: &mut Frame, area: Rect) {
@@ -3107,66 +3482,61 @@ impl App {
         let enc = if r.encrypted {
             Span::styled(
                 "● encrypted",
-                Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled("○ plaintext at rest", Style::new().dim())
         };
         let rec = if r.recovery_set {
-            Span::styled("● set", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "● set",
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled("○ not set", Style::new().dim())
         };
         let mut lines = vec![
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled(
-                    "Templates at rest    ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                enc,
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Recovery passphrase  ",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                rec,
-            ]),
+            section("Recovery + template encryption"),
+            state_row("templates", 12, enc),
+            state_row("passphrase", 12, rec),
             Line::raw(""),
             Line::from(Span::styled(
-                "A recovery passphrase backs up the face-template key, the manual",
+                "  A recovery passphrase backs up the face-template key, the manual",
                 Style::new().dim(),
             )),
             Line::from(Span::styled(
-                "backstop after a TPM clear, firmware/dbx update, or disk move.",
+                "  backstop after a TPM clear, firmware/dbx update, or disk move.",
                 Style::new().dim(),
             )),
             Line::raw(""),
         ];
         if !r.tpm_present {
             lines.push(Line::from(Span::styled(
-                "No TPM on this host: templates stay plaintext; recovery N/A.",
-                Style::new().fg(ERR),
+                "  No TPM on this host: templates stay plaintext; recovery N/A.",
+                Style::new().fg(th().err),
             )));
         } else if r.encrypted && !r.recovery_set {
             lines.push(Line::from(Span::styled(
-                "⚠ No backstop: set one now, or a broken seal means re-enrolling.",
-                Style::new().fg(ERR),
+                "  ⚠ No backstop: set one now, or a broken seal means re-enrolling.",
+                Style::new().fg(th().err),
             )));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "  [s] set passphrase   [t] restore from passphrase   [f] forget",
-            Style::new().dim(),
-        )));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        lines.push(action_line(&[
+            ("s", "set passphrase"),
+            ("t", "restore"),
+            ("f", "forget"),
+        ]));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_keyring(&self, f: &mut Frame, area: Rect) {
         let armed = self.keyring_armed.unwrap_or(false);
         let status = match self.keyring_armed {
-            Some(true) => Span::styled("● armed", Style::new().fg(OK).add_modifier(Modifier::BOLD)),
+            Some(true) => Span::styled(
+                "● armed",
+                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            ),
             Some(false) => Span::styled("○ not armed", Style::new().dim()),
             None => Span::styled("unknown (daemon unreachable)", Style::new().dim()),
         };
@@ -3180,7 +3550,7 @@ impl App {
                 Span::raw("  PCRs     "),
                 Span::styled(
                     "drifted since sealing; re-arm to rebind",
-                    Style::new().fg(WARN),
+                    Style::new().fg(th().warn),
                 ),
             ]));
         }
@@ -3195,9 +3565,9 @@ impl App {
             Line::from(vec![
                 Span::raw("  TPM      "),
                 if tpm {
-                    Span::styled("● present", Style::new().fg(OK))
+                    Span::styled("● present", Style::new().fg(th().ok))
                 } else {
-                    Span::styled("✗ none", Style::new().fg(ERR))
+                    Span::styled("✗ none", Style::new().fg(th().err))
                 },
             ]),
             Line::from(vec![
@@ -3234,20 +3604,24 @@ impl App {
                 .is_some_and(|p| p.contains("Tier 2"));
             if tier2 {
                 lines.push(Line::from(Span::styled(
-                    "  after a firmware/Secure Boot update, re-run `systemd-pcrlock",
+                    "  Tier 2 seal (survives kernel updates). After a firmware or Secure",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "  make-policy` as root; the seal keeps working with no re-arm.",
+                    "  Boot change, the boot measurements move; press [p] to refresh the",
+                    Style::new().dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  pcrlock policy so face-unlock keeps working (no re-arm needed).",
                     Style::new().dim(),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
                     "  ⚠ if a firmware/dbx update moves the bound PCRs, unseal fails →",
-                    Style::new().fg(WARN),
+                    Style::new().fg(th().warn),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    use the Repair tab or `irlume reseal` to re-bind to current PCRs.",
+                    "    press [r] to reseal (re-bind to the current PCRs, same password).",
                     Style::new().dim(),
                 )));
             }
@@ -3263,22 +3637,58 @@ impl App {
             )));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("  [a]", Style::new().fg(ACCENT)),
-            Span::styled(" arm (enter your login password)   ", Style::new().dim()),
-            Span::styled("[f]", Style::new().fg(ACCENT)),
-            Span::styled(" forget", Style::new().dim()),
-        ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        // [r] reseal is shown only once armed (re-bind needs an existing seal);
+        // it re-enters the password and re-seals to the current PCRs, the CLI
+        // `irlume reseal` a keyboard-only user would otherwise have no way to run.
+        if armed {
+            lines.push(action_line(&[
+                ("a", "re-arm (new password)"),
+                ("r", "reseal (re-bind to current PCRs)"),
+                ("f", "forget"),
+            ]));
+        } else {
+            lines.push(action_line(&[
+                ("a", "arm (enter your login password)"),
+                ("f", "forget"),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    /// Hub rows for the Welcome screen: each visible section with its live
+    /// state, selectable and Enter-jumpable (hub-and-spoke: the summary IS
+    /// the navigation, the tab ribbon stays for direct access).
+    fn hub_rows(&self) -> Vec<(&'static str, bool, usize)> {
+        let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
+        let rec = self.recovery.unwrap_or_default();
+        let all: [(&'static str, bool, usize); 7] = [
+            ("checks & repair", self.daemon_up, SC_REPAIR),
+            ("cameras", self.caps.rgb, SC_CAMERAS),
+            ("enrollment", scans > 0, SC_PROFILES),
+            (
+                "keyring unlock",
+                self.keyring_armed.unwrap_or(false),
+                SC_KEYRING,
+            ),
+            (
+                "recovery + encryption",
+                rec.encrypted && rec.recovery_set,
+                SC_RECOVERY,
+            ),
+            ("login wiring", crate::pamwire::login_wired(), SC_PAM),
+            ("settings", true, SC_SETTINGS),
+        ];
+        all.into_iter()
+            .filter(|(_, _, sc)| self.visible.contains(sc))
+            .collect()
     }
 
     fn draw_welcome(&self, f: &mut Frame, area: Rect) {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
-        let rec = self.recovery.unwrap_or_default();
         let lines = vec![
             Line::from(Span::styled(
                 "  irlume - local face authentication",
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "  IR + lume · clean-BOM · TPM-sealed · privacy by design",
@@ -3294,22 +3704,43 @@ impl App {
                 Style::new().dim(),
             )),
             Line::raw(""),
-            section("At a glance"),
-            Line::from(vec![Span::raw("  daemon       "), onoff(self.daemon_up)]),
-            Line::from(vec![
-                Span::raw("  enrolled     "),
-                count_badge(self.profiles.len(), scans),
-            ]),
-            Line::from(vec![
-                Span::raw("  keyring      "),
-                onoff(self.keyring_armed.unwrap_or(false)),
-            ]),
-            Line::from(vec![Span::raw("  encrypted    "), onoff(rec.encrypted)]),
-            Line::from(vec![Span::raw("  biopolicy    "), onoff(biopolicy_on())]),
+            {
+                // A one-line health summary from the same run_checks() the
+                // Repair tab uses, so a healthy user never needs to open Repair
+                // and an unhealthy one is pointed straight at it.
+                let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
+                let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
+                // needs_repair (compute_visible) surfaces the "checks & repair"
+                // hub row on any warn/fail, so this always points at a row that
+                // is right below and Enter-openable, no "switch to advanced" step.
+                if fails > 0 {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  ✗ {fails} issue(s) need attention"),
+                            Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" → open \"checks & repair\" below", Style::new().dim()),
+                    ])
+                } else if warns > 0 {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  ⚠ {warns} advisory item(s)"),
+                            Style::new().fg(th().warn),
+                        ),
+                        Span::styled(" → open \"checks & repair\" below", Style::new().dim()),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        "  ✓ all checks pass",
+                        Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                    ))
+                }
+            },
             Line::raw(""),
+            section("At a glance  (↑↓ pick a section, Enter opens it)"),
             Line::from(vec![
                 Span::styled("  Recommended  ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::styled(self.recommended(), Style::new().fg(OK)),
+                Span::styled(self.recommended(), Style::new().fg(th().ok)),
             ]),
             Line::from(Span::styled(
                 "  (you can change the method any time; [v] shows every tab)",
@@ -3318,20 +3749,20 @@ impl App {
             Line::raw(""),
             if self.visible.contains(&SC_IDENTIFY) {
                 Line::from(vec![
-                    Span::styled("  [e]", Style::new().fg(ACCENT)),
+                    Span::styled("  [e]", Style::new().fg(th().accent)),
                     Span::styled(" enroll now   ", Style::new().dim()),
-                    Span::styled("[i]", Style::new().fg(ACCENT)),
+                    Span::styled("[i]", Style::new().fg(th().accent)),
                     Span::styled(" identify   ", Style::new().dim()),
-                    Span::styled("Tab", Style::new().fg(ACCENT)),
+                    Span::styled("Tab", Style::new().fg(th().accent)),
                     Span::styled(" walk the steps", Style::new().dim()),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled("  [e]", Style::new().fg(ACCENT)),
+                    Span::styled("  [e]", Style::new().fg(th().accent)),
                     Span::styled(" enroll now   ", Style::new().dim()),
-                    Span::styled("Tab", Style::new().fg(ACCENT)),
+                    Span::styled("Tab", Style::new().fg(th().accent)),
                     Span::styled(" walk the steps   ", Style::new().dim()),
-                    Span::styled("[v]", Style::new().fg(ACCENT)),
+                    Span::styled("[v]", Style::new().fg(th().accent)),
                     Span::styled(" all tabs", Style::new().dim()),
                 ])
             },
@@ -3340,12 +3771,50 @@ impl App {
                 Style::new().dim(),
             )),
         ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        let mut lines = lines;
+        // Splice the selectable hub rows just under the "At a glance" header.
+        let at = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|sp| sp.content.contains("At a glance")))
+            .map(|i| i + 1)
+            .unwrap_or(lines.len());
+        let rows = self.hub_rows();
+        let n = rows.len();
+        for (i, (label, ok, _)) in rows.into_iter().enumerate() {
+            let selected = i == self.hub_sel;
+            let mut style = Style::new();
+            if selected {
+                style = style.fg(th().accent).add_modifier(Modifier::BOLD);
+            }
+            let badge = if label == "enrollment" {
+                count_badge(self.profiles.len(), scans)
+            } else {
+                onoff(ok)
+            };
+            let marker = if selected { '▸' } else { ' ' };
+            lines.insert(
+                at + i,
+                Line::from(vec![
+                    Span::styled(format!("  {marker} {label:<24}"), style),
+                    badge,
+                ]),
+            );
+        }
+        lines.insert(at + n, Line::raw(""));
+        // trim:false: leading spaces are the marker column of the hub rows;
+        // trim would collapse unselected rows against the ▸ rows.
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     /// Diagnostic + repair: a live checklist (✓/⚠/✗) of everything irlume needs
     /// to run, with one-key fixes, plus platform trust anchors and a live IR PAD
-    /// self-test. Mirrors `irlume doctor` + `diag` + `deps` and adds remediation.
+    /// self-test. Covers the `irlume doctor`/`diag`/`deps` checks that have a
+    /// remediation or that a TUI-only user would otherwise miss (daemon, models,
+    /// cameras, SELinux/AppArmor, wiring drift, keyring drift, login-keyring
+    /// locked, recovery, TPM, third-party-model checksum). The full text
+    /// readout (incl. info-only lines) is one key away via the `[d]` key. Some
+    /// advisory-only doctor lines (fingerprint
+    /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
         use irlume_common::secureboot;
         let [list_area, info_area] =
@@ -3360,9 +3829,9 @@ impl App {
             .iter()
             .map(|c| {
                 let (icon, color) = match c.sev {
-                    Sev::Ok => ("✓", OK),
-                    Sev::Warn => ("⚠", WARN),
-                    Sev::Fail => ("✗", ERR),
+                    Sev::Ok => ("✓", th().ok),
+                    Sev::Warn => ("⚠", th().warn),
+                    Sev::Fail => ("✗", th().err),
                 };
                 let tag = match &c.fix {
                     Fix::None => "",
@@ -3379,7 +3848,7 @@ impl App {
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(c.detail.clone(), Style::new().dim()),
-                    Span::styled(tag.to_string(), Style::new().fg(ACCENT)),
+                    Span::styled(tag.to_string(), Style::new().fg(th().accent)),
                 ]))
             })
             .collect();
@@ -3398,23 +3867,26 @@ impl App {
 
         // ---- info / platform / live test --------------------------------
         let sb = if secureboot::is_secure_boot_enabled() {
-            ("enabled", OK)
+            ("enabled", th().ok)
         } else if secureboot::is_setup_mode() {
-            ("setup mode", WARN)
+            ("setup mode", th().warn)
         } else if secureboot::secure_boot_present() {
-            ("disabled", WARN)
+            ("disabled", th().warn)
         } else {
-            ("n/a", WARN)
+            ("n/a", th().warn)
         };
         let mut lines = vec![Line::from(vec![
-            Span::styled(format!("  {ok} ok"), Style::new().fg(OK)),
-            Span::styled(format!("   {warn} warn"), Style::new().fg(WARN)),
-            Span::styled(format!("   {fail} fail"), Style::new().fg(ERR)),
-            Span::styled(
-                "      [f] fix selected   [r] re-check   [l] IR self-test   [g] logs",
-                Style::new().dim(),
-            ),
+            Span::styled(format!("  {ok} ok"), Style::new().fg(th().ok)),
+            Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
+            Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
         ])];
+        lines.push(action_line(&[
+            ("f", "fix selected"),
+            ("r", "re-check"),
+            ("l", "IR self-test"),
+            ("g", "logs"),
+        ]));
+        lines.push(Line::raw(""));
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
                 // "no action needed" next to a non-zero fail count reads as a
@@ -3427,7 +3899,7 @@ impl App {
                 Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
             };
             lines.push(Line::from(vec![
-                Span::styled("  → ", Style::new().fg(ACCENT)),
+                Span::styled("  → ", Style::new().fg(th().accent)),
                 Span::styled(hint, Style::new()),
             ]));
         }
@@ -3462,22 +3934,16 @@ impl App {
                 Style::new().dim(),
             ),
         ]));
-        match &self.selftest_result {
-            Some((ok, d)) => lines.push(Line::from(vec![
-                Span::styled("  IR test   ", Style::new().dim()),
-                Span::styled(d.clone(), Style::new().fg(if *ok { OK } else { ERR })),
-            ])),
-            None => lines.push(Line::from(Span::styled(
-                "  IR test    press [l] to run the IR PAD self-test (look at the camera)",
-                Style::new().dim(),
-            ))),
-        }
+        lines.push(Line::from(Span::styled(
+            "  IR test    press [l] to run the IR PAD self-test (sudo; look at the camera)",
+            Style::new().dim(),
+        )));
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim())
             .title(" diagnosis ");
         f.render_widget(
-            Paragraph::new(lines).block(blk).wrap(Wrap { trim: true }),
+            Paragraph::new(lines).block(blk).wrap(Wrap { trim: false }),
             info_area,
         );
     }
@@ -3497,25 +3963,25 @@ impl App {
         ];
         match &self.identify_result {
             Some((true, who)) => {
-                lines.push(Line::from(Span::styled(
-                    "  ┌─ result ───────────────────────────",
-                    Style::new().dim(),
-                )));
                 lines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::new().dim()),
                     Span::styled(
-                        who.clone(),
-                        Style::new().fg(OK).add_modifier(Modifier::BOLD),
+                        "  ✓ Recognized  ",
+                        Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled(who.clone(), Style::new().fg(th().ok)),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    "  └────────────────────────────────────",
+                    "    confidence is 0.00-1.00 (higher = surer); this cleared your match",
+                    Style::new().dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    threshold. Identify is a diagnostic check, not a login.",
                     Style::new().dim(),
                 )));
             }
             Some((false, why)) => lines.push(Line::from(vec![
-                Span::styled("  ✗ ", Style::new().fg(ERR)),
-                Span::styled(why.clone(), Style::new().fg(ERR)),
+                Span::styled("  ✗ ", Style::new().fg(th().err)),
+                Span::styled(why.clone(), Style::new().fg(th().err)),
             ])),
             None => lines.push(Line::from(Span::styled(
                 "  press [i] and look at the camera",
@@ -3524,10 +3990,10 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  [i]", Style::new().fg(ACCENT)),
+            Span::styled("  [i]", Style::new().fg(th().accent)),
             Span::styled(" identify now", Style::new().dim()),
         ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
@@ -3537,7 +4003,10 @@ impl App {
             let val = if !present {
                 Span::styled("(not present)", Style::new().dim())
             } else if wired {
-                Span::styled("● wired", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    "● wired",
+                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled("○ not wired", Style::new().dim())
             };
@@ -3548,8 +4017,8 @@ impl App {
         // SELinux row on a non-SELinux system reads as a fault that isn't one.
         if std::path::Path::new("/sys/fs/selinux").exists() {
             let sel = match crate::pamwire::selinux_state() {
-                Some(true) => Span::styled("● loaded", Style::new().fg(OK)),
-                Some(false) => Span::styled("✗ not loaded", Style::new().fg(ERR)),
+                Some(true) => Span::styled("● loaded", Style::new().fg(th().ok)),
+                Some(false) => Span::styled("✗ not loaded", Style::new().fg(th().err)),
                 None => Span::styled("unknown (needs root)", Style::new().dim()),
             };
             lines.push(Line::from(vec![
@@ -3564,7 +4033,7 @@ impl App {
             lines.push(Line::from(vec![
                 Span::raw(format!("  {:<16}", "AppArmor")),
                 if profiled {
-                    Span::styled("● irlume profile installed", Style::new().fg(OK))
+                    Span::styled("● irlume profile installed", Style::new().fg(th().ok))
                 } else {
                     Span::styled(
                         "active; irlume unconfined (profile optional)",
@@ -3611,82 +4080,87 @@ impl App {
         )));
         lines.push(Line::raw(""));
         lines.push(section("Change (root)"));
-        lines.push(Line::from(vec![
-            Span::styled("  [w]", Style::new().fg(ACCENT)),
-            Span::styled(
-                " wire the login stack now (runs sudo irlume login enable --apply)",
-                Style::new(),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "  empty password + Enter fires face (greeter login = IR/secure tier; RGB-only = lock screen only)",
-            Style::new().dim(),
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("  face-sudo ", Style::new()),
-            Span::styled("[u]", Style::new().fg(ACCENT)),
-            Span::styled(
-                " wire it (opt-in, not part of [w]; face approves sudo prompts)",
-                Style::new().dim(),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  app prompts ", Style::new()),
-            Span::styled("[p]", Style::new().fg(ACCENT)),
-            Span::styled(
-                " wire them (opt-in; face approves Bitwarden/pkexec)",
-                Style::new().dim(),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "    an app prompt needs a deliberate NOD to approve (no calibration); or an eye",
-            Style::new().dim(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "    closure, taught once with [c].  See docs/APP-INTEGRATION.md",
-            Style::new().dim(),
-        )));
-        // Bitwarden app-unlock row: only rendered when Bitwarden is installed
-        // (invisible for everyone else), and never acts on its own — [b] is
-        // the user's explicit opt-in.
-        match crate::bitwarden::tui_state() {
-            None => {}
-            Some(crate::bitwarden::TuiState::Ready) => lines.push(Line::from(vec![
-                Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("● polkit action installed", Style::new().fg(OK)),
-                Span::styled(
-                    "  (enable \"unlock with system authentication\" in its settings)",
-                    Style::new().dim(),
-                ),
-            ])),
-            Some(crate::bitwarden::TuiState::SnapMissing) => lines.push(Line::from(vec![
-                Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("○ snap action missing", Style::new().fg(WARN)),
-                Span::styled(
-                    "  fix: sudo snap connect bitwarden:polkit",
-                    Style::new().dim(),
-                ),
-            ])),
-            Some(crate::bitwarden::TuiState::NeedsSetup) => lines.push(Line::from(vec![
-                Span::styled("  Bitwarden ", Style::new()),
-                Span::styled("○ biometric unlock not set up", Style::new().fg(WARN)),
-                Span::styled("  [b]", Style::new().fg(ACCENT)),
-                Span::styled(" set it up (sudo; optional)", Style::new().dim()),
-            ])),
+        // One consistent shape per action: [key] in a fixed accent column, a
+        // verb-first label padded to a common width, then a dim detail column.
+        // Scannable as a command list instead of a paragraph; the key never
+        // wanders into the middle of a sentence.
+        let act = |key: &str, label: &str, detail: &str| {
+            Line::from(vec![
+                Span::styled(format!("  {key:<4}"), Style::new().fg(th().accent)),
+                Span::styled(format!("{label:<22}"), Style::new()),
+                Span::styled(detail.to_string(), Style::new().dim()),
+            ])
+        };
+        lines.push(act(
+            "[w]",
+            "Wire login + lock",
+            "the core action; leave the password empty then Enter to use your face",
+        ));
+        lines.push(act(
+            "[u]",
+            "Wire face-sudo",
+            "opt-in; face approves sudo prompts",
+        ));
+        lines.push(act(
+            "[p]",
+            "Wire app prompts",
+            "opt-in; face approves Bitwarden and pkexec",
+        ));
+        lines.push(act(
+            "[c]",
+            "Calibrate gesture",
+            "approve app prompts by closing your eyes ~1s (the nod needs none)",
+        ));
+        // [b] is an ACTION only when Bitwarden is installed without its polkit
+        // action; otherwise its state shows as a status line below.
+        if matches!(
+            crate::bitwarden::tui_state(),
+            Some(crate::bitwarden::TuiState::NeedsSetup)
+        ) {
+            lines.push(act(
+                "[b]",
+                "Set up Bitwarden",
+                "installs its polkit action so your face unlocks the vault",
+            ));
         }
-        lines.push(Line::from(vec![
-            Span::styled("  disable ", Style::new()),
-            Span::styled("[x]", Style::new().fg(ACCENT)),
-            Span::styled(
-                " un-wires face auth everywhere (confirmed first)",
-                Style::new().dim(),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(ACCENT)),
-            Span::styled(" open full status in a console view", Style::new().dim()),
-        ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        lines.push(act(
+            "[x]",
+            "Un-wire everything",
+            "removes face auth from login/lock/sudo/apps; asks first",
+        ));
+        lines.push(act(
+            "[s]",
+            "Show full status",
+            "opens the detailed console status view",
+        ));
+        // Bitwarden status line (not an action): only when installed and the
+        // action is present or snapd owns it. Set apart by a blank line.
+        match crate::bitwarden::tui_state() {
+            Some(crate::bitwarden::TuiState::Ready) => {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Bitwarden   "),
+                    Span::styled("● polkit action installed", Style::new().fg(th().ok)),
+                    Span::styled(
+                        "  (turn on \"unlock with system authentication\" in its settings)",
+                        Style::new().dim(),
+                    ),
+                ]));
+            }
+            Some(crate::bitwarden::TuiState::SnapMissing) => {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::raw("  Bitwarden   "),
+                    Span::styled("○ snap action missing", Style::new().fg(th().warn)),
+                    Span::styled(
+                        "  run: sudo snap connect bitwarden:polkit",
+                        Style::new().dim(),
+                    ),
+                ]));
+            }
+            _ => {}
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_done(&self, f: &mut Frame, area: Rect) {
@@ -3694,10 +4168,7 @@ impl App {
         let rec = self.recovery.unwrap_or_default();
         let wired = crate::pamwire::login_wired();
         let lines = vec![
-            Line::from(Span::styled(
-                "  Setup dashboard",
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
+            section("Setup dashboard"),
             Line::raw(""),
             Line::from(vec![
                 Span::raw("  daemon            "),
@@ -3705,7 +4176,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  auth method       "),
-                Span::styled(method_label(&self.fp.method), Style::new().fg(ACCENT)),
+                Span::styled(method_label(&self.fp.method), Style::new().fg(th().accent)),
             ]),
             Line::from(vec![
                 Span::raw("  enrollment        "),
@@ -3757,17 +4228,17 @@ impl App {
             )),
             if !self.profiles.is_empty() && !wired {
                 Line::from(vec![
-                    Span::styled("  [w]", Style::new().fg(ACCENT)),
+                    Span::styled("  [w]", Style::new().fg(th().accent)),
                     Span::styled(" wire login    [r] refresh    [q] quit", Style::new().dim()),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled("  [r]", Style::new().fg(ACCENT)),
+                    Span::styled("  [r]", Style::new().fg(th().accent)),
                     Span::styled(" refresh    [q] quit", Style::new().dim()),
                 ])
             },
         ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_activity(&self, f: &mut Frame, area: Rect) {
@@ -3783,20 +4254,30 @@ impl App {
         let blk = Block::bordered()
             .title(title)
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(if scrolled { ACCENT } else { BLUE }));
+            .border_style(Style::new().fg(if scrolled { th().accent } else { th().blue }));
         let inner = blk.inner(area);
         f.render_widget(blk, area);
         let h = inner.height as usize;
         // Window ends `act_scroll` lines up from the newest entry.
+        // Designed empty state (HIG placeholders): say what will appear, not
+        // nothing.
+        if self.activity.is_empty() {
+            f.render_widget(
+                Paragraph::new("Actions you take show up here, newest last.")
+                    .style(Style::new().dim()),
+                inner,
+            );
+            return;
+        }
         let end = self.activity.len().saturating_sub(self.act_scroll);
         let start = end.saturating_sub(h);
         let lines: Vec<Line> = self.activity[start..end]
             .iter()
             .map(|(g, m)| {
                 let gs = match g {
-                    '→' => Style::new().fg(ACCENT),
-                    '✓' => Style::new().fg(OK),
-                    '✗' => Style::new().fg(ERR),
+                    '→' => Style::new().fg(th().accent),
+                    '✓' => Style::new().fg(th().ok),
+                    '✗' => Style::new().fg(th().err),
                     _ => Style::new().dim(),
                 };
                 Line::from(vec![
@@ -3808,9 +4289,63 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
+    /// Per-screen action keys, ordered primary-first: the footer shows
+    /// the first three, the [?] overlay shows them all.
+    fn screen_actions(&self) -> &'static [(&'static str, &'static str)] {
+        match self.screen {
+            SC_WELCOME => &[
+                ("e", "enroll"),
+                ("i", "identify"),
+                ("r", "refresh"),
+                ("U", "uninstall"),
+            ],
+            SC_REPAIR => &[
+                ("f", "fix"),
+                ("r", "re-check"),
+                ("d", "full doctor"),
+                ("l", "IR test"),
+                ("g", "logs"),
+                ("t", "debug logs"),
+            ],
+            SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
+            SC_PROFILES => &[
+                ("e", "enroll"),
+                ("a", "add scan"),
+                ("r", "rename"),
+                ("d", "delete"),
+            ],
+            SC_IDENTIFY => &[("i", "identify")],
+            SC_KEYRING => &[("a", "arm"), ("r", "reseal"), ("f", "forget")],
+            SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
+            SC_FINGERPRINT => &[
+                ("a", "enroll finger"),
+                ("t", "test finger"),
+                ("e", "enable both"),
+                ("d", "disable"),
+                ("x", "reset"),
+            ],
+            SC_PAM => &[
+                ("w", "wire login (sudo)"),
+                ("u", "face-sudo"),
+                ("p", "app prompts"),
+                ("c", "calibrate gesture"),
+                ("b", "app unlock"),
+                ("x", "un-wire"),
+                ("s", "show status"),
+            ],
+            SC_SETTINGS => &[
+                ("enter", "eyes-open"),
+                ("c", "blink"),
+                ("b", "biopolicy"),
+                ("m", "3rd-party model"),
+            ],
+            SC_DONE => &[("w", "wire login"), ("u", "update"), ("r", "refresh")],
+            _ => &[("r", "refresh")],
+        }
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let key =
-            |k: &str| Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(ACCENT));
+        let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
         // Guided enrollment swallows every key but Esc; show only that, so the
         // footer doesn't advertise dead nav/action keys during a capture.
         if self.enroll.is_some() {
@@ -3837,81 +4372,43 @@ impl App {
             f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
             return;
         }
-        let actions: &[(&str, &str)] = match self.screen {
-            SC_WELCOME => &[
-                ("e", "enroll"),
-                ("i", "identify"),
-                ("r", "refresh"),
-                ("U", "uninstall"),
-            ],
-            SC_REPAIR => &[
-                ("f", "fix"),
-                ("r", "re-check"),
-                ("l", "IR test"),
-                ("g", "logs"),
-                ("t", "debug logs"),
-            ],
-            SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
-            SC_PROFILES => &[
-                ("e", "enroll"),
-                ("a", "add scan"),
-                ("r", "rename"),
-                ("d", "delete"),
-            ],
-            SC_IDENTIFY => &[("i", "identify")],
-            SC_KEYRING => &[("a", "arm"), ("f", "forget")],
-            SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
-            SC_FINGERPRINT => &[
-                ("a", "enroll finger"),
-                ("t", "test finger"),
-                ("e", "enable both"),
-                ("d", "disable"),
-                ("x", "reset"),
-            ],
-            SC_PAM => &[
-                ("w", "wire login (sudo)"),
-                ("u", "face-sudo"),
-                ("p", "app prompts"),
-                ("c", "calibrate gesture"),
-                ("b", "app unlock"),
-                ("x", "un-wire"),
-                ("s", "show status"),
-            ],
-            SC_SETTINGS => &[
-                ("enter", "toggle eyes-open"),
-                ("c", "toggle blink"),
-                ("m", "3rd-party model"),
-            ],
-            SC_DONE => &[("w", "wire login"), ("u", "update"), ("r", "refresh")],
-            _ => &[("r", "refresh")],
-        };
-        let mut spans = vec![
-            key("Tab / ← →"),
-            Span::styled(" switch tab  ", Style::new().dim()),
-            key("↑↓"),
-            Span::styled(" select  ", Style::new().dim()),
-            key("v"),
-            Span::styled(
-                if self.advanced {
-                    " basic  "
-                } else {
-                    " all tabs  "
-                },
-                Style::new().dim(),
-            ),
-            key("PgUp/Dn"),
-            Span::styled(" activity  ", Style::new().dim()),
-            key("q"),
-            Span::styled(" quit    ", Style::new().dim()),
-        ];
-        for (k, d) in actions {
+        let actions = self.screen_actions();
+        // Three-tier disclosure (GNOME HIG): the footer shows the primary
+        // action plus at most two more; [?] opens the full keymap overlay;
+        // docs hold the rest. The first action is THE action for the screen,
+        // so it alone gets the emphasized label.
+        let mut spans = vec![key("Tab"), Span::styled(" tabs  ", Style::new().dim())];
+        for (i, (k, d)) in actions.iter().take(3).enumerate() {
             spans.push(key(k));
-            spans.push(Span::styled(format!(" {d}  "), Style::new().dim()));
+            if i == 0 {
+                spans.push(Span::styled(
+                    format!(" {d}  "),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(format!(" {d}  "), Style::new().dim()));
+            }
         }
+        spans.push(key("?"));
+        spans.push(Span::styled(" all keys  ", Style::new().dim()));
+        spans.push(key("q"));
+        spans.push(Span::styled(" quit", Style::new().dim()));
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
         f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
+    }
+
+    /// The full keymap for the [?] overlay: the global keys plus every action
+    /// of the CURRENT screen (tier two of the disclosure ladder).
+    fn help_body(&self) -> String {
+        let mut b = String::from(
+            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
+        );
+        for (k, d) in self.screen_actions() {
+            b.push_str(&format!("  {k:<7} {d}\n"));
+        }
+        b
     }
 
     fn modal(&self, f: &mut Frame, title: &str, body: &str) {
@@ -3932,7 +4429,7 @@ impl App {
         let blk = Block::bordered()
             .title(format!(" {title} "))
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(ACCENT))
+            .border_style(Style::new().fg(th().accent))
             .padding(ratatui::widgets::Padding::horizontal(1));
         f.render_widget(
             Paragraph::new(body.to_string())
@@ -3986,17 +4483,41 @@ fn quality_bar(q: u8) -> String {
 fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         title.to_string(),
-        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
     ))
 }
 
 /// Green ● ON / dim ○ off badge.
 fn onoff(on: bool) -> Span<'static> {
     if on {
-        Span::styled("● yes", Style::new().fg(OK).add_modifier(Modifier::BOLD))
+        Span::styled(
+            "● yes",
+            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::styled("○ no", Style::new().dim())
     }
+}
+
+/// A screen state row: 2-space indent, label padded to `w`, then the value
+/// span. One shape for every status line so screens line up the same way.
+fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
+    Line::from(vec![Span::raw(format!("  {label:<w$}")), value])
+}
+
+/// An action line: accent `[key]` chips with dim labels, 2-space indent, a
+/// gap between actions. THE way action keys render, so a key is never a dim
+/// mid-sentence token or a whole dim line.
+fn action_line(items: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for (i, (k, d)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(format!("[{k}]"), Style::new().fg(th().accent)));
+        spans.push(Span::styled(format!(" {d}"), Style::new().dim()));
+    }
+    Line::from(spans)
 }
 
 /// Human label for the stored auth method string (`Method::as_str()`): the raw
@@ -4018,7 +4539,7 @@ fn count_badge(profiles: usize, scans: usize) -> Span<'static> {
     } else {
         Span::styled(
             format!("● {profiles} profile(s), {scans} scan(s)"),
-            Style::new().fg(OK).add_modifier(Modifier::BOLD),
+            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -4049,7 +4570,10 @@ fn map_identify(resp: Response) -> (bool, String) {
             ..
         } => (
             true,
-            format!("{u} · {} · score {score:.3}", profile.unwrap_or_default()),
+            format!(
+                "{u} · {} · confidence {score:.3}",
+                profile.unwrap_or_default()
+            ),
         ),
         Response::Identified {
             user: None,
@@ -4064,14 +4588,6 @@ fn map_identify(resp: Response) -> (bool, String) {
                 format!("no live face ({reason})")
             },
         ),
-        Response::Error(e) => (false, e),
-        o => (false, format!("unexpected: {o:?}")),
-    }
-}
-
-fn map_selftest(resp: Response) -> (bool, String) {
-    match resp {
-        Response::SelfTest { passed, detail } => (passed, detail),
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),
     }
@@ -4301,6 +4817,8 @@ mod tests {
             input: None,
             confirm: None,
             mouse_select: false,
+            show_help: false,
+            hub_sel: 0,
             op: None,
             enroll: None,
             enroll_merge: None,
@@ -4309,7 +4827,6 @@ mod tests {
             suspend: None,
             resume_enroll: None,
             identify_result: None,
-            selftest_result: None,
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
@@ -4515,6 +5032,29 @@ mod tests {
     // cut off. It must render inside the wrapping body, with the deliberate
     // [y] yes / [n] no hint from 093dc56.
     #[test]
+    fn hub_selection_and_enter_jump_to_the_picked_screen() {
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        app.visible = (0..SCREENS.len()).collect();
+        app.daemon_up = true;
+        let rows = app.hub_rows();
+        assert!(rows.len() >= 6, "hub rows: {rows:?}");
+        // 5 downs from 0 select row 5; Enter opens exactly that screen.
+        for _ in 0..5 {
+            app.move_sel(1);
+        }
+        assert_eq!(app.hub_sel, 5);
+        let target = app.hub_rows()[5].2;
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, target);
+        // Wrap: one Up from row 0 lands on the last row.
+        app.screen = SC_WELCOME;
+        app.hub_sel = 0;
+        app.move_sel(-1);
+        assert_eq!(app.hub_sel, app.hub_rows().len() - 1);
+    }
+
+    #[test]
     fn parity_keys_route_to_the_right_actions() {
         // The new per-screen actions: keys must set the right suspend/confirm,
         // and destructive ones must go through the y/n gate, not act directly.
@@ -4534,7 +5074,7 @@ mod tests {
         assert!(app.suspend.is_none());
         assert!(matches!(
             app.confirm,
-            Some((_, ConfirmAct::Sus(Suspend::LoginDisable)))
+            Some((_, _, ConfirmAct::Sus(Suspend::LoginDisable)))
         ));
         app.on_key(KeyCode::Char('y'));
         assert!(matches!(app.suspend, Some(Suspend::LoginDisable)));
@@ -4552,7 +5092,7 @@ mod tests {
         app.on_key(KeyCode::Char('x'));
         assert!(matches!(
             app.confirm,
-            Some((_, ConfirmAct::Sus(Suspend::FingerprintReset)))
+            Some((_, _, ConfirmAct::Sus(Suspend::FingerprintReset)))
         ));
         app.on_key(KeyCode::Esc); // cancel path leaves nothing armed
         assert!(app.confirm.is_none() && app.suspend.is_none());
@@ -4565,6 +5105,24 @@ mod tests {
         app.screen = SC_DONE;
         app.on_key(KeyCode::Char('u'));
         assert!(matches!(app.suspend, Some(Suspend::Update)));
+        app.suspend = None;
+
+        // Biopolicy [b]: enabling (from off) is confirm-gated; the confirm's
+        // affirmative names the specific verb and carries the enable suspend.
+        app.screen = SC_SETTINGS;
+        app.on_key(KeyCode::Char('b'));
+        assert!(
+            app.suspend.is_none(),
+            "enabling biopolicy must confirm first"
+        );
+        match &app.confirm {
+            Some((q, verb, ConfirmAct::Sus(Suspend::Biopolicy(true)))) => {
+                assert!(q.contains("biopolicy") && *verb == "Enable");
+            }
+            _ => panic!("expected the biopolicy-enable confirm"),
+        }
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::Biopolicy(true))));
         app.suspend = None;
 
         // The mouse toggle flips state and logs; second press restores.
@@ -4582,7 +5140,7 @@ mod tests {
             "Delete profile '{}ZZTARGETZZ' and all its scans?",
             ["word"; 20].join(" ")
         );
-        app.confirm = Some((question, ConfirmAct::Daemon(Request::Ping)));
+        app.confirm = Some((question, "Confirm", ConfirmAct::Daemon(Request::Ping)));
         let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let text = rendered(&term);
@@ -4590,7 +5148,12 @@ mod tests {
             text.contains("ZZTARGETZZ"),
             "end of a long confirm question was clipped:\n{text}"
         );
-        assert!(text.contains("[y] yes"), "deliberate-confirm hint missing");
+        // The affirmative carries the verb now (GNOME HIG), cancel is first.
+        assert!(
+            text.contains("[y] Confirm"),
+            "deliberate-confirm hint missing"
+        );
+        assert!(text.contains("Cancel"), "cancel option missing");
     }
 
     // Regression: f00f316. At MAX_PROFILES the guidance said only "delete one
@@ -4623,6 +5186,7 @@ mod tests {
         let mut app = test_app();
         app.confirm = Some((
             "Delete profile 'x'?".into(),
+            "Confirm",
             ConfirmAct::Daemon(Request::Ping),
         ));
         app.on_key(KeyCode::Char('x'));
@@ -4634,7 +5198,11 @@ mod tests {
         );
         app.on_key(KeyCode::Char('n'));
         assert!(app.confirm.is_none(), "[n] cancels");
-        app.confirm = Some(("Delete scan 's'?".into(), ConfirmAct::Daemon(Request::Ping)));
+        app.confirm = Some((
+            "Delete scan 's'?".into(),
+            "Delete",
+            ConfirmAct::Daemon(Request::Ping),
+        ));
         app.on_key(KeyCode::Esc);
         assert!(app.confirm.is_none(), "Esc cancels");
     }
@@ -4703,10 +5271,12 @@ mod tests {
             !text.contains("switch tab"),
             "footer advertises dead nav keys during an op:\n{text}"
         );
-        // Sanity: the full footer returns once the op is gone.
+        // Sanity: the normal footer returns once the op is gone (trimmed
+        // design: tabs hint + primary action + the [?] disclosure chip).
         app.op = None;
         term.draw(|f| app.draw_footer(f, f.area())).unwrap();
-        assert!(rendered(&term).contains("switch tab"));
+        let text = rendered(&term);
+        assert!(text.contains("tabs") && text.contains("all keys"), "{text}");
     }
 
     // Regression: cae2eea. caps/fp_present were captured once at startup, so a
@@ -4791,6 +5361,7 @@ mod tests {
             mesh: true,
             adapter: false,
             version: "test".into(),
+            third_party_pad: None,
         });
         let start = std::time::Instant::now();
         app.refresh_light();
@@ -4935,7 +5506,7 @@ mod tests {
             reason: String::new(),
         });
         assert!(ok);
-        assert_eq!(msg, "alice · Face Profile 1 · score 0.812");
+        assert_eq!(msg, "alice · Face Profile 1 · confidence 0.812");
         let (ok, msg) = map_identify(Response::Identified {
             user: None,
             profile: None,
@@ -4955,24 +5526,6 @@ mod tests {
         assert!(!ok);
         assert_eq!(msg, "no live face (flat depth)");
         assert!(!map_identify(Response::Error("e".into())).0);
-    }
-
-    #[test]
-    fn map_selftest_passes_through_verdict() {
-        assert_eq!(
-            map_selftest(Response::SelfTest {
-                passed: true,
-                detail: "depth 0.7".into()
-            }),
-            (true, "depth 0.7".into())
-        );
-        assert_eq!(
-            map_selftest(Response::SelfTest {
-                passed: false,
-                detail: "too flat".into()
-            }),
-            (false, "too flat".into())
-        );
     }
 
     #[test]
@@ -5068,12 +5621,19 @@ mod tests {
         // No biometric hardware: only the always-on steps.
         assert_eq!(
             App::compute_visible(&none, basic, &[]),
-            vec![SC_WELCOME, SC_PAM, SC_DONE]
+            vec![SC_WELCOME, SC_PAM, SC_SETTINGS, SC_DONE]
         );
         // RGB-only adds the face path (Profiles + Recovery), not Keyring.
         assert_eq!(
             App::compute_visible(&rgb, basic, &[]),
-            vec![SC_WELCOME, SC_PROFILES, SC_RECOVERY, SC_PAM, SC_DONE]
+            vec![
+                SC_WELCOME,
+                SC_PROFILES,
+                SC_RECOVERY,
+                SC_PAM,
+                SC_SETTINGS,
+                SC_DONE
+            ]
         );
         // An IR pair earns the Keyring step.
         assert_eq!(
@@ -5084,6 +5644,7 @@ mod tests {
                 SC_KEYRING,
                 SC_RECOVERY,
                 SC_PAM,
+                SC_SETTINGS,
                 SC_DONE
             ]
         );
@@ -5097,7 +5658,14 @@ mod tests {
                 },
                 &[]
             ),
-            vec![SC_WELCOME, SC_KEYRING, SC_FINGERPRINT, SC_PAM, SC_DONE]
+            vec![
+                SC_WELCOME,
+                SC_KEYRING,
+                SC_FINGERPRINT,
+                SC_PAM,
+                SC_SETTINGS,
+                SC_DONE
+            ]
         );
         // Advanced view on full hardware shows every screen.
         assert_eq!(
@@ -5122,13 +5690,17 @@ mod tests {
                 },
                 &[]
             ),
-            vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_DONE]
+            vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_SETTINGS, SC_DONE]
         );
-        // …or when any check fails, but not for a mere warning.
+        // …and when anything needs reporting (a failure OR an advisory), so the
+        // Welcome health summary's "→ open checks & repair" pointer is reachable.
         let fail = [check_row("x", Sev::Fail, Fix::None)];
         assert!(App::compute_visible(&none, basic, &fail).contains(&SC_REPAIR));
         let warn = [check_row("x", Sev::Warn, Fix::None)];
-        assert!(!App::compute_visible(&none, basic, &warn).contains(&SC_REPAIR));
+        assert!(App::compute_visible(&none, basic, &warn).contains(&SC_REPAIR));
+        // But an all-clear basic view hides it.
+        let ok = [check_row("x", Sev::Ok, Fix::None)];
+        assert!(!App::compute_visible(&none, basic, &ok).contains(&SC_REPAIR));
     }
 
     #[test]
@@ -5161,12 +5733,17 @@ mod tests {
         let mut app = test_app();
         app.advanced = true;
         app.recompute_visible();
-        app.screen = SC_SETTINGS;
+        // Identify is advanced-only; leaving advanced view must snap off it.
+        app.screen = SC_IDENTIFY;
         app.advanced = false;
         app.recompute_visible();
-        assert_eq!(
-            app.screen, SC_PAM,
-            "leaving advanced view must land on the nearest visible step"
+        assert_ne!(
+            app.screen, SC_IDENTIFY,
+            "leaving advanced view must land on a still-visible step"
+        );
+        assert!(
+            app.visible.contains(&app.screen),
+            "the landed screen is visible"
         );
     }
 
@@ -5399,7 +5976,7 @@ mod tests {
         app.sel = 0;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
-            Some((q, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
+            Some((q, _, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
                 assert!(q.contains("Delete profile 'p1'"), "got: {q}");
                 assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
             }
@@ -5409,7 +5986,7 @@ mod tests {
         app.sel = 1;
         app.on_key(KeyCode::Char('d'));
         match &app.confirm {
-            Some((q, ConfirmAct::Daemon(Request::DeleteScan { profile, scan, .. }))) => {
+            Some((q, _, ConfirmAct::Daemon(Request::DeleteScan { profile, scan, .. }))) => {
                 assert!(q.contains("Delete scan 's1' from 'p1'"), "got: {q}");
                 assert_eq!((profile.as_str(), scan.as_str()), ("p1", "s1"));
             }
@@ -5429,9 +6006,23 @@ mod tests {
             _ => panic!("expected the keyring password prompt"),
         }
         app.input = None;
+        // [r] reseal opens the masked prompt ONLY when armed (re-bind needs an
+        // existing seal); the CLI `irlume reseal` reachable from the TUI.
+        app.keyring_armed = Some(false);
+        app.on_key(KeyCode::Char('r'));
+        assert!(app.input.is_none(), "reseal is inert when not armed");
+        app.keyring_armed = Some(true);
+        app.on_key(KeyCode::Char('r'));
+        match &app.input {
+            Some((prompt, _, p @ Pending::KeyringPw(None))) => {
+                assert!(p.masked() && prompt.contains("re-seal"), "got: {prompt}");
+            }
+            _ => panic!("expected the reseal password prompt"),
+        }
+        app.input = None;
         app.on_key(KeyCode::Char('f'));
         match &app.confirm {
-            Some((q, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {
+            Some((q, _, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {
                 assert!(q.contains("Erase the TPM-sealed"), "got: {q}");
                 assert_eq!(user, "testuser");
             }
@@ -5451,7 +6042,7 @@ mod tests {
         app.on_key(KeyCode::Char('f'));
         assert!(matches!(
             app.confirm,
-            Some((_, ConfirmAct::Daemon(Request::RecoveryForget { .. })))
+            Some((_, _, ConfirmAct::Daemon(Request::RecoveryForget { .. })))
         ));
     }
 
@@ -5561,22 +6152,15 @@ mod tests {
     }
 
     #[test]
-    fn repair_ir_selftest_lands_on_the_card_without_the_error_modal() {
-        let _sock = dead_socket();
+    fn repair_ir_selftest_suspends_to_sudo_not_a_direct_daemon_call() {
+        // The daemon root-gates SelfTest (spoof-tuning oracle), so [l] must run
+        // it via sudo like every other root action, not fail on a peer-uid
+        // error from a direct socket call.
         let mut app = test_app();
         app.screen = SC_REPAIR;
         app.on_key(KeyCode::Char('l'));
-        assert!(app.op.is_some());
-        wait_op_done(&mut app);
-        let (ok, _) = app
-            .selftest_result
-            .as_ref()
-            .expect("the self-test verdict must land on the Repair card");
-        assert!(!ok);
-        assert!(
-            app.error.is_none(),
-            "a self-test miss is a card result, not an error modal"
-        );
+        assert!(matches!(app.suspend, Some(Suspend::SelfTestLiveness)));
+        assert!(app.op.is_none() && app.error.is_none());
     }
 
     #[test]
@@ -5839,6 +6423,7 @@ mod tests {
         let mut app = test_app();
         app.confirm = Some((
             "Delete profile 'x'?".into(),
+            "Confirm",
             ConfirmAct::Daemon(Request::Ping),
         ));
         app.on_key(KeyCode::Char('y'));
@@ -6144,8 +6729,8 @@ mod tests {
         assert!(text.contains("drifted since sealing"));
         assert!(text.contains("pcrlock NV 0x1a2b (Tier 2)"));
         assert!(
-            text.contains("systemd-pcrlock"),
-            "Tier 2 gets the make-policy guidance, not the re-arm warning"
+            text.contains("press [p]") && text.contains("pcrlock policy"),
+            "Tier 2 offers the [p] pcrlock-refresh action, not the re-arm warning"
         );
         assert!(text.contains("At a face login"));
         // Armed on the plain PCR-7 tier: the dbx re-arm warning instead.
@@ -6225,12 +6810,12 @@ mod tests {
         app.screen = SC_IDENTIFY;
         let text = draw_text(&app);
         assert!(text.contains("press [i] and look at the camera"));
-        app.identify_result = Some((true, "alice · Face Profile 1 · score 0.912".into()));
+        app.identify_result = Some((true, "alice · Face Profile 1 · confidence 0.912".into()));
         let text = draw_text(&app);
-        assert!(text.contains("alice · Face Profile 1 · score 0.912"));
+        assert!(text.contains("alice · Face Profile 1 · confidence 0.912"));
         assert!(
-            text.contains("result"),
-            "the hit renders in the result card"
+            text.contains("✓ Recognized") && text.contains("confidence is 0.00-1.00"),
+            "the hit shows a plain verdict + the confidence scale"
         );
         app.identify_result = Some((false, "no live face (flat depth)".into()));
         let text = draw_text(&app);
@@ -6272,11 +6857,9 @@ mod tests {
         app.repair_sel = 2;
         let text = draw_text(&app);
         assert!(text.contains("press [f]: irlume runs the fix with sudo"));
-        // The IR self-test card: idle prompt, then the verdict.
+        // The IR self-test prompt (the result now shows in the terminal, run
+        // via sudo, so the card is a static "press [l]" prompt).
         assert!(text.contains("press [l] to run the IR PAD self-test"));
-        app.selftest_result = Some((true, "PAD pass: depth 0.71".into()));
-        let text = draw_text(&app);
-        assert!(text.contains("PAD pass: depth 0.71"));
     }
 
     #[test]
@@ -6317,7 +6900,9 @@ mod tests {
             text.contains("tier unknown (daemon unreachable)"),
             "no tier claim without the daemon"
         );
-        assert!(text.contains("wire the login stack now"));
+        // The aligned action list: the primary wire action plus the un-wire.
+        assert!(text.contains("[w]") && text.contains("Wire login + lock"));
+        assert!(text.contains("[x]") && text.contains("Un-wire everything"));
         app.health = Some(HealthInfo {
             tier: "convenience".into(),
             rgb_dev: Some("/dev/video0".into()),
@@ -6325,6 +6910,7 @@ mod tests {
             mesh: false,
             adapter: false,
             version: "1.0".into(),
+            third_party_pad: None,
         });
         let text = draw_text(&app);
         assert!(
@@ -6350,6 +6936,53 @@ mod tests {
         app.eyes_open = true;
         let text = draw_text(&app);
         assert!(text.contains("● yes"), "the toggled state must show");
+    }
+
+    #[test]
+    fn settings_third_party_row_prefers_the_daemon_loaded_cue() {
+        // The daemon's loaded-cue name is authoritative: a non-root TUI can't
+        // read the root-only settings.conf flag, so a loaded cue must show as
+        // green enabled (not the ◐ "root-only" filesystem guess).
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.daemon_up = true;
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            version: "test".into(),
+            third_party_pad: Some("flir".into()),
+        });
+        let text = draw_text(&app);
+        assert!(
+            text.contains("● ") && text.contains("enabled: flir"),
+            "a daemon-loaded cue shows green enabled:\n{text}"
+        );
+        assert!(
+            !text.contains("root-only"),
+            "the authoritative state replaces the root-only guess"
+        );
+        // No daemon-reported cue: fall back to the filesystem probe (we can't
+        // tell "old daemon didn't report" from "new daemon reports none"). With
+        // no weights on disk (empty state dir) that is a clean ○ none. This also
+        // proves an older daemon with weights present is NOT falsely shown off.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let empty = std::env::temp_dir().join(format!("irlume-tp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let old = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &empty);
+        app.health.as_mut().unwrap().third_party_pad = None;
+        let text = draw_text(&app);
+        assert!(text.contains("none (default)"), "empty state dir -> ○ none");
+        match old {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]
@@ -6464,11 +7097,11 @@ mod tests {
 
     #[test]
     fn header_counts_steps_over_visible_screens_only() {
-        let mut app = test_app(); // visible: Welcome, Login wiring, Done
+        let mut app = test_app(); // visible: Welcome, Login wiring, Settings, Done
         app.screen = SC_PAM;
         let text = draw_text(&app);
         assert!(
-            text.contains("step 2/3: Login wiring"),
+            text.contains("step 2/4: Login wiring"),
             "the step counter must track visible tabs, got:\n{text}"
         );
         assert!(text.contains("testuser"), "the managed user is shown");
@@ -6482,35 +7115,41 @@ mod tests {
             term.draw(|f| app.draw_footer(f, f.area())).unwrap();
             rendered(&term)
         };
-        let cases: [(usize, &str); 11] = [
-            (SC_WELCOME, "uninstall"),
-            (SC_REPAIR, "IR test"),
-            (SC_CAMERAS, "setup emitter"),
-            (SC_PROFILES, "add scan"),
-            (SC_IDENTIFY, "identify"),
-            (SC_KEYRING, "arm"),
-            (SC_RECOVERY, "restore"),
-            (SC_FINGERPRINT, "enroll finger"),
-            (SC_PAM, "wire login (sudo)"),
-            (SC_SETTINGS, "toggle eyes-open"),
-            (SC_DONE, "wire login"),
+        // Footer = primary action only (trimmed, three-tier disclosure);
+        // the [?] overlay must list EVERY action of the screen.
+        let cases: [(usize, &str, &str); 11] = [
+            (SC_WELCOME, "enroll", "uninstall"),
+            (SC_REPAIR, "fix", "debug logs"),
+            (SC_CAMERAS, "use", "probe"),
+            (SC_PROFILES, "enroll", "delete"),
+            (SC_IDENTIFY, "identify", "identify"),
+            (SC_KEYRING, "arm", "forget"),
+            (SC_RECOVERY, "set", "forget"),
+            (SC_FINGERPRINT, "enroll finger", "reset"),
+            (SC_PAM, "wire login (sudo)", "un-wire"),
+            (SC_SETTINGS, "eyes-open", "3rd-party model"),
+            (SC_DONE, "wire login", "refresh"),
         ];
         let mut app = app;
-        for (screen, needle) in cases {
+        for (screen, primary, in_overlay) in cases {
             app.screen = screen;
+            assert!(
+                app.help_body().contains(in_overlay),
+                "[?] overlay for screen {screen} misses '{in_overlay}':\n{}",
+                app.help_body()
+            );
+            let needle = primary;
             let text = footer(&app);
             assert!(
                 text.contains(needle),
                 "footer for {} must advertise '{needle}', got:\n{text}",
                 SCREENS[screen]
             );
-            assert!(text.contains("switch tab"), "global nav keys always show");
+            assert!(
+                text.contains("all keys"),
+                "the [?] disclosure chip always shows"
+            );
         }
-        // The [v] label flips with the view mode.
-        app.screen = SC_WELCOME;
-        assert!(footer(&app).contains("all tabs"));
-        app.advanced = true;
-        assert!(footer(&app).contains("basic"));
         // Guided enrollment swallows everything but Esc: only that shows.
         let (_tx, enroll) = fake_enroll(0, 4);
         app.enroll = Some(enroll);
@@ -6631,6 +7270,7 @@ mod tests {
             mesh: true,
             adapter: true,
             version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
         });
         app.run_checks();
         let find = |label: &str| {
@@ -6677,6 +7317,7 @@ mod tests {
             mesh: false,
             adapter: false,
             version: "0.0.1-old".into(),
+            third_party_pad: None,
         });
         app.challenge = true;
         app.enroll_error = Some("bad ciphertext".into());
@@ -6714,5 +7355,30 @@ mod tests {
         app.repair_sel = 999;
         app.run_checks();
         assert!(app.repair_sel < app.repair.len());
+    }
+
+    #[test]
+    fn repair_surfaces_keyring_drift_with_the_reseal_fix() {
+        // A TUI-only user never runs `doctor`; PCR drift must show on Repair
+        // and point at the reseal action (the newly-added parity fix).
+        let mut app = test_app();
+        app.keyring_drift = None;
+        app.run_checks();
+        assert!(
+            !app.repair.iter().any(|c| c.label == "Keyring seal"),
+            "no drift, no row"
+        );
+        app.keyring_drift = Some(true);
+        app.run_checks();
+        let row = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Keyring seal")
+            .expect("drift must surface on Repair");
+        assert!(row.sev == Sev::Warn);
+        match &row.fix {
+            Fix::Manual(m) => assert!(m.contains("reseal"), "fix points at reseal: {m}"),
+            _ => panic!("expected a manual fix pointing at reseal"),
+        }
     }
 }

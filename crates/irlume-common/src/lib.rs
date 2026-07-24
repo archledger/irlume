@@ -392,6 +392,12 @@ pub enum Response {
         /// build (daemon predating the CLI it's talking to).
         #[serde(default)]
         version: String,
+        /// Name of the loaded opt-in third-party PAD cue, if any. The
+        /// authoritative enabled-state: settings.conf is root-only, so a
+        /// non-root TUI can only see the weights file otherwise. `None` when
+        /// no cue is loaded (or an older daemon that predates this field).
+        #[serde(default)]
+        third_party_pad: Option<String>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),

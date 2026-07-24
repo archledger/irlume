@@ -73,9 +73,13 @@ fn main() -> std::process::ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // Gate the developer tools unless IRLUME_DEV is set.
+    // Gate the developer tools unless IRLUME_DEV is set. Exception:
+    // `selftest liveness` goes THROUGH the daemon (no direct camera open), so
+    // it's a normal diagnostic the TUI's [l] uses, not a dev tool.
+    let daemon_selftest = args.first().map(String::as_str) == Some("selftest")
+        && args.get(1).map(String::as_str) == Some("liveness");
     if let Some(cmd) = args.first().map(String::as_str) {
-        if DEV_CMDS.contains(&cmd) && std::env::var_os("IRLUME_DEV").is_none() {
+        if DEV_CMDS.contains(&cmd) && !daemon_selftest && std::env::var_os("IRLUME_DEV").is_none() {
             eprintln!(
                 "[irlume] '{cmd}' is a developer/benchmark tool (opens the camera directly, \
                        not for normal use). Set IRLUME_DEV=1 to enable it."
@@ -88,6 +92,7 @@ fn main() -> std::process::ExitCode {
         args.get(1).map(String::as_str),
     ) {
         (Some("selftest"), Some("align")) => selftest_align(&args),
+        (Some("selftest"), Some("liveness")) => selftest_liveness(),
         (Some("capture"), _) => capture(&args),
         (Some("eval"), _) => eval(&args),
         (Some("irbench"), _) => irbench(&args),
@@ -110,6 +115,7 @@ fn main() -> std::process::ExitCode {
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),
+        (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
         (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
@@ -2768,6 +2774,39 @@ pub(crate) mod testenv {
 /// twice: cosine MUST be ~1.0. Proves the ONNX path is deterministic and the
 /// preprocessing is wired before any matching is trusted. Needs the AuraFace
 /// model file and `libonnxruntime.so` available at runtime.
+/// `irlume selftest liveness`: run the daemon's IR liveness self-test (fires
+/// the camera through the running daemon, so no camera contention). The daemon
+/// root-gates it (the raw measurements are a spoof-tuning oracle), so this must
+/// run as root; the TUI reaches it via `sudo irlume selftest liveness`.
+fn selftest_liveness() -> std::process::ExitCode {
+    use irlume_common::{Request, Response, SelfTestKind};
+    match daemon_request(&Request::SelfTest {
+        kind: SelfTestKind::Liveness,
+    }) {
+        Ok(Response::SelfTest { passed, detail }) => {
+            println!("[selftest liveness] {detail}");
+            if passed {
+                println!("[selftest liveness] PASS");
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("[selftest liveness] {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(o) => {
+            eprintln!("[selftest liveness] unexpected: {o:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[selftest liveness] {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 fn selftest_align(args: &[String]) -> std::process::ExitCode {
     let model = match flag(args, "--model") {
         Some(p) => p,

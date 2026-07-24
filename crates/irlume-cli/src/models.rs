@@ -241,6 +241,40 @@ fn stdin_is_tty() -> bool {
 /// still matches the pin. settings.conf is root-only, so an unprivileged
 /// caller cannot read the enabled key; the weights file (0644) is readable,
 /// so installed-but-unconfirmable gets reported instead of a false "none".
+/// Condensed third-party-model state for a TUI status row, so it can show a
+/// ●/○ icon like the other Settings sections instead of a bare text blob.
+pub(crate) enum TuiState {
+    /// A catalog model is enabled in settings.conf; carries its name and the
+    /// weight health (checksum ok / mismatch).
+    Enabled { name: String, detail: String },
+    /// Weights are installed but the enabled flag is root-only and we are not
+    /// root, so we can report presence but not the on/off state.
+    InstalledUnknown { name: String },
+    /// No third-party model enabled (the default).
+    None,
+}
+
+pub(crate) fn tui_state() -> TuiState {
+    if let Some(name) = enabled_name() {
+        let detail = match thirdparty::by_name(&name) {
+            Some(m) => format!("deny-only cue · {}", file_state(m)),
+            None => "set in settings.conf but NOT in the catalog (daemon ignores it)".into(),
+        };
+        return TuiState::Enabled { name, detail };
+    }
+    if !is_root() {
+        if let Some(m) = thirdparty::CATALOG
+            .iter()
+            .find(|m| thirdparty::model_path(m).exists())
+        {
+            return TuiState::InstalledUnknown {
+                name: m.name.to_string(),
+            };
+        }
+    }
+    TuiState::None
+}
+
 pub fn doctor_line() -> String {
     if let Some(name) = enabled_name() {
         return match thirdparty::by_name(&name) {
@@ -383,6 +417,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(enabled_name().as_deref(), Some(m.name));
+
+        // tui_state mirrors the same config: an enabled name -> Enabled row.
+        match tui_state() {
+            TuiState::Enabled { name, .. } => assert_eq!(name, m.name),
+            _ => panic!("expected Enabled after setting the config key"),
+        }
 
         match old_cfg {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),

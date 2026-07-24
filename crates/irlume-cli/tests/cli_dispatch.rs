@@ -419,6 +419,7 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: one_profile(),
@@ -454,6 +455,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),
@@ -489,6 +491,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),

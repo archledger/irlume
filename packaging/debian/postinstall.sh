@@ -17,6 +17,10 @@ if [ -z "${2:-}" ]; then
     # update strips it. Self-gates on the login.wired marker, so it stays idle
     # until `irlume login enable` runs.
     systemctl enable --now irlume-reconcile.path 2>/dev/null || true
+    # The .service runs at boot + on PAM change; --now runs one reconcile so an
+    # upgrade adopts an already-wired install into the self-heal marker and a
+    # same-transaction strip is re-applied. Self-gates; no-op on a fresh box.
+    systemctl enable --now irlume-reconcile.service 2>/dev/null || true
 fi
 systemctl try-restart irlumed.service 2>/dev/null || true
 cat <<'EOF'

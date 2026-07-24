@@ -799,8 +799,17 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             engine.set_devices(&rgb, &ir);
             let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
+            // Record each node's stable device identity (vid:pid:serial) next to
+            // its path so select_pair can survive a udev renumber: after an
+            // upgrade shuffles /dev/videoN, the identity re-anchors the pin to the
+            // right sensor instead of trusting a now-stale number. An empty value
+            // clears a stale id when the current node has no USB descriptor.
+            let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
+            let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
             if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
                 .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
+                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "rgb_id", &rgb_id))
+                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir_id", &ir_id))
             {
                 msg = format!("{msg} (live only; could not persist: {e})");
             }

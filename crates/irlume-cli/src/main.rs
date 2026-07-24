@@ -2624,6 +2624,19 @@ fn doctor() -> std::process::ExitCode {
              sudo irlume login enable --apply"
         );
     }
+    // A brand-new or renamed display manager irlume has no PAM mapping for:
+    // `login enable` can't target it, so face login there quietly stays on the
+    // password no matter how the reconcile self-heal runs. `active_display_manager`
+    // still resolves the symlink, so name the DM and point at the tracker; adding
+    // one line to dm_pam_services is all support takes.
+    if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
+        println!(
+            "[doctor] ⚠ the active display manager '{dm}' is not recognized by irlume,\n     \
+             so face login cannot be wired for it (your password still works). This is\n     \
+             usually a display manager that is new, or was renamed by an update. Please\n     \
+             report it at https://github.com/archledger/irlume/issues so we can add it."
+        );
+    }
     // authselect / pam-auth-update awareness: on hosts where a distro tool owns
     // the PAM stacks, confirm the self-heal watcher is in place so the user
     // knows a future `authselect apply` / `pam-auth-update` won't silently kill

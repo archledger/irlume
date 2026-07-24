@@ -395,8 +395,20 @@ pub fn select_pair() -> (String, String) {
         irlume_common::config::read_kv("cameras.conf", "rgb"),
         irlume_common::config::read_kv("cameras.conf", "ir"),
     ) {
-        if !r.trim().is_empty() && !i.trim().is_empty() && device_exists(&r) && device_exists(&i) {
-            return (r, i);
+        if !r.trim().is_empty() && !i.trim().is_empty() {
+            // The saved paths are bare /dev/videoN, which a kernel or udev
+            // update can renumber, so a plain path pin can silently land on a
+            // different sensor after an upgrade. When the pair was persisted
+            // with its device identity (vid:pid:serial), trust the identity over
+            // the number: keep the saved path only while it still resolves to
+            // that camera, else re-find the node that carries the identity.
+            let saved_rgb_id = nonblank(irlume_common::config::read_kv("cameras.conf", "rgb_id"));
+            let saved_ir_id = nonblank(irlume_common::config::read_kv("cameras.conf", "ir_id"));
+            if let Some(pair) =
+                resolve_saved_pair(&r, &i, saved_rgb_id.as_deref(), saved_ir_id.as_deref())
+            {
+                return pair;
+            }
         }
     }
     let allow = pin_allowlist();
@@ -417,6 +429,52 @@ pub fn select_pair() -> (String, String) {
 
 fn device_exists(dev: &str) -> bool {
     std::path::Path::new(dev).exists()
+}
+
+/// `Some(trimmed)` for a present, non-empty config value; `None` otherwise. Lets
+/// a persisted empty `rgb_id=` (written to clear a stale identity) read as absent.
+fn nonblank(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The `/dev/videoN` node whose physical camera identity matches `id` and whose
+/// role is `role`, if one is present. Used to re-anchor a saved pin after a udev
+/// renumber. When two cameras share a `vid:pid` with no serial the identities are
+/// not unique; the first matching node wins, which is still the right sensor
+/// class (RGB vs IR) even if not the exact unit.
+fn find_node_by_identity(id: &str, role: Role) -> Option<String> {
+    discover_nodes()
+        .into_iter()
+        .find(|(path, r)| *r == role && device_identity(path).as_deref() == Some(id))
+        .map(|(path, _)| path)
+}
+
+/// Resolve the persisted camera pair to the paths to actually open. With no saved
+/// identities (a pin written by a pre-identity version), keep the legacy
+/// behaviour: trust the saved paths as long as both nodes still exist. With saved
+/// identities, prefer the saved path only while it still resolves to that
+/// identity, otherwise re-find the node that now carries it; returns `None` (fall
+/// through to auto-discovery) when either camera can no longer be found.
+fn resolve_saved_pair(
+    r: &str,
+    i: &str,
+    r_id: Option<&str>,
+    i_id: Option<&str>,
+) -> Option<(String, String)> {
+    let (Some(r_id), Some(i_id)) = (r_id, i_id) else {
+        return (device_exists(r) && device_exists(i)).then(|| (r.to_string(), i.to_string()));
+    };
+    let resolve = |path: &str, want: &str, role: Role| -> Option<String> {
+        if device_identity(path).as_deref() == Some(want) {
+            Some(path.to_string())
+        } else {
+            find_node_by_identity(want, role)
+        }
+    };
+    match (resolve(r, r_id, Role::Rgb), resolve(i, i_id, Role::Ir)) {
+        (Some(r), Some(i)) => Some((r, i)),
+        _ => None,
+    }
 }
 
 /// Hardware capability summary, for "smart Auto": what biometric face hardware
@@ -1967,6 +2025,52 @@ mod tests {
             .unwrap();
         assert!(last_grey8 < first_grey16, "native grey must be tried first");
         assert!(first_grey16 < first_luma, "grey16 before luma extraction");
+    }
+
+    #[test]
+    fn nonblank_treats_empty_and_whitespace_as_absent() {
+        assert_eq!(nonblank(None), None);
+        assert_eq!(nonblank(Some(String::new())), None);
+        assert_eq!(nonblank(Some("  ".into())), None);
+        assert_eq!(
+            nonblank(Some(" 3277:0059:abc ".into())),
+            Some("3277:0059:abc".into())
+        );
+    }
+
+    #[test]
+    fn resolve_saved_pair_without_ids_keeps_legacy_path_behaviour() {
+        // No recorded identities (a pin written by a pre-identity version): both
+        // nodes present -> trust the saved paths unchanged.
+        assert_eq!(
+            resolve_saved_pair("/dev/null", "/dev/zero", None, None),
+            Some(("/dev/null".to_string(), "/dev/zero".to_string()))
+        );
+        // A missing node with no identity -> fall through to auto-discovery.
+        assert_eq!(
+            resolve_saved_pair("/dev/irlume-gone0", "/dev/zero", None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_saved_pair_with_unmatched_ids_falls_through() {
+        // Identities recorded, but the saved nodes carry no USB descriptor
+        // (device_identity -> None) and no discovered node matches the bogus
+        // ids: resolve re-searches by identity, finds nothing, and returns None
+        // so select_pair falls through to auto-discovery instead of opening the
+        // wrong sensor. Exercises the identity branch and find_node_by_identity.
+        assert_eq!(
+            resolve_saved_pair(
+                "/dev/null",
+                "/dev/zero",
+                Some("dead:beef:rgb"),
+                Some("dead:beef:ir")
+            ),
+            None
+        );
+        // A bogus identity never matches a real node either.
+        assert_eq!(find_node_by_identity("dead:beef:none", Role::Ir), None);
     }
 
     #[test]

@@ -253,7 +253,29 @@ fn read_wired_marker() -> Option<(bool, bool)> {
 /// otherwise exit quietly. Always root (the path unit's service runs as root).
 fn reconcile() -> ExitCode {
     let Some((with_sudo, with_polkit)) = read_wired_marker() else {
-        // Never enabled here: nothing to maintain.
+        // No marker. Two sub-cases:
+        //  - Login IS currently wired (an upgrade from a pre-marker version, or
+        //    a hand-wired install): ADOPT the existing wiring into a marker so a
+        //    FUTURE distro strip self-heals. This is what the marker migration
+        //    covers; without it an upgrader stays un-self-healing until they
+        //    happen to re-run `login enable` (the exact gap issue #93 hit).
+        //  - Login was never wired: nothing to maintain.
+        if !login_wired() {
+            return ExitCode::SUCCESS;
+        }
+        if effective_uid() != 0 {
+            // The root-owned marker can't be written as a normal user; the boot
+            // service / path unit run as root, so this is only a manual-run edge.
+            return ExitCode::SUCCESS;
+        }
+        let with_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+        let with_polkit = polkit_wired() == Some(true);
+        write_wired_marker(true, with_sudo, with_polkit);
+        eprintln!(
+            "[login] adopted the existing face-login wiring into the self-heal marker \
+             (sudo={with_sudo}, polkit={with_polkit}); a future distro PAM update will now \
+             re-apply it automatically"
+        );
         return ExitCode::SUCCESS;
     };
     if active_login_wired() {
@@ -430,6 +452,20 @@ fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
         "cosmic-greeter" => ("cosmic-greeter", None),
         _ => ("(unknown)", None),
     }
+}
+
+/// The active display manager and whether irlume has a PAM-service mapping for
+/// it. `None` when no display-manager.service is set (headless / a non-DM
+/// greeter). Doctor uses the `false` case to warn: `active_display_manager`
+/// still resolves the symlink, but a brand-new or renamed DM has no
+/// `dm_pam_services` entry, so `login enable` can't target it and face login
+/// silently stays on the password. This is the proactive counterpart to the
+/// biopolicy `Unknown` deny: catch the unmapped DM at `doctor` time instead of
+/// at a failed unlock.
+pub(crate) fn active_dm_recognized() -> Option<(String, bool)> {
+    let dm = active_display_manager()?;
+    let recognized = dm_pam_services(&dm).0 != "(unknown)";
+    Some((dm, recognized))
 }
 
 /// SELinux module load state for the TUI (None = can't tell without root).

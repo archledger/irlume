@@ -2,8 +2,11 @@ post_install() {
     systemctl daemon-reload
     systemctl enable --now irlumed.service 2>/dev/null || true
     # Watches greeter PAM files and re-applies irlume wiring after a distro
-    # update strips it; idle until `irlume login enable` runs.
+    # update strips it; idle until `irlume login enable` runs. The .service also
+    # runs at boot to catch an offline strip and to adopt an existing wiring on
+    # upgrade; --now runs one reconcile immediately.
     systemctl enable --now irlume-reconcile.path 2>/dev/null || true
+    systemctl enable --now irlume-reconcile.service 2>/dev/null || true
     cat <<'EOF'
 irlume installed. Next steps:
   irlume tui                      # enroll your face + configure
@@ -18,6 +21,11 @@ EOF
 post_upgrade() {
     systemctl daemon-reload
     systemctl try-restart irlumed.service 2>/dev/null || true
+    # Ensure the self-heal units are enabled and run one reconcile: adopts an
+    # already-wired install (upgrades from a pre-marker version) into the marker.
+    systemctl enable --now irlume-reconcile.path 2>/dev/null || true
+    systemctl enable --now irlume-reconcile.service 2>/dev/null || true
+    systemctl start irlume-reconcile.service 2>/dev/null || true
     # 0.1.x -> 0.2.0 removed the IR adapter; IR templates enrolled before 0.2.0
     # no longer match. Bright-light (RGB) login still works; the password is
     # unaffected. Compare the just-installed version against the old one.
@@ -33,4 +41,5 @@ EOF
 pre_remove() {
     systemctl disable --now irlumed.service 2>/dev/null || true
     systemctl disable --now irlume-reconcile.path 2>/dev/null || true
+    systemctl disable --now irlume-reconcile.service 2>/dev/null || true
 }

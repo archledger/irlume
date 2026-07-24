@@ -19,7 +19,7 @@ Built to match or beat Windows Hello, on a fully open, commercially clean stack.
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-1f2328)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
-![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu-2ea44f)
+![Packaged](https://img.shields.io/badge/packaged-Fedora%20·%20Arch%20·%20Debian%2FUbuntu%20·%20NixOS-2ea44f)
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/archledger/irlume/badge)](https://scorecard.dev/viewer/?uri=github.com/archledger/irlume)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
@@ -64,7 +64,7 @@ probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://githu
 | **Opens your keyring/wallet** | ✅ | ❌ *(keyring stays locked)* | ❌ | ✅ **TPM-unseals** it at login |
 | **Stores your face as…** | template | encoding | embedding | **embedding only, never an image** |
 | **Model licensing** | proprietary | MIT code · dlib weights | ⚠️ non-commercial weights | ✅ **permissive, bundleable** |
-| **Runs on** | Windows | Linux | Linux | **Linux: Fedora · Arch · Debian/Ubuntu** |
+| **Runs on** | Windows | Linux | Linux | **Linux: Fedora · Arch · Debian/Ubuntu · NixOS** |
 
 <sup>†</sup> The default IR gate blocks screens and matte prints (0% APCER in
 self-test), but a determined life-size *glossy* print passed it at 98.6% APCER;

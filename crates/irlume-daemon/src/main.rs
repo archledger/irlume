@@ -506,14 +506,27 @@ extern "C" {
 /// non-password field), in which case the caller does NOT block, since absence
 /// of proof is not proof of a wrong password. Root-only (`/etc/shadow`).
 fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
-    let shadow = std::fs::read_to_string("/etc/shadow").ok()?;
-    let stored = verifiable_shadow_hash(&shadow, user)?;
+    // The whole shadow file (every user's hash), the target hash, and the
+    // plaintext password are wrapped in Zeroizing so they are scrubbed on drop
+    // rather than left in freed heap that could page to swap or a core dump.
+    // The rest of the daemon keeps this discipline via SecretBytes; this path
+    // (a raw /etc/shadow read + a crypt() call) is the one place that bypassed
+    // it.
+    let shadow = zeroize::Zeroizing::new(std::fs::read_to_string("/etc/shadow").ok()?);
+    let stored = zeroize::Zeroizing::new(verifiable_shadow_hash(&shadow, user)?);
     // An interior NUL can't be a shadow password; treat as unverifiable.
-    let key = std::ffi::CString::new(password).ok()?;
+    if password.contains(&0) {
+        return None;
+    }
+    // A NUL-terminated, zeroizing copy of the password for crypt(): scrubbed on
+    // drop, unlike the CString this replaces.
+    let mut key = zeroize::Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    key.extend_from_slice(password);
+    key.push(0);
     let setting = std::ffi::CString::new(stored.as_str()).ok()?;
     // SAFETY: single-threaded daemon (crypt's static buffer is not shared); the
     // pointers are valid NUL-terminated C strings for the call's duration.
-    let out = unsafe { crypt(key.as_ptr(), setting.as_ptr()) };
+    let out = unsafe { crypt(key.as_ptr() as *const libc::c_char, setting.as_ptr()) };
     if out.is_null() {
         return None; // unsupported hash format on this libcrypt
     }
@@ -547,9 +560,12 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
     // A read/write deadline stops one wedged peer from blocking the single-
-    // threaded daemon (and thus ALL logins) forever.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    // threaded daemon (and thus ALL logins) forever. Propagate a setsockopt
+    // failure (drop this one connection) rather than swallow it: a silently
+    // absent timeout is the exact unbounded-blocking-read this guards against,
+    // and the '?' returns before any read happens.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
     match read_request(&stream)? {
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),

@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-24
+
 ### Added
 
 - **TUI feature parity: every CLI action is now reachable by keypress.** A

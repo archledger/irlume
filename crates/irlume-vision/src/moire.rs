@@ -87,6 +87,12 @@ pub fn moire_score(gray: &[u8]) -> f32 {
 /// for [`moire_score`]. Nearest (not bilinear) is deliberate; interpolation
 /// low-passes the very grid we want to keep.
 pub fn face_gray_n(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> Vec<u8> {
+    // A 0-dimension frame would invert the clamp bounds below (clamp(0, -1)
+    // panics). Return a uniform buffer so moire_score reads no signal (0.0), the
+    // fail-safe, instead of panicking the root daemon.
+    if w == 0 || h == 0 {
+        return vec![0u8; N * N];
+    }
     let (w, h) = (w as i32, h as i32);
     let x0 = (bbox[0] as i32).clamp(0, w - 1);
     let y0 = (bbox[1] as i32).clamp(0, h - 1);
@@ -138,6 +144,15 @@ mod tests {
     fn short_buffer_scores_zero() {
         assert_eq!(moire_score(&[128u8; N * N - 1]), 0.0);
         assert_eq!(moire_score(&[]), 0.0);
+    }
+
+    #[test]
+    fn face_gray_n_survives_a_zero_dimension_frame() {
+        // A 0-width/height frame would invert the clamp bounds and panic the root
+        // daemon; it must return a uniform (no-signal) crop instead.
+        let g = face_gray_n(&[], 0, 0, &[0.0, 0.0, 10.0, 10.0]);
+        assert_eq!(g.len(), N * N);
+        assert_eq!(moire_score(&g), 0.0);
     }
 
     #[test]

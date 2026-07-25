@@ -2411,6 +2411,13 @@ const EYE_OPEN_PEAK_MIN: f32 = 200.0;
 /// reads closed (auth falls back to password). Heuristic; used only when a
 /// profile opts into the require-eyes-open gate.
 pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks5) -> bool {
+    // Same w*h invariant guard as eye_glint/mean_in_bbox: eye_open_at's in-bounds
+    // test is against the logical w/h, so a truncated IR frame (buffer < w*h)
+    // would index past the slice and panic the root daemon. A short frame reads
+    // "eyes not verified" (closed), the safe fail-closed for this gate.
+    if grey.len() < (w as usize).saturating_mul(h as usize) {
+        return false;
+    }
     let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     eye_open_at(grey, w, h, lm[0], r) && eye_open_at(grey, w, h, lm[1], r)
@@ -3322,6 +3329,10 @@ mod tests {
         let short = &grey[..grey.len() / 4]; // buffer well under w*h
         assert_eq!(eye_glint(short, 64, 48, &lm), 0.0);
         assert_eq!(eye_glint_contrast(short, 64, 48, &lm), 0.0);
+        // The require-eyes-open gate reads the same frame via a different index
+        // path; a truncated frame there must fail-closed (eyes read closed), not
+        // panic the daemon on an out-of-bounds index.
+        assert!(!both_eyes_open(short, 64, 48, &lm));
     }
 }
 

@@ -346,6 +346,11 @@ struct HealthInfo {
     /// Loaded third-party PAD cue name (authoritative on/off, since
     /// settings.conf is root-only and a non-root TUI can't read it).
     third_party_pad: Option<String>,
+    /// The daemon's real AppArmor confinement label ("irlumed (enforce)",
+    /// "unconfined", ...), or None when AppArmor is off or the daemon predates
+    /// the field. Authoritative: the on-disk profile can exist while the daemon
+    /// runs unconfined (a failed apparmor_parser load).
+    apparmor: Option<String>,
 }
 
 /// Template-encryption + recovery status (`RecoveryStatus`).
@@ -694,6 +699,7 @@ impl App {
                     adapter,
                     version,
                     third_party_pad,
+                    apparmor,
                 }) => Some(HealthInfo {
                     tier,
                     rgb_dev,
@@ -702,6 +708,7 @@ impl App {
                     adapter,
                     version,
                     third_party_pad,
+                    apparmor,
                 }),
                 _ => None, // older daemon / daemon down → Repair falls back to local probes
             };
@@ -1256,36 +1263,59 @@ impl App {
                 "moiré screen-detector active; if real faces read 'screen pattern', tune IRLUME_RGB_MOIRE_MAX on the unit".into(),
                 Fix::None));
         }
-        // AppArmor: only when it is ACTUALLY enabled on this boot, on any distro.
-        // Gating on distro was wrong (a user runs AppArmor on Arch too); gating on
-        // the securityfs node was too broad (it exists whenever the kernel built
-        // AppArmor, enabled or not). `/sys/module/apparmor/parameters/enabled` is
-        // "Y" only when AppArmor is live. irlume ships the profile as
-        // /etc/apparmor.d/usr.bin.irlumed on every packaged install (the daemon
-        // binary is /usr/bin/irlumed everywhere), so the confined-or-not check is
-        // the same path on all families.
-        let apparmor_enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
-            .map(|s| s.trim() == "Y")
-            .unwrap_or(false);
-        if apparmor_enabled {
-            let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists();
-            v.push(mk(
+        // AppArmor: prefer the daemon's SELF-REPORTED confinement (Health.apparmor
+        // read from its /proc/self/attr). The on-disk profile file existing does
+        // NOT prove the daemon is confined: apparmor_parser can fail to load it
+        // (a swallowed install error) and leave irlumed unconfined while the file
+        // is still present. Only fall back to the file heuristic for an older
+        // daemon that doesn't report the field.
+        let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
+        let aa_reload =
+            "reinstall the package, or: sudo apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed";
+        match aa {
+            Some(label) if label.contains("unconfined") => v.push(mk(
                 "AppArmor",
-                if profiled { Sev::Ok } else { Sev::Warn },
-                if profiled {
-                    "irlume profile installed".into()
-                } else {
-                    "daemon unconfined; the AppArmor hardening profile is not loaded".into()
-                },
-                if profiled {
-                    Fix::None
-                } else {
-                    Fix::Manual(
-                        "reinstall the package, or: apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed"
-                            .into(),
-                    )
-                },
-            ));
+                Sev::Warn,
+                "daemon running UNCONFINED; the profile is installed but not loaded".into(),
+                Fix::Manual(aa_reload.into()),
+            )),
+            Some(label) if label.contains("(complain)") => v.push(mk(
+                "AppArmor",
+                Sev::Warn,
+                format!("profile loaded in COMPLAIN mode, not enforcing ({label})"),
+                Fix::Manual("enforce it: sudo aa-enforce /etc/apparmor.d/usr.bin.irlumed".into()),
+            )),
+            Some(label) => v.push(mk(
+                "AppArmor",
+                Sev::Ok,
+                format!("daemon confined ({label})"),
+                Fix::None,
+            )),
+            None => {
+                // Older daemon (no field). Fall back to the file heuristic, but
+                // only when AppArmor is actually live this boot.
+                let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+                    .map(|s| s.trim() == "Y")
+                    .unwrap_or(false);
+                if enabled {
+                    let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists();
+                    v.push(mk(
+                        "AppArmor",
+                        if profiled { Sev::Ok } else { Sev::Warn },
+                        if profiled {
+                            "irlume profile installed (update the daemon to confirm it is loaded)"
+                                .into()
+                        } else {
+                            "daemon unconfined; the AppArmor hardening profile is not loaded".into()
+                        },
+                        if profiled {
+                            Fix::None
+                        } else {
+                            Fix::Manual(aa_reload.into())
+                        },
+                    ));
+                }
+            }
         }
 
         // Login keyring LOCKED: a Secret Service provider is up but its login
@@ -4072,27 +4102,49 @@ impl App {
                 Span::raw(format!("  {:<16}", "SELinux module")),
                 sel,
             ]));
-        } else if std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
-            .map(|s| s.trim() == "Y")
-            .unwrap_or(false)
-        {
-            // Whether the irlumed profile is installed. Checking /proc/self here
-            // would read the CLI's own (unconfined) label, not the daemon's, so
-            // key off the on-disk profile the package ships: usr.bin.irlumed for
-            // a packaged install, usr.local.bin.irlumed for a source build.
-            let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
-                || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
-            lines.push(Line::from(vec![
-                Span::raw(format!("  {:<16}", "AppArmor")),
-                if profiled {
-                    Span::styled("● irlume profile installed", Style::new().fg(th().ok))
-                } else {
-                    Span::styled(
-                        "active; irlume unconfined (profile optional)",
-                        Style::new().dim(),
-                    )
-                },
-            ]));
+        } else {
+            // AppArmor row: prefer the daemon's real confinement (Health.apparmor
+            // from its /proc/self/attr). The on-disk profile existing does not
+            // prove the daemon is confined (apparmor_parser can fail silently at
+            // install). Fall back to the on-disk-profile heuristic only for an
+            // older daemon that doesn't report the field.
+            let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
+            let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+                .map(|s| s.trim() == "Y")
+                .unwrap_or(false);
+            let val = match aa {
+                Some(l) if l.contains("unconfined") => Some(Span::styled(
+                    "✗ daemon UNCONFINED (profile installed but not loaded)",
+                    Style::new().fg(th().err),
+                )),
+                Some(l) if l.contains("(complain)") => Some(Span::styled(
+                    "◐ profile loaded in complain mode (not enforcing)",
+                    Style::new().dim(),
+                )),
+                Some(_) => Some(Span::styled(
+                    "● daemon confined (enforce)",
+                    Style::new().fg(th().ok),
+                )),
+                None if enabled => {
+                    let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
+                        || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
+                    Some(if profiled {
+                        Span::styled("● irlume profile installed", Style::new().fg(th().ok))
+                    } else {
+                        Span::styled(
+                            "active; irlume unconfined (profile optional)",
+                            Style::new().dim(),
+                        )
+                    })
+                }
+                None => None, // AppArmor not enabled this boot: no row
+            };
+            if let Some(val) = val {
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {:<16}", "AppArmor")),
+                    val,
+                ]));
+            }
         }
         lines.push(Line::raw(""));
         lines.push(section("What each does"));
@@ -5415,6 +5467,7 @@ mod tests {
             adapter: false,
             version: "test".into(),
             third_party_pad: None,
+            apparmor: None,
         });
         let start = std::time::Instant::now();
         app.refresh_light();
@@ -6964,6 +7017,7 @@ mod tests {
             adapter: false,
             version: "1.0".into(),
             third_party_pad: None,
+            apparmor: None,
         });
         let text = draw_text(&app);
         assert!(
@@ -7007,6 +7061,7 @@ mod tests {
             adapter: false,
             version: "test".into(),
             third_party_pad: Some("flir".into()),
+            apparmor: None,
         });
         let text = draw_text(&app);
         assert!(
@@ -7324,6 +7379,7 @@ mod tests {
             adapter: true,
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
+            apparmor: None,
         });
         app.run_checks();
         let find = |label: &str| {
@@ -7371,6 +7427,7 @@ mod tests {
             adapter: false,
             version: "0.0.1-old".into(),
             third_party_pad: None,
+            apparmor: None,
         });
         app.challenge = true;
         app.enroll_error = Some("bad ciphertext".into());

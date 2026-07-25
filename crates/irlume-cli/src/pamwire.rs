@@ -313,19 +313,29 @@ fn active_login_wired() -> bool {
     etc.exists() && file_has_module(&etc)
 }
 
-/// Whether the KDE lock-screen face line regressed: the /etc/pam.d/kde override
-/// exists (so `login enable` materialized it) but no longer carries the module.
-/// A pambase / pam-auth-update regeneration can strip only the lock-screen file
-/// while leaving the DM's login greeter intact, which `active_login_wired`
-/// (login greeter only) would miss. A missing /etc file, or a non-KDE box, is
-/// not a regression — there is no lock-screen wiring there to maintain.
+/// Whether the KDE lock-screen face wiring regressed. Two shapes, both of which
+/// `active_login_wired` (login greeter only) misses while the DM greeter stays
+/// intact: a pambase / pam-auth-update regeneration STRIPS the module from the
+/// /etc/pam.d/kde override, OR a package update DELETES the override entirely
+/// (reverting to the vendor-only service). On a non-KDE box the vendor file is
+/// absent, so a missing override is not a regression — there is nothing to
+/// maintain there. reconcile re-materializes/re-wires in either case.
 fn lockscreen_regressed() -> bool {
-    path_regressed(Path::new(LOCKSCREEN.etc))
+    lock_regressed(Path::new(LOCKSCREEN.etc), LOCKSCREEN.vendor.map(Path::new))
 }
 
-/// A wired PAM file that regressed: it still exists (so it WAS materialized/
-/// wired) but no longer carries the module. Split out from `lockscreen_regressed`
-/// for testability against a temp path.
+/// Testable core of [`lockscreen_regressed`]: the /etc override was stripped in
+/// place (still there, lost the module), or it was deleted while a `vendor`
+/// service remains (a KDE box `login enable` had materialized and a package
+/// removed). A path taken from a real Svc so a temp path can drive it in tests.
+fn lock_regressed(etc: &Path, vendor: Option<&Path>) -> bool {
+    if etc.exists() {
+        return !file_has_module(etc); // stripped in place
+    }
+    vendor.is_some_and(|v| v.exists()) // deleted, but re-materializable from vendor
+}
+
+#[cfg(test)]
 fn path_regressed(etc: &Path) -> bool {
     etc.exists() && !file_has_module(etc)
 }
@@ -1364,6 +1374,17 @@ mod tests {
         assert!(!path_regressed(&wired));
         // Absent (non-KDE box / never wired): nothing to maintain, not a regression.
         assert!(!path_regressed(&absent));
+
+        // lock_regressed adds the deleted-override case: /etc gone but the vendor
+        // service remains (a KDE box) is a regression; gone with no vendor is not.
+        let vendor = dir.join("vendor-kde");
+        std::fs::write(&vendor, "auth include something\n").unwrap();
+        assert!(lock_regressed(&stripped, Some(&vendor))); // stripped in place
+        assert!(!lock_regressed(&wired, Some(&vendor))); // still wired
+        assert!(lock_regressed(&absent, Some(&vendor))); // deleted, vendor present
+        assert!(!lock_regressed(&absent, None)); // deleted, no vendor (non-KDE)
+        let missing_vendor = dir.join("no-such-vendor");
+        assert!(!lock_regressed(&absent, Some(&missing_vendor))); // vendor also gone
         let _ = std::fs::remove_dir_all(&dir);
     }
 

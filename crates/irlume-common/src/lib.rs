@@ -456,6 +456,15 @@ pub enum Response {
         /// no cue is loaded (or an older daemon that predates this field).
         #[serde(default)]
         third_party_pad: Option<String>,
+        /// The daemon's OWN AppArmor confinement, read from its /proc/self/attr
+        /// at request time: e.g. `irlumed (enforce)`, `irlumed (complain)`, or
+        /// `unconfined`. `None` when AppArmor is not enabled on this boot (or an
+        /// older daemon that predates this field). Lets the TUI report the real
+        /// confinement of the running daemon instead of inferring it from the
+        /// on-disk profile file, which stays present even if `apparmor_parser`
+        /// failed to load it and the daemon is actually unconfined.
+        #[serde(default)]
+        apparmor: Option<String>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),

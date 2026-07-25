@@ -24,8 +24,6 @@ result
 .claude/
 /ppa-out/
 
-# Gemini CLI local project config (not part of the repo)
-GEMINI.md
 # Locally-generated release checksum artifacts
 SHA256SUMS
 SHA256SUMS.asc

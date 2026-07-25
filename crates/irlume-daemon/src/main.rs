@@ -491,6 +491,30 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+/// The daemon's OWN AppArmor confinement label (e.g. "irlumed (enforce)",
+/// "irlumed (complain)", "unconfined") from /proc/self/attr, or None when
+/// AppArmor is not enabled on this boot. Reported in Health so the TUI shows the
+/// real confinement of the running daemon instead of inferring it from the
+/// on-disk profile file, which stays present even if `apparmor_parser` failed to
+/// load it and the daemon is actually unconfined.
+fn apparmor_confinement() -> Option<String> {
+    // The attr node exists whenever the kernel built AppArmor; only trust it when
+    // AppArmor is actually live this boot.
+    let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+        .map(|s| s.trim() == "Y")
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    // Newer kernels expose the label at attr/apparmor/current, older ones at
+    // attr/current; the value is "profile (mode)\n" or "unconfined\n".
+    let raw = std::fs::read_to_string("/proc/self/attr/apparmor/current")
+        .or_else(|_| std::fs::read_to_string("/proc/self/attr/current"))
+        .ok()?;
+    let label = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    (!label.is_empty()).then(|| label.to_string())
+}
+
 // libxcrypt's one-way hash (glibc moved `crypt` out of libc into libcrypt).
 #[link(name = "crypt")]
 extern "C" {
@@ -686,6 +710,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 // Authoritative loaded-cue name so a non-root TUI can show the
                 // real on/off state (settings.conf is root-only).
                 third_party_pad: engine.thirdparty_pad_name().map(String::from),
+                apparmor: apparmor_confinement(),
             }
         }
         // Only tune the band to a user the peer may act for (root, or their own

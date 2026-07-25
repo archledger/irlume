@@ -84,19 +84,27 @@ fn is_remote_session(pamh: &Pam) -> bool {
     // the exact vector by which a locally-oriented biometric runs during a remote
     // login (see xrdp issue #1546). Logind seat/session data that could prove a
     // local seat is not populated yet at authenticate() time (pam_systemd runs in
-    // the later session phase), so a service-name deny-list plus the rhost/SSH_*
-    // checks is the reliable authenticate()-time signal.
+    // the later session phase), so the service-name deny-list plus the rhost/SSH_*
+    // checks are the best available authenticate()-time signal. They are NOT a
+    // complete remote-desktop policy (see the residual below).
     if let Ok(Some(svc)) = pamh.get_service() {
         if is_remote_desktop_service(&svc.to_string_lossy()) {
             return true;
         }
     }
-    // RESIDUAL (documented in docs/THREAT_MODEL.md): remote-control software that
-    // attaches to the GENUINE local greeter/desktop on seat0 (x11vnc of :0, an
-    // RDP screen-share, NoMachine to the physical session) makes the PAM request
-    // originate from the real local GDM/SDDM and is intentionally indistinguishable
-    // from someone typing at the monitor. That threat is out of scope for the
-    // module and must be handled by not exposing the greeter to remote control.
+    // RESIDUAL (documented in docs/THREAT_MODEL.md): a deny-list by service name
+    // cannot catch every remote login. Two known classes:
+    //  - Remote-control software attached to the GENUINE local greeter/desktop on
+    //    seat0 (x11vnc of :0, an RDP screen-share, NoMachine to the physical
+    //    session): the PAM request originates from the real local GDM/SDDM and is
+    //    intentionally indistinguishable from someone typing at the monitor.
+    //  - GNOME Remote Desktop's headless multi-user RDP mode spins up a remote GDM
+    //    login that authenticates through the ORDINARY `gdm-password` service (a
+    //    permitted local name), so if that transaction sets no PAM_RHOST it is not
+    //    distinguishable here either.
+    // Both must be handled outside the module: do not expose the greeter/lock
+    // screen to remote control, and do not wire face auth where GNOME Remote Login
+    // is enabled.
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 

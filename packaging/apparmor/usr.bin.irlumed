@@ -79,6 +79,16 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /proc/[0-9]*/fd/[0-9]* r,
   /proc/[0-9]*/comm r,
 
+  # The daemon reads its OWN confinement label + whether AppArmor is live so it
+  # can report real confinement in Health (the TUI shows enforce/complain/
+  # unconfined instead of guessing from the on-disk profile file). Under enforce
+  # these reads are themselves mediated, so without these rules the daemon cannot
+  # even tell it is confined and would report "unknown". /proc/self resolves to
+  # its own pid, matched by the numeric glob.
+  /sys/module/apparmor/parameters/enabled r,
+  /proc/[0-9]*/attr/current r,
+  /proc/[0-9]*/attr/apparmor/current r,
+
   # Reading another user's state dir as the root daemon.
   capability dac_override,
   capability dac_read_search,

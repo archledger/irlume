@@ -194,7 +194,7 @@ fn wired_marker_path() -> std::path::PathBuf {
 /// Persist (on enable) or remove (on disable) the wiring marker. The body is a
 /// tiny stable key=value record of the extra scopes so reconcile re-applies the
 /// same `--with-sudo` / `--with-polkit` choice, not a bare login wiring.
-fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
+fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool, with_lock: bool) {
     let path = wired_marker_path();
     if !enable {
         let _ = std::fs::remove_file(&path);
@@ -203,7 +203,11 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\n");
+    // with_lock records whether we actually wired the KDE lock screen, so a later
+    // absence of /etc/pam.d/kde is only a regression when it was ours to maintain
+    // (a Plasma package's vendor /usr/lib/pam.d/kde on a GNOME box must not read
+    // as a regression and loop reconcile forever).
+    let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\nwith_lock={with_lock}\n");
     // 0600, root-owned (enable/reconcile run as root): the marker must not be
     // plantable by a non-root user, since reconcile trusts its with_sudo flag.
     // A silent failure would leave self-heal disabled without the user knowing,
@@ -219,7 +223,7 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool) {
 
 /// Re-read the marker's recorded flags. Returns `None` when login was never
 /// enabled (no marker), so reconcile does nothing on machines that opted out.
-fn read_wired_marker() -> Option<(bool, bool)> {
+fn read_wired_marker() -> Option<(bool, bool, bool)> {
     let path = wired_marker_path();
     // In production (default state dir) the marker must be root-owned: reconcile
     // acts on its with_sudo flag as root, so a marker a non-root user could plant
@@ -244,7 +248,10 @@ fn read_wired_marker() -> Option<(bool, bool)> {
             .map(|v| v.trim() == "true")
             .unwrap_or(false)
     };
-    Some((flag("with_sudo"), flag("with_polkit")))
+    // with_lock absent in a marker written before this field existed: default
+    // false, so an old marker never triggers a false lock-screen regression; the
+    // next `login enable` / adopt rewrites it with the real value.
+    Some((flag("with_sudo"), flag("with_polkit"), flag("with_lock")))
 }
 
 /// Idempotent repair entry point, meant to run unattended from a systemd path
@@ -252,7 +259,7 @@ fn read_wired_marker() -> Option<(bool, bool)> {
 /// but the PAM stack is no longer wired, re-apply the recorded configuration;
 /// otherwise exit quietly. Always root (the path unit's service runs as root).
 fn reconcile() -> ExitCode {
-    let Some((with_sudo, with_polkit)) = read_wired_marker() else {
+    let Some((with_sudo, with_polkit, with_lock)) = read_wired_marker() else {
         // No marker. Two sub-cases:
         //  - Login IS currently wired (an upgrade from a pre-marker version, or
         //    a hand-wired install): ADOPT the existing wiring into a marker so a
@@ -270,15 +277,20 @@ fn reconcile() -> ExitCode {
         }
         let with_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
         let with_polkit = polkit_wired() == Some(true);
-        write_wired_marker(true, with_sudo, with_polkit);
+        // Record the lock screen as ours only if the /etc override actually
+        // carries the module now (it was wired), not merely because the vendor
+        // file exists.
+        let with_lock =
+            Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc));
+        write_wired_marker(true, with_sudo, with_polkit, with_lock);
         eprintln!(
             "[login] adopted the existing face-login wiring into the self-heal marker \
-             (sudo={with_sudo}, polkit={with_polkit}); a future distro PAM update will now \
-             re-apply it automatically"
+             (sudo={with_sudo}, polkit={with_polkit}, lock={with_lock}); a future distro PAM \
+             update will now re-apply it automatically"
         );
         return ExitCode::SUCCESS;
     };
-    if active_login_wired() && !lockscreen_regressed() {
+    if active_login_wired() && !lockscreen_regressed(with_lock) {
         // Still intact; the common case after a spurious file-change event.
         // Also re-apply when only the KDE lock screen regressed (its file is
         // watched too, but active_login_wired alone would treat the login
@@ -320,7 +332,14 @@ fn active_login_wired() -> bool {
 /// (reverting to the vendor-only service). On a non-KDE box the vendor file is
 /// absent, so a missing override is not a regression — there is nothing to
 /// maintain there. reconcile re-materializes/re-wires in either case.
-fn lockscreen_regressed() -> bool {
+fn lockscreen_regressed(with_lock: bool) -> bool {
+    // Only maintain the lock screen if we actually wired it (marker with_lock).
+    // Otherwise a Plasma vendor file present on a non-KDE box, or a box that
+    // chose fingerprint/RGB-less (no face lock), would read as a permanent
+    // regression and loop reconcile.
+    if !with_lock {
+        return false;
+    }
     lock_regressed(Path::new(LOCKSCREEN.etc), LOCKSCREEN.vendor.map(Path::new))
 }
 
@@ -346,7 +365,10 @@ fn path_regressed(etc: &Path) -> bool {
 /// condition `login reconcile` repairs. The TUI's Repair tab uses this to offer
 /// the fix.
 pub(crate) fn reconcile_needed() -> bool {
-    read_wired_marker().is_some() && (!active_login_wired() || lockscreen_regressed())
+    match read_wired_marker() {
+        Some((_, _, with_lock)) => !active_login_wired() || lockscreen_regressed(with_lock),
+        None => false,
+    }
 }
 
 pub(crate) fn login_wired() -> bool {
@@ -779,7 +801,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         // after a distro update rewrites a greeter's PAM file out from under us
         // (authselect, pam-auth-update, or a package upgrade shipping a fresh
         // vendor copy). On disable we clear the marker so reconcile stays quiet.
-        write_wired_marker(enable, with_sudo, with_polkit);
+        write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
         println!("[login] done. Password remains the fallback everywhere.");
     }
     if errs == 0 {
@@ -1385,6 +1407,10 @@ mod tests {
         assert!(!lock_regressed(&absent, None)); // deleted, no vendor (non-KDE)
         let missing_vendor = dir.join("no-such-vendor");
         assert!(!lock_regressed(&absent, Some(&missing_vendor))); // vendor also gone
+                                                                  // The marker gate: if we never wired the lock (with_lock=false), no state
+                                                                  // of /etc/pam.d/kde counts as a regression (a Plasma vendor file on a
+                                                                  // GNOME box must not loop reconcile).
+        assert!(!lockscreen_regressed(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1976,14 +2002,20 @@ mod tests {
         std::env::set_var("IRLUME_STATE_DIR", &dir.0);
         // No marker → reconcile has nothing to maintain.
         assert_eq!(read_wired_marker(), None);
-        // Enable with only --with-polkit is recorded as (sudo=false, polkit=true).
-        write_wired_marker(true, false, true);
-        assert_eq!(read_wired_marker(), Some((false, true)));
-        // Re-enable with both flags overwrites cleanly.
-        write_wired_marker(true, true, true);
-        assert_eq!(read_wired_marker(), Some((true, true)));
+        // Enable with only --with-polkit is recorded (sudo=false, polkit=true,
+        // lock=false).
+        write_wired_marker(true, false, true, false);
+        assert_eq!(read_wired_marker(), Some((false, true, false)));
+        // Re-enable with both flags + the lock screen overwrites cleanly.
+        write_wired_marker(true, true, true, true);
+        assert_eq!(read_wired_marker(), Some((true, true, true)));
+        // A marker written before with_lock existed (only the two flags) reads
+        // back with lock=false, so it never triggers a false lock regression.
+        irlume_common::write_0600(&wired_marker_path(), b"with_sudo=true\nwith_polkit=false\n")
+            .unwrap();
+        assert_eq!(read_wired_marker(), Some((true, false, false)));
         // Disable clears the marker so the self-heal service stays quiet.
-        write_wired_marker(false, false, false);
+        write_wired_marker(false, false, false, false);
         assert_eq!(read_wired_marker(), None);
         match old {
             Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),

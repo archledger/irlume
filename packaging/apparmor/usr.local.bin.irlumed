@@ -72,6 +72,13 @@ profile irlumed /usr/local/bin/irlumed {
   /proc/[0-9]*/fd/[0-9]* r,
   /proc/[0-9]*/comm r,
 
+  # The daemon reads its OWN confinement label + whether AppArmor is live so it
+  # can report real confinement in Health. Under enforce these reads are mediated
+  # too, so without them the daemon cannot tell it is confined.
+  /sys/module/apparmor/parameters/enabled r,
+  /proc/[0-9]*/attr/current r,
+  /proc/[0-9]*/attr/apparmor/current r,
+
   # Reading another user's state dir as the root daemon.
   capability dac_override,
   capability dac_read_search,

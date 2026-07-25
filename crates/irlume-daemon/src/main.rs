@@ -430,6 +430,41 @@ fn rate_record(user: &str, granted: bool, faced: bool) {
     }
 }
 
+/// Minimum interval in seconds between unprivileged Identify captures. Two
+/// seconds bounds how often one local peer can occupy the camera pipeline
+/// without affecting a real login.
+const IDENTIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+// Keep this separate from the failure throttle: Identify has no authentication
+// outcome to strike or reset, and its caller identity is the peer uid.
+type IdentifyRateState = std::sync::Mutex<std::collections::HashMap<u32, std::time::Instant>>;
+
+fn identify_rate_state() -> &'static IdentifyRateState {
+    static S: std::sync::OnceLock<IdentifyRateState> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Admit and record an Identify attempt atomically. Root is the PAM/greeter
+/// trust boundary and must never be delayed by an unprivileged convenience
+/// request.
+fn identify_rate_limited(uid: u32) -> bool {
+    if uid == 0 {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    let mut map = identify_rate_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map
+        .get(&uid)
+        .is_some_and(|last| now.duration_since(*last) < IDENTIFY_MIN_INTERVAL)
+    {
+        return true;
+    }
+    map.insert(uid, now);
+    false
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
 }
@@ -830,6 +865,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::Identify => {
+            if identify_rate_limited(peer.uid) {
+                return Response::Error("rate limited; try again shortly".into());
+            }
             // 1:N identify returns an exact similarity score, so an ungated
             // socket peer could hill-climb it to tune a spoof or enumerate who
             // is enrolled. Root keeps the full cross-user search (admin/test);
@@ -1768,6 +1806,18 @@ mod tests {
         assert_eq!(identify_scope(&peer(0xfffe_fffe)), IdentifyScope::NoAccount);
         // Ground the reverse lookup itself (added by the same fix).
         assert_eq!(users::name_for_uid(0).as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn identify_rate_limit_is_per_uid_and_exempts_root() {
+        let uid = 0xfffe_fffd;
+        let other_uid = 0xfffe_fffc;
+
+        assert!(!identify_rate_limited(uid));
+        assert!(identify_rate_limited(uid));
+        assert!(!identify_rate_limited(other_uid));
+        assert!(!identify_rate_limited(0));
+        assert!(!identify_rate_limited(0));
     }
 
     // Regression: 834c71e. IRLUME_MODELS_STRICT=1 refused to start because the

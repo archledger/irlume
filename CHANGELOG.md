@@ -36,6 +36,25 @@ All notable changes to irlume are documented here. This project adheres to
   doctor` reports the state, and flags the case where the gate is on but cannot
   run on this machine.
 
+### Fixed
+
+- **Face `sudo` never worked on Debian and Ubuntu.** The wiring looked for a line
+  starting with `auth` to place the stanza above, and Ubuntu's `/etc/pam.d/sudo`
+  has none: it carries `session` lines and `@include common-auth`. The stanza was
+  appended at the end of the file instead, after the password modules, where it
+  can never grant. `sudo` now uses the same include-aware anchor as the polkit
+  wiring. Run `sudo irlume login enable --with-sudo --apply` (or `irlume login
+  reconcile`) to move an existing misplaced stanza; a file with no auth phase at
+  all is now skipped and reported instead of appended to.
+
+- **Fedora-layout greeters we have not validated for the on-demand probe lost the
+  face entirely.** The `substack` wiring path emitted `pam_irlume.so unseal`
+  without the `facefirst` argument that the `@include` path emits, so on those
+  greeters the module waited on a password probe the greeter answers only after
+  the user types, and the camera never ran. Affects GDM below the GNOME version
+  gate and any unrecognized display manager; GNOME 46 and later, SDDM,
+  plasmalogin, LightDM, greetd and COSMIC were unaffected.
+
 ## [0.6.1] - 2026-07-24
 
 ### Added

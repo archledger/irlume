@@ -29,8 +29,14 @@ const CREATED_PREFIX: &str = "# irlume: created from ";
 /// line, the plan line, and docs/SETUP.md's mirror never drift apart.
 const ONDEMAND_HINT: &str = "leave the password empty and press Enter to use your face";
 
-// Greeter block (mirrors scripts/deploy-keyring-unlock.sh exactly).
-const GREETER_UNSEAL: &str = "auth       [success=1 default=ignore]   pam_irlume.so unseal";
+// Greeter block for a non-`@include` (Fedora `substack`) stack: a `success=1`
+// jump over the password substack, plus the `PERMIT_LANDING` it lands on.
+/// Jump-style face line for a submit-driven greeter we have NOT validated for the
+/// on-demand probe (old GDM, unknown DM). `facefirst` is mandatory here: without
+/// it the module runs the ACTIVE probe (`pam_get_authtok`), and a greeter that
+/// blocks that probe until the user types means face never fires at all.
+const GREETER_UNSEAL_FACEFIRST_JUMP: &str =
+    "auth       [success=1 default=ignore]   pam_irlume.so unseal facefirst";
 /// The greeter/locker face line for any INCLUDE layout: Debian/Ubuntu
 /// `@include common-auth` and Arch `auth include system-login` alike (a
 /// `success=N` jump can't skip an include expansion, so this can't be the jump
@@ -60,13 +66,12 @@ const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so
 /// wallet. No-op when the keyring isn't armed or a password is already set.
 const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
-const SUDO_STANZA: &str = "auth       sufficient                   pam_irlume.so";
-/// polkit prompts (Bitwarden vault unlock, pkexec, systemd unit control) get the
-/// same plain verify stanza as sudo: no `unseal` (the daemon refuses credential
-/// release for the polkit class anyway) and no mode arg (the polkit agent runs
-/// the conversation as soon as its dialog opens, which IS the face-first
-/// trigger; the daemon adds the forced blink gate on top).
-const POLKIT_STANZA: &str = SUDO_STANZA;
+/// The plain verify stanza, shared by `sudo` and polkit prompts (Bitwarden vault
+/// unlock, pkexec, systemd unit control): no `unseal` (the daemon refuses
+/// credential release for both classes anyway) and no mode arg (each surface runs
+/// the PAM conversation as soon as it prompts, which IS the face-first trigger;
+/// the daemon adds the forced consent gesture on top).
+const VERIFY_STANZA: &str = "auth       sufficient                   pam_irlume.so";
 
 /// A PAM service to wire. `vendor=Some` → materialize an /etc override from the
 /// vendor copy; `vendor=None` → back up and edit the real /etc file.
@@ -757,7 +762,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
             },
             enable,
             apply,
-            &wire_sudo,
+            &wire_verify_service,
         ) {
             Ok(msg) => println!("  {msg}"),
             Err(e) => {
@@ -767,7 +772,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         }
     }
     if polkit_in_scope(enable, with_polkit) {
-        match wire_service(&POLKIT, enable, apply, &wire_polkit) {
+        match wire_service(&POLKIT, enable, apply, &wire_verify_service) {
             Ok(msg) => {
                 println!("  {msg}");
                 if enable && apply {
@@ -1053,7 +1058,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
                     if ondemand {
                         GREETER_UNSEAL_COSMIC_JUMP
                     } else {
-                        GREETER_UNSEAL
+                        GREETER_UNSEAL_FACEFIRST_JUMP
                     }
                     .to_string(),
                 );
@@ -1075,25 +1080,6 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
     }
     if sess_at.is_none() {
         out.push(RESEAL_SESSION.to_string()); // harmless optional session line
-    }
-    (format!("{}\n", out.join("\n")), true)
-}
-
-fn wire_single(content: &str, stanza: &str) -> (String, bool) {
-    if content_has_module(content) {
-        return (content.to_string(), false);
-    }
-    let mut out = Vec::new();
-    let mut done = false;
-    for l in content.lines() {
-        if !done && is_auth_directive(l) {
-            out.push(stanza.to_string());
-            done = true;
-        }
-        out.push(l.to_string());
-    }
-    if !done {
-        out.push(stanza.to_string());
     }
     (format!("{}\n", out.join("\n")), true)
 }
@@ -1171,17 +1157,17 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
     }
     (format!("{}\n", out.join("\n")), true)
 }
-fn wire_sudo(content: &str) -> (String, bool) {
-    wire_single(content, SUDO_STANZA)
-}
-/// Wire the polkit-1 stack: the verify stanza goes ABOVE the first auth-phase
-/// line, whether that is Fedora's `auth include system-auth` or Debian's
-/// `@include common-auth` (which `wire_single`'s auth-token anchor misses; an
-/// appended-at-end line would run after the password modules). No anchor →
-/// no wiring: appending to a file with no auth phase would leave pam_irlume as
-/// the only auth module, and its IGNORE on a failed face would then fail the
-/// whole prompt instead of falling back to the password.
-fn wire_polkit(content: &str) -> (String, bool) {
+/// Wire a single-stanza verify service (`sudo`, `polkit-1`): the stanza goes
+/// ABOVE the first auth-phase line, whether that is Fedora's `auth include
+/// system-auth` or Debian/Ubuntu's `@include common-auth`. An anchor that only
+/// matched a literal `auth` token missed the include layout entirely and the
+/// stanza got appended at EOF, i.e. AFTER the password modules, where it is dead:
+/// a wrong password already hit common-auth's pam_deny, a right one already
+/// granted via pam_unix. No anchor at all → no wiring: appending to a file with
+/// no auth phase would leave pam_irlume as the only auth module, and its IGNORE
+/// on a failed face would then fail the whole prompt instead of falling back to
+/// the password.
+fn wire_verify_service(content: &str) -> (String, bool) {
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -1195,7 +1181,7 @@ fn wire_polkit(content: &str) -> (String, bool) {
     let mut out = Vec::with_capacity(lines.len() + 1);
     for (i, l) in lines.iter().enumerate() {
         if i == anchor {
-            out.push(POLKIT_STANZA.to_string());
+            out.push(VERIFY_STANZA.to_string());
         }
         out.push((*l).to_string());
     }
@@ -1440,6 +1426,23 @@ mod tests {
             .any(|l| l.starts_with("session") && l.contains("reseal")));
     }
 
+    // Regression: the substack (Fedora) branch emitted a BARE `unseal` where the
+    // @include branch emitted `unseal facefirst`. Without the arg the module runs
+    // the active probe and blocks until the user types, so on the greeters this
+    // branch serves (old GDM below the GNOME gate, any unvalidated DM) the face
+    // never fired at all.
+    #[test]
+    fn substack_greeter_without_ondemand_still_gets_facefirst() {
+        let (w, changed) = wire_greeter_impl(GDM, true, false, false);
+        assert!(changed);
+        assert!(w.contains("pam_irlume.so unseal facefirst"), "{w}");
+        assert!(!w.contains("unseal ondemand"));
+        // Still the jump form (a substack IS skippable by success=1), with the
+        // landing that jump needs.
+        assert!(w.contains("[success=1 default=ignore]"));
+        assert!(w.contains("irlume-landing"));
+    }
+
     // Debian/Ubuntu cosmic-greeter layout (@include-based; one service drives
     // both the login and the lock screen).
     const COSMIC: &str = "#%PAM-1.0\nauth    requisite    pam_nologin.so\n@include common-auth\nauth    optional    pam_gnome_keyring.so\n@include common-account\n@include common-session\n@include common-password\n";
@@ -1611,7 +1614,7 @@ mod tests {
     #[test]
     fn single_stanza_and_unwire_roundtrip() {
         let base = "#%PAM-1.0\nauth required pam_unix.so\nsession required pam_unix.so\n";
-        let (w, c) = wire_single(base, SUDO_STANZA);
+        let (w, c) = wire_verify_service(base);
         assert!(c && content_has_module(&w));
         let (back, changed) = unwire_lines(&w);
         assert!(changed && !content_has_module(&back));
@@ -1665,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_polkit_inserts_the_verify_stanza_before_the_first_auth_line() {
+    fn verify_service_inserts_the_stanza_before_the_first_auth_line() {
         // Fedora vendor layout (include system-auth) and Debian's @include
         // layout both anchor on the first auth directive; the stanza must land
         // above it so the face runs before the password modules, and the line
@@ -1675,7 +1678,7 @@ mod tests {
             "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n",
             "#%PAM-1.0\n@include common-auth\n@include common-account\n",
         ] {
-            let (wired, changed) = wire_polkit(stock);
+            let (wired, changed) = wire_verify_service(stock);
             assert!(changed, "{stock:?}");
             let face = wired
                 .lines()
@@ -1694,19 +1697,19 @@ mod tests {
                 "{line}"
             );
             // Idempotent and fully reversible.
-            assert!(!wire_polkit(&wired).1);
+            assert!(!wire_verify_service(&wired).1);
             let (back, undone) = unwire_lines(&wired);
             assert!(undone && !content_has_module(&back));
         }
     }
 
     #[test]
-    fn wire_polkit_skips_a_file_with_no_auth_phase() {
+    fn verify_service_skips_a_file_with_no_auth_phase() {
         // With no auth anchor the stanza would become the ONLY auth module, and
         // a failed face (IGNORE) would then fail the prompt outright instead of
         // cascading to the password. Must skip, not append.
         let stock = "#%PAM-1.0\nsession    include      system-auth\n";
-        let (out, changed) = wire_polkit(stock);
+        let (out, changed) = wire_verify_service(stock);
         assert!(!changed);
         assert_eq!(out, stock);
     }
@@ -1762,7 +1765,7 @@ mod tests {
     #[test]
     fn disable_strips_in_place_when_the_file_changed_after_wiring() {
         let dir = TestDir::new("strip");
-        let (wired, changed) = wire_sudo(SUDO_STOCK);
+        let (wired, changed) = wire_verify_service(SUDO_STOCK);
         assert!(changed);
         let admin_line = "auth       required   pam_faillock.so preauth";
         let current = format!("{wired}{admin_line}\n");
@@ -1773,7 +1776,7 @@ mod tests {
             etc: leak(&etc),
             vendor: None,
         };
-        let msg = wire_service(&svc, false, true, &wire_sudo).unwrap();
+        let msg = wire_service(&svc, false, true, &wire_verify_service).unwrap();
         assert!(msg.contains("stripped irlume lines"), "{msg}");
         let after = std::fs::read_to_string(&etc).unwrap();
         assert!(
@@ -1793,7 +1796,7 @@ mod tests {
     #[test]
     fn disable_restores_the_backup_when_nothing_else_changed() {
         let dir = TestDir::new("restore");
-        let (wired, _) = wire_sudo(SUDO_STOCK);
+        let (wired, _) = wire_verify_service(SUDO_STOCK);
         let etc = dir.0.join("sudo");
         std::fs::write(&etc, &wired).unwrap();
         std::fs::write(dir.0.join(format!("sudo{BACKUP}")), SUDO_STOCK).unwrap();
@@ -1801,7 +1804,7 @@ mod tests {
             etc: leak(&etc),
             vendor: None,
         };
-        let msg = wire_service(&svc, false, true, &wire_sudo).unwrap();
+        let msg = wire_service(&svc, false, true, &wire_verify_service).unwrap();
         assert!(msg.contains("restored from backup"), "{msg}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), SUDO_STOCK);
         assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
@@ -1945,12 +1948,33 @@ mod tests {
         assert_eq!(w, src);
     }
 
+    // Regression: face-sudo was dead code on Debian/Ubuntu. The old anchor only
+    // matched lines whose first token is `auth`, and Ubuntu 26.04's
+    // /etc/pam.d/sudo has none (session lines plus `@include common-auth`), so
+    // the stanza was appended at EOF — after the password stack, where it can
+    // never grant: a wrong password dies in common-auth's pam_deny first, a
+    // right one already succeeded via pam_unix.
     #[test]
-    fn wire_single_appends_when_there_is_no_auth_directive() {
-        // A stack with no auth line: the stanza is appended at the end.
-        let (w, c) = wire_single("#%PAM-1.0\n# comment only\n", SUDO_STANZA);
-        assert!(c && content_has_module(&w));
-        assert!(w.trim_end().ends_with(SUDO_STANZA));
+    fn face_sudo_wires_above_the_ubuntu_include_layout() {
+        const UBUNTU_SUDO: &str = "#%PAM-1.0\nsession    required   pam_env.so readenv=1 user_readenv=0\n@include common-auth\n@include common-account\n@include common-session-noninteractive\n";
+        let (wired, changed) = wire_verify_service(UBUNTU_SUDO);
+        assert!(changed);
+        let lines: Vec<&str> = wired.lines().collect();
+        let stanza = lines.iter().position(|l| l.contains(MODULE)).unwrap();
+        let common_auth = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("@include common-auth"))
+            .unwrap();
+        assert!(
+            stanza < common_auth,
+            "stanza must precede the password stack:\n{wired}"
+        );
+        assert!(
+            !wired.trim_end().ends_with(VERIFY_STANZA),
+            "must not append at EOF"
+        );
+        // The `session pam_env` line above it is not an auth anchor.
+        assert!(stanza > 1, "{wired}");
     }
 
     #[test]

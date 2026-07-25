@@ -168,7 +168,9 @@ fn save_recovery(user: &str, env: &RecoveryEnvelope) -> Result<()> {
     std::fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
     let json = serde_json::to_vec_pretty(env).map_err(|e| Error::Protocol(e.to_string()))?;
     let path = recovery_path(user);
-    irlume_common::write_0600(&path, &json).map_err(|e| Error::Io(e.to_string()))
+    // Atomic: replacing a recovery envelope must not corrupt the existing one on
+    // a failed write; it is the last-resort backstop after a TPM seal breaks.
+    irlume_common::write_0600_atomic(&path, &json).map_err(|e| Error::Io(e.to_string()))
 }
 
 fn load_recovery(user: &str) -> Result<RecoveryEnvelope> {

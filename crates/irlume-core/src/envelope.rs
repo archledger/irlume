@@ -115,7 +115,11 @@ impl SealedEnvelope {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| Error::Protocol(e.to_string()))?;
-        irlume_common::write_0600(path, s.as_bytes()).map_err(|e| Error::Io(e.to_string()))
+        // Atomic: a failed rewrite (ENOSPC, power loss, kill) must never corrupt
+        // the live seal. Every seal writer (keyring arm/reseal, template-key
+        // reseal) goes through here, so this one change protects them all; the
+        // greeter unseal always reads a whole envelope, old or new.
+        irlume_common::write_0600_atomic(path, s.as_bytes()).map_err(|e| Error::Io(e.to_string()))
     }
 }
 

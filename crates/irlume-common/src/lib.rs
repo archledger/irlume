@@ -118,6 +118,58 @@ pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
+/// Like [`write_0600`] but ATOMIC: write a unique 0600 temp file in the same
+/// directory, fsync it, rename it over `path`, then fsync the directory. A
+/// crash, ENOSPC, or kill mid-write leaves the PRE-EXISTING file byte-for-byte
+/// intact instead of a truncated/half-written one. Use this for anything a
+/// failed rewrite must never corrupt: a TPM-sealed keyring password or template
+/// key whose loss would drop face auth to the password until a re-seal or
+/// re-enroll. The rename replaces the target in one step, so a reader (the
+/// greeter unseal) sees either the whole old file or the whole new one, never a
+/// torn write. Temp and target must share a directory so the rename stays within
+/// one filesystem (where rename is atomic).
+pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("irlume");
+        // pid keeps the temp unique per writer; the daemon is single-threaded so
+        // there is no same-process race on one target. A leftover temp from a
+        // crashed write is overwritten (truncate) by the next attempt.
+        let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        // Re-assert the mode in case a stale temp pre-existed at a wider mode.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp); // don't leave a stray temp behind
+            return Err(e);
+        }
+        // fsync the directory so the rename (the metadata that makes the new
+        // bytes visible under `path`) is itself durable across a power loss.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)
+}
+
 /// Request from an (untrusted) client to the (privileged) daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -494,6 +546,30 @@ pub(crate) mod testenv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_0600_atomic_replaces_content_at_0600_without_stray_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-atomic-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("seal.json");
+        // Fresh write, then an overwrite: the new content fully replaces the old.
+        write_0600_atomic(&target, b"OLD-SEAL").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"OLD-SEAL");
+        write_0600_atomic(&target, b"NEW-SEAL-longer").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW-SEAL-longer");
+        // 0600, and no leftover `.seal.json.tmp.*` beside it.
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "must be 0600");
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "atomic write left a temp file behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The `Locked:` kB of the /proc/self/smaps mapping containing `addr`
     /// (Linux splits a VMA on mlock, so a locked buffer's mapping reports a

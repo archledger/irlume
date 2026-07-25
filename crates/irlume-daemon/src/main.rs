@@ -169,15 +169,23 @@ fn main() {
                 entry.name.to_string(),
             ))
         });
-    let mut engine = match irlume_auth::Engine::load(&det, &model)
-        .map(|e| e.with_devices(&rgb_dev, &ir_dev))
-        .and_then(|e| e.with_ir_adapter(&adapter))
-        .and_then(|e| e.with_mesh(&mesh))
-        .and_then(|e| e.with_blaze_rescue(&blaze))
-        .and_then(|e| match &tp_pad {
-            Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
-            None => Ok(e),
-        }) {
+    // Engine factory: (re)loads the models and rebinds devices/adapters. Used
+    // once at startup and again by the accept loop to rebuild the engine after a
+    // caught connection-handler panic, so a fresh request never runs against ONNX
+    // sessions left in an unproven state by an unwind. It only borrows the load
+    // inputs, so it is Fn and callable repeatedly.
+    let build_engine = || {
+        irlume_auth::Engine::load(&det, &model)
+            .map(|e| e.with_devices(&rgb_dev, &ir_dev))
+            .and_then(|e| e.with_ir_adapter(&adapter))
+            .and_then(|e| e.with_mesh(&mesh))
+            .and_then(|e| e.with_blaze_rescue(&blaze))
+            .and_then(|e| match &tp_pad {
+                Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
+                None => Ok(e),
+            })
+    };
+    let mut engine = match build_engine() {
         Ok(e) => {
             eprintln!(
                 "irlumed: IR adapter {}",
@@ -316,21 +324,43 @@ fn main() {
                 // 0-dimension or short-buffered frame) must deny THIS one request
                 // and let PAM fall back to the password, never unwind out of the
                 // single-threaded accept loop and take down all face auth for
-                // every user. The engine is effectively per-request stateless
-                // (fresh capture each call; its locks recover from poisoning via
-                // into_inner), so reusing it after a caught unwind is safe. The
-                // panicking handler dropped the stream, so the client sees EOF
-                // and PAM treats it as a fail-safe decline.
+                // every user. The panicking handler dropped the stream, so the
+                // client sees EOF and PAM treats it as a fail-safe decline.
+                //
+                // On a caught panic we REBUILD the engine before serving the next
+                // request rather than reuse it: AssertUnwindSafe only silences the
+                // compiler, it does not prove the ONNX sessions are in a supported
+                // state after an unwind, so a fresh engine removes that doubt. This
+                // is chosen over exiting-and-letting-systemd-restart because a
+                // reproducible panic would otherwise become a restart loop that
+                // takes the login path down entirely; a rebuild keeps the daemon
+                // up. It only runs on a real panic (the known frame-math panic
+                // sources are guarded at their site), so the reload cost is not on
+                // any normal path. If the rebuild itself fails, the old engine is
+                // kept: still better than a dead daemon.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle(stream, &mut engine)
                 }));
                 match outcome {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => eprintln!("irlumed: connection error: {e}"),
-                    Err(_) => eprintln!(
-                        "irlumed: connection handler panicked; this request was denied \
-                         (PAM falls back to the password), daemon continues"
-                    ),
+                    Err(_) => {
+                        eprintln!(
+                            "irlumed: connection handler PANICKED; this request was denied \
+                             (PAM falls back to the password). Rebuilding the engine for a \
+                             clean state; please report this with the backtrace above."
+                        );
+                        match build_engine() {
+                            Ok(fresh) => {
+                                engine = fresh;
+                                eprintln!("irlumed: engine rebuilt after panic");
+                            }
+                            Err(e) => eprintln!(
+                                "irlumed: engine rebuild after panic FAILED ({e}); continuing \
+                                 with the existing engine"
+                            ),
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("irlumed: accept error: {e}"),

@@ -141,6 +141,56 @@ pub fn credential_release_challenge() -> bool {
     !read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| falsy(&v))
 }
 
+/// Which deliberate gesture the consent gate accepts.
+///
+/// Lives here, not in the auth engine, because two crates must agree on it: the
+/// engine decides which detector may fire, and the PAM module tells the user which
+/// gesture to perform. Two copies of the parse would eventually disagree, and the
+/// user-visible symptom of that is being told to nod at a gate that only accepts an
+/// eye closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentGesture {
+    /// Head nod only.
+    Nod,
+    /// Eye closure only. The one mode that needs a per-user EAR calibration.
+    Closure,
+    /// Accept either (the default): the user does whichever suits their position.
+    Either,
+}
+
+impl ConsentGesture {
+    /// One line telling the user what to do, for a PAM conversation or a prompt.
+    /// `what` names the thing being unlocked, e.g. "unlock your keyring".
+    pub fn instruction(self, what: &str) -> String {
+        match self {
+            Self::Nod => format!("nod your head to {what}"),
+            Self::Closure => {
+                format!("close your eyes for about a second, then open, to {what}")
+            }
+            Self::Either => {
+                format!("nod your head to {what} (or close your eyes ~1s then open)")
+            }
+        }
+    }
+}
+
+/// The configured consent-gesture mode: `consent_gesture=nod|closure` in
+/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset or any other
+/// value accepts EITHER.
+pub fn consent_gesture_mode() -> ConsentGesture {
+    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+        "nod" => ConsentGesture::Nod,
+        "closure" => ConsentGesture::Closure,
+        _ => ConsentGesture::Either,
+    };
+    if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
+        return parse(&v);
+    }
+    read_kv("settings.conf", "consent_gesture")
+        .map(|v| parse(&v))
+        .unwrap_or(ConsentGesture::Either)
+}
+
 /// The spellings that turn a boolean settings.conf key off.
 fn falsy(v: &str) -> bool {
     matches!(
@@ -341,6 +391,57 @@ mod tests {
 
         write_kv("settings.conf", key, "").unwrap(); // disable
         assert_eq!(read_kv("settings.conf", key), None);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gesture mode and the sentence the user is shown must come from one
+    /// parse: the engine decides which detector may fire, the PAM module tells the
+    /// user what to do, and a disagreement means a `closure`-only user is told to
+    /// nod, nods for the whole window, and is refused.
+    #[test]
+    fn consent_gesture_mode_parses_and_names_the_gesture_it_accepts() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        // Unset, and any unrecognized value, accept EITHER.
+        assert_eq!(consent_gesture_mode(), ConsentGesture::Either);
+        for (v, want) in [
+            ("nod", ConsentGesture::Nod),
+            ("closure", ConsentGesture::Closure),
+            ("CLOSURE", ConsentGesture::Closure),
+            (" nod ", ConsentGesture::Nod),
+            ("wink", ConsentGesture::Either),
+        ] {
+            write_kv("settings.conf", "consent_gesture", v).unwrap();
+            assert_eq!(consent_gesture_mode(), want, "consent_gesture={v:?}");
+        }
+        // The env override wins over the file.
+        write_kv("settings.conf", "consent_gesture", "closure").unwrap();
+        std::env::set_var("IRLUME_CONSENT_GESTURE", "nod");
+        assert_eq!(consent_gesture_mode(), ConsentGesture::Nod);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        // The instruction names ONLY gestures that mode actually accepts.
+        let nod = ConsentGesture::Nod.instruction("unlock your keyring");
+        assert!(nod.contains("nod") && !nod.contains("eyes"), "{nod}");
+        let closure = ConsentGesture::Closure.instruction("unlock your keyring");
+        assert!(
+            closure.contains("eyes") && !closure.contains("nod"),
+            "closure-only must not tell the user to nod: {closure}"
+        );
+        let either = ConsentGesture::Either.instruction("unlock your keyring");
+        assert!(
+            either.contains("nod") && either.contains("eyes"),
+            "{either}"
+        );
+        // The subject is interpolated, so one wording serves keyring and polkit.
+        assert!(nod.ends_with("unlock your keyring"), "{nod}");
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

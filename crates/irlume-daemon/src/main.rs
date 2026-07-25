@@ -2349,10 +2349,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Credential release must reach the engine as `CredentialRelease`, never as a
-    /// plain verify, and its `temporal_challenge` must track the live setting so a
-    /// toggle needs no daemon restart. DEFAULT ON: an absent key means the gesture
-    /// is required, which is the whole point of the change.
+    /// The POLICY read behind credential release: `temporal_challenge` tracks the
+    /// live setting so a toggle needs no daemon restart, and DEFAULT ON means an
+    /// absent key still requires the gesture, which is the whole point of the
+    /// change.
+    ///
+    /// Scope, stated plainly: this covers the helper, not the dispatch. That
+    /// `UnsealPassword` runs under this purpose rests on
+    /// [`credential_release_purpose`] having exactly one caller,
+    /// [`do_unseal_password`], which is also the only path to
+    /// `keyring::unseal_password`. A camera-less test cannot observe the gesture
+    /// gate itself; the engine-side proof lives in irlume-auth
+    /// (`no_credential_release_failure_mode_ever_grants`) and the end-to-end proof
+    /// in irlume-pam (`pamwrap_refused_challenge_falls_through_to_the_password_module`).
     #[test]
     fn credential_release_purpose_defaults_to_a_required_challenge() {
         use irlume_auth::AuthenticationPurpose::CredentialRelease;

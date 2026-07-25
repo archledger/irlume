@@ -2628,8 +2628,10 @@ fn doctor() -> std::process::ExitCode {
     // The consent gesture is a head NOD by default (no calibration). Only the
     // opt-in closure gesture needs a per-user calibration; wired-but-uncalibrated
     // then silently falls to the password on every polkit prompt.
-    let gesture_is_closure = irlume_common::config::read_kv("settings.conf", "consent_gesture")
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("closure"));
+    // Same parse the engine gates on and the PAM module instructs from, so doctor
+    // can never report a gesture the daemon would refuse.
+    let gesture_is_closure = irlume_common::config::consent_gesture_mode()
+        == irlume_common::config::ConsentGesture::Closure;
     let closure_calibrated = matches!(
         daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
         Ok(irlume_common::Response::Enrollment {

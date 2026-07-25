@@ -279,15 +279,24 @@ impl PamServiceModule for IrlumePam {
             // gives the user no way to know that. Shown only on the interactive
             // greeter probe (`unseal` without `wait`): in `wait` mode KDE runs us as
             // a parallel biometric device where an unsolicited message competes with
-            // the password field. This module runs as root on the unseal path (the
-            // daemon refuses a non-root UnsealPassword), so it can read the
-            // root-only setting and stay silent when the operator opted out.
+            // the password field.
+            //
+            // The instruction names the gesture the daemon will actually accept,
+            // from the same `consent_gesture` parse the engine gates on: telling a
+            // `closure`-only user to nod would cost them the whole watch window and
+            // then the password.
+            //
+            // Reading a root-only setting here is best-effort by design. Greeter and
+            // lock stacks run as root, so the read normally succeeds; a non-root PAM
+            // caller (a custom locker, `pamtester`) sees an unreadable file, which
+            // fails secure to ON and at worst over-instructs. It cannot obtain the
+            // credential either way, since the daemon refuses a non-root
+            // UnsealPassword.
             if unseal && !wait && irlume_common::config::credential_release_challenge() {
+                let how = irlume_common::config::consent_gesture_mode()
+                    .instruction("unlock your keyring");
                 let _ = pamh.conv(
-                    Some(
-                        "irlume: nod your head to unlock your keyring \
-                         (or close your eyes ~1s then open)",
-                    ),
+                    Some(&format!("irlume: {how}")),
                     pamsm::PamMsgStyle::TEXT_INFO,
                 );
             }

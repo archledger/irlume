@@ -231,33 +231,9 @@ fn consent_gesture_enabled() -> bool {
     !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
 }
 
-/// Which consent gesture(s) the polkit gate accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConsentGesture {
-    /// Head nod only.
-    Nod,
-    /// Eye closure only.
-    Closure,
-    /// Accept either (the default): the user does whichever suits their position.
-    Either,
-}
-
-/// The configured consent-gesture mode: `consent_gesture=nod|closure` in
-/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset / any
-/// other value accepts EITHER.
-fn consent_gesture_mode() -> ConsentGesture {
-    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
-        "nod" => ConsentGesture::Nod,
-        "closure" => ConsentGesture::Closure,
-        _ => ConsentGesture::Either,
-    };
-    if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
-        return parse(&v);
-    }
-    irlume_common::config::read_kv("settings.conf", "consent_gesture")
-        .map(|v| parse(&v))
-        .unwrap_or(ConsentGesture::Either)
-}
+// The consent-gesture mode is defined in irlume_common::config so the PAM module
+// can name the SAME gesture it tells the user to perform; see `ConsentGesture`.
+use irlume_common::config::{consent_gesture_mode, ConsentGesture};
 
 /// Whether this PAM service forces the passive blink gate even without the
 /// per-enrollment opt-in (polkit prompts; see
@@ -3973,30 +3949,43 @@ mod engine_tests {
                 std::env::set_var("IRLUME_CONSENT_GESTURE", mode);
             }
             for (label, enr) in [("calibrated", &calibrated), ("uncalibrated", &uncalibrated)] {
-                // An Err is as fail-safe as a deny: both become Response::Error,
-                // then PAM_IGNORE, then the password prompt.
-                let assert_no_grant = |engine: &mut Engine, stage: &str| {
-                    if let Ok(o) =
-                        engine.challenge_if_required(enr, release, Outcome::grant(0.95, "match"))
+                // An Err is as fail-safe as a deny (both become Response::Error, then
+                // PAM_IGNORE, then the password prompt), but WHICH error still has to
+                // be the one this stage is named for: silently accepting any Err
+                // would let the stage pass without exercising its branch at all.
+                let assert_no_grant =
+                    |engine: &mut Engine, stage: &str, err_must_say: &str| match engine
+                        .challenge_if_required(enr, release, Outcome::grant(0.95, "match"))
                     {
-                        assert!(
+                        Ok(o) => assert!(
                             !o.granted,
                             "mode={mode} {label} {stage} GRANTED without a gesture: {}",
                             o.reason
-                        );
-                    }
-                };
+                        ),
+                        Err(e) => assert!(
+                            e.to_string().contains(err_must_say),
+                            "mode={mode} {label} {stage} failed for the wrong reason \
+                             (wanted {err_must_say:?}): {e}"
+                        ),
+                    };
                 // No IR at all: declined before any camera is touched.
                 s.engine.ir_available = false;
-                assert_no_grant(&mut s.engine, "no-IR");
+                assert_no_grant(&mut s.engine, "no-IR", "camera");
                 // IR present, FaceMesh missing: the consent watch cannot classify
                 // a frame, so there is no way to observe the gesture.
                 s.engine.ir_available = true;
                 let mesh = s.engine.mesh.take();
-                assert_no_grant(&mut s.engine, "no-mesh");
-                // Mesh loaded but no camera to stream: the watch errors out.
+                assert_no_grant(&mut s.engine, "no-mesh", "camera");
+                // Mesh loaded but no camera to stream: the watch itself errors out.
+                // Assert the mesh really came back, else this repeats the no-mesh
+                // case and the stage would prove nothing.
                 s.engine.mesh = mesh;
-                assert_no_grant(&mut s.engine, "no-camera");
+                assert!(
+                    s.engine.mesh.is_some(),
+                    "the shared engine must carry a FaceMesh for the no-camera stage \
+                     to exercise the consent watch rather than the missing-model branch"
+                );
+                assert_no_grant(&mut s.engine, "no-camera", "no camera found");
             }
         }
         std::env::remove_var("IRLUME_CONSENT_GESTURE");

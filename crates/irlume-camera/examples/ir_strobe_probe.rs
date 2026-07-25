@@ -68,7 +68,7 @@ fn main() {
     // Contrast proxy: how much brighter is the center (near subject, lit by the
     // emitter) than the border (background) before vs after subtraction? A
     // bigger center/border ratio after subtraction means the emitter's light is
-    // being isolated (the depth/liveness cue this whole feature strengthens).
+    // being isolated (the center/edge liveness cue this whole feature strengthens).
     let (w, h) = (frames[lit].width, frames[lit].height);
     let raw_ratio = ir_probe::center_border_ratio(&frames[lit].data, w, h);
     let sub_ratio = ir_probe::center_border_ratio(&sub, w, h);

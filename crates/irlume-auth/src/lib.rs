@@ -69,7 +69,7 @@ pub struct Assessment {
     /// contract is 512→512, see [`Engine::ir_dim`]), else raw 512-D.
     pub ir_embedding: Option<Vec<f32>>,
     pub signals: Signals,
-    pub ir_depth: f32,
+    pub ir_center_edge_ratio: f32,
     pub ir_brightness: f32,
     /// Both eyes read open (IR corneal-glint heuristic). Used only when a profile
     /// opts into the require-eyes-open gate. `false` if eyes couldn't be verified.
@@ -172,8 +172,8 @@ struct CapturedScan {
     rgb: Vec<f32>,
     /// IR-face embedding, when an IR face was captured (engine `ir_space`).
     ir: Option<Vec<f32>>,
-    /// IR center/edge depth ratio at capture (feeds the per-user depth floor).
-    depth: f32,
+    /// IR center/edge brightness ratio at capture (feeds the per-user floor).
+    center_edge_ratio: f32,
     /// Mean IR face brightness at capture (0-255 grey).
     brightness: f32,
     /// Head pitch fraction at capture (calibrates this user's pitch neutral).
@@ -320,7 +320,7 @@ impl AuthenticationPurpose {
 /// until the window expires and the denial stands; a genuine user's IR
 /// catches up within a retry or two. Live-found 2026-07-15: without this,
 /// settling into frame can be denied on the transient mismatch. Other Spoof
-/// reasons (flat/depth/2D) are NOT retried.
+/// reasons (a flat-reading face region) are NOT retried.
 pub fn presence_retryable(o: &Outcome) -> bool {
     matches!(
         o.kind,
@@ -737,7 +737,7 @@ impl Engine {
             embedding,
             ir_embedding: None,
             signals,
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             eyes_open: false,
             thirdparty_fake: None,
@@ -908,7 +908,7 @@ impl Engine {
             .as_ref()
             .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        let ir_depth = ir_top
+        let ir_center_edge_ratio = ir_top
             .as_ref()
             .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
@@ -932,7 +932,7 @@ impl Engine {
             rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width, rgb.height)),
             ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
             ir_face_brightness: ir_brightness,
-            ir_center_edge_ratio: ir_depth,
+            ir_center_edge_ratio,
             ir_eye_glint: ir_top
                 .as_ref()
                 .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
@@ -948,7 +948,7 @@ impl Engine {
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
-            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2}",
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2}",
             signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
             signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac);
         // Opt-in third-party PAD cue: score whenever an IR face is present (the
@@ -1022,7 +1022,7 @@ impl Engine {
             embedding,
             ir_embedding,
             signals,
-            ir_depth,
+            ir_center_edge_ratio,
             ir_brightness,
             eyes_open,
             thirdparty_fake,
@@ -1540,26 +1540,30 @@ impl Engine {
                     format!("liveness {:?}: {}", a.verdict, a.reason),
                 ));
             }
-            // Per-user IR-liveness DEPTH floor (anti-screen/photo, calibrated to
-            // this user's enrolled 3D face structure): the live frame must clear the
-            // enrolled depth floor. Depth only: a per-user IR *brightness* floor was
-            // removed because IR face brightness is ambient-dependent (emitter-only
-            // ~40 in the dark vs ~140 lit) and a lit-enrollment floor false-rejected
-            // genuine dim/night logins as "screen/photo". The global gate above
-            // (`evaluate`) already enforces an ambient-tolerant IR brightness floor.
-            // Only meaningful when IR was actually captured (skip on RGB-only).
-            if let Some(depth_floor) = enr.ir_depth_floor().filter(|_| self.ir_available) {
+            // Per-user floor on the IR center/edge brightness ratio
+            // (anti-screen/photo, calibrated to how this user's face reads under
+            // the emitter): the live frame must clear the enrolled floor. Ratio
+            // only: a per-user IR *brightness* floor was removed because IR face
+            // brightness is ambient-dependent (emitter-only ~40 in the dark vs ~140
+            // lit) and a lit-enrollment floor false-rejected genuine dim/night
+            // logins as "screen/photo". The global gate above (`evaluate`) already
+            // enforces an ambient-tolerant IR brightness floor. Only meaningful
+            // when IR was actually captured (skip on RGB-only).
+            if let Some(ratio_floor) = enr
+                .ir_center_edge_ratio_floor()
+                .filter(|_| self.ir_available)
+            {
                 irlume_common::dlog!(
-                    "gate(per-user depth floor): live {:.2} vs floor {:.2}",
-                    a.ir_depth,
-                    depth_floor
+                    "gate(per-user IR center/edge floor): live {:.2} vs floor {:.2}",
+                    a.ir_center_edge_ratio,
+                    ratio_floor
                 );
-                if a.ir_depth < depth_floor {
+                if a.ir_center_edge_ratio < ratio_floor {
                     return Ok(Outcome::deny(
                         OutcomeKind::Spoof,
                         format!(
-                            "IR depth {:.2} below your calibrated floor {:.2}; looks 2D (screen/photo)",
-                            a.ir_depth, depth_floor
+                            "IR center/edge {:.2} below your calibrated floor {:.2}; the face region is flatter than your enrolled face (screen/photo)",
+                            a.ir_center_edge_ratio, ratio_floor
                         ),
                     ));
                 }
@@ -1659,7 +1663,7 @@ impl Engine {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
-            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_depth={:.2} glint={:.2} ambient={:.0}",
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0}",
                 a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint,
                 a.signals.ir_ambient);
             if verdict != Verdict::Live {
@@ -1676,24 +1680,27 @@ impl Engine {
                     format!("dark liveness {verdict:?}: {reason}"),
                 ));
             }
-            // Per-user calibrated IR depth floor, same as the RGB primary path.
-            // `evaluate_ir_only` uses the lenient global DEPTH_MIN_RATIO; the
+            // Per-user calibrated center/edge floor, same as the RGB primary path.
+            // `evaluate_ir_only` uses the lenient global MIN_CENTER_EDGE_RATIO; the
             // per-user floor is stricter and ambient-independent, so a curved
             // warm spoof that sits between the global ratio and this user's
-            // enrolled 3D structure is caught in lit conditions but must not
-            // slip through in the dark. Apply it here too before the IR match.
-            if let Some(depth_floor) = enr.ir_depth_floor().filter(|_| self.ir_available) {
+            // enrolled falloff is caught in lit conditions but must not slip
+            // through in the dark. Apply it here too before the IR match.
+            if let Some(ratio_floor) = enr
+                .ir_center_edge_ratio_floor()
+                .filter(|_| self.ir_available)
+            {
                 irlume_common::dlog!(
-                    "gate(per-user depth floor, dark): live {:.2} vs floor {:.2}",
-                    a.ir_depth,
-                    depth_floor
+                    "gate(per-user IR center/edge floor, dark): live {:.2} vs floor {:.2}",
+                    a.ir_center_edge_ratio,
+                    ratio_floor
                 );
-                if a.ir_depth < depth_floor {
+                if a.ir_center_edge_ratio < ratio_floor {
                     return Ok(Outcome::deny(
                         OutcomeKind::Spoof,
                         format!(
-                            "IR depth {:.2} below your calibrated floor {:.2}; looks 2D (screen/photo)",
-                            a.ir_depth, depth_floor
+                            "IR center/edge {:.2} below your calibrated floor {:.2}; the face region is flatter than your enrolled face (screen/photo)",
+                            a.ir_center_edge_ratio, ratio_floor
                         ),
                     ));
                 }
@@ -1866,11 +1873,11 @@ impl Engine {
         let live = a.verdict == Verdict::Live;
         let detail = if live {
             format!(
-                "Live: RGB face {}, IR face {} · IR brightness {:.0}, depth {:.2}, glint {:.0}",
+                "Live: RGB face {}, IR face {} · IR brightness {:.0}, center/edge {:.2}, glint {:.0}",
                 if s.rgb_face.is_some() { "✓" } else { "✗" },
                 if s.ir_face.is_some() { "✓" } else { "✗" },
                 a.ir_brightness,
-                a.ir_depth,
+                a.ir_center_edge_ratio,
                 s.ir_eye_glint,
             )
         } else {
@@ -1934,7 +1941,7 @@ impl Engine {
                     out.push(CapturedScan {
                         rgb: e.to_vec(),
                         ir: a.ir_embedding.clone(),
-                        depth: a.ir_depth,
+                        center_edge_ratio: a.ir_center_edge_ratio,
                         brightness: a.ir_brightness,
                         pitch: a.signals.head_pitch_frac,
                     });
@@ -2043,7 +2050,7 @@ impl Engine {
                     rgb: s.rgb,
                     ir: s.ir,
                     ir_space,
-                    ir_depth: s.depth,
+                    ir_center_edge_ratio: s.center_edge_ratio,
                     ir_brightness: s.brightness,
                     pitch: s.pitch,
                 });
@@ -2077,7 +2084,7 @@ impl Engine {
                 rgb: s.rgb,
                 ir: s.ir,
                 ir_space,
-                ir_depth: s.depth,
+                ir_center_edge_ratio: s.center_edge_ratio,
                 ir_brightness: s.brightness,
                 pitch: s.pitch,
             });
@@ -2175,7 +2182,7 @@ impl Engine {
             rgb: captured.rgb,
             ir: captured.ir,
             ir_space,
-            ir_depth: captured.depth,
+            ir_center_edge_ratio: captured.center_edge_ratio,
             ir_brightness: captured.brightness,
             pitch: captured.pitch,
         });
@@ -2565,11 +2572,14 @@ pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
-/// The IR depth cue: ratio of the center-box mean to the edge-ring mean of
-/// the IR face crop (grey 0-255). A real 3D face lit by the near-coaxial
+/// The IR center/edge cue: ratio of the center-box mean to the edge-ring mean
+/// of the IR face crop (grey 0-255). A real 3D face lit by the near-coaxial
 /// emitter is brighter at the center/nose and falls off at the rim (ratio
-/// above 1); a flat screen/photo reads ~1. Returns 0.0 on a degenerate bbox
-/// or a near-black edge (no signal, never inf).
+/// above 1); a flat matte screen/photo reads ~1. This is a brightness ratio,
+/// not a range measurement: a glossy print with a hot specular center clears
+/// it (docs/pad-results/2026-06-30-ir-liveness-selftest.md), which is why it is
+/// one cue and not a liveness proof. Returns 0.0 on a degenerate bbox or a
+/// near-black edge (no signal, never inf).
 pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
     if bw <= 4.0 || bh <= 4.0 {
@@ -2715,7 +2725,7 @@ mod tests {
                 rgb: rgb.clone(),
                 ir: Some(ir.clone()),
                 ir_space: Some("raw".into()),
-                ir_depth: 0.0,
+                ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
             })
@@ -2907,7 +2917,7 @@ mod tests {
             rgb: v,
             ir: None,
             ir_space: None,
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
         }
@@ -3232,7 +3242,7 @@ mod tests {
                 rgb: vec![0.0; 4],
                 ir: Some(v.to_vec()),
                 ir_space: Some("raw".into()),
-                ir_depth: 0.0,
+                ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
             }],
@@ -3308,7 +3318,7 @@ mod tests {
     }
 
     #[test]
-    fn center_edge_ratio_reads_depth_from_center_emphasis() {
+    fn center_edge_ratio_rises_with_center_emphasis() {
         let (w, h) = (40u32, 40u32);
         let bbox = [0.0f32, 0.0, 40.0, 40.0];
         // Emitter-lit 3D face: the center quarter markedly brighter than the rim.
@@ -3580,7 +3590,7 @@ mod engine_tests {
             rgb: unit512(seed),
             ir: ir.then(|| unit512(seed + 100)),
             ir_space: space.map(String::from),
-            ir_depth: 1.3,
+            ir_center_edge_ratio: 1.3,
             ir_brightness: 90.0,
             pitch: 0.5,
         }

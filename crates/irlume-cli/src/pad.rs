@@ -50,8 +50,8 @@ fn caught_cue(path: Path, s: &Signals) -> Option<&'static str> {
                 Some("face_in_ir")
             } else if s.ir_face_brightness < irlume_liveness::IR_FACE_MIN_BRIGHTNESS {
                 Some("ir_reflectance")
-            } else if s.ir_center_edge_ratio < irlume_liveness::DEPTH_MIN_RATIO {
-                Some("depth")
+            } else if s.ir_center_edge_ratio < irlume_liveness::MIN_CENTER_EDGE_RATIO {
+                Some("center_edge")
             } else {
                 None
             }
@@ -59,8 +59,8 @@ fn caught_cue(path: Path, s: &Signals) -> Option<&'static str> {
         Path::IrOnly => {
             if s.ir_face_brightness < irlume_liveness::IR_FACE_MIN_BRIGHTNESS {
                 Some("ir_reflectance")
-            } else if s.ir_center_edge_ratio < irlume_liveness::DEPTH_MIN_RATIO {
-                Some("depth")
+            } else if s.ir_center_edge_ratio < irlume_liveness::MIN_CENTER_EDGE_RATIO {
+                Some("center_edge")
             } else {
                 None
             }
@@ -252,7 +252,10 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 "ir_brightness".into(),
                 crate::json_f32(s.ir_face_brightness),
             );
-            rec.insert("ir_depth".into(), crate::json_f32(s.ir_center_edge_ratio));
+            rec.insert(
+                "ir_center_edge_ratio".into(),
+                crate::json_f32(s.ir_center_edge_ratio),
+            );
             rec.insert("ir_glint".into(), crate::json_f32(s.ir_eye_glint));
             let cross = match (s.rgb_face, s.ir_face) {
                 (Some(r), Some(i)) => ((r.cx - i.cx).powi(2) + (r.cy - i.cy).powi(2)).sqrt(),
@@ -266,7 +269,7 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 "face_in_ir": cues.face_in_ir,
                 "cross_spectrum_aligned": cues.cross_spectrum_aligned,
                 "ir_reflectance_ok": cues.ir_reflectance_ok,
-                "depth_ok": cues.depth_ok,
+                "center_edge_ratio_ok": cues.center_edge_ratio_ok,
                 "glint_present": cues.glint_present,
                 "frontal_ok": cues.frontal_ok,
             });
@@ -286,7 +289,7 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 ""
             };
             println!(
-                "      -> {} | ir {} bri {:>5.1} depth {:>5.2} glint {:>3.0} | {}{}",
+                "      -> {} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>3.0} | {}{}",
                 verdict_str(verdict),
                 if s.ir_face.is_some() { "✓" } else { "·" },
                 s.ir_face_brightness,
@@ -560,7 +563,7 @@ fn render_markdown(r: &metrics::PadReport, input: &str, paths: &[String]) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use irlume_liveness::{DEPTH_MIN_RATIO, IR_FACE_MIN_BRIGHTNESS, MIN_FACE_SCORE};
+    use irlume_liveness::{IR_FACE_MIN_BRIGHTNESS, MIN_CENTER_EDGE_RATIO, MIN_FACE_SCORE};
 
     /// Signals that pass every cue the attribution helper looks at.
     fn passing_signals() -> Signals {
@@ -571,7 +574,7 @@ mod tests {
                 score: MIN_FACE_SCORE + 0.2,
             }),
             ir_face_brightness: IR_FACE_MIN_BRIGHTNESS + 20.0,
-            ir_center_edge_ratio: DEPTH_MIN_RATIO + 0.2,
+            ir_center_edge_ratio: MIN_CENTER_EDGE_RATIO + 0.2,
             ..Default::default()
         }
     }
@@ -590,10 +593,10 @@ mod tests {
         let mut s = passing_signals();
         assert_eq!(caught_cue(Path::Full, &s), None);
 
-        s.ir_center_edge_ratio = DEPTH_MIN_RATIO - 0.1;
-        assert_eq!(caught_cue(Path::Full, &s), Some("depth"));
+        s.ir_center_edge_ratio = MIN_CENTER_EDGE_RATIO - 0.1;
+        assert_eq!(caught_cue(Path::Full, &s), Some("center_edge"));
 
-        // Reflectance failure outranks the depth failure.
+        // Reflectance failure outranks the center/edge failure.
         s.ir_face_brightness = IR_FACE_MIN_BRIGHTNESS - 1.0;
         assert_eq!(caught_cue(Path::Full, &s), Some("ir_reflectance"));
 
@@ -616,8 +619,8 @@ mod tests {
         assert_eq!(caught_cue(Path::IrOnly, &s), Some("ir_reflectance"));
 
         let mut s = passing_signals();
-        s.ir_center_edge_ratio = DEPTH_MIN_RATIO - 0.1;
-        assert_eq!(caught_cue(Path::IrOnly, &s), Some("depth"));
+        s.ir_center_edge_ratio = MIN_CENTER_EDGE_RATIO - 0.1;
+        assert_eq!(caught_cue(Path::IrOnly, &s), Some("center_edge"));
         assert_eq!(caught_cue(Path::IrOnly, &passing_signals()), None);
     }
 
@@ -651,8 +654,8 @@ mod tests {
     fn renderers_carry_the_iso_numbers_and_cue_attribution() {
         use metrics::Outcome::{Accepted, Rejected};
         let trials = vec![
-            attack("print_glossy", Rejected, &["depth"]),
-            attack("print_glossy", Rejected, &["depth"]),
+            attack("print_glossy", Rejected, &["center_edge"]),
+            attack("print_glossy", Rejected, &["center_edge"]),
             attack("print_glossy", Accepted, &[]),
             bonafide(Accepted),
             bonafide(Accepted),
@@ -667,7 +670,7 @@ mod tests {
         assert!(h.contains("bona-fide: 4"), "{h}");
         assert!(h.contains("print_glossy"), "{h}");
         assert!(h.contains("33.3%"), "APCER 1 accepted of 3: {h}");
-        assert!(h.contains("depth:2"), "cue attribution: {h}");
+        assert!(h.contains("center_edge:2"), "cue attribution: {h}");
         assert!(h.contains("WORST-CASE APCER: print_glossy"), "{h}");
         assert!(h.contains("25.0%"), "BPCER 1 of 4: {h}");
         assert!(h.contains("29.2%"), "ACER = (33.3 + 25.0)/2: {h}");
@@ -688,7 +691,11 @@ mod tests {
 
     #[test]
     fn render_human_flags_a_missing_bonafide_baseline() {
-        let trials = vec![attack("cutout", metrics::Outcome::Rejected, &["depth"])];
+        let trials = vec![attack(
+            "cutout",
+            metrics::Outcome::Rejected,
+            &["center_edge"],
+        )];
         let r = metrics::analyze(&trials);
         let h = render_human(&r, "pad.jsonl", &[]);
         assert!(h.contains("gate path(s): unknown"), "{h}");

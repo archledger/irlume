@@ -2,7 +2,7 @@
 // Copyright the irlume contributors.
 
 //! Dump a raw IR strobe burst to disk as PGM frames plus a means index, so
-//! ambient-subtraction and depth-cue tuning can be done offline against real
+//! ambient-subtraction and center/edge-cue tuning can be done offline against real
 //! captured conditions (e.g. direct sunlight) long after the light is gone.
 //!
 //! Usage: cargo run --release -p irlume-camera --example burst_dump -- <out_dir> [ir_dev] [frames]

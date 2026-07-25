@@ -886,7 +886,7 @@ const IR_BURST: usize = 10;
 /// floor (8), NOT a large absolute gap: under strong ambient IR (direct sun)
 /// the sensor saturates and a real strobe compresses to a gap of ~8-10, so the
 /// old value of 20 blocked subtraction in exactly the sunlit bursts that need
-/// it most (dataset `~/irlume-suncal`: bursts 06-08, gap 8-9, raw depth
+/// it most (dataset `~/irlume-suncal`: bursts 06-08, gap 8-9, raw center/edge
 /// 0.96-0.97, subtracted 1.37-1.46).
 ///
 /// `LOW_AMBIENT_SKIP`: if the off-frame mean is below this, there is
@@ -976,7 +976,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     // (sunlight) the pedestal would otherwise wash out the emitter reflection.
     // It is not primarily a spoof control (Hello credits spoof resistance to the
     // IR wavelength plus a separate liveness stage, which is where irlume's
-    // depth/glint cues live). Indoors the off-frame is ~0, so it is a no-op.
+    // center/edge and glint cues live). Indoors the off-frame is ~0, so it is a no-op.
     //
     // The subtraction assumes the lit and off frames share an exposure; pairing
     // ADJACENT burst frames (after AE_WARMUP) keeps auto-exposure drift between
@@ -985,11 +985,11 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     // blown exposure is visible rather than silently trusted.
     //
     // NOT a validated security control yet, two reasons it stays behind a flag:
-    //   1. The liveness DEPTH cue is center/edge RATIO, which is non-monotonic
+    //   1. The liveness center/edge cue is a RATIO, which is non-monotonic
     //      under subtraction: removing an ambient frame that is brighter at the
     //      border than the center RAISES the ratio, so a subtracted frame could
-    //      pass the depth floor a raw frame would fail. The depth floor must be
-    //      re-tuned against subtracted frames before this can be a default.
+    //      pass the floor a raw frame would fail. That floor must be re-tuned
+    //      against subtracted frames before this can be a default.
     //   2. The IR frame also feeds dark-mode IR matching, so enrollment and
     //      auth must use the SAME setting; toggling it requires a re-enroll.
     // Both are moot while the flag is unset (the shipped default).

@@ -50,9 +50,13 @@ pub struct FaceScan {
     /// `None` = scan predates space tagging; grandfathered as compatible.
     #[serde(default)]
     pub ir_space: Option<String>,
-    /// Per-scan IR liveness calibration (center/edge depth, face brightness).
-    #[serde(default)]
-    pub ir_depth: f32,
+    /// Per-scan IR liveness calibration: the center/edge brightness ratio of the
+    /// face region at capture, and the face brightness. The on-disk key stays
+    /// `ir_depth` (the name it shipped under) so an enrollment written here still
+    /// loads on an older binary; renaming the key would make a downgrade read the
+    /// field as absent, which silently drops this user's fitted ratio floor.
+    #[serde(default, rename = "ir_depth")]
+    pub ir_center_edge_ratio: f32,
     #[serde(default)]
     pub ir_brightness: f32,
     /// Head `pitch_frac` at capture. The median across scans is this user's
@@ -231,28 +235,29 @@ impl Enrollment {
         n
     }
 
-    /// Per-user IR **depth** floor (center/edge ratio, a 3D-structure cue) for the
-    /// anti-screen/photo gate: 75% of the weakest enrolled IR depth. Needs ≥2 IR
-    /// scans. DEPTH ONLY; the former per-user IR *brightness* floor was removed:
-    /// IR face brightness is strongly ambient-dependent (emitter-only ~40 in the
-    /// dark vs ~140 in a lit room, measured on the ASUS Hello cam), so a brightness
-    /// floor derived from lit enrollment false-rejects a genuine dim/night login as
-    /// a "screen/photo". The global liveness gate (`evaluate`) already enforces an
-    /// ambient-tolerant IR brightness floor (`IR_FACE_MIN_BRIGHTNESS`) and depth floor
-    /// (`DEPTH_MIN_RATIO`); this adds a personalized depth tightening on top.
-    pub fn ir_depth_floor(&self) -> Option<f32> {
-        let mut depths = Vec::new();
+    /// Per-user floor on the IR center/edge brightness ratio for the
+    /// anti-screen/photo gate: 75% of the weakest ratio this user enrolled with.
+    /// Needs ≥2 IR scans. RATIO ONLY; the former per-user IR *brightness* floor
+    /// was removed: IR face brightness is strongly ambient-dependent (emitter-only
+    /// ~40 in the dark vs ~140 in a lit room, measured on the ASUS Hello cam), so a
+    /// brightness floor derived from lit enrollment false-rejects a genuine
+    /// dim/night login as a "screen/photo". The global liveness gate (`evaluate`)
+    /// already enforces an ambient-tolerant IR brightness floor
+    /// (`IR_FACE_MIN_BRIGHTNESS`) and the global ratio floor
+    /// (`MIN_CENTER_EDGE_RATIO`); this personalizes the ratio floor on top.
+    pub fn ir_center_edge_ratio_floor(&self) -> Option<f32> {
+        let mut ratios = Vec::new();
         for p in &self.profiles {
             for s in &p.scans {
-                if s.ir.is_some() && s.ir_depth > 0.0 {
-                    depths.push(s.ir_depth);
+                if s.ir.is_some() && s.ir_center_edge_ratio > 0.0 {
+                    ratios.push(s.ir_center_edge_ratio);
                 }
             }
         }
-        if depths.len() < 2 {
+        if ratios.len() < 2 {
             return None;
         }
-        let min = depths.iter().copied().fold(f32::INFINITY, f32::min);
+        let min = ratios.iter().copied().fold(f32::INFINITY, f32::min);
         Some(min * 0.75)
     }
 
@@ -326,7 +331,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
             ir: old.ir_templates.get(i).cloned(),
             ir_space: None, // legacy scans predate space tagging
 
-            ir_depth: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
+            ir_center_edge_ratio: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
             ir_brightness: old.ir_brightness_samples.get(i).copied().unwrap_or(0.0),
             pitch: 0.0, // legacy scans predate pitch calibration
         })
@@ -542,7 +547,7 @@ mod tests {
                     rgb: vec![0.1, 0.2, 0.3, 0.4],
                     ir: Some(vec![0.5, 0.6]),
                     ir_space: None,
-                    ir_depth: 1.4,
+                    ir_center_edge_ratio: 1.4,
                     ir_brightness: 90.0,
                     pitch: 0.52,
                 }],
@@ -587,13 +592,13 @@ mod tests {
         assert!(deserialize_enrollment(&bytes, Some(&crypto::generate_key())).is_err());
     }
 
-    fn scan_with_ir(depth: f32, bright: f32) -> FaceScan {
+    fn scan_with_ir(ratio: f32, bright: f32) -> FaceScan {
         FaceScan {
             name: "s".into(),
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; 4]),
             ir_space: None,
-            ir_depth: depth,
+            ir_center_edge_ratio: ratio,
             ir_brightness: bright,
             pitch: 0.0,
         }
@@ -605,7 +610,7 @@ mod tests {
             rgb: vec![0.1; 4],
             ir: None,
             ir_space: None,
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch,
         }
@@ -639,12 +644,12 @@ mod tests {
             name: "p".into(),
             scans: vec![scan_with_ir(1.5, 100.0)],
         });
-        assert!(e.ir_depth_floor().is_none());
+        assert!(e.ir_center_edge_ratio_floor().is_none());
 
-        // Two+ scans -> depth floor at 75% of the weakest enrolled depth.
+        // Two+ scans -> floor at 75% of the weakest enrolled ratio.
         // (brightness is intentionally NOT floored per-user; it is ambient-dependent.)
         e.profiles[0].scans.push(scan_with_ir(1.2, 80.0));
-        let depth_floor = e.ir_depth_floor().unwrap();
+        let depth_floor = e.ir_center_edge_ratio_floor().unwrap();
         assert!((depth_floor - 1.2 * 0.75).abs() < 1e-5);
     }
 
@@ -654,7 +659,7 @@ mod tests {
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; dim]),
             ir_space: space.map(Into::into),
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
         }
@@ -734,14 +739,14 @@ mod tests {
                     rgb: vec![0.1; 4],
                     ir: None,
                     ir_space: None,
-                    ir_depth: 0.0,
+                    ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     pitch: 0.0,
                 },
                 scan_with_ir(1.5, 100.0),
             ],
         });
-        assert!(e.ir_depth_floor().is_none()); // only one IR-bearing scan
+        assert!(e.ir_center_edge_ratio_floor().is_none()); // only one IR-bearing scan
     }
 
     #[test]
@@ -845,7 +850,7 @@ mod tests {
             rgb: vec![0.0; 4],
             ir: Some(vec![0.0; 4]),
             ir_space: space.map(String::from),
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
         };

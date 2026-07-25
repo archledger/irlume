@@ -406,11 +406,11 @@ mod tests {
         let mut trials = vec![];
         // Species A: airtight.
         for _ in 0..10 {
-            trials.push(attack("A", Outcome::Rejected, &["depth_ok"]));
+            trials.push(attack("A", Outcome::Rejected, &["center_edge_ratio_ok"]));
         }
         // Species B: 3/10 slipped through as bona fide.
         for _ in 0..7 {
-            trials.push(attack("B", Outcome::Rejected, &["depth_ok"]));
+            trials.push(attack("B", Outcome::Rejected, &["center_edge_ratio_ok"]));
         }
         for _ in 0..3 {
             trials.push(attack("B", Outcome::Accepted, &[]));

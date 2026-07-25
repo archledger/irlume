@@ -126,8 +126,13 @@ pub struct Cues {
     pub cross_spectrum_aligned: bool,
     /// IR face region is brightly lit by the emitter (skin reflectance).
     pub ir_reflectance_ok: bool,
-    /// 3D structure present (center brighter than edges); anti-flat-spoof.
-    pub depth_ok: bool,
+    /// The IR face region's center is brighter than its edges by at least
+    /// [`MIN_CENTER_EDGE_RATIO`]. A lit 3D face produces that falloff and a flat
+    /// surface held at the same distance usually does not, so it is evidence
+    /// against a flat spoof. It is a brightness ratio, not a depth measurement:
+    /// the sensor has no range-finding, and a glossy print with a hot center
+    /// passes it (see docs/PAD_SELFTEST.md).
+    pub center_edge_ratio_ok: bool,
     /// Corneal glint present (supporting; logged, not decisive).
     pub glint_present: bool,
     /// Face is frontal enough (≈±15°) to make a decision; Windows-Hello-style
@@ -143,16 +148,19 @@ pub const IR_FACE_MIN_BRIGHTNESS: f32 = 35.0;
 pub const CROSS_SPECTRUM_TOLERANCE: f32 = 0.30;
 /// Minimum detector score to trust a face.
 pub const MIN_FACE_SCORE: f32 = 0.6;
-/// Center/edge IR ratio above this indicates 3D structure (anti-flat). Calibrated
-/// 2026-06-26: a real lit face measured 1.36; a flat spoof is ~1.0. Kept lenient
-/// at 1.03 to avoid false-rejects across poses; tighten with flat-IR-spoof data.
-pub const DEPTH_MIN_RATIO: f32 = 1.03;
+/// Center/edge IR brightness ratio above which the face region is treated as
+/// having 3D falloff. Calibrated 2026-06-26: a real lit face measured 1.36; a
+/// flat matte spoof is ~1.0. The 1.03 floor is lenient to avoid false-rejects
+/// across poses, and that leniency is measured: a glossy IR print cleared it in
+/// 69 of 70 trials (docs/pad-results/2026-06-30-ir-liveness-selftest.md). Treat
+/// it as one weak cue, never as proof of a live face.
+pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
 
 /// Ambient IR (see [`Signals::ir_ambient`]) above which the brightness and
-/// depth cues are physically starved rather than measuring a spoof: the scene's
+/// center/edge cues are physically starved rather than measuring a spoof: the scene's
 /// own infrared swamps the emitter, so the strobe adds almost nothing to read
 /// shape or skin reflectance from. Measured 2026-07-16 (430-sample field
-/// session, ~/irlume-suncal/SESSION-2026-07-16.md): genuine faces pass depth
+/// session, ~/irlume-suncal/SESSION-2026-07-16.md): genuine faces clear the ratio
 /// reliably below ambient ~120, marginally to ~170, and 0/129 samples passed
 /// above ~170 (emitter-over-ambient gap collapsed to 4–9, IR frame 46–82%
 /// saturated). The verdict stays Spoof (fail closed); only the REASON changes,
@@ -261,8 +269,8 @@ impl LivenessGate {
         }
 
         // Anti-flat: a real 3D face shows center-vs-edge IR falloff.
-        cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
-        if !cues.depth_ok {
+        cues.center_edge_ratio_ok = s.ir_center_edge_ratio >= MIN_CENTER_EDGE_RATIO;
+        if !cues.center_edge_ratio_ok {
             let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
             } else {
@@ -346,8 +354,8 @@ impl LivenessGate {
 
     /// Dark-operation gate: IR only (no RGB to cross-check). Used when there's no
     /// visible-light face. Weaker than the full gate (no cross-spectrum anti-
-    /// injection) but keeps IR reflectance + 3D depth + glint; same basis
-    /// Windows Hello uses in the dark.
+    /// injection) but keeps IR reflectance + center/edge falloff + glint; same
+    /// basis Windows Hello uses in the dark.
     pub fn evaluate_ir_only(&self, s: &Signals) -> (Verdict, Cues, String) {
         let mut cues = Cues::default();
         if s.ir_face.filter(|f| f.score >= MIN_FACE_SCORE).is_none() {
@@ -363,8 +371,8 @@ impl LivenessGate {
             };
             return (Verdict::Spoof, cues, reason);
         }
-        cues.depth_ok = s.ir_center_edge_ratio >= DEPTH_MIN_RATIO;
-        if !cues.depth_ok {
+        cues.center_edge_ratio_ok = s.ir_center_edge_ratio >= MIN_CENTER_EDGE_RATIO;
+        if !cues.center_edge_ratio_ok {
             let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
             } else {

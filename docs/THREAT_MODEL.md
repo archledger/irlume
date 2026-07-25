@@ -23,7 +23,7 @@ formal certification stays optional.
 |---|---|---|
 | **CVE-2021-34466** (CyberArk): inject a spoofed IR frame from a fake USB camera | Hello trusts any USB device as camera root-of-trust; descriptors unauthenticated | **Device pinning** (topology + descriptor + `fixed`) defeats *software* virtual-camera injection; a malicious *hardware* USB device needs crypto attestation (out of scope). See [Camera trust](#camera-trust-device-pinning). |
 | Same, but real IR + arbitrary RGB ("SpongeBob") passes | Only IR validated, RGB ignored | **Cross-spectrum RGB↔IR spatial overlap**: face must align in both streams |
-| Weak frame-transition liveness | Trivial transition check | **IR reflectance floor** + **depth (center/edge) ratio** + **cross-spectrum overlap** |
+| Weak frame-transition liveness | Trivial transition check | **IR reflectance floor** + **center/edge brightness ratio** + **cross-spectrum overlap** |
 
 ## Camera trust: device pinning
 
@@ -78,9 +78,12 @@ classifier, and is Apache-2.0, so the clean-BOM claim holds.)
 Physically-grounded cues, hard gate (any failure rejects):
 
 - **IR reflectance floor**: emitter-lit skin brightness (with a per-user
-  depth-calibrated floor for opt-in re-enrollments).
-- **Depth (center/edge) ratio**: a real face is closer to the emitter at the
-  nose than at the cheeks; flat media are not.
+  calibrated floor for opt-in re-enrollments).
+- **Center/edge brightness ratio**: a real face is closer to the emitter at the
+  nose than at the cheeks, so the face region falls off toward its rim; flat
+  matte media are uniform. This is a brightness ratio and nothing measures
+  range: a glossy print with a hot specular center produces the same reading,
+  which is what the 2026-06-30 result below records.
 - **Cross-spectrum RGB↔IR overlap** (anti-injection).
 - **Frontality** (yaw/pitch bounds from landmarks).
 - **Corneal glint**: *supporting only* (standalone-glint liveness was refuted).
@@ -101,7 +104,7 @@ The decision to stay single-frame (no rPPG / no licensed PAD CNN) and the accept
 **CONFIRMED BREACH (2026-06-30):** the self-test found that a **life-size glossy
 vinyl print** (graduation banner) defeats the gate at **98.6% APCER**: vinyl
 reflects 850 nm (defeating `face_in_ir`) and a large flat print mimics the
-brightness-ratio depth cue (banner depth 1.02–1.58 *overlaps and exceeds* genuine
+brightness-ratio cue (banner center/edge 1.02–1.58 *overlaps and exceeds* genuine
 1.37–1.40, so no threshold separates them). Screen replays and matte-paper prints
 were still fully rejected. This is a demonstrated instance of the accepted
 IR-approximating-spoof residual risk. The mitigation, **passive-blink
@@ -139,7 +142,7 @@ requires a daemon-verified live biometric even against root).
 **Fingerprint presentation attacks: scope.** The fingerprint path's
 anti-spoofing is whatever the sensor and `fprintd` provide, which for common
 match-on-host readers is **none**. irlume's IR liveness gates (emitter
-ratio/glint/depth cues, eyes-open, blink challenge) apply to the **face path
+ratio/glint/center-edge cues, eyes-open, blink challenge) apply to the **face path
 only** and do not transfer. For reference, Windows Hello certification
 *requires* fingerprint anti-spoofing; irlume's fingerprint companion makes no
 equivalent claim. Treat it as convenience-tier against a determined attacker

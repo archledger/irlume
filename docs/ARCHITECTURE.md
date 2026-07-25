@@ -117,7 +117,7 @@ flowchart LR
 ```
 
 Two things are deliberately *not* learned models. The liveness gate is IR
-physics (cross-spectrum co-location, depth gradient, corneal glint, moiré),
+physics (cross-spectrum co-location, center/edge brightness falloff, corneal glint, moiré),
 and the matcher is a fixed cosine threshold; both are plain, auditable
 algorithms. Per-user IR calibration is fitted on-device from the user's own
 enrollment scans ([ADR-0004](adr/0004-per-enrollment-ir-adapter.md); it
@@ -139,7 +139,7 @@ off-frame adjacent to the lit one, isolating the emitter's own reflected light.
 This is the same illuminated/ambient pairing Windows Hello uses.
 
 Subtraction is experimental and off by default. Its job is surviving exposure extremes
-under strong ambient IR (sunlight), not spoof detection; the depth and glint
+under strong ambient IR (sunlight), not spoof detection; the center/edge and glint
 cues in the liveness gate carry that. Field captures set the gates it runs
 behind (`crates/irlume-camera/src/lib.rs`):
 

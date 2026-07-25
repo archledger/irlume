@@ -1023,7 +1023,7 @@ fn padreport_with_attacks_only_flags_the_missing_bonafide_baseline() {
     let jsonl = sb.path("work/attacks.jsonl");
     std::fs::write(
         &jsonl,
-        r#"{"species":"cutout","kind":"attack","path":"full","verdict":"Spoof","caught":["depth"]}
+        r#"{"species":"cutout","kind":"attack","path":"full","verdict":"Spoof","caught":["center_edge"]}
 "#,
     )
     .unwrap();
@@ -1217,7 +1217,7 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
             require_eyes_open: true,
             require_challenge: false,
             closure_calibrated: false,
-            ir_depth_floored: false,
+            ir_ratio_calibrated: false,
         },
         Request::SetRequireEyesOpen { .. } => Response::Ok("eyes-open now ON".into()),
         _ => Response::Error("unexpected request".into()),
@@ -1244,7 +1244,7 @@ fn profiles_empty_listing_says_none_enrolled() {
         require_eyes_open: false,
         require_challenge: false,
         closure_calibrated: false,
-        ir_depth_floored: false,
+        ir_ratio_calibrated: false,
     });
     // Bare `profiles` (no subcommand) defaults to the listing. Note: a flag
     // directly after `profiles` is read as the subcommand word, so --user
@@ -1360,7 +1360,7 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             require_eyes_open: false,
             require_challenge: true,
             closure_calibrated: false,
-            ir_depth_floored: false,
+            ir_ratio_calibrated: false,
         },
         Request::KeyringInfo { .. } => Response::KeyringInfo {
             armed: true,
@@ -1464,7 +1464,7 @@ fn setup_walks_every_step_noninteractively() {
             require_eyes_open: false,
             require_challenge: false,
             closure_calibrated: false,
-            ir_depth_floored: false,
+            ir_ratio_calibrated: false,
         },
         Request::Enroll { .. } => Response::Enrolled {
             profile: "Face Profile 1".into(),

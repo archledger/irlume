@@ -3,14 +3,14 @@
 
 //! Offline analysis of the sunlight/ambient burst dataset captured by the
 //! `burst_dump` example. For each burst directory it runs the real detection +
-//! depth-cue path over the brightest (lit) frame and over the ambient-subtracted
-//! frame, so the depth-floor and subtraction-gate tuning works from measured
+//! center/edge-cue path over the brightest (lit) frame and over the ambient-subtracted
+//! frame, so the ratio-floor and subtraction-gate tuning works from measured
 //! face-crop ratios instead of the crude whole-frame probe numbers.
 //!
 //! `IRLUME_DEV=1 irlume suncal <det.onnx> <dataset_dir>`
 //!
 //! Emits one TSV row per burst: dir, ambient mean, lit mean, strobe gap,
-//! gap/ambient, raw face depth ratio, subtracted face depth ratio, subtracted
+//! gap/ambient, raw face center/edge ratio, subtracted face center/edge ratio, subtracted
 //! IR face brightness. A trailing legend explains the current gate/floor and
 //! prints candidate thresholds derived from the run.
 
@@ -72,9 +72,9 @@ fn load_burst(dir: &std::path::Path) -> Option<(u32, u32, Vec<Vec<u8>>)> {
     }
 }
 
-/// Detect the top IR face and return (brightness, depth ratio) for one grey
+/// Detect the top IR face and return (brightness, center/edge ratio) for one grey
 /// frame, or None when no face is found.
-fn face_depth(
+fn face_center_edge(
     det: &mut irlume_vision::Detector,
     grey: &[u8],
     w: u32,
@@ -119,7 +119,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     };
     dirs.sort();
 
-    println!("burst\tamb\tlit\tgap\tsubM\tdepth_raw\tdepth_sub\tbri_sub\traw_ok\tchose\tgated");
+    println!("burst\tamb\tlit\tgap\tsubM\tce_raw\tce_sub\tbri_sub\traw_ok\tchose\tgated");
     // Rows where a face was found in the raw lit frame, for the summary.
     let mut raw_pass = 0usize;
     let mut sub_rescued = 0usize;
@@ -155,19 +155,19 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             && amb_mean >= irlume_camera::LOW_AMBIENT_SKIP
             && sub_mean >= irlume_camera::SUBTRACT_MIN_RESULT;
 
-        let (draw, dsub, bsub) = match face_depth(&mut det, &frames[best_i], w, h) {
+        let (draw, dsub, bsub) = match face_center_edge(&mut det, &frames[best_i], w, h) {
             Some((_bri, r)) => {
                 faces_found += 1;
-                let (bs, rs) = face_depth(&mut det, &subtracted, w, h).unwrap_or((0.0, 0.0));
+                let (bs, rs) = face_center_edge(&mut det, &subtracted, w, h).unwrap_or((0.0, 0.0));
                 (r, rs, bs)
             }
             None => (0.0, 0.0, 0.0),
         };
-        // The shipped global depth floor (per-user calibration tightens it).
-        let rp = draw >= irlume_liveness::DEPTH_MIN_RATIO;
-        // The gated outcome: the depth the gate would actually hand downstream.
-        let gated_depth = if gate_subtracts { dsub } else { draw };
-        let gated_pass = gated_depth >= irlume_liveness::DEPTH_MIN_RATIO;
+        // The shipped global center/edge floor (per-user calibration tightens it).
+        let rp = draw >= irlume_liveness::MIN_CENTER_EDGE_RATIO;
+        // The gated outcome: the ratio the gate would actually hand downstream.
+        let gated_ratio = if gate_subtracts { dsub } else { draw };
+        let gated_pass = gated_ratio >= irlume_liveness::MIN_CENTER_EDGE_RATIO;
         if rp {
             raw_pass += 1;
         }
@@ -184,14 +184,14 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
     eprintln!(
         "\n[suncal] {faces_found} bursts with a detectable IR face.\n\
-         [suncal] raw depth alone (shipped default): {raw_pass}/{faces_found} pass (>=1.03).\n\
+         [suncal] raw center/edge alone (shipped default): {raw_pass}/{faces_found} pass (>=1.03).\n\
          [suncal] NEW gate (gap>8, amb>=5, sub_mean>=12): +{sub_rescued} rescued, so \
          {}/{faces_found} pass.\n\
          [suncal] 'chose' column = which frame the new gate hands downstream; 'gated' = its verdict.\n\
          [suncal] The gate reverts to the raw frame when subtraction collapses the signal\n\
          (sub_mean < 12), so no raw-passing burst regresses; only clear-signal cases are lifted.\n\
-         [suncal] Bursts with no face at all (depth 0.00) are DETECTION failures from background\n\
-         saturation (outdoor frames run >50% pixels at 255), a separate problem from the depth\n\
+         [suncal] Bursts with no face at all (ratio 0.00) are DETECTION failures from background\n\
+         saturation (outdoor frames run >50% pixels at 255), a separate problem from the ratio\n\
          floor: they need IR exposure reduction, not subtraction.\n\
          [suncal] This is GENUINE-only data. Before enabling by default, capture flat spoofs\n\
          under the same bright light to confirm subtraction does NOT lift them over the floor,\n\

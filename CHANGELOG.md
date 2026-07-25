@@ -36,6 +36,18 @@ All notable changes to irlume are documented here. This project adheres to
   doctor` reports the state, and flags the case where the gate is on but cannot
   run on this machine.
 
+- **The IR "depth" cue is now called what it is: a center/edge brightness
+  ratio.** Nothing in irlume measures range. The cue compares the middle of the
+  IR face region to its rim, which a lit 3D face brightens and a flat matte print
+  does not, and a glossy print defeats. Calling it depth oversold it. Renamed
+  throughout: the `depth_ok` cue is `center_edge_ratio_ok`, `DEPTH_MIN_RATIO` is
+  `MIN_CENTER_EDGE_RATIO`, the per-user floor accessor is
+  `ir_center_edge_ratio_floor`, and the debug and doctor lines, the PAD self-test
+  cue attribution (`depth` → `center_edge`), and the capture-dump JSON key follow.
+  Stored enrollments are untouched: the on-disk key stays `ir_depth` so a
+  downgrade still reads your fitted floor. The denial text now says the face
+  region is flatter than your enrolled face instead of asserting you are a photo.
+
 ### Fixed
 
 - **Face `sudo` never worked on Debian and Ubuntu.** The wiring looked for a line

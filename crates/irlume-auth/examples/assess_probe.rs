@@ -41,8 +41,8 @@ fn main() {
                     live += 1;
                 }
                 println!(
-                    "run {i}: {:?} (rgb_face={has_rgb} ir_face={has_ir} ir_bright={:.0} ir_depth={:.2}) {}",
-                    a.verdict, a.ir_brightness, a.ir_depth, a.reason
+                    "run {i}: {:?} (rgb_face={has_rgb} ir_face={has_ir} ir_bright={:.0} ir_center_edge_ratio={:.2}) {}",
+                    a.verdict, a.ir_brightness, a.ir_center_edge_ratio, a.reason
                 );
             }
             Err(e) => println!("run {i}: error {e}"),

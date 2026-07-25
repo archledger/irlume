@@ -507,7 +507,7 @@ fn pgm(w: u32, h: u32, fill: u8) -> Vec<u8> {
 }
 
 /// `suncal` is the offline half of the sunlight-capture toolchain: it replays
-/// recorded IR bursts through the real detector + depth cue. No camera nodes
+/// recorded IR bursts through the real detector + center/edge cue. No camera nodes
 /// are opened, but it needs the YuNet model and the ONNX runtime, which only
 /// the loopback CI lane guarantees, so it gates on the same env.
 #[test]
@@ -546,8 +546,11 @@ fn loopback_suncal_analyzes_a_faceless_burst_dataset() {
     assert_eq!(cols[1], "5", "ambient mean column: {row}");
     assert_eq!(cols[2], "200", "lit mean column: {row}");
     assert_eq!(cols[3], "195", "strobe gap column: {row}");
-    assert_eq!(cols[5], "0.00", "no face means raw depth 0.00: {row}");
-    assert_eq!(cols[8], "n", "raw depth cannot pass without a face: {row}");
+    assert_eq!(cols[5], "0.00", "no face means a raw ratio of 0.00: {row}");
+    assert_eq!(
+        cols[8], "n",
+        "the raw ratio cannot pass without a face: {row}"
+    );
     assert_eq!(
         cols[9], "sub",
         "this burst clears the subtraction gate: {row}"

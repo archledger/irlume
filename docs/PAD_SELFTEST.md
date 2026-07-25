@@ -53,13 +53,13 @@ Attack Instrument categories, ISO term). Constants are the current values in
 | `face_in_ir` | skin reflects 850 nm; emissive screens / prints do not render an IR face | phone / tablet / laptop **screen replay**, printed photo | detector score ≥ `MIN_FACE_SCORE` (0.6) |
 | `cross_spectrum_aligned` | the same face must appear co-located in RGB **and** IR | RGB-only deepfake + IR blocker, USB IR **injection** (CVE-2021-34466) | center distance ≤ `CROSS_SPECTRUM_TOLERANCE` (0.30) |
 | `ir_reflectance_ok` | active-emitter skin remission floor (melanin-independent > 1.2 µm → skin-tone fair) | dark / low-reflectance flat media | IR face mean ≥ `IR_FACE_MIN_BRIGHTNESS` (35) |
-| `depth_ok` | shape-from-shading: a 3D face is brighter center→edge under a near-coaxial emitter; flat media are uniform | **printed photo**, flat screen, paper **cutout** | center/edge ratio ≥ `DEPTH_MIN_RATIO` (1.03) |
+| `center_edge_ratio_ok` | shape-from-shading: a lit 3D face is brighter center→edge under a near-coaxial emitter; flat matte media are uniform. A brightness ratio, not a range measurement, and a glossy print clears it (see the 2026-06-30 result below) | **printed photo** (matte), flat screen, paper **cutout** | center/edge ratio ≥ `MIN_CENTER_EDGE_RATIO` (1.03) |
 | `frontal_ok` | Windows-Hello-style ±15° pose gate (quality, not spoof → `Uncertain`) | off-angle / partial captures | yaw ≤ 0.40, pitch ∈ [0.20, 0.80] |
 | `glint_present` | corneal retro-reflection of the emitter | *supporting only*, never decisive (standalone-glint liveness is refuted) | eye peak ≥ `GLINT_MIN` (180) |
 
-The **per-user calibrated IR floor** (a depth-only floor stored at enrollment by
-`irlume-core`, enforced in `Engine::authenticate`) tightens the depth gate for a
-specific user without depending on ambient brightness. `padcapture` exercises
+The **per-user calibrated IR floor** (a center/edge-ratio floor stored at
+enrollment by `irlume-core`, enforced in `Engine::authenticate`) tightens that
+same ratio gate for a specific user without depending on ambient brightness. `padcapture` exercises
 the **global** gate only; the per-user floor applies at real authentication,
 not in this self-test.
 
@@ -72,11 +72,11 @@ not in this self-test.
 | Species (`--species`) | Instrument |
 |---|---|
 | `print_matte` | matte-paper printed photo of the enrolled user |
-| `print_glossy` | glossy-paper printed photo (worst case for the specular/depth cues) |
+| `print_glossy` | glossy-paper printed photo (worst case for the specular and center/edge cues) |
 | `phone_replay` | photo/video shown on a phone screen, held at varying distance |
 | `tablet_replay` | photo/video on a larger tablet screen |
 | `laptop_replay` | photo/video on a laptop display |
-| `cutout` | printed photo with the eyes cut out / bent for pseudo-depth |
+| `cutout` | printed photo with the eyes cut out / bent to fake 3D falloff |
 
 Use a **high-quality image of the genuine enrolled user** for every instrument;
 the attack must target *that identity*, or it tests nothing (a stranger's photo is
@@ -119,7 +119,7 @@ Definitions follow ISO/IEC 30107-3. Implementation and unit tests live in
   accepted means "APCER ≤ 16.8% with 95% confidence", not "0% APCER".* Read the
   upper bound, not the point estimate.
 - **Per-cue attribution**: for each species, which hard cue caught the rejected
-  attacks (`face_in_ir`, `ir_reflectance`, `depth`). This points hardening at the
+  attacks (`face_in_ir`, `ir_reflectance`, `center_edge`). This points hardening at the
   cue that is (or isn't) doing the work.
 
 ### Decision policy
@@ -199,7 +199,7 @@ for the report to notice a hole.
 
 Each JSONL record carries the ground-truth label (`species`, `kind`), the gate
 `verdict`, the catching cue (`caught`), and the raw signals (`ir_brightness`,
-`ir_depth`, `ir_glint`, `cross_dist`, pose), so a marginal near-threshold attack
+`ir_center_edge_ratio`, `ir_glint`, `cross_dist`, pose), so a marginal near-threshold attack
 can be inspected to tune the exact constant responsible.
 
 ---

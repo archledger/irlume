@@ -1956,7 +1956,8 @@ mod tests {
     // right one already succeeded via pam_unix.
     #[test]
     fn face_sudo_wires_above_the_ubuntu_include_layout() {
-        const UBUNTU_SUDO: &str = "#%PAM-1.0\nsession    required   pam_env.so readenv=1 user_readenv=0\n@include common-auth\n@include common-account\n@include common-session-noninteractive\n";
+        // Verbatim from `podman run ubuntu:26.04` with the sudo package installed.
+        const UBUNTU_SUDO: &str = "#%PAM-1.0\n\n# Set up user limits from /etc/security/limits.conf.\nsession    required   pam_limits.so\n\nsession    required   pam_env.so readenv=1 user_readenv=0\nsession    required   pam_env.so readenv=1 envfile=/etc/default/locale user_readenv=0\n\n@include common-auth\n@include common-account\n@include common-session-noninteractive\n";
         let (wired, changed) = wire_verify_service(UBUNTU_SUDO);
         assert!(changed);
         let lines: Vec<&str> = wired.lines().collect();

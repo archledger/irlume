@@ -46,8 +46,9 @@ irlume adopted the methodology rather than the certificate:
   at n=20 per species, so the honest statement is "APCER at or below 16.8% with
   95% confidence") and then found that a life-size glossy vinyl print defeats
   the gate: 69 of 70 presentations accepted, APCER 98.6% [92.3%, 100%]. The
-  result document proves threshold tuning cannot fix it (the banner's depth
-  ratio range overlaps and exceeds the genuine range) instead of shipping a
+  result document proves threshold tuning cannot fix it (the banner's
+  center/edge ratio range overlaps and exceeds the genuine range) instead of
+  shipping a
   cosmetic threshold bump.
 - The follow-up passive blink gate closed that breach in validation
   ([2026-07-01](pad-results/2026-07-01-passive-ear-liveness.md), 0 of 10 banner

@@ -812,7 +812,7 @@ pub(crate) fn engine(
     Ok(e)
 }
 
-// Brightness/depth cue helpers live in irlume-auth (the daemon-side pipeline
+// Brightness/center-edge cue helpers live in irlume-auth (the daemon-side pipeline
 // owns them); re-exported so the dev tools here and in pad.rs measure with the
 // exact same code the gate uses.
 pub(crate) use irlume_auth::{center_edge_ratio, mean_in_bbox};
@@ -1501,12 +1501,12 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
         println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");
         println!(
-            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} depth={} glint={}",
+            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
             cues.face_in_rgb,
             cues.face_in_ir,
             cues.cross_spectrum_aligned,
             cues.ir_reflectance_ok,
-            cues.depth_ok,
+            cues.center_edge_ratio_ok,
             cues.glint_present
         );
         println!("[GATE] {verdict:?}: {reason}");
@@ -2102,15 +2102,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
 
-            let (mut ir_cos, mut ir_bri, mut ir_depth, mut ir_glint) =
+            let (mut ir_cos, mut ir_bri, mut ir_center_edge_ratio, mut ir_glint) =
                 (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
                 ir_bri = mean_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox);
-                // Ambient-INDEPENDENT liveness cues (the depth-primary-floor candidates):
+                // Ambient-INDEPENDENT liveness cues (the center/edge-floor candidates):
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
-                ir_depth =
+                ir_center_edge_ratio =
                     irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
                 ir_glint = irlume_auth::eye_glint(&irf.data, irf.width, irf.height, &t.landmarks);
                 if let Some(a) = adapter.as_mut() {
@@ -2146,7 +2146,10 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                     irlume_auth::both_eyes_open(&irf.data, irf.width, irf.height, &t.landmarks)
                         .into(),
                 );
-                rec.insert("ir_depth".into(), json_f32(ir_depth));
+                rec.insert(
+                    "ir_center_edge_ratio".into(),
+                    json_f32(ir_center_edge_ratio),
+                );
                 rec.insert("ir_glint".into(), json_f32(ir_glint));
                 rec.insert(
                     "ir_emb_raw".into(),
@@ -2159,13 +2162,13 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             written += 1;
             println!(
-                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} depth {:>5.2} glint {:>3.0}",
+                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>3.0}",
                 idx + 1,
                 if rgb_top.is_some() { "✓" } else { "·" },
                 rgb_bri,
                 if ir_top.is_some() { "✓" } else { "·" },
                 ir_bri,
-                ir_depth,
+                ir_center_edge_ratio,
                 ir_glint
             );
         }
@@ -2704,23 +2707,23 @@ fn doctor() -> std::process::ExitCode {
     // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
     // back to the password, so this is not a lockout, but face login silently
     // stopped working. Surface it with the one-command fix.
-    let (enrolled, ir_depth_floored) =
+    let (enrolled, ir_ratio_calibrated) =
         match daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }) {
             Ok(irlume_common::Response::Enrollment {
                 ref profiles,
-                ir_depth_floored,
+                ir_ratio_calibrated,
                 ..
-            }) => (!profiles.is_empty(), ir_depth_floored),
+            }) => (!profiles.is_empty(), ir_ratio_calibrated),
             _ => (false, false),
         };
-    // An IR enrollment made before the per-user depth floor existed carries no
-    // recorded IR depth, so the personalized anti-print 3D-structure check never
-    // engages (new IR enrollments fit it automatically). Nudge a re-enroll to
-    // activate it. Secure/IR hardware only, and only when actually enrolled.
-    if enrolled && !ir_depth_floored && irlume_camera::capabilities().ir_pair {
+    // An IR enrollment made before the per-user center/edge floor existed carries
+    // no recorded ratio, so the personalized anti-print check never engages (new
+    // IR enrollments fit it automatically). Nudge a re-enroll to activate it.
+    // Secure/IR hardware only, and only when actually enrolled.
+    if enrolled && !ir_ratio_calibrated && irlume_camera::capabilities().ir_pair {
         println!(
-            "[doctor] {user}'s face enrollment predates the per-user IR depth floor (an\n     \
-             anti-print 3D-structure check that new IR enrollments fit automatically).\n     \
+            "[doctor] {user}'s face enrollment predates the per-user IR center/edge floor\n     \
+             (an anti-print check that new IR enrollments fit automatically).\n     \
              Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
         );
     }

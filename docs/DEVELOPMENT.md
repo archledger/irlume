@@ -223,7 +223,7 @@ CLI tools, they open the camera directly and hold no privileged path.
 
 | Example (crate) | What it measures |
 |---|---|
-| `burst_dump` (irlume-camera) | dumps a raw IR strobe burst as PGM frames + a means index, for offline depth/subtraction tuning |
+| `burst_dump` (irlume-camera) | dumps a raw IR strobe burst as PGM frames + a means index, for offline center/edge and subtraction tuning |
 | `rgb_burst_dump` (irlume-camera) | the RGB companion (PPM), for detection-floor and fusion analysis |
 | `ambient_ab` (irlume-camera) | A/B harness for ambient subtraction under a real ambient-IR or spoof condition |
 | `ir_strobe_probe` (irlume-camera) | prints per-frame burst brightness: does this module strobe the emitter or hold it steady? |

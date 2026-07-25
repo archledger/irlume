@@ -1325,14 +1325,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             .is_usable()
                         })
                         .unwrap_or(false),
-                    ir_depth_floored: enr.ir_depth_floor().is_some(),
+                    ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
                 },
                 Ok(None) => Response::Enrollment {
                     profiles: vec![],
                     require_eyes_open: false,
                     require_challenge: false,
                     closure_calibrated: false,
-                    ir_depth_floored: false,
+                    ir_ratio_calibrated: false,
                 },
                 Err(e) => Response::Error(e.to_string()),
             }
@@ -1482,7 +1482,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         }
         Request::SelfTest { kind } => {
             // Fires the camera and returns raw liveness/alignment measurements
-            // (IR brightness, depth, glint), which are a spoof-tuning oracle and
+            // (IR brightness, center/edge, glint), which are a spoof-tuning oracle and
             // a way to tie up the single-threaded daemon. Gate to root, like the
             // other camera-bearing requests; on the 0666 socket fallback this is
             // the only thing keeping an arbitrary local uid out.
@@ -1582,10 +1582,14 @@ fn mutate_enrollment(
     }
 }
 
-/// Face-verify `user` and, on a live match, release the TPM-sealed password. The
-/// biometric check happens HERE (inside unseal), so a caller cannot get the
-/// password without a live face that matches the enrolled templates. We log the
-/// decision + cosine score, but never the password or its length.
+/// Face-verify `user` and, on a passing match, release the TPM-sealed password.
+/// The biometric check happens HERE (inside unseal), so a caller cannot get the
+/// password without a capture that clears the liveness gate and matches the
+/// enrolled templates. Clearing the gate is evidence, not proof, that a live
+/// person is present: the single-frame IR cues are defeatable by a good print
+/// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
+/// temporal consent gesture by default. We log the decision + cosine score, but
+/// never the password or its length.
 /// Deny-line score display: exact under IRLUME_LOG=debug tracing, else
 /// quantized to one decimal (anti-oracle; see comment at the deny log).
 fn deny_score(s: f32) -> String {
@@ -2676,7 +2680,7 @@ mod tests {
             rgb: unit512(seed),
             ir: None,
             ir_space: None,
-            ir_depth: 0.0,
+            ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
         }

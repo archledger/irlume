@@ -419,12 +419,13 @@ pub enum Response {
         /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
         #[serde(default)]
         closure_calibrated: bool,
-        /// Whether this enrollment has a per-user IR depth floor fitted (>=2
-        /// scans carry recorded IR depth). False for enrollments made before the
-        /// depth-floor feature; surfaced so `doctor` can nudge a re-enroll to
-        /// activate the anti-print depth tightening.
-        #[serde(default)]
-        ir_depth_floored: bool,
+        /// Whether this enrollment has a per-user floor fitted on the IR
+        /// center/edge brightness ratio (>=2 scans carry a recorded ratio). False
+        /// for enrollments made before the feature; surfaced so `doctor` can nudge
+        /// a re-enroll to activate the personalized tightening. The alias keeps a
+        /// new client readable by the 0.6.1 daemon, which sent `ir_depth_floored`.
+        #[serde(default, alias = "ir_depth_floored")]
+        ir_ratio_calibrated: bool,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),

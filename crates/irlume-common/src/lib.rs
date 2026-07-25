@@ -133,37 +133,48 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
         let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("irlume");
-        // pid keeps the temp unique per writer; the daemon is single-threaded so
-        // there is no same-process race on one target. A leftover temp from a
-        // crashed write is overwritten (truncate) by the next attempt.
-        let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::OpenOptions::new()
+        // Unique per call: pid plus a process-monotonic counter (no time
+        // dependency). create_new below never adopts a stale or planted temp, so
+        // the inode is always freshly ours at 0600.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.tmp.{}.{seq}", std::process::id()));
+        // create_new + mode(0o600): the mode is set at CREATION, before the fsync,
+        // so sync_all captures the final permissions; no post-fsync metadata
+        // change. On the rare stale-temp collision (a crashed prior writer reusing
+        // this pid+seq), drop it and retry once.
+        let open_tmp = || {
+            std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-        }
-        // Re-assert the mode in case a stale temp pre-existed at a wider mode.
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+                .open(&tmp)
+        };
+        let mut f = match open_tmp() {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&tmp)?;
+                open_tmp()?
+            }
+            other => other?,
+        };
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp); // don't leave a stray temp behind
             return Err(e);
         }
-        // fsync the directory so the rename (the metadata that makes the new
-        // bytes visible under `path`) is itself durable across a power loss.
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        // fsync the directory so the rename (the directory entry that makes the
+        // new bytes visible under `path`) is itself durable across a power loss.
+        // A failure here means the update is NOT durably committed, so surface it
+        // as a write failure (the content is live but a crash could revert the
+        // entry); the caller retries the whole atomic write.
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
     #[cfg(not(unix))]

@@ -5,6 +5,37 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Releasing your keyring password now asks for a gesture, by default.** On a
+  face login that unlocks the login keyring, irlume waits for a deliberate nod
+  (or a calibrated eye closure, if you set that up) after the face match before
+  the TPM releases your stored password. The watch ends the instant the nod is
+  seen; only a login where you never nod pays the whole watch window (120 frames,
+  roughly 8 seconds) before the password prompt. Nothing else changes: login, the
+  lock screen, `sudo` and app prompts behave exactly as before.
+
+  Why only this operation: a session grant ends with the session, but a released
+  keyring password is a reusable secret that also unlocks your password manager.
+  irlume's own PAD self-test recorded the default single-frame IR gate accepting a
+  life-size glossy vinyl print 69 times out of 70, an APCER of 98.6%
+  ([2026-06-30](docs/pad-results/2026-06-30-ir-liveness-selftest.md)), against the
+  15% ceiling FIDO's Level 1 biometric certification allows. A nod is something
+  that print cannot produce, which is why the credential path no longer rests on
+  the single-frame cues alone.
+
+  Nothing here can lock you out. A missed gesture, a camera that is busy, no IR
+  camera, or a FaceMesh model that is not deployed all fall back to typing your
+  password, and your keyring then unlocks from what you typed exactly as it would
+  have from a released password. A nod needs no calibration, so an existing
+  enrollment keeps working with no re-enroll.
+
+  Prefer the old behavior? `sudo irlume credential-release-challenge off` (it
+  warns and asks first), the `[g]` key on the TUI's Settings page, or
+  `credential_release_challenge=0` in `/etc/irlume/settings.conf`. `irlume
+  doctor` reports the state, and flags the case where the gate is on but cannot
+  run on this machine.
+
 ## [0.6.1] - 2026-07-24
 
 ### Added

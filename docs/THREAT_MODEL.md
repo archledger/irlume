@@ -181,6 +181,26 @@ with a fabricated print.
   extra challenge beyond the gesture and the default IR liveness gate: adding
   one would impose latency and false rejects on a factor whose fallback (the
   password) is always one keystroke away.
+- **Credential release requires a temporal gesture (default on).** Releasing the
+  TPM-sealed login-keyring password is treated as a stronger operation than
+  logging in, and it is the one place where the single-frame IR gate is not
+  considered sufficient on its own. A session grant buys an attacker that
+  session; a released keyring password is a reusable secret that outlives the
+  attempt and unlocks a password manager. So on the `UnsealPassword` path the
+  match must be followed by a deliberate gesture the user performs on request: a
+  head nod, or a calibrated eye closure (the same gate polkit prompts use). A
+  static presentation cannot produce one. Login, the lock screen, `sudo` and
+  polkit are unchanged. A nod needs no calibration, so existing enrollments keep
+  working without re-enrolling. Every way the gesture can fail to happen (no
+  gesture in the window, no IR camera, FaceMesh not deployed, camera busy,
+  closure-only mode without a calibration) ends in the typed-password path, never
+  a lockout, and the keyring then unlocks from the typed password exactly as it
+  would have from a released one. Operators who accept the weaker posture can
+  turn it off with `sudo irlume credential-release-challenge off`, which warns
+  and requires confirmation; `irlume doctor` reports the state and flags a gate
+  that is enabled but cannot run. This is a replay-resistance measure, not proof
+  of physical liveness: it raises the cost of a static-presentation attack on the
+  credential path, and it does not make a face grant equivalent to a live person.
 - **Consecutive-failure throttle.** After a run of failed face attempts (5 by
   default, `IRLUME_RATE_LIMIT`), the daemon stops firing the camera on the
   gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls

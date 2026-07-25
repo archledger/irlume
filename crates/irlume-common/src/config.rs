@@ -118,6 +118,57 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The settings.conf key for the credential-release temporal-liveness gate.
+pub const CREDENTIAL_RELEASE_CHALLENGE_KEY: &str = "credential_release_challenge";
+
+/// Is the credential-release temporal challenge required? DEFAULT ON.
+///
+/// Releasing the TPM-sealed login-keyring password is the one operation where a
+/// successful spoof hands the attacker a reusable secret instead of one session,
+/// so it asks for a deliberate gesture (nod, or a calibrated eye closure) on top
+/// of the face match. Everything else (login, lock screen, sudo) is unaffected.
+///
+/// FAILS SECURE: absent key, empty value, unreadable file, or an unrecognized
+/// spelling all leave the gate ON. Only an explicit `0|false|no|off` disables it,
+/// so a typo can never quietly weaken credential release. Read live per request
+/// (no daemon restart needed), mirroring `enforce_biopolicy`.
+///
+/// `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` overrides the file, for tests.
+pub fn credential_release_challenge() -> bool {
+    if let Ok(v) = std::env::var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE") {
+        return !falsy(&v);
+    }
+    !read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| falsy(&v))
+}
+
+/// The spellings that turn a boolean settings.conf key off.
+fn falsy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// [`credential_release_challenge`], but honest about not knowing.
+///
+/// `None` when settings.conf exists and this process may not read it. That is
+/// every unprivileged caller: the file is 0600 root-only, so `irlume status` as an
+/// ordinary user cannot tell "key absent" (on) from "key set to off". Reporting a
+/// guessed security state is worse than saying to re-run under sudo, so the
+/// display paths take the `None` and say so. The daemon is root and never sees it.
+pub fn credential_release_challenge_visible() -> Option<bool> {
+    // An explicit env override answers regardless of file permissions.
+    if std::env::var_os("IRLUME_CREDENTIAL_RELEASE_CHALLENGE").is_some() {
+        return Some(credential_release_challenge());
+    }
+    match std::fs::File::open(config_path("settings.conf")) {
+        Ok(_) => Some(credential_release_challenge()),
+        // No file at all is not ambiguous: no key means the default, on.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +341,59 @@ mod tests {
 
         write_kv("settings.conf", key, "").unwrap(); // disable
         assert_eq!(read_kv("settings.conf", key), None);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one default-ON security key: absent means ON, only an explicit falsy
+    /// spelling turns it off, and an unrecognized value fails SECURE (stays on).
+    #[test]
+    fn credential_release_challenge_defaults_on_and_fails_secure() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-crc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        let key = CREDENTIAL_RELEASE_CHALLENGE_KEY;
+        // No settings.conf at all -> on.
+        assert!(credential_release_challenge(), "missing file must stay on");
+
+        // Every falsy spelling, in either case, turns it off.
+        for v in ["0", "false", "no", "off", "OFF", "False"] {
+            write_kv("settings.conf", key, v).unwrap();
+            assert!(
+                !credential_release_challenge(),
+                "'{v}' must disable the gate"
+            );
+        }
+        // Truthy spellings and a typo both leave it ON (fail secure).
+        for v in ["1", "true", "yes", "on", "0ff", "disabled", "maybe"] {
+            write_kv("settings.conf", key, v).unwrap();
+            assert!(credential_release_challenge(), "'{v}' must leave it on");
+        }
+        // An empty value reads as absent -> on.
+        write_kv("settings.conf", key, "").unwrap();
+        assert!(credential_release_challenge(), "empty value must stay on");
+
+        // The env override wins over the file, both directions.
+        write_kv("settings.conf", key, "off").unwrap();
+        std::env::set_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE", "1");
+        assert!(credential_release_challenge(), "env on must win");
+        std::env::set_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE", "0");
+        write_kv("settings.conf", key, "on").unwrap();
+        assert!(!credential_release_challenge(), "env off must win");
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        // Unrelated keys survive a write of ours.
+        write_kv("settings.conf", "consent_gesture", "nod").unwrap();
+        write_kv("settings.conf", key, "0").unwrap();
+        assert_eq!(
+            read_kv("settings.conf", "consent_gesture").as_deref(),
+            Some("nod")
+        );
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

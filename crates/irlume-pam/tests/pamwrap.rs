@@ -57,6 +57,10 @@ struct Harness {
     module: PathBuf,
     /// Directory of per-service stack files (PAM_WRAPPER_SERVICE_DIR).
     service_dir: PathBuf,
+    /// IRLUME_CONFIG_DIR for the module: keeps a run from reading the HOST's
+    /// /etc/irlume/settings.conf, which would make a test's verdict depend on how
+    /// the developer's own machine is configured.
+    config_dir: PathBuf,
     /// Where this test's fake daemon listens (IRLUME_SOCKET).
     socket: PathBuf,
     root: PathBuf,
@@ -101,14 +105,29 @@ impl Harness {
         let _ = std::fs::remove_dir_all(&root);
         let service_dir = root.join("services");
         std::fs::create_dir_all(&service_dir).unwrap();
+        let config_dir = root.join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
         Some(Harness {
             wrapper,
             set_items,
             module: built_module(),
             socket: root.join("irlumed.sock"),
             service_dir,
+            config_dir,
             root,
         })
+    }
+
+    /// Write this run's settings.conf (the module reads it live). `None` removes
+    /// it, which is the default-everything state a fresh install has.
+    fn write_settings(&self, body: Option<&str>) {
+        let p = self.config_dir.join("settings.conf");
+        match body {
+            Some(b) => std::fs::write(&p, b).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
     }
 
     /// Write a pam_wrapper service file. `lines` are ordinary pam.d lines;
@@ -137,6 +156,8 @@ impl Harness {
             .env("PAM_WRAPPER", "1")
             .env("PAM_WRAPPER_SERVICE_DIR", &self.service_dir)
             .env("IRLUME_SOCKET", &self.socket)
+            .env("IRLUME_CONFIG_DIR", &self.config_dir)
+            .env_remove("IRLUME_CREDENTIAL_RELEASE_CHALLENGE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -397,6 +418,125 @@ fn pamwrap_unseal_face_login_releases_sealed_password() {
         }
         other => panic!("expected UnsealPassword, daemon saw {other:?}"),
     }
+}
+
+/// The credential-release challenge, through a real PAM conversation.
+///
+/// Releasing the sealed keyring password needs a deliberate gesture by default,
+/// and a greeter that only says "Password:" gives the user no way to know that, so
+/// the module states it. Two properties are pinned here: the instruction appears
+/// exactly where the gesture is actually required, and it is silent everywhere
+/// else. A user told to nod on a lock screen that never asks for a nod would learn
+/// to ignore the message.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
+    const HINT: &str = "nod your head to unlock your keyring";
+    let Some(h) = Harness::try_new("crc-hint") else {
+        return;
+    };
+    // Every arm denies: the instruction is emitted before the outcome, and a deny
+    // is the case where the user most needs to know what was expected of them.
+    serve(&h.socket, |_| {
+        Response::Error("face not granted: nod your head to approve".into())
+    });
+
+    // Default (no settings.conf): the gate is on, so the greeter is instructed.
+    h.write_settings(None);
+    h.write_service("irlume-crc-login", &[h.auth_line("required", "unseal")]);
+    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    assert!(out.contains(HINT), "the gesture must be explained: {out}");
+
+    // Opted out: no gesture is required, so telling the user to nod would be a
+    // lie that costs them a login attempt.
+    h.write_settings(Some("credential_release_challenge=0\n"));
+    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    assert!(!out.contains(HINT), "opted out must stay silent: {out}");
+
+    h.write_settings(None);
+    // `wait` (the KDE lock screen runs us as a parallel biometric device): an
+    // unsolicited message there competes with the password field.
+    h.write_service("irlume-crc-lock", &[h.auth_line("required", "unseal wait")]);
+    let (_, out) = h.run("irlume-crc-lock", &["authenticate"], "", None);
+    assert!(!out.contains(HINT), "wait mode must stay silent: {out}");
+
+    // Plain verify (sudo): releases no credential, so no gesture and no message.
+    h.write_service("irlume-crc-verify", &[h.auth_line("required", "")]);
+    let (_, out) = h.run("irlume-crc-verify", &["authenticate"], "", None);
+    assert!(!out.contains(HINT), "verify must stay silent: {out}");
+}
+
+/// THE fail-safe that makes a default-on challenge acceptable: when the gesture is
+/// not performed, the daemon refuses to release the password, and the PAM stack
+/// must carry on to the password module rather than fail the transaction.
+///
+/// Both greeter layouts are exercised, because the failure would be layout-shaped:
+/// the Fedora `[success=1 default=ignore]` jump form, where an IGNORE must fall
+/// through to the next line and NOT take the jump, and the Debian/Arch
+/// `sufficient` include form. `pam_permit` stands in for the distro's password
+/// module: it grants only if the stack actually reaches it.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_refused_challenge_falls_through_to_the_password_module() {
+    let Some(h) = Harness::try_new("crc-fallback") else {
+        return;
+    };
+    h.write_settings(None);
+    let log = serve(&h.socket, |_| {
+        Response::Error("face not granted: nod your head to approve".into())
+    });
+
+    // Fedora-style jump layout. success=1 would skip the password module; a
+    // refused release must instead land on it.
+    h.write_service(
+        "irlume-crc-jump",
+        &[
+            h.auth_line("[success=1 default=ignore]", "unseal"),
+            "auth required pam_permit.so".into(),
+            "auth optional pam_deny.so".into(), // the landing the jump would hit
+        ],
+    );
+    let (ok, out) = h.run("irlume-crc-jump", &["authenticate"], "\n", None);
+    assert!(
+        ok,
+        "a refused release must fall through to the password module: {out}"
+    );
+
+    // Debian/Arch-style include layout, same requirement.
+    h.write_service(
+        "irlume-crc-sufficient",
+        &[
+            h.auth_line("sufficient", "unseal ondemand kr"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("irlume-crc-sufficient", &["authenticate"], "\n", None);
+    assert!(ok, "sufficient layout must also fall through: {out}");
+
+    // The daemon really was asked, so the fall-through is a REFUSED release and
+    // not "face never ran". Each layout opens with UnsealPassword; `ondemand` then
+    // adds its documented warm-unlock retry (a refused release still lets a live
+    // lock screen unlock on identity alone), which releases no token and so does
+    // not weaken the gate.
+    let reqs = log.lock().unwrap();
+    assert!(
+        matches!(reqs.first(), Some(Request::UnsealPassword { .. })),
+        "the jump layout must attempt a release first: {reqs:?}"
+    );
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| matches!(r, Request::UnsealPassword { .. }))
+            .count(),
+        2,
+        "one release attempt per layout: {reqs:?}"
+    );
+    assert!(
+        reqs.iter().all(|r| matches!(
+            r,
+            Request::UnsealPassword { .. } | Request::Authenticate { .. }
+        )),
+        "no other request kind belongs on this path: {reqs:?}"
+    );
 }
 
 /// The documented privacy property: typing a password NEVER starts a scan.

@@ -1651,6 +1651,20 @@ fn deny_reason(r: &str) -> String {
     out
 }
 
+/// The purpose every credential release runs under. Releasing the sealed password
+/// hands over a REUSABLE secret rather than one session, so by default the face
+/// match must be followed by a deliberate gesture (a nod, or a calibrated eye
+/// closure).
+///
+/// The setting is read here, per request, so `irlume credential-release-challenge
+/// off` takes effect without a daemon restart; the engine receives the decision,
+/// not the policy lookup.
+fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
+    irlume_auth::AuthenticationPurpose::CredentialRelease {
+        temporal_challenge: irlume_common::config::credential_release_challenge(),
+    }
+}
+
 fn do_unseal_password(
     user: &str,
     service: Option<&str>,
@@ -1668,7 +1682,7 @@ fn do_unseal_password(
     if rate_limited(user) {
         return Response::Error("too many recent face attempts; use your password".into());
     }
-    let outcome = match engine.authenticate(user, service) {
+    let outcome = match engine.authenticate_for(user, service, credential_release_purpose()) {
         Ok(o) => o,
         Err(e) => {
             // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it
@@ -2331,6 +2345,69 @@ mod tests {
             assert!(biopolicy_enforced(), "{truthy:?} must enable");
         }
         std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Credential release must reach the engine as `CredentialRelease`, never as a
+    /// plain verify, and its `temporal_challenge` must track the live setting so a
+    /// toggle needs no daemon restart. DEFAULT ON: an absent key means the gesture
+    /// is required, which is the whole point of the change.
+    #[test]
+    fn credential_release_purpose_defaults_to_a_required_challenge() {
+        use irlume_auth::AuthenticationPurpose::CredentialRelease;
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-crp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        // No settings.conf at all: the challenge is REQUIRED.
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: true
+            },
+            "an absent key must still require the gesture"
+        );
+        // An explicit opt-out, read live, is the only way to drop it.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=off\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: false
+            }
+        );
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=on\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: true
+            }
+        );
+        // Whatever the setting says, the purpose is never Verify or AppConsent:
+        // credential release can never be downgraded to a session-only gate.
+        for v in ["on", "off", "garbage"] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("credential_release_challenge={v}\n"),
+            )
+            .unwrap();
+            assert!(
+                matches!(credential_release_purpose(), CredentialRelease { .. }),
+                "'{v}' must stay a credential release"
+            );
+        }
+
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

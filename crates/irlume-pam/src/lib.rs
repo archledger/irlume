@@ -273,6 +273,25 @@ impl PamServiceModule for IrlumePam {
                 );
             }
 
+            // Same discoverability problem on the credential-release path: by
+            // default the daemon requires the deliberate gesture before it releases
+            // the sealed keyring password, and a greeter that just says "Password:"
+            // gives the user no way to know that. Shown only on the interactive
+            // greeter probe (`unseal` without `wait`): in `wait` mode KDE runs us as
+            // a parallel biometric device where an unsolicited message competes with
+            // the password field. This module runs as root on the unseal path (the
+            // daemon refuses a non-root UnsealPassword), so it can read the
+            // root-only setting and stay silent when the operator opted out.
+            if unseal && !wait && irlume_common::config::credential_release_challenge() {
+                let _ = pamh.conv(
+                    Some(
+                        "irlume: nod your head to unlock your keyring \
+                         (or close your eyes ~1s then open)",
+                    ),
+                    pamsm::PamMsgStyle::TEXT_INFO,
+                );
+            }
+
             // In `wait` mode, retry until a match or the budget runs out; otherwise
             // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
             // stack always cascades to the password (NIST: a fallback must exist).

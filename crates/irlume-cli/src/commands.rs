@@ -677,6 +677,18 @@ pub fn status(args: &[String]) -> ExitCode {
         }
     );
 
+    // The credential-release gesture gate (default on). Only interesting when it
+    // is OFF or unreadable, but print it always: a security default the user can
+    // turn off should be visible where they look for the current state.
+    println!(
+        "  keyring gate  : {}",
+        match irlume_common::config::credential_release_challenge_visible() {
+            Some(true) => format!("gesture required {OK} (default)"),
+            Some(false) => format!("DISABLED {WARN} (a static IR print may release the password)"),
+            None => "root-only setting (re-run with sudo)".into(),
+        }
+    );
+
     // Cameras.
     let (rgb, ir) = irlume_camera::select_pair();
     println!("  cameras       : rgb={rgb} ir={ir}");
@@ -1092,6 +1104,107 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
     }
 }
 
+/// One line naming what the challenge is, for the places that have to explain the
+/// consequence of turning it off. Kept in one place so the CLI, the TUI confirm and
+/// doctor cannot drift into describing different security properties.
+pub const CREDENTIAL_RELEASE_RISK: &str =
+    "a static IR print that passes the face checks can then release your \
+     TPM-sealed login-keyring password";
+
+/// `irlume credential-release-challenge <on|off|status>`: the deliberate-gesture
+/// gate on releasing the sealed login-keyring password (`credential_release_challenge`
+/// in settings.conf). DEFAULT ON. The daemon reads it live per request, so no
+/// restart is needed.
+///
+/// Turning it off never locks anyone out (the typed password is always the
+/// fallback) but it does drop the only check that distinguishes a present person
+/// from a photograph of one, so `off` asks for confirmation and says why.
+pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
+    const TAG: &str = "[credential-release-challenge]";
+    match sub {
+        None | Some("status") => {
+            match irlume_common::config::credential_release_challenge_visible() {
+                Some(true) => println!("{TAG} temporal challenge: REQUIRED {OK} (default)"),
+                Some(false) => {
+                    println!("{TAG} temporal challenge: DISABLED {WARN}");
+                    println!("     {CREDENTIAL_RELEASE_RISK}.");
+                    println!("     Re-enable: sudo irlume credential-release-challenge on");
+                }
+                // Root-only file: don't print a guessed security state.
+                None => println!(
+                    "{TAG} temporal challenge: root-only setting, re-run with sudo to read it"
+                ),
+            }
+            ExitCode::SUCCESS
+        }
+        Some(v @ ("on" | "off")) => {
+            if !crate::is_root() {
+                eprintln!("{TAG} needs root: sudo irlume credential-release-challenge {v}");
+                return ExitCode::FAILURE;
+            }
+            // Weakening credential release is the one direction that needs an
+            // explicit yes. `--yes` exists for scripted installs, and still prints
+            // the warning: the point is the record, not the keystroke.
+            let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
+            if v == "off" && !assumed_yes && !confirm_disable() {
+                println!("{TAG} left enabled.");
+                return ExitCode::SUCCESS;
+            }
+            let val = if v == "on" { "1" } else { "0" };
+            match irlume_common::config::write_kv(
+                "settings.conf",
+                irlume_common::config::CREDENTIAL_RELEASE_CHALLENGE_KEY,
+                val,
+            ) {
+                Ok(()) => {
+                    if v == "on" {
+                        println!(
+                            "{TAG} temporal challenge REQUIRED {OK}: releasing your keyring \
+                             password now needs a nod (or a calibrated eye closure ~1s) after \
+                             the face match. Takes effect on the next face auth."
+                        );
+                    } else {
+                        eprintln!(
+                            "{TAG} WARNING: temporal liveness for credential release is \
+                             DISABLED. {CREDENTIAL_RELEASE_RISK}. Your typed password still \
+                             works either way. Re-enable: sudo irlume \
+                             credential-release-challenge on"
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{TAG} could not update settings.conf: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "{TAG} usage: irlume credential-release-challenge <on|off|status> (got '{other}')"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The confirm step before disabling the gate. A non-terminal stdin (a script, a
+/// pipe) is NOT taken as consent: it must send an explicit `y`, or pass `--yes`.
+fn confirm_disable() -> bool {
+    use std::io::Write as _;
+    println!(
+        "WARNING: Disabling the credential-release challenge means {CREDENTIAL_RELEASE_RISK}.\n\
+         Your typed password remains available either way."
+    );
+    print!("Disable the challenge? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 pub fn reseal(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     // Only meaningful if already armed (we never auto-arm from here).
@@ -1339,6 +1452,10 @@ SYSTEM INTEGRATION
                         checksum-pinned, deny-only; fetched, never shipped
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
+  credential-release-challenge <on|off|status>
+                        require a nod (or calibrated eye closure) before your
+                        keyring password is released. ON by default; turning it
+                        off lets a static IR print release that password
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   uninstall [--keep-data]         un-wire PAM, stop the daemon, wipe enrolled

@@ -116,6 +116,9 @@ fn main() -> std::process::ExitCode {
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
+        (Some("credential-release-challenge"), sub) => {
+            commands::credential_release_challenge(sub, &args)
+        }
         (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
@@ -2291,6 +2294,86 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
         .find(|d| std::path::Path::new(d).exists())
 }
 
+/// Doctor's credential-release block: is the temporal gesture required before the
+/// TPM-sealed keyring password is released, and can that gesture actually run here?
+///
+/// Kept separate from the polkit block because the failure MEANING differs. A
+/// polkit prompt that cannot run the gesture falls back to a password dialog the
+/// user is already looking at; a credential release that cannot run it leaves the
+/// keyring locked after an otherwise successful face login, which reads as "face
+/// login is broken" unless doctor names it.
+///
+/// Silent when the user has no sealed password: nothing is released, so there is no
+/// gate to explain.
+fn report_credential_release(user: &str, gesture_is_closure: bool, closure_calibrated: bool) {
+    let armed = matches!(
+        daemon_request(&irlume_common::Request::HasSealedPassword {
+            user: user.to_string()
+        }),
+        Ok(irlume_common::Response::HasPassword(true))
+    );
+    if !armed {
+        return;
+    }
+    match irlume_common::config::credential_release_challenge_visible() {
+        Some(true) => {}
+        Some(false) => {
+            println!(
+                "[doctor] ⚠ credential-release challenge: DISABLED\n     \
+                 {risk}.\n     \
+                 Re-enable: sudo irlume credential-release-challenge on",
+                risk = commands::CREDENTIAL_RELEASE_RISK
+            );
+            return;
+        }
+        None => {
+            println!(
+                "[doctor] credential-release challenge: root-only setting; re-run \
+                 `sudo irlume doctor` to read it"
+            );
+            return;
+        }
+    }
+    // The gate is on. Whether it can RUN needs the mesh model (every consent frame
+    // goes through FaceMesh) and, in closure-only mode, this user's EAR calibration.
+    // A nod needs no calibration, which is why the default mode leaves existing
+    // enrollments working with no re-enroll.
+    let mesh = matches!(
+        daemon_request(&irlume_common::Request::Health),
+        Ok(irlume_common::Response::Health { mesh: true, .. })
+    );
+    if !mesh {
+        println!(
+            "[doctor] ⚠ credential-release challenge is required but cannot run: FaceMesh \
+             is not loaded\n     \
+             (face_landmark.onnx). Face login still works; your keyring will fall back to \
+             the typed\n     password. Fix: set IRLUME_MESH_MODEL in the irlumed unit, or \
+             reinstall the package."
+        );
+        return;
+    }
+    if gesture_is_closure && !closure_calibrated {
+        println!(
+            "[doctor] ⚠ credential-release challenge is required but consent_gesture=closure \
+             is NOT\n     calibrated for '{user}': your keyring will fall back to the typed \
+             password.\n     Fix: sudo irlume calibrate-closure, or unset consent_gesture in \
+             settings.conf to\n     use the no-calibration head nod."
+        );
+        return;
+    }
+    println!(
+        "[doctor] credential-release challenge: required ✓ ({} to release your keyring \
+         password)",
+        if gesture_is_closure {
+            "close your eyes ~1s then open"
+        } else if closure_calibrated {
+            "nod, or close your eyes ~1s then open"
+        } else {
+            "nod your head"
+        }
+    );
+}
+
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
 /// privacy switch, and confirm models + ONNX Runtime are present.
 /// Certify that the polkit agent helper (polkit 126+ socket-activated,
@@ -2554,6 +2637,12 @@ fn doctor() -> std::process::ExitCode {
             ..
         })
     );
+    // --- credential release (the keyring password) --------------------------
+    // Reported before the polkit block because it shares the gesture-readiness
+    // facts above: this is the same nod/closure gate, applied to the one operation
+    // where a spoof yields a REUSABLE secret instead of one session.
+    report_credential_release(&user, gesture_is_closure, closure_calibrated);
+
     match crate::pamwire::polkit_wired() {
         Some(true) if !gesture_is_closure => println!(
             "[doctor] polkit app prompts: wired ✓ (NOD your head to approve Bitwarden unlock,\n     \

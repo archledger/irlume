@@ -243,6 +243,101 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
     assert!(out.contains("biopolicy     : ENFORCING"), "{out}");
 }
 
+// The credential-release challenge command: default-ON reporting, the warning on
+// the opt-out, the root gate, and the confirm before weakening it. The setting is
+// what stands between a static IR print and the sealed keyring password, so the
+// exact strings a user acts on are pinned here.
+#[test]
+fn credential_release_challenge_reports_defaults_and_gates_the_opt_out() {
+    let sb = Sandbox::new("crc");
+    let cfg = sb.path("cfg/settings.conf");
+    let cmd = "credential-release-challenge";
+
+    // No settings.conf at all: REQUIRED, and status never fails.
+    let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
+    assert_eq!(code, 0);
+    assert!(out.contains("temporal challenge: REQUIRED"), "{out}");
+
+    // No subcommand behaves as status (same as `irlume biopolicy`).
+    let (code, out, _) = run(&mut sb.cmd(&[cmd]), cmd);
+    assert_eq!(code, 0);
+    assert!(out.contains("REQUIRED"), "{out}");
+
+    // Opted out: the state AND the consequence AND the fix, all three.
+    std::fs::write(&cfg, "credential_release_challenge=0\n").unwrap();
+    let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
+    assert_eq!(code, 0);
+    assert!(out.contains("temporal challenge: DISABLED"), "{out}");
+    assert!(out.contains("static IR print"), "{out}");
+    assert!(
+        out.contains("sudo irlume credential-release-challenge on"),
+        "{out}"
+    );
+
+    // An unrecognized value must NOT read as off (fail secure).
+    std::fs::write(&cfg, "credential_release_challenge=disabled\n").unwrap();
+    let (_, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
+    assert!(out.contains("REQUIRED"), "a typo must stay on:\n{out}");
+
+    // Bad subcommand: usage, exit 2, and nothing written.
+    let (code, _, err) = run(&mut sb.cmd(&[cmd, "maybe"]), cmd);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains("usage: irlume credential-release-challenge"),
+        "{err}"
+    );
+
+    if !is_root() {
+        // Writing needs root, and says the command to re-run.
+        for v in ["on", "off"] {
+            let (code, _, err) = run(&mut sb.cmd(&[cmd, v]), cmd);
+            assert_eq!(code, 1, "{v} must refuse without root");
+            assert!(
+                err.contains(&format!("sudo irlume credential-release-challenge {v}")),
+                "{err}"
+            );
+        }
+        // The refusal must not have touched the file.
+        assert!(
+            std::fs::read_to_string(&cfg).unwrap().contains("=disabled"),
+            "a refused write must leave settings.conf alone"
+        );
+        return;
+    }
+
+    // Running as root (containerized CI): the confirm actually gates the write.
+    std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
+    let (code, out, _) = run_stdin(&mut sb.cmd(&[cmd, "off"]), "n\n", cmd);
+    assert_eq!(code, 0);
+    assert!(out.contains("left enabled"), "{out}");
+    assert!(
+        std::fs::read_to_string(&cfg).unwrap().contains("=1"),
+        "answering n must not disable the gate"
+    );
+    // A closed stdin is not consent either.
+    let (_, out, _) = run(&mut sb.cmd(&[cmd, "off"]), cmd);
+    assert!(out.contains("left enabled"), "{out}");
+    // An explicit y disables it, and the warning still goes out.
+    let (code, _, err) = run_stdin(&mut sb.cmd(&[cmd, "off"]), "y\n", cmd);
+    assert_eq!(code, 0);
+    assert!(
+        err.contains("WARNING") && err.contains("static IR print"),
+        "{err}"
+    );
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
+    // --yes skips the prompt but not the warning.
+    std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
+    let (code, _, err) = run(&mut sb.cmd(&[cmd, "off", "--yes"]), cmd);
+    assert_eq!(code, 0);
+    assert!(err.contains("WARNING"), "{err}");
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
+    // Turning it back on needs no confirm and reports what it now requires.
+    let (code, out, _) = run(&mut sb.cmd(&[cmd, "on"]), cmd);
+    assert_eq!(code, 0);
+    assert!(out.contains("REQUIRED") && out.contains("nod"), "{out}");
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=1"));
+}
+
 // enrollment-query error is a distinct arm from "none"/populated; and when the
 // daemon can't answer KeyringInfo, status falls back to the plain armed bit.
 #[test]

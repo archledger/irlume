@@ -24,7 +24,7 @@ use std::process::{Command, ExitCode};
 
 const MODULE: &str = "pam_irlume.so";
 const BACKUP: &str = ".pre-irlume";
-const CREATED_PREFIX: &str = "# irlume: created from ";
+pub(crate) const CREATED_PREFIX: &str = "# irlume: created from ";
 /// The one sentence that explains the on-demand trigger; shared so the status
 /// line, the plan line, and docs/SETUP.md's mirror never drift apart.
 const ONDEMAND_HINT: &str = "leave the password empty and press Enter to use your face";
@@ -141,6 +141,9 @@ const POLKIT: Svc = Svc {
 // ---- CLI entry ---------------------------------------------------------------
 
 pub fn run(action: Option<&str>, args: &[String]) -> ExitCode {
+    if args.iter().any(|argument| argument == "--json") {
+        return crate::login_transaction::run(action, args);
+    }
     let apply = args.iter().any(|a| a == "--apply");
     let with_sudo = args.iter().any(|a| a == "--with-sudo");
     let with_polkit = args.iter().any(|a| a == "--with-polkit");
@@ -405,7 +408,7 @@ fn label_of(etc: &str) -> String {
 /// The active login manager, from the `display-manager.service` symlink
 /// (`gdm`, `gdm3`, `sddm`, `lightdm`, `greetd`, `ly`, …). None on a
 /// non-graphical / greeter-less host.
-fn active_display_manager() -> Option<String> {
+pub(crate) fn active_display_manager() -> Option<String> {
     std::fs::read_link("/etc/systemd/system/display-manager.service")
         .ok()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
@@ -489,7 +492,7 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
 /// The PAM services THIS login manager actually uses, so wiring targets what the
 /// DM will really consult (and, above all, its separate FINGERPRINT service).
 /// Returns `(greeter_label, fingerprint_label_or_none)`.
-fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
+pub(crate) fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
     match dm {
         // GDM drives the password/face path and a SEPARATE fingerprint service.
         "gdm" | "gdm3" => ("gdm-password", Some("gdm-fingerprint")),
@@ -1000,7 +1003,12 @@ fn is_auth_directive(line: &str) -> bool {
 /// line (fingerprint keyring unlock; needed in gdm-password too, since GDM's
 /// SESSION keyring unlock runs through gdm-password even on a fingerprint login).
 /// Reseal (self-heal of the sealed password) rides along whenever either is set.
-fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -> (String, bool) {
+pub(crate) fn wire_greeter_impl(
+    content: &str,
+    face: bool,
+    keyring: bool,
+    ondemand: bool,
+) -> (String, bool) {
     if !face && !keyring {
         return (content.to_string(), false);
     }
@@ -1090,7 +1098,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
 /// cosmic-greeter, applied to KDE's submit-driven lock service. No reseal (a
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
-fn wire_lock(content: &str) -> (String, bool) {
+pub(crate) fn wire_lock(content: &str) -> (String, bool) {
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -1190,7 +1198,7 @@ fn wire_verify_service(content: &str) -> (String, bool) {
 
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists; the backup-restore path is preferred).
-fn unwire_lines(content: &str) -> (String, bool) {
+pub(crate) fn unwire_lines(content: &str) -> (String, bool) {
     // Strip every pam_irlume line, plus ONLY the pam_permit landing WE tagged
     // (`# irlume-landing`), never a foreign pam_permit.so.
     let mut changed = false;

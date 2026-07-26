@@ -23,6 +23,7 @@ const CAPABILITIES: &[&str] = &[
     "events-jsonl",
     "position-report",
     "preview-ir-jpeg",
+    "login-transactions",
 ];
 
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -957,7 +958,8 @@ mod tests {
                 "profile-mutations-json",
                 "events-jsonl",
                 "position-report",
-                "preview-ir-jpeg"
+                "preview-ir-jpeg",
+                "login-transactions"
             ])
         );
         assert!(document.get("error").is_none());

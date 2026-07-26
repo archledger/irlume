@@ -24,6 +24,7 @@ mod bitwarden;
 mod blinkcap;
 mod commands;
 mod fingerprint;
+mod login_transaction;
 mod logs;
 mod machine;
 mod models;

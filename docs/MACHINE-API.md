@@ -138,6 +138,40 @@ Stream failures expose only stable codes and retryability. Defined codes include
 `daemon-unavailable`, `protocol-error`, `invalid-preview`, and
 `operation-failed`. Consumers must not parse standard error or daemon logs.
 
+### Login transactions
+
+Capability: `login-transactions`.
+
+```text
+irlume login enable --scope lock-screen --json
+irlume login enable --scope login-screen --json
+irlume login disable --json
+irlume login enable --scope SCOPE --apply --plan-id ID --json
+irlume login disable --apply --plan-id ID --json
+irlume login verify --transaction-id ID --json
+irlume login rollback --transaction-id ID --apply --json
+```
+
+Plans are read-only and limited to `pam-service:kde` plus the active
+`pam-service:plasmalogin` or `pam-service:sddm`. A plan ID binds the operation,
+scope, display manager, security tier, password-fallback result, and exact
+before/after digests. Apply rejects state drift before writing and accepts no
+path, command, or PAM target from the caller.
+
+Before the first PAM write, apply stores a mode-0600 transaction journal in a
+mode-0700 irlume state directory. It then writes only the planned allowlisted
+targets with atomic replacement, verifies the resulting digests and password
+fallback, and returns a transaction ID. Login-screen enable requires the Secure
+tier. Lock-screen enable is limited to the KDE lock service.
+
+Verify reports daemon reachability, display-manager lineage, exact
+target-to-plan agreement, Fedora SELinux readiness, and password fallback as
+typed checks. Rollback restores the exact pre-transaction bytes only when the
+current target still equals the transaction's after-image. It refuses to
+overwrite unrelated post-apply edits, is idempotent after a clean restore, and
+never trusts a path stored in the journal. Apply-time verification failure
+performs the same rollback before returning the typed failure result.
+
 ## Security and privacy
 
 Ordinary JSON output never includes camera frames, embeddings, templates,
@@ -151,4 +185,3 @@ The following are not part of contract version 1 yet and must not be inferred
 from human output or the private socket protocol:
 
 - camera configuration mutation;
-- login plan, apply, verify, or rollback transactions.

@@ -89,6 +89,14 @@ All notable changes to irlume are documented here. This project adheres to
   are omitted unless the complete fixed preview flag set is present. Machine
   failures use typed codes such as `camera-busy`, `not-authorized`, `timeout`,
   and `precondition-failed` instead of parsing diagnostic prose.
+- **Plasma login and lock-screen activation now use an engine-owned
+  transaction.** The machine API plans only allowlisted KDE/Plasma PAM targets,
+  binds the plan to before/after digests, rejects pre-apply drift, journals the
+  exact pre-state before writing, verifies daemon reachability, target state,
+  and password fallback, and rolls back automatically on apply-time verification
+  failure. Rollback is idempotent and refuses to overwrite an unrelated
+  post-apply administrator edit. Arbitrary paths and shell arguments are never
+  accepted from the caller.
 
 - **`sudo irlume camera-tune` measures whether your camera can read both sensors
   at once.** Some Hello modules stop exposing their colour stream properly while

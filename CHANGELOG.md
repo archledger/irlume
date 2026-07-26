@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- CLI help flags are now resolved before command dispatch. A trailing
+  `--help` or `-h` can no longer start camera capture or a mutation such as
+  enrollment.
+- TPM-backed template storage now treats a device as available only when the
+  current process can open it for use (or an explicit `IRLUME_TCTI` is set).
+  Seeing an inaccessible device node no longer makes unprivileged development
+  and test profile writes fail.
 - **Releasing your keyring password now asks for a gesture, by default.** On a
   face login that unlocks the login keyring, irlume waits for a deliberate nod
   (or a calibrated eye closure, if you set that up) after the face match before

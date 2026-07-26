@@ -22,6 +22,7 @@ use crate::recovery::RecoveryEnvelope;
 use crate::tpm;
 use crate::{crypto, envelope::SealedEnvelope};
 use irlume_common::{Error, Result};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -45,10 +46,19 @@ pub fn recovery_path(user: &str) -> PathBuf {
     recovery_dir().join(format!("{user}.json"))
 }
 
-/// Whether a TPM is present. When false, [`crate::storage`] keeps templates as
-/// root-only plaintext (dev boxes / no-TPM hosts) instead of failing.
+fn device_accessible(path: &Path) -> bool {
+    OpenOptions::new().read(true).write(true).open(path).is_ok()
+}
+
+/// Whether this process can use a TPM. Device-node presence alone is not
+/// enough: an unprivileged process may see `/dev/tpmrm0` without having access
+/// to it. When false, [`crate::storage`] keeps templates as root-only plaintext
+/// (dev boxes / no-TPM hosts) instead of failing every profile write.
 pub fn tpm_available() -> bool {
-    Path::new("/dev/tpmrm0").exists() || Path::new("/dev/tpm0").exists()
+    if std::env::var_os("IRLUME_TCTI").is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    device_accessible(Path::new("/dev/tpmrm0")) || device_accessible(Path::new("/dev/tpm0"))
 }
 
 /// Whether a sealed template key exists for `user`.
@@ -205,6 +215,20 @@ mod tests {
         );
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::env::remove_var("IRLUME_RECOVERY_DIR");
+    }
+
+    #[test]
+    fn device_probe_requires_an_openable_read_write_target() {
+        let dir = PathBuf::from(crate::test_tmp_dir("tpm-access"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("device");
+        std::fs::write(&target, b"probe").unwrap();
+
+        assert!(device_accessible(&target));
+        assert!(!device_accessible(&dir.join("missing")));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Recovery round-trip WITHOUT a TPM: seed a key file via wrap math directly

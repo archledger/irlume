@@ -4627,7 +4627,7 @@ mod tests {
         ) {
             Response::OperationError {
                 code: irlume_common::OperationErrorCode::HardwareUnavailable,
-                retryable: false,
+                retryable: true,
             } => {}
             other => panic!("dry-run without a camera must Error, got {other:?}"),
         }

@@ -72,7 +72,15 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
 /// Insert or update `key=value`, preserving every other line (including
 /// comments) and dropping duplicate keys. Creates the file at 0600 if absent.
 pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    write_kvs_atomic(file, &[(key, val)])
+}
+
+/// Atomically insert or update several keys in one config-file generation.
+///
+/// This is the mutation primitive for settings whose fields form one security
+/// decision (for example an RGB/IR camera pair). Readers observe either the
+/// complete old generation or the complete new generation, never a torn mix.
+pub fn write_kvs_atomic(file: &str, values: &[(&str, &str)]) -> std::io::Result<()> {
     let path = config_path(file);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -80,42 +88,36 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
     let mut out = String::new();
-    let mut replaced = false;
+    let mut replaced = vec![false; values.len()];
     for line in existing.lines() {
         let trimmed = line.trim();
-        let is_target = !trimmed.starts_with('#')
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(k, _)| k.trim() == key);
-        if is_target {
-            if !replaced {
-                out.push_str(&format!("{key}={val}\n"));
-                replaced = true;
+        let target = if trimmed.starts_with('#') {
+            None
+        } else {
+            trimmed.split_once('=').and_then(|(key, _)| {
+                values
+                    .iter()
+                    .position(|(candidate, _)| key.trim() == *candidate)
+            })
+        };
+        if let Some(index) = target {
+            if !replaced[index] {
+                let (key, value) = values[index];
+                out.push_str(&format!("{key}={value}\n"));
+                replaced[index] = true;
             }
             continue; // drop duplicates
         }
         out.push_str(line);
         out.push('\n');
     }
-    if !replaced {
-        out.push_str(&format!("{key}={val}\n"));
+    for (index, (key, value)) in values.iter().enumerate() {
+        if !replaced[index] {
+            out.push_str(&format!("{key}={value}\n"));
+        }
     }
 
-    // Create with mode 0600 so the file is never briefly world-readable in the
-    // window between write and chmod (umask can only clear bits, so 0600 stays
-    // at most 0600); set_permissions still normalizes an already-existing file.
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
-    f.write_all(out.as_bytes())?;
-    f.flush()?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    crate::write_0600_atomic(&path, out.as_bytes())
 }
 
 /// The settings.conf key for the credential-release temporal-liveness gate.
@@ -276,6 +278,44 @@ mod tests {
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_write_replaces_one_atomic_generation_and_preserves_other_keys() {
+        let _guard = crate::testenv::lock();
+        let directory =
+            std::env::temp_dir().join(format!("irlume-cfg-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &directory);
+        std::fs::write(
+            directory.join("cameras.conf"),
+            "# camera policy\nrgb=old-rgb\nir=old-ir\ncapture_mode=sequential\nrgb=duplicate\n",
+        )
+        .unwrap();
+
+        write_kvs_atomic(
+            "cameras.conf",
+            &[
+                ("rgb", "new-rgb"),
+                ("ir", "new-ir"),
+                ("rgb_id", "rgb-id"),
+                ("ir_id", "ir-id"),
+            ],
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(directory.join("cameras.conf")).unwrap();
+        assert_eq!(text.matches("rgb=").count(), 1);
+        assert!(text.contains("# camera policy\n"));
+        assert!(text.contains("rgb=new-rgb\n"));
+        assert!(text.contains("ir=new-ir\n"));
+        assert!(text.contains("capture_mode=sequential\n"));
+        assert!(text.contains("rgb_id=rgb-id\n"));
+        assert!(text.contains("ir_id=ir-id\n"));
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

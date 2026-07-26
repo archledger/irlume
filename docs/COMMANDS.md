@@ -73,6 +73,11 @@ flag set: `--preview=ir-jpeg --preview-max-fps=8
 | `irlume ir-setup [--dry-run]` | yes | auto-configure the IR emitter; rarely needed, enroll runs it itself when IR frames come back dark |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume camera-tune [--rounds N]` | yes | measure whether this camera keeps its brightness while both sensors stream, and store the resulting capture mode in `cameras.conf`; some modules starve their own RGB interface (measured: NexiGo HelloCam N930W keeps 56% of its RGB brightness), and this puts those on one-at-a-time capture |
+| `irlume cameras list --json` | no | list reviewed camera pairs by opaque ID without exposing device nodes |
+| `irlume cameras select --pair-id ID --apply --json` | yes | atomically persist and activate one currently discovered pair |
+| `irlume cameras emitter-test --json` | no | typed, read-only emitter-control availability probe |
+| `irlume cameras emitter-setup --apply --json` | yes | configure the emitter through a fixed machine operation |
+| `irlume cameras tune --apply --json` | yes | measure and persist the capture mode with fixed bounds |
 | `irlume models [list]` | no | show the opt-in third-party liveness models and their checksum state |
 | `irlume models enable <name>` / `models disable` | yes | fetch and enable one (deny-only, checksum-pinned), or turn it off |
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |

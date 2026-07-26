@@ -176,9 +176,86 @@ fn version_json_is_one_machine_document() {
             "events-jsonl",
             "position-report",
             "preview-ir-jpeg",
-            "login-transactions"
+            "login-transactions",
+            "camera-config-json"
         ])
     );
+}
+
+#[test]
+fn camera_list_is_machine_only_and_never_exposes_device_paths() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["cameras", "list", "--json"])
+        .output()
+        .expect("run camera list");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["command"], "cameras.list");
+    assert_eq!(document["ok"], true);
+    assert!(document["data"]["pairs"].is_array());
+    let encoded = serde_json::to_string(&document).unwrap();
+    assert!(!encoded.contains("/dev/"));
+    assert!(!encoded.contains("device_path"));
+}
+
+#[test]
+fn camera_probe_setup_and_tune_have_typed_bounded_results() {
+    let run = |suffix: &str, command: &[&str], response: irlume_common::Response| {
+        let socket = std::env::temp_dir().join(format!(
+            "irlume-machine-camera-{suffix}-{}",
+            std::process::id()
+        ));
+        let server = serve_once(&socket, move |_| response.clone());
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(command)
+            .env("IRLUME_SOCKET", &socket)
+            .output()
+            .expect("run camera command");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(socket);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stderr.is_empty());
+        serde_json::from_slice::<Value>(&output.stdout).expect("valid JSON")
+    };
+
+    let probe = run(
+        "probe",
+        &["cameras", "emitter-test", "--json"],
+        irlume_common::Response::EmitterProbe {
+            available: true,
+            control_count: 2,
+        },
+    );
+    assert_eq!(probe["data"]["available"], true);
+    assert_eq!(probe["data"]["mutated"], false);
+
+    let setup = run(
+        "setup",
+        &["cameras", "emitter-setup", "--apply", "--json"],
+        irlume_common::Response::EmitterConfigured,
+    );
+    assert_eq!(setup["data"]["configured"], true);
+    assert_eq!(setup["data"]["mutated"], true);
+
+    let tune = run(
+        "tune",
+        &["cameras", "tune", "--apply", "--json"],
+        irlume_common::Response::CaptureModeTuned {
+            mode: "sequential".into(),
+            retained_rgb: 0.5,
+            retained_ir: 0.9,
+            saved_ms: 120.0,
+            conclusive: true,
+        },
+    );
+    assert_eq!(tune["data"]["capture_mode"], "sequential");
+    assert_eq!(tune["data"]["conclusive"], true);
 }
 
 #[test]

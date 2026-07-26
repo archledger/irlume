@@ -97,6 +97,12 @@ All notable changes to irlume are documented here. This project adheres to
   failure. Rollback is idempotent and refuses to overwrite an unrelated
   post-apply administrator edit. Arbitrary paths and shell arguments are never
   accepted from the caller.
+- **Camera setup now has a path-free machine contract.** Desktop integrations
+  can list discovered secure pairs by opaque ID, select one through a fixed
+  root-only operation, probe or configure the IR emitter, and measure capture
+  mode without accepting a device node, UVC selector, round count, or shell
+  argument. RGB/IR selection fields are persisted as one atomic config
+  generation before the live engine switches devices.
 
 - **`sudo irlume camera-tune` measures whether your camera can read both sensors
   at once.** Some Hello modules stop exposing their colour stream properly while

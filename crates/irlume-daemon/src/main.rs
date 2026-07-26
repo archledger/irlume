@@ -1029,13 +1029,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // video into the match path (spoof) or bricks face auth (DoS). Root
             // only (a system-wide /etc setting isn't an arbitrary peer's to make).
             if peer.uid != 0 {
-                return Response::Error(format!(
-                    "set_cameras requires root (peer uid {})",
-                    peer.uid
-                ));
+                return Response::OperationError {
+                    code: irlume_common::OperationErrorCode::NotAuthorized,
+                    retryable: false,
+                };
             }
-            engine.set_devices(&rgb, &ir);
-            let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
             // Record each node's stable device identity (vid:pid:serial) next to
             // its path so select_pair can survive a udev renumber: after an
             // upgrade shuffles /dev/videoN, the identity re-anchors the pin to the
@@ -1043,15 +1041,20 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // clears a stale id when the current node has no USB descriptor.
             let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
             let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
-            if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "rgb_id", &rgb_id))
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir_id", &ir_id))
-            {
-                msg = format!("{msg} (live only; could not persist: {e})");
+            if let Err(error) = irlume_common::config::write_kvs_atomic(
+                "cameras.conf",
+                &[
+                    ("rgb", rgb.as_str()),
+                    ("ir", ir.as_str()),
+                    ("rgb_id", rgb_id.as_str()),
+                    ("ir_id", ir_id.as_str()),
+                ],
+            ) {
+                return operation_error(irlume_common::Error::Io(error.to_string()));
             }
-            eprintln!("irlumed: {msg}");
-            Response::Ok(msg)
+            engine.set_devices(&rgb, &ir);
+            eprintln!("irlumed: camera pair selection persisted and activated");
+            Response::CameraPairSelected
         }
         Request::Enroll {
             user,
@@ -1087,10 +1090,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // /etc/irlume, so it is root-only like the other camera-bearing
             // management requests.
             if peer.uid != 0 {
-                return Response::Error(format!(
-                    "camera-tune requires root (peer uid {})",
-                    peer.uid
-                ));
+                return Response::OperationError {
+                    code: irlume_common::OperationErrorCode::NotAuthorized,
+                    retryable: false,
+                };
             }
             // Enough rounds that one unlucky capture cannot decide the answer,
             // few enough that a user waits seconds rather than minutes: the
@@ -1107,64 +1110,49 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     let mode = report.recommended_mode();
                     match irlume_auth::store_capture_mode(&rgb_dev, mode) {
                         Ok(()) => {
-                            let mut msg = format!(
-                                "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
-                                 and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
-                                mode.as_str(),
-                                report.retained_rgb() * 100.0,
-                                report.retained_ir() * 100.0,
-                                report.saved_ms(),
+                            eprintln!(
+                                "irlumed: capture mode {} measured and persisted ({rounds} rounds)",
+                                mode.as_str()
                             );
-                            // Say so rather than letting a dark room read as a
-                            // clean bill of health.
-                            if !report.conclusive() {
-                                msg.push_str(&format!(
-                                    "\n     measured in a dim scene (RGB mean {:.0}); this loss only \
-                                     shows in normal light, so re-run camera-tune with the room lit \
-                                     to confirm",
-                                    report.sequential.rgb_mean
-                                ));
+                            Response::CaptureModeTuned {
+                                mode: mode.as_str().into(),
+                                retained_rgb: report.retained_rgb(),
+                                retained_ir: report.retained_ir(),
+                                saved_ms: report.saved_ms(),
+                                conclusive: report.conclusive(),
                             }
-                            eprintln!("irlumed: {msg}");
-                            Response::Ok(msg)
                         }
-                        Err(e) => Response::Error(e.to_string()),
+                        Err(error) => operation_error(error),
                     }
                 }
-                Err(e) => Response::Error(e.to_string()),
+                Err(error) => operation_error(error),
             }
         }
         Request::SetupIrEmitter { dry_run } => {
             // Hardware fix on the shared camera; non-destructive on failure.
             if dry_run {
                 match irlume_auth::list_ir_controls(engine.ir_device()) {
-                    Ok(c) if c.is_empty() => {
-                        Response::Ok("no UVC extension-unit controls found".into())
-                    }
-                    Ok(c) => Response::Ok(format!(
-                        "XU controls: {}",
-                        c.iter()
-                            .map(|(u, s, l)| format!("unit{u}/sel{s}/{l}B"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                    Err(e) => Response::Error(e.to_string()),
+                    Ok(controls) => Response::EmitterProbe {
+                        available: !controls.is_empty(),
+                        control_count: controls.len(),
+                    },
+                    Err(error) => operation_error(error),
                 }
             } else {
                 // The non-dry path brute-forces UVC control writes on the shared
                 // camera; a local peer could thrash the hardware. Root only.
                 if peer.uid != 0 {
-                    return Response::Error(format!(
-                        "setup_ir_emitter requires root (peer uid {})",
-                        peer.uid
-                    ));
+                    return Response::OperationError {
+                        code: irlume_common::OperationErrorCode::NotAuthorized,
+                        retryable: false,
+                    };
                 }
                 match irlume_auth::setup_ir_emitter(engine.ir_device()) {
                     Ok(msg) => {
                         eprintln!("irlumed: {msg}");
-                        Response::Ok(msg)
+                        Response::EmitterConfigured
                     }
-                    Err(e) => Response::Error(e.to_string()),
+                    Err(error) => operation_error(error),
                 }
             }
         }
@@ -4608,12 +4596,10 @@ mod tests {
             &peer(NOBODY),
             &mut e,
         ) {
-            Response::Error(msg) => {
-                assert_eq!(
-                    msg,
-                    format!("set_cameras requires root (peer uid {NOBODY})")
-                )
-            }
+            Response::OperationError {
+                code: irlume_common::OperationErrorCode::NotAuthorized,
+                retryable: false,
+            } => {}
             other => panic!("non-root SetCameras must be refused, got {other:?}"),
         }
         let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
@@ -4625,9 +4611,7 @@ mod tests {
             &peer(0),
             &mut e,
         ) {
-            // The exact message proves the persist to cameras.conf succeeded
-            // (a failed persist appends a "live only" suffix).
-            Response::Ok(msg) => assert_eq!(msg, format!("cameras set to rgb={rgb} ir={ir}")),
+            Response::CameraPairSelected => {}
             other => panic!("root SetCameras must succeed, got {other:?}"),
         }
         assert_eq!(e.rgb_device(), rgb);
@@ -4654,7 +4638,10 @@ mod tests {
             &peer(NOBODY),
             &mut e,
         ) {
-            Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
+            Response::OperationError {
+                code: irlume_common::OperationErrorCode::HardwareUnavailable,
+                retryable: false,
+            } => {}
             other => panic!("dry-run without a camera must Error, got {other:?}"),
         }
         // The write path is root-only.
@@ -4663,12 +4650,10 @@ mod tests {
             &peer(NOBODY),
             &mut e,
         ) {
-            Response::Error(msg) => {
-                assert_eq!(
-                    msg,
-                    format!("setup_ir_emitter requires root (peer uid {NOBODY})")
-                )
-            }
+            Response::OperationError {
+                code: irlume_common::OperationErrorCode::NotAuthorized,
+                retryable: false,
+            } => {}
             other => panic!("non-root setup must be refused, got {other:?}"),
         }
     }

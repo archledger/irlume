@@ -125,6 +125,21 @@ fn main() -> std::process::ExitCode {
         (Some("profiles"), Some("add-scan")) if args.iter().any(|arg| arg == "--events=jsonl") => {
             machine::profiles_add_scan_events(&args)
         }
+        (Some("cameras"), Some("list")) if args.iter().any(|arg| arg == "--json") => {
+            machine::cameras_list(&args)
+        }
+        (Some("cameras"), Some("select")) if args.iter().any(|arg| arg == "--json") => {
+            machine::cameras_select(&args)
+        }
+        (Some("cameras"), Some("emitter-test")) if args.iter().any(|arg| arg == "--json") => {
+            machine::cameras_emitter_test(&args)
+        }
+        (Some("cameras"), Some("emitter-setup")) if args.iter().any(|arg| arg == "--json") => {
+            machine::cameras_emitter_setup(&args)
+        }
+        (Some("cameras"), Some("tune")) if args.iter().any(|arg| arg == "--json") => {
+            machine::cameras_tune(&args)
+        }
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("enrolldev"), _) => enrolldev(&args),
@@ -421,6 +436,44 @@ fn report_ok_response(
         Ok(Response::Ok(msg)) => {
             println!("[{tag}] {msg}");
             std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::CameraPairSelected) if tag == "set-cameras" => {
+            println!("[set-cameras] camera pair saved and activated");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::EmitterProbe {
+            available,
+            control_count,
+        }) if tag == "ir-setup" => {
+            println!(
+                "[ir-setup] emitter controls {} ({control_count} found)",
+                if available { "available" } else { "not found" }
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::EmitterConfigured) if tag == "ir-setup" => {
+            println!("[ir-setup] emitter configured");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::CaptureModeTuned {
+            mode,
+            retained_rgb,
+            retained_ir,
+            saved_ms,
+            conclusive,
+        }) if tag == "camera-tune" => {
+            println!(
+                "[camera-tune] capture mode {mode}; RGB {:.0}%, IR {:.0}%, saves {:.0}ms{}",
+                retained_rgb * 100.0,
+                retained_ir * 100.0,
+                saved_ms,
+                if conclusive { "" } else { " (inconclusive)" }
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::OperationError { code, retryable }) => {
+            eprintln!("[{tag}] {code:?} (retryable={retryable})");
+            std::process::ExitCode::FAILURE
         }
         Ok(Response::Error(e)) => {
             eprintln!("[{tag}] {e}");

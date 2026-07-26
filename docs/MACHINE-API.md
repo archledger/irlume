@@ -174,10 +174,38 @@ overwrite unrelated post-apply edits, is idempotent after a clean restore, and
 never trusts a path stored in the journal. Apply-time verification failure
 performs the same rollback before returning the typed failure result.
 
+### Camera configuration
+
+Capability: `camera-config-json`.
+
+```text
+irlume cameras list --json
+irlume cameras select --pair-id ID --apply --json
+irlume cameras emitter-test --json
+irlume cameras emitter-setup --apply --json
+irlume cameras tune --apply --json
+```
+
+Camera listing returns opaque pair IDs, bounded display labels, built-in state,
+active selection, and security tier. It never returns a device node, USB
+identity, serial number, or arbitrary path. Selection accepts only an opaque ID
+from the current allowlisted hardware discovery result; the CLI resolves the
+corresponding nodes internally, and the root daemon persists all RGB/IR
+selection fields as one atomic config generation before activating them.
+
+Emitter test is read-only and reports only availability plus a bounded control
+count. Emitter setup and capture tuning require both explicit `--apply` and root
+authorization. Tune uses a fixed reviewed round count and returns only the
+selected `concurrent` or `sequential` mode, bounded retained-signal ratios,
+saved milliseconds, and whether the measurement was conclusive. No camera
+operation accepts a node, path, round count, UVC selector, or shell argument
+from the machine client.
+
 ## Security and privacy
 
 Ordinary JSON output never includes camera frames, embeddings, templates,
-passwords, credential material, TPM secrets, device paths, or usernames. Preview
+passwords, credential material, TPM secrets, device paths, serial numbers, or
+usernames. Preview
 frames are the sole opt-in exception and exist only in the requested stream;
 they are never written to disk. Neither preview nor auth-test output contains
 identity embeddings, templates, secrets, or released credentials. Errors

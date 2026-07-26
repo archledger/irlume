@@ -10,6 +10,7 @@
 use irlume_common::{OperationErrorCode, ProfileMutationKind, ProfileSummary, Request, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,7 @@ const CAPABILITIES: &[&str] = &[
     "position-report",
     "preview-ir-jpeg",
     "login-transactions",
+    "camera-config-json",
 ];
 
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -715,6 +717,243 @@ pub fn profiles_rename(args: &[String]) -> ExitCode {
     emit_profile_mutation(COMMAND, request)
 }
 
+pub fn cameras_list(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "cameras.list";
+    if args != ["cameras", "list", "--json"] {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    }
+    let active = match crate::daemon_request(&Request::Health) {
+        Ok(Response::Health {
+            rgb_dev, ir_dev, ..
+        }) => rgb_dev.zip(ir_dev),
+        _ => None,
+    };
+    let pairs = irlume_camera::list_pairs()
+        .into_iter()
+        .enumerate()
+        .map(|(index, pair)| {
+            json!({
+                "pair_id": camera_pair_id(&pair),
+                "display_name": if pair.fixed {
+                    format!("Built-in secure camera {}", index + 1)
+                } else {
+                    format!("External secure camera {}", index + 1)
+                },
+                "built_in": pair.fixed,
+                "active": active.as_ref().is_some_and(|(rgb, ir)| pair.rgb == *rgb && pair.ir == *ir),
+                "security_tier": "secure"
+            })
+        })
+        .collect::<Vec<_>>();
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "pairs": pairs,
+                "active_known": active.is_some(),
+                "selection_requires_authorization": true
+            }),
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+pub fn cameras_select(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "cameras.select";
+    let Some(pair_id) = exact_value_flag(args, "--pair-id") else {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    };
+    if args.len() != 6
+        || args.first().map(String::as_str) != Some("cameras")
+        || args.get(1).map(String::as_str) != Some("select")
+        || !args.iter().any(|arg| arg == "--apply")
+        || !args.iter().any(|arg| arg == "--json")
+        || !valid_camera_pair_id(pair_id)
+    {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    }
+    let Some(pair) = irlume_camera::list_pairs()
+        .into_iter()
+        .find(|pair| camera_pair_id(pair) == pair_id)
+    else {
+        return emit(
+            &failure(COMMAND, "camera-pair-unavailable", true),
+            ExitCode::FAILURE,
+        );
+    };
+    match crate::daemon_request(&Request::SetCameras {
+        rgb: pair.rgb,
+        ir: pair.ir,
+    }) {
+        Ok(Response::CameraPairSelected) => emit(
+            &success(
+                COMMAND,
+                json!({"pair_id": pair_id, "selected": true, "mutated": true}),
+            ),
+            ExitCode::SUCCESS,
+        ),
+        Ok(Response::OperationError { code, retryable }) => emit(
+            &failure(COMMAND, operation_error_code(code), retryable),
+            ExitCode::FAILURE,
+        ),
+        Ok(_) => emit(
+            &failure(COMMAND, "protocol-error", false),
+            ExitCode::FAILURE,
+        ),
+        Err(_) => emit(
+            &failure(COMMAND, "daemon-unavailable", true),
+            ExitCode::FAILURE,
+        ),
+    }
+}
+
+pub fn cameras_emitter_test(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "cameras.emitter-test";
+    if args != ["cameras", "emitter-test", "--json"] {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    }
+    match crate::daemon_request(&Request::SetupIrEmitter { dry_run: true }) {
+        Ok(Response::EmitterProbe {
+            available,
+            control_count,
+        }) if control_count <= 256 => emit(
+            &success(
+                COMMAND,
+                json!({"available": available, "control_count": control_count, "mutated": false}),
+            ),
+            ExitCode::SUCCESS,
+        ),
+        Ok(Response::OperationError { code, retryable }) => emit(
+            &failure(COMMAND, operation_error_code(code), retryable),
+            ExitCode::FAILURE,
+        ),
+        Ok(_) => emit(
+            &failure(COMMAND, "protocol-error", false),
+            ExitCode::FAILURE,
+        ),
+        Err(_) => emit(
+            &failure(COMMAND, "daemon-unavailable", true),
+            ExitCode::FAILURE,
+        ),
+    }
+}
+
+pub fn cameras_emitter_setup(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "cameras.emitter-setup";
+    if args != ["cameras", "emitter-setup", "--apply", "--json"] {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    }
+    emit_camera_ack(
+        COMMAND,
+        crate::daemon_request(&Request::SetupIrEmitter { dry_run: false }),
+        |response| matches!(response, Response::EmitterConfigured),
+        json!({"configured": true, "mutated": true}),
+    )
+}
+
+pub fn cameras_tune(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "cameras.tune";
+    if args != ["cameras", "tune", "--apply", "--json"] {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    }
+    match crate::daemon_request(&Request::TuneCaptureMode { rounds: None }) {
+        Ok(Response::CaptureModeTuned {
+            mode,
+            retained_rgb,
+            retained_ir,
+            saved_ms,
+            conclusive,
+        }) if matches!(mode.as_str(), "concurrent" | "sequential")
+            && retained_rgb.is_finite()
+            && retained_ir.is_finite()
+            && saved_ms.is_finite()
+            && (0.0..=2.0).contains(&retained_rgb)
+            && (0.0..=2.0).contains(&retained_ir)
+            && (0.0..=60_000.0).contains(&saved_ms) =>
+        {
+            emit(
+                &success(
+                    COMMAND,
+                    json!({
+                        "capture_mode": mode,
+                        "retained_rgb": retained_rgb,
+                        "retained_ir": retained_ir,
+                        "saved_ms": saved_ms,
+                        "conclusive": conclusive,
+                        "mutated": true
+                    }),
+                ),
+                ExitCode::SUCCESS,
+            )
+        }
+        Ok(Response::OperationError { code, retryable }) => emit(
+            &failure(COMMAND, operation_error_code(code), retryable),
+            ExitCode::FAILURE,
+        ),
+        Ok(_) => emit(
+            &failure(COMMAND, "protocol-error", false),
+            ExitCode::FAILURE,
+        ),
+        Err(_) => emit(
+            &failure(COMMAND, "daemon-unavailable", true),
+            ExitCode::FAILURE,
+        ),
+    }
+}
+
+fn emit_camera_ack(
+    command: &'static str,
+    response: Result<Response, String>,
+    accepted: impl FnOnce(&Response) -> bool,
+    data: Value,
+) -> ExitCode {
+    match response {
+        Ok(response) if accepted(&response) => emit(&success(command, data), ExitCode::SUCCESS),
+        Ok(Response::OperationError { code, retryable }) => emit(
+            &failure(command, operation_error_code(code), retryable),
+            ExitCode::FAILURE,
+        ),
+        Ok(_) => emit(
+            &failure(command, "protocol-error", false),
+            ExitCode::FAILURE,
+        ),
+        Err(_) => emit(
+            &failure(command, "daemon-unavailable", true),
+            ExitCode::FAILURE,
+        ),
+    }
+}
+
+fn camera_pair_id(pair: &irlume_camera::CameraPair) -> String {
+    let rgb = irlume_camera::device_identity(&pair.rgb).unwrap_or_else(|| pair.rgb.clone());
+    let ir = irlume_camera::device_identity(&pair.ir).unwrap_or_else(|| pair.ir.clone());
+    let digest = Sha256::digest(format!("{rgb}\0{ir}").as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        std::fmt::Write::write_fmt(&mut encoded, format_args!("{byte:02x}"))
+            .expect("writing to a String cannot fail");
+    }
+    format!("camera-pair-{encoded}")
+}
+
+fn valid_camera_pair_id(value: &str) -> bool {
+    value.strip_prefix("camera-pair-").is_some_and(|suffix| {
+        suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn exact_value_flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == name).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() != 1 {
+        return None;
+    }
+    args.get(positions[0] + 1).map(String::as_str)
+}
+
 fn emit_profile_mutation(command: &'static str, request: Request) -> ExitCode {
     match crate::daemon_request(&request) {
         Ok(Response::ProfileMutation {
@@ -961,7 +1200,8 @@ mod tests {
                 "events-jsonl",
                 "position-report",
                 "preview-ir-jpeg",
-                "login-transactions"
+                "login-transactions",
+                "camera-config-json"
             ])
         );
         assert!(document.get("error").is_none());

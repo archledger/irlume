@@ -523,6 +523,23 @@ pub enum Response {
         /// complete profile.
         total_scans: Option<usize>,
     },
+    /// A reviewed RGB/IR pair was persisted and activated.
+    CameraPairSelected,
+    /// Read-only IR emitter capability probe without raw control identifiers.
+    EmitterProbe {
+        available: bool,
+        control_count: usize,
+    },
+    /// The IR emitter configuration operation completed.
+    EmitterConfigured,
+    /// Result of capture-mode measurement and persistence.
+    CaptureModeTuned {
+        mode: String,
+        retained_rgb: f32,
+        retained_ir: f32,
+        saved_ms: f32,
+        conclusive: bool,
+    },
     /// Result of an Enroll capture, carrying the profile the scans actually
     /// landed on. `created` distinguishes a brand-new profile from a merge into
     /// an existing identity (the engine auto-merges a face that already owns a

@@ -431,7 +431,7 @@ fn pamwrap_unseal_face_login_releases_sealed_password() {
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
-    const HINT: &str = "nod your head to unlock your keyring";
+    const HINT: &str = "keep nodding your head to unlock your keyring";
     let Some(h) = Harness::try_new("crc-hint") else {
         return;
     };

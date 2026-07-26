@@ -2390,9 +2390,9 @@ fn report_credential_release(user: &str, gesture_is_closure: bool, closure_calib
         if gesture_is_closure {
             "close your eyes ~1s then open"
         } else if closure_calibrated {
-            "nod, or close your eyes ~1s then open"
+            "keep nodding, or close your eyes ~1s then open"
         } else {
-            "nod your head"
+            "keep nodding your head"
         }
     );
 }

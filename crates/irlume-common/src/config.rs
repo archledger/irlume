@@ -161,14 +161,21 @@ pub enum ConsentGesture {
 impl ConsentGesture {
     /// One line telling the user what to do, for a PAM conversation or a prompt.
     /// `what` names the thing being unlocked, e.g. "unlock your keyring".
+    /// The nod wording says KEEP nodding, because that is what actually works.
+    /// Measured on hardware 2026-07-25, seated, 17 attempts against the real
+    /// greeter stack: nodding continuously released 4 times out of 4, while a
+    /// single nod released 0 times out of 3. The detector needs a run of frames
+    /// showing the motion, and a user who nods once has stopped before it has
+    /// enough. Telling someone to "nod" and then refusing them is the failure in
+    /// issue #101; this describes the gesture the engine can actually see.
     pub fn instruction(self, what: &str) -> String {
         match self {
-            Self::Nod => format!("nod your head to {what}"),
+            Self::Nod => format!("keep nodding your head to {what}"),
             Self::Closure => {
                 format!("close your eyes for about a second, then open, to {what}")
             }
             Self::Either => {
-                format!("nod your head to {what} (or close your eyes ~1s then open)")
+                format!("keep nodding your head to {what} (or close your eyes ~1s then open)")
             }
         }
     }

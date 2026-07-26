@@ -1624,12 +1624,12 @@ impl Engine {
             Ok(outcome)
         } else {
             Ok(deny(match mode {
-                ConsentGesture::Nod => "nod your head to approve",
+                ConsentGesture::Nod => "keep nodding your head to approve",
                 ConsentGesture::Closure => {
                     "close your eyes for about a second, then open, to approve"
                 }
                 ConsentGesture::Either => {
-                    "nod your head to approve (or, if you've calibrated it, close your eyes ~1s then open)"
+                    "keep nodding your head to approve (or, if you've calibrated it, close your eyes ~1s then open)"
                 }
             }))
         }

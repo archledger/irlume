@@ -268,7 +268,7 @@ impl PamServiceModule for IrlumePam {
             );
             if is_polkit && !unseal {
                 let _ = pamh.conv(
-                    Some("irlume: nod your head to approve (or close your eyes ~1s then open)"),
+                    Some("irlume: keep nodding your head to approve (or close your eyes ~1s then open)"),
                     pamsm::PamMsgStyle::TEXT_INFO,
                 );
             }

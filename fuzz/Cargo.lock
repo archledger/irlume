@@ -77,6 +77,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-camera"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "irlume-common",
  "libc",
@@ -474,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-common"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "libc",
  "serde",
@@ -486,11 +492,11 @@ dependencies = [
 
 [[package]]
 name = "irlume-core"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "aes-gcm",
  "argon2",
- "base64",
+ "base64 0.23.0",
  "irlume-common",
  "irlume-vision",
  "rand 0.10.2",
@@ -515,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-vision"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "irlume-camera",
  "irlume-common",
@@ -819,7 +825,7 @@ version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "859d4117bd1b1dc5646359ee7243c50c5000c0920ea2d1fb120335a2f4c684b8"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "oid",
  "picky-asn1",
  "picky-asn1-der",

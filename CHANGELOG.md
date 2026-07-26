@@ -100,6 +100,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Desktop integrations now have a small, versioned JSON foundation.**
+  `irlume version --json` advertises only implemented public capabilities, and
+  `irlume profiles list --json` exposes the existing read-only enrollment
+  summary without daemon prose or private socket access. The documented
+  contract keeps stdout machine-only, uses stable error codes, and deliberately
+  withholds mutation capabilities until the enrollment store owns opaque IDs.
+
 - **`sudo irlume camera-tune` measures whether your camera can read both sensors
   at once.** Some Hello modules stop exposing their colour stream properly while
   their infrared sibling is streaming. On a NexiGo HelloCam N930W the colour

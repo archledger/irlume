@@ -25,6 +25,7 @@ mod blinkcap;
 mod commands;
 mod fingerprint;
 mod logs;
+mod machine;
 mod models;
 mod pad;
 mod pamwire;
@@ -105,6 +106,9 @@ fn main() -> std::process::ExitCode {
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
+        (Some("profiles"), Some("list")) if args.iter().any(|arg| arg == "--json") => {
+            machine::profiles_list(&args)
+        }
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("enrolldev"), _) => enrolldev(&args),
@@ -125,6 +129,7 @@ fn main() -> std::process::ExitCode {
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
+        (Some("version"), _) if args.iter().any(|arg| arg == "--json") => machine::version(&args),
         (Some("version"), _) | (Some("--version"), _) | (Some("-V"), _) => {
             println!("irlume {}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS

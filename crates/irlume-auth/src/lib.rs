@@ -766,7 +766,27 @@ impl Engine {
         })
     }
 
+    /// Streams held open across a run of captures, so a loop pays the open,
+    /// format negotiation, buffer mapping, STREAMON and auto-exposure warm-up
+    /// once instead of per capture. Measured on the ASUS built-in: ~700ms of
+    /// every RGB capture is that setup.
+    ///
+    /// Only handed to loops that capture repeatedly under one request, never
+    /// held across requests: an idle stream reserves the camera against other
+    /// applications, keeps the capture LED lit, and would go stale across a
+    /// suspend.
     fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
+        self.assess_full_with(None)
+    }
+
+    /// [`Self::assess_full`], optionally reusing already-streaming cameras.
+    fn assess_full_with(
+        &mut self,
+        held: Option<(
+            &mut irlume_camera::RgbSession<'_>,
+            &mut irlume_camera::IrSession<'_>,
+        )>,
+    ) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
         //
@@ -797,7 +817,43 @@ impl Engine {
                     == Some(irlume_camera::CaptureMode::Sequential)
             }
         };
-        let (rgb_res, rgb_ms, ir_res, ir_ms) = if sequential {
+        // With held sessions the streams are already running, so a capture is
+        // just the frames. Every RETRY below deliberately stays on the one-shot
+        // path: a retry exists because something went wrong with this capture,
+        // and re-opening is what makes a broken stream recoverable.
+        let (rgb_res, rgb_ms, ir_res, ir_ms) = if let Some((rgb_s, ir_s)) = held {
+            if sequential {
+                let t = std::time::Instant::now();
+                let rgb = rgb_s.denoised();
+                let rgb_ms = t.elapsed().as_millis();
+                if rgb.is_err() {
+                    (rgb, rgb_ms, Ok(None), 0)
+                } else {
+                    let t = std::time::Instant::now();
+                    let ir = ir_s.capture_with_stats();
+                    (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
+                }
+            } else {
+                std::thread::scope(|s| {
+                    let ir_thread = s.spawn(move || {
+                        let t = std::time::Instant::now();
+                        (ir_s.capture_with_stats(), t.elapsed().as_millis())
+                    });
+                    let t = std::time::Instant::now();
+                    let rgb = rgb_s.denoised();
+                    let rgb_ms = t.elapsed().as_millis();
+                    let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
+                        (
+                            Err(irlume_common::Error::Hardware(
+                                "IR capture thread panicked".into(),
+                            )),
+                            0,
+                        )
+                    });
+                    (rgb, rgb_ms, ir.map(Some), ir_ms)
+                })
+            }
+        } else if sequential {
             let t = std::time::Instant::now();
             let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
             let rgb_ms = t.elapsed().as_millis();
@@ -2013,6 +2069,42 @@ impl Engine {
         pitch_neutral: Option<f32>,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
         let mut out = Vec::new();
+        // Hold the cameras open for the whole loop. This is the heaviest repeated
+        // capture in the codebase (the budget below is ten assessments per wanted
+        // scan), and every one of them otherwise re-opened, re-negotiated,
+        // re-mapped and re-warmed both streams, plus blinked the capture LED.
+        // Measured on the ASUS built-in with examples/session_bench.rs: an
+        // RGB+IR pair costs 1912ms per-call against 797ms on a held session,
+        // so 1115ms of every attempt was setup (58%). Safe to hold
+        // for a burst this long because the emitter does not go dark: measured at
+        // a flat lit level for 30s of continuous streaming on both modules we
+        // have (examples/ir_refire_probe.rs).
+        //
+        // A camera that cannot be opened is NOT fatal here: fall back to the
+        // per-capture path, which is exactly today's behaviour, so enrolment
+        // still works on hardware the session path cannot hold.
+        let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
+        let cams = if self.ir_available {
+            match (
+                irlume_camera::RgbCamera::open(&rgb_dev),
+                irlume_camera::IrCamera::open(&ir_dev),
+            ) {
+                (Ok(r), Ok(i)) => Some((r, i)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut sessions = match &cams {
+            Some((r, i)) => match (r.session(), i.session()) {
+                (Ok(rs), Ok(is)) => Some((rs, is)),
+                _ => None,
+            },
+            None => None,
+        };
+        if sessions.is_none() {
+            irlume_common::dlog!("enroll: capturing per-frame (no held camera session)");
+        }
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved) with enough
         // retries that a brief drift near the capture moment doesn't abort enroll.
@@ -2020,7 +2112,10 @@ impl Engine {
             if out.len() >= want {
                 break;
             }
-            let a = self.assess()?;
+            let a = match &mut sessions {
+                Some((rs, is)) => self.assess_full_with(Some((rs, is)))?,
+                None => self.assess()?,
+            };
             // Authoritative capture gate: LIVE *and* squarely frontal. The guided
             // TUI only decides when to START the 3-2-1; this is what actually
             // decides whether the frame is kept, so a turned/tilted (but live)

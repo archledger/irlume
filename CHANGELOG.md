@@ -71,6 +71,19 @@ All notable changes to irlume are documented here. This project adheres to
   a sequential brightness of 100 it reports the measurement as inconclusive and
   asks for a re-run in normal light. A detected loss needs no such caveat.
 
+- **Enrolling no longer re-opens the camera for every attempt.** The capture
+  loop holds both streams open for its duration instead of paying the open,
+  format negotiation, buffer mapping, stream start and auto-exposure warm-up per
+  attempt. Measured on an ASUS FHD built-in, a colour+infrared capture pair costs
+  1912ms through the per-call path and 797ms on a held stream, so 58% of every
+  attempt was setup rather than frames. It also stops the capture light blinking
+  once per attempt, which is what the old lifecycle looked like from the outside.
+
+  Holding the stream is safe because the emitter does not go dark: after a single
+  control write it stayed lit through 30 seconds of continuous streaming on both
+  modules tested, and the control survives even closing the stream. Streams are
+  still never held between requests, so an idle daemon keeps reserving nothing.
+
 ### Fixed
 
 - **The RGB and IR frames of one decision had no bound on how far apart they were

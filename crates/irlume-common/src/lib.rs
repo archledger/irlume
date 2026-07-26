@@ -21,7 +21,7 @@ pub mod thirdparty;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-/// Unix domain socket the daemon listens on. Root-owned, mode 0660, group-gated.
+/// Unix domain socket the daemon listens on. SO_PEERCRED gates every request.
 pub const SOCKET_PATH: &str = "/run/irlume.sock";
 
 /// A byte secret (e.g. the login password) that zeroizes on drop and whose

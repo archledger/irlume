@@ -266,35 +266,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // SO_PEERCRED is the real trust boundary. Defence-in-depth: if the `irlume`
-    // group exists, restrict the socket to `0660 root:irlume` so only group
-    // members (greeters, the user) can even connect; otherwise fall back to
-    // 0666 so a box without the group set up still works (greeters run as
-    // varied uids). Privileged ops are gated by the peer-credential check either way.
-    match users::gid_for_group("irlume") {
-        Some(gid) => {
-            if let Err(e) = users::chown(std::path::Path::new(&socket), Some(0), Some(gid)) {
-                eprintln!("irlumed: could not chown socket to root:irlume ({e}); leaving 0666");
-                set_mode(&socket, 0o666);
-            } else {
-                set_mode(&socket, 0o660);
-                eprintln!("irlumed: socket restricted to root:irlume (0660)");
-            }
-        }
-        None => {
-            // No `irlume` group: the socket is world-connectable. Privileged ops
-            // still require the peer-credential check, but the unprivileged
-            // endpoints (health tier, self-scoped identify) are now open to any
-            // local uid. A normal packaged install creates the group; warn loudly
-            // so a hand-rolled deployment notices it skipped that step.
-            eprintln!(
-                "irlumed: WARNING: no `irlume` group; socket left world-connectable (0666). \
-                 Create the group and restart so only greeters/users can connect: \
-                 groupadd -r irlume"
-            );
-            set_mode(&socket, 0o666);
-        }
-    }
+    // SO_PEERCRED is the authorization boundary. The socket must remain
+    // reachable by every local desktop and greeter uid: packaged installs
+    // cannot safely predict those accounts or add active sessions to a
+    // supplementary group. Every mutation is still root-only or scoped to the
+    // authenticated peer uid in request handling below.
+    set_mode(&socket, daemon_socket_mode());
+    eprintln!("irlumed: socket available to local peers (0666; SO_PEERCRED enforced)");
     eprintln!("irlumed: listening on {socket}");
     if irlume_common::dbglog::on() {
         eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
@@ -1721,7 +1699,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         }
         Request::CaptureEarMedian { user: _ } => {
             // Fires the camera; root-gate like the other camera-bearing requests
-            // (on the 0666 socket fallback this is what keeps other uids out).
+            // (on the local-peer socket this is what keeps other uids out).
             if peer.uid != 0 {
                 return Response::Error(format!(
                     "capture_ear_median requires root (peer uid {})",
@@ -1755,7 +1733,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // Fires the camera and returns raw liveness/alignment measurements
             // (IR brightness, center/edge, glint), which are a spoof-tuning oracle and
             // a way to tie up the single-threaded daemon. Gate to root, like the
-            // other camera-bearing requests; on the 0666 socket fallback this is
+            // other camera-bearing requests; on the local-peer socket this is
             // the only thing keeping an arbitrary local uid out.
             if peer.uid != 0 {
                 return Response::Error(format!("self_test requires root (peer uid {})", peer.uid));
@@ -2219,9 +2197,18 @@ fn set_mode(path: &str, mode: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
+const fn daemon_socket_mode() -> u32 {
+    0o666
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_stays_reachable_to_desktop_and_greeter_peers() {
+        assert_eq!(daemon_socket_mode(), 0o666);
+    }
 
     #[test]
     fn verifiable_shadow_hash_extracts_and_skips_unverifiable() {

@@ -1,8 +1,5 @@
 post_install() {
     systemctl daemon-reload
-    # Create the `irlume` system group so the daemon restricts its socket to
-    # 0660 root:irlume instead of falling back to 0666.
-    systemd-sysusers 2>/dev/null || true
     # Load the AppArmor profile before the daemon starts, but only if this box
     # actually runs AppArmor (Arch does not by default). apparmor_parser is
     # absent unless the user opted in, so this is a no-op on a stock install.
@@ -22,8 +19,8 @@ irlume installed. Next steps:
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
 (enrollment auto-enables the 850nm IR emitter when IR frames are black;
  manual fallback for IR cameras: sudo irlume ir-setup)
-Arch runs no LSM policy by default; SO_PEERCRED plus the 0660 root:irlume
-socket group are the daemon's protection. If you boot with AppArmor, the
+Arch runs no LSM policy by default; SO_PEERCRED is the daemon's local
+authorization boundary. If you boot with AppArmor, the
 bundled profile (/etc/apparmor.d/usr.bin.irlumed) is loaded automatically.
 Password is always the fallback.
 EOF
@@ -31,8 +28,6 @@ EOF
 
 post_upgrade() {
     systemctl daemon-reload
-    # Create the `irlume` group if an older version predated it (idempotent).
-    systemd-sysusers 2>/dev/null || true
     if command -v apparmor_parser >/dev/null 2>&1; then
         apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>/dev/null || true
     fi

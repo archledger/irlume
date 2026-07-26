@@ -31,7 +31,7 @@ Conventions that apply everywhere:
 | Command | What it does |
 |---|---|
 | `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` starts the profile space over |
-| `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
+| `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P` | add a scan to profile P (improves recognition in new conditions) |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
@@ -39,6 +39,9 @@ Conventions that apply everywhere:
 | `irlume profiles challenge <on\|off>` | opt-in passive blink liveness |
 | `sudo irlume calibrate-closure` | teach the eye-closure consent gesture for app prompts (captures eyes-open/closed EAR); the head nod is the default and needs no calibration |
 | `irlume identify` | 1:N "who is this?"; as root it checks all users, otherwise scoped to you |
+
+Desktop integrations use opaque IDs with `--profile-id` / `--scan-id` plus
+`--json`; human commands continue to use display names.
 
 ## Keyring, TPM, and recovery
 

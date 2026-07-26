@@ -7,14 +7,14 @@
 //! protocol. A capability is advertised only after its public command, output
 //! shape, and compatibility rules are covered here and in `docs/MACHINE-API.md`.
 
-use irlume_common::{ProfileSummary, Request, Response};
+use irlume_common::{ProfileMutationKind, ProfileSummary, Request, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::process::ExitCode;
 
 pub const CONTRACT_VERSION: u32 = 1;
 
-const CAPABILITIES: &[&str] = &["version-json", "profiles-list-json"];
+const CAPABILITIES: &[&str] = &["version-json", "profiles-json", "profile-mutations-json"];
 
 #[derive(Serialize)]
 struct Document {
@@ -82,7 +82,8 @@ pub fn version(args: &[String]) -> ExitCode {
             json!({
                 "capabilities": CAPABILITIES,
                 "limits": {
-                    "max_profiles": 3
+                    "max_profiles": 3,
+                    "max_scans_per_profile": 20
                 }
             }),
         ),
@@ -102,13 +103,10 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
             require_eyes_open,
             require_challenge,
             ..
-        }) => emit(
-            &success(
-                COMMAND,
-                profiles_data(profiles, require_eyes_open, require_challenge),
-            ),
-            ExitCode::SUCCESS,
-        ),
+        }) => match profiles_data(profiles, require_eyes_open, require_challenge) {
+            Ok(data) => emit(&success(COMMAND, data), ExitCode::SUCCESS),
+            Err(code) => emit(&failure(COMMAND, code, false), ExitCode::FAILURE),
+        },
         Ok(Response::Error(_)) => emit(
             &failure(COMMAND, "operation-failed", false),
             ExitCode::FAILURE,
@@ -122,6 +120,202 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
             ExitCode::FAILURE,
         ),
     }
+}
+
+pub fn profiles_delete(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "profiles.delete";
+    let Some(parsed) = parse_profile_mutation_args(args, false) else {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    };
+    let user = crate::user_arg(args);
+    let request = match parsed.scan_id {
+        Some(scan_id) => Request::DeleteScanById {
+            user,
+            profile_id: parsed.profile_id,
+            scan_id,
+        },
+        None => Request::DeleteProfileById {
+            user,
+            profile_id: parsed.profile_id,
+        },
+    };
+    emit_profile_mutation(COMMAND, request)
+}
+
+pub fn profiles_rename(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "profiles.rename";
+    let Some(parsed) = parse_profile_mutation_args(args, true) else {
+        return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
+    };
+    let user = crate::user_arg(args);
+    let new_name = parsed.new_name.expect("rename parser requires a name");
+    let request = match parsed.scan_id {
+        Some(scan_id) => Request::RenameScanById {
+            user,
+            profile_id: parsed.profile_id,
+            scan_id,
+            new_name,
+        },
+        None => Request::RenameProfileById {
+            user,
+            profile_id: parsed.profile_id,
+            new_name,
+        },
+    };
+    emit_profile_mutation(COMMAND, request)
+}
+
+fn emit_profile_mutation(command: &'static str, request: Request) -> ExitCode {
+    match crate::daemon_request(&request) {
+        Ok(Response::ProfileMutation {
+            operation,
+            profile_id,
+            profile_name_before,
+            profile_name_after,
+            scan_id,
+            scan_name_before,
+            scan_name_after,
+            total_scans,
+        }) => emit(
+            &success(
+                command,
+                mutation_data(
+                    operation,
+                    profile_id,
+                    profile_name_before,
+                    profile_name_after,
+                    scan_id,
+                    scan_name_before,
+                    scan_name_after,
+                    total_scans,
+                ),
+            ),
+            ExitCode::SUCCESS,
+        ),
+        Ok(Response::Error(_)) => emit(
+            &failure(command, "operation-failed", false),
+            ExitCode::FAILURE,
+        ),
+        Ok(_) => emit(
+            &failure(command, "protocol-error", false),
+            ExitCode::FAILURE,
+        ),
+        Err(_) => emit(
+            &failure(command, "daemon-unavailable", true),
+            ExitCode::FAILURE,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mutation_data(
+    operation: ProfileMutationKind,
+    profile_id: String,
+    profile_name_before: Option<String>,
+    profile_name_after: Option<String>,
+    scan_id: Option<String>,
+    scan_name_before: Option<String>,
+    scan_name_after: Option<String>,
+    total_scans: Option<usize>,
+) -> Value {
+    let record = |profile_name: Option<String>, scan_name: Option<String>| {
+        profile_name.map(|profile_name| {
+            json!({
+                "profile_id": profile_id,
+                "profile_name": profile_name,
+                "scan_id": scan_id,
+                "scan_name": scan_name
+            })
+        })
+    };
+    let before = record(profile_name_before, scan_name_before);
+    let after = record(profile_name_after, scan_name_after);
+    let deleted = matches!(
+        operation,
+        ProfileMutationKind::DeleteProfile | ProfileMutationKind::DeleteScan
+    );
+    json!({
+        "operation": operation,
+        "profile_id": profile_id,
+        "scan_id": scan_id,
+        "before": before,
+        "after": after,
+        "total_scans": total_scans,
+        "deleted": deleted,
+        "mutated_other_profiles": false
+    })
+}
+
+struct MutationArgs {
+    profile_id: String,
+    scan_id: Option<String>,
+    new_name: Option<String>,
+}
+
+fn parse_profile_mutation_args(args: &[String], rename: bool) -> Option<MutationArgs> {
+    let expected_subcommand = if rename { "rename" } else { "delete" };
+    if args.first().map(String::as_str) != Some("profiles")
+        || args.get(1).map(String::as_str) != Some(expected_subcommand)
+    {
+        return None;
+    }
+    let mut profile_id = None;
+    let mut scan_id = None;
+    let mut new_name = None;
+    let mut saw_json = false;
+    let mut saw_user = false;
+    let mut index = 2;
+    while index < args.len() {
+        let (slot, validate_id): (&mut Option<String>, bool) = match args[index].as_str() {
+            "--profile-id" if profile_id.is_none() => (&mut profile_id, true),
+            "--scan-id" if scan_id.is_none() => (&mut scan_id, true),
+            "--name" if rename && new_name.is_none() => (&mut new_name, false),
+            "--user" if !saw_user => {
+                saw_user = true;
+                let user = args.get(index + 1)?;
+                if user.is_empty() || user.starts_with('-') {
+                    return None;
+                }
+                index += 2;
+                continue;
+            }
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+                continue;
+            }
+            _ => return None,
+        };
+        let value = args.get(index + 1)?;
+        if value.is_empty() || value.starts_with('-') {
+            return None;
+        }
+        if validate_id {
+            let valid = if args[index] == "--profile-id" {
+                irlume_core::storage::valid_profile_id(value)
+            } else {
+                irlume_core::storage::valid_scan_id(value)
+            };
+            if !valid {
+                return None;
+            }
+        } else if value.trim() != value
+            || value.chars().count() > 80
+            || value.chars().any(char::is_control)
+        {
+            return None;
+        }
+        *slot = Some(value.clone());
+        index += 2;
+    }
+    if !saw_json || profile_id.is_none() || rename != new_name.is_some() {
+        return None;
+    }
+    Some(MutationArgs {
+        profile_id: profile_id.expect("checked"),
+        scan_id,
+        new_name,
+    })
 }
 
 fn valid_profiles_list_args(args: &[String]) -> bool {
@@ -159,26 +353,35 @@ fn profiles_data(
     profiles: Vec<ProfileSummary>,
     require_eyes_open: bool,
     require_challenge: bool,
-) -> Value {
-    // The current enrollment store identifies profiles and scans by their
-    // names. Do not falsely present those names as opaque stable IDs. A later
-    // contract capability can add mutation-safe IDs after the store owns them.
-    let profiles = profiles
-        .into_iter()
-        .map(|profile| {
-            json!({
-                "display_name": profile.name,
-                "scans": profile.scans.into_iter().map(|name| {
-                    json!({ "display_name": name })
-                }).collect::<Vec<_>>()
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "profiles": profiles,
+) -> Result<Value, &'static str> {
+    let mut output = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        if !irlume_core::storage::valid_profile_id(&profile.id)
+            || profile.scans.len() != profile.scan_ids.len()
+        {
+            return Err("unsupported-daemon");
+        }
+        let mut scans = Vec::with_capacity(profile.scans.len());
+        for (name, id) in profile.scans.into_iter().zip(profile.scan_ids) {
+            if !irlume_core::storage::valid_scan_id(&id) {
+                return Err("unsupported-daemon");
+            }
+            scans.push(json!({
+                "scan_id": id,
+                "display_name": name
+            }));
+        }
+        output.push(json!({
+            "profile_id": profile.id,
+            "display_name": profile.name,
+            "scans": scans
+        }));
+    }
+    Ok(json!({
+        "profiles": output,
         "require_eyes_open": require_eyes_open,
         "require_challenge": require_challenge
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -201,28 +404,107 @@ mod tests {
         assert_eq!(document["ok"], true);
         assert_eq!(
             document["data"]["capabilities"],
-            json!(["version-json", "profiles-list-json"])
+            json!(["version-json", "profiles-json", "profile-mutations-json"])
         );
         assert!(document.get("error").is_none());
     }
 
     #[test]
-    fn profile_listing_does_not_claim_unimplemented_opaque_ids() {
+    fn profile_listing_exposes_stored_opaque_ids() {
         let data = profiles_data(
             vec![ProfileSummary {
+                id: "profile-0123456789abcdef0123456789abcdef".into(),
                 name: "Face Profile 1".into(),
                 scans: vec!["Scan 1".into()],
+                scan_ids: vec!["scan-fedcba9876543210fedcba9876543210".into()],
             }],
             true,
             false,
-        );
+        )
+        .unwrap();
 
+        assert_eq!(
+            data["profiles"][0]["profile_id"],
+            "profile-0123456789abcdef0123456789abcdef"
+        );
         assert_eq!(data["profiles"][0]["display_name"], "Face Profile 1");
         assert_eq!(data["profiles"][0]["scans"][0]["display_name"], "Scan 1");
-        assert!(data["profiles"][0].get("profile_id").is_none());
-        assert!(data["profiles"][0]["scans"][0].get("scan_id").is_none());
+        assert_eq!(
+            data["profiles"][0]["scans"][0]["scan_id"],
+            "scan-fedcba9876543210fedcba9876543210"
+        );
         assert_eq!(data["require_eyes_open"], true);
         assert_eq!(data["require_challenge"], false);
+    }
+
+    #[test]
+    fn profile_listing_refuses_missing_or_misaligned_ids() {
+        let profile = |scan_ids| ProfileSummary {
+            id: "profile-0123456789abcdef0123456789abcdef".into(),
+            name: "Primary".into(),
+            scans: vec!["Scan 1".into()],
+            scan_ids,
+        };
+        assert_eq!(
+            profiles_data(vec![profile(vec![])], false, false).unwrap_err(),
+            "unsupported-daemon"
+        );
+        let mut missing = profile(vec!["scan-fedcba9876543210fedcba9876543210".into()]);
+        missing.id.clear();
+        assert_eq!(
+            profiles_data(vec![missing], false, false).unwrap_err(),
+            "unsupported-daemon"
+        );
+    }
+
+    #[test]
+    fn mutation_args_require_safe_ids_json_and_bounded_names() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        let profile = "profile-0123456789abcdef0123456789abcdef";
+        let scan = "scan-fedcba9876543210fedcba9876543210";
+        assert!(parse_profile_mutation_args(
+            &args(&[
+                "profiles",
+                "rename",
+                "--profile-id",
+                profile,
+                "--scan-id",
+                scan,
+                "--name",
+                "Glasses",
+                "--json"
+            ]),
+            true
+        )
+        .is_some());
+        assert!(parse_profile_mutation_args(
+            &args(&["profiles", "delete", "--profile-id", profile, "--json"]),
+            false
+        )
+        .is_some());
+        assert!(parse_profile_mutation_args(
+            &args(&["profiles", "delete", "--profile-id", "../unsafe", "--json"]),
+            false
+        )
+        .is_none());
+        assert!(parse_profile_mutation_args(
+            &args(&[
+                "profiles",
+                "rename",
+                "--profile-id",
+                profile,
+                "--name",
+                " padded ",
+                "--json"
+            ]),
+            true
+        )
+        .is_none());
     }
 
     #[test]

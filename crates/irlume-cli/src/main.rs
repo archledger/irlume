@@ -109,6 +109,12 @@ fn main() -> std::process::ExitCode {
         (Some("profiles"), Some("list")) if args.iter().any(|arg| arg == "--json") => {
             machine::profiles_list(&args)
         }
+        (Some("profiles"), Some("delete")) if args.iter().any(|arg| arg == "--json") => {
+            machine::profiles_delete(&args)
+        }
+        (Some("profiles"), Some("rename")) if args.iter().any(|arg| arg == "--json") => {
+            machine::profiles_rename(&args)
+        }
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
         (Some("enrolldev"), _) => enrolldev(&args),

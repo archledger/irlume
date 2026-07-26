@@ -50,13 +50,29 @@ advertised capabilities, and public limits.
 
 ### `irlume profiles list --json [--user USER]`
 
-Capability: `profiles-list-json`.
+Capability: `profiles-json`.
 
-Returns display names, scan display names, and the two per-user liveness policy
-flags. The current enrollment store identifies these records by mutable names,
-so this first read-only contract intentionally does not invent opaque IDs or
-advertise profile mutations. Mutation-safe IDs must originate in the engine
-store before a later capability can expose them.
+Returns stable opaque profile and scan IDs, display names, and the two per-user
+liveness policy flags. An older daemon that cannot supply valid aligned IDs is
+rejected with `unsupported-daemon`; mutable display names are never substituted.
+
+### Profile mutations
+
+Capability: `profile-mutations-json`.
+
+```text
+irlume profiles rename --profile-id ID --name NAME --json
+irlume profiles rename --profile-id ID --scan-id ID --name NAME --json
+irlume profiles delete --profile-id ID --json
+irlume profiles delete --profile-id ID --scan-id ID --json
+```
+
+Mutation targets are stable opaque IDs. The daemon resolves them inside its
+privileged storage boundary and returns the exact affected IDs, typed operation,
+explicit before/after display identity, remaining scan count, and
+`mutated_other_profiles: false`. IDs and names are bounded and validated before
+the request is sent. Deleting the final scan is refused; callers must delete the
+profile instead.
 
 ## Security and privacy
 
@@ -69,6 +85,6 @@ from human output or the private socket protocol:
 
 - enrollment or authentication-test event streams;
 - preview images and cancellation semantics;
-- profile or scan mutation;
+- streaming improve-recognition capture;
 - camera configuration mutation;
 - login plan, apply, verify, or rollback transactions.

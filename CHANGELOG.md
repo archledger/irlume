@@ -48,7 +48,62 @@ All notable changes to irlume are documented here. This project adheres to
   downgrade still reads your fitted floor. The denial text now says the face
   region is flatter than your enrolled face instead of asserting you are a photo.
 
+### Added
+
+- **`sudo irlume camera-tune` measures whether your camera can read both sensors
+  at once.** Some Hello modules stop exposing their colour stream properly while
+  their infrared sibling is streaming. On a NexiGo HelloCam N930W the colour
+  frame parks near a brightness of 60 no matter the room: with the light behind
+  the camera it measured 142.9 captured alone against 59.8 captured alongside
+  infrared, 42% of the signal, while the infrared stream was untouched. The same
+  colour sensor paired with a *different* camera's infrared node kept 99%, so it
+  is the two interfaces of one module competing, not concurrency itself. An ASUS
+  FHD built-in measured in the same light kept 102%.
+
+  The command runs both capture orders a few times, compares them, and stores the
+  answer per camera in `cameras.conf`; authentication then captures one sensor at
+  a time on cameras that need it and keeps the faster overlapped path on cameras
+  that do not. Overlapping saves 716ms per capture on the ASUS and 1410ms on the
+  NexiGo, which is what it costs those cameras to switch.
+
+  A dim room hides the fault, since a scene that genuinely reads ~60 looks the
+  same either way. The command says so instead of reporting a clean result: below
+  a sequential brightness of 100 it reports the measurement as inconclusive and
+  asks for a re-run in normal light. A detected loss needs no such caveat.
+
 ### Fixed
+
+- **The RGB and IR frames of one decision had no bound on how far apart they were
+  taken.** The liveness gate treats them as one scene: the face must appear in
+  the same place in both, and the colour frame's head pose judges a decision made
+  largely on the infrared frame. Nothing enforced that they showed the same
+  moment. The two captures race on separate threads, either one can retry alone,
+  and the dimming self-heal recaptures colour after infrared has finished. Frames
+  now carry the span of time their pixels came from, and a pair more than 3
+  seconds apart is refused as an uncertain capture rather than judged. That is a
+  retryable outcome, not a spoof accusation, so the grace window simply captures
+  again; the normal paths sit far below the limit, since overlapped captures
+  overlap and sequential ones run back to back.
+
+- **A camera that failed to stop streaming could take the daemon down.** The v4l
+  binding panics from its stream destructor on any STREAMOFF failure except a
+  disconnected device, and a destructor panic during an existing panic aborts the
+  process, which for the root daemon means every session's face auth, not one
+  request. Teardown failures are now contained and logged; the frames are already
+  captured by then and nothing depends on the stop succeeding.
+
+- **16-bit infrared frames were rescaled one frame at a time.** The scale was
+  derived from each frame's own brightest pixel, so a single hot pixel appearing
+  or leaving changed the whole frame's values. The capture path then compares
+  frame brightness to pick the emitter's lit phase and the ambient floor, which
+  that rescaling makes meaningless. The scale is now fixed once per capture
+  session. Cameras with 8-bit infrared, which is all of the ones tested, were
+  never affected.
+
+- **A short infrared sequence read as "you did not blink".** When frozen frames
+  exhausted the capture's attempt budget, the blink check silently judged whatever
+  short window arrived. The shortfall is now reported, so a camera fault is
+  distinguishable from a still face in the logs.
 
 - **Face `sudo` never worked on Debian and Ubuntu.** The wiring looked for a line
   starting with `auth` to place the stanza above, and Ubuntu's `/etc/pam.d/sudo`

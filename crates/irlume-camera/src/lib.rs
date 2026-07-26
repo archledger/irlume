@@ -37,6 +37,53 @@ pub struct Frame {
     pub spectrum: Spectrum,
     /// Raw bytes: RGB8 (R,G,B interleaved) for `Rgb`, GREY (8-bit) for `Ir`.
     pub data: Vec<u8>,
+    /// When the pixels were taken. Callers that reason about one scene across
+    /// BOTH sensors need this: the RGB and IR frames of one decision come from
+    /// separate streams that can drift apart without it.
+    pub captured: CaptureWindow,
+}
+
+/// The span of time a frame's pixels came from, on the monotonic clock.
+///
+/// Most frames are one dequeue, so `start == end`. Two are not: the denoised RGB
+/// frame is a per-pixel median over a burst, and the IR frame is the brightest of
+/// a burst, so their contents belong to a stretch of time rather than an instant.
+/// Keeping the stretch (instead of stamping "now" at return) is what lets
+/// [`CaptureWindow::gap_to`] state a real bound rather than a flattering one.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureWindow {
+    pub start: std::time::Instant,
+    pub end: std::time::Instant,
+}
+
+impl CaptureWindow {
+    /// A window covering a single instant.
+    pub fn at(t: std::time::Instant) -> Self {
+        Self { start: t, end: t }
+    }
+
+    /// The smallest window containing both.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
+    }
+
+    /// Time between the two windows: zero when they overlap, otherwise the gap
+    /// between the end of the earlier and the start of the later. This is the
+    /// worst case for "do these two frames show the same moment?", which is the
+    /// question the cross-spectrum cues actually depend on.
+    pub fn gap_to(self, other: Self) -> std::time::Duration {
+        if self.start <= other.end && other.start <= self.end {
+            return std::time::Duration::ZERO;
+        }
+        if self.end < other.start {
+            other.start - self.end
+        } else {
+            self.start - other.end
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +131,61 @@ const IR_DARK_HINT_MAX: f64 = 35.0;
 /// quad-buffer: enough that the driver never stalls waiting for a dequeue at
 /// 30fps, small enough to be granted by every UVC camera we have seen.
 const MMAP_BUFFERS: u32 = 4;
+
+/// A capture stream whose teardown cannot take the process down.
+///
+/// v4l 0.14's `Stream::drop` calls `stop()` and PANICS on any failure except
+/// ENODEV (`io/mmap/stream.rs:92`). That is a real hazard here: the daemon runs
+/// as root and opens a stream for every authentication, so one camera that
+/// errors on STREAMOFF would panic out of a destructor, and a destructor panic
+/// while another panic is unwinding aborts the whole process. The frames are
+/// already dequeued by then, and nothing we return depends on STREAMOFF
+/// succeeding, so the failure is worth a log line and nothing more.
+///
+/// Wrapping (rather than calling a "drop it safely" helper at each success
+/// path) is deliberate: every `?` early return drops the stream too, and those
+/// are exactly the paths a failing camera takes.
+struct SafeStream<'a> {
+    inner: Option<v4l::io::mmap::Stream<'a>>,
+    device: String,
+}
+
+impl<'a> SafeStream<'a> {
+    /// Open a stream on `dev` with the standard buffer ring.
+    fn open(device: &str, dev: &'a Device) -> irlume_common::Result<Self> {
+        let inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
+            .map_err(|e| map_io(device, e))?;
+        Ok(Self {
+            inner: Some(inner),
+            device: device.to_string(),
+        })
+    }
+}
+
+impl<'a> std::ops::Deref for SafeStream<'a> {
+    type Target = v4l::io::mmap::Stream<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("stream taken only in Drop")
+    }
+}
+
+impl std::ops::DerefMut for SafeStream<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut().expect("stream taken only in Drop")
+    }
+}
+
+impl Drop for SafeStream<'_> {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let device = self.device.clone();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(inner))).is_err() {
+            irlume_common::dlog!("{device}: stream teardown failed (STREAMOFF); frames unaffected");
+        }
+    }
+}
 
 /// Colour pixel formats imply an RGB sensor; greyscale-only implies the IR
 /// companion. linhello lesson: classify by advertised FourCC, never hardcode.
@@ -579,8 +681,7 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
         )));
     }
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-        .map_err(|e| map_io(device, e))?;
+    let mut stream = SafeStream::open(device, &dev)?;
 
     warm_up_stream(device, &mut stream)?;
     for _ in 0..AE_WARMUP {
@@ -589,6 +690,7 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
     let mut frames = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        let taken = std::time::Instant::now();
         let data = match &chosen {
             b"NV12" => nv12_to_rgb(buf, w, h),
             _ => yuyv_to_rgb(buf, w, h),
@@ -598,6 +700,7 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
             height: h,
             spectrum: Spectrum::Rgb,
             data,
+            captured: CaptureWindow::at(taken),
         });
     }
     Ok(frames)
@@ -794,10 +897,13 @@ fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(For
 }
 
 /// Convert one dequeued IR buffer to the 8-bit GREY layout the pipeline uses.
+/// Prefer [`IrDecoder`] inside a capture session: this entry point rescales
+/// each Y16 frame independently, which is fine for a one-shot decode but makes
+/// frame-to-frame brightness comparisons meaningless.
 pub(crate) fn decode_ir(buf: &[u8], pix: IrPixel, w: u32, h: u32) -> Vec<u8> {
     match pix {
         IrPixel::Grey8 => buf.to_vec(),
-        IrPixel::Grey16 => grey16_to_8(buf),
+        IrPixel::Grey16 => grey16_to_8_at(buf, grey16_shift(buf)),
         IrPixel::Nv12Luma => {
             let luma = (w as usize * h as usize).min(buf.len());
             buf[..luma].to_vec()
@@ -806,23 +912,58 @@ pub(crate) fn decode_ir(buf: &[u8], pix: IrPixel, w: u32, h: u32) -> Vec<u8> {
     }
 }
 
-/// 16-bit-LE grey (Y16/Y10/Y12) → 8-bit. The V4L2 spec keeps sample data
-/// LSB-aligned and lets the real precision be anything up to 16 bits, and
-/// nothing reports which; a fixed top-byte take (what a sibling project ships)
-/// reads a 10-bit-in-Y16 sensor as near-black. Instead, estimate the effective
-/// depth from the frame's own maximum and shift the whole frame uniformly:
-/// deterministic, monotone, and stable within a burst.
-pub(crate) fn grey16_to_8(buf: &[u8]) -> Vec<u8> {
+/// The right-shift that maps this frame's 16-bit-LE samples into 8 bits. The
+/// V4L2 spec keeps sample data LSB-aligned and lets the real precision be
+/// anything up to 16 bits, and nothing reports which; a fixed top-byte take
+/// (what a sibling project ships) reads a 10-bit-in-Y16 sensor as near-black,
+/// so the effective depth is estimated from the frame's own maximum.
+fn grey16_shift(buf: &[u8]) -> u32 {
     let max: u16 = buf
         .chunks_exact(2)
         .map(|p| u16::from_le_bytes([p[0], p[1]]))
         .max()
         .unwrap_or(0);
-    let bits = 16 - max.leading_zeros();
-    let shift = bits.saturating_sub(8);
+    (16 - max.leading_zeros()).saturating_sub(8)
+}
+
+/// 16-bit-LE grey (Y16/Y10/Y12) → 8-bit at a given shift.
+fn grey16_to_8_at(buf: &[u8], shift: u32) -> Vec<u8> {
     buf.chunks_exact(2)
         .map(|p| (u16::from_le_bytes([p[0], p[1]]) >> shift).min(255) as u8)
         .collect()
+}
+
+/// Decodes every frame of ONE capture session into 8-bit grey.
+///
+/// It exists to hold the Y16 shift steady. Deriving the shift from each frame's
+/// own maximum rescales every frame independently, so a single bright pixel
+/// appearing or leaving changes the scale even when the scene did not move. The
+/// IR path then compares frame means to pick the lit strobe phase and the
+/// ambient floor ([`IrCaptureStats`]), and those comparisons are only meaningful
+/// on a common scale. The first frame of the session sets the shift and the rest
+/// reuse it, which is what the old comment claimed ("stable within a burst") but
+/// the per-frame call could not deliver.
+///
+/// 8-bit formats carry no scale, so they are unaffected.
+pub(crate) struct IrDecoder {
+    pix: IrPixel,
+    shift: Option<u32>,
+}
+
+impl IrDecoder {
+    pub(crate) fn new(pix: IrPixel) -> Self {
+        Self { pix, shift: None }
+    }
+
+    pub(crate) fn decode(&mut self, buf: &[u8], w: u32, h: u32) -> Vec<u8> {
+        match self.pix {
+            IrPixel::Grey16 => {
+                let shift = *self.shift.get_or_insert_with(|| grey16_shift(buf));
+                grey16_to_8_at(buf, shift)
+            }
+            other => decode_ir(buf, other, w, h),
+        }
+    }
 }
 
 /// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
@@ -852,6 +993,11 @@ fn median_frame(mut frames: Vec<Frame>) -> Frame {
         return frames.pop().expect("median_frame: empty burst");
     }
     let (w, h, spectrum) = (frames[0].width, frames[0].height, frames[0].spectrum);
+    let window = frames
+        .iter()
+        .map(|f| f.captured)
+        .reduce(CaptureWindow::union)
+        .unwrap_or_else(|| CaptureWindow::at(std::time::Instant::now()));
     let len = frames.iter().map(|f| f.data.len()).min().unwrap_or(0);
     let mut out = vec![0u8; len];
     let mut col = vec![0u8; frames.len()];
@@ -867,6 +1013,9 @@ fn median_frame(mut frames: Vec<Frame>) -> Frame {
         height: h,
         spectrum,
         data: out,
+        // A median pixel can come from any frame in the burst, so the result
+        // belongs to the whole span, not to any one dequeue.
+        captured: window,
     }
 }
 
@@ -927,9 +1076,9 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-        .map_err(|e| map_io(device, e))?;
+    let mut stream = SafeStream::open(device, &dev)?;
     // Survive the first-capture-after-resume race (uvcvideo still re-initializing).
     warm_up_stream(device, &mut stream)?;
     // Fire the active-IR emitter on the open fd (Hello modules reset it per-open,
@@ -944,12 +1093,14 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
     // subtraction, and everything downstream see one uniform layout.
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
     let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
+    let mut taken: Vec<std::time::Instant> = Vec::with_capacity(IR_BURST);
     for i in 0..IR_BURST {
         if i == IR_BURST / 2 {
             ir_emitter::enable(dev.handle().fd(), &card);
         }
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        let data = decode_ir(buf, pix, w, h);
+        taken.push(std::time::Instant::now());
+        let data = dec.decode(buf, w, h);
         means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
         frames.push(data);
     }
@@ -967,6 +1118,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
         }
     }
     let mut best = Some(frames[best_i].clone());
+    let mut ir_window = CaptureWindow::at(taken[best_i]);
 
     // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in. On a
     // strobing emitter the frame adjacent to the brightest is an emitter-OFF
@@ -1015,6 +1167,8 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
                 // handing downstream a blank one.
                 if sub_mean >= SUBTRACT_MIN_RESULT {
                     best = Some(sub);
+                    // The result now carries pixels from BOTH frames.
+                    ir_window = ir_window.union(CaptureWindow::at(taken[ai]));
                 }
                 if debug_ir {
                     let clipped = ir_probe::saturated_fraction(&frames[best_i]);
@@ -1061,6 +1215,10 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
             height: h,
             spectrum: Spectrum::Ir,
             data: grey,
+            // The returned pixels are the chosen burst frame's, so the window is
+            // that dequeue. Ambient subtraction mixes in an ADJACENT frame, so
+            // it widens to cover both.
+            captured: ir_window,
         },
         IrCaptureStats {
             lit_mean: bmax as f32,
@@ -1076,9 +1234,9 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
 /// are diagnostics for the strobe-probe example. Kept in the crate so the
 /// example and the capture path share one implementation.
 pub mod ir_probe {
-    use super::{decode_ir, negotiate_ir_format};
+    use super::negotiate_ir_format;
     use super::{ir_emitter, map_io, privacy_engaged, verify_pinned, Error, Frame, Spectrum};
-    use super::{CaptureStream, Device, Type};
+    use super::{CaptureStream, Device};
 
     /// Mean brightness of an 8-bit greyscale buffer.
     pub fn mean(data: &[u8]) -> f64 {
@@ -1176,22 +1334,23 @@ pub mod ir_probe {
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+        let mut dec = super::IrDecoder::new(pix);
         let (w, h) = (fmt.width, fmt.height);
-        let mut stream =
-            v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, super::MMAP_BUFFERS)
-                .map_err(|e| map_io(device, e))?;
+        let mut stream = super::SafeStream::open(device, &dev)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         ir_emitter::enable(dev.handle().fd(), &card);
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
             let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            let taken = std::time::Instant::now();
             out.push((
                 Frame {
                     width: w,
                     height: h,
                     spectrum: Spectrum::Ir,
-                    data: decode_ir(buf, pix, w, h),
+                    data: dec.decode(buf, w, h),
+                    captured: super::CaptureWindow::at(taken),
                 },
                 t0.elapsed().as_secs_f64() * 1000.0,
             ));
@@ -1260,9 +1419,9 @@ pub fn capture_ir_streaming<B>(
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-        .map_err(|e| map_io(device, e))?;
+    let mut stream = SafeStream::open(device, &dev)?;
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     ir_emitter::enable(dev.handle().fd(), &card);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
@@ -1280,7 +1439,8 @@ pub fn capture_ir_streaming<B>(
             ir_emitter::enable(dev.handle().fd(), &card);
         }
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
-        let data = decode_ir(buf, pix, w, h);
+        let taken = std::time::Instant::now();
+        let data = dec.decode(buf, w, h);
         let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
         let sig = frame_signature(&data);
         let frozen = frame_frozen(mean, &sig, last_sig.as_deref());
@@ -1292,9 +1452,7 @@ pub fn capture_ir_streaming<B>(
                 dead_run = 0;
                 last_sig = None;
                 drop(stream); // stop + release buffers before re-arming
-                stream =
-                    v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-                        .map_err(|e| map_io(device, e))?;
+                stream = SafeStream::open(device, &dev)?;
                 ir_emitter::enable(dev.handle().fd(), &card);
             }
             continue;
@@ -1308,6 +1466,7 @@ pub fn capture_ir_streaming<B>(
             height: h,
             spectrum: Spectrum::Ir,
             data,
+            captured: CaptureWindow::at(taken),
         };
         if let std::ops::ControlFlow::Break(b) = on_frame(IrStreamFrame { frame, mean }) {
             return Ok(Some(b));
@@ -1341,11 +1500,9 @@ pub fn capture_ir_sequence(
     let burst = burst.max(1);
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = Some(
-        v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-            .map_err(|e| map_io(device, e))?,
-    );
+    let mut stream = Some(SafeStream::open(device, &dev)?);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     ir_emitter::enable(dev.handle().fd(), &card);
     let mut frames = Vec::with_capacity(samples);
@@ -1361,17 +1518,22 @@ pub fn capture_ir_sequence(
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
+        // The kept frame is one dequeue out of the mini-burst, so remember WHICH
+        // instant it came from rather than stamping the end of the burst.
+        let mut taken = std::time::Instant::now();
         for _ in 0..burst {
             let (buf, _meta) = stream
                 .as_mut()
                 .expect("IR stream present")
                 .next()
                 .map_err(|e| map_io(device, e))?;
-            let data = decode_ir(buf, pix, w, h);
+            let at = std::time::Instant::now();
+            let data = dec.decode(buf, w, h);
             let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
             if mean > best_mean {
                 best_mean = mean;
                 best = Some(data);
+                taken = at;
             }
         }
         let Some(data) = best else { continue };
@@ -1385,10 +1547,7 @@ pub fn capture_ir_sequence(
                 dead_run = 0;
                 last_sig = None;
                 drop(stream.take()); // stop + release buffers before re-arming
-                stream = Some(
-                    v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-                        .map_err(|e| map_io(device, e))?,
-                );
+                stream = Some(SafeStream::open(device, &dev)?);
                 ir_emitter::enable(dev.handle().fd(), &card);
             }
             continue;
@@ -1402,9 +1561,247 @@ pub fn capture_ir_sequence(
             height: h,
             spectrum: Spectrum::Ir,
             data,
+            captured: CaptureWindow::at(taken),
         });
     }
+    // A short return is a CAPTURE fault, not a quiet fact about the scene: the
+    // attempt budget ran out because frames arrived frozen, blown out, or too
+    // slowly. Callers read this sequence as temporal evidence, so a silent
+    // shortfall reads downstream as "the user did not blink" when the truth is
+    // "the camera did not deliver a window to look at". Say so; the caller
+    // decides whether a partial window is still worth judging.
+    if frames.len() < samples {
+        irlume_common::dlog!(
+            "{device}: IR sequence delivered {}/{samples} frames in {max_attempts} attempts \
+             ({restarts} stream restarts); temporal evidence is incomplete",
+            frames.len()
+        );
+    }
     Ok(frames)
+}
+
+// ---- capture-mode tuning (per-camera concurrency policy) --------------------
+
+/// How the RGB and IR frames of one decision are captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// Both streams at once. Faster, and correct on cameras that can sustain it.
+    Concurrent,
+    /// One stream at a time. Slower, and the only way to get full signal out of
+    /// a module whose two interfaces fight over the link they share.
+    Sequential,
+}
+
+impl CaptureMode {
+    /// The `cameras.conf` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaptureMode::Concurrent => "concurrent",
+            CaptureMode::Sequential => "sequential",
+        }
+    }
+
+    /// Parse a stored value; unknown text is not a mode.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "concurrent" => Some(CaptureMode::Concurrent),
+            "sequential" => Some(CaptureMode::Sequential),
+            _ => None,
+        }
+    }
+}
+
+/// One arm of the contention probe: what a capture produced, averaged.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PairSample {
+    pub rgb_mean: f32,
+    pub ir_mean: f32,
+    pub total_ms: f32,
+    pub rounds: usize,
+}
+
+/// What the probe measured about capturing both sensors at once.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContentionReport {
+    pub sequential: PairSample,
+    pub concurrent: PairSample,
+}
+
+/// Fraction of the sequential brightness the concurrent path must retain.
+///
+/// Measured 2026-07-25 on two modules. The ASUS FHD built-in retains 1.04 of its
+/// RGB and 0.94 of its IR, i.e. nothing outside round-to-round spread. The
+/// NexiGo HelloCam N930W retains 0.42-0.56 of its RGB while its IR is
+/// unaffected, and the loss is specific to its OWN sibling interface: pairing
+/// the same NexiGo RGB node with a different camera's IR node retains 0.99.
+///
+/// What the module actually does is stop tracking the scene. Across four runs
+/// its concurrent RGB mean stayed inside 56-66 while the sequential arm ranged
+/// 62 to 143 with the room lighting: 142.9 -> 59.8, 124.2 -> 64.9, 117.4 -> 66.1,
+/// 61.8 -> 56.2. That is auto-exposure freezing near a fixed short exposure
+/// while both interfaces stream, not a proportional dimming, which is why the
+/// same camera looks healthy in a dark room and loses more than half its signal
+/// in a lit one.
+///
+/// The floor sits between the two populations, nearer the healthy one, because
+/// the cost of a wrong answer is asymmetric: needlessly capturing sequentially
+/// costs latency, while capturing a face at a fraction of its real brightness
+/// costs recognition.
+pub const CONCURRENT_SIGNAL_FLOOR: f32 = 0.80;
+
+/// Sequential RGB brightness below which a CLEAN result proves nothing.
+///
+/// The loss only shows against a scene the camera should be exposing brightly.
+/// Found the hard way on 2026-07-25: the same NexiGo N930W measured 0.42-0.56
+/// retention with the sequential arm at 117-143, then 0.91 an hour later in a
+/// dark room with the sequential arm at 62. Since the concurrent path parks
+/// brightness near 60 whatever the light ([`CONCURRENT_SIGNAL_FLOOR`]), a scene
+/// that legitimately reads ~60 hides the fault completely.
+///
+/// So the two answers carry different weight: a measured LOSS stands on its own,
+/// while "no loss" is worth only as much as the light it was found in. The value
+/// sits between the brightness where the fault was visible (117 and up) and the
+/// one where it was not (62).
+pub const CONCLUSIVE_SCENE_BRIGHTNESS: f32 = 100.0;
+
+impl ContentionReport {
+    /// Whether a clean result can be believed. A measured LOSS is always
+    /// conclusive; only a clean bill of health depends on there having been
+    /// enough light to reveal one.
+    pub fn conclusive(&self) -> bool {
+        self.recommended_mode() == CaptureMode::Sequential
+            || self.sequential.rgb_mean >= CONCLUSIVE_SCENE_BRIGHTNESS
+    }
+
+    /// Share of the sequential RGB brightness the concurrent path kept. 1.0 when
+    /// the sequential arm measured nothing (no evidence of a loss).
+    pub fn retained_rgb(&self) -> f32 {
+        retained(self.concurrent.rgb_mean, self.sequential.rgb_mean)
+    }
+
+    /// Share of the sequential IR brightness the concurrent path kept.
+    pub fn retained_ir(&self) -> f32 {
+        retained(self.concurrent.ir_mean, self.sequential.ir_mean)
+    }
+
+    /// The mode this camera should use. Pure, so the decision is testable
+    /// without hardware.
+    pub fn recommended_mode(&self) -> CaptureMode {
+        if self.retained_rgb() < CONCURRENT_SIGNAL_FLOOR
+            || self.retained_ir() < CONCURRENT_SIGNAL_FLOOR
+        {
+            CaptureMode::Sequential
+        } else {
+            CaptureMode::Concurrent
+        }
+    }
+
+    /// Time the concurrent path saves per capture. Negative if it saves nothing.
+    pub fn saved_ms(&self) -> f32 {
+        self.sequential.total_ms - self.concurrent.total_ms
+    }
+}
+
+/// Guard against dividing by a sequential arm that captured nothing: with no
+/// baseline there is no measured loss, so report full retention.
+fn retained(concurrent: f32, sequential: f32) -> f32 {
+    if sequential <= f32::EPSILON {
+        return 1.0;
+    }
+    concurrent / sequential
+}
+
+/// Run the contention probe on a camera pair: `rounds` sequential captures, then
+/// `rounds` concurrent ones, reporting mean frame brightness and wall time for
+/// each. Fires the IR emitter repeatedly and takes a few seconds per round, so
+/// it is a setup-time action, not something an authentication does.
+///
+/// Failed captures are skipped rather than aborting the probe: a camera that
+/// errors under load is exactly what we are trying to characterize, and the
+/// round counts in the report say how much evidence each arm really has.
+pub fn measure_contention(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+) -> irlume_common::Result<ContentionReport> {
+    verify_pinned(rgb_dev)?;
+    verify_pinned(ir_dev)?;
+    let rounds = rounds.max(1);
+    let mut report = ContentionReport::default();
+
+    for _ in 0..rounds {
+        let t0 = std::time::Instant::now();
+        let rgb = capture_rgb_denoised(rgb_dev);
+        let ir = capture_ir(ir_dev);
+        accumulate(&mut report.sequential, &rgb, &ir, t0.elapsed());
+    }
+    for _ in 0..rounds {
+        let t0 = std::time::Instant::now();
+        let (rgb, ir) = std::thread::scope(|s| {
+            let ir_t = s.spawn(|| capture_ir(ir_dev));
+            let rgb = capture_rgb_denoised(rgb_dev);
+            (
+                rgb,
+                ir_t.join()
+                    .unwrap_or_else(|_| Err(Error::Hardware("IR probe thread panicked".into()))),
+            )
+        });
+        accumulate(&mut report.concurrent, &rgb, &ir, t0.elapsed());
+    }
+    if report.sequential.rounds == 0 || report.concurrent.rounds == 0 {
+        return Err(Error::Hardware(
+            "capture-mode probe: no round completed on this camera pair".into(),
+        ));
+    }
+    Ok(report)
+}
+
+/// Fold one probe round into a running mean.
+fn accumulate(
+    into: &mut PairSample,
+    rgb: &irlume_common::Result<Frame>,
+    ir: &irlume_common::Result<Frame>,
+    elapsed: std::time::Duration,
+) {
+    let (Ok(rgb), Ok(ir)) = (rgb, ir) else { return };
+    let n = into.rounds as f32;
+    let mix = |old: f32, new: f32| (old * n + new) / (n + 1.0);
+    into.rgb_mean = mix(into.rgb_mean, frame_mean(&rgb.data));
+    into.ir_mean = mix(into.ir_mean, frame_mean(&ir.data));
+    into.total_ms = mix(into.total_ms, elapsed.as_millis() as f32);
+    into.rounds += 1;
+}
+
+fn frame_mean(data: &[u8]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    data.iter().map(|&b| b as u64).sum::<u64>() as f32 / data.len() as f32
+}
+
+/// `cameras.conf` key holding the capture mode for one physical camera. Keyed by
+/// camera IDENTITY, not by device node: `/dev/videoN` numbering moves across
+/// reboots and replugs, and the answer belongs to the hardware.
+fn capture_mode_key(identity: &str) -> String {
+    format!("capture_mode.{identity}")
+}
+
+/// The stored capture mode for the camera behind `device`, if one was measured.
+/// `None` means unmeasured (the caller keeps its default) or an unreadable
+/// config; an unrecognized stored value is also `None` rather than a guess.
+pub fn stored_capture_mode(device: &str) -> Option<CaptureMode> {
+    let id = device_identity(device)?;
+    let raw = irlume_common::config::read_kv("cameras.conf", &capture_mode_key(&id))?;
+    CaptureMode::parse(&raw)
+}
+
+/// Persist the capture mode for the camera behind `device`. Writes
+/// `/etc/irlume/cameras.conf`, so it needs root.
+pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Result<()> {
+    let id = device_identity(device)
+        .ok_or_else(|| Error::Hardware(format!("{device}: cannot identify the camera")))?;
+    irlume_common::config::write_kv("cameras.conf", &capture_mode_key(&id), mode.as_str())
+        .map_err(|e| Error::Io(e.to_string()))
 }
 
 /// Auto-configure the IR emitter for `device`, irlume's integrated
@@ -1418,9 +1815,9 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = v4l::io::mmap::Stream::with_buffers(&dev, Type::VideoCapture, MMAP_BUFFERS)
-        .map_err(|e| map_io(device, e))?;
+    let mut stream = SafeStream::open(device, &dev)?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
@@ -1432,7 +1829,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         let mut best = 0.0f32;
         for _ in 0..8 {
             if let Ok((buf, _)) = stream.next() {
-                let data = decode_ir(buf, pix, w, h);
+                let data = dec.decode(buf, w, h);
                 let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
                 best = best.max(m as f32);
             }
@@ -1595,7 +1992,130 @@ mod tests {
             height: 1,
             spectrum: Spectrum::Rgb,
             data: data.to_vec(),
+            captured: CaptureWindow::at(std::time::Instant::now()),
         }
+    }
+
+    // The decision the probe exists to make, checked against the two modules we
+    // actually measured on 2026-07-25 rather than invented numbers.
+    #[test]
+    fn capture_mode_follows_the_measured_signal_loss() {
+        let report = |seq_rgb: f32, con_rgb: f32, seq_ir: f32, con_ir: f32| ContentionReport {
+            sequential: PairSample {
+                rgb_mean: seq_rgb,
+                ir_mean: seq_ir,
+                total_ms: 3595.0,
+                rounds: 20,
+            },
+            concurrent: PairSample {
+                rgb_mean: con_rgb,
+                ir_mean: con_ir,
+                total_ms: 2194.0,
+                rounds: 20,
+            },
+        };
+
+        // NexiGo HelloCam N930W: RGB collapses when its own IR sibling streams.
+        let nexigo = report(117.4, 66.1, 56.2, 50.8);
+        assert_eq!(nexigo.recommended_mode(), CaptureMode::Sequential);
+        assert!((nexigo.retained_rgb() - 0.563).abs() < 0.01);
+
+        // Same camera in a brighter scene: the concurrent arm barely moves
+        // (59.8 vs 66.1) while the sequential arm tracks the light up to 142.9,
+        // so the shortfall grows. Both runs must reach the same verdict.
+        let nexigo_lit = report(142.9, 59.8, 47.5, 51.1);
+        assert_eq!(nexigo_lit.recommended_mode(), CaptureMode::Sequential);
+        assert!(nexigo_lit.retained_rgb() < nexigo.retained_rgb());
+
+        // ASUS FHD built-in: no loss on either stream, so keep the fast path.
+        let asus = report(104.6, 108.4, 53.1, 50.1);
+        assert_eq!(asus.recommended_mode(), CaptureMode::Concurrent);
+
+        // A loss on the IR side alone is just as disqualifying as one on RGB.
+        assert_eq!(
+            report(104.0, 104.0, 100.0, 40.0).recommended_mode(),
+            CaptureMode::Sequential
+        );
+
+        // No baseline (the sequential arm captured nothing usable) must not read
+        // as a total loss and force every camera to the slow path.
+        let blind = report(0.0, 0.0, 0.0, 0.0);
+        assert_eq!(blind.retained_rgb(), 1.0);
+        assert_eq!(blind.recommended_mode(), CaptureMode::Concurrent);
+
+        assert!(nexigo.saved_ms() > 1400.0 && nexigo.saved_ms() < 1402.0);
+
+        // Scene dependence, measured the same day on the same NexiGo: bright
+        // room 117.4 -> 66.1 (loss visible), dark room 61.8 -> 56.2 (loss
+        // hidden). A clean result from the dark run must not be reported as
+        // proof the camera is healthy; a detected loss needs no such caveat.
+        assert!(nexigo.conclusive());
+        assert!(asus.conclusive());
+        assert!(!report(61.8, 56.2, 46.0, 45.0).conclusive());
+        assert!(!blind.conclusive());
+    }
+
+    #[test]
+    fn capture_mode_parses_only_the_two_spellings() {
+        assert_eq!(
+            CaptureMode::parse("sequential"),
+            Some(CaptureMode::Sequential)
+        );
+        assert_eq!(
+            CaptureMode::parse(" Concurrent \n"),
+            Some(CaptureMode::Concurrent)
+        );
+        // An unrecognized or empty value is NOT a mode: the caller keeps its own
+        // default rather than acting on a value it does not understand.
+        assert_eq!(CaptureMode::parse("fast"), None);
+        assert_eq!(CaptureMode::parse(""), None);
+        assert_eq!(
+            CaptureMode::parse(CaptureMode::Sequential.as_str()),
+            Some(CaptureMode::Sequential)
+        );
+    }
+
+    #[test]
+    fn capture_window_gap_is_zero_while_the_windows_touch() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let w = |a: u64, b: u64| CaptureWindow {
+            start: at(a),
+            end: at(b),
+        };
+
+        // Overlapping (the shipped concurrent capture) and abutting (a
+        // sequential capture, one burst then the other) both mean "same moment".
+        assert_eq!(w(0, 400).gap_to(w(200, 900)), Duration::ZERO);
+        assert_eq!(w(0, 400).gap_to(w(400, 1100)), Duration::ZERO);
+        // Containment counts as overlap in both directions.
+        assert_eq!(w(0, 900).gap_to(w(300, 400)), Duration::ZERO);
+        assert_eq!(w(300, 400).gap_to(w(0, 900)), Duration::ZERO);
+        // Disjoint: the gap is between the windows, not between their starts,
+        // and it reads the same from either side.
+        assert_eq!(w(0, 400).gap_to(w(1000, 1400)), Duration::from_millis(600));
+        assert_eq!(w(1000, 1400).gap_to(w(0, 400)), Duration::from_millis(600));
+        // A union spans both and therefore touches each of them.
+        let u = w(0, 400).union(w(1000, 1400));
+        assert_eq!(u.start, at(0));
+        assert_eq!(u.end, at(1400));
+    }
+
+    #[test]
+    fn median_frame_window_spans_the_whole_burst() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut frames = vec![frame(&[10, 10]), frame(&[20, 20]), frame(&[30, 30])];
+        for (i, f) in frames.iter_mut().enumerate() {
+            f.captured = CaptureWindow::at(t0 + Duration::from_millis(100 * i as u64));
+        }
+        // A median pixel may come from any frame, so the result cannot claim a
+        // single instant: it must cover first-to-last dequeue.
+        let m = median_frame(frames);
+        assert_eq!(m.captured.start, t0);
+        assert_eq!(m.captured.end, t0 + Duration::from_millis(200));
+        assert_eq!(m.data, vec![20, 20]);
     }
 
     #[test]
@@ -1965,7 +2485,10 @@ mod tests {
 
     #[test]
     fn grey16_conversion_estimates_effective_depth() {
-        use super::grey16_to_8;
+        use super::{grey16_shift, grey16_to_8_at};
+        fn grey16_to_8(buf: &[u8]) -> Vec<u8> {
+            grey16_to_8_at(buf, grey16_shift(buf))
+        }
         // True 16-bit data: high byte survives (0xAB00 → 0xAB).
         let full: Vec<u8> = [0xCDu16, 0xAB00, 0xFFFF]
             .iter()
@@ -1988,6 +2511,35 @@ mod tests {
         // Empty and odd-length buffers do not panic; the odd byte is ignored.
         assert!(grey16_to_8(&[]).is_empty());
         assert_eq!(grey16_to_8(&[0x40, 0x00, 0x7F]), vec![0x40]);
+    }
+
+    // The IR path picks the lit strobe frame and the ambient floor by comparing
+    // frame MEANS, so every frame of one session must share a scale. Deriving
+    // the shift per frame made a single bright pixel rescale the whole frame:
+    // here the second frame is physically identical to the first except for one
+    // hot sample, and a per-frame shift would report it as half as bright.
+    #[test]
+    fn ir_decoder_holds_the_y16_scale_across_a_session() {
+        use super::{IrDecoder, IrPixel};
+        let words = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let first = words(&[0, 256, 512, 1023]); // 10-bit: shift 2
+        let with_hot_pixel = words(&[0, 256, 512, 2047]); // one 11-bit sample
+
+        let mut session = IrDecoder::new(IrPixel::Grey16);
+        let a = session.decode(&first, 2, 2);
+        let b = session.decode(&with_hot_pixel, 2, 2);
+        assert_eq!(a, vec![0, 64, 128, 255]);
+        // Same scale: the unchanged samples decode to the SAME bytes.
+        assert_eq!(&b[..3], &a[..3]);
+
+        // A fresh session re-estimates, so a genuinely deeper feed still maps
+        // onto the full range instead of clipping forever.
+        let mut next = IrDecoder::new(IrPixel::Grey16);
+        assert_eq!(next.decode(&with_hot_pixel, 2, 2), vec![0, 32, 64, 255]);
+
+        // 8-bit formats carry no scale and are untouched by the session state.
+        let mut grey8 = IrDecoder::new(IrPixel::Grey8);
+        assert_eq!(grey8.decode(&[9, 9], 1, 2), vec![9, 9]);
     }
 
     #[test]

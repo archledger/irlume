@@ -984,6 +984,58 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
+        Request::TuneCaptureMode { rounds } => {
+            // Holds the camera for tens of seconds and rewrites capture policy in
+            // /etc/irlume, so it is root-only like the other camera-bearing
+            // management requests.
+            if peer.uid != 0 {
+                return Response::Error(format!(
+                    "camera-tune requires root (peer uid {})",
+                    peer.uid
+                ));
+            }
+            // Enough rounds that one unlucky capture cannot decide the answer,
+            // few enough that a user waits seconds rather than minutes: the
+            // measured spread was sd ~1.3 on a mean of ~117, so 6 is ample.
+            const DEFAULT_ROUNDS: usize = 6;
+            const MAX_ROUNDS: usize = 30;
+            let rounds = rounds.unwrap_or(DEFAULT_ROUNDS).clamp(1, MAX_ROUNDS);
+            let (rgb_dev, ir_dev) = (
+                engine.rgb_device().to_string(),
+                engine.ir_device().to_string(),
+            );
+            match irlume_auth::measure_contention(&rgb_dev, &ir_dev, rounds) {
+                Ok(report) => {
+                    let mode = report.recommended_mode();
+                    match irlume_auth::store_capture_mode(&rgb_dev, mode) {
+                        Ok(()) => {
+                            let mut msg = format!(
+                                "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
+                                 and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
+                                mode.as_str(),
+                                report.retained_rgb() * 100.0,
+                                report.retained_ir() * 100.0,
+                                report.saved_ms(),
+                            );
+                            // Say so rather than letting a dark room read as a
+                            // clean bill of health.
+                            if !report.conclusive() {
+                                msg.push_str(&format!(
+                                    "\n     measured in a dim scene (RGB mean {:.0}); this loss only \
+                                     shows in normal light, so re-run camera-tune with the room lit \
+                                     to confirm",
+                                    report.sequential.rgb_mean
+                                ));
+                            }
+                            eprintln!("irlumed: {msg}");
+                            Response::Ok(msg)
+                        }
+                        Err(e) => Response::Error(e.to_string()),
+                    }
+                }
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::SetupIrEmitter { dry_run } => {
             // Hardware fix on the shared camera; non-destructive on failure.
             if dry_run {

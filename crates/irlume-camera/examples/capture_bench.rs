@@ -57,6 +57,7 @@ fn main() {
     let rgb_dev = args.next().unwrap_or_else(|| "/dev/video0".into());
     let ir_dev = args.next().unwrap_or_else(|| "/dev/video2".into());
     let rounds: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let rgb_dev2 = rgb_dev.clone();
     println!("capture_bench: rgb={rgb_dev} ir={ir_dev} rounds={rounds}\n");
 
     let (mut seq_total, mut seq_rgb_b, mut seq_ir_b) = (
@@ -107,4 +108,29 @@ fn main() {
     con_total.report();
     con_rgb_b.report();
     con_ir_b.report();
+
+    // The distributions above are the raw evidence; this is the call `irlume
+    // camera-tune` would make from the same measurement, run through the shared
+    // implementation so the tool and the example cannot drift apart.
+    match irlume_camera::measure_contention(&rgb_dev2, &ir_dev, rounds.min(6)) {
+        Ok(report) => {
+            println!(
+                "\nRecommendation: {} capture for this camera\n  \
+             concurrent keeps {:.0}% of sequential RGB brightness, {:.0}% of IR \
+             (floor {:.0}%), and saves {:.0}ms per capture",
+                report.recommended_mode().as_str(),
+                report.retained_rgb() * 100.0,
+                report.retained_ir() * 100.0,
+                irlume_camera::CONCURRENT_SIGNAL_FLOOR * 100.0,
+                report.saved_ms(),
+            );
+            if !report.conclusive() {
+                println!(
+                    "  INCONCLUSIVE: the scene was dim (sequential RGB mean {:.0}); the loss this \n                       probe looks for only appears in normal light, so re-run with the room lit",
+                    report.sequential.rgb_mean
+                );
+            }
+        }
+        Err(e) => println!("\nRecommendation unavailable: {e}"),
+    }
 }

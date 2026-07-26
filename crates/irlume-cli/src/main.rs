@@ -121,6 +121,7 @@ fn main() -> std::process::ExitCode {
         }
         (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
+        (Some("camera-tune"), _) => camera_tune(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
@@ -517,6 +518,25 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
     report_ok_response(
         "ir-setup",
         daemon_request(&Request::SetupIrEmitter { dry_run: dry }),
+    )
+}
+
+/// `irlume camera-tune`: measure whether this camera can stream RGB and IR at
+/// once without losing signal, and persist the answer. Some Hello modules starve
+/// their own RGB interface when both stream (measured: the NexiGo HelloCam N930W
+/// keeps 56% of its RGB brightness), which dims the frame recognition runs on;
+/// others are unaffected and should keep the faster concurrent path. Only a
+/// measurement on the camera in front of the user can tell the two apart.
+fn camera_tune(args: &[String]) -> std::process::ExitCode {
+    use irlume_common::Request;
+    let rounds = flag(args, "--rounds").and_then(|v| v.parse::<usize>().ok());
+    eprintln!(
+        "[camera-tune] measuring this camera under load; it fires the IR emitter \
+         for up to a minute…"
+    );
+    report_ok_response(
+        "camera-tune",
+        daemon_request(&Request::TuneCaptureMode { rounds }),
     )
 }
 

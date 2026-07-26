@@ -1448,6 +1448,8 @@ SYSTEM INTEGRATION
                         needed; enroll auto-runs it when IR frames are dark)
   set-cameras <rgb> <ir>          persist the RGB+IR camera pair (sudo; the TUI
                         camera picker runs this for you)
+  camera-tune [--rounds N]        measure whether this camera can stream RGB and
+                        IR at once without dimming, and store the answer (sudo)
   models [enable|disable]         opt-in third-party liveness models: measured,
                         checksum-pinned, deny-only; fetched, never shipped
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which

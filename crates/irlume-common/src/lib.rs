@@ -257,6 +257,13 @@ pub enum Request {
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
     SetupIrEmitter { dry_run: bool },
+    /// Measure whether this camera can stream RGB and IR at once without losing
+    /// signal, and persist the answer (cameras.conf) so authentication picks the
+    /// right capture mode. Fires the camera for several seconds. PRIVILEGED.
+    TuneCaptureMode {
+        #[serde(default)]
+        rounds: Option<usize>,
+    },
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Liveness/health ping.

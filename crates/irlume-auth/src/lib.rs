@@ -19,7 +19,10 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 pub use irlume_camera::{capabilities, device_identity, select_pair};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
-pub use irlume_camera::{ensure_ir_emitter, list_ir_controls, setup_ir_emitter};
+pub use irlume_camera::{
+    ensure_ir_emitter, list_ir_controls, measure_contention, setup_ir_emitter, store_capture_mode,
+    CaptureMode, ContentionReport,
+};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
@@ -192,6 +195,25 @@ pub const GRACE_WINDOW_MS: u64 = 15000;
 /// looking at the screen, so a match lands on the first attempt; if they look
 /// away they want a quick drop to the password prompt, not a long freeze.
 pub const SUDO_GRACE_WINDOW_MS: u64 = 5000;
+
+/// How far apart the RGB and IR frames of ONE decision may be captured.
+///
+/// The cross-spectrum cues treat the two frames as one scene: the face must sit
+/// in the same place in both, and the RGB head pose is used to judge a decision
+/// made largely on the IR frame. Nothing else bounds the distance between them,
+/// so this does. It is a ceiling on the pathological case, not a tuning knob:
+/// the normal paths sit far below it, since the concurrent captures OVERLAP
+/// (gap zero) and a sequential capture runs the two bursts back to back (the
+/// windows abut, so the gap is again near zero). The distance only grows when
+/// captures stack up: a hard retry of one side, or the dimming self-heal
+/// recapturing RGB after IR finished. Measured worst single capture on the
+/// hardware we have is the NexiGo N930W at ~3.6s for a full sequential pair, so
+/// 3s of GAP between two windows means something went wrong rather than slow.
+///
+/// Exceeding it is [`Verdict::Uncertain`], never Spoof: a stale pair is a
+/// capture fault and says nothing about the person in front of the camera. That
+/// kind is presence-retryable, so the grace window just captures again.
+const MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// True for the sudo/su family of PAM services, which take the shorter window.
 fn is_sudo_like(service: &str) -> bool {
@@ -760,7 +782,21 @@ impl Engine {
         // never triggers either path. `IRLUME_SEQUENTIAL_CAPTURE=1` forces
         // strict back-to-back capture (RGB, then IR only if RGB succeeded) to
         // isolate a suspected concurrency problem.
-        let sequential = std::env::var("IRLUME_SEQUENTIAL_CAPTURE").is_ok_and(|v| v.trim() == "1");
+        // Order of authority: an explicit env override, then what the
+        // capture-mode probe measured on THIS camera (`irlume camera-tune`,
+        // stored per camera identity in cameras.conf), then the concurrent
+        // default. The probe exists because the dimming above is a property of
+        // the hardware, not of irlume: the NexiGo N930W keeps 56% of its RGB
+        // brightness when both of its interfaces stream, the ASUS built-in keeps
+        // all of it, and only a measurement on the actual camera can tell which
+        // kind is plugged in.
+        let sequential = match std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
+            Ok(v) => v.trim() == "1",
+            Err(_) => {
+                irlume_camera::stored_capture_mode(&self.rgb_dev)
+                    == Some(irlume_camera::CaptureMode::Sequential)
+            }
+        };
         let (rgb_res, rgb_ms, ir_res, ir_ms) = if sequential {
             let t = std::time::Instant::now();
             let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
@@ -897,6 +933,48 @@ impl Engine {
                 rgb_faces.len(),
                 rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
             );
+        }
+
+        // How far apart in time the two frames are. The cross-spectrum cues
+        // (same face co-located in RGB and IR, RGB pose judged against the IR
+        // face) only mean something if both frames show the SAME moment, and
+        // nothing upstream bounds that: the two captures race on separate
+        // threads, either side can retry alone, and the dimming self-heal above
+        // recaptures RGB after IR is long finished. Measure it, then refuse a
+        // pair too stale to compare.
+        let skew = rgb.captured.gap_to(ir.captured);
+        irlume_common::dlog!(
+            "assess: rgb/ir capture skew {}ms (rgb span {}ms, ir span {}ms)",
+            skew.as_millis(),
+            rgb.captured
+                .end
+                .duration_since(rgb.captured.start)
+                .as_millis(),
+            ir.captured
+                .end
+                .duration_since(ir.captured.start)
+                .as_millis()
+        );
+        if skew > MAX_CROSS_SPECTRUM_SKEW {
+            // Uncertain, not Spoof: a stale pair is a capture-quality problem and
+            // says nothing about the person. `OutcomeKind::Uncertain` is
+            // presence-retryable, so a caller inside the grace window simply
+            // captures again, which is exactly the fix.
+            return Ok(Assessment {
+                verdict: Verdict::Uncertain,
+                reason: format!(
+                    "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
+                    skew.as_millis(),
+                    MAX_CROSS_SPECTRUM_SKEW.as_millis()
+                ),
+                embedding: None,
+                ir_embedding: None,
+                signals: Default::default(),
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                eyes_open: false,
+                thirdparty_fake: None,
+            });
         }
 
         let fbox = |f: &Detection, w: u32, h: u32| irlume_liveness::FaceBox {
@@ -1041,6 +1119,18 @@ impl Engine {
         // No landmark model → no samples → `detect_blink` reads NoEyes, which is
         // the historical no-mesh result (the caller decides what to do with it).
         let samples = self.capture_ear_samples(SAMPLES)?;
+        // A window this short is a capture fault, not evidence about the user:
+        // the camera returned frozen or unusable frames until the attempt budget
+        // ran out. Judging it would report "no blink" for a hardware problem, so
+        // separate the two in the log; the verdict itself stays fail-closed
+        // because too few samples cannot show a dip either way.
+        if !samples.is_empty() && samples.len() < SAMPLES / 3 {
+            irlume_common::dlog!(
+                "liveness(blink): only {}/{SAMPLES} usable frames arrived; treating as \
+                 inconclusive capture, not as a missing blink",
+                samples.len()
+            );
+        }
         Ok(irlume_liveness::detect_blink(&samples))
     }
 

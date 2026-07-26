@@ -192,7 +192,7 @@ with a fabricated print.
   attempt and unlocks a password manager. So on the `UnsealPassword` path the
   match must be followed by a deliberate gesture the user performs on request: a
   head nod, or a calibrated eye closure (the same gate polkit prompts use). A
-  static presentation cannot produce one. Login, the lock screen, `sudo` and
+  print lying on a desk cannot produce one. Login, the lock screen, `sudo` and
   polkit are unchanged. A nod needs no calibration, so existing enrollments keep
   working without re-enrolling. Every way the gesture can fail to happen (no
   gesture in the window, no IR camera, FaceMesh not deployed, camera busy,
@@ -204,6 +204,23 @@ with a fabricated print.
   that is enabled but cannot run. This is a replay-resistance measure, not proof
   of physical liveness: it raises the cost of a static-presentation attack on the
   credential path, and it does not make a face grant equivalent to a live person.
+
+  **What it was measured to do (2026-07-25, one camera, seated user, 17 attempts
+  against the real greeter stack).** Nodding continuously released 4 times out of
+  4. A single nod released 0 times out of 3, which is why the instruction asks
+  the user to keep nodding rather than to nod. Holding still, with consent
+  deliberately withheld, released 1 time out of 10; counting gesture detections
+  rather than releases the detector fired twice in those ten, one of which was
+  refused only because the face match failed for an unrelated reason. An earlier
+  run in a less stable posture released 2 of 5, so incidental body movement
+  drives that number.
+
+  **What it has NOT been measured against: a hand-held print.** The detections
+  above show the nod detector responding to incidental motion, and a photo held
+  in the hand produces exactly that. Until that case is measured, treat this gate
+  as raising the cost of the attack rather than closing it, and do not read the
+  9-in-10 refusal above as an anti-spoofing figure. Tracked in
+  [#101](https://github.com/archledger/irlume/issues/101).
 - **Consecutive-failure throttle.** After a run of failed face attempts (5 by
   default, `IRLUME_RATE_LIMIT`), the daemon stops firing the camera on the
   gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls

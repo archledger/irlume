@@ -36,6 +36,15 @@ All notable changes to irlume are documented here. This project adheres to
   doctor` reports the state, and flags the case where the gate is on but cannot
   run on this machine.
 
+  What it was measured to do, on one camera with a seated user, 17 attempts
+  against the real login stack: nodding continuously released the password 4
+  times out of 4, and holding still with consent withheld released it once in 10.
+  A single nod released it 0 times out of 3, which is why the prompt asks you to
+  keep nodding rather than to nod. It has not been measured against a photo held
+  in the hand, and the same detections show the detector responding to incidental
+  movement, so treat this as raising the cost of a print attack rather than
+  closing it. See docs/THREAT_MODEL.md and issue #101.
+
 - **The IR "depth" cue is now called what it is: a center/edge brightness
   ratio.** Nothing in irlume measures range. The cue compares the middle of the
   IR face region to its rim, which a lit 3D face brightens and a flat matte print

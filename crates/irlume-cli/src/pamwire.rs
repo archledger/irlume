@@ -295,11 +295,14 @@ fn reconcile() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
-    if active_login_wired() && !lockscreen_regressed(with_lock) {
+    if active_login_wired()
+        && !lockscreen_regressed(with_lock)
+        && !wired_surface_regressed(with_sudo, with_polkit)
+    {
         // Still intact; the common case after a spurious file-change event.
-        // Also re-apply when only the KDE lock screen regressed (its file is
-        // watched too, but active_login_wired alone would treat the login
-        // greeter staying wired as "nothing to do").
+        // Every surface the marker claims must be checked, not just the login
+        // greeter: sudo, polkit and the fingerprint-keyring service can be
+        // stripped on their own while the greeter stays wired.
         return ExitCode::SUCCESS;
     }
     if effective_uid() != 0 {
@@ -359,9 +362,54 @@ fn lock_regressed(etc: &Path, vendor: Option<&Path>) -> bool {
     vendor.is_some_and(|v| v.exists()) // deleted, but re-materializable from vendor
 }
 
-#[cfg(test)]
 fn path_regressed(etc: &Path) -> bool {
     etc.exists() && !file_has_module(etc)
+}
+
+/// Whether a surface we RECORDED as wired has since lost the module.
+///
+/// The login greeter and the KDE lock screen were checked; `sudo`, polkit and
+/// the fingerprint-keyring service were not. That left the self-heal half open:
+/// a distro update that rewrote only one of those healed nothing, because
+/// reconcile saw the login greeter intact and returned "still intact" without
+/// looking further. The feature then stopped working silently, which is the
+/// exact failure mode the self-heal exists to prevent (issue #93).
+///
+/// Found on hardware: stripping `/etc/pam.d/gdm-fingerprint` on a wired box left
+/// it stripped through both a manual `login reconcile` and the path unit's
+/// automatic run.
+///
+/// Each surface is only maintained if the marker says we wired it, so a file
+/// that was never ours cannot make reconcile loop forever.
+fn wired_surface_regressed(with_sudo: bool, with_polkit: bool) -> bool {
+    let fp: Vec<&Path> = FP_GREETERS.iter().map(|s| Path::new(s.etc)).collect();
+    surfaces_regressed(
+        with_sudo.then(|| Path::new(SUDO)),
+        with_polkit.then(|| (Path::new(POLKIT.etc), POLKIT.vendor.map(Path::new))),
+        &fp,
+    )
+}
+
+/// Testable core of [`wired_surface_regressed`], taking the paths so a temp
+/// directory can drive it. `sudo`/`polkit` are `None` when the marker says we
+/// never wired them.
+fn surfaces_regressed(
+    sudo: Option<&Path>,
+    polkit: Option<(&Path, Option<&Path>)>,
+    fp_services: &[&Path],
+) -> bool {
+    if sudo.is_some_and(path_regressed) {
+        return true;
+    }
+    // polkit is materialized from a vendor copy on Fedora, so a DELETED /etc
+    // override is a regression there exactly as it is for the lock screen.
+    if polkit.is_some_and(|(etc, vendor)| lock_regressed(etc, vendor)) {
+        return true;
+    }
+    // The fingerprint-keyring line rides on a service the display manager owns;
+    // we only ever add to a file that already exists, so a missing file is not a
+    // regression, only a stripped one.
+    fp_services.iter().copied().any(path_regressed)
 }
 
 /// Whether the self-heal marker says login WAS wired but the wiring no longer
@@ -371,7 +419,11 @@ fn path_regressed(etc: &Path) -> bool {
 /// the fix.
 pub(crate) fn reconcile_needed() -> bool {
     match read_wired_marker() {
-        Some((_, _, with_lock)) => !active_login_wired() || lockscreen_regressed(with_lock),
+        Some((with_sudo, with_polkit, with_lock)) => {
+            !active_login_wired()
+                || lockscreen_regressed(with_lock)
+                || wired_surface_regressed(with_sudo, with_polkit)
+        }
         None => false,
     }
 }
@@ -1976,6 +2028,45 @@ mod tests {
         );
         // The `session pam_env` line above it is not an auth anchor.
         assert!(stanza > 1, "{wired}");
+    }
+
+    // Regression found on hardware during the 0.7.0 soak: stripping
+    // /etc/pam.d/gdm-fingerprint on a wired box survived BOTH a manual
+    // `login reconcile` and the path unit's automatic run, because the
+    // "is anything broken?" check only looked at the login greeter and the
+    // lock screen. sudo and polkit had the same blind spot.
+    #[test]
+    fn every_wired_surface_counts_as_a_regression_not_just_the_greeter() {
+        let dir = TestDir::new("surfaces");
+        let wired = dir.0.join("wired");
+        let stripped = dir.0.join("stripped");
+        let vendor = dir.0.join("vendor");
+        std::fs::write(&wired, "auth sufficient pam_irlume.so\n").unwrap();
+        std::fs::write(&stripped, "auth include system-auth\n").unwrap();
+        std::fs::write(&vendor, "auth include system-auth\n").unwrap();
+        let gone = dir.0.join("gone");
+
+        // Nothing recorded as wired: nothing to maintain.
+        assert!(!surfaces_regressed(None, None, &[]));
+        // Intact surfaces are not regressions.
+        assert!(!surfaces_regressed(
+            Some(&wired),
+            Some((&wired, None)),
+            &[&wired]
+        ));
+        // Each surface on its own must trigger a repair.
+        assert!(surfaces_regressed(Some(&stripped), None, &[]));
+        assert!(surfaces_regressed(None, Some((&stripped, None)), &[]));
+        assert!(surfaces_regressed(None, None, &[&stripped]));
+        // polkit deleted while a vendor copy remains is re-materializable, so it
+        // IS a regression; deleted with no vendor is not ours to restore.
+        assert!(surfaces_regressed(None, Some((&gone, Some(&vendor))), &[]));
+        assert!(!surfaces_regressed(None, Some((&gone, None)), &[]));
+        // A fingerprint service that does not exist is not a regression: we only
+        // ever add a line to a file the display manager already ships.
+        assert!(!surfaces_regressed(None, None, &[&gone]));
+        // A surface we never wired is ignored even when stripped.
+        assert!(!surfaces_regressed(None, None, &[]));
     }
 
     #[test]

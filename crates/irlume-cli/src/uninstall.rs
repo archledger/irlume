@@ -261,9 +261,20 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     );
     let pam_unwired = !pamwire::login_wired();
 
-    // 2. Stop and disable the daemon.
+    // 2. Stop and disable the daemon, and the self-heal units with it. Leaving
+    //    those enabled means a uninstalled irlume still wakes up on a PAM change
+    //    or on the timer; they self-gate on the marker so they would no-op, but
+    //    an uninstall should not leave units armed. Their failure is not counted
+    //    against the daemon's: a box that never enabled login never had them.
     let stop = systemctl(&["stop", "irlumed.service"]);
     let disable = systemctl(&["disable", "irlumed.service"]);
+    for unit in [
+        "irlume-reconcile.path",
+        "irlume-reconcile.timer",
+        "irlume-reconcile.service",
+    ] {
+        let _ = systemctl(&["disable", "--now", unit]);
+    }
     let service_stopped = stop && disable;
 
     // 3. Disarm each enrolled user's keyring seal (idempotent), and 4. wipe the

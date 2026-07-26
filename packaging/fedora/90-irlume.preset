@@ -6,3 +6,6 @@ enable irlumed.service
 # strips it. Self-gates on the login.wired marker, so it stays idle until
 # `irlume login enable` runs.
 enable irlume-reconcile.path
+# Backstop for the path unit, which does not see a file replaced by rename
+# (measured: `sed -i` triggers nothing). Same reconcile, on a schedule.
+enable irlume-reconcile.timer

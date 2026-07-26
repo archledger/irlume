@@ -15,6 +15,7 @@ post_install() {
     # runs at boot to catch an offline strip and to adopt an existing wiring on
     # upgrade; --now runs one reconcile immediately.
     systemctl enable --now irlume-reconcile.path 2>/dev/null || true
+    systemctl enable --now irlume-reconcile.timer 2>/dev/null || true
     systemctl enable --now irlume-reconcile.service 2>/dev/null || true
     cat <<'EOF'
 irlume installed. Next steps:
@@ -42,6 +43,13 @@ post_upgrade() {
     systemctl enable --now irlume-reconcile.path 2>/dev/null || true
     systemctl enable --now irlume-reconcile.service 2>/dev/null || true
     systemctl start irlume-reconcile.service 2>/dev/null || true
+    # The timer is NEW in 0.7.0; arm it once for upgraders too, recorded by a
+    # marker so a later deliberate disable is respected.
+    if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
+        mkdir -p /var/lib/irlume
+        systemctl enable --now irlume-reconcile.timer 2>/dev/null || true
+        : > /var/lib/irlume/.reconcile-timer-armed
+    fi
     # 0.1.x -> 0.2.0 removed the IR adapter; IR templates enrolled before 0.2.0
     # no longer match. Bright-light (RGB) login still works; the password is
     # unaffected. Compare the just-installed version against the old one.
@@ -57,5 +65,6 @@ EOF
 pre_remove() {
     systemctl disable --now irlumed.service 2>/dev/null || true
     systemctl disable --now irlume-reconcile.path 2>/dev/null || true
+    systemctl disable --now irlume-reconcile.timer 2>/dev/null || true
     systemctl disable --now irlume-reconcile.service 2>/dev/null || true
 }

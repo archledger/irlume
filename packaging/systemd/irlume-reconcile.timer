@@ -1,0 +1,26 @@
+[Unit]
+Description=Periodically re-apply irlume face-auth PAM wiring if a distro update stripped it
+Documentation=https://github.com/archledger/irlume
+
+[Timer]
+# Backstop for irlume-reconcile.path, which cannot see every kind of edit.
+# Measured 2026-07-26 on Ubuntu 26.04: appending to a watched greeter file
+# triggered the path unit within a second, and so did an `install` over it, but
+# replacing the file the way `sed -i` does (write a temp file, rename it over
+# the target) triggered nothing at all. A rename replaces the inode, so the
+# watch is left pointing at the old one. Adding a directory watch did not help.
+#
+# Config regenerators commonly replace files by rename, which is exactly the
+# case the self-heal exists for, so the wiring must not depend on the watcher
+# noticing. This runs the same reconcile on a schedule; it is a no-op unless the
+# wiring actually went missing, and it self-gates on the login.wired marker, so
+# it stays idle on a box that never ran `irlume login enable`.
+OnBootSec=3min
+OnUnitActiveSec=30min
+# Catch up after the machine was asleep or off rather than silently skipping.
+Persistent=true
+AccuracySec=1min
+Unit=irlume-reconcile.service
+
+[Install]
+WantedBy=timers.target

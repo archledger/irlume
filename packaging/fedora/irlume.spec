@@ -105,6 +105,7 @@ install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlume
 # missing). Enabled by preset; harmless when login was never wired.
 install -Dm0644 packaging/systemd/irlume-reconcile.path %{buildroot}%{_unitdir}/irlume-reconcile.path
 install -Dm0644 packaging/systemd/irlume-reconcile.service %{buildroot}%{_unitdir}/irlume-reconcile.service
+install -Dm0644 packaging/systemd/irlume-reconcile.timer %{buildroot}%{_unitdir}/irlume-reconcile.timer
 # The `irlume` system group (socket 0660 root:irlume). The systemd file trigger
 # runs systemd-sysusers on install to create it.
 install -Dm0644 packaging/systemd/irlume.sysusers %{buildroot}%{_sysusersdir}/irlume.conf
@@ -121,7 +122,7 @@ install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-i
 %post
 # %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
 # self-heal path unit on first install.
-%systemd_post irlumed.service irlume-reconcile.path irlume-reconcile.service
+%systemd_post irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
 # Also start it now so `irlume tui` works immediately after `dnf install`
 # (no-op in chroots/containers where systemd isn't running).
 if [ $1 -eq 1 ]; then
@@ -132,6 +133,15 @@ fi
 # the self-heal marker, and re-applies wiring a same-transaction strip removed.
 # Both self-gate and no-op on a fresh/un-wired box.
 systemctl start irlume-reconcile.path &>/dev/null || :
+systemctl start irlume-reconcile.timer &>/dev/null || :
+# The timer is NEW in 0.7.0 and %%systemd_post only applies presets on a FRESH
+# install, so an upgrader would never get the backstop. Arm it once, recorded by
+# a marker, leaving a later deliberate disable alone.
+if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
+    mkdir -p /var/lib/irlume
+    systemctl enable --now irlume-reconcile.timer &>/dev/null || :
+    : > /var/lib/irlume/.reconcile-timer-armed
+fi
 systemctl start irlume-reconcile.service &>/dev/null || :
 # PAM wiring is opt-in (irlume login enable); never auto-wire auth on install.
 # Upgrade from a version that shipped the IR adapter (< 0.2.0): dark/dim IR

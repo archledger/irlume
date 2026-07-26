@@ -24,14 +24,14 @@ Conventions that apply everywhere:
 | `irlume detect` | script-friendly probe; exit `0` = ready, `10` = partial, `20` = absent |
 | `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones) |
 | `irlume deps` | verify runtime dependencies (onnxruntime, models, TPM) |
-| `irlume version` | print the installed version (`--version` / `-V` also work) |
+| `irlume version` | print the installed version (`--version` / `-V` also work); `version --json` uses the public [machine API](MACHINE-API.md) |
 
 ## Enrollment and profiles
 
 | Command | What it does |
 |---|---|
 | `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` starts the profile space over |
-| `irlume profiles` (or `profiles list`) | list profiles and their scans |
+| `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P` | add a scan to profile P (improves recognition in new conditions) |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
@@ -85,5 +85,6 @@ calibration analyzer.
 ## Where to go next
 
 - First-time setup, step by step: [SETUP.md](SETUP.md)
+- Versioned JSON for desktop integrations: [MACHINE-API.md](MACHINE-API.md)
 - Reading scores, gate reasons, and PAM decisions: [DEBUGGING.md](DEBUGGING.md)
 - NixOS module instead of imperative wiring: [NIXOS.md](NIXOS.md)

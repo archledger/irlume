@@ -432,6 +432,7 @@ default IR-structure gate already rejects photos, screens, and video replays.
 |---|---|
 | **Install and set up**, guided or by hand | [`docs/SETUP.md`](docs/SETUP.md) |
 | Look up **every command and flag** | [`docs/COMMANDS.md`](docs/COMMANDS.md) |
+| Integrate through the versioned **machine API** | [`docs/MACHINE-API.md`](docs/MACHINE-API.md) |
 | Understand the **architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | Read the **threat model** and standards mapping | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) · [`docs/STANDARDS.md`](docs/STANDARDS.md) |
 | **Verify the claims** on my own machine | [`docs/VERIFY.md`](docs/VERIFY.md) |

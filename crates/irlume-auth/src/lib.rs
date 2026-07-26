@@ -821,13 +821,24 @@ impl Engine {
         // brightness when both of its interfaces stream, the ASUS built-in keeps
         // all of it, and only a measurement on the actual camera can tell which
         // kind is plugged in.
-        let sequential = match std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
-            Ok(v) => v.trim() == "1",
-            Err(_) => {
-                irlume_camera::stored_capture_mode(&self.rgb_dev)
-                    == Some(irlume_camera::CaptureMode::Sequential)
-            }
+        let (sequential, mode_source) = match std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
+            Ok(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
+            Err(_) => match irlume_camera::stored_capture_mode(&self.rgb_dev) {
+                Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
+                None => (false, "default"),
+            },
         };
+        // Name the mode AND where it came from. Without this the only way to
+        // tell which path ran is to infer it from timings, which is exactly the
+        // guessing this measurement work exists to remove.
+        irlume_common::dlog!(
+            "assess: capture mode {} (from {mode_source})",
+            if sequential {
+                "sequential"
+            } else {
+                "concurrent"
+            }
+        );
         // With held sessions the streams are already running, so a capture is
         // just the frames. Every RETRY below deliberately stays on the one-shot
         // path: a retry exists because something went wrong with this capture,

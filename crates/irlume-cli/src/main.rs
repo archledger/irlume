@@ -105,7 +105,13 @@ fn main() -> std::process::ExitCode {
         (Some("suncal"), _) => suncal::run(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("meshprobe"), _) => meshprobe(&args),
+        (Some("enroll"), _) if args.iter().any(|arg| arg == "--events=jsonl") => {
+            machine::enroll_events(&args)
+        }
         (Some("enroll"), _) => enroll(&args),
+        (Some("auth"), Some("test")) if args.iter().any(|arg| arg == "--events=jsonl") => {
+            machine::auth_test_events(&args)
+        }
         (Some("profiles"), Some("list")) if args.iter().any(|arg| arg == "--json") => {
             machine::profiles_list(&args)
         }
@@ -114,6 +120,9 @@ fn main() -> std::process::ExitCode {
         }
         (Some("profiles"), Some("rename")) if args.iter().any(|arg| arg == "--json") => {
             machine::profiles_rename(&args)
+        }
+        (Some("profiles"), Some("add-scan")) if args.iter().any(|arg| arg == "--events=jsonl") => {
+            machine::profiles_add_scan_events(&args)
         }
         (Some("profiles"), sub) => profiles(sub, &args),
         (Some("verify"), _) => verify(&args),
@@ -727,18 +736,48 @@ pub(crate) fn daemon_request(
 ) -> Result<irlume_common::Response, String> {
     // Shared client: bounded connect timeout + zeroized wire buffers. The 120s
     // read budget covers slow operations (guided enroll capture loops).
-    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120)).map_err(
-        |e| {
-            // The connect-failure message already names irlumed and the exact
-            // fix (client.rs); only append the hint where it adds information.
-            let m = e.to_string();
-            if m.contains("irlumed") {
-                m
-            } else {
-                format!("{m} (is irlumed running?)")
-            }
-        },
+    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120))
+        .map_err(daemon_error)
+}
+
+/// Camera request variant for the public event API. The cancellation callback
+/// closes the socket before returning so daemon-side disconnect rollback owns
+/// the outcome if a mutation completed concurrently with SIGTERM.
+pub(crate) enum CancellableRequestError {
+    Cancelled,
+    Timeout,
+    Protocol,
+    Unavailable,
+}
+
+pub(crate) fn daemon_request_cancellable(
+    req: &irlume_common::Request,
+    cancelled: impl Fn() -> bool,
+) -> Result<irlume_common::Response, CancellableRequestError> {
+    irlume_common::client::request_with_timeout_and_cancel(
+        req,
+        std::time::Duration::from_secs(120),
+        cancelled,
     )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::Interrupted => CancellableRequestError::Cancelled,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            CancellableRequestError::Timeout
+        }
+        std::io::ErrorKind::InvalidData => CancellableRequestError::Protocol,
+        _ => CancellableRequestError::Unavailable,
+    })
+}
+
+fn daemon_error(error: std::io::Error) -> String {
+    // The connect-failure message already names irlumed and the exact fix
+    // (client.rs); only append the hint where it adds information.
+    let message = error.to_string();
+    if message.contains("irlumed") || error.kind() == std::io::ErrorKind::Interrupted {
+        message
+    } else {
+        format!("{message} (is irlumed running?)")
+    }
 }
 
 /// A short-budget status poll (TUI periodic refresh): a busy/wedged daemon fails
@@ -792,7 +831,7 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
         .unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
     eprintln!("[enrolldev] '{user}': {want} scans into IRLUME_STATE_DIR; stay in frame…");
     match engine(det, model, args).and_then(|mut e| e.enroll_profile(&user, name, want)) {
-        Ok(irlume_auth::EnrollOutcome::New { name, scans }) => {
+        Ok(irlume_auth::EnrollOutcome::New { name, scans, .. }) => {
             println!("[enrolldev] enrolled '{name}' ({scans} scans)");
             std::process::ExitCode::SUCCESS
         }

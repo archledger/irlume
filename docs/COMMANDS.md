@@ -31,8 +31,11 @@ Conventions that apply everywhere:
 | Command | What it does |
 |---|---|
 | `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` starts the profile space over |
+| `irlume enroll --events=jsonl [preview flags]` | public bounded enrollment event stream; see the [machine API](MACHINE-API.md) |
+| `irlume auth test --events=jsonl [preview flags]` | live match/liveness test that never releases a credential or changes a profile |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P` | add a scan to profile P (improves recognition in new conditions) |
+| `irlume profiles add-scan --profile-id ID --events=jsonl [preview flags]` | machine-facing improve-recognition stream targeting an opaque ID |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles eyes-open <on\|off>` | require eyes open to unlock |
@@ -42,6 +45,9 @@ Conventions that apply everywhere:
 
 Desktop integrations use opaque IDs with `--profile-id` / `--scan-id` plus
 `--json`; human commands continue to use display names.
+Machine event streams optionally expose a preview only with the complete fixed
+flag set: `--preview=ir-jpeg --preview-max-fps=8
+--preview-max-size=640x480`. Without it, positioning events contain no image.
 
 ## Keyring, TPM, and recovery
 

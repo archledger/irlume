@@ -2323,12 +2323,15 @@ impl Engine {
             }
             let added = captured.len().min(room);
             let mut added_scans = Vec::with_capacity(added);
+            let mut added_scan_ids = Vec::with_capacity(added);
             for s in captured.into_iter().take(room) {
                 let sname = enr.profiles[idx].next_scan_name();
                 added_scans.push(sname.clone());
                 let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
+                let scan_id = storage::new_scan_id();
+                added_scan_ids.push(scan_id.clone());
                 enr.profiles[idx].scans.push(FaceScan {
-                    id: storage::new_scan_id(),
+                    id: scan_id,
                     name: sname,
                     rgb: s.rgb,
                     ir: s.ir,
@@ -2342,10 +2345,12 @@ impl Engine {
             let total = enr.profiles[idx].scans.len();
             storage::save(&enr)?;
             return Ok(EnrollOutcome::Merged {
+                profile_id: enr.profiles[idx].id.clone(),
                 name: target,
                 added,
                 total,
                 added_scans,
+                added_scan_ids,
             });
         }
         if enr.profiles.len() >= MAX_PROFILES {
@@ -2375,13 +2380,20 @@ impl Engine {
             });
         }
         let n = prof.scans.len();
+        let profile_id = prof.id.clone();
+        let added_scan_ids = prof.scans.iter().map(|scan| scan.id.clone()).collect();
         self.refit_profile_calib(&mut prof);
         enr.profiles.push(prof);
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
         }
         storage::save(&enr)?;
-        Ok(EnrollOutcome::New { name, scans: n })
+        Ok(EnrollOutcome::New {
+            profile_id,
+            name,
+            scans: n,
+            added_scan_ids,
+        })
     }
 
     /// Snapshot the identity of the cameras this engine is bound to, for
@@ -2586,6 +2598,172 @@ impl Engine {
             guidance,
         })
     }
+
+    /// Capture one bounded preview frame for a machine enrollment stream.
+    ///
+    /// The frame is encoded in memory, never written to disk, and carries only
+    /// geometry and positioning cues. Identity embeddings and match scores are
+    /// deliberately absent.
+    pub fn preview_sample(
+        &mut self,
+        user: Option<&str>,
+    ) -> irlume_common::Result<irlume_common::PreviewSample> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use irlume_common::{PositionReport, PreviewSample};
+
+        let (frame, spectrum) = if self.ir_available {
+            (irlume_camera::capture_ir(&self.ir_dev)?, "ir")
+        } else {
+            (irlume_camera::capture_rgb(&self.rgb_dev)?, "rgb")
+        };
+        let rgb = match frame.spectrum {
+            irlume_camera::Spectrum::Rgb => frame.data.clone(),
+            irlume_camera::Spectrum::Ir => frame
+                .data
+                .iter()
+                .flat_map(|value| [*value, *value, *value])
+                .collect(),
+        };
+        let view = align::RgbView {
+            data: &rgb,
+            width: frame.width,
+            height: frame.height,
+        };
+        let faces = self.det.detect(&view)?;
+        let face = top_detection(&faces).ok_or_else(|| {
+            irlume_common::Error::Precondition(
+                "no face detected in preview; keep looking at the camera".into(),
+            )
+        })?;
+        let mesh = self.mesh.as_mut().ok_or_else(|| {
+            irlume_common::Error::Hardware(
+                "preview requires the 478-point face landmark model".into(),
+            )
+        })?;
+        let dense = mesh.landmarks(&view, &face.bbox, 0.25)?;
+        if dense.len() != irlume_vision::MESH_N_IRIS {
+            return Err(irlume_common::Error::Protocol(format!(
+                "preview landmark model returned {} points, expected {}",
+                dense.len(),
+                irlume_vision::MESH_N_IRIS
+            )));
+        }
+
+        let fw = frame.width as f32;
+        let fh = frame.height as f32;
+        let [x1, y1, x2, y2] = face.bbox;
+        let face_frac = (x2 - x1).max(0.0) / fw;
+        let centered = ((x1 + x2) / 2.0 - fw / 2.0).abs() <= 0.18 * fw
+            && ((y1 + y2) / 2.0 - fh / 2.0).abs() <= 0.18 * fh;
+        let pose = irlume_vision::head_pose(&face.landmarks);
+        let pitch_neutral = user
+            .and_then(|name| irlume_core::storage::load(name).ok().flatten())
+            .and_then(|enrollment| enrollment.pitch_neutral());
+        let (pitch_low, pitch_high) = pitch_band(pitch_neutral);
+        let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX
+            && (pitch_low..=pitch_high).contains(&pose.pitch_frac);
+        let brightness = luma_in_bbox(&rgb, frame.width, frame.height, &face.bbox);
+        let well_lit = (55.0..=235.0).contains(&brightness);
+        let well_framed = (0.12..=0.55).contains(&face_frac) && centered && frontal && well_lit;
+        let mut quality = 100i32;
+        let guidance = if face_frac < 0.12 {
+            quality -= 45;
+            "Move closer"
+        } else if face_frac > 0.55 {
+            quality -= 30;
+            "Move back a little"
+        } else if !centered {
+            quality -= 30;
+            "Center your face in the frame"
+        } else if !frontal {
+            quality -= 30;
+            "Face the camera directly"
+        } else if brightness < 55.0 {
+            quality -= 30;
+            "Too dark: add light or face a window"
+        } else if brightness > 235.0 {
+            quality -= 20;
+            "Too bright: reduce glare or backlight"
+        } else {
+            "Hold still, looking good"
+        };
+        let landmarks = dense
+            .into_iter()
+            .map(|(x, y)| [(x / fw).clamp(0.0, 1.0), (y / fh).clamp(0.0, 1.0)])
+            .collect();
+        let (jpeg, width, height) = encode_preview_jpeg(
+            &frame.data,
+            frame.width,
+            frame.height,
+            matches!(frame.spectrum, irlume_camera::Spectrum::Ir),
+        )?;
+        let left = (x1 / fw).clamp(0.0, 1.0);
+        let top = (y1 / fh).clamp(0.0, 1.0);
+        let right = (x2 / fw).clamp(left, 1.0);
+        let bottom = (y2 / fh).clamp(top, 1.0);
+        Ok(PreviewSample {
+            frame_jpeg_base64: STANDARD.encode(jpeg),
+            width,
+            height,
+            spectrum: spectrum.into(),
+            landmarks,
+            face_box: [left, top, right - left, bottom - top],
+            position: PositionReport {
+                face: true,
+                face_frac,
+                centered,
+                yaw_asym: pose.yaw_asym,
+                pitch_frac: pose.pitch_frac,
+                brightness,
+                ir_ok: spectrum == "ir",
+                quality: quality.clamp(0, 100) as u8,
+                well_framed,
+                guidance: guidance.into(),
+            },
+        })
+    }
+}
+
+fn encode_preview_jpeg(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    grayscale: bool,
+) -> irlume_common::Result<(Vec<u8>, u32, u32)> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::imageops::FilterType;
+
+    let source = if grayscale {
+        image::GrayImage::from_raw(width, height, pixels.to_vec())
+            .map(image::DynamicImage::ImageLuma8)
+    } else {
+        image::RgbImage::from_raw(width, height, pixels.to_vec())
+            .map(image::DynamicImage::ImageRgb8)
+    }
+    .ok_or_else(|| irlume_common::Error::Protocol("invalid preview frame buffer".into()))?;
+
+    // Keep enough headroom for 478 landmarks and the event envelope below the
+    // desktop contract's 256 KiB per-line limit.
+    const MAX_JPEG_BYTES: usize = 96 * 1024;
+    for (max_width, max_height) in [(640, 480), (480, 360), (320, 240)] {
+        let image = if width <= max_width && height <= max_height {
+            source.clone()
+        } else {
+            source.resize(max_width, max_height, FilterType::Triangle)
+        };
+        for quality in [75, 60, 45] {
+            let mut encoded = Vec::new();
+            JpegEncoder::new_with_quality(&mut encoded, quality)
+                .encode_image(&image)
+                .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
+            if encoded.len() <= MAX_JPEG_BYTES {
+                return Ok((encoded, image.width(), image.height()));
+            }
+        }
+    }
+    Err(irlume_common::Error::Protocol(
+        "preview JPEG exceeds 96 KiB after bounded encoding".into(),
+    ))
 }
 
 /// Framing-guide frontality bounds: deliberately STRICTER than the liveness
@@ -2691,7 +2869,12 @@ fn luma_in_bbox(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnrollOutcome {
     /// A new face profile was created.
-    New { name: String, scans: usize },
+    New {
+        profile_id: String,
+        name: String,
+        scans: usize,
+        added_scan_ids: Vec<String>,
+    },
     /// The captured face already owned `name`, so the capture was added to that
     /// profile instead (`added` new scans, `total` scans now) and the
     /// per-enrollment calibration was refitted. This is what makes `irlume
@@ -2700,6 +2883,7 @@ pub enum EnrollOutcome {
     /// 0.2.0 upgrade remedy (fresh current-space scans revive dark/dim login
     /// after an embedding-space change strands the old IR templates).
     Merged {
+        profile_id: String,
         name: String,
         added: usize,
         total: usize,
@@ -2707,6 +2891,7 @@ pub enum EnrollOutcome {
         /// merge by deleting exactly them (the TUI does this on a declined
         /// "add to the existing profile?" confirm).
         added_scans: Vec<String>,
+        added_scan_ids: Vec<String>,
     },
 }
 
@@ -3210,6 +3395,27 @@ mod tests {
             ir_brightness: 0.0,
             pitch: 0.0,
         }
+    }
+
+    #[test]
+    fn preview_jpeg_is_bounded_and_preserves_aspect_ratio() {
+        let gray = vec![96u8; 1280 * 720];
+        let (jpeg, width, height) = encode_preview_jpeg(&gray, 1280, 720, true).unwrap();
+        assert!(jpeg.len() <= 96 * 1024);
+        assert!(width <= 640 && height <= 480);
+        assert_eq!(width * 9, height * 16);
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+
+        let rgb = vec![128u8; 320 * 240 * 3];
+        let (jpeg, width, height) = encode_preview_jpeg(&rgb, 320, 240, false).unwrap();
+        assert!(jpeg.len() <= 96 * 1024);
+        assert_eq!((width, height), (320, 240));
+
+        let portrait = vec![64u8; 720 * 1280];
+        let (_, width, height) = encode_preview_jpeg(&portrait, 720, 1280, true).unwrap();
+        assert!(width <= 640 && height <= 480);
+        assert_eq!(width * 16, height * 9);
     }
 
     #[test]

@@ -13,10 +13,10 @@
 //! unsealed secret in transit, before it lands inside a zeroizing `SecretBytes`).
 
 use crate::{Request, Response, SOCKET_PATH};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 /// Bounded wait for the initial connect (distinct from the read timeout, which
@@ -28,6 +28,8 @@ const POLL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
 const POLL_RW_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Default read/write timeout for management requests.
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
 /// Read an environment override that must NEVER be honoured in a
 /// secure-execution context. `pam_irlume` is linked into setuid-root PAM stacks
@@ -86,6 +88,18 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
 }
 
+/// Send `req` while allowing a caller-owned cancellation flag to interrupt
+/// connect or response wait. Cancellation closes the socket before returning,
+/// so a daemon-side mutation whose response was not delivered can roll itself
+/// back instead of becoming an orphaned operation.
+pub fn request_with_timeout_and_cancel(
+    req: &Request,
+    rw_timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Response> {
+    request_with_timeouts_and_cancel(req, CONNECT_TIMEOUT, rw_timeout, cancelled)
+}
+
 /// Map a "nobody is listening" error to the actionable start-the-daemon
 /// message. A missing socket / dead peer is the #1 first-run failure (fresh
 /// package install, unit disabled by distro preset policy), so name the daemon
@@ -111,7 +125,24 @@ fn request_with_timeouts(
     connect_timeout: Duration,
     rw_timeout: Duration,
 ) -> io::Result<Response> {
-    let stream = connect_with_timeout(&socket_path(), connect_timeout).map_err(map_not_running)?;
+    request_with_timeouts_and_cancel(req, connect_timeout, rw_timeout, || false)
+}
+
+fn request_with_timeouts_and_cancel(
+    req: &Request,
+    connect_timeout: Duration,
+    rw_timeout: Duration,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<Response> {
+    let mut stream = connect_with_timeout_and_cancel(&socket_path(), connect_timeout, &cancelled)
+        .map_err(map_not_running)?;
+    if cancelled() {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "request cancelled",
+        ));
+    }
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 
@@ -128,17 +159,83 @@ fn request_with_timeouts(
     // The request may carry a password (SealPassword/RecoverySetup); wipe it.
     line.zeroize();
 
-    let mut reader = BufReader::new(&stream);
-    let mut buf = String::new();
-    reader.read_line(&mut buf).map_err(map_not_running)?;
-    if buf.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "daemon closed connection without responding",
-        ));
+    // Poll a bounded raw buffer rather than parking in read_line for the whole
+    // camera budget. This makes SIGTERM cancellation prompt and also places a
+    // hard ceiling on daemon responses (preview frames are bounded below it).
+    stream.set_read_timeout(Some(CANCEL_POLL_INTERVAL.min(rw_timeout)))?;
+    let deadline = Instant::now() + rw_timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        if cancelled() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            buf.zeroize();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request cancelled",
+            ));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) if buf.is_empty() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "daemon closed connection without responding",
+                ));
+            }
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "daemon closed connection mid-response",
+                ));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > MAX_RESPONSE_BYTES {
+                    buf.zeroize();
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "daemon response exceeds 512 KiB",
+                    ));
+                }
+                if let Some(newline) = buf.iter().position(|byte| *byte == b'\n') {
+                    if buf[newline + 1..]
+                        .iter()
+                        .any(|byte| !byte.is_ascii_whitespace())
+                    {
+                        buf.zeroize();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "daemon sent multiple responses",
+                        ));
+                    }
+                    buf.truncate(newline);
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    buf.zeroize();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for irlumed response",
+                    ));
+                }
+            }
+            Err(error) => {
+                buf.zeroize();
+                return Err(map_not_running(error));
+            }
+        }
     }
     let parsed =
-        serde_json::from_str(buf.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
     // The response may carry an unsealed secret; wipe the raw JSON now that the
     // bytes live inside a zeroizing `SecretBytes` in the parsed value.
     buf.zeroize();
@@ -147,19 +244,42 @@ fn request_with_timeouts(
 
 /// `UnixStream::connect` has no timeout, so a stalled listener (backlog full /
 /// `accept()` stuck) would hang the caller. Connect on a detached helper thread
-/// and give up after `timeout`.
-fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+/// and give up after `timeout`, while still observing an optional cancellation.
+fn connect_with_timeout_and_cancel(
+    path: &Path,
+    timeout: Duration,
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<UnixStream> {
     let (tx, rx) = std::sync::mpsc::channel();
     let p = path.to_path_buf();
     std::thread::spawn(move || {
         let _ = tx.send(UnixStream::connect(&p));
     });
-    match rx.recv_timeout(timeout) {
-        Ok(res) => res,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out connecting to irlumed socket",
-        )),
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request cancelled",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out connecting to irlumed socket",
+            ));
+        }
+        match rx.recv_timeout(CANCEL_POLL_INTERVAL.min(remaining)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "irlumed connection worker stopped",
+                ));
+            }
+        }
     }
 }
 
@@ -167,7 +287,8 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream
 mod tests {
     use super::*;
     use crate::testenv;
-    use std::io::Read as _;
+    use std::io::BufRead as _;
+    use std::io::BufReader;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
@@ -303,6 +424,54 @@ mod tests {
         });
         let err = request_with_timeout(&Request::Ping, Duration::from_secs(5)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cancellable_request_closes_the_socket_before_returning() {
+        let _g = testenv::lock();
+        let path = sock("cancel");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_cancelled = cancelled.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            assert!(!line.is_empty(), "server must receive the mutation request");
+            server_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                stream.read(&mut byte).unwrap(),
+                0,
+                "client cancellation must close its socket before returning"
+            );
+        });
+
+        let started = Instant::now();
+        let error = request_with_timeout_and_cancel(
+            &Request::Enroll {
+                user: "alice".into(),
+                profile: None,
+                scans: None,
+                reset: false,
+            },
+            Duration::from_secs(5),
+            || cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must not wait for the camera timeout"
+        );
+
         server.join().unwrap();
         std::env::remove_var("IRLUME_SOCKET");
         let _ = std::fs::remove_file(&path);

@@ -659,9 +659,76 @@ fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Resu
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
+            let rollback_request = req.clone();
             let resp = dispatch(req, &peer, engine);
-            respond(stream, &resp)
+            let result = respond(stream, &resp);
+            if result.is_err() {
+                rollback_disconnected_mutation(&rollback_request, &resp);
+            }
+            result
         }
+    }
+}
+
+/// A machine client can disappear while a camera operation is in progress.
+/// If the daemon completed a mutation but could not deliver its response, put
+/// the enrollment back exactly as it was. The daemon is single-threaded, so no
+/// other profile write can interleave between dispatch and this rollback.
+fn rollback_disconnected_mutation(request: &Request, response: &Response) {
+    match (request, response) {
+        (
+            Request::Enroll { user, .. },
+            Response::Enrolled {
+                profile_id,
+                created: true,
+                ..
+            },
+        ) if irlume_core::storage::valid_profile_id(profile_id) => {
+            let _ = mutate_enrollment_response(user, |enrollment| {
+                delete_profile_by_id(enrollment, profile_id)
+            });
+        }
+        (
+            Request::Enroll { user, .. },
+            Response::Enrolled {
+                profile_id,
+                created: false,
+                added_scan_ids,
+                ..
+            },
+        ) if irlume_core::storage::valid_profile_id(profile_id)
+            && added_scan_ids
+                .iter()
+                .all(|scan_id| irlume_core::storage::valid_scan_id(scan_id)) =>
+        {
+            let _ = mutate_enrollment_response(user, |enrollment| {
+                let mut last = None;
+                for scan_id in added_scan_ids.iter().rev() {
+                    last = Some(delete_scan_by_id(enrollment, profile_id, scan_id)?);
+                }
+                last.ok_or_else(|| "enrollment reported no added scan IDs".into())
+            });
+        }
+        (
+            Request::AddScanById {
+                user,
+                profile_id: requested_profile_id,
+            },
+            Response::ProfileMutation {
+                operation: irlume_common::ProfileMutationKind::AddScan,
+                profile_id: response_profile_id,
+                scan_id: Some(scan_id),
+                ..
+            },
+        ) if requested_profile_id == response_profile_id
+            && irlume_core::storage::valid_profile_id(requested_profile_id)
+            && irlume_core::storage::valid_scan_id(scan_id) =>
+        {
+            let _ = mutate_enrollment_response(user, |enrollment| {
+                delete_scan_by_id(enrollment, requested_profile_id, scan_id)
+            });
+        }
+        _ => {}
     }
 }
 
@@ -751,6 +818,7 @@ fn request_user(req: &Request) -> Option<&str> {
         // Framing guide: the (optional) user only tunes the pitch band, but it's
         // still interpolated into a state path, so validate it like the rest.
         PositionSample { user: Some(u) } => Some(u.as_str()),
+        PreviewSample { user } => Some(user.as_str()),
         _ => None,
     }
 }
@@ -797,6 +865,24 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             match engine.position_sample(user.as_deref().filter(|u| authorized_for(peer, u))) {
                 Ok(r) => Response::Position(r),
                 Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::PreviewSample { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::OperationError {
+                    code: irlume_common::OperationErrorCode::NotAuthorized,
+                    retryable: false,
+                };
+            }
+            if !engine.has_mesh() {
+                return Response::OperationError {
+                    code: irlume_common::OperationErrorCode::PreconditionFailed,
+                    retryable: false,
+                };
+            }
+            match engine.preview_sample(Some(&user)) {
+                Ok(sample) => Response::Preview(sample),
+                Err(error) => operation_error(error),
             }
         }
         Request::Authenticate { user, service } => {
@@ -1095,31 +1181,49 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         }
         Request::AddScanById { user, profile_id } => {
             if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
+                return Response::OperationError {
+                    code: irlume_common::OperationErrorCode::NotAuthorized,
+                    retryable: false,
+                };
             }
             if !irlume_core::storage::valid_profile_id(&profile_id) {
-                return Response::Error("invalid profile ID".into());
+                return Response::OperationError {
+                    code: irlume_common::OperationErrorCode::PreconditionFailed,
+                    retryable: false,
+                };
             }
             let profile_name = match irlume_core::storage::load(&user) {
                 Ok(Some(enr)) => match enr.profiles.iter().find(|p| p.id == profile_id) {
                     Some(profile) => profile.name.clone(),
-                    None => return Response::Error(format!("no face profile ID '{profile_id}'")),
+                    None => {
+                        return Response::OperationError {
+                            code: irlume_common::OperationErrorCode::PreconditionFailed,
+                            retryable: false,
+                        }
+                    }
                 },
-                Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
-                Err(e) => return Response::Error(e.to_string()),
+                Ok(None) => {
+                    return Response::OperationError {
+                        code: irlume_common::OperationErrorCode::PreconditionFailed,
+                        retryable: false,
+                    }
+                }
+                Err(error) => return operation_error(error),
             };
             match engine.add_scan(&user, &profile_name) {
                 Ok((scan_name, total)) => match irlume_core::storage::load(&user) {
                     Ok(Some(enr)) => {
                         let Some(profile) = enr.profiles.iter().find(|p| p.id == profile_id) else {
-                            return Response::Error(
-                                "profile disappeared after adding the scan".into(),
-                            );
+                            return Response::OperationError {
+                                code: irlume_common::OperationErrorCode::ProtocolError,
+                                retryable: false,
+                            };
                         };
                         let Some(scan) = profile.scans.iter().find(|s| s.name == scan_name) else {
-                            return Response::Error(
-                                "new scan missing after successful enrollment".into(),
-                            );
+                            return Response::OperationError {
+                                code: irlume_common::OperationErrorCode::ProtocolError,
+                                retryable: false,
+                            };
                         };
                         Response::ProfileMutation {
                             operation: irlume_common::ProfileMutationKind::AddScan,
@@ -1132,12 +1236,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             total_scans: Some(total),
                         }
                     }
-                    Ok(None) => {
-                        Response::Error("enrollment disappeared after adding the scan".into())
-                    }
-                    Err(e) => Response::Error(e.to_string()),
+                    Ok(None) => Response::OperationError {
+                        code: irlume_common::OperationErrorCode::ProtocolError,
+                        retryable: false,
+                    },
+                    Err(error) => operation_error(error),
                 },
-                Err(e) => Response::Error(e.to_string()),
+                Err(error) => operation_error(error),
             }
         }
         // --- keyring unlock (TPM-sealed password) ---------------------------
@@ -1710,24 +1815,35 @@ fn identify_scope(peer: &Peer) -> IdentifyScope {
 /// AddScans to a profile that was never created.
 fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
     match outcome {
-        irlume_auth::EnrollOutcome::New { name, scans } => Response::Enrolled {
+        irlume_auth::EnrollOutcome::New {
+            profile_id,
+            name,
+            scans,
+            added_scan_ids,
+        } => Response::Enrolled {
+            profile_id,
             profile: name,
             created: true,
             added: scans,
             total: scans,
             added_scans: Vec::new(),
+            added_scan_ids,
         },
         irlume_auth::EnrollOutcome::Merged {
+            profile_id,
             name,
             added,
             total,
             added_scans,
+            added_scan_ids,
         } => Response::Enrolled {
+            profile_id,
             profile: name,
             created: false,
             added,
             total,
             added_scans,
+            added_scan_ids,
         },
     }
 }
@@ -2083,6 +2199,22 @@ fn is_pcr_drift(e: &irlume_common::Error) -> bool {
     irlume_core::tpm::is_pcr_mismatch(e)
 }
 
+fn operation_error(error: irlume_common::Error) -> Response {
+    use irlume_common::{Error, OperationErrorCode};
+
+    eprintln!("irlumed: machine operation failed: {error}");
+    let (code, retryable) = match error {
+        Error::CameraBusy(_) => (OperationErrorCode::CameraBusy, true),
+        Error::Precondition(_) => (OperationErrorCode::PreconditionFailed, true),
+        Error::NotAuthorized(_) => (OperationErrorCode::NotAuthorized, false),
+        Error::Hardware(_) => (OperationErrorCode::HardwareUnavailable, true),
+        Error::Protocol(_) => (OperationErrorCode::ProtocolError, false),
+        Error::Policy(_) | Error::Tpm(_) => (OperationErrorCode::PreconditionFailed, false),
+        Error::Io(_) => (OperationErrorCode::OperationFailed, true),
+    };
+    Response::OperationError { code, retryable }
+}
+
 fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
     let mut json = serde_json::to_vec(resp)?;
     json.push(b'\n');
@@ -2138,6 +2270,45 @@ mod tests {
         assert!(!is_pcr_drift(&Error::Tpm(
             "structure is the wrong size".into()
         )));
+    }
+
+    #[test]
+    fn machine_operation_errors_do_not_expose_diagnostic_prose() {
+        use irlume_common::{Error, OperationErrorCode};
+
+        for (error, expected, retryable) in [
+            (
+                Error::CameraBusy("/dev/video2 held by process 123".into()),
+                OperationErrorCode::CameraBusy,
+                true,
+            ),
+            (
+                Error::Precondition("no face detected".into()),
+                OperationErrorCode::PreconditionFailed,
+                true,
+            ),
+            (
+                Error::NotAuthorized("peer uid 1001".into()),
+                OperationErrorCode::NotAuthorized,
+                false,
+            ),
+            (
+                Error::Protocol("bad internal payload".into()),
+                OperationErrorCode::ProtocolError,
+                false,
+            ),
+        ] {
+            match operation_error(error) {
+                Response::OperationError {
+                    code,
+                    retryable: actual_retryable,
+                } => {
+                    assert_eq!(code, expected);
+                    assert_eq!(actual_retryable, retryable);
+                }
+                other => panic!("expected typed operation error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2260,10 +2431,12 @@ mod tests {
     #[test]
     fn enroll_merge_reports_created_false_with_the_added_scans() {
         let merged = enroll_response(irlume_auth::EnrollOutcome::Merged {
+            profile_id: "profile-0123456789abcdef0123456789abcdef".into(),
             name: "Face Profile 1".into(),
             added: 1,
             total: 8,
             added_scans: vec!["Face Scan 8".into()],
+            added_scan_ids: vec!["scan-8123456789abcdef0123456789abcdef".into()],
         });
         match merged {
             Response::Enrolled {
@@ -2272,17 +2445,30 @@ mod tests {
                 added,
                 total,
                 added_scans,
+                profile_id,
+                added_scan_ids,
             } => {
+                assert_eq!(profile_id, "profile-0123456789abcdef0123456789abcdef");
                 assert_eq!(profile, "Face Profile 1");
                 assert!(!created, "a merge must not claim a new profile was created");
                 assert_eq!((added, total), (1, 8));
                 assert_eq!(added_scans, vec!["Face Scan 8".to_string()]);
+                assert_eq!(
+                    added_scan_ids,
+                    vec!["scan-8123456789abcdef0123456789abcdef".to_string()]
+                );
             }
             other => panic!("merge must answer Enrolled, got {other:?}"),
         }
         let new = enroll_response(irlume_auth::EnrollOutcome::New {
+            profile_id: "profile-1123456789abcdef0123456789abcdef".into(),
             name: "Face Profile 2".into(),
             scans: 3,
+            added_scan_ids: vec![
+                "scan-1123456789abcdef0123456789abcdef".into(),
+                "scan-2123456789abcdef0123456789abcdef".into(),
+                "scan-3123456789abcdef0123456789abcdef".into(),
+            ],
         });
         match new {
             Response::Enrolled {
@@ -2498,6 +2684,7 @@ mod tests {
             },
             Request::RecoveryForget { user: u() },
             Request::PositionSample { user: Some(u()) },
+            Request::PreviewSample { user: u() },
         ];
         for req in &carrying {
             assert_eq!(
@@ -3067,6 +3254,147 @@ mod tests {
             camera_binding: None,
             closure_calibration: None,
         }
+    }
+
+    fn enrollment_with_ids(user: &str, profile_id: &str, scan_ids: &[&str]) -> Enrollment {
+        Enrollment {
+            user: user.into(),
+            profiles: vec![FaceProfile {
+                id: profile_id.into(),
+                name: "Face Profile 1".into(),
+                ir_calib: None,
+                scans: scan_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        let mut scan = rgb_scan(&format!("Face Scan {}", i + 1), i + 1);
+                        scan.id = (*id).into();
+                        scan
+                    })
+                    .collect(),
+            }],
+            require_eyes_open: false,
+            require_challenge: false,
+            camera_binding: None,
+            closure_calibration: None,
+        }
+    }
+
+    #[test]
+    fn disconnected_new_enrollment_removes_the_exact_profile() {
+        let _g = env_lock();
+        let sb = sandbox("rollback-new");
+        let profile_id = "profile-0123456789abcdef0123456789abcdef";
+        let scan_id = "scan-0123456789abcdef0123456789abcdef";
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with_ids("carol", profile_id, &[scan_id]),
+        );
+
+        rollback_disconnected_mutation(
+            &Request::Enroll {
+                user: "carol".into(),
+                profile: None,
+                scans: Some(1),
+                reset: false,
+            },
+            &Response::Enrolled {
+                profile_id: profile_id.into(),
+                profile: "Face Profile 1".into(),
+                created: true,
+                added: 1,
+                total: 1,
+                added_scans: Vec::new(),
+                added_scan_ids: vec![scan_id.into()],
+            },
+        );
+
+        assert!(
+            irlume_core::storage::load("carol").unwrap().is_none(),
+            "rolling back the only newly-created profile must remove the enrollment"
+        );
+    }
+
+    #[test]
+    fn disconnected_merged_enrollment_removes_only_added_scans_atomically() {
+        let _g = env_lock();
+        let sb = sandbox("rollback-merged");
+        let profile_id = "profile-1123456789abcdef0123456789abcdef";
+        let original_id = "scan-1123456789abcdef0123456789abcdef";
+        let added_one = "scan-2123456789abcdef0123456789abcdef";
+        let added_two = "scan-3123456789abcdef0123456789abcdef";
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with_ids("carol", profile_id, &[original_id, added_one, added_two]),
+        );
+
+        rollback_disconnected_mutation(
+            &Request::Enroll {
+                user: "carol".into(),
+                profile: Some("Face Profile 1".into()),
+                scans: Some(2),
+                reset: false,
+            },
+            &Response::Enrolled {
+                profile_id: profile_id.into(),
+                profile: "Face Profile 1".into(),
+                created: false,
+                added: 2,
+                total: 3,
+                added_scans: vec!["Face Scan 2".into(), "Face Scan 3".into()],
+                added_scan_ids: vec![added_one.into(), added_two.into()],
+            },
+        );
+
+        let enrollment = irlume_core::storage::load("carol")
+            .unwrap()
+            .expect("original enrollment remains");
+        let ids: Vec<_> = enrollment.profiles[0]
+            .scans
+            .iter()
+            .map(|scan| scan.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![original_id]);
+    }
+
+    #[test]
+    fn disconnected_add_scan_removes_only_the_returned_scan() {
+        let _g = env_lock();
+        let sb = sandbox("rollback-add-scan");
+        let profile_id = "profile-4123456789abcdef0123456789abcdef";
+        let original_id = "scan-4123456789abcdef0123456789abcdef";
+        let added_id = "scan-5123456789abcdef0123456789abcdef";
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with_ids("carol", profile_id, &[original_id, added_id]),
+        );
+
+        rollback_disconnected_mutation(
+            &Request::AddScanById {
+                user: "carol".into(),
+                profile_id: profile_id.into(),
+            },
+            &Response::ProfileMutation {
+                operation: irlume_common::ProfileMutationKind::AddScan,
+                profile_id: profile_id.into(),
+                profile_name_before: Some("Face Profile 1".into()),
+                profile_name_after: Some("Face Profile 1".into()),
+                scan_id: Some(added_id.into()),
+                scan_name_before: None,
+                scan_name_after: Some("Face Scan 2".into()),
+                total_scans: Some(2),
+            },
+        );
+
+        let enrollment = irlume_core::storage::load("carol")
+            .unwrap()
+            .expect("original enrollment remains");
+        let ids: Vec<_> = enrollment.profiles[0]
+            .scans
+            .iter()
+            .map(|scan| scan.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![original_id]);
     }
 
     /// Plant a bogus sealed-password envelope file. has_sealed_password() is a

@@ -7,14 +7,29 @@
 //! protocol. A capability is advertised only after its public command, output
 //! shape, and compatibility rules are covered here and in `docs/MACHINE-API.md`.
 
-use irlume_common::{ProfileMutationKind, ProfileSummary, Request, Response};
+use irlume_common::{OperationErrorCode, ProfileMutationKind, ProfileSummary, Request, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::io::Write;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const CONTRACT_VERSION: u32 = 1;
 
-const CAPABILITIES: &[&str] = &["version-json", "profiles-json", "profile-mutations-json"];
+const CAPABILITIES: &[&str] = &[
+    "version-json",
+    "profiles-json",
+    "profile-mutations-json",
+    "events-jsonl",
+    "position-report",
+    "preview-ir-jpeg",
+];
+
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_cancel(_: libc::c_int) {
+    CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 #[derive(Serialize)]
 struct Document {
@@ -72,6 +87,94 @@ fn emit(document: &Document, exit: ExitCode) -> ExitCode {
     }
 }
 
+fn operation_id(prefix: &str) -> String {
+    format!("{prefix}-{:032x}", rand::random::<u128>())
+}
+
+fn install_cancellation_handler() {
+    CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    unsafe {
+        let handler = request_cancel as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+
+struct EventStream {
+    command: &'static str,
+    operation_id: String,
+    session_id: String,
+    sequence: u64,
+}
+
+impl EventStream {
+    fn new(command: &'static str) -> Self {
+        Self {
+            command,
+            operation_id: operation_id("operation"),
+            session_id: operation_id("session"),
+            sequence: 0,
+        }
+    }
+
+    fn value(
+        &self,
+        event: &str,
+        terminal: bool,
+        data: Option<Value>,
+        error: Option<Value>,
+    ) -> Value {
+        let mut value = json!({
+            "contract_version": CONTRACT_VERSION,
+            "engine_version": env!("CARGO_PKG_VERSION"),
+            "command": self.command,
+            "operation_id": self.operation_id,
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+            "event": event,
+            "terminal": terminal
+        });
+        let object = value.as_object_mut().expect("event is an object");
+        if let Some(data) = data {
+            object.insert("data".into(), data);
+        }
+        if let Some(error) = error {
+            object.insert("error".into(), error);
+        }
+        value
+    }
+
+    fn emit(&mut self, event: &str, terminal: bool, data: Option<Value>, error: Option<Value>) {
+        let value = self.value(event, terminal, data, error);
+        self.sequence += 1;
+        println!(
+            "{}",
+            serde_json::to_string(&value).expect("serialize event")
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn failed(&mut self, code: &'static str, retryable: bool) -> ExitCode {
+        self.emit(
+            "failed",
+            true,
+            None,
+            Some(json!({"code": code, "retryable": retryable})),
+        );
+        ExitCode::FAILURE
+    }
+
+    fn cancelled(&mut self) -> ExitCode {
+        self.emit(
+            "cancelled",
+            true,
+            None,
+            Some(json!({"code": "user-cancelled", "retryable": true})),
+        );
+        ExitCode::from(130)
+    }
+}
+
 pub fn version(args: &[String]) -> ExitCode {
     if args != ["version", "--json"] {
         return emit(&failure("version", "usage-error", false), ExitCode::from(2));
@@ -89,6 +192,450 @@ pub fn version(args: &[String]) -> ExitCode {
         ),
         ExitCode::SUCCESS,
     )
+}
+
+pub fn enroll_events(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "enroll";
+    if !valid_event_args(args, "enroll", false) {
+        return event_usage(COMMAND);
+    }
+    install_cancellation_handler();
+    let mut stream = EventStream::new(COMMAND);
+    stream.emit("started", false, None, None);
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return stream.cancelled();
+    }
+    let user = crate::user_arg(args);
+    if let Err((code, retryable)) =
+        emit_preview_countdown(&mut stream, &user, preview_requested(args))
+    {
+        return if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            stream.cancelled()
+        } else {
+            stream.failed(code, retryable)
+        };
+    }
+    stream.emit("stage", false, Some(json!({"stage": "capturing"})), None);
+    let response = cancellable_request(&Request::Enroll {
+        user: user.clone(),
+        profile: None,
+        scans: None,
+        reset: false,
+    });
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) && response.is_err() {
+        return stream.cancelled();
+    }
+    match response {
+        Ok(Response::Enrolled {
+            profile_id,
+            created,
+            added,
+            total,
+            added_scan_ids,
+            ..
+        }) if irlume_core::storage::valid_profile_id(&profile_id)
+            && added_scan_ids
+                .iter()
+                .all(|id| irlume_core::storage::valid_scan_id(id)) =>
+        {
+            if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                if rollback_enrollment(&user, &profile_id, created, &added_scan_ids) {
+                    return stream.cancelled();
+                }
+                return stream.failed("rollback-failed", false);
+            }
+            stream.emit(
+                "completed",
+                true,
+                Some(json!({
+                    "profile_id": profile_id,
+                    "created": created,
+                    "added_scans": added,
+                    "total_scans": total
+                })),
+                None,
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Response::OperationError { code, retryable }) => {
+            stream.failed(operation_error_code(code), retryable)
+        }
+        Ok(Response::Error(_)) => stream.failed("precondition-failed", false),
+        Ok(_) => stream.failed("protocol-error", false),
+        Err(error) => request_failed(&mut stream, error),
+    }
+}
+
+pub fn auth_test_events(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "auth.test";
+    if !valid_event_args(args, "auth", false) || args.get(1).map(String::as_str) != Some("test") {
+        return event_usage(COMMAND);
+    }
+    install_cancellation_handler();
+    let mut stream = EventStream::new(COMMAND);
+    stream.emit("started", false, None, None);
+    let user = crate::user_arg(args);
+    if let Err((code, retryable)) =
+        emit_preview_countdown(&mut stream, &user, preview_requested(args))
+    {
+        return if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            stream.cancelled()
+        } else {
+            stream.failed(code, retryable)
+        };
+    }
+    stream.emit("stage", false, Some(json!({"stage": "matching"})), None);
+    let response = cancellable_request(&Request::Authenticate {
+        user,
+        service: None,
+    });
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return stream.cancelled();
+    }
+    match response {
+        Ok(Response::AuthResult {
+            granted,
+            score,
+            live,
+            ..
+        }) => {
+            stream.emit(
+                "completed",
+                true,
+                Some(json!({
+                    "matched": granted,
+                    "liveness": if live { "live" } else { "not-live" },
+                    "score": score,
+                    "credential_released": false,
+                    "profile_modified": false
+                })),
+                None,
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Response::OperationError { code, retryable }) => {
+            stream.failed(operation_error_code(code), retryable)
+        }
+        Ok(Response::Error(_)) => stream.failed("precondition-failed", false),
+        Ok(_) => stream.failed("protocol-error", false),
+        Err(error) => request_failed(&mut stream, error),
+    }
+}
+
+pub fn profiles_add_scan_events(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "profiles.add-scan";
+    if !valid_event_args(args, "profiles", true)
+        || args.get(1).map(String::as_str) != Some("add-scan")
+    {
+        return event_usage(COMMAND);
+    }
+    let Some(profile_id) = crate::flag(args, "--profile-id").map(String::from) else {
+        return event_usage(COMMAND);
+    };
+    if !irlume_core::storage::valid_profile_id(&profile_id) {
+        return event_usage(COMMAND);
+    }
+    install_cancellation_handler();
+    let mut stream = EventStream::new(COMMAND);
+    stream.emit("started", false, None, None);
+    let user = crate::user_arg(args);
+    if let Err((code, retryable)) =
+        emit_preview_countdown(&mut stream, &user, preview_requested(args))
+    {
+        return if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            stream.cancelled()
+        } else {
+            stream.failed(code, retryable)
+        };
+    }
+    stream.emit("stage", false, Some(json!({"stage": "capturing"})), None);
+    let response = cancellable_request(&Request::AddScanById {
+        user: user.clone(),
+        profile_id: profile_id.clone(),
+    });
+    if CANCEL_REQUESTED.load(Ordering::SeqCst) && response.is_err() {
+        return stream.cancelled();
+    }
+    match response {
+        Ok(Response::ProfileMutation {
+            operation: ProfileMutationKind::AddScan,
+            profile_id: returned_profile_id,
+            scan_id: Some(scan_id),
+            total_scans: Some(total),
+            ..
+        }) if returned_profile_id == profile_id
+            && irlume_core::storage::valid_scan_id(&scan_id) =>
+        {
+            if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                let rolled_back = matches!(
+                    crate::daemon_request(&Request::DeleteScanById {
+                        user,
+                        profile_id: profile_id.clone(),
+                        scan_id,
+                    }),
+                    Ok(Response::ProfileMutation {
+                        operation: ProfileMutationKind::DeleteScan,
+                        ..
+                    })
+                );
+                return if rolled_back {
+                    stream.cancelled()
+                } else {
+                    stream.failed("rollback-failed", false)
+                };
+            }
+            stream.emit(
+                "completed",
+                true,
+                Some(json!({
+                    "profile_id": profile_id,
+                    "added_scans": 1,
+                    "total_scans": total,
+                    "mutated_other_profiles": false
+                })),
+                None,
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Response::OperationError { code, retryable }) => {
+            stream.failed(operation_error_code(code), retryable)
+        }
+        Ok(Response::Error(_)) => stream.failed("precondition-failed", false),
+        Ok(_) => stream.failed("protocol-error", false),
+        Err(error) => request_failed(&mut stream, error),
+    }
+}
+
+fn emit_preview_countdown(
+    stream: &mut EventStream,
+    user: &str,
+    include_preview: bool,
+) -> Result<(), (&'static str, bool)> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let mut countdown = 3;
+    for _ in 0..12 {
+        if CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return Err(("user-cancelled", true));
+        }
+        let started = std::time::Instant::now();
+        let sample = match cancellable_request(&Request::PreviewSample { user: user.into() }) {
+            Ok(Response::Preview(sample)) => sample,
+            Ok(Response::OperationError {
+                code: OperationErrorCode::PreconditionFailed,
+                retryable: true,
+            }) => continue,
+            Ok(Response::OperationError { code, retryable }) => {
+                return Err((operation_error_code(code), retryable))
+            }
+            Ok(Response::Error(_)) => return Err(("precondition-failed", false)),
+            Ok(_) => return Err(("protocol-error", false)),
+            Err(crate::CancellableRequestError::Cancelled) => return Err(("user-cancelled", true)),
+            Err(crate::CancellableRequestError::Timeout) => return Err(("timeout", true)),
+            Err(crate::CancellableRequestError::Protocol) => return Err(("protocol-error", false)),
+            Err(crate::CancellableRequestError::Unavailable) => {
+                return Err(("daemon-unavailable", true))
+            }
+        };
+        let bytes = STANDARD
+            .decode(&sample.frame_jpeg_base64)
+            .map_err(|_| ("invalid-preview", false))?;
+        if bytes.len() > 128 * 1024
+            || sample.width == 0
+            || sample.height == 0
+            || sample.width > 640
+            || sample.height > 480
+            || !matches!(sample.spectrum.as_str(), "ir" | "rgb")
+            || sample.landmarks.len() != 478
+            || sample
+                .landmarks
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+            || sample
+                .face_box
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+            || sample.face_box[2] <= 0.0
+            || sample.face_box[3] <= 0.0
+            || sample.face_box[0] + sample.face_box[2] > 1.0
+            || sample.face_box[1] + sample.face_box[3] > 1.0
+        {
+            return Err(("invalid-preview", false));
+        }
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+            .map_err(|_| ("invalid-preview", false))?;
+        if decoded.width() != sample.width || decoded.height() != sample.height {
+            return Err(("invalid-preview", false));
+        }
+        let position = &sample.position;
+        if position.guidance.len() > 160
+            || position.guidance.chars().any(char::is_control)
+            || position.quality > 100
+        {
+            return Err(("invalid-preview", false));
+        }
+        let position_data = json!({
+            "face_detected": position.face,
+            "centered": position.centered,
+            "facing_camera": position.yaw_asym <= 0.22
+                && (0.28..=0.72).contains(&position.pitch_frac),
+            "well_lit": (55.0..=235.0).contains(&position.brightness),
+            "ir_ready": position.ir_ok,
+            "well_framed": position.well_framed,
+            "quality": position.quality,
+            "countdown": countdown,
+            "guidance": position.guidance
+        });
+        let data = if include_preview {
+            json!({
+                "frame_jpeg_base64": sample.frame_jpeg_base64,
+                "width": sample.width,
+                "height": sample.height,
+                "spectrum": sample.spectrum,
+                "landmarks": sample.landmarks,
+                "face_box": sample.face_box,
+                "position": position_data
+            })
+        } else {
+            json!({"position": position_data})
+        };
+        stream.emit("preview", false, Some(data), None);
+        if position.well_framed {
+            countdown -= 1;
+            if countdown == 0 {
+                return Ok(());
+            }
+        } else {
+            countdown = 3;
+        }
+        let elapsed = started.elapsed();
+        let minimum = std::time::Duration::from_millis(125);
+        if elapsed < minimum {
+            std::thread::sleep(minimum - elapsed);
+        }
+    }
+    Err(("positioning-timeout", true))
+}
+
+fn preview_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--preview=ir-jpeg")
+}
+
+fn cancellable_request(request: &Request) -> Result<Response, crate::CancellableRequestError> {
+    crate::daemon_request_cancellable(request, || CANCEL_REQUESTED.load(Ordering::SeqCst))
+}
+
+fn operation_error_code(code: OperationErrorCode) -> &'static str {
+    match code {
+        OperationErrorCode::CameraBusy => "camera-busy",
+        OperationErrorCode::NotAuthorized => "not-authorized",
+        OperationErrorCode::Cancelled => "user-cancelled",
+        OperationErrorCode::Timeout => "timeout",
+        OperationErrorCode::PreconditionFailed => "precondition-failed",
+        OperationErrorCode::HardwareUnavailable => "hardware-unavailable",
+        OperationErrorCode::ProtocolError => "protocol-error",
+        OperationErrorCode::OperationFailed => "operation-failed",
+    }
+}
+
+fn request_failed(stream: &mut EventStream, error: crate::CancellableRequestError) -> ExitCode {
+    match error {
+        crate::CancellableRequestError::Cancelled => stream.cancelled(),
+        crate::CancellableRequestError::Timeout => stream.failed("timeout", true),
+        crate::CancellableRequestError::Protocol => stream.failed("protocol-error", false),
+        crate::CancellableRequestError::Unavailable => stream.failed("daemon-unavailable", true),
+    }
+}
+
+fn rollback_enrollment(
+    user: &str,
+    profile_id: &str,
+    created: bool,
+    added_scan_ids: &[String],
+) -> bool {
+    if created {
+        return matches!(
+            crate::daemon_request(&Request::DeleteProfileById {
+                user: user.into(),
+                profile_id: profile_id.into(),
+            }),
+            Ok(Response::ProfileMutation {
+                operation: ProfileMutationKind::DeleteProfile,
+                ..
+            })
+        );
+    }
+    for scan_id in added_scan_ids.iter().rev() {
+        if !matches!(
+            crate::daemon_request(&Request::DeleteScanById {
+                user: user.into(),
+                profile_id: profile_id.into(),
+                scan_id: scan_id.clone(),
+            }),
+            Ok(Response::ProfileMutation {
+                operation: ProfileMutationKind::DeleteScan,
+                ..
+            })
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn event_usage(command: &'static str) -> ExitCode {
+    let mut stream = EventStream::new(command);
+    stream.failed("usage-error", false);
+    ExitCode::from(2)
+}
+
+fn valid_event_args(args: &[String], root: &str, profile_required: bool) -> bool {
+    if args.first().map(String::as_str) != Some(root) {
+        return false;
+    }
+    let mut events = false;
+    let mut preview = false;
+    let mut fps = false;
+    let mut size = false;
+    let mut user = false;
+    let mut profile = false;
+    let mut index = if root == "auth" || root == "profiles" {
+        2
+    } else {
+        1
+    };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--events=jsonl" if !events => events = true,
+            "--preview=ir-jpeg" if !preview => preview = true,
+            "--preview-max-fps=8" if !fps => fps = true,
+            "--preview-max-size=640x480" if !size => size = true,
+            "--user" if !user => {
+                user = true;
+                let Some(value) = args.get(index + 1) else {
+                    return false;
+                };
+                if value.is_empty() || value.starts_with('-') {
+                    return false;
+                }
+                index += 1;
+            }
+            "--profile-id" if profile_required && !profile => {
+                profile = true;
+                let Some(value) = args.get(index + 1) else {
+                    return false;
+                };
+                if !irlume_core::storage::valid_profile_id(value) {
+                    return false;
+                }
+                index += 1;
+            }
+            _ => return false,
+        }
+        index += 1;
+    }
+    events && preview == fps && fps == size && (!profile_required || profile)
 }
 
 pub fn profiles_list(args: &[String]) -> ExitCode {
@@ -404,7 +951,14 @@ mod tests {
         assert_eq!(document["ok"], true);
         assert_eq!(
             document["data"]["capabilities"],
-            json!(["version-json", "profiles-json", "profile-mutations-json"])
+            json!([
+                "version-json",
+                "profiles-json",
+                "profile-mutations-json",
+                "events-jsonl",
+                "position-report",
+                "preview-ir-jpeg"
+            ])
         );
         assert!(document.get("error").is_none());
     }
@@ -516,6 +1070,76 @@ mod tests {
         assert_eq!(document["error"]["code"], "daemon-unavailable");
         assert_eq!(document["error"]["retryable"], true);
         assert!(document.get("data").is_none());
+    }
+
+    #[test]
+    fn maximum_preview_event_fits_the_desktop_line_budget() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let stream = EventStream::new("enroll");
+        let event = stream.value(
+            "preview",
+            false,
+            Some(json!({
+                "frame_jpeg_base64": STANDARD.encode(vec![0_u8; 96 * 1024]),
+                "width": 640,
+                "height": 480,
+                "spectrum": "ir",
+                "landmarks": vec![[1.0_f32, 1.0_f32]; 478],
+                "face_box": [0.0, 0.0, 1.0, 1.0],
+                "position": {
+                    "face_detected": true,
+                    "centered": true,
+                    "facing_camera": true,
+                    "well_lit": true,
+                    "ir_ready": true,
+                    "well_framed": true,
+                    "quality": 100,
+                    "countdown": 3,
+                    "guidance": "x".repeat(160)
+                }
+            })),
+            None,
+        );
+        let line = serde_json::to_vec(&event).unwrap();
+        assert!(
+            line.len() < 256 * 1024,
+            "maximum preview event is {} bytes",
+            line.len()
+        );
+    }
+
+    #[test]
+    fn operation_error_codes_are_stable_and_exhaustive() {
+        assert_eq!(
+            operation_error_code(OperationErrorCode::CameraBusy),
+            "camera-busy"
+        );
+        assert_eq!(
+            operation_error_code(OperationErrorCode::NotAuthorized),
+            "not-authorized"
+        );
+        assert_eq!(
+            operation_error_code(OperationErrorCode::Cancelled),
+            "user-cancelled"
+        );
+        assert_eq!(operation_error_code(OperationErrorCode::Timeout), "timeout");
+        assert_eq!(
+            operation_error_code(OperationErrorCode::PreconditionFailed),
+            "precondition-failed"
+        );
+        assert_eq!(
+            operation_error_code(OperationErrorCode::HardwareUnavailable),
+            "hardware-unavailable"
+        );
+        assert_eq!(
+            operation_error_code(OperationErrorCode::ProtocolError),
+            "protocol-error"
+        );
+        assert_eq!(
+            operation_error_code(OperationErrorCode::OperationFailed),
+            "operation-failed"
+        );
     }
 
     #[test]

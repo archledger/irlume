@@ -1263,11 +1263,13 @@ fn profiles_empty_listing_says_none_enrolled() {
 fn enroll_reports_a_new_profile_and_forwards_the_flags() {
     let sb = Sandbox::new("enrollnew");
     let log = serve(&sock(&sb), |_| Response::Enrolled {
+        profile_id: String::new(),
         profile: "Night".into(),
         created: true,
         added: 3,
         total: 3,
         added_scans: vec!["Scan 1".into(), "Scan 2".into(), "Scan 3".into()],
+        added_scan_ids: Vec::new(),
     });
     let (code, out, _) = run(&mut sb.cmd(&[
         "enroll", "--user", "tester", "--name", "Night", "--scans", "3",
@@ -1296,11 +1298,13 @@ fn enroll_reports_a_new_profile_and_forwards_the_flags() {
 fn enroll_merge_points_at_add_scan() {
     let sb = Sandbox::new("enrollmerge");
     serve(&sock(&sb), |_| Response::Enrolled {
+        profile_id: String::new(),
         profile: "Face Profile 1".into(),
         created: false,
         added: 2,
         total: 8,
         added_scans: vec!["Scan 7".into(), "Scan 8".into()],
+        added_scan_ids: Vec::new(),
     });
     let (code, out, _) = run(&mut sb.cmd(&["enroll", "--user", "tester"]));
     assert_eq!(code, 0);
@@ -1471,11 +1475,13 @@ fn setup_walks_every_step_noninteractively() {
             ir_ratio_calibrated: false,
         },
         Request::Enroll { .. } => Response::Enrolled {
+            profile_id: String::new(),
             profile: "Face Profile 1".into(),
             created: true,
             added: 6,
             total: 6,
             added_scans: Vec::new(),
+            added_scan_ids: Vec::new(),
         },
         Request::SealPassword { .. } => Response::PasswordSealed,
         _ => Response::Error("unexpected request".into()),

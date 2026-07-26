@@ -302,6 +302,9 @@ pub enum Request {
     /// enrolled: it tunes the pitch band to that user's calibrated neutral (a
     /// read-only lookup) so the guide matches the capture gate. `None` = default band.
     PositionSample { user: Option<String> },
+    /// One bounded in-memory preview sample for the public enrollment event
+    /// stream. The daemon owns capture and inference; no path is accepted.
+    PreviewSample { user: String },
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
@@ -437,6 +440,34 @@ pub struct PositionReport {
     pub guidance: String,
 }
 
+/// Bounded preview payload returned only for an explicitly requested
+/// enrollment stream. It contains no identity, score, embedding, or path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewSample {
+    pub frame_jpeg_base64: String,
+    pub width: u32,
+    pub height: u32,
+    pub spectrum: String,
+    pub landmarks: Vec<[f32; 2]>,
+    pub face_box: [f32; 4],
+    pub position: PositionReport,
+}
+
+/// Stable daemon error code for machine-facing operations. Human diagnostic
+/// text remains in daemon logs; public clients branch only on this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationErrorCode {
+    CameraBusy,
+    NotAuthorized,
+    Cancelled,
+    Timeout,
+    PreconditionFailed,
+    HardwareUnavailable,
+    ProtocolError,
+    OperationFailed,
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -499,11 +530,15 @@ pub enum Response {
     /// that wants to undo a merge (e.g. the TUI on a declined confirm) can
     /// delete exactly them. See EnrollOutcome.
     Enrolled {
+        #[serde(default)]
+        profile_id: String,
         profile: String,
         created: bool,
         added: usize,
         total: usize,
         added_scans: Vec<String>,
+        #[serde(default)]
+        added_scan_ids: Vec<String>,
     },
     SelfTest {
         passed: bool,
@@ -543,6 +578,13 @@ pub enum Response {
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
+    /// A bounded enrollment preview (`PreviewSample`).
+    Preview(PreviewSample),
+    /// Stable failure for machine-facing requests.
+    OperationError {
+        code: OperationErrorCode,
+        retryable: bool,
+    },
     /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
     /// eye was detected in any frame.
     EarMedian(Option<f32>),
@@ -602,6 +644,10 @@ pub enum Error {
     NotAuthorized(String),
     #[error("hardware: {0}")]
     Hardware(String),
+    #[error("camera busy: {0}")]
+    CameraBusy(String),
+    #[error("precondition: {0}")]
+    Precondition(String),
     #[error("tpm: {0}")]
     Tpm(String),
     #[error("policy: {0}")]
@@ -733,6 +779,14 @@ mod tests {
                 "not authorized: peer uid 1000",
             ),
             (Error::Hardware("no camera".into()), "hardware: no camera"),
+            (
+                Error::CameraBusy("/dev/video2".into()),
+                "camera busy: /dev/video2",
+            ),
+            (
+                Error::Precondition("no face".into()),
+                "precondition: no face",
+            ),
             (Error::Tpm("unseal failed".into()), "tpm: unseal failed"),
             (
                 Error::Policy("PCR mismatch: [7]".into()),
@@ -866,18 +920,26 @@ mod tests {
         // the resolved profile + the merged scan names intact.
         for r in [
             Response::Enrolled {
+                profile_id: "profile-0123456789abcdef0123456789abcdef".into(),
                 profile: "Face Profile 1".into(),
                 created: true,
                 added: 3,
                 total: 3,
                 added_scans: vec![],
+                added_scan_ids: vec![
+                    "scan-0123456789abcdef0123456789abcdef".into(),
+                    "scan-1123456789abcdef0123456789abcdef".into(),
+                    "scan-2123456789abcdef0123456789abcdef".into(),
+                ],
             },
             Response::Enrolled {
+                profile_id: "profile-0123456789abcdef0123456789abcdef".into(),
                 profile: "Face Profile 1".into(),
                 created: false,
                 added: 1,
                 total: 8,
                 added_scans: vec!["scan8".into()],
+                added_scan_ids: vec!["scan-8123456789abcdef0123456789abcdef".into()],
             },
         ] {
             let wire = serde_json::to_string(&r).unwrap();
@@ -890,6 +952,8 @@ mod tests {
                         added: a1,
                         total: t1,
                         added_scans: s1,
+                        profile_id: i1,
+                        added_scan_ids: si1,
                     },
                     Response::Enrolled {
                         profile: p2,
@@ -897,9 +961,12 @@ mod tests {
                         added: a2,
                         total: t2,
                         added_scans: s2,
+                        profile_id: i2,
+                        added_scan_ids: si2,
                     },
                 ) => {
                     assert_eq!((p1, c1, a1, t1, s1), (p2, c2, a2, t2, s2));
+                    assert_eq!((i1, si1), (i2, si2));
                 }
                 _ => panic!("Enrolled did not round-trip to Enrolled"),
             }

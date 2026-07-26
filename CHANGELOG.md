@@ -79,6 +79,16 @@ All notable changes to irlume are documented here. This project adheres to
   mutations.** Profile and scan rename/delete commands target IDs, validate
   bounded inputs, and return typed before/after identity without exposing the
   private daemon socket.
+- **Enrollment, authentication test, and improve-recognition now have bounded
+  JSONL event streams.** Streams carry stable operation/session identity,
+  monotonic events, positioning and an explicitly requested in-memory preview,
+  then exactly one terminal result. `SIGINT`/`SIGTERM` closes an in-flight
+  request promptly; completed mutations are rolled back by exact opaque IDs,
+  including daemon-side rollback when the client disconnects before receiving
+  the result. Preview frames never touch disk, fit the desktop line budget, and
+  are omitted unless the complete fixed preview flag set is present. Machine
+  failures use typed codes such as `camera-busy`, `not-authorized`, `timeout`,
+  and `precondition-failed` instead of parsing diagnostic prose.
 
 - **`sudo irlume camera-tune` measures whether your camera can read both sensors
   at once.** Some Hello modules stop exposing their colour stream properly while

@@ -882,6 +882,8 @@ dependencies = [
 name = "irlume-auth"
 version = "0.6.1"
 dependencies = [
+ "base64",
+ "image",
  "irlume-camera",
  "irlume-common",
  "irlume-core",
@@ -905,6 +907,7 @@ dependencies = [
 name = "irlume-cli"
 version = "0.6.1"
 dependencies = [
+ "base64",
  "image",
  "irlume-auth",
  "irlume-camera",
@@ -914,6 +917,7 @@ dependencies = [
  "irlume-liveness",
  "irlume-vision",
  "libc",
+ "rand 0.10.2",
  "ratatui",
  "rpassword",
  "serde",

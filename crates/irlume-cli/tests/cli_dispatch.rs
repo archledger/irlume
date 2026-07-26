@@ -567,11 +567,13 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_ratio_calibrated: false,
         },
         Request::Enroll { .. } => Response::Enrolled {
+            profile_id: String::new(),
             profile: "Face Profile 1".into(),
             created: false,
             added: 2,
             total: 8,
             added_scans: Vec::new(),
+            added_scan_ids: Vec::new(),
         },
         Request::SealPassword { .. } => Response::PasswordSealed,
         _ => Response::Error("unexpected request".into()),

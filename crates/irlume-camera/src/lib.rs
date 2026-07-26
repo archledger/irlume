@@ -205,7 +205,7 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
             let who = camera_holder(device)
                 .map(|h| format!(", in use by {h}"))
                 .unwrap_or_else(|| ", another app is using it".into());
-            Error::Hardware(format!(
+            Error::CameraBusy(format!(
                 "{device}: camera busy{who}. Close that app (e.g. a camera/video/conferencing app) and retry."
             ))
         }

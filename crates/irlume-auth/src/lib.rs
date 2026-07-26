@@ -56,6 +56,16 @@ pub struct Engine {
     /// RGB-only device → face runs in CONVENIENCE tier (lock-screen unlock only,
     /// RGB-only liveness, never releases credentials / logs in / elevates).
     ir_available: bool,
+    /// Did the pre-match consent watch see the gesture for the authentication
+    /// currently in flight?
+    ///
+    /// Set by [`Engine::authenticate_for`] and cleared there when it returns, so
+    /// it never outlives one call. It is engine state rather than a parameter
+    /// because the grant sites that consult it are spread across the matcher and
+    /// threading a flag through every one of them would obscure them for no gain.
+    /// The gate treats `false` as "not seen yet", which is the fail-closed
+    /// reading: the worst a stale `false` can do is ask for another gesture.
+    gesture_seen_before_match: bool,
 }
 
 /// Assurance tier of this engine, derived from the available camera hardware.
@@ -484,6 +494,7 @@ impl Engine {
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
             ir_available: irlume_camera::capabilities().ir_pair,
+            gesture_seen_before_match: false,
         })
     }
 
@@ -1344,6 +1355,77 @@ impl Engine {
     /// draining a fixed window and letting the polkit agent re-run the whole
     /// prompt. Bounded by `max_frames`. Returns whether a gesture was accepted.
     /// `check_closure` is `Some(cal)` only when the closure gesture is eligible.
+    /// Total frames the consent gesture may be watched for across ONE
+    /// authentication, split between a watch before the face match and one
+    /// after. `IRLUME_CONSENT_MAX_FRAMES` overrides. At the IR node's ~15fps the
+    /// default is roughly 8 seconds.
+    fn consent_budget() -> usize {
+        std::env::var("IRLUME_CONSENT_MAX_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= 24)
+            .unwrap_or(120)
+    }
+
+    /// Watch for the consent gesture BEFORE the face is captured.
+    ///
+    /// The greeter tells the user to nod and then this daemon spends several
+    /// seconds capturing and matching a face, so a watch that only opens after
+    /// the match starts looking well after a cooperative user has already
+    /// nodded and stopped. Measured on hardware 2026-07-25: holding still was
+    /// correctly refused, nodding CONTINUOUSLY released in 6s, and nodding ONCE
+    /// when the prompt appeared was refused, which is indistinguishable from a
+    /// broken gate to the person doing it.
+    ///
+    /// It takes a share of the same budget rather than adding to it, so the
+    /// worst case is no slower than before, and it runs ONCE per authentication
+    /// rather than per grace-window retry.
+    fn early_consent_watch(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+    ) -> irlume_common::Result<bool> {
+        if !self.ir_available {
+            return Ok(false);
+        }
+        let (allow_nod, closure_cal) = self.consent_gesture_inputs(enr);
+        if !allow_nod && closure_cal.is_none() {
+            return Ok(false);
+        }
+        let seen = self.consent_watch(Self::consent_budget() / 3, allow_nod, closure_cal)?;
+        irlume_common::dlog!(
+            "consent: pre-match watch {}",
+            if seen {
+                "saw the gesture"
+            } else {
+                "saw nothing yet; will watch again after the match"
+            }
+        );
+        Ok(seen)
+    }
+
+    /// Which gestures this enrollment can be asked for: the nod unless the
+    /// operator restricted the mode, and the eye closure only when the mesh is
+    /// loaded and the user has a usable calibration.
+    fn consent_gesture_inputs(
+        &self,
+        enr: &irlume_core::storage::Enrollment,
+    ) -> (bool, Option<irlume_liveness::ClosureCalibration>) {
+        let mode = consent_gesture_mode();
+        let allow_nod = mode != ConsentGesture::Closure;
+        let closure_cal = (mode != ConsentGesture::Nod && self.mesh.is_some())
+            .then(|| {
+                enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
+                    let cal = irlume_liveness::ClosureCalibration {
+                        ear_open,
+                        ear_closed,
+                    };
+                    cal.is_usable().then_some(cal)
+                })
+            })
+            .flatten();
+        (allow_nod, closure_cal)
+    }
+
     fn consent_watch(
         &mut self,
         max_frames: usize,
@@ -1417,7 +1499,8 @@ impl Engine {
             return Ok(outcome);
         }
         if purpose.demands_gesture() {
-            return self.consent_gesture_gate(enr, outcome);
+            let seen = self.gesture_seen_before_match;
+            return self.consent_gesture_gate(enr, outcome, seen);
         }
         // Credential release with the challenge switched OFF, and no per-enrollment
         // gate either: the operator chose this, so honour it, but say so on every
@@ -1503,18 +1586,24 @@ impl Engine {
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         outcome: Outcome,
+        already_seen: bool,
     ) -> irlume_common::Result<Outcome> {
-        // Rolling watch deadline: keep watching up to ~8s and return the INSTANT
-        // a gesture appears, so the user can nod whenever without a fixed 5s
-        // window to miss (which made the fixed-window version slow and unreliable
-        // as the polkit agent re-ran the whole prompt). A quick nod returns in
-        // ~2-3s; only a no-gesture window pays the full deadline before the
-        // password fallback. `IRLUME_CONSENT_MAX_FRAMES` overrides.
-        let max_frames = std::env::var("IRLUME_CONSENT_MAX_FRAMES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v >= 24)
-            .unwrap_or(120);
+        // The gesture was already made, before the face capture. Nothing is
+        // gained by asking for a second one; it is the same person in the same
+        // authentication, seconds apart.
+        if already_seen {
+            irlume_common::dlog!("consent: gesture already seen before the match");
+            return Ok(outcome);
+        }
+        // Rolling watch deadline: keep watching and return the INSTANT a gesture
+        // appears, so the user can nod whenever without a fixed window to miss
+        // (which made the fixed-window version slow and unreliable as the polkit
+        // agent re-ran the whole prompt). A quick nod returns in ~2-3s; only a
+        // no-gesture window pays the full deadline before the password fallback.
+        // This is the REMAINDER of the budget, the rest having been spent
+        // watching before the match.
+        let budget = Self::consent_budget();
+        let max_frames = budget - budget / 3;
         let (live, score) = (outcome.live, outcome.score);
         let deny = |reason: &str| Outcome {
             granted: false,
@@ -1529,21 +1618,9 @@ impl Engine {
             ));
         }
         let mode = consent_gesture_mode();
-        let allow_nod = mode != ConsentGesture::Closure;
-        // The eye closure is eligible only when not restricted to nod, the mesh
-        // is loaded, and the user has a usable calibration.
-        let closure_cal = (mode != ConsentGesture::Nod && self.mesh.is_some())
-            .then(|| {
-                enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
-                    let cal = irlume_liveness::ClosureCalibration {
-                        ear_open,
-                        ear_closed,
-                    };
-                    cal.is_usable().then_some(cal)
-                })
-            })
-            .flatten();
+        let (allow_nod, closure_cal) = self.consent_gesture_inputs(enr);
         if self.consent_watch(max_frames, allow_nod, closure_cal)? {
+            irlume_common::dlog!("consent: gesture seen after the match");
             Ok(outcome)
         } else {
             Ok(deny(match mode {
@@ -1601,8 +1678,19 @@ impl Engine {
     ) -> irlume_common::Result<Outcome> {
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
+        // Watch for the consent gesture BEFORE the first capture, so a user who
+        // nods when the greeter asks is not ignored for the seconds it takes to
+        // capture and match a face. Once per authentication, never per retry: a
+        // grace window can hold several attempts and none of them should re-ask
+        // for a gesture already given.
+        self.gesture_seen_before_match = false;
+        if purpose.demands_gesture() {
+            if let Some(enr) = irlume_core::storage::load(user)? {
+                self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
+            }
+        }
         let mut attempt = 0u32;
-        loop {
+        let out = loop {
             attempt += 1;
             let out = self.authenticate_once(user, purpose)?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
@@ -1612,13 +1700,16 @@ impl Engine {
                         window
                     );
                 }
-                return Ok(out);
+                break out;
             }
             irlume_common::dlog!(
                 "grace: attempt {attempt} found no usable face ({}); retrying within window",
                 out.reason
             );
-        }
+        };
+        // The gesture belongs to the authentication that just ended.
+        self.gesture_seen_before_match = false;
+        Ok(out)
     }
 
     fn authenticate_once(
@@ -1750,7 +1841,9 @@ impl Engine {
                         f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
                     if f.grant {
                         let who = if ir_score >= score { ir_who } else { who };
-                        return self.challenge_if_required(&enr, purpose, Outcome::grant(f.prob,
+                        return self.challenge_if_required(
+                    &enr,
+                    purpose, Outcome::grant(f.prob,
                             format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
                     }
                     // (b) pure IR fallback: still valid when IR alone is clearly strong
@@ -1768,7 +1861,9 @@ impl Engine {
                         self.ir_adapter.is_some()
                     );
                     if ir_score >= ir_thr {
-                        return self.challenge_if_required(&enr, purpose, Outcome::grant(ir_score,
+                        return self.challenge_if_required(
+                    &enr,
+                    purpose, Outcome::grant(ir_score,
                             format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
                     }
                     // (c) calibrated-centroid fallback (ADR-0004): the mean-
@@ -1779,7 +1874,9 @@ impl Engine {
                             + irlume_core::IR_FALLBACK_MARGIN;
                         irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
                         if *cs >= cthr {
-                            return self.challenge_if_required(&enr, purpose, Outcome::grant(*cs,
+                            return self.challenge_if_required(
+                    &enr,
+                    purpose, Outcome::grant(*cs,
                                 format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
                         }
                     }
@@ -4102,6 +4199,35 @@ mod engine_tests {
         assert!(
             out.reason.contains("below threshold"),
             "the deny reason must survive untouched: {}",
+            out.reason
+        );
+
+        // A gesture seen BEFORE the match satisfies the gate without asking for
+        // a second one (issue #101: the watch used to open only after the match,
+        // so a user who nodded when the greeter asked was refused). The flag is
+        // the only thing that changes here: same enrollment, same purpose, same
+        // granted outcome.
+        s.engine.gesture_seen_before_match = true;
+        let out = s
+            .engine
+            .challenge_if_required(&plain, release(true), grant())
+            .unwrap();
+        assert!(
+            out.granted,
+            "a gesture made before the match must satisfy the gate: {}",
+            out.reason
+        );
+        // And it must not persist: cleared, the gate is back to requiring one.
+        // (No camera in the sandbox, so the watch fails closed rather than
+        // waiting, which is exactly the fail-closed reading of `false`.)
+        s.engine.gesture_seen_before_match = false;
+        let out = s
+            .engine
+            .challenge_if_required(&plain, release(true), grant())
+            .unwrap();
+        assert!(
+            !out.granted,
+            "without a seen gesture the gate must still refuse: {}",
             out.reason
         );
 

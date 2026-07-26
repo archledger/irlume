@@ -783,7 +783,7 @@ impl RgbSession<'_> {
     }
 
     /// The recognition path's denoised frame: a per-pixel temporal median over
-    /// [`RGB_BURST`] frames.
+    /// the burst, so one blurry or over-exposed frame cannot decide a match.
     pub fn denoised(&mut self) -> irlume_common::Result<Frame> {
         Ok(median_frame(self.burst(RGB_BURST)?))
     }

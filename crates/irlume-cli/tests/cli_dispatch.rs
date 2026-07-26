@@ -197,8 +197,10 @@ fn serve(sock: &Path, respond: impl Fn(&Request) -> Response + Send + 'static) {
 
 fn one_profile() -> Vec<ProfileSummary> {
     vec![ProfileSummary {
+        id: String::new(),
         name: "Face Profile 1".into(),
         scans: vec!["Scan 1".into(), "Scan 2".into()],
+        scan_ids: Vec::new(),
     }]
 }
 

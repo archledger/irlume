@@ -366,8 +366,16 @@ pub enum SelfTestKind {
 /// A profile and the names of its scans, for `ListProfiles`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSummary {
+    /// Stable opaque profile identifier. Empty when talking to a daemon that
+    /// predates record IDs.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub scans: Vec<String>,
+    /// Stable opaque IDs corresponding positionally to [`Self::scans`]. Empty
+    /// when talking to an older daemon.
+    #[serde(default)]
+    pub scan_ids: Vec<String>,
 }
 
 /// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
@@ -758,6 +766,14 @@ mod tests {
             }
             other => panic!("expected Health, got {other:?}"),
         }
+        // Profile summaries from a daemon predating opaque record IDs still
+        // deserialize; the new fields default empty so callers can fail closed
+        // for mutation while retaining the human read-only listing.
+        let p: ProfileSummary =
+            serde_json::from_str(r#"{"name":"Face Profile 1","scans":["Face Scan 1"]}"#).unwrap();
+        assert!(p.id.is_empty());
+        assert!(p.scan_ids.is_empty());
+        assert_eq!(p.scans, vec!["Face Scan 1"]);
     }
 
     #[test]

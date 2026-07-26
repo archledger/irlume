@@ -2328,6 +2328,7 @@ impl Engine {
                 added_scans.push(sname.clone());
                 let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
                 enr.profiles[idx].scans.push(FaceScan {
+                    id: storage::new_scan_id(),
                     name: sname,
                     rgb: s.rgb,
                     ir: s.ir,
@@ -2354,6 +2355,7 @@ impl Engine {
         }
         let name = profile_name.unwrap_or_else(|| enr.next_profile_name());
         let mut prof = FaceProfile {
+            id: storage::new_profile_id(),
             ir_calib: None,
             name: name.clone(),
             scans: Vec::new(),
@@ -2362,6 +2364,7 @@ impl Engine {
             let sname = prof.next_scan_name();
             let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
             prof.scans.push(FaceScan {
+                id: storage::new_scan_id(),
                 name: sname,
                 rgb: s.rgb,
                 ir: s.ir,
@@ -2460,6 +2463,7 @@ impl Engine {
         let sname = enr.profiles[idx].next_scan_name();
         let ir_space = captured.ir.as_ref().map(|_| self.ir_space.clone());
         enr.profiles[idx].scans.push(FaceScan {
+            id: storage::new_scan_id(),
             name: sname.clone(),
             rgb: captured.rgb,
             ir: captured.ir,
@@ -3003,6 +3007,7 @@ mod tests {
             .iter()
             .zip(&rgb_rows)
             .map(|(ir, rgb)| FaceScan {
+                id: String::new(),
                 name: "s".into(),
                 rgb: rgb.clone(),
                 ir: Some(ir.clone()),
@@ -3016,6 +3021,7 @@ mod tests {
         let probe = mk(6, 0.4);
         (
             FaceProfile {
+                id: String::new(),
                 name: "p".into(),
                 scans,
                 ir_calib: calib,
@@ -3195,6 +3201,7 @@ mod tests {
 
     fn scan(v: Vec<f32>) -> FaceScan {
         FaceScan {
+            id: String::new(),
             name: "s".into(),
             rgb: v,
             ir: None,
@@ -3308,11 +3315,13 @@ mod tests {
             closure_calibration: None,
             profiles: vec![
                 FaceProfile {
+                    id: String::new(),
                     ir_calib: None,
                     name: "Face Profile 1".into(),
                     scans: vec![scan(face1.clone())],
                 },
                 FaceProfile {
+                    id: String::new(),
                     ir_calib: None,
                     name: "Face Profile 2".into(),
                     scans: vec![scan(face2.clone())],
@@ -3336,6 +3345,7 @@ mod tests {
         let face2 = vec![0.0, 1.0, 0.0];
         let novel = vec![0.0, 0.0, 1.0];
         let ir_scan = |v: Vec<f32>, space: Option<&str>| FaceScan {
+            id: String::new(),
             ir: Some(vec![0.5; 3]),
             ir_space: space.map(String::from),
             ..scan(v)
@@ -3343,6 +3353,7 @@ mod tests {
         let enr_with = |scans: Vec<FaceScan>| {
             let mut enr = Enrollment::new("u");
             enr.profiles.push(FaceProfile {
+                id: String::new(),
                 ir_calib: None,
                 name: "P1".into(),
                 scans,
@@ -3385,6 +3396,7 @@ mod tests {
         // Captures matching two different profiles: refused outright.
         let mut enr = enr_with(vec![ir_scan(face1.clone(), Some("adapter:deadbeef0123"))]);
         enr.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "P2".into(),
             scans: vec![ir_scan(face2.clone(), Some("adapter:deadbeef0123"))],
@@ -3517,9 +3529,11 @@ mod tests {
         let a = unit(vec![1.0, 0.0, 0.0, 0.0]);
         let b = unit(vec![0.0, 1.0, 0.0, 0.0]);
         let mk_prof = |name: &str, v: &[f32]| FaceProfile {
+            id: String::new(),
             name: name.into(),
             ir_calib: None,
             scans: vec![FaceScan {
+                id: String::new(),
                 name: "s".into(),
                 rgb: vec![0.0; 4],
                 ir: Some(v.to_vec()),
@@ -3868,6 +3882,7 @@ mod engine_tests {
 
     fn scan512(seed: usize, ir: bool, space: Option<&str>) -> FaceScan {
         FaceScan {
+            id: String::new(),
             name: format!("Face Scan {seed}"),
             rgb: unit512(seed),
             ir: ir.then(|| unit512(seed + 100)),
@@ -3917,6 +3932,7 @@ mod engine_tests {
         let mut s = shared();
         // Healthy paired 512-D scans in the current space: calibration fits.
         let mut prof = FaceProfile {
+            id: String::new(),
             name: "p".into(),
             ir_calib: None,
             scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
@@ -3926,10 +3942,12 @@ mod engine_tests {
         assert_eq!(calib.fitted_pairs, 5);
         // Wrong-dimension IR templates are quarantined: nothing to fit.
         let mut bad = FaceProfile {
+            id: String::new(),
             name: "bad".into(),
             ir_calib: None,
             scans: (0..5)
                 .map(|i| FaceScan {
+                    id: String::new(),
                     ir: Some(vec![0.1; 256]),
                     ..scan512(i, true, Some("raw"))
                 })
@@ -3939,6 +3957,7 @@ mod engine_tests {
         assert!(bad.ir_calib.is_none());
         // Foreign-space templates (stranded by an adapter change) are skipped.
         let mut foreign = FaceProfile {
+            id: String::new(),
             name: "foreign".into(),
             ir_calib: None,
             scans: (0..5)
@@ -3959,6 +3978,7 @@ mod engine_tests {
             "adapter mode must not refit"
         );
         let mut fresh = FaceProfile {
+            id: String::new(),
             name: "fresh".into(),
             ir_calib: None,
             scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
@@ -4021,6 +4041,7 @@ mod engine_tests {
         // Enrolled but with zero scans.
         let mut e = Enrollment::new("irlume-test-empty");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             name: "P1".into(),
             scans: vec![],
             ir_calib: None,
@@ -4033,6 +4054,7 @@ mod engine_tests {
         // Camera binding mismatch: anti-swap refusal before any capture.
         let mut e = Enrollment::new("irlume-test-bound");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             name: "P1".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
@@ -4054,6 +4076,7 @@ mod engine_tests {
         // on the nonexistent device (never a silent grant/deny).
         let mut e = Enrollment::new("irlume-test-cam");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             name: "P1".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
@@ -4342,6 +4365,7 @@ mod engine_tests {
         // Duplicate explicit profile name fails BEFORE the camera opens.
         let mut e = Enrollment::new("irlume-test-enroll");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             name: "Work Laptop".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
@@ -4372,6 +4396,7 @@ mod engine_tests {
         // Known user, unknown profile.
         let mut e = Enrollment::new("irlume-test-add");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             name: "P1".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
@@ -4382,6 +4407,7 @@ mod engine_tests {
         // Full profile: refused before any capture.
         let mut e = Enrollment::new("irlume-test-full");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             name: "P1".into(),
             scans: (0..irlume_core::storage::MAX_SCANS_PER_PROFILE)
                 .map(|i| scan512(i, false, None))
@@ -4533,6 +4559,7 @@ mod engine_tests {
                 camera_binding: None,
                 closure_calibration: None,
                 profiles: vec![FaceProfile {
+                    id: String::new(),
                     ir_calib: None,
                     name: "Face Profile 1".into(),
                     scans: vec![scan512(1, false, None)],

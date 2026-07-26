@@ -9,7 +9,9 @@
 
 use crate::{crypto, template_key};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
@@ -39,6 +41,13 @@ pub const IMPROVE_SCANS: usize = 5;
 /// AuraFace embedding; `ir` is the IR-face embedding for dark operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaceScan {
+    /// Stable opaque identifier for machine-facing operations. It is random,
+    /// carries no biometric or user information, and does not change on rename.
+    /// Empty only while loading enrollments written before IDs were introduced;
+    /// [`Enrollment::ensure_record_ids`] backfills it before the value escapes
+    /// the storage boundary.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub rgb: Vec<f32>,
     #[serde(default)]
@@ -70,6 +79,10 @@ pub struct FaceScan {
 /// A face profile: a named set of scans of one face.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaceProfile {
+    /// Stable opaque identifier for machine-facing operations. See
+    /// [`FaceScan::id`].
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub scans: Vec<FaceScan>,
     /// Per-profile IR calibration (ADR-0004), fitted from this profile's own
@@ -130,6 +143,33 @@ impl Enrollment {
             camera_binding: None,
             closure_calibration: None,
         }
+    }
+
+    /// Backfill stable opaque IDs for enrollments written by older versions.
+    ///
+    /// Existing valid unique IDs are preserved byte-for-byte. Empty, malformed,
+    /// or duplicate IDs are replaced. Returns the number of repaired records so
+    /// callers can persist a migration when appropriate.
+    pub fn ensure_record_ids(&mut self) -> usize {
+        let mut repaired = 0;
+        let user = self.user.clone();
+        let mut profile_ids = std::collections::HashSet::new();
+        let mut scan_ids = std::collections::HashSet::new();
+        for (profile_index, profile) in self.profiles.iter_mut().enumerate() {
+            if !valid_record_id(&profile.id, "profile") || !profile_ids.insert(profile.id.clone()) {
+                profile.id = legacy_record_id("profile", &user, profile_index, None);
+                profile_ids.insert(profile.id.clone());
+                repaired += 1;
+            }
+            for (scan_index, scan) in profile.scans.iter_mut().enumerate() {
+                if !valid_record_id(&scan.id, "scan") || !scan_ids.insert(scan.id.clone()) {
+                    scan.id = legacy_record_id("scan", &user, profile_index, Some(scan_index));
+                    scan_ids.insert(scan.id.clone());
+                    repaired += 1;
+                }
+            }
+        }
+        repaired
     }
 
     /// Total scans across all profiles (drives threshold scaling).
@@ -293,6 +333,73 @@ impl Enrollment {
     }
 }
 
+/// Mint a random stable identifier for a face profile.
+pub fn new_profile_id() -> String {
+    new_record_id("profile")
+}
+
+/// Mint a random stable identifier for a face scan.
+pub fn new_scan_id() -> String {
+    new_record_id("scan")
+}
+
+/// Mint a random 128-bit identifier with a type prefix. The alphabet matches
+/// the public CLI's safe opaque-ID grammar and remains comfortably below its
+/// length bound.
+fn new_record_id(kind: &str) -> String {
+    let mut random = [0u8; 16];
+    rand::rng().fill_bytes(&mut random);
+    let mut id = String::with_capacity(kind.len() + 1 + random.len() * 2);
+    id.push_str(kind);
+    id.push('-');
+    for byte in random {
+        use std::fmt::Write;
+        write!(id, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    id
+}
+
+fn valid_record_id(id: &str, kind: &str) -> bool {
+    let Some(hex) = id
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Stable migration ID for records that predate stored random IDs. It uses only
+/// the enrollment owner and record ordinals, never names or biometric data.
+/// The first ID-aware mutation persists these values, so later deletes or
+/// reordering cannot change them.
+fn legacy_record_id(
+    kind: &str,
+    user: &str,
+    profile_index: usize,
+    scan_index: Option<usize>,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"irlume-record-id-v1\0");
+    hash.update(kind.as_bytes());
+    hash.update(b"\0");
+    hash.update(user.as_bytes());
+    hash.update(b"\0");
+    hash.update(profile_index.to_le_bytes());
+    if let Some(index) = scan_index {
+        hash.update(index.to_le_bytes());
+    }
+    let digest = hash.finalize();
+    let mut id = String::with_capacity(kind.len() + 1 + 32);
+    id.push_str(kind);
+    id.push('-');
+    for byte in &digest[..16] {
+        use std::fmt::Write;
+        write!(id, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    id
+}
+
 impl FaceProfile {
     /// Default name for the next scan ("Face Scan N", first free slot).
     pub fn next_scan_name(&self) -> String {
@@ -321,11 +428,13 @@ struct LegacyProfile {
 }
 
 fn migrate(old: LegacyProfile) -> Enrollment {
+    let user = old.user;
     let scans = old
         .templates
         .iter()
         .enumerate()
         .map(|(i, t)| FaceScan {
+            id: legacy_record_id("scan", &user, 0, Some(i)),
             name: format!("Face Scan {}", i + 1),
             rgb: t.clone(),
             ir: old.ir_templates.get(i).cloned(),
@@ -337,8 +446,9 @@ fn migrate(old: LegacyProfile) -> Enrollment {
         })
         .collect();
     Enrollment {
-        user: old.user,
+        user: user.clone(),
         profiles: vec![FaceProfile {
+            id: legacy_record_id("profile", &user, 0, None),
             ir_calib: None,
             name: "Face Profile 1".into(),
             scans,
@@ -409,7 +519,7 @@ fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Re
 fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Result<Enrollment> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
-    if v.get("enc").is_some() {
+    let mut enrollment = if v.get("enc").is_some() {
         let env: EncEnvelope =
             serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
         let key = key.ok_or_else(|| {
@@ -421,14 +531,16 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
             .decode(env.enc.as_bytes())
             .map_err(|e| irlume_common::Error::Protocol(format!("bad enc blob: {e}")))?;
         let plain = crypto::decrypt(key, &blob)?;
-        serde_json::from_slice(&plain).map_err(|e| irlume_common::Error::Protocol(e.to_string()))
+        serde_json::from_slice(&plain).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?
     } else if v.get("profiles").is_some() {
-        serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))
+        serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?
     } else {
         let old: LegacyProfile =
             serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
-        Ok(migrate(old))
-    }
+        migrate(old)
+    };
+    enrollment.ensure_record_ids();
+    Ok(enrollment)
 }
 
 /// Resolve the key to encrypt `user`'s templates with: the TPM-sealed template
@@ -540,9 +652,11 @@ mod tests {
         Enrollment {
             user: "u".into(),
             profiles: vec![FaceProfile {
+                id: String::new(),
                 ir_calib: None,
                 name: "Face Profile 1".into(),
                 scans: vec![FaceScan {
+                    id: String::new(),
                     name: "Face Scan 1".into(),
                     rgb: vec![0.1, 0.2, 0.3, 0.4],
                     ir: Some(vec![0.5, 0.6]),
@@ -594,6 +708,7 @@ mod tests {
 
     fn scan_with_ir(ratio: f32, bright: f32) -> FaceScan {
         FaceScan {
+            id: String::new(),
             name: "s".into(),
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; 4]),
@@ -606,6 +721,7 @@ mod tests {
 
     fn scan_with_pitch(pitch: f32) -> FaceScan {
         FaceScan {
+            id: String::new(),
             name: "s".into(),
             rgb: vec![0.1; 4],
             ir: None,
@@ -621,6 +737,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         // One calibrated scan -> not enough.
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "p".into(),
             scans: vec![scan_with_pitch(0.60)],
@@ -640,6 +757,7 @@ mod tests {
         // One IR scan -> not enough to characterise the user's rig.
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "p".into(),
             scans: vec![scan_with_ir(1.5, 100.0)],
@@ -655,6 +773,7 @@ mod tests {
 
     fn scan_in_space(name: &str, dim: usize, space: Option<&str>) -> FaceScan {
         FaceScan {
+            id: String::new(),
             name: name.into(),
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; dim]),
@@ -669,6 +788,7 @@ mod tests {
     fn ir_scans_for_filters_space_and_dimension() {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "p".into(),
             scans: vec![
@@ -698,6 +818,7 @@ mod tests {
     fn retag_untagged_ir_stamps_only_matching_legacy_scans() {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "p".into(),
             scans: vec![
@@ -722,8 +843,104 @@ mod tests {
         // Enrollments written before space tagging must load unchanged.
         let json = r#"{"name":"s","rgb":[0.1],"ir":[0.2]}"#;
         let s: FaceScan = serde_json::from_str(json).unwrap();
+        assert!(s.id.is_empty());
         assert!(s.ir_space.is_none());
         assert_eq!(s.ir.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_records_get_stable_opaque_ids_without_biometric_input() {
+        let json = br#"{
+            "user":"alice",
+            "profiles":[{
+                "name":"Renamable profile",
+                "scans":[
+                    {"name":"First scan","rgb":[0.1,0.2]},
+                    {"name":"Second scan","rgb":[0.9,0.8]}
+                ]
+            }]
+        }"#;
+        let first = deserialize_enrollment(json, None).unwrap();
+        let second = deserialize_enrollment(json, None).unwrap();
+
+        assert_eq!(first.profiles[0].id, second.profiles[0].id);
+        assert_eq!(
+            first.profiles[0].scans[0].id,
+            second.profiles[0].scans[0].id
+        );
+        assert_ne!(first.profiles[0].scans[0].id, first.profiles[0].scans[1].id);
+        assert!(valid_record_id(&first.profiles[0].id, "profile"));
+        assert!(first.profiles[0]
+            .scans
+            .iter()
+            .all(|scan| valid_record_id(&scan.id, "scan")));
+
+        // Names and embeddings are deliberately absent from the migration ID:
+        // changing either cannot silently change a record's public identity.
+        let renamed = br#"{
+            "user":"alice",
+            "profiles":[{
+                "name":"Different display name",
+                "scans":[
+                    {"name":"Renamed scan","rgb":[0.7,0.6]},
+                    {"name":"Other renamed scan","rgb":[0.4,0.3]}
+                ]
+            }]
+        }"#;
+        let renamed = deserialize_enrollment(renamed, None).unwrap();
+        assert_eq!(first.profiles[0].id, renamed.profiles[0].id);
+        assert_eq!(
+            first.profiles[0].scans[0].id,
+            renamed.profiles[0].scans[0].id
+        );
+    }
+
+    #[test]
+    fn stored_ids_survive_rename_and_round_trip() {
+        let mut enrollment = sample();
+        assert_eq!(enrollment.ensure_record_ids(), 2);
+        let profile_id = enrollment.profiles[0].id.clone();
+        let scan_id = enrollment.profiles[0].scans[0].id.clone();
+        enrollment.profiles[0].name = "Renamed profile".into();
+        enrollment.profiles[0].scans[0].name = "Renamed scan".into();
+
+        let bytes = serialize_enrollment(&enrollment, None).unwrap();
+        let mut loaded = deserialize_enrollment(&bytes, None).unwrap();
+        assert_eq!(loaded.profiles[0].id, profile_id);
+        assert_eq!(loaded.profiles[0].scans[0].id, scan_id);
+        assert_eq!(loaded.ensure_record_ids(), 0);
+    }
+
+    #[test]
+    fn malformed_and_duplicate_ids_are_repaired_deterministically() {
+        let mut enrollment = sample();
+        enrollment.profiles.push(enrollment.profiles[0].clone());
+        enrollment.profiles[0].id = "not-an-id".into();
+        enrollment.profiles[1].id = "not-an-id".into();
+        enrollment.profiles[0].scans[0].id = "scan-00000000000000000000000000000000".into();
+        enrollment.profiles[1].scans[0].id = "scan-00000000000000000000000000000000".into();
+
+        assert_eq!(enrollment.ensure_record_ids(), 3);
+        assert_ne!(enrollment.profiles[0].id, enrollment.profiles[1].id);
+        assert_ne!(
+            enrollment.profiles[0].scans[0].id,
+            enrollment.profiles[1].scans[0].id
+        );
+        assert_eq!(enrollment.ensure_record_ids(), 0);
+    }
+
+    #[test]
+    fn fresh_record_ids_are_typed_unique_and_machine_safe() {
+        let profile_a = new_record_id("profile");
+        let profile_b = new_record_id("profile");
+        let scan = new_record_id("scan");
+        assert!(valid_record_id(&profile_a, "profile"));
+        assert!(valid_record_id(&profile_b, "profile"));
+        assert!(valid_record_id(&scan, "scan"));
+        assert_ne!(profile_a, profile_b);
+        assert!(profile_a
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
     }
 
     #[test]
@@ -731,10 +948,12 @@ mod tests {
         // RGB-only scans (no IR) must not count toward the floor.
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "p".into(),
             scans: vec![
                 FaceScan {
+                    id: String::new(),
                     name: "a".into(),
                     rgb: vec![0.1; 4],
                     ir: None,
@@ -754,6 +973,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         assert_eq!(e.next_profile_name(), "Face Profile 1");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "Face Profile 1".into(),
             scans: vec![],
@@ -846,6 +1066,7 @@ mod tests {
     #[test]
     fn stale_and_usable_ir_counts_partition_the_scans() {
         let ir_scan = |name: &str, space: Option<&str>| FaceScan {
+            id: String::new(),
             name: name.into(),
             rgb: vec![0.0; 4],
             ir: Some(vec![0.0; 4]),
@@ -856,6 +1077,7 @@ mod tests {
         };
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
+            id: String::new(),
             ir_calib: None,
             name: "P".into(),
             scans: vec![
@@ -873,6 +1095,7 @@ mod tests {
         assert_eq!(e.usable_ir_scans("raw"), 0);
         // An RGB-only scan (no ir) counts for neither side.
         e.profiles[0].scans.push(FaceScan {
+            id: String::new(),
             ir: None,
             ..ir_scan("rgb-only", None)
         });

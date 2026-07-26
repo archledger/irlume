@@ -5172,8 +5172,10 @@ mod tests {
 
     fn profile(name: &str, scans: &[&str]) -> ProfileSummary {
         ProfileSummary {
+            id: String::new(),
             name: name.into(),
             scans: scans.iter().map(|s| s.to_string()).collect(),
+            scan_ids: Vec::new(),
         }
     }
 
@@ -5460,8 +5462,10 @@ mod tests {
         app.daemon_up = true; // skip the daemon gate; the cap check is next
         app.profiles = (0..MAX_PROFILES)
             .map(|i| ProfileSummary {
+                id: String::new(),
                 name: format!("p{i}"),
                 scans: Vec::new(),
+                scan_ids: Vec::new(),
             })
             .collect();
         app.begin_enroll();

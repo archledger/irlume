@@ -1361,8 +1361,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         .profiles
                         .iter()
                         .map(|p| irlume_common::ProfileSummary {
+                            id: p.id.clone(),
                             name: p.name.clone(),
                             scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                            scan_ids: p.scans.iter().map(|s| s.id.clone()).collect(),
                         })
                         .collect(),
                     require_eyes_open: enr.require_eyes_open,
@@ -2728,6 +2730,7 @@ mod tests {
 
     fn rgb_scan(name: &str, seed: usize) -> FaceScan {
         FaceScan {
+            id: String::new(),
             name: name.into(),
             rgb: unit512(seed),
             ir: None,
@@ -2743,6 +2746,7 @@ mod tests {
         Enrollment {
             user: user.into(),
             profiles: vec![FaceProfile {
+                id: String::new(),
                 name: "Face Profile 1".into(),
                 ir_calib: None,
                 scans: scans
@@ -3026,6 +3030,12 @@ mod tests {
                     profiles[0].scans,
                     vec!["Face Scan 1".to_string(), "Face Scan 2".to_string()]
                 );
+                assert!(profiles[0].id.starts_with("profile-"));
+                assert_eq!(profiles[0].scan_ids.len(), profiles[0].scans.len());
+                assert!(profiles[0]
+                    .scan_ids
+                    .iter()
+                    .all(|id| id.starts_with("scan-")));
                 assert!(require_eyes_open);
                 assert!(!require_challenge);
             }

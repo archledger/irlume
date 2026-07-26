@@ -1211,8 +1211,10 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
     serve(&sock(&sb), |req| match req {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: vec![ProfileSummary {
+                id: String::new(),
                 name: "Face Profile 1".into(),
                 scans: vec!["Scan 1".into(), "Glasses".into()],
+                scan_ids: Vec::new(),
             }],
             require_eyes_open: true,
             require_challenge: false,
@@ -1354,8 +1356,10 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
         Request::Ping => Response::Pong,
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: vec![ProfileSummary {
+                id: String::new(),
                 name: "Face Profile 1".into(),
                 scans: vec!["Scan 1".into(), "Scan 2".into()],
+                scan_ids: Vec::new(),
             }],
             require_eyes_open: false,
             require_challenge: true,

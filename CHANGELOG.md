@@ -59,6 +59,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Face profiles and scans now carry stable opaque IDs.** Fresh records receive
+  random 128-bit identifiers that survive display-name changes. Existing
+  enrollments are backfilled deterministically from user and record order,
+  never names or biometric templates, and the typed daemon profile summary
+  exposes the IDs without breaking older clients. This is the storage boundary
+  required for safe machine-facing rename, delete, and improve-recognition
+  operations.
+
 - **`sudo irlume camera-tune` measures whether your camera can read both sensors
   at once.** Some Hello modules stop exposing their colour stream properly while
   their infrared sibling is streaming. On a NexiGo HelloCam N930W the colour

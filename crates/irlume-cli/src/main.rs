@@ -75,6 +75,12 @@ fn main() -> std::process::ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Help must be resolved before command dispatch. Several commands start
+    // camera capture or mutate state immediately, so treating a trailing
+    // `--help` as an ignored command-specific argument is unsafe.
+    if help_requested(&args) {
+        return commands::help();
+    }
     // Gate the developer tools unless IRLUME_DEV is set. Exception:
     // `selftest liveness` goes THROUGH the daemon (no direct camera open), so
     // it's a normal diagnostic the TUI's [l] uses, not a dev tool.
@@ -189,6 +195,11 @@ fn main() -> std::process::ExitCode {
         }
         (None, _) => commands::help(),
     }
+}
+
+fn help_requested(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "help" | "--help" | "-h"))
 }
 
 /// `irlume enroll --user U [--name "..."]`: enroll a NEW face profile (captures
@@ -3098,6 +3109,14 @@ mod tests {
         assert_eq!(flag(&a, "--user"), Some("alice"));
         assert_eq!(flag(&a, "--scans"), Some("5"));
         assert_eq!(flag(&a, "--name"), None);
+    }
+
+    #[test]
+    fn help_is_detected_before_mutating_command_dispatch() {
+        assert!(help_requested(&argv(&["enroll", "--help"])));
+        assert!(help_requested(&argv(&["profiles", "delete", "-h"])));
+        assert!(help_requested(&argv(&["help"])));
+        assert!(!help_requested(&argv(&["enroll", "--name", "Laptop"])));
     }
 
     #[test]

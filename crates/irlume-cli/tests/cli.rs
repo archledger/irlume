@@ -136,8 +136,16 @@ fn version_prints_the_crate_version_for_all_spellings() {
 #[test]
 fn help_lists_every_public_command_and_hides_dev_tools() {
     let sb = Sandbox::new("help");
-    // `help`, `--help`, `-h`, and no arguments all print the same listing.
-    for args in [&["help"][..], &["--help"], &["-h"], &[]] {
+    // Global and trailing help forms must all resolve before dispatch. In
+    // particular, `enroll --help` must never contact the daemon or capture.
+    for args in [
+        &["help"][..],
+        &["--help"],
+        &["-h"],
+        &[],
+        &["enroll", "--help"],
+        &["profiles", "delete", "-h"],
+    ] {
         let (code, out, _) = run(&mut sb.cmd(args));
         assert_eq!(code, 0, "help exit code for {args:?}");
         for cmd in [

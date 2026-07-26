@@ -13,8 +13,10 @@ use irlume_common::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::fs::FileType;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -92,6 +94,8 @@ struct FileImage {
     present: bool,
     sha256: String,
     mode: u32,
+    uid: u32,
+    gid: u32,
     bytes_base64: String,
 }
 
@@ -101,28 +105,37 @@ impl FileImage {
             present: false,
             sha256: ABSENT_DIGEST.into(),
             mode: 0,
+            uid: 0,
+            gid: 0,
             bytes_base64: String::new(),
         }
     }
 
     fn from_path(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self::absent());
-        }
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::absent());
+            }
+            Err(error) => return Err(format!("metadata failed: {error}")),
+        };
+        ensure_regular_file(metadata.file_type())?;
         let bytes = std::fs::read(path).map_err(|error| format!("read failed: {error}"))?;
-        let mode = std::fs::metadata(path)
-            .map_err(|error| format!("metadata failed: {error}"))?
-            .permissions()
-            .mode()
-            & 0o777;
-        Ok(Self::from_bytes(bytes, mode))
+        Ok(Self::from_bytes(
+            bytes,
+            metadata.permissions().mode() & 0o777,
+            metadata.uid(),
+            metadata.gid(),
+        ))
     }
 
-    fn from_bytes(bytes: Vec<u8>, mode: u32) -> Self {
+    fn from_bytes(bytes: Vec<u8>, mode: u32, uid: u32, gid: u32) -> Self {
         Self {
             present: true,
             sha256: digest(&bytes),
             mode,
+            uid,
+            gid,
             bytes_base64: STANDARD.encode(bytes),
         }
     }
@@ -134,6 +147,14 @@ impl FileImage {
         STANDARD
             .decode(&self.bytes_base64)
             .map_err(|_| "transaction journal is corrupt".into())
+    }
+}
+
+fn ensure_regular_file(file_type: FileType) -> Result<(), String> {
+    if file_type.is_file() {
+        Ok(())
+    } else {
+        Err("refusing non-regular PAM target".into())
     }
 }
 
@@ -411,7 +432,12 @@ fn desired_image(target: &Target, operation: Operation) -> Result<FileImage, Str
             return Ok(FileImage::absent());
         }
         let (clean, _) = crate::pamwire::unwire_lines(&text);
-        return Ok(FileImage::from_bytes(clean.into_bytes(), before.mode));
+        return Ok(FileImage::from_bytes(
+            clean.into_bytes(),
+            before.mode,
+            before.uid,
+            before.gid,
+        ));
     }
 
     let (base, from_vendor) = if before.present {
@@ -441,7 +467,12 @@ fn desired_image(target: &Target, operation: Operation) -> Result<FileImage, Str
     } else {
         wired
     };
-    Ok(FileImage::from_bytes(body.into_bytes(), base.mode))
+    Ok(FileImage::from_bytes(
+        body.into_bytes(),
+        base.mode,
+        base.uid,
+        base.gid,
+    ))
 }
 
 fn effective_after_bytes(target: &PlannedTarget) -> Result<Vec<u8>, String> {
@@ -955,11 +986,21 @@ fn apply_image(path: &Path, image: &FileImage) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "target has no parent".to_string())?;
     if !image.present {
-        if path.exists() {
-            std::fs::remove_file(path).map_err(|error| format!("remove failed: {error}"))?;
-            sync_directory(parent)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                ensure_regular_file(metadata.file_type())?;
+                std::fs::remove_file(path).map_err(|error| format!("remove failed: {error}"))?;
+                sync_directory(parent)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("metadata failed: {error}")),
         }
         return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => ensure_regular_file(metadata.file_type())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("metadata failed: {error}")),
     }
     let bytes = image.bytes()?;
     let name = path
@@ -979,10 +1020,16 @@ fn apply_image(path: &Path, image: &FileImage) -> Result<(), String> {
             .map_err(|error| format!("create temporary failed: {error}"))?;
         file.write_all(&bytes)
             .map_err(|error| format!("write failed: {error}"))?;
+        if unsafe { libc::fchown(file.as_raw_fd(), image.uid, image.gid) } != 0 {
+            return Err(format!(
+                "ownership failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(image.mode))
+            .map_err(|error| format!("permissions failed: {error}"))?;
         file.sync_all()
             .map_err(|error| format!("sync failed: {error}"))?;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(image.mode))
-            .map_err(|error| format!("permissions failed: {error}"))?;
         std::fs::rename(&temporary, path).map_err(|error| format!("rename failed: {error}"))?;
         sync_directory(parent)
     })();
@@ -1104,6 +1151,7 @@ fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     const PAM_STOCK: &str =
         "#%PAM-1.0\nauth substack password-auth\naccount required pam_unix.so\n";
@@ -1257,6 +1305,12 @@ mod tests {
         let wired = std::fs::read_to_string(sandbox.paths.pam_etc.join("plasmalogin")).unwrap();
         assert!(wired.contains("pam_irlume.so"));
         assert!(has_password_fallback(wired.as_bytes()));
+        let vendor_metadata =
+            std::fs::metadata(sandbox.paths.pam_vendor.join("plasmalogin")).unwrap();
+        let applied_metadata =
+            std::fs::metadata(sandbox.paths.pam_etc.join("plasmalogin")).unwrap();
+        assert_eq!(applied_metadata.uid(), vendor_metadata.uid());
+        assert_eq!(applied_metadata.gid(), vendor_metadata.gid());
 
         let transaction_id = std::fs::read_dir(&sandbox.paths.transactions)
             .unwrap()
@@ -1312,6 +1366,23 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!sandbox.paths.transactions.exists());
+    }
+
+    #[test]
+    fn symlink_targets_are_rejected_without_touching_the_link_or_destination() {
+        let sandbox = Sandbox::new("symlink");
+        let destination = sandbox.root.join("foreign-pam");
+        std::fs::write(&destination, PAM_STOCK).unwrap();
+        let target = sandbox.paths.pam_etc.join("kde");
+        symlink(&destination, &target).unwrap();
+
+        assert!(build_plan(&sandbox.paths, &facts(), Operation::Enable, "lock-screen").is_err());
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), PAM_STOCK);
         assert!(!sandbox.paths.transactions.exists());
     }
 

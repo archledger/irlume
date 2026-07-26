@@ -213,15 +213,26 @@ pub enum Request {
     SetCameras { rgb: String, ir: String },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
+    /// Add one scan to an existing profile selected by stable opaque ID.
+    /// PRIVILEGED. Machine clients should prefer this over display names.
+    AddScanById { user: String, profile_id: String },
     /// List enrolled profiles + their scans for `user`.
     ListProfiles { user: String },
     /// Delete a whole profile (and its scans). PRIVILEGED, same rule as Enroll.
     DeleteProfile { user: String, profile: String },
+    /// Delete a whole profile selected by stable opaque ID. PRIVILEGED.
+    DeleteProfileById { user: String, profile_id: String },
     /// Delete one scan from a profile. PRIVILEGED.
     DeleteScan {
         user: String,
         profile: String,
         scan: String,
+    },
+    /// Delete one scan selected by stable opaque IDs. PRIVILEGED.
+    DeleteScanById {
+        user: String,
+        profile_id: String,
+        scan_id: String,
     },
     /// Rename a profile. PRIVILEGED.
     RenameProfile {
@@ -229,11 +240,24 @@ pub enum Request {
         profile: String,
         new_name: String,
     },
+    /// Rename a profile selected by stable opaque ID. PRIVILEGED.
+    RenameProfileById {
+        user: String,
+        profile_id: String,
+        new_name: String,
+    },
     /// Rename a scan within a profile. PRIVILEGED.
     RenameScan {
         user: String,
         profile: String,
         scan: String,
+        new_name: String,
+    },
+    /// Rename a scan selected by stable opaque IDs. PRIVILEGED.
+    RenameScanById {
+        user: String,
+        profile_id: String,
+        scan_id: String,
         new_name: String,
     },
     /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
@@ -378,6 +402,17 @@ pub struct ProfileSummary {
     pub scan_ids: Vec<String>,
 }
 
+/// Stable operation name for an ID-addressed profile mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileMutationKind {
+    AddScan,
+    DeleteProfile,
+    DeleteScan,
+    RenameProfile,
+    RenameScan,
+}
+
 /// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
 /// gates that set `well_framed` mirror the enroll/auth path, so "well framed"
 /// implies a capture will succeed.
@@ -444,6 +479,19 @@ pub enum Response {
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
+    /// Typed success result for an ID-addressed profile mutation.
+    ProfileMutation {
+        operation: ProfileMutationKind,
+        profile_id: String,
+        profile_name_before: Option<String>,
+        profile_name_after: Option<String>,
+        scan_id: Option<String>,
+        scan_name_before: Option<String>,
+        scan_name_after: Option<String>,
+        /// Number of scans remaining in the profile. `None` after deleting the
+        /// complete profile.
+        total_scans: Option<usize>,
+    },
     /// Result of an Enroll capture, carrying the profile the scans actually
     /// landed on. `created` distinguishes a brand-new profile from a merge into
     /// an existing identity (the engine auto-merges a face that already owns a
@@ -774,6 +822,41 @@ mod tests {
         assert!(p.id.is_empty());
         assert!(p.scan_ids.is_empty());
         assert_eq!(p.scans, vec!["Face Scan 1"]);
+
+        let request = Request::RenameScanById {
+            user: "alice".into(),
+            profile_id: "profile-0123456789abcdef0123456789abcdef".into(),
+            scan_id: "scan-fedcba9876543210fedcba9876543210".into(),
+            new_name: "Glasses".into(),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(matches!(
+            serde_json::from_str(&encoded).unwrap(),
+            Request::RenameScanById { .. }
+        ));
+
+        let response = Response::ProfileMutation {
+            operation: ProfileMutationKind::RenameScan,
+            profile_id: "profile-0123456789abcdef0123456789abcdef".into(),
+            profile_name_before: Some("Primary".into()),
+            profile_name_after: Some("Primary".into()),
+            scan_id: Some("scan-fedcba9876543210fedcba9876543210".into()),
+            scan_name_before: Some("Default".into()),
+            scan_name_after: Some("Glasses".into()),
+            total_scans: Some(2),
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        match serde_json::from_str(&encoded).unwrap() {
+            Response::ProfileMutation {
+                operation,
+                total_scans,
+                ..
+            } => {
+                assert_eq!(operation, ProfileMutationKind::RenameScan);
+                assert_eq!(total_scans, Some(2));
+            }
+            other => panic!("expected ProfileMutation, got {other:?}"),
+        }
     }
 
     #[test]

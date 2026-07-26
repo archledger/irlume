@@ -343,6 +343,16 @@ pub fn new_scan_id() -> String {
     new_record_id("scan")
 }
 
+/// Whether `id` is a well-formed opaque profile identifier.
+pub fn valid_profile_id(id: &str) -> bool {
+    valid_record_id(id, "profile")
+}
+
+/// Whether `id` is a well-formed opaque scan identifier.
+pub fn valid_scan_id(id: &str) -> bool {
+    valid_record_id(id, "scan")
+}
+
 /// Mint a random 128-bit identifier with a type prefix. The alphabet matches
 /// the public CLI's safe opaque-ID grammar and remains comfortably below its
 /// length bound.

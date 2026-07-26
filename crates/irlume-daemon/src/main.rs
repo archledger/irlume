@@ -709,6 +709,13 @@ fn valid_username(u: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
 }
 
+fn valid_display_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && name.chars().count() <= 80
+        && !name.chars().any(char::is_control)
+}
+
 /// The `user` field of a request, if it carries one (for the traversal guard).
 fn request_user(req: &Request) -> Option<&str> {
     use Request::*;
@@ -717,10 +724,15 @@ fn request_user(req: &Request) -> Option<&str> {
         | Enroll { user, .. }
         | ListProfiles { user }
         | DeleteProfile { user, .. }
+        | DeleteProfileById { user, .. }
         | DeleteScan { user, .. }
+        | DeleteScanById { user, .. }
         | RenameProfile { user, .. }
+        | RenameProfileById { user, .. }
         | RenameScan { user, .. }
+        | RenameScanById { user, .. }
         | AddScan { user, .. }
+        | AddScanById { user, .. }
         | SetRequireEyesOpen { user, .. }
         | SetRequireChallenge { user, .. }
         | CaptureEarMedian { user }
@@ -1081,6 +1093,53 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
+        Request::AddScanById { user, profile_id } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            if !irlume_core::storage::valid_profile_id(&profile_id) {
+                return Response::Error("invalid profile ID".into());
+            }
+            let profile_name = match irlume_core::storage::load(&user) {
+                Ok(Some(enr)) => match enr.profiles.iter().find(|p| p.id == profile_id) {
+                    Some(profile) => profile.name.clone(),
+                    None => return Response::Error(format!("no face profile ID '{profile_id}'")),
+                },
+                Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
+                Err(e) => return Response::Error(e.to_string()),
+            };
+            match engine.add_scan(&user, &profile_name) {
+                Ok((scan_name, total)) => match irlume_core::storage::load(&user) {
+                    Ok(Some(enr)) => {
+                        let Some(profile) = enr.profiles.iter().find(|p| p.id == profile_id) else {
+                            return Response::Error(
+                                "profile disappeared after adding the scan".into(),
+                            );
+                        };
+                        let Some(scan) = profile.scans.iter().find(|s| s.name == scan_name) else {
+                            return Response::Error(
+                                "new scan missing after successful enrollment".into(),
+                            );
+                        };
+                        Response::ProfileMutation {
+                            operation: irlume_common::ProfileMutationKind::AddScan,
+                            profile_id,
+                            profile_name_before: Some(profile.name.clone()),
+                            profile_name_after: Some(profile.name.clone()),
+                            scan_id: Some(scan.id.clone()),
+                            scan_name_before: None,
+                            scan_name_after: Some(scan.name.clone()),
+                            total_scans: Some(total),
+                        }
+                    }
+                    Ok(None) => {
+                        Response::Error("enrollment disappeared after adding the scan".into())
+                    }
+                    Err(e) => Response::Error(e.to_string()),
+                },
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         // --- keyring unlock (TPM-sealed password) ---------------------------
         Request::SealPassword { user, password } => {
             // Arming the keyring: root or the user themselves. `password`
@@ -1405,6 +1464,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             })
         }
+        Request::DeleteProfileById { user, profile_id } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            if !irlume_core::storage::valid_profile_id(&profile_id) {
+                return Response::Error("invalid profile ID".into());
+            }
+            mutate_enrollment_response(&user, |enr| delete_profile_by_id(enr, &profile_id))
+        }
         Request::DeleteScan {
             user,
             profile,
@@ -1430,6 +1498,22 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             })
         }
+        Request::DeleteScanById {
+            user,
+            profile_id,
+            scan_id,
+        } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            if !irlume_core::storage::valid_profile_id(&profile_id) {
+                return Response::Error("invalid profile ID".into());
+            }
+            if !irlume_core::storage::valid_scan_id(&scan_id) {
+                return Response::Error("invalid scan ID".into());
+            }
+            mutate_enrollment_response(&user, |enr| delete_scan_by_id(enr, &profile_id, &scan_id))
+        }
         Request::RenameProfile {
             user,
             profile,
@@ -1449,6 +1533,24 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     .ok_or(format!("no face profile '{profile}'"))?;
                 p.name = new_name.clone();
                 Ok(format!("renamed profile to '{new_name}'"))
+            })
+        }
+        Request::RenameProfileById {
+            user,
+            profile_id,
+            new_name,
+        } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            if !irlume_core::storage::valid_profile_id(&profile_id) {
+                return Response::Error("invalid profile ID".into());
+            }
+            if !valid_display_name(&new_name) {
+                return Response::Error("invalid profile name".into());
+            }
+            mutate_enrollment_response(&user, |enr| {
+                rename_profile_by_id(enr, &profile_id, new_name)
             })
         }
         Request::RenameScan {
@@ -1476,6 +1578,28 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     .ok_or(format!("no scan '{scan}' in '{profile}'"))?;
                 s.name = new_name.clone();
                 Ok(format!("renamed scan to '{new_name}'"))
+            })
+        }
+        Request::RenameScanById {
+            user,
+            profile_id,
+            scan_id,
+            new_name,
+        } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            if !irlume_core::storage::valid_profile_id(&profile_id) {
+                return Response::Error("invalid profile ID".into());
+            }
+            if !irlume_core::storage::valid_scan_id(&scan_id) {
+                return Response::Error("invalid scan ID".into());
+            }
+            if !valid_display_name(&new_name) {
+                return Response::Error("invalid scan name".into());
+            }
+            mutate_enrollment_response(&user, |enr| {
+                rename_scan_by_id(enr, &profile_id, &scan_id, new_name)
             })
         }
         Request::SetRequireEyesOpen { user, on } => {
@@ -1608,8 +1732,124 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
     }
 }
 
-/// Load `user`'s enrollment, apply `f`, and save. `f` returns an Ok message or an
-/// error string. Used by the storage-only management operations.
+/// ID-addressed mutation primitives shared by dispatch and storage-only tests.
+fn delete_profile_by_id(
+    enrollment: &mut irlume_core::storage::Enrollment,
+    profile_id: &str,
+) -> Result<Response, String> {
+    let index = enrollment
+        .profiles
+        .iter()
+        .position(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("no face profile ID '{profile_id}'"))?;
+    let profile = enrollment.profiles.remove(index);
+    Ok(Response::ProfileMutation {
+        operation: irlume_common::ProfileMutationKind::DeleteProfile,
+        profile_id: profile.id,
+        profile_name_before: Some(profile.name),
+        profile_name_after: None,
+        scan_id: None,
+        scan_name_before: None,
+        scan_name_after: None,
+        total_scans: None,
+    })
+}
+
+fn delete_scan_by_id(
+    enrollment: &mut irlume_core::storage::Enrollment,
+    profile_id: &str,
+    scan_id: &str,
+) -> Result<Response, String> {
+    let profile = enrollment
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("no face profile ID '{profile_id}'"))?;
+    if profile.scans.len() == 1 && profile.scans[0].id == scan_id {
+        return Err("a profile must keep at least one scan; delete the profile instead".into());
+    }
+    let index = profile
+        .scans
+        .iter()
+        .position(|scan| scan.id == scan_id)
+        .ok_or_else(|| format!("no scan ID '{scan_id}' in profile '{profile_id}'"))?;
+    let scan = profile.scans.remove(index);
+    Ok(Response::ProfileMutation {
+        operation: irlume_common::ProfileMutationKind::DeleteScan,
+        profile_id: profile.id.clone(),
+        profile_name_before: Some(profile.name.clone()),
+        profile_name_after: Some(profile.name.clone()),
+        scan_id: Some(scan.id),
+        scan_name_before: Some(scan.name),
+        scan_name_after: None,
+        total_scans: Some(profile.scans.len()),
+    })
+}
+
+fn rename_profile_by_id(
+    enrollment: &mut irlume_core::storage::Enrollment,
+    profile_id: &str,
+    new_name: String,
+) -> Result<Response, String> {
+    if enrollment
+        .profiles
+        .iter()
+        .any(|profile| profile.name == new_name)
+    {
+        return Err(format!("'{new_name}' already exists"));
+    }
+    let profile = enrollment
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("no face profile ID '{profile_id}'"))?;
+    let old_name = profile.name.clone();
+    profile.name = new_name;
+    Ok(Response::ProfileMutation {
+        operation: irlume_common::ProfileMutationKind::RenameProfile,
+        profile_id: profile.id.clone(),
+        profile_name_before: Some(old_name),
+        profile_name_after: Some(profile.name.clone()),
+        scan_id: None,
+        scan_name_before: None,
+        scan_name_after: None,
+        total_scans: Some(profile.scans.len()),
+    })
+}
+
+fn rename_scan_by_id(
+    enrollment: &mut irlume_core::storage::Enrollment,
+    profile_id: &str,
+    scan_id: &str,
+    new_name: String,
+) -> Result<Response, String> {
+    let profile = enrollment
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| format!("no face profile ID '{profile_id}'"))?;
+    if profile.scans.iter().any(|scan| scan.name == new_name) {
+        return Err(format!("'{new_name}' already exists in '{}'", profile.name));
+    }
+    let scan = profile
+        .scans
+        .iter_mut()
+        .find(|scan| scan.id == scan_id)
+        .ok_or_else(|| format!("no scan ID '{scan_id}' in profile '{profile_id}'"))?;
+    let old_name = scan.name.clone();
+    scan.name = new_name;
+    Ok(Response::ProfileMutation {
+        operation: irlume_common::ProfileMutationKind::RenameScan,
+        profile_id: profile.id.clone(),
+        profile_name_before: Some(profile.name.clone()),
+        profile_name_after: Some(profile.name.clone()),
+        scan_id: Some(scan.id.clone()),
+        scan_name_before: Some(old_name),
+        scan_name_after: Some(scan.name.clone()),
+        total_scans: Some(profile.scans.len()),
+    })
+}
+
 fn mutate_enrollment(
     user: &str,
     f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<String, String>,
@@ -1629,6 +1869,32 @@ fn mutate_enrollment(
             };
             match save {
                 Ok(()) => Response::Ok(msg),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Err(e) => Response::Error(e),
+    }
+}
+
+/// Variant of [`mutate_enrollment`] for operations with a typed success reply.
+fn mutate_enrollment_response(
+    user: &str,
+    f: impl FnOnce(&mut irlume_core::storage::Enrollment) -> Result<Response, String>,
+) -> Response {
+    let mut enr = match irlume_core::storage::load(user) {
+        Ok(Some(e)) => e,
+        Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    match f(&mut enr) {
+        Ok(response) => {
+            let save = if enr.profiles.is_empty() {
+                irlume_core::storage::delete(user).map(|_| ())
+            } else {
+                irlume_core::storage::save(&enr)
+            };
+            match save {
+                Ok(()) => response,
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -2113,6 +2379,23 @@ mod tests {
     }
 
     #[test]
+    fn display_names_are_bounded_and_reject_control_or_padding() {
+        for valid in ["Primary", "Glasses on", "Ansikte 1", &"a".repeat(80)] {
+            assert!(valid_display_name(valid), "{valid:?} must be accepted");
+        }
+        for invalid in [
+            "",
+            " leading",
+            "trailing ",
+            "new\nline",
+            "tab\tname",
+            &"a".repeat(81),
+        ] {
+            assert!(!valid_display_name(invalid), "{invalid:?} must be rejected");
+        }
+    }
+
+    #[test]
     fn request_user_extracts_the_user_from_every_user_bearing_variant() {
         use irlume_common::SecretBytes;
         let u = || "carol".to_string();
@@ -2133,14 +2416,28 @@ mod tests {
                 user: u(),
                 profile: "p".into(),
             },
+            Request::DeleteProfileById {
+                user: u(),
+                profile_id: "profile-00000000000000000000000000000000".into(),
+            },
             Request::DeleteScan {
                 user: u(),
                 profile: "p".into(),
                 scan: "s".into(),
             },
+            Request::DeleteScanById {
+                user: u(),
+                profile_id: "profile-00000000000000000000000000000000".into(),
+                scan_id: "scan-00000000000000000000000000000000".into(),
+            },
             Request::RenameProfile {
                 user: u(),
                 profile: "p".into(),
+                new_name: "q".into(),
+            },
+            Request::RenameProfileById {
+                user: u(),
+                profile_id: "profile-00000000000000000000000000000000".into(),
                 new_name: "q".into(),
             },
             Request::RenameScan {
@@ -2149,9 +2446,19 @@ mod tests {
                 scan: "s".into(),
                 new_name: "t".into(),
             },
+            Request::RenameScanById {
+                user: u(),
+                profile_id: "profile-00000000000000000000000000000000".into(),
+                scan_id: "scan-00000000000000000000000000000000".into(),
+                new_name: "t".into(),
+            },
             Request::AddScan {
                 user: u(),
                 profile: "p".into(),
+            },
+            Request::AddScanById {
+                user: u(),
+                profile_id: "profile-00000000000000000000000000000000".into(),
             },
             Request::SetRequireEyesOpen {
                 user: u(),
@@ -3387,6 +3694,117 @@ mod tests {
             !sb.dir.join("carol.json").exists(),
             "Enroll{{reset:true}} must delete the previous enrollment first"
         );
+    }
+
+    #[test]
+    fn opaque_id_mutations_target_exact_records_and_return_typed_results() {
+        if irlume_core::template_key::tpm_available() {
+            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        let _g = env_lock();
+        let sb = sandbox("id-mutations");
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]),
+        );
+        let initial = irlume_core::storage::load("carol").unwrap().unwrap();
+        let profile_id = initial.profiles[0].id.clone();
+        let first_scan_id = initial.profiles[0].scans[0].id.clone();
+        let second_scan_id = initial.profiles[0].scans[1].id.clone();
+        match mutate_enrollment_response("carol", |enrollment| {
+            rename_scan_by_id(enrollment, &profile_id, &first_scan_id, "Front".into())
+        }) {
+            Response::ProfileMutation {
+                operation,
+                profile_id: returned_profile,
+                scan_id,
+                scan_name_before,
+                scan_name_after,
+                total_scans,
+                ..
+            } => {
+                assert_eq!(operation, irlume_common::ProfileMutationKind::RenameScan);
+                assert_eq!(returned_profile, profile_id);
+                assert_eq!(scan_id.as_deref(), Some(first_scan_id.as_str()));
+                assert_eq!(scan_name_before.as_deref(), Some("Face Scan 1"));
+                assert_eq!(scan_name_after.as_deref(), Some("Front"));
+                assert_eq!(total_scans, Some(2));
+            }
+            other => panic!("expected typed rename result, got {other:?}"),
+        }
+
+        match mutate_enrollment_response("carol", |enrollment| {
+            delete_scan_by_id(enrollment, &profile_id, &second_scan_id)
+        }) {
+            Response::ProfileMutation {
+                operation,
+                scan_id,
+                total_scans,
+                ..
+            } => {
+                assert_eq!(operation, irlume_common::ProfileMutationKind::DeleteScan);
+                assert_eq!(scan_id.as_deref(), Some(second_scan_id.as_str()));
+                assert_eq!(total_scans, Some(1));
+            }
+            other => panic!("expected typed delete result, got {other:?}"),
+        }
+
+        match mutate_enrollment_response("carol", |enrollment| {
+            rename_profile_by_id(enrollment, &profile_id, "Work".into())
+        }) {
+            Response::ProfileMutation {
+                operation,
+                profile_id: returned_profile,
+                profile_name_before,
+                profile_name_after,
+                total_scans,
+                ..
+            } => {
+                assert_eq!(operation, irlume_common::ProfileMutationKind::RenameProfile);
+                assert_eq!(returned_profile, profile_id);
+                assert_eq!(profile_name_before.as_deref(), Some("Face Profile 1"));
+                assert_eq!(profile_name_after.as_deref(), Some("Work"));
+                assert_eq!(total_scans, Some(1));
+            }
+            other => panic!("expected typed profile rename result, got {other:?}"),
+        }
+
+        let saved = irlume_core::storage::load("carol").unwrap().unwrap();
+        assert_eq!(saved.profiles[0].id, profile_id);
+        assert_eq!(saved.profiles[0].name, "Work");
+        assert_eq!(saved.profiles[0].scans[0].id, first_scan_id);
+        assert_eq!(saved.profiles[0].scans[0].name, "Front");
+    }
+
+    #[test]
+    fn opaque_id_mutations_fail_closed_on_bad_or_cross_profile_ids() {
+        let _g = env_lock();
+        let sb = sandbox("id-mutation-errors");
+        write_enrollment(
+            &sb.dir,
+            &enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]),
+        );
+        let initial = irlume_core::storage::load("carol").unwrap().unwrap();
+        let profile_id = initial.profiles[0].id.clone();
+        let scan_id = initial.profiles[0].scans[0].id.clone();
+        assert!(!irlume_core::storage::valid_profile_id("../profile"));
+        assert!(!irlume_core::storage::valid_scan_id("scan-not-hex"));
+        let mut unchanged = initial.clone();
+        assert_eq!(
+            delete_scan_by_id(
+                &mut unchanged,
+                "profile-ffffffffffffffffffffffffffffffff",
+                &scan_id,
+            )
+            .unwrap_err(),
+            "no face profile ID 'profile-ffffffffffffffffffffffffffffffff'"
+        );
+
+        let saved = irlume_core::storage::load("carol").unwrap().unwrap();
+        assert_eq!(saved.profiles[0].id, profile_id);
+        assert_eq!(saved.profiles[0].scans[0].id, scan_id);
+        assert_eq!(saved.profiles[0].scans.len(), 2);
     }
 
     #[test]

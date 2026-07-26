@@ -66,6 +66,10 @@ All notable changes to irlume are documented here. This project adheres to
   exposes the IDs without breaking older clients. This is the storage boundary
   required for safe machine-facing rename, delete, and improve-recognition
   operations.
+- **Profile mutations can target opaque IDs and return typed results.** New
+  daemon requests add scans, rename profiles or scans, and delete profiles or
+  scans without resolving mutable display names in an untrusted client. Legacy
+  name-based requests remain wire-compatible for existing human CLI clients.
 
 - **`sudo irlume camera-tune` measures whether your camera can read both sensors
   at once.** Some Hello modules stop exposing their colour stream properly while

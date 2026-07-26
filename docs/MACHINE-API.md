@@ -106,10 +106,12 @@ and session IDs, and a monotonically increasing sequence number:
 The sequence is `started`, one or more `preview` positioning reports, `stage`,
 then exactly one terminal `completed`, `failed`, or `cancelled`. Enrollment
 completion returns `profile_id`, whether it was created, and the added and total
-scan counts. Add-scan completion returns the exact profile ID, counts, and
-`mutated_other_profiles: false`. Authentication test completion reports match
-and liveness decisions while guaranteeing `credential_released: false` and
-`profile_modified: false`.
+scan counts plus the exact `added_scan_ids`. A consumer can therefore ask for
+confirmation after an automatic identity merge and remove only those scans if
+the user declines or subsequent verification fails. Add-scan completion returns
+the exact profile and scan IDs, counts, and `mutated_other_profiles: false`.
+Authentication test completion reports match and liveness decisions while
+guaranteeing `credential_released: false` and `profile_modified: false`.
 
 Position reports contain only bounded booleans, quality 0–100, countdown, and
 plain guidance. A frame is emitted only when all three fixed preview flags are

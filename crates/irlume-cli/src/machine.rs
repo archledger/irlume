@@ -252,7 +252,8 @@ pub fn enroll_events(args: &[String]) -> ExitCode {
                     "profile_id": profile_id,
                     "created": created,
                     "added_scans": added,
-                    "total_scans": total
+                    "total_scans": total,
+                    "added_scan_ids": added_scan_ids
                 })),
                 None,
             );
@@ -390,6 +391,7 @@ pub fn profiles_add_scan_events(args: &[String]) -> ExitCode {
                 true,
                 Some(json!({
                     "profile_id": profile_id,
+                    "scan_id": scan_id,
                     "added_scans": 1,
                     "total_scans": total,
                     "mutated_other_profiles": false

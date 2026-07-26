@@ -405,6 +405,15 @@ fn enroll_event_stream_has_monotonic_identity_and_one_terminal_event() {
     assert_eq!(events[5]["event"], "completed");
     assert_eq!(events[5]["terminal"], true);
     assert_eq!(events[5]["data"]["profile_id"], profile_id);
+    assert_eq!(events[5]["data"]["created"], true);
+    assert_eq!(
+        events[5]["data"]["added_scan_ids"],
+        serde_json::json!([
+            "scan-0123456789abcdef0123456789abcdef",
+            "scan-1123456789abcdef0123456789abcdef",
+            "scan-2123456789abcdef0123456789abcdef"
+        ])
+    );
     assert_eq!(
         events
             .iter()

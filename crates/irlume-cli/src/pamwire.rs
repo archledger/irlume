@@ -545,43 +545,78 @@ fn dm_profile(greeter_etc: &str, gnome: Option<u32>) -> DmProfile {
     }
 }
 
+/// Every login manager irlume knows, and the PAM services it consults.
+///
+/// A table rather than a `match` so a test can walk it: each entry claims irlume
+/// understands that login manager, and a claim nothing can wire is exactly the
+/// bug this shape prevents. Adding a row here without adding the matching `Svc`
+/// fails `a_login_manager_is_recognized_only_when_something_can_wire_it`.
+const DM_PAM_SERVICES: &[(&str, &str, Option<&str>)] = &[
+    // GDM drives the password/face path and a SEPARATE fingerprint service.
+    ("gdm", "gdm-password", Some("gdm-fingerprint")),
+    ("gdm3", "gdm-password", Some("gdm-fingerprint")),
+    // SDDM / Plasma: one greeter; KDE's fingerprint is the lock screen
+    // (kde-fingerprint), wired separately as the lock service.
+    ("sddm", "sddm", None),
+    // Plasma 6 renamed the SDDM greeter service to `plasmalogin`; the
+    // display-manager.service symlink resolves to it. Same shape as SDDM:
+    // one greeter, KDE's fingerprint lives on the lock screen (kde-fingerprint).
+    ("plasmalogin", "plasmalogin", None),
+    ("lightdm", "lightdm", None),
+    ("greetd", "greetd", None),
+    // ly: named here because the symlink resolves to it, but there is no `Svc`
+    // for /etc/pam.d/ly, so nothing wires it and `dm_wirable` reports false.
+    // Adding the recipe needs validation on a real ly host (issue #128).
+    ("ly", "ly", None),
+    // COSMIC (System76 / Pop!_OS): cosmic-greeter drives BOTH the cold login
+    // and the live lock screen through the SAME `cosmic-greeter` PAM service;
+    // the SessionState in biopolicy::classify distinguishes them. No
+    // separate fingerprint service.
+    ("cosmic-greeter", "cosmic-greeter", None),
+];
+
 /// The PAM services THIS login manager actually uses, so wiring targets what the
 /// DM will really consult (and, above all, its separate FINGERPRINT service).
 /// Returns `(greeter_label, fingerprint_label_or_none)`.
 fn dm_pam_services(dm: &str) -> (&'static str, Option<&'static str>) {
-    match dm {
-        // GDM drives the password/face path and a SEPARATE fingerprint service.
-        "gdm" | "gdm3" => ("gdm-password", Some("gdm-fingerprint")),
-        // SDDM / Plasma: one greeter; KDE's fingerprint is the lock screen
-        // (kde-fingerprint), wired separately as the lock service.
-        "sddm" => ("sddm", None),
-        // Plasma 6 renamed the SDDM greeter service to `plasmalogin`; the
-        // display-manager.service symlink resolves to it. Same shape as SDDM:
-        // one greeter, KDE's fingerprint lives on the lock screen (kde-fingerprint).
-        "plasmalogin" => ("plasmalogin", None),
-        "lightdm" => ("lightdm", None),
-        "greetd" => ("greetd", None),
-        "ly" => ("ly", None),
-        // COSMIC (System76 / Pop!_OS): cosmic-greeter drives BOTH the cold login
-        // and the live lock screen through the SAME `cosmic-greeter` PAM service;
-        // the SessionState in biopolicy::classify distinguishes them. No
-        // separate fingerprint service.
-        "cosmic-greeter" => ("cosmic-greeter", None),
-        _ => ("(unknown)", None),
-    }
+    DM_PAM_SERVICES
+        .iter()
+        .find(|(name, _, _)| *name == dm)
+        .map_or(("(unknown)", None), |(_, greeter, fp)| (greeter, *fp))
 }
 
-/// The active display manager and whether irlume has a PAM-service mapping for
-/// it. `None` when no display-manager.service is set (headless / a non-DM
-/// greeter). Doctor uses the `false` case to warn: `active_display_manager`
-/// still resolves the symlink, but a brand-new or renamed DM has no
-/// `dm_pam_services` entry, so `login enable` can't target it and face login
-/// silently stays on the password. This is the proactive counterpart to the
-/// biopolicy `Unknown` deny: catch the unmapped DM at `doctor` time instead of
-/// at a failed unlock.
+/// Whether `login enable` can actually wire this PAM service, i.e. whether one
+/// of the `Svc` tables names it. Having a NAME for a service is not the same as
+/// having a recipe for it: `dm_pam_services` maps `ly` to a `ly` service that no
+/// `Svc` covers, so the wiring loop never touches it.
+fn service_wirable(service: &str) -> bool {
+    GREETERS
+        .iter()
+        .chain(FP_GREETERS.iter())
+        .any(|s| service_name(s.etc) == service)
+}
+
+/// Whether irlume can wire face login for this login manager: it maps to a PAM
+/// service, and that service is one the wiring loop writes.
+fn dm_wirable(dm: &str) -> bool {
+    let (greeter, _) = dm_pam_services(dm);
+    greeter != "(unknown)" && service_wirable(greeter)
+}
+
+/// The active display manager and whether irlume can wire face login for it.
+/// `None` when no display-manager.service is set (headless / a non-DM greeter).
+///
+/// Doctor uses the `false` case to warn. Two different machines land there: a
+/// brand-new or renamed DM that has no `dm_pam_services` entry, and one that has
+/// an entry naming a service no `Svc` covers. Both end the same way, with
+/// `login enable` unable to target it and face login silently staying on the
+/// password, so both must warn. Reporting only the first is how `ly` came to be
+/// called supported while nothing could wire it. This is the proactive
+/// counterpart to the biopolicy `Unknown` deny: catch it at `doctor` time
+/// instead of at a failed unlock.
 pub(crate) fn active_dm_recognized() -> Option<(String, bool)> {
     let dm = active_display_manager()?;
-    let recognized = dm_pam_services(&dm).0 != "(unknown)";
+    let recognized = dm_wirable(&dm);
     Some((dm, recognized))
 }
 
@@ -714,8 +749,9 @@ pub(crate) struct LoginManagerFact {
     /// `None` when no `display-manager.service` is set: a headless host, or a
     /// greeter that does not register one. Not the same as "no face login".
     pub(crate) name: Option<String>,
-    /// Whether irlume maps this login manager to PAM services at all. An
-    /// unrecognized manager cannot be targeted by `login enable`.
+    /// Whether irlume can wire face login here. False covers both a login
+    /// manager it has no mapping for and one whose mapped service it has no
+    /// recipe for; either way `login enable` cannot target it.
     pub(crate) recognized: bool,
     /// The greeter service, plus the separate fingerprint service on the login
     /// managers that have one (GDM). Empty when unrecognized.
@@ -731,7 +767,9 @@ pub(crate) fn login_manager_fact() -> LoginManagerFact {
         };
     };
     let (greeter, fp) = dm_pam_services(&dm);
-    let recognized = greeter != "(unknown)";
+    // Named is not the same as wirable, so a service irlume cannot write must
+    // not be published as one it consults.
+    let recognized = dm_wirable(&dm);
     LoginManagerFact {
         name: Some(dm),
         recognized,
@@ -1999,6 +2037,28 @@ mod tests {
         assert_eq!(dm_pam_services("cosmic-greeter"), ("cosmic-greeter", None));
         // Anything unrecognised is named "(unknown)" with no fingerprint service.
         assert_eq!(dm_pam_services("mystery-dm"), ("(unknown)", None));
+    }
+
+    #[test]
+    fn a_login_manager_is_recognized_only_when_something_can_wire_it() {
+        // Walk the whole table, so a login manager added later cannot claim
+        // support without a recipe. `ly` is the case that motivated this: it maps
+        // to a `ly` PAM service that no `Svc` covers, so `login enable` never
+        // touched it while doctor called the machine supported.
+        const NO_RECIPE_YET: &[&str] = &["ly"];
+        for (dm, greeter, fp) in DM_PAM_SERVICES {
+            if NO_RECIPE_YET.contains(dm) {
+                assert!(!dm_wirable(dm), "{dm} has no Svc entry, so it cannot wire");
+                continue;
+            }
+            assert!(dm_wirable(dm), "{dm} is claimed as supported");
+            assert!(service_wirable(greeter), "{dm} greeter {greeter}");
+            if let Some(fp) = fp {
+                assert!(service_wirable(fp), "{dm} fingerprint service {fp}");
+            }
+        }
+        // Never heard of it at all: the pre-existing case, still false.
+        assert!(!dm_wirable("some-new-greeter"));
     }
 
     #[test]

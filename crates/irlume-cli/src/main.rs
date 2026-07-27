@@ -2998,10 +2998,11 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
     if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
         dout!(
             report,
-            "[doctor] ⚠ the active display manager '{dm}' is not recognized by irlume,\n     \
-             so face login cannot be wired for it (your password still works). This is\n     \
-             usually a display manager that is new, or was renamed by an update. Please\n     \
-             report it at https://github.com/archledger/irlume/issues so we can add it."
+            "[doctor] ⚠ irlume has no PAM wiring recipe for the active display manager\n     \
+             '{dm}', so face login cannot be wired for it (your password still works).\n     \
+             This is usually a display manager that is new, or was renamed by an update.\n     \
+             Please report it at https://github.com/archledger/irlume/issues so we can\n     \
+             add it."
         );
     }
     // authselect / pam-auth-update awareness: on hosts where a distro tool owns

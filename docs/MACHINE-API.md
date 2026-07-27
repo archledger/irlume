@@ -280,8 +280,10 @@ null, when the surface is not wired.
 `login_manager.known` is false when no `display-manager.service` is set: a
 headless host, or a greeter that registers none. That is not the same as "no
 login manager is installed", and a consumer should not render it that way.
-`recognized` is whether irlume maps this login manager to PAM services at all; an
-unrecognized one cannot be targeted by `login enable`. `services` are the PAM
+`recognized` is whether irlume can wire face login for this login manager. It is
+false both for one irlume has no mapping for and for one whose mapped PAM service
+irlume has no wiring recipe for; either way `login enable` cannot target it, which
+is what a consumer needs to know. `services` are the PAM
 services that login manager consults, which is how a consumer decides which
 surface entry describes its own login screen without matching on names. A service
 listed there with no matching entry in `surfaces` is one this engine has no

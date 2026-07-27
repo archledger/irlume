@@ -152,6 +152,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A display manager irlume could name but not wire was reported as supported.**
+  `doctor` recorded `display-manager: pass` whenever the active login manager had
+  an entry in the PAM service mapping, without checking that anything wires the
+  service that entry names. `ly` maps to a `ly` PAM service that no wiring recipe
+  covers, so on an `ly` host `login enable` silently wired nothing while doctor
+  said the machine was fine, and `login status --json` reported
+  `recognized: true`.
+
+  Being named and being wirable are now the same test, which is what
+  `login status --json` already documented `recognized` to mean. An `ly` host now
+  gets the warning that points at the issue tracker.
+
+  The mapping became a table rather than a `match` so a test can walk every entry:
+  adding a login manager without adding its wiring recipe now fails the suite.
+  Wiring `ly` itself still needs validation on a real `ly` host (#128).
+
 - **`mlock_refusal_warns_and_continues` failed under a sanitizer instead of
   saying why.** The sanitizer runtime defines its own `mlock`, so the call never
   reaches the kernel, `RLIMIT_MEMLOCK` refuses nothing, and the warning the test

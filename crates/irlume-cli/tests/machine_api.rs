@@ -23,7 +23,12 @@ fn version_json_is_one_machine_document() {
     assert_eq!(document["ok"], true);
     assert_eq!(
         document["data"]["capabilities"],
-        serde_json::json!(["version-json", "profiles-list-json", "status-json"])
+        serde_json::json!([
+            "version-json",
+            "profiles-list-json",
+            "status-json",
+            "doctor-json"
+        ])
     );
 }
 
@@ -137,4 +142,78 @@ fn status_json_refuses_an_unsupported_contract_before_reading_anything() {
     assert_eq!(output.status.code(), Some(2));
     let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert_eq!(document["error"]["code"], "unsupported-contract");
+}
+
+#[test]
+fn doctor_json_reports_every_check_with_a_stable_id() {
+    // The array must be COMPLETE. A consumer is entitled to read a missing id as
+    // "this engine does not run that check", so a check that silently drops out
+    // under some condition would be read as one that passed.
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["doctor", "--json"])
+        .env("IRLUME_SOCKET", "/nonexistent/irlume-doctor-test.sock")
+        .output()
+        .expect("run irlume");
+
+    assert!(output.stderr.is_empty(), "stdout must stay machine-only");
+    assert_eq!(
+        output.stdout.iter().filter(|&&b| b == b'\n').count(),
+        1,
+        "exactly one document"
+    );
+    let raw = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(
+        !raw.contains("[doctor]"),
+        "the human report must not leak into machine mode: {raw}"
+    );
+
+    let document: Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(document["command"], "doctor");
+    let checks = document["data"]["checks"]
+        .as_array()
+        .expect("checks must be an array");
+
+    // Ids a consumer keys off. These are public API: this list may grow, but an
+    // entry may never be renamed or repurposed, so removing one here should be
+    // as uncomfortable as it looks.
+    for required in [
+        "platform",
+        "install-origin",
+        "tpm",
+        "secure-boot",
+        "boot-mode",
+        "signed-pcr-policy",
+        "pcrlock",
+        "camera-nodes",
+        "models",
+        "templates",
+        "recovery-passphrase",
+        "credential-release-challenge",
+        "login-wiring",
+        "display-manager",
+        "install-hygiene",
+        "keyring-secrets",
+    ] {
+        assert!(
+            checks.iter().any(|c| c["id"] == required),
+            "check `{required}` is missing from the array"
+        );
+    }
+
+    // Every entry is well-formed and uses the published state vocabulary.
+    for c in checks {
+        assert!(c["id"].is_string(), "each check needs an id: {c}");
+        let state = c["state"].as_str().expect("state must be a string");
+        assert!(
+            ["pass", "warn", "fail", "unknown", "info"].contains(&state),
+            "unexpected state `{state}`"
+        );
+    }
+
+    // Ids are unique: a duplicate would make a consumer's lookup ambiguous.
+    let mut ids: Vec<_> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    let before = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(before, ids.len(), "check ids must be unique");
 }

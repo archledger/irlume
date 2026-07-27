@@ -17,6 +17,7 @@
 //! admin decide.
 
 use crate::commands::InstallOrigin;
+use crate::dout;
 
 /// Where the managed binaries live. Deliberately NOT the running exe's
 /// directory: a dev running `target/release/irlume doctor` would otherwise see
@@ -35,10 +36,19 @@ const PAM_DIRS: &[&str] = &[
 /// Print doctor lines for stray irlume-named files and overlaid managed
 /// binaries. Silent when everything is clean (matching the wiring-drift
 /// check: doctor stays quiet unless something needs attention).
-pub fn report(origin: &InstallOrigin) {
-    report_strays();
-    report_overlay(origin);
-    report_shadow(origin);
+pub fn report(report: &mut crate::doctor_report::Report, origin: &InstallOrigin) {
+    use crate::doctor_report::State;
+    // One check covering install hygiene. Each sub-report prints only when it
+    // finds something, so a clean machine prints nothing; the machine document
+    // still has to say the check ran and passed.
+    let mut clean = true;
+    clean &= !report_strays(report);
+    clean &= !report_overlay(report, origin);
+    clean &= !report_shadow(report, origin);
+    report.check(
+        "install-hygiene",
+        if clean { State::Pass } else { State::Warn },
+    );
 }
 
 /// A hand-built binary in a PATH-earlier directory (`/usr/local/bin`) shadowing
@@ -46,11 +56,12 @@ pub fn report(origin: &InstallOrigin) {
 /// the package manager verifies only its own path, so `report_overlay` can never
 /// see it. This is the more dangerous variant of the overlay it does catch (a
 /// PATH shadow, not an in-place overwrite), so flag it with the one-line fix.
-fn report_shadow(origin: &InstallOrigin) {
+fn report_shadow(report: &mut crate::doctor_report::Report, origin: &InstallOrigin) -> bool {
     // A source install has no package to be shadowed; the local build IS it.
     if matches!(origin, InstallOrigin::Source) {
-        return;
+        return false;
     }
+    let mut found = false;
     for name in ["irlume", "irlumed"] {
         let local = format!("/usr/local/bin/{name}");
         let packaged = format!("/usr/bin/{name}");
@@ -60,18 +71,20 @@ fn report_shadow(origin: &InstallOrigin) {
             && std::path::Path::new(&packaged).exists()
             && package_owns(&local) != Some(true)
         {
-            println!(
+            dout!(report,
                 "[doctor] ⚠ {local} shadows the packaged {packaged} on PATH: `{name}` runs the\n     \
                  hand-installed copy, not the package. Remove {local} to run the packaged build."
             );
+            found = true;
         }
     }
+    found
 }
 
 /// Stray = a file whose name starts with an irlume prefix, in a directory we
 /// manage files in, that is not one of the managed names themselves and that
 /// no package owns.
-fn report_strays() {
+fn report_strays(report: &mut crate::doctor_report::Report) -> bool {
     let mut strays: Vec<String> = Vec::new();
     for dir in BIN_DIRS {
         collect_strays(dir, "irlume", &["irlume", "irlumed"], &mut strays);
@@ -95,20 +108,22 @@ fn report_strays() {
     // (whatever it is) is some package's business, not ours.
     strays.retain(|p| !package_owns(p).unwrap_or(false));
     if strays.is_empty() {
-        return;
+        return false;
     }
     let claim = if package_query_available() {
         "not owned by any package; "
     } else {
         ""
     };
-    println!(
+    dout!(
+        report,
         "[doctor] ⚠ stray file(s) next to the managed irlume files ({claim}likely \
          backups\n     from a manual install; safe to remove once you no longer need them):"
     );
     for p in &strays {
-        println!("       {p}");
+        dout!(report, "       {p}");
     }
+    true
 }
 
 /// Push every regular file in `dir` whose name starts with `prefix` but is not
@@ -171,7 +186,7 @@ fn package_query_available() -> bool {
 /// longer matches the package (someone hand-installed over it). mtime-only
 /// drift is ignored: it is what a `touch` or a backup-restore does and the
 /// binary is still the packaged one.
-fn report_overlay(origin: &InstallOrigin) {
+fn report_overlay(report: &mut crate::doctor_report::Report, origin: &InstallOrigin) -> bool {
     let (verify, reinstall): (&[&str], &str) = match origin {
         InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
             (&["rpm", "-V", "irlume"], "sudo dnf reinstall irlume")
@@ -182,22 +197,24 @@ fn report_overlay(origin: &InstallOrigin) {
         ),
         InstallOrigin::ArchPkg => (&["pacman", "-Qkk", "irlume"], "sudo pacman -S irlume"),
         // No package to verify against; a source install IS the hand-install.
-        InstallOrigin::Source => return,
+        InstallOrigin::Source => return false,
     };
     let Some(out) = cmd_output_lossy(verify[0], &verify[1..]) else {
-        return; // verify clean (no output) or tool failed: nothing to report
+        return false; // verify clean (no output) or tool failed: nothing to report
     };
     let modified = overlaid_paths(&out);
     if modified.is_empty() {
-        return;
+        return false;
     }
     for path in &modified {
-        println!(
+        dout!(
+            report,
             "[doctor] ⚠ {path} differs from the packaged file: a hand-installed build is\n     \
              overlaying the package, and the next package update will silently replace it.\n     \
              Restore the packaged build with: {reinstall}"
         );
     }
+    true
 }
 
 /// Parse a package-verify report (rpm -V / dpkg --verify / pacman -Qkk) down

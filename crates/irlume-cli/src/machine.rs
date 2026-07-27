@@ -27,7 +27,12 @@ pub const CONTRACT_MAX: u32 = 1;
 /// never asked for it. "Newest" is the one thing a default must not mean here.
 pub const CONTRACT_DEFAULT: u32 = 1;
 
-const CAPABILITIES: &[&str] = &["version-json", "profiles-list-json", "status-json"];
+const CAPABILITIES: &[&str] = &[
+    "version-json",
+    "profiles-list-json",
+    "status-json",
+    "doctor-json",
+];
 
 /// The contract the caller asked for, or the failure to report.
 ///
@@ -335,6 +340,46 @@ fn valid_status_args(args: &[String]) -> bool {
     saw_json
 }
 
+/// `irlume doctor --json`: every readiness check as an identified result.
+///
+/// The array is complete. A consumer may assume that a check it knows about and
+/// does not find here was not run by this engine version, rather than that it
+/// passed silently, which is why this shipped all at once instead of check by
+/// check.
+pub fn doctor(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "doctor";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = without_contract(args);
+    if args != ["doctor", "--json"] {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Collect);
+    // Same pass the human report makes, printing nothing.
+    let _ = crate::doctor_run(&mut report);
+    let checks = report.into_checks();
+    emit(
+        &success(COMMAND, json!({ "checks": checks }), contract),
+        ExitCode::SUCCESS,
+    )
+}
+
 pub fn profiles_list(args: &[String]) -> ExitCode {
     const COMMAND: &str = "profiles.list";
     // Negotiate first: an unsupported contract is refused before the daemon is
@@ -547,7 +592,12 @@ mod tests {
         assert_eq!(document["ok"], true);
         assert_eq!(
             document["data"]["capabilities"],
-            json!(["version-json", "profiles-list-json", "status-json"])
+            json!([
+                "version-json",
+                "profiles-list-json",
+                "status-json",
+                "doctor-json"
+            ])
         );
         assert!(document.get("error").is_none());
     }

@@ -154,6 +154,39 @@ enrolled".
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 
+### `irlume doctor --json`
+
+Capability: `doctor-json`.
+
+Every readiness check as an identified result:
+
+```json
+{ "checks": [
+  { "id": "tpm", "state": "pass" },
+  { "id": "platform", "state": "info", "detail": "Fedora-family" },
+  { "id": "keyring-secrets", "state": "unknown" }
+] }
+```
+
+`state` is one of `pass`, `warn`, `fail`, `unknown` or `info`. `unknown` is not a
+synonym for `fail`: it means the check could not be carried out, usually because
+the daemon was unreachable or the command ran without a session bus, and a
+consumer should say so rather than report a problem the machine may not have.
+`info` is a fact worth reporting that is neither good nor bad, such as the
+platform family.
+
+`detail` is English elaboration for a support report. It is not stable and not
+for matching. A consumer that branches on that text has reintroduced the problem
+this command removes.
+
+**The array is complete.** Every check reports on every run, including checks
+that do not apply to this machine, so a consumer may read an id it knows about
+and cannot find as "this engine version does not run that check" rather than as
+"it passed". A check never disappears because it had nothing to say.
+
+`id` values are public API. The list may grow; an id is never renamed and never
+reused for a different meaning.
+
 ### `irlume profiles list --json [--user USER]`
 
 Capability: `profiles-list-json`.

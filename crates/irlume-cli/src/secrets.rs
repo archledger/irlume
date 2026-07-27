@@ -12,6 +12,7 @@
 //! matching how irlume-fingerprint talks to fprintd. It only inspects the
 //! caller's own session bus, so it is meaningful only for the current user.
 
+use crate::dout;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -139,8 +140,14 @@ pub(crate) fn login_keyring_locked() -> Option<bool> {
     }
 }
 
-pub fn report_keyring_status() {
+pub fn report_keyring_status(report: &mut crate::doctor_report::Report) {
+    use crate::doctor_report::State;
     if !have_session_bus() {
+        // No session bus, e.g. under `sudo irlume doctor`. The human report stays
+        // silent, but the machine one must still carry the check: a consumer that
+        // found this id missing could not tell "not checked here" from "checked
+        // and fine", which is the failure this whole array exists to avoid.
+        report.check("keyring-secrets", State::Unknown);
         return;
     }
     // Name the provider (ksecretd on Plasma 6, kwalletd, gnome-keyring) so the
@@ -155,17 +162,28 @@ pub fn report_keyring_status() {
         .as_deref()
         .map(|p| format!(" [{p}]"))
         .unwrap_or_default();
+    report.check(
+        "keyring-secrets",
+        match query_collection() {
+            Collection::Present { locked: false } => State::Pass,
+            Collection::Present { locked: true } => State::Warn,
+            Collection::NoProvider => State::Info,
+        },
+    );
     match query_collection() {
-        Collection::Present { locked: false } => println!(
+        Collection::Present { locked: false } => dout!(
+            report,
             "[doctor] login keyring{who}: unlocked ✓ (Secret Service apps like Bitwarden \
              can read secrets after a face login)"
         ),
-        Collection::Present { locked: true } => println!(
+        Collection::Present { locked: true } => dout!(
+            report,
             "[doctor] login keyring{who}: LOCKED. A face login should unlock it {via}.\n     \
              If it stays locked, the sealed keyring password is stale; re-run: \
              sudo irlume keyring arm"
         ),
-        Collection::NoProvider => println!(
+        Collection::NoProvider => dout!(
+            report,
             "[doctor] login keyring: no Secret Service provider running \
              (GNOME Keyring / KWallet).\n     \
              Bitwarden and other secret-storing apps need one; your desktop \

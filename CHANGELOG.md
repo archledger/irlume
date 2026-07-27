@@ -7,6 +7,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`irlume doctor --json`.** Every readiness check as an identified result with
+  a state of `pass`, `warn`, `fail`, `unknown` or `info`, so an integration can
+  show a diagnostic list without matching English.
+
+  The array is complete: every check reports on every run, including ones that do
+  not apply to this machine. A consumer may therefore read an id it knows about
+  and cannot find as "this engine version does not run that check" rather than as
+  "it passed". One check previously went silent when `doctor` ran without a
+  session bus, which under this rule would have read as a pass; it now reports
+  `unknown`.
+
+  Check ids are public API. The list may grow, but an id is never renamed or
+  reused for a different meaning.
+
+  The human `doctor` is unchanged, byte for byte. It is instrumented rather than
+  rewritten: each check records its result beside the line that reports it, so
+  one pass over the machine produces both outputs and they cannot drift.
+
 - **`irlume status --json`.** The readiness summary a desktop integration needs,
   as values instead of prose. It reports the daemon state, auth method,
   enrollment counts, template protection, keyring arming, recovery passphrase,

@@ -21,17 +21,18 @@
 //!   back has lost a frame, while one that is queued behind an enrollment holds
 //!   a slot the login path may want.
 //!
-//! What this deliberately does not do is preempt. An operation already running
-//! runs to completion, so an enrollment in flight still delays a login until it
-//! finishes. Stopping one early means checking a signal between whole captures,
-//! inside `irlume_auth`'s enrollment loop rather than here, and that is the
-//! second half of issue #117.
+//! What this deliberately does not do is preempt by force. An operation already
+//! running is ASKED to stop, through [`CancelToken`], and it answers at its own
+//! next safe boundary: between whole captures, where nothing is half-written.
+//! Nothing here unwinds a thread, closes a device out from under a capture, or
+//! interrupts an ONNX session.
 //!
 //! [`Engine`]: irlume_auth::Engine
 
 use irlume_common::Request;
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// What a request costs and how much it may delay a login.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,6 +92,38 @@ impl Refusal {
     }
 }
 
+/// A cooperative stop signal for long camera loops.
+///
+/// Enrolment captures many scans and may retry each one. The boundary between
+/// two whole captures is where stopping is safe, and it is the only place this
+/// is read. The token says "an authentication is waiting"; what it never does is
+/// interrupt a capture already inside V4L2 or an inference session, or fire
+/// while a profile is half-written.
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the running long operation to stop at its next safe boundary.
+    pub fn request_stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// True once a stop has been asked for.
+    pub fn stop_requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Clear the signal before the worker starts its next operation, so the one
+    /// that yielded does not hand its cancellation to the one that follows.
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// One queued unit of work: what to run, and who asked.
 pub struct Job<T> {
     pub class: Class,
@@ -120,6 +153,7 @@ impl<T> Inner<T> {
 pub struct Arbiter<T> {
     inner: Mutex<Inner<T>>,
     ready: Condvar,
+    cancel: CancelToken,
 }
 
 impl<T> Default for Arbiter<T> {
@@ -139,7 +173,14 @@ impl<T> Arbiter<T> {
                 closed: false,
             }),
             ready: Condvar::new(),
+            cancel: CancelToken::new(),
         }
+    }
+
+    /// The signal long operations poll. Shared, so an authentication arriving on
+    /// any connection reaches an enrolment already in flight.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// Offer a request to the queue.
@@ -149,12 +190,18 @@ impl<T> Arbiter<T> {
     pub fn submit(&self, class: Class, uid: u32, payload: T) -> Result<(), Refusal> {
         let mut inner = self.lock();
         match class {
-            // An authentication never waits behind preview work.
-            Class::Auth => inner.auth.push_back(Job {
-                class,
-                uid,
-                payload,
-            }),
+            Class::Auth => {
+                // An authentication never waits behind preview work, and the
+                // request to yield goes out NOW rather than when the worker next
+                // looks: an enrolment should learn it is wanted elsewhere while
+                // it still has boundaries left to stop at.
+                self.cancel.request_stop();
+                inner.auth.push_back(Job {
+                    class,
+                    uid,
+                    payload,
+                });
+            }
             Class::Camera => {
                 if inner.auth_pending() {
                     return Err(Refusal::AuthenticationPending);
@@ -190,9 +237,14 @@ impl<T> Arbiter<T> {
         loop {
             if let Some(job) = inner.auth.pop_front() {
                 inner.auth_running = true;
+                // The stop that was asked for has been honoured by this
+                // authentication reaching the front; clear it so the next long
+                // operation does not start already cancelled.
+                self.cancel.reset();
                 return Some(job);
             }
             if let Some(job) = inner.other.pop_front() {
+                self.cancel.reset();
                 return Some(job);
             }
             if inner.closed {
@@ -303,6 +355,27 @@ mod tests {
         let job = a.take().unwrap();
         a.finish(job.class, job.uid);
         assert!(a.submit(Class::Camera, 1000, "again").is_ok());
+    }
+
+    #[test]
+    fn a_submitted_authentication_asks_a_running_loop_to_stop() {
+        let a = arb();
+        let token = a.cancel_token();
+        a.submit(Class::Camera, 1000, "enrolment").unwrap();
+        let job = a.take().unwrap();
+        assert!(!token.stop_requested(), "nothing is waiting yet");
+        a.submit(Class::Auth, 0, "login").unwrap();
+        assert!(
+            token.stop_requested(),
+            "the enrolment must learn an authentication is waiting"
+        );
+        a.finish(job.class, job.uid);
+        let next = a.take().unwrap();
+        assert_eq!(next.payload, "login");
+        assert!(
+            !token.stop_requested(),
+            "the next operation must not inherit the cancellation"
+        );
     }
 
     #[test]

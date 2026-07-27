@@ -339,6 +339,11 @@ fn main() {
         std::thread::Builder::new()
             .name("irlume-camera".into())
             .spawn(move || {
+                // The engine asks this between whole captures, so a long
+                // enrolment yields the camera to an authentication instead of
+                // making it wait for ten scans.
+                let token = arbiter.cancel_token();
+                engine.set_stop_signal(std::sync::Arc::new(move || token.stop_requested()));
                 while let Some(job) = arbiter.take() {
                     let Queued { req, peer, reply } = job.payload;
                     // Isolate each request behind catch_unwind. A panic deep in

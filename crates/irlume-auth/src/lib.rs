@@ -66,6 +66,14 @@ pub struct Engine {
     /// The gate treats `false` as "not seen yet", which is the fail-closed
     /// reading: the worst a stale `false` can do is ask for another gesture.
     gesture_seen_before_match: bool,
+    /// Asked between whole captures: "should this long operation stop now?".
+    ///
+    /// The daemon points this at its arbiter so an enrolment yields the camera
+    /// to an authentication. `None` (the CLI, tests) never stops. It is polled
+    /// only at a boundary where nothing is half-written, never mid-capture and
+    /// never mid-inference: stopping an operation is a scheduling decision, not
+    /// a way to abandon a device or a session.
+    stop_requested: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Assurance tier of this engine, derived from the available camera hardware.
@@ -495,7 +503,23 @@ impl Engine {
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
             ir_available: irlume_camera::capabilities().ir_pair,
             gesture_seen_before_match: false,
+            stop_requested: None,
         })
+    }
+
+    /// Point the engine at a signal asked between whole captures, so a long
+    /// operation can yield the camera to an authentication.
+    ///
+    /// Only the daemon sets this. It is a request, not a kill: the check happens
+    /// at boundaries where nothing is half-written, so a stopped operation
+    /// persists nothing and the caller retries.
+    pub fn set_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.stop_requested = Some(signal);
+    }
+
+    /// True when something has asked this operation to stop.
+    fn should_stop(&self) -> bool {
+        self.stop_requested.as_ref().is_some_and(|f| f())
     }
 
     /// Assurance tier from the hardware: `Secure` with a real RGB+IR camera,
@@ -2191,6 +2215,14 @@ impl Engine {
         // A camera that cannot be opened is NOT fatal here: fall back to the
         // per-capture path, which is exactly today's behaviour, so enrolment
         // still works on hardware the session path cannot hold.
+        // Asked to yield before the first frame: do not even open the device.
+        // A queued enrolment that already knows an authentication is waiting has
+        // no business claiming the camera for the moment it takes to notice.
+        if self.should_stop() {
+            return Err(irlume_common::Error::Preempted(
+                "an authentication needed the camera; nothing was saved, please retry".into(),
+            ));
+        }
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let cams = if self.ir_available {
             match (
@@ -2219,6 +2251,14 @@ impl Engine {
         for _ in 0..(want * 10) {
             if out.len() >= want {
                 break;
+            }
+            // The safe boundary: between whole captures, before the next one
+            // opens. Nothing is written until the caller finishes, so returning
+            // here leaves no partial profile behind and no device mid-stream.
+            if self.should_stop() {
+                return Err(irlume_common::Error::Preempted(
+                    "an authentication needed the camera; nothing was saved, please retry".into(),
+                ));
             }
             let a = match &mut sessions {
                 Some((rs, is)) => self.assess_full_with(Some((rs, is)))?,
@@ -4571,6 +4611,69 @@ mod engine_tests {
         );
 
         std::env::remove_var("IRLUME_GRACE_MS");
+        teardown_sandbox(&dir);
+    }
+
+    /// An enrolment asked to stop must yield at a capture boundary and leave
+    /// nothing behind.
+    ///
+    /// Run against the loopback feeders, which hold no face, so the enrolment
+    /// would otherwise spend its whole retry budget looking for one: that is
+    /// precisely the long operation an arriving authentication must not wait
+    /// for. The assertions that matter are the typed `Preempted` outcome and an
+    /// enrollment store that is still empty afterwards, because a half-written
+    /// profile would be worse than the delay this feature removes.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_enrolment_stops_when_asked_and_saves_nothing() {
+        let (Ok(rgb), Ok(ir)) = (
+            std::env::var("IRLUME_TEST_RGB_DEVICE"),
+            std::env::var("IRLUME_TEST_IR_DEVICE"),
+        ) else {
+            return;
+        };
+        let _g = env_guard();
+        ort_init();
+        let dir = state_sandbox("loopback-preempt");
+
+        let mut e = Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("engine load")
+        .with_devices(&rgb, &ir);
+        // Answer "keep going" once so the entry check passes and the camera is
+        // opened, then "stop": that lands the yield on the boundary BETWEEN
+        // captures, which is the case that has to work. A signal that is true
+        // from the start would only prove the cheap entry check.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        e.set_stop_signal(std::sync::Arc::new(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+        }));
+
+        let err = e
+            .enroll_profile("preemptuser", None, 10)
+            .expect_err("a stop request must not look like a successful enrolment");
+        assert!(
+            matches!(err, irlume_common::Error::Preempted(_)),
+            "the caller has to tell a yield from a failure, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("retry"),
+            "the message should tell the user what to do: {err}"
+        );
+        assert!(
+            irlume_core::storage::load("preemptuser")
+                .expect("store readable")
+                .is_none(),
+            "a stopped enrolment must persist nothing"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the yield must come from the in-loop boundary, not only the entry check"
+        );
+
         teardown_sandbox(&dir);
     }
 }

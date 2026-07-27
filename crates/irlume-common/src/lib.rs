@@ -609,6 +609,11 @@ pub enum Error {
     Tpm(String),
     #[error("policy: {0}")]
     Policy(String),
+    /// A long camera operation stopped early because an authentication needed
+    /// the camera. Distinct from a failure: nothing went wrong and nothing was
+    /// written, so the caller should say "retry", not "it broke".
+    #[error("preempted: {0}")]
+    Preempted(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

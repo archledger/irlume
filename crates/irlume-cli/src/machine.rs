@@ -82,7 +82,11 @@ pub fn version(args: &[String]) -> ExitCode {
             json!({
                 "capabilities": CAPABILITIES,
                 "limits": {
-                    "max_profiles": 3
+                    // Read the engine's own constant rather than repeating the
+                    // number. A consumer displays this as the enrollment limit,
+                    // so a literal here would silently start lying the day the
+                    // store's limit changes.
+                    "max_profiles": irlume_core::storage::MAX_PROFILES
                 }
             }),
         ),

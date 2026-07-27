@@ -28,6 +28,24 @@ fn version_json_is_one_machine_document() {
 }
 
 #[test]
+fn advertised_limits_track_the_engine_constants() {
+    // Not a tautology: this runs the real binary and compares its published
+    // limit against the engine's own constant, so reverting to a literal in
+    // machine.rs fails here rather than silently misinforming a consumer that
+    // renders this as the enrollment limit.
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["version", "--json"])
+        .output()
+        .expect("run irlume");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(
+        document["data"]["limits"]["max_profiles"],
+        serde_json::json!(irlume_core::storage::MAX_PROFILES),
+        "published max_profiles must come from irlume_core::storage::MAX_PROFILES"
+    );
+}
+
+#[test]
 fn unavailable_daemon_is_a_typed_json_error() {
     let socket = std::env::temp_dir().join(format!(
         "irlume-machine-api-no-daemon-{}",

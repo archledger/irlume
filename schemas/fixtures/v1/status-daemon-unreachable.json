@@ -1,0 +1,1 @@
+{"contract_version":1,"engine_version":"0.6.1","command":"status","ok":true,"data":{"auth_method":"auto","camera":{"ir":true,"rgb":true},"daemon":"unreachable","enrollment":{"known":false},"face_disabled":false,"fingerprint":false,"keyring":{"known":false},"recovery":{"known":false},"templates":"unknown"}}

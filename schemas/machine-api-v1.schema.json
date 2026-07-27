@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/archledger/irlume/main/schemas/machine-api-v1.schema.json",
+  "title": "irlume machine API, contract version 1",
+  "description": "One document as written to standard output by an irlume machine-mode command (`--json`). Validating a document proves it is well-formed for contract 1; it says nothing about whether the machine described is healthy. Unknown properties are allowed on purpose: fields may be added within a contract version, so a consumer that rejects them will break on an engine update that is permitted by the contract. See docs/MACHINE-API.md.",
+  "type": "object",
+  "required": ["contract_version", "engine_version", "command", "ok"],
+  "properties": {
+    "contract_version": {
+      "description": "The contract actually in force for this response. Always 1 for this schema.",
+      "const": 1
+    },
+    "engine_version": {
+      "description": "The irlume build that answered. Informational: gate on contract_version and capabilities, never on this.",
+      "type": "string",
+      "minLength": 1
+    },
+    "command": {
+      "description": "Which command answered. A new command adds a name here without a contract bump.",
+      "type": "string",
+      "minLength": 1
+    },
+    "ok": { "type": "boolean" },
+    "data": { "type": "object" },
+    "error": { "$ref": "#/$defs/error" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+      "then": { "required": ["data"], "not": { "required": ["error"] } },
+      "else": { "required": ["error"], "not": { "required": ["data"] } }
+    },
+    {
+      "if": {
+        "properties": { "ok": { "const": true }, "command": { "const": "version" } },
+        "required": ["ok", "command"]
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/versionData" } } }
+    },
+    {
+      "if": {
+        "properties": { "ok": { "const": true }, "command": { "const": "status" } },
+        "required": ["ok", "command"]
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/statusData" } } }
+    },
+    {
+      "if": {
+        "properties": { "ok": { "const": true }, "command": { "const": "doctor" } },
+        "required": ["ok", "command"]
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/doctorData" } } }
+    },
+    {
+      "if": {
+        "properties": { "ok": { "const": true }, "command": { "const": "profiles.list" } },
+        "required": ["ok", "command"]
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/profilesListData" } } }
+    },
+    {
+      "if": {
+        "properties": { "ok": { "const": true }, "command": { "const": "login.status" } },
+        "required": ["ok", "command"]
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/loginStatusData" } } }
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": ["code", "retryable"],
+      "properties": {
+        "code": {
+          "description": "A stable code, never daemon prose. The list may grow; treat an unrecognized code as a non-retryable failure.",
+          "type": "string",
+          "examples": [
+            "usage-error",
+            "unsupported-contract",
+            "daemon-unavailable",
+            "not-authorized",
+            "operation-failed",
+            "protocol-error"
+          ]
+        },
+        "retryable": {
+          "description": "Whether an identical request could plausibly succeed later with nothing changed by the caller. Not a promise, and it carries no suggested delay.",
+          "type": "boolean"
+        }
+      }
+    },
+
+    "versionData": {
+      "type": "object",
+      "required": ["capabilities", "contract_versions", "limits"],
+      "properties": {
+        "capabilities": {
+          "description": "Commands this build implements and can reach. A name is permanent public API once published, and is an availability check rather than a version substitute. The list grows, so match names you know and ignore the rest.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "contract_versions": {
+          "description": "The contract range this build speaks. Pick one inside it and pass `--contract N`.",
+          "type": "object",
+          "required": ["min", "max"],
+          "properties": {
+            "min": { "type": "integer", "minimum": 1 },
+            "max": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": ["max_profiles"],
+          "properties": {
+            "max_profiles": {
+              "description": "How many face profiles one account may hold.",
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+
+    "statusData": {
+      "type": "object",
+      "required": [
+        "daemon",
+        "auth_method",
+        "face_disabled",
+        "enrollment",
+        "templates",
+        "keyring",
+        "recovery",
+        "camera",
+        "fingerprint"
+      ],
+      "properties": {
+        "daemon": {
+          "description": "Whether the daemon answered. An unreachable daemon is a reported value, not an error, because the facts that do not need it are still worth having.",
+          "enum": ["running", "access-denied", "unreachable"]
+        },
+        "auth_method": {
+          "description": "The configured modality. `both` means face and fingerprint are each usable.",
+          "enum": ["auto", "face", "fingerprint", "both"]
+        },
+        "face_disabled": { "type": "boolean" },
+        "enrollment": {
+          "description": "Unknown is not zero: when `known` is false the counts are absent rather than 0, so \"we could not find out\" cannot be read as \"nothing is enrolled\".",
+          "type": "object",
+          "required": ["known"],
+          "properties": {
+            "known": { "type": "boolean" },
+            "profiles": { "type": "integer", "minimum": 0 },
+            "scans": { "type": "integer", "minimum": 0 }
+          },
+          "if": { "properties": { "known": { "const": false } }, "required": ["known"] },
+          "then": { "not": { "anyOf": [{ "required": ["profiles"] }, { "required": ["scans"] }] } }
+        },
+        "templates": {
+          "description": "Whether face templates are encrypted at rest. `unknown` when the daemon did not answer.",
+          "enum": ["encrypted", "plaintext", "unknown"]
+        },
+        "keyring": {
+          "type": "object",
+          "required": ["known"],
+          "properties": {
+            "known": { "type": "boolean" },
+            "armed": {
+              "description": "Whether a sealed login password is armed, which is what lets a face login unlock the wallet.",
+              "type": "boolean"
+            },
+            "policy": {
+              "description": "The TPM policy the password is sealed against, as text for display. Null when nothing is armed.",
+              "type": ["string", "null"]
+            }
+          }
+        },
+        "recovery": {
+          "type": "object",
+          "required": ["known"],
+          "properties": {
+            "known": { "type": "boolean" },
+            "passphrase_set": { "type": "boolean" }
+          }
+        },
+        "camera": {
+          "description": "Camera capability, never camera identity. Device nodes are not published by any machine command.",
+          "type": "object",
+          "required": ["rgb", "ir"],
+          "properties": {
+            "rgb": { "type": "boolean" },
+            "ir": { "type": "boolean" }
+          }
+        },
+        "fingerprint": {
+          "description": "Whether a fingerprint reader was found.",
+          "type": "boolean"
+        }
+      }
+    },
+
+    "doctorData": {
+      "type": "object",
+      "required": ["checks"],
+      "properties": {
+        "checks": {
+          "description": "Every readiness check this build runs, complete on every run. A consumer may read an id it knows and cannot find as \"this engine version does not run that check\" rather than as \"it passed\".",
+          "type": "array",
+          "items": { "$ref": "#/$defs/doctorCheck" }
+        }
+      }
+    },
+    "doctorCheck": {
+      "type": "object",
+      "required": ["id", "state"],
+      "properties": {
+        "id": {
+          "description": "Stable check id, public API: the registry grows, but an id is never renamed or reused. The current registry is documented in docs/MACHINE-API.md.",
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "description": "`unknown` is not `fail`: it means the check could not be carried out. `info` is a fact that is neither good nor bad.",
+          "enum": ["pass", "warn", "fail", "unknown", "info"]
+        },
+        "detail": {
+          "description": "English elaboration for a support report. NOT stable and NOT for matching. A consumer that branches on this text has reintroduced the problem this command removes.",
+          "type": "string"
+        }
+      }
+    },
+
+    "profilesListData": {
+      "type": "object",
+      "required": ["profiles", "require_eyes_open", "require_challenge"],
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["display_name", "scans"],
+            "properties": {
+              "display_name": {
+                "description": "User text, not an identifier. It may contain anything the user typed, and it is mutable.",
+                "type": "string"
+              },
+              "scans": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["display_name"],
+                  "properties": { "display_name": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "require_eyes_open": { "type": "boolean" },
+        "require_challenge": { "type": "boolean" }
+      }
+    },
+
+    "loginStatusData": {
+      "type": "object",
+      "required": ["login_manager", "surfaces", "selinux_module"],
+      "properties": {
+        "login_manager": {
+          "type": "object",
+          "required": ["known"],
+          "properties": {
+            "known": {
+              "description": "False when no display-manager.service is set: a headless host, or a greeter that registers none. Not the same as \"no login manager is installed\".",
+              "type": "boolean"
+            },
+            "name": { "type": "string", "minLength": 1 },
+            "recognized": {
+              "description": "Whether irlume maps this login manager to PAM services. An unrecognized one cannot be targeted by `login enable`.",
+              "type": "boolean"
+            },
+            "services": {
+              "description": "The PAM services this login manager consults. Intersect with surface ids to find the entry describing this machine's login screen. A service with no matching surface is one this engine has no wiring recipe for.",
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          },
+          "if": { "properties": { "known": { "const": false } }, "required": ["known"] },
+          "then": { "not": { "required": ["name"] } }
+        },
+        "surfaces": {
+          "description": "Complete: a service absent from this machine is still listed, with `present` false.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/loginSurface" }
+        },
+        "selinux_module": {
+          "description": "`unknown` when the policy store could not be read, which needs root. It is not a synonym for `not-loaded`.",
+          "enum": ["loaded", "not-loaded", "unknown"]
+        }
+      }
+    },
+    "loginSurface": {
+      "type": "object",
+      "required": ["id", "role", "present", "wired"],
+      "properties": {
+        "id": {
+          "description": "The PAM service name, e.g. `plasmalogin`, `kde`, `sudo`, `polkit-1`. Stable public API; PAM file paths are not published.",
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "description": "What the surface is for. The vocabulary may grow.",
+          "type": "string",
+          "examples": [
+            "login-screen",
+            "login-screen-fingerprint",
+            "lock-screen",
+            "sudo",
+            "polkit"
+          ]
+        },
+        "present": {
+          "description": "Whether the PAM service exists here at all, counting a vendor copy an override would be materialized from.",
+          "type": "boolean"
+        },
+        "wired": { "type": "boolean" },
+        "mode": {
+          "description": "How face fires on a wired surface: `face-first` verifies as soon as the greeter prompts, `on-demand` waits for an empty password submission, `keyring` is the fingerprint keyring-unlock line rather than a face factor, `verify` is the sudo and polkit stanza. Absent, never null, when the surface is not wired.",
+          "type": "string",
+          "examples": ["face-first", "on-demand", "keyring", "verify"]
+        }
+      },
+      "if": { "properties": { "wired": { "const": false } }, "required": ["wired"] },
+      "then": { "not": { "required": ["mode"] } }
+    }
+  }
+}

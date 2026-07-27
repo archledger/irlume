@@ -115,6 +115,10 @@ install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/pack
 # Preset: the daemon is enabled on install (see %%post); it only serves a local
 # socket and auth stays opt-in, so "installed" should mean "works".
 install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-irlume.preset
+# The machine-API contract: the schema a consumer validates our JSON against,
+# shipped with the engine that implements it so the two cannot be a version
+# apart on a user's machine.
+install -Dm0644 schemas/machine-api-v1.schema.json %{buildroot}%{_datadir}/%{name}/schemas/machine-api-v1.schema.json
 
 %post
 # %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
@@ -172,7 +176,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 
 %files
 %license LICENSE
-%doc README.md docs/SECURITY_AT_REST.md
+%doc README.md docs/SECURITY_AT_REST.md docs/MACHINE-API.md docs/INTEGRATION.md
 %{_bindir}/irlumed
 %{_bindir}/irlume
 %{_libdir}/security/pam_irlume.so
@@ -182,6 +186,8 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %dir %{_datadir}/%{name}/models
 %dir %{_datadir}/%{name}/onnxruntime
 %dir %{_datadir}/%{name}/onnxruntime/lib
+%dir %{_datadir}/%{name}/schemas
+%{_datadir}/%{name}/schemas/*.json
 %{_datadir}/%{name}/models/*.onnx
 %{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service

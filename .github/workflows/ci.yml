@@ -104,6 +104,19 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+      # The machine API is a promise to other people's software, so it is
+      # checked the way a consumer would check it: run the release binary and
+      # validate what it actually writes against the published schema, rather
+      # than trusting a unit test over the same code that produced the output.
+      # --strict additionally fails on properties the schema does not describe;
+      # adding a field is allowed within a contract, but it should be a decision
+      # rather than a surprise, so it fails here until the schema documents it.
+      - name: machine API conformance (real binary against the published schema)
+        run: |
+          sudo apt-get install -y --no-install-recommends python3-jsonschema
+          python3 scripts/machine-api-conformance.py \
+            --irlume target/release/irlume --strict
+
       # The TPM-gated tests run against a software TPM: same TSS stack, no
       # hardware. IRLUME_TCTI is the production env override; swtpm state is
       # throwaway per run.

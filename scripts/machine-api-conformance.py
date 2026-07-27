@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
+"""Check that an irlume build answers contract 1 the way docs/MACHINE-API.md says.
+
+Written for consumers, not for this repository: it needs Python 3 and an irlume
+binary, no Rust toolchain and no irlume source tree. A desktop integration can
+run it in its own CI against whichever irlume versions it claims to support, and
+a packager can run it after a build to confirm the packaging did not break the
+machine surface.
+
+It checks three things a consumer depends on and cannot see from a single call:
+
+  * the envelope rules (one JSON document on stdout, nothing on stderr, exit
+    codes, `data` and `error` never both present);
+  * every advertised capability actually answers, so a capability is never a
+    promise the build cannot keep;
+  * contract negotiation refuses what it does not implement, before acting.
+
+Schema validation needs the `jsonschema` package (Fedora `python3-jsonschema`,
+Debian/Ubuntu `python3-jsonschema`, Arch `python-jsonschema`, or `pip install
+jsonschema`). Without it the structural checks still run and the skipped ones
+are reported rather than passed over quietly.
+
+Only read-only commands are run. Nothing here enrolls, wires PAM, or writes.
+"""
+
+import argparse
+import copy
+import json
+import os
+import subprocess
+import sys
+
+# Capability name -> the argv that capability promises will work.
+CAPABILITY_COMMANDS = {
+    "version-json": ["version", "--json"],
+    "status-json": ["status", "--json"],
+    "doctor-json": ["doctor", "--json"],
+    "profiles-list-json": ["profiles", "list", "--json"],
+    "login-status-json": ["login", "status", "--json"],
+}
+
+# Commands whose output must never contain these, per the security and privacy
+# section of docs/MACHINE-API.md. Camera device nodes and PAM file paths are the
+# two that a well-meaning addition would most plausibly reintroduce.
+FORBIDDEN_SUBSTRINGS = ["/dev/video", "/etc/pam.d", "/usr/lib/pam.d"]
+
+CONTRACT = 1
+
+
+class Results:
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+        self.skipped = []
+
+    def ok(self, what):
+        self.passed += 1
+        print(f"  ok      {what}")
+
+    def fail(self, what, detail):
+        self.failed.append((what, detail))
+        print(f"  FAILED  {what}\n            {detail}")
+
+    def skip(self, what, why):
+        self.skipped.append((what, why))
+        print(f"  skipped {what} ({why})")
+
+
+def run(binary, argv, env_extra=None):
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    proc = subprocess.run(
+        [binary] + argv,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    return proc
+
+
+def parse_document(results, what, proc):
+    """Envelope rules that hold for every machine document. Returns the document
+    or None, so a caller can stop rather than report the same break twice."""
+    if proc.stderr != "":
+        results.fail(what, f"stderr must be empty in machine mode, got: {proc.stderr!r}")
+        return None
+    if proc.stdout.count("\n") != 1 or not proc.stdout.endswith("\n"):
+        results.fail(what, "stdout must be exactly one line holding one JSON document")
+        return None
+    try:
+        document = json.loads(proc.stdout)
+    except json.JSONDecodeError as error:
+        results.fail(what, f"stdout is not valid JSON: {error}")
+        return None
+    if document.get("contract_version") != CONTRACT:
+        results.fail(what, f"contract_version must be {CONTRACT}, got {document.get('contract_version')!r}")
+        return None
+    if not isinstance(document.get("ok"), bool):
+        results.fail(what, "ok must be a boolean")
+        return None
+    if document["ok"] and "error" in document:
+        results.fail(what, "a successful document must not carry an error")
+        return None
+    if not document["ok"] and "data" in document:
+        results.fail(what, "a failed document must not carry data")
+        return None
+    if not document["ok"] and "error" not in document:
+        results.fail(what, "a failed document must carry an error")
+        return None
+    return document
+
+
+def strict_schema(schema):
+    """The same schema with every described object closed.
+
+    The published schema deliberately allows unknown properties: fields may be
+    added within a contract version, so a consumer that rejects them breaks on an
+    engine update the contract permits. This variant is for the engine's own CI,
+    where a property nobody documented is worth seeing before it ships.
+    """
+    # Never close a subschema reached through `if`, `then`, `else` or `not`.
+    # Those describe a condition or a fragment, not a whole object: closing the
+    # `if` in {"if": {"properties": {"ok": {"const": true}}}} would make the
+    # condition false for every real document, and closing a `then` that names
+    # one property would reject the rest of the envelope. Shapes worth closing
+    # all live in $defs and are reached directly.
+    conditional_keys = {"if", "then", "else", "not"}
+
+    def close(node, closable):
+        if isinstance(node, dict):
+            if closable and "properties" in node and "additionalProperties" not in node:
+                node["additionalProperties"] = False
+            for key, value in node.items():
+                close(value, closable and key not in conditional_keys)
+        elif isinstance(node, list):
+            for item in node:
+                close(item, closable)
+
+    closed = copy.deepcopy(schema)
+    close(closed, True)
+    return closed
+
+
+def load_validator(schema_path, strict):
+    """Returns (validate_fn, note). validate_fn is None when validation cannot run."""
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError:
+        return None, (
+            "install python3-jsonschema (Fedora/Debian/Ubuntu), python-jsonschema "
+            "(Arch), or `pip install jsonschema`"
+        )
+    try:
+        with open(schema_path, encoding="utf-8") as handle:
+            schema = json.load(handle)
+    except OSError as error:
+        return None, f"cannot read {schema_path}: {error}"
+    if strict:
+        schema = strict_schema(schema)
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema)
+
+    def validate(document):
+        return [
+            f"{'/'.join(str(p) for p in error.absolute_path) or '<root>'}: {error.message}"
+            for error in sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
+        ]
+
+    return validate, None
+
+
+def check_engine(results, binary, validate, validate_note):
+    print(f"\nengine: {binary}")
+    proc = run(binary, ["version", "--json"])
+    document = parse_document(results, "version --json envelope", proc)
+    if document is None:
+        results.fail("engine", "version --json did not produce a usable document; stopping")
+        return
+    results.ok("version --json envelope")
+    if proc.returncode != 0:
+        results.fail("version --json exit code", f"expected 0, got {proc.returncode}")
+    else:
+        results.ok("version --json exit code")
+
+    data = document.get("data", {})
+    capabilities = data.get("capabilities", [])
+    versions = data.get("contract_versions", {})
+    if versions.get("min", 0) <= CONTRACT <= versions.get("max", 0):
+        results.ok(f"engine speaks contract {CONTRACT} (range {versions.get('min')}-{versions.get('max')})")
+    else:
+        results.fail(
+            "contract range",
+            f"this script checks contract {CONTRACT}, engine advertises {versions}",
+        )
+        return
+
+    # Every advertised capability must answer. A capability that does not is
+    # worse than a missing one: consumers enable behaviour on seeing the name.
+    for capability in capabilities:
+        argv = CAPABILITY_COMMANDS.get(capability)
+        if argv is None:
+            results.skip(
+                f"capability {capability}",
+                "this script does not know that capability; it is newer than the script",
+            )
+            continue
+        what = f"capability {capability} -> irlume {' '.join(argv)}"
+        proc = run(binary, argv)
+        document = parse_document(results, what, proc)
+        if document is None:
+            continue
+        if document["ok"] and proc.returncode != 0:
+            results.fail(what, f"ok document with nonzero exit {proc.returncode}")
+            continue
+        if not document["ok"] and proc.returncode == 0:
+            results.fail(what, "error document with exit 0")
+            continue
+        leaked = [s for s in FORBIDDEN_SUBSTRINGS if s in proc.stdout]
+        if leaked:
+            results.fail(what, f"output contains paths the contract does not publish: {leaked}")
+            continue
+        if validate is not None:
+            errors = validate(document)
+            if errors:
+                results.fail(what, "schema: " + "; ".join(errors[:5]))
+                continue
+        results.ok(what)
+
+    for capability, argv in CAPABILITY_COMMANDS.items():
+        if capability not in capabilities:
+            results.skip(f"capability {capability}", "not advertised by this build")
+
+    if validate is None:
+        results.skip("schema validation", validate_note)
+
+    # Negotiation refuses before acting. An engine that ignores --contract would
+    # let a consumer act on semantics it does not implement.
+    negotiation = [
+        (["status", "--contract", "999", "--json"], "unsupported-contract"),
+        (["status", "--contract", "not-a-number", "--json"], "usage-error"),
+        (["status", "--contract", "--json"], "usage-error"),
+        (["version", "--json", "--no-such-flag"], "usage-error"),
+    ]
+    for argv, expected in negotiation:
+        what = f"refusal: irlume {' '.join(argv)} -> {expected}"
+        proc = run(binary, argv)
+        document = parse_document(results, what, proc)
+        if document is None:
+            continue
+        code = document.get("error", {}).get("code")
+        if code != expected:
+            results.fail(what, f"expected error code {expected!r}, got {code!r}")
+        elif proc.returncode != 2:
+            results.fail(what, f"expected exit 2, got {proc.returncode}")
+        else:
+            results.ok(what)
+
+
+def check_fixtures(results, fixtures_dir, validate, validate_note):
+    print(f"\nfixtures: {fixtures_dir}")
+    try:
+        names = sorted(n for n in os.listdir(fixtures_dir) if n.endswith(".json"))
+    except OSError as error:
+        results.fail("fixtures", f"cannot read {fixtures_dir}: {error}")
+        return
+    if not names:
+        results.fail("fixtures", f"no .json files in {fixtures_dir}")
+        return
+    for name in names:
+        path = os.path.join(fixtures_dir, name)
+        what = f"fixture {name}"
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+            document = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as error:
+            results.fail(what, str(error))
+            continue
+        # Fixtures are captures, so they must look like what the engine writes:
+        # one line, no trailing blank.
+        if raw.count("\n") != 1 or not raw.endswith("\n"):
+            results.fail(what, "a fixture must be one line, as written by the engine")
+            continue
+        if validate is None:
+            results.skip(what, validate_note)
+            continue
+        errors = validate(document)
+        if errors:
+            results.fail(what, "schema: " + "; ".join(errors[:5]))
+        else:
+            results.ok(what)
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    parser = argparse.ArgumentParser(
+        description="Check an irlume build against the contract 1 machine API."
+    )
+    parser.add_argument(
+        "--irlume",
+        default="irlume",
+        help="the irlume binary to check (default: irlume on PATH)",
+    )
+    parser.add_argument(
+        "--schema",
+        default=os.path.join(root, "schemas", "machine-api-v1.schema.json"),
+        help="the contract 1 schema (default: the one beside this script; installed builds carry it in /usr/share/irlume/schemas)",
+    )
+    parser.add_argument(
+        "--fixtures",
+        default=os.path.join(root, "schemas", "fixtures", "v1"),
+        help="directory of captured documents to validate as well",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="also fail on properties the schema does not describe (for the engine's own CI; a consumer must accept added fields)",
+    )
+    parser.add_argument(
+        "--no-engine",
+        action="store_true",
+        help="check the fixtures only, without running a binary",
+    )
+    parser.add_argument(
+        "--no-fixtures",
+        action="store_true",
+        help="check the engine only",
+    )
+    args = parser.parse_args()
+
+    validate, validate_note = load_validator(args.schema, args.strict)
+    results = Results()
+
+    if not args.no_engine:
+        check_engine(results, args.irlume, validate, validate_note)
+    if not args.no_fixtures:
+        check_fixtures(results, args.fixtures, validate, validate_note)
+
+    print(
+        f"\n{results.passed} passed, {len(results.failed)} failed, "
+        f"{len(results.skipped)} skipped"
+    )
+    if results.skipped:
+        print("skipped checks are not passes:")
+        for what, why in results.skipped:
+            print(f"  {what}: {why}")
+    if results.failed:
+        print("failures:")
+        for what, detail in results.failed:
+            print(f"  {what}: {detail}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except FileNotFoundError as error:
+        print(f"cannot run: {error}", file=sys.stderr)
+        sys.exit(2)

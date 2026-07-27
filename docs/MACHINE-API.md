@@ -185,7 +185,50 @@ and cannot find as "this engine version does not run that check" rather than as
 "it passed". A check never disappears because it had nothing to say.
 
 `id` values are public API. The list may grow; an id is never renamed and never
-reused for a different meaning.
+reused for a different meaning. The registry as of this contract:
+
+| Check id | Reports on |
+|---|---|
+| `platform` | the distribution family irlume detected |
+| `install-origin` | where this build came from: a distro package, the Copr, or a source install |
+| `tpm` | a usable TPM 2.0 resource-manager device |
+| `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
+| `boot-mode` | the boot chain, which decides which PCR policy tier applies |
+| `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
+| `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
+| `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths |
+| `models` | the ONNX weights irlume needs, present and checksummed |
+| `ort-dylib-path` | which ONNX runtime library will be loaded |
+| `third-party-pad-model` | optional third-party presentation-attack weights, if installed |
+| `fingerprint-reader` | whether a fingerprint reader was found |
+| `templates` | face templates encrypted at rest for the account asked about |
+| `recovery-passphrase` | whether a recovery passphrase is set |
+| `credential-release-challenge` | the consent gesture required before the keyring password is released |
+| `polkit-app-prompts` | whether polkit application prompts accept a face match |
+| `polkit-helper-sandbox` | whether the polkit helper's sandbox permits what irlume needs |
+| `ir-calibration` | whether this account's IR enrollment carries the per-user liveness floor |
+| `login-wiring` | whether face auth is wired into the login stack |
+| `display-manager` | whether the active display manager is one irlume can target |
+| `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
+| `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
+| `keyring-secrets` | the login keyring's lock state and provider |
+
+## Schema, fixtures, and conformance
+
+Contract 1 has a JSON Schema (2020-12) at `schemas/machine-api-v1.schema.json`,
+installed on packaged systems at
+`/usr/share/irlume/schemas/machine-api-v1.schema.json`.
+
+**The schema does not close its objects, and a consumer's validator must not
+either.** Fields may be added within a contract version, so rejecting unknown
+properties turns a permitted engine update into a broken consumer.
+
+`schemas/fixtures/v1/` holds documents captured from a real engine, including the
+daemon-unreachable and refusal cases, for building against without an
+installation. `scripts/machine-api-conformance.py` checks a build the way a
+consumer would: envelope rules, every advertised capability answering, and the
+refusals behaving. [INTEGRATION.md](INTEGRATION.md) is the guide for writing a
+consumer.
 
 ### `irlume login status --json`
 

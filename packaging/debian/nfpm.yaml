@@ -76,6 +76,13 @@ contents:
     dst: /usr/share/doc/irlume/LICENSE
   - src: ../../README.md
     dst: /usr/share/doc/irlume/README.md
+  # The machine-API contract, beside the engine that implements it.
+  - src: ../../schemas/machine-api-v1.schema.json
+    dst: /usr/share/irlume/schemas/machine-api-v1.schema.json
+  - src: ../../docs/MACHINE-API.md
+    dst: /usr/share/doc/irlume/MACHINE-API.md
+  - src: ../../docs/INTEGRATION.md
+    dst: /usr/share/doc/irlume/INTEGRATION.md
 
 scripts:
   postinstall: ./postinstall.sh

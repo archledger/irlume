@@ -2907,6 +2907,13 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
                  unlock\n     falls back to the password. Fix: sudo irlume bitwarden setup --apply"
             );
         }
+    } else {
+        // The helper sandbox only matters once polkit prompts are wired, but the
+        // check still has to report: an id missing from the machine document
+        // means "this engine does not run that check", so staying silent here
+        // would tell a consumer the check does not exist rather than that it did
+        // not apply. Same rule that put `keyring-secrets` on Unknown.
+        report.check("polkit-helper-sandbox", State::Info);
     }
     // The login keyring an app like Bitwarden reads from: report whether a
     // Secret Service provider is up and the collection is unlocked. Self-gates
@@ -3003,6 +3010,11 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
     // face login (the reconcile.path re-applies it). Only meaningful once wired.
     if crate::pamwire::login_wired() {
         report_pam_regeneration_guard(report);
+    } else {
+        // Nothing is wired, so there is no wiring for a regeneration to strip.
+        // Reported rather than skipped, for the same reason as the polkit
+        // sandbox above: a vanished id is read as an absent check.
+        report.check("pam-regeneration-guard", State::Info);
     }
     // Leftover backups next to the managed binaries, and hand-installed builds
     // overlaying the packaged ones (silent when clean).

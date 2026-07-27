@@ -146,6 +146,57 @@ fn status_json_refuses_an_unsupported_contract_before_reading_anything() {
 }
 
 #[test]
+fn every_doctor_check_id_is_documented_and_every_documented_id_exists() {
+    // Check ids are public API, so an id that ships undocumented is a promise
+    // nobody can read, and a documented id that no longer ships is a promise
+    // broken quietly. The registry table in MACHINE-API.md is the contract; this
+    // holds it to the engine in both directions.
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/MACHINE-API.md"
+    ))
+    .expect("read docs/MACHINE-API.md");
+    // The registry is one table among several with the same row shape, so take
+    // the rows under its header and stop at the blank line that ends it.
+    let documented: std::collections::BTreeSet<&str> = doc
+        .lines()
+        .skip_while(|line| !line.starts_with("| Check id |"))
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split_once("` |"))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        documented.contains("tpm"),
+        "the registry table was not found; did its formatting change?"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["doctor", "--json"])
+        .env("IRLUME_SOCKET", "/nonexistent/irlume-doctor-doc-test.sock")
+        .output()
+        .expect("run irlume");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let emitted: std::collections::BTreeSet<&str> = document["data"]["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id"))
+        .collect();
+
+    let undocumented: Vec<_> = emitted.difference(&documented).collect();
+    assert!(
+        undocumented.is_empty(),
+        "these check ids ship without a row in the MACHINE-API.md registry: {undocumented:?}"
+    );
+    let missing: Vec<_> = documented.difference(&emitted).collect();
+    assert!(
+        missing.is_empty(),
+        "these ids are documented but no longer emitted: {missing:?}"
+    );
+}
+
+#[test]
 fn login_status_json_lists_every_surface_by_service_name() {
     // The surface list is COMPLETE: services that do not exist on this machine
     // stay in the array with `present: false`, so a consumer reading an id it

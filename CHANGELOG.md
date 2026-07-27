@@ -7,6 +7,42 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`docs/INTEGRATION.md`, a guide for people writing software that drives
+  irlume.** How to call the machine API, the startup handshake, what contract 1
+  offers, what it deliberately does not (no mutation, no event stream, no D-Bus
+  service, no client library) and what to do instead, the authorization model,
+  and how to develop against a sandbox daemon on your own socket rather than
+  pointing test knobs at the one that authenticates real logins.
+
+  It also names the version-gating mistake directly: matching `engine_version`
+  against a version range turns an unrelated release into "unsupported" for the
+  user. Gate on `contract_versions` and `capabilities`, which are promises about
+  behaviour.
+
+- **A JSON Schema for contract 1, with captured fixtures and a conformance
+  script.** `schemas/machine-api-v1.schema.json` (JSON Schema 2020-12) describes
+  every document the machine commands write, and packaged builds install it at
+  `/usr/share/irlume/schemas/` so the schema and the engine implementing it are
+  never a version apart on a user's machine.
+
+  The schema does not close its objects, and consumers are told not to either:
+  fields may be added within a contract version, so a validator that rejects
+  unknown properties turns a permitted engine update into a broken panel.
+
+  `schemas/fixtures/v1/` holds documents captured from a real engine, including
+  the daemon-unreachable and the three refusal cases, so a consumer can build
+  against what irlume actually writes rather than against invented examples.
+  Profile and scan display names are replaced with placeholders, since they are
+  user text.
+
+  `scripts/machine-api-conformance.py` checks a build the way a consumer would:
+  envelope rules, every advertised capability actually answering, the refusals
+  refusing, and no device or PAM paths in the output. It runs in CI against the
+  release binary, and a downstream can run it against whichever irlume versions
+  it supports. The doctor check-id registry is now documented in
+  MACHINE-API.md, and a test fails if an id ships undocumented or a documented
+  id stops shipping.
+
 - **`irlume login status --json`.** Which PAM surfaces carry face auth, as values
   instead of the report's glyphs and column spacing. Each surface reports its PAM
   service name, its role (`login-screen`, `login-screen-fingerprint`,
@@ -102,6 +138,16 @@ All notable changes to irlume are documented here. This project adheres to
   written to be read.
 
 ### Fixed
+
+- **Two `doctor` checks vanished from the machine document instead of reporting
+  that they did not apply.** `polkit-helper-sandbox` was recorded only when
+  polkit prompts were already wired, and `pam-regeneration-guard` only when the
+  login stack was wired. On any machine where neither is true, both ids were
+  simply absent, which under the completeness rule reads as "this engine version
+  does not run that check" rather than "it did not apply here". Both now report
+  `info`, so the array is 23 entries on a wired desktop and in a bare container
+  alike. Found by running `doctor --json` in a container rather than by reading
+  the code. The human report is unchanged, byte for byte.
 
 - **Face unlock on the KDE lock screen works again, and `irlume detect` stops
   lying to unprivileged callers.** An earlier change in this development cycle

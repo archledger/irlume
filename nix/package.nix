@@ -105,6 +105,12 @@ rustPlatform.buildRustPackage {
 
     install -d "$out/share/irlume/models"
     install -m0644 ${models}/*.onnx "$out/share/irlume/models/"
+
+    # The machine-API contract travels with the engine that implements it, so a
+    # consumer validating our JSON never has to guess which schema this build
+    # speaks.
+    install -Dm0644 schemas/machine-api-v1.schema.json \
+      "$out/share/irlume/schemas/machine-api-v1.schema.json"
   '';
 
   meta = {

@@ -41,6 +41,37 @@ meaning requires a new contract version. Consumers must first call
 The machine API is not the daemon socket protocol. The socket remains private,
 and its serialized Rust enums are not a public compatibility promise.
 
+### Declaring which contract you implement
+
+Pass `--contract N` on any machine command. The engine agrees only to a version
+it implements, and refuses anything else **before** contacting the daemon and
+before any command with side effects begins:
+
+```
+$ irlume profiles list --contract 9 --json
+{"contract_version":1,...,"error":{"code":"unsupported-contract","retryable":false}}
+```
+
+Exit code 2. A malformed flag (no value, a non-number, repeated) is a
+`usage-error`.
+
+`irlume version --json` advertises the range this build speaks:
+
+```json
+"contract_versions": { "min": 1, "max": 1 }
+```
+
+Pick a version inside that range and pass it. Every response echoes the contract
+actually in force in `contract_version`, so a consumer can assert the engine
+agreed to the version it implements rather than inferring it.
+
+**Omitting the flag always means contract 1.** It does not mean "whatever is
+newest", and it never will. A program written against contract 1 that omits the
+flag keeps receiving contract 1 on an engine that has since learned contract 2,
+because the alternative is changing the meaning of a response under a program
+that never asked for it. Passing the flag is still better: it makes the refusal
+explicit and immediate when a consumer meets an engine too old for it.
+
 ### A capability is not a compatibility promise
 
 `capabilities` says a command exists and is reachable. It does not say the
@@ -107,6 +138,7 @@ identifiers: they may contain anything the user typed.
 | Code | Meaning | `retryable` |
 |---|---|---|
 | `usage-error` | The command line was not one this contract accepts. Exits 2. | no |
+| `unsupported-contract` | The engine does not implement the requested contract. Refused before any side effect. Exits 2. | no |
 | `daemon-unavailable` | The daemon could not be reached. | yes |
 | `not-authorized` | The caller may not act on the named account. | no |
 | `operation-failed` | The engine could not carry out a well-formed request. | no |

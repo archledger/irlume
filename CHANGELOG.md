@@ -7,6 +7,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **A consumer can state which contract it implements.** `--contract N` on any
+  machine command makes the engine agree only to a version it actually speaks,
+  and refuse anything else before the daemon is contacted or any side effect
+  begins. `irlume version --json` advertises the supported range as
+  `contract_versions`, and every response echoes the version in force.
+
+  Omitting the flag always means contract 1 and always will. It deliberately
+  does not mean "newest": a program written against contract 1 must keep getting
+  contract 1 from an engine that has since learned contract 2, rather than
+  having a response change meaning underneath it.
+
+  This exists now, while the surface is read-only, because a capability string
+  alone is a poor gate. A consumer that enables behaviour on seeing a capability
+  name has no way to say which semantics it was built for, and the engine has no
+  way to refuse. Contract negotiation is the part that has to be in place before
+  any privileged or mutating command is added.
+
 - **The machine API can tell a consumer why a request failed.** `profiles list
   --json` previously reported one opaque `operation-failed` whether the caller
   was not permitted to read that account or the engine genuinely broke, because

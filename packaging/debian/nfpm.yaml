@@ -69,10 +69,6 @@ contents:
     dst: /usr/lib/systemd/system/irlume-reconcile.service
   - src: ../systemd/irlume-reconcile.timer
     dst: /usr/lib/systemd/system/irlume-reconcile.timer
-  # The `irlume` system group (socket 0660 root:irlume); postinstall runs
-  # systemd-sysusers to create it.
-  - src: ../systemd/irlume.sysusers
-    dst: /usr/lib/sysusers.d/irlume.conf
   # AppArmor profile (ships in complain mode; see the profile header)
   - src: ../apparmor/usr.bin.irlumed
     dst: /etc/apparmor.d/usr.bin.irlumed

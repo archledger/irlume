@@ -266,36 +266,39 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // SO_PEERCRED is the real trust boundary. Defence-in-depth: if the `irlume`
-    // group exists, restrict the socket to `0660 root:irlume` so only group
-    // members (greeters, the user) can even connect; otherwise fall back to
-    // 0666 so a box without the group set up still works (greeters run as
-    // varied uids). Privileged ops are gated by the peer-credential check either way.
-    match users::gid_for_group("irlume") {
-        Some(gid) => {
-            if let Err(e) = users::chown(std::path::Path::new(&socket), Some(0), Some(gid)) {
-                eprintln!("irlumed: could not chown socket to root:irlume ({e}); leaving 0666");
-                set_mode(&socket, 0o666);
-            } else {
-                set_mode(&socket, 0o660);
-                eprintln!("irlumed: socket restricted to root:irlume (0660)");
-            }
-        }
-        None => {
-            // No `irlume` group: the socket is world-connectable. Privileged ops
-            // still require the peer-credential check, but the unprivileged
-            // endpoints (health tier, self-scoped identify) are now open to any
-            // local uid. A normal packaged install creates the group; warn loudly
-            // so a hand-rolled deployment notices it skipped that step.
-            eprintln!(
-                "irlumed: WARNING: no `irlume` group; socket left world-connectable (0666). \
-                 Create the group and restart so only greeters/users can connect: \
-                 groupadd -r irlume"
-            );
-            set_mode(&socket, 0o666);
-        }
-    }
-    eprintln!("irlumed: listening on {socket}");
+    // SO_PEERCRED is the authorization boundary, and the socket mode must not
+    // pretend to be a second one.
+    //
+    // This was `0660 root:irlume` whenever an `irlume` group existed. That gate
+    // blocked every client it was supposed to admit. The group is created by
+    // packaging with no members, and nothing adds any: the KDE lock screen runs
+    // `kscreenlocker_greet` (not setuid) as the user, so its `pam_irlume.so`
+    // got `connect() = EACCES` and face unlock silently fell through to the
+    // password. `irlume detect` exited 10 (partial) as a user and 0 (ready) as
+    // root on the same healthy box. A gate that stops every intended non-root
+    // client is not defence in depth.
+    //
+    // Membership cannot fix it either: supplementary GIDs are process
+    // credentials set at login, so adding a uid to the group does not reach an
+    // already-running desktop (see newgrp(1)), and greeter account names differ
+    // per display manager (`sddm`, `plasmalogin`, `gdm`, `Debian-gdm`).
+    //
+    // 0666 plus connect-time peer credentials is the ordinary Linux pattern for
+    // this: it is systemd's own documented default for filesystem sockets
+    // (`SocketMode=` in systemd.socket(5)), pcscd ships the same, and the D-Bus
+    // system bus is world-connectable with authorization done in the service.
+    // `SO_PEERCRED` is supplied by the kernel at connect() time and a client
+    // cannot forge it through protocol input (unix(7)). fprintd, the closest
+    // analogue, likewise keeps its endpoint reachable and authorizes per method.
+    //
+    // What this widens is reachability, not authority: every request still
+    // requires peer uid 0 or `target == peer`, root-only operations stay
+    // root-only, requests are bounded to MAX_REQUEST_BYTES with read/write
+    // deadlines, each connection is isolated behind catch_unwind, and camera
+    // work carries a per-uid throttle. On Fedora the SELinux module remains the
+    // mandatory-access layer.
+    set_mode(&socket, DAEMON_SOCKET_MODE);
+    eprintln!("irlumed: listening on {socket} (0666; SO_PEERCRED authorizes every request)");
     if irlume_common::dbglog::on() {
         eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
     }
@@ -460,39 +463,57 @@ fn rate_record(user: &str, granted: bool, faced: bool) {
     }
 }
 
-/// Minimum interval in seconds between unprivileged Identify captures. Two
-/// seconds bounds how often one local peer can occupy the camera pipeline
-/// without affecting a real login.
-const IDENTIFY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Minimum interval in seconds between unprivileged camera probes. Two seconds
+/// bounds how often one local peer can occupy the camera pipeline without
+/// affecting a real login.
+const CAMERA_PROBE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-// Keep this separate from the failure throttle: Identify has no authentication
-// outcome to strike or reset, and its caller identity is the peer uid.
-type IdentifyRateState = std::sync::Mutex<std::collections::HashMap<u32, std::time::Instant>>;
+// Keep this separate from the failure throttle: these probes have no
+// authentication outcome to strike or reset, and their caller identity is the
+// peer uid.
+type CameraProbeRateState = std::sync::Mutex<std::collections::HashMap<u32, std::time::Instant>>;
 
-fn identify_rate_state() -> &'static IdentifyRateState {
-    static S: std::sync::OnceLock<IdentifyRateState> = std::sync::OnceLock::new();
+fn camera_probe_rate_state() -> &'static CameraProbeRateState {
+    static S: std::sync::OnceLock<CameraProbeRateState> = std::sync::OnceLock::new();
     S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Admit and record an Identify attempt atomically. Root is the PAM/greeter
-/// trust boundary and must never be delayed by an unprivileged convenience
-/// request.
-fn identify_rate_limited(uid: u32) -> bool {
+/// Admit and record one unprivileged camera probe atomically. Root is the
+/// PAM/greeter trust boundary and must never be delayed by an unprivileged
+/// convenience request.
+///
+/// Covers `Identify` and the dry-run emitter probe: both open the shared camera
+/// node, neither has an interactive frame-rate requirement, and both are now
+/// reachable by any local uid. Deliberately NOT applied to `Authenticate` (the
+/// real login path, throttled instead by consecutive-failure strikes) or to
+/// `PositionSample` (the framing guide needs continuous samples to give live
+/// feedback, so an interval here would break enrollment).
+fn camera_probe_rate_limited(uid: u32) -> bool {
     if uid == 0 {
         return false;
     }
     let now = std::time::Instant::now();
-    let mut map = identify_rate_state()
+    let mut map = camera_probe_rate_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if map
         .get(&uid)
-        .is_some_and(|last| now.duration_since(*last) < IDENTIFY_MIN_INTERVAL)
+        .is_some_and(|last| now.duration_since(*last) < CAMERA_PROBE_MIN_INTERVAL)
     {
         return true;
     }
     map.insert(uid, now);
     false
+}
+
+/// Forget every recorded probe. The state is process-global, so one test's
+/// dispatch would otherwise throttle the next test that uses the same uid.
+#[cfg(test)]
+fn clear_camera_probe_rate_state() {
+    camera_probe_rate_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -895,7 +916,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::Identify => {
-            if identify_rate_limited(peer.uid) {
+            if camera_probe_rate_limited(peer.uid) {
                 return Response::Error("rate limited; try again shortly".into());
             }
             // 1:N identify returns an exact similarity score, so an ungated
@@ -1039,6 +1060,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         Request::SetupIrEmitter { dry_run } => {
             // Hardware fix on the shared camera; non-destructive on failure.
             if dry_run {
+                // Enumerating XU controls opens the shared camera node. Harmless
+                // once, but it is unauthenticated and now reachable by any local
+                // uid, so it shares the camera-probe interval.
+                if camera_probe_rate_limited(peer.uid) {
+                    return Response::Error("rate limited; try again shortly".into());
+                }
                 match irlume_auth::list_ir_controls(engine.ir_device()) {
                     Ok(c) if c.is_empty() => {
                         Response::Ok("no UVC extension-unit controls found".into())
@@ -1826,6 +1853,11 @@ fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
     r
 }
 
+/// Mode for the control socket. Every local uid may connect; `SO_PEERCRED`
+/// decides what each one may then do. See the note at the bind site for why a
+/// group-restricted mode was removed rather than repaired.
+const DAEMON_SOCKET_MODE: u32 = 0o666;
+
 fn set_mode(path: &str, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
@@ -1909,15 +1941,52 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_emitter_probe_shares_the_camera_interval() {
+        let _g = env_lock();
+        let mut e = engine();
+        clear_camera_probe_rate_state();
+        // The probe opens the shared camera node, is unauthenticated, and is
+        // reachable by any local uid now that the socket admits them, so a
+        // second immediate attempt from the same uid must be refused.
+        let first = dispatch(
+            Request::SetupIrEmitter { dry_run: true },
+            &peer(NOBODY),
+            &mut e,
+        );
+        let Response::Error(first) = first else {
+            panic!("expected the absent-camera error, got {first:?}");
+        };
+        assert!(!first.contains("rate limited"), "first attempt: {first}");
+
+        match dispatch(
+            Request::SetupIrEmitter { dry_run: true },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("rate limited"), "{msg}"),
+            other => panic!("second immediate probe must be throttled, got {other:?}"),
+        }
+
+        // Root is the PAM/greeter path and is never delayed.
+        clear_camera_probe_rate_state();
+        for _ in 0..2 {
+            match dispatch(Request::SetupIrEmitter { dry_run: true }, &peer(0), &mut e) {
+                Response::Error(msg) => assert!(!msg.contains("rate limited"), "{msg}"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn identify_rate_limit_is_per_uid_and_exempts_root() {
         let uid = 0xfffe_fffd;
         let other_uid = 0xfffe_fffc;
 
-        assert!(!identify_rate_limited(uid));
-        assert!(identify_rate_limited(uid));
-        assert!(!identify_rate_limited(other_uid));
-        assert!(!identify_rate_limited(0));
-        assert!(!identify_rate_limited(0));
+        assert!(!camera_probe_rate_limited(uid));
+        assert!(camera_probe_rate_limited(uid));
+        assert!(!camera_probe_rate_limited(other_uid));
+        assert!(!camera_probe_rate_limited(0));
+        assert!(!camera_probe_rate_limited(0));
     }
 
     // Regression: 834c71e. IRLUME_MODELS_STRICT=1 refused to start because the
@@ -2590,6 +2659,31 @@ mod tests {
         assert_eq!(mode, 0o660);
         // Best-effort on a missing path: must not panic.
         set_mode("/nonexistent/irlume-test/sock", 0o666);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_mode_admits_every_local_uid_because_peercred_is_the_gate() {
+        use std::os::unix::fs::PermissionsExt;
+        // Regression: a 0660 root:irlume socket blocked the clients it was meant
+        // to admit. kscreenlocker_greet is not setuid, so the KDE lock screen's
+        // pam_irlume got EACCES and face unlock fell through to the password,
+        // and `irlume detect` exited 10 as a user against 0 as root on the same
+        // healthy box. Assert the mode a real bind produces, not just the
+        // constant, so removing the set_mode call fails this test.
+        let dir = std::env::temp_dir().join(format!("irlume-sockmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("irlume.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        set_mode(path.to_str().unwrap(), DAEMON_SOCKET_MODE);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666, "every local uid must be able to connect");
+        // Group-restricted modes are the exact regression; spell it out.
+        assert_ne!(mode, 0o660);
+        assert_ne!(mode & 0o006, 0, "other-rw is what admits a user session");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3892,6 +3986,9 @@ mod tests {
     fn setup_ir_emitter_gates_root_and_surfaces_a_missing_camera() {
         let _g = env_lock();
         let mut e = engine();
+        // The dry-run probe shares the per-uid camera-probe interval, and another
+        // test may have just spent this uid's slot.
+        clear_camera_probe_rate_state();
         // Dry-run is open to any peer but needs the (absent) IR node.
         match dispatch(
             Request::SetupIrEmitter { dry_run: true },

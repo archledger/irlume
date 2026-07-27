@@ -60,9 +60,6 @@ package() {
     install -Dm0644 packaging/systemd/irlume-reconcile.path "$pkgdir/usr/lib/systemd/system/irlume-reconcile.path"
     install -Dm0644 packaging/systemd/irlume-reconcile.service "$pkgdir/usr/lib/systemd/system/irlume-reconcile.service"
     install -Dm0644 packaging/systemd/irlume-reconcile.timer "$pkgdir/usr/lib/systemd/system/irlume-reconcile.timer"
-    # The `irlume` system group (socket 0660 root:irlume); irlume.install runs
-    # systemd-sysusers to create it.
-    install -Dm0644 packaging/systemd/irlume.sysusers "$pkgdir/usr/lib/sysusers.d/irlume.conf"
     # AppArmor profile for the daemon. Arch does not run AppArmor by default, so
     # it sits inert unless the user boots with `lsm=...,apparmor`; irlume.install
     # loads it only when apparmor_parser is present. The profile confines the

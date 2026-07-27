@@ -69,8 +69,23 @@ mod tests {
     #[test]
     fn mlock_refusal_warns_and_continues() {
         if std::env::var("IRLUME_TEST_MEMLOCK_CHILD").is_ok() {
-            lock_slice(&vec![0x5a_u8; 4096]);
+            let secret = vec![0x5a_u8; 4096];
+            lock_slice(&secret);
             println!("survived-without-mlock");
+            // Probe whether mlock reaches the kernel at all here. A sanitizer
+            // runtime defines its own mlock and returns success without making
+            // the syscall, so RLIMIT_MEMLOCK refuses nothing and the warning
+            // this test looks for is never printed. Say so, rather than leaving
+            // the parent to read an intercepted call as a missing warning.
+            let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+                n if n > 0 => n as usize,
+                _ => 4096,
+            };
+            let aligned = secret.as_ptr() as usize & !(page - 1);
+            // SAFETY: `aligned` is the page containing a live 4 KiB allocation.
+            if unsafe { libc::mlock(aligned as *mut libc::c_void, page) } == 0 {
+                println!("mlock-not-enforced");
+            }
             return;
         }
         use std::os::unix::process::CommandExt;
@@ -103,7 +118,18 @@ mod tests {
             "a refused mlock must not fail the caller; stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(String::from_utf8_lossy(&out.stdout).contains("survived-without-mlock"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("survived-without-mlock"));
+        if stdout.contains("mlock-not-enforced") {
+            // Reported rather than passed silently: under ASan this test proves
+            // only that the caller survived, not that the refusal was warned
+            // about, and a reader of the log should know which.
+            eprintln!(
+                "SKIPPED the refusal-is-warned assertion: mlock is intercepted in this build \
+                 (sanitizer runtime), so RLIMIT_MEMLOCK cannot refuse the lock"
+            );
+            return;
+        }
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             err.contains("mlock failed"),

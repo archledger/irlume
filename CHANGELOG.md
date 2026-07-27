@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **AddressSanitizer over the test suite, weekly and on pull requests that touch
+  the code.** irlume is mostly safe Rust, so this is aimed at the places where it
+  is not: NSS `getpwnam_r` buffer handling, the mlock and madvise page arithmetic
+  that protects a decrypted secret, `secure_getenv`, a UVC control ioctl, and the
+  daemon's `SO_PEERCRED` path. Clippy cannot see into any of them.
+
+  Not a required check, on purpose: `-Zsanitizer` is unstable, and an unrelated
+  nightly regression must not be able to block a pull request.
+
+  Verified by planting a deliberate out-of-bounds read and confirming the job
+  reported it with the right file and line, then removing it. A gate nobody has
+  seen fire is a gate nobody should trust.
+
 - **`docs/INTEGRATION.md`, a guide for people writing software that drives
   irlume.** How to call the machine API, the startup handshake, what contract 1
   offers, what it deliberately does not (no mutation, no event stream, no D-Bus
@@ -138,6 +151,13 @@ All notable changes to irlume are documented here. This project adheres to
   written to be read.
 
 ### Fixed
+
+- **`mlock_refusal_warns_and_continues` failed under a sanitizer instead of
+  saying why.** The sanitizer runtime defines its own `mlock`, so the call never
+  reaches the kernel, `RLIMIT_MEMLOCK` refuses nothing, and the warning the test
+  looks for is never printed. The test now detects that the lock was not enforced
+  and reports which assertion it skipped, rather than reporting a bug that is not
+  there or passing quietly as though it had checked.
 
 - **Two `doctor` checks vanished from the machine document instead of reporting
   that they did not apply.** `polkit-helper-sandbox` was recorded only when

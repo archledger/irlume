@@ -1,0 +1,108 @@
+# AddressSanitizer over the test suite.
+#
+# irlume is mostly safe Rust, so this is aimed at the places where it is not:
+# the NSS `getpwnam_r`/`getpwuid_r` buffer handling, the mlock/madvise page
+# arithmetic that protects a decrypted secret, `secure_getenv`, the UVC XU
+# control ioctl, and the SO_PEERCRED socket path the daemon authorizes callers
+# with. Those are a few dozen lines, but they are the lines where a mistake is
+# a memory-safety bug in a program that authenticates people, and clippy cannot
+# see into them.
+#
+# Deliberately NOT a required check, and deliberately not on the fast path: it
+# needs a nightly toolchain (`-Zsanitizer` is unstable), so an unrelated nightly
+# regression must not be able to block a pull request. It runs on pull requests
+# that touch the code, on main, and weekly, so a break is visible without being
+# in the way.
+#
+# Two known interactions, both handled rather than papered over:
+#   * the sanitizer runtime defines its own `mlock`, so the RLIMIT_MEMLOCK
+#     refusal test cannot reach the kernel. That test detects the interception
+#     and reports which assertion it skipped.
+#   * `pamwire`'s wiring tests leak a `&'static str` on purpose; the scope and
+#     the reasoning are in .github/lsan-suppressions.txt.
+name: ASan
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/asan.yml"
+      - ".github/lsan-suppressions.txt"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  schedule:
+    - cron: "40 4 * * 3" # Wednesdays 04:40 UTC, clear of the other scheduled jobs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asan:
+    name: AddressSanitizer (test suite)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
+
+      - name: Cache model weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
+
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+
+      - name: Install nightly Rust (-Zsanitizer is unstable)
+        # @master (declares the `toolchain` input); the version tag branches
+        # have no such input and ignore `with: toolchain:`.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
+          # The sanitizer runtimes ship with the standard library for the
+          # explicit target, which is also why --target is passed below: without
+          # it, build scripts and proc macros would be instrumented too.
+          components: rust-src
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Own cache key: an instrumented build shares nothing with the normal
+          # one, and PRs restore without saving (see ci.yml for the quota).
+          key: asan
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
+        run: |
+          ver=1.24.4
+          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: test (instrumented with AddressSanitizer + LeakSanitizer)
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          # A leak report names the allocation, not the leak's owner, so keep
+          # the whole stack: the deliberate one is only distinguishable by the
+          # test function that allocated it.
+          ASAN_OPTIONS: detect_stack_use_after_return=1
+        run: |
+          LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt" \
+            cargo +nightly test --workspace --locked \
+              --target x86_64-unknown-linux-gnu

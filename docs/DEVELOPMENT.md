@@ -167,6 +167,30 @@ cargo run -p irlume-cli -- doctor   # platform / TPM / camera / model check
 Developer-only benchmark and capture subcommands are gated behind `IRLUME_DEV=1`
 (e.g. `IRLUME_DEV=1 cargo run -p irlume-cli -- selftest align --model models/glintr100.onnx`).
 
+### AddressSanitizer
+
+The unsafe code in irlume is a few dozen lines: NSS `getpwnam_r` buffers, the
+mlock and madvise page arithmetic around a decrypted secret, `secure_getenv`, a
+UVC control ioctl, and the daemon's `SO_PEERCRED` path. Clippy cannot see into
+them, so a weekly job runs the suite instrumented. To reproduce it:
+
+```sh
+RUSTFLAGS=-Zsanitizer=address \
+LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt" \
+  cargo +nightly test --workspace --target x86_64-unknown-linux-gnu
+```
+
+`--target` is not optional: without it, build scripts and proc macros are
+instrumented too and the build fails. The whole suite takes about twenty seconds
+once warm.
+
+Two interactions are worth knowing before you read a failure. The sanitizer
+runtime defines its own `mlock`, so `RLIMIT_MEMLOCK` cannot refuse anything and
+`mlock_refusal_warns_and_continues` prints which assertion it skipped instead of
+failing. And `pamwire`'s wiring tests leak a `&'static str` deliberately;
+`.github/lsan-suppressions.txt` explains the scope, which is why the suppression
+names those tests rather than the crate.
+
 The TPM-gated tests (marked `#[ignore]`) run against a software TPM, no
 hardware or root needed; CI does exactly this:
 

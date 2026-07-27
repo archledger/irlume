@@ -1,0 +1,16 @@
+# LeakSanitizer suppressions for the ASan job. Keep this file short: every entry
+# here is a leak nobody will be told about again.
+#
+# `pamwire`'s wiring tests build a `Svc`, whose `etc` and `vendor` fields are
+# `&'static str` because the real ones are compile-time paths. A test pointing at
+# a temporary directory has to produce a `&'static str` at runtime, which the
+# `leak()` helper does with `Box::leak`. That is a deliberate, bounded leak in
+# test scaffolding: eleven allocations totalling roughly half a kilobyte, all
+# freed when the test process exits.
+#
+# This is scoped to that test module rather than to the crate, so a leak anywhere
+# else in irlume-cli still fails the job. The trade it makes is that a genuine
+# leak inside those specific test functions would also be hidden; they allocate
+# almost nothing else, which is why the trade is acceptable here and would not be
+# at a wider scope.
+leak:irlume::pamwire::tests::

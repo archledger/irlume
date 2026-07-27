@@ -16,6 +16,10 @@ jobs:
   # Collect the sha256 of the release's distributable artifacts into the
   # base64 subjects blob the generator signs over.
   hashes:
+    # Version releases only. The model-weights release (`models-v1`) carries
+    # .onnx files and no packages, so it has nothing for this workflow to
+    # attest; it used to run anyway and fail in the generator's final step.
+    if: startsWith(github.ref_name, 'v')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -31,9 +35,20 @@ jobs:
         id: hash
         working-directory: assets
         run: |
+          set -euo pipefail
           # Provenance covers the distributables, not the checksum manifest or
           # its detached signature (those authenticate these same artifacts).
-          echo "digests=$(sha256sum irlume_*.deb irlume-selinux-*.rpm | base64 -w0)" >> "$GITHUB_OUTPUT"
+          #
+          # Compute into a variable first. Writing `echo "digests=$(sha256sum
+          # ...)"` hides the failure, because the exit status belongs to echo:
+          # a release with no packages produced an EMPTY digests output, this
+          # job went green, and the generator failed later with a bare exit 27.
+          digests="$(sha256sum irlume_*.deb irlume-selinux-*.rpm | base64 -w0)"
+          if [ -z "$digests" ]; then
+            echo "::error::no package digests computed; refusing to request provenance over nothing"
+            exit 1
+          fi
+          echo "digests=$digests" >> "$GITHUB_OUTPUT"
 
   # The generic generator runs in an isolated reusable workflow (SLSA L3 for the
   # provenance step) and uploads multiple.intoto.jsonl to the release. It must be

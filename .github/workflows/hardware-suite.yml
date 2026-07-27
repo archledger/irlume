@@ -80,7 +80,17 @@ jobs:
           # fail loudly if it errors, and only skip when it succeeded AND
           # reported no IR node.
           doc="$(mktemp)"
-          if ! ./target/debug/irlume doctor >"$doc" 2>&1; then
+          # The runner sets CARGO_TARGET_DIR in its .env (outside the work dir,
+          # so checkout's clean cannot wipe the incremental build state), which
+          # means cargo never writes ./target here. Hardcoding that path made
+          # every scheduled run fail on a missing binary while the tests above
+          # passed, so resolve the same directory cargo just built into.
+          irlume_bin="${CARGO_TARGET_DIR:-target}/debug/irlume"
+          if [ ! -x "$irlume_bin" ]; then
+            echo "::error::built binary not found at $irlume_bin"
+            exit 1
+          fi
+          if ! "$irlume_bin" doctor >"$doc" 2>&1; then
             echo "::error::irlume doctor failed — not a clean camera-absent skip"
             cat "$doc"; exit 1
           fi

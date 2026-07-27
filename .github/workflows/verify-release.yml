@@ -50,6 +50,22 @@ jobs:
           if [ ! -f SHA256SUMS ] || [ ! -f SHA256SUMS.asc ]; then
             echo "::notice::SHA256SUMS/.asc not present yet — assets still uploading; skipping this run"
             echo "incomplete=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # The sums pair can land BEFORE the last package it covers, and then
+          # `sha256sum --check` fails with "listed file could not be read" on a
+          # release that is merely mid-upload. That is the same incomplete state
+          # as a missing sums file, so treat it the same way instead of failing
+          # the release. A genuinely missing asset still fails once uploading
+          # has finished, because the final upload triggers another run.
+          missing=""
+          while read -r _ name; do
+            [ -n "$name" ] || continue
+            [ -f "$name" ] || missing="$missing $name"
+          done < SHA256SUMS
+          if [ -n "$missing" ]; then
+            echo "::notice::assets still uploading, not yet present:$missing — skipping this run"
+            echo "incomplete=1" >> "$GITHUB_ENV"
           fi
 
       - name: Verify signature, checksums, and coverage

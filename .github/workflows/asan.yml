@@ -67,7 +67,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
+            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev llvm
+
+      # A leak suppression matches the SYMBOL NAMES in an allocation stack, so
+      # without a symbolizer it matches nothing and the deliberate test leak
+      # comes back as a failure with a stack of bare addresses. That is how this
+      # job failed the first time it ran here, while passing locally where a
+      # symbolizer happened to be installed. Resolve it explicitly and stop if it
+      # is missing, rather than let the job degrade into an unreadable report.
+      - name: Locate llvm-symbolizer (suppressions and reports both need it)
+        run: |
+          sym=$(command -v llvm-symbolizer || true)
+          if [ -z "$sym" ]; then
+            sym=$(ls -1 /usr/lib/llvm-*/bin/llvm-symbolizer 2>/dev/null | sort -V | tail -1 || true)
+          fi
+          if [ -z "$sym" ]; then
+            echo "no llvm-symbolizer found; ASan reports would be bare addresses" >&2
+            exit 1
+          fi
+          "$sym" --version
+          echo "ASAN_SYMBOLIZER_PATH=$sym" >> "$GITHUB_ENV"
 
       - name: Install nightly Rust (-Zsanitizer is unstable)
         # @master (declares the `toolchain` input); the version tag branches
@@ -103,6 +122,8 @@ jobs:
           # test function that allocated it.
           ASAN_OPTIONS: detect_stack_use_after_return=1
         run: |
-          LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt" \
+          # print_suppressions puts "Suppressions used:" in the log, so a reader
+          # can see the deliberate leak was matched rather than assume it.
+          LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt:print_suppressions=1" \
             cargo +nightly test --workspace --locked \
               --target x86_64-unknown-linux-gnu

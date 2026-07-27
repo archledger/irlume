@@ -184,6 +184,12 @@ LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt" \
 instrumented too and the build fails. The whole suite takes about twenty seconds
 once warm.
 
+A leak suppression matches the symbol names in an allocation stack, so it does
+nothing on a machine with no symbolizer: the suppressed leak comes back looking
+like a real one, with a stack of bare addresses. If that happens, install
+`llvm-symbolizer` and set `ASAN_SYMBOLIZER_PATH` to it. The CI job resolves it
+explicitly and refuses to run without one.
+
 Two interactions are worth knowing before you read a failure. The sanitizer
 runtime defines its own `mlock`, so `RLIMIT_MEMLOCK` cannot refuse anything and
 `mlock_refusal_warns_and_continues` prints which assertion it skipped instead of

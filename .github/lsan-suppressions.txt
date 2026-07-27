@@ -8,6 +8,11 @@
 # test scaffolding: eleven allocations totalling roughly half a kilobyte, all
 # freed when the test process exits.
 #
+# A suppression matches the SYMBOL NAMES in the allocation stack. With no
+# symbolizer the stack is bare addresses, this entry matches nothing, and the
+# deliberate leak reappears as a failure that looks like a real one. The workflow
+# therefore resolves llvm-symbolizer and stops if it cannot find one.
+#
 # This is scoped to that test module rather than to the crate, so a leak anywhere
 # else in irlume-cli still fails the job. The trade it makes is that a genuine
 # leak inside those specific test functions would also be hidden; they allocate

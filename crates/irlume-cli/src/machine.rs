@@ -7,7 +7,7 @@
 //! protocol. A capability is advertised only after its public command, output
 //! shape, and compatibility rules are covered here and in `docs/MACHINE-API.md`.
 
-use irlume_common::{ProfileSummary, Request, Response};
+use irlume_common::{OperationErrorCode, ProfileSummary, Request, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::process::ExitCode;
@@ -56,6 +56,16 @@ fn failure(command: &'static str, code: &'static str, retryable: bool) -> Docume
     }
 }
 
+/// Map a daemon outcome to a published error code. The mapping is total: an
+/// `Unknown` code from a newer daemon degrades to the generic failure rather
+/// than inventing a meaning for it.
+fn error_code(code: OperationErrorCode) -> &'static str {
+    match code {
+        OperationErrorCode::NotAuthorized => "not-authorized",
+        OperationErrorCode::OperationFailed | OperationErrorCode::Unknown => "operation-failed",
+    }
+}
+
 fn emit(document: &Document, exit: ExitCode) -> ExitCode {
     // Serialization only contains compile-time strings and serde_json values,
     // so failure would be a programming error. Keep stdout machine-only even
@@ -100,7 +110,12 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
         return emit(&failure(COMMAND, "usage-error", false), ExitCode::from(2));
     }
     let user = crate::user_arg(args);
-    match crate::daemon_request(&Request::ListProfiles { user }) {
+    // Ask for typed failures. An older daemon ignores the field and answers
+    // with prose, which the `Response::Error` arm below still maps.
+    match crate::daemon_request(&Request::ListProfiles {
+        user,
+        structured_errors: true,
+    }) {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
@@ -113,6 +128,13 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
             ),
             ExitCode::SUCCESS,
         ),
+        Ok(Response::OperationError { code, retryable }) => emit(
+            &failure(COMMAND, error_code(code), retryable),
+            ExitCode::FAILURE,
+        ),
+        // An older daemon predates the typed variant and answers with prose.
+        // Its text is deliberately not inspected: matching on daemon wording
+        // would make a message change a breaking API change.
         Ok(Response::Error(_)) => emit(
             &failure(COMMAND, "operation-failed", false),
             ExitCode::FAILURE,

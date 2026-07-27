@@ -222,7 +222,7 @@ mod tests {
             assert!(line.ends_with('\n'), "request must be newline-terminated");
             let req: Request = serde_json::from_str(line.trim()).unwrap();
             match req {
-                Request::ListProfiles { user } => assert_eq!(user, "alice"),
+                Request::ListProfiles { user, .. } => assert_eq!(user, "alice"),
                 other => panic!("server expected ListProfiles, got {other:?}"),
             }
             let reply = Response::Profiles(vec!["Face Profile 1".into()]);
@@ -233,6 +233,7 @@ mod tests {
 
         let resp = request(&Request::ListProfiles {
             user: "alice".into(),
+            structured_errors: false,
         })
         .expect("round trip");
         match resp {

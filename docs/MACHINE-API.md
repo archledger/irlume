@@ -108,21 +108,22 @@ identifiers: they may contain anything the user typed.
 |---|---|---|
 | `usage-error` | The command line was not one this contract accepts. Exits 2. | no |
 | `daemon-unavailable` | The daemon could not be reached. | yes |
-| `operation-failed` | The daemon refused or could not complete the request. | no |
+| `not-authorized` | The caller may not act on the named account. | no |
+| `operation-failed` | The engine could not carry out a well-formed request. | no |
 | `protocol-error` | The daemon replied with something this command did not expect. | no |
 
-`operation-failed` is deliberately coarse in contract version 1, and a consumer
-should know what it hides: a request refused because the caller may not act on
-that account, a request naming an account that does not exist, and a genuine
-engine failure all report it identically, because the daemon reports those to the
-CLI as prose rather than as typed outcomes. A consumer therefore cannot yet tell
-"you are not permitted" from "something broke", and should present a neutral
-failure rather than guessing. A distinct authorization code is planned for when
-the daemon reports typed outcomes for this path; it will be additive.
+`not-authorized` and `operation-failed` are distinct so a consumer can tell "you
+may not do that" from "something broke", and act accordingly: the first is worth
+a message about permissions, the second is worth a retry or a support report.
 
-The one thing that identical treatment does buy today is that an unprivileged
-caller cannot use this command to discover which accounts exist or which are
-enrolled.
+`not-authorized` deliberately says nothing about whether the named account
+exists. An ordinary caller is refused before the enrollment store is consulted,
+so a real account and an invented one produce the identical answer, and this
+command cannot be used to discover which accounts exist or which are enrolled.
+
+`retryable` means an identical request could plausibly succeed later without the
+caller changing anything. Only `daemon-unavailable` sets it today. It is not a
+promise that a retry will succeed, and it carries no suggested delay.
 
 ## Security and privacy
 

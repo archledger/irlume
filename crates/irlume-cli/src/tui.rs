@@ -789,6 +789,7 @@ impl App {
         }
         match crate::daemon_poll(&Request::ListProfiles {
             user: self.user.clone(),
+            structured_errors: false,
         }) {
             Ok(Response::Enrollment {
                 profiles,

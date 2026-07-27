@@ -744,7 +744,7 @@ fn request_user(req: &Request) -> Option<&str> {
     match req {
         Authenticate { user, .. }
         | Enroll { user, .. }
-        | ListProfiles { user }
+        | ListProfiles { user, .. }
         | DeleteProfile { user, .. }
         | DeleteScan { user, .. }
         | RenameProfile { user, .. }
@@ -1386,9 +1386,29 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::ListProfiles { user } => {
+        Request::ListProfiles {
+            user,
+            structured_errors,
+        } => {
+            // Only ever answer with a typed error when the request asked for
+            // one. An older client cannot deserialize an unknown response
+            // variant, so sending one unasked would break it across the upgrade
+            // window, which is the failure class of issue #93.
+            let fail = |code: irlume_common::OperationErrorCode, prose: String| {
+                if structured_errors {
+                    Response::OperationError {
+                        code,
+                        retryable: false,
+                    }
+                } else {
+                    Response::Error(prose)
+                }
+            };
             if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to list '{user}'"));
+                return fail(
+                    irlume_common::OperationErrorCode::NotAuthorized,
+                    format!("not authorized to list '{user}'"),
+                );
             }
             match irlume_core::storage::load(&user) {
                 Ok(Some(enr)) => Response::Enrollment {
@@ -1421,7 +1441,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     closure_calibrated: false,
                     ir_ratio_calibrated: false,
                 },
-                Err(e) => Response::Error(e.to_string()),
+                Err(e) => fail(
+                    irlume_common::OperationErrorCode::OperationFailed,
+                    e.to_string(),
+                ),
             }
         }
         Request::DeleteProfile { user, profile } => {
@@ -2204,7 +2227,10 @@ mod tests {
                 scans: None,
                 reset: false,
             },
-            Request::ListProfiles { user: u() },
+            Request::ListProfiles {
+                user: u(),
+                structured_errors: false,
+            },
             Request::DeleteProfile {
                 user: u(),
                 profile: "p".into(),
@@ -2877,6 +2903,7 @@ mod tests {
         for req in [
             Request::ListProfiles {
                 user: "../root".into(),
+                structured_errors: false,
             },
             Request::Authenticate {
                 user: "a/b".into(),
@@ -3113,6 +3140,7 @@ mod tests {
         match dispatch(
             Request::ListProfiles {
                 user: "carol".into(),
+                structured_errors: false,
             },
             &peer(0),
             &mut e,
@@ -3138,6 +3166,7 @@ mod tests {
         match dispatch(
             Request::ListProfiles {
                 user: "ghost".into(),
+                structured_errors: false,
             },
             &peer(0),
             &mut e,
@@ -3149,6 +3178,7 @@ mod tests {
         match dispatch(
             Request::ListProfiles {
                 user: "carol".into(),
+                structured_errors: false,
             },
             &peer(NOBODY),
             &mut e,
@@ -3387,6 +3417,7 @@ mod tests {
         match dispatch(
             Request::ListProfiles {
                 user: "carol".into(),
+                structured_errors: false,
             },
             &root,
             &mut e,

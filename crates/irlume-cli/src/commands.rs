@@ -607,7 +607,11 @@ pub fn status(args: &[String]) -> ExitCode {
     );
 
     // Enrollment.
-    match daemon_request(&Request::ListProfiles { user: user.clone() }) {
+    match daemon_request(&Request::ListProfiles {
+        user: user.clone(),
+        // Human output: keep the daemon's prose, it is written to be read.
+        structured_errors: false,
+    }) {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
@@ -767,7 +771,10 @@ pub fn detect(args: &[String]) -> ExitCode {
     }
     let up = reach == DaemonReach::Running;
     let enrolled = matches!(
-        daemon_request(&Request::ListProfiles { user }),
+        daemon_request(&Request::ListProfiles {
+            user,
+            structured_errors: false,
+        }),
         Ok(Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()
     );
     if up && enrolled {
@@ -1336,7 +1343,11 @@ pub fn setup(args: &[String]) -> ExitCode {
 
     // 2. Enroll (reset if already enrolled and the user wants a clean start).
     println!("\n[2/6] Face enrollment");
-    let enrolled = matches!(daemon_request(&Request::ListProfiles { user: user.clone() }),
+    let enrolled = matches!(
+        daemon_request(&Request::ListProfiles {
+            user: user.clone(),
+            structured_errors: false,
+        }),
         Ok(Response::Enrollment { ref profiles, .. }) if !profiles.is_empty());
     if enrolled {
         println!("  already enrolled.");

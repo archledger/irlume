@@ -217,7 +217,23 @@ pub enum Request {
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },
     /// List enrolled profiles + their scans for `user`.
-    ListProfiles { user: String },
+    ListProfiles {
+        user: String,
+        /// Opt in to [`Response::OperationError`] instead of
+        /// [`Response::Error`].
+        ///
+        /// This exists because the socket has to survive a package upgrade in
+        /// both directions: the old daemon keeps running until it restarts, so
+        /// a new client can meet an old daemon and vice versa. An unknown
+        /// response variant fails to deserialize outright, so the daemon must
+        /// never send a typed error to a client that did not ask for one. An
+        /// old client omits this field, serde defaults it to false, and the
+        /// daemon answers exactly as before. A new client meeting an old daemon
+        /// is equally safe: serde ignores the unknown field and the old daemon
+        /// replies with the prose `Error` the new client still handles.
+        #[serde(default)]
+        structured_errors: bool,
+    },
     /// Delete a whole profile (and its scans). PRIVILEGED, same rule as Enroll.
     DeleteProfile { user: String, profile: String },
     /// Delete one scan from a profile. PRIVILEGED.
@@ -366,6 +382,31 @@ pub enum SelfTestKind {
     Liveness,
 }
 
+/// Why an operation failed, in terms a caller can act on.
+///
+/// Kept deliberately small. Each value has to mean the same thing for the life
+/// of a contract version, because the public machine API maps these straight to
+/// its published error codes, so a new value is cheap to add and a changed
+/// meaning is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OperationErrorCode {
+    /// The peer may not act on the target. Covers "that is not your account"
+    /// and "this needs root": the daemon does not distinguish them to the
+    /// caller, because an unprivileged peer is refused before the store is ever
+    /// consulted, so the answer carries no information about which accounts
+    /// exist or which are enrolled.
+    NotAuthorized,
+    /// The request was well-formed but the engine could not carry it out, for
+    /// example the enrollment store could not be read.
+    OperationFailed,
+    /// A code this build does not know. Present so a client compiled against an
+    /// older contract can still decode a response from a newer daemon rather
+    /// than failing the whole message.
+    #[serde(other)]
+    Unknown,
+}
+
 /// A profile and the names of its scans, for `ListProfiles`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSummary {
@@ -494,6 +535,21 @@ pub enum Response {
     /// eye was detected in any frame.
     EarMedian(Option<f32>),
     Error(String),
+    /// A failure the caller can act on, sent ONLY to a request that opted in
+    /// (see `ListProfiles::structured_errors`).
+    ///
+    /// `Error(String)` carries prose meant for a human, so the machine API had
+    /// to flatten every failure into one opaque code: a request refused for
+    /// authorization and a storage failure were indistinguishable, and a
+    /// frontend could not tell "you may not do that" from "something broke".
+    /// This variant carries the distinction the daemon already knows.
+    OperationError {
+        code: OperationErrorCode,
+        /// Whether an identical request could plausibly succeed later without
+        /// the caller changing anything.
+        #[serde(default)]
+        retryable: bool,
+    },
 
     // --- keyring unlock responses -------------------------------------------
     /// The password was sealed (`SealPassword`).
@@ -576,6 +632,108 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+
+    // --- cross-version wire compatibility for typed operation errors --------
+    //
+    // The package ships client and daemon together, but the old daemon keeps
+    // running until it restarts, so both directions happen during an upgrade.
+    // These pin the behaviour that makes that safe.
+
+    #[test]
+    fn an_old_client_request_defaults_to_prose_errors() {
+        // Exactly what a pre-typed-error client puts on the wire: no
+        // `structured_errors` key at all. The daemon must read it as false and
+        // therefore keep answering with `Error(String)`, which is the only
+        // variant that client can decode.
+        let wire = r#"{"ListProfiles":{"user":"alice"}}"#;
+        let req: Request = serde_json::from_str(wire).expect("old request must still parse");
+        match req {
+            Request::ListProfiles {
+                user,
+                structured_errors,
+            } => {
+                assert_eq!(user, "alice");
+                assert!(!structured_errors, "absent field must default to opted-out");
+            }
+            other => panic!("expected ListProfiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_old_daemon_ignores_the_new_request_field() {
+        // The other direction: a new client sends the field to a daemon that
+        // predates it. Serde ignores unknown fields, so the old daemon still
+        // sees a valid request. Simulated with a struct carrying only the old
+        // shape, because the old type no longer exists in this build.
+        #[derive(serde::Deserialize)]
+        struct OldListProfiles {
+            user: String,
+        }
+        #[derive(serde::Deserialize)]
+        enum OldRequest {
+            ListProfiles(OldListProfiles),
+        }
+        let new_wire = serde_json::to_string(&Request::ListProfiles {
+            user: "alice".into(),
+            structured_errors: true,
+        })
+        .unwrap();
+        let parsed: OldRequest =
+            serde_json::from_str(&new_wire).expect("old daemon must still parse a new request");
+        let OldRequest::ListProfiles(p) = parsed;
+        assert_eq!(p.user, "alice");
+    }
+
+    #[test]
+    fn an_unknown_error_code_decodes_instead_of_failing_the_message() {
+        // A newer daemon may name a code this build has never heard of. The
+        // whole response must still decode, degrading to Unknown, rather than
+        // failing to parse and losing the outcome entirely.
+        let wire = r#"{"OperationError":{"code":"some-future-code","retryable":true}}"#;
+        let resp: Response = serde_json::from_str(wire).expect("must decode");
+        match resp {
+            Response::OperationError { code, retryable } => {
+                assert_eq!(code, OperationErrorCode::Unknown);
+                assert!(retryable);
+            }
+            other => panic!("expected OperationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operation_error_round_trips_and_retryable_defaults_false() {
+        for code in [
+            OperationErrorCode::NotAuthorized,
+            OperationErrorCode::OperationFailed,
+        ] {
+            let wire = serde_json::to_string(&Response::OperationError {
+                code,
+                retryable: false,
+            })
+            .unwrap();
+            match serde_json::from_str::<Response>(&wire).unwrap() {
+                Response::OperationError { code: back, .. } => assert_eq!(back, code),
+                other => panic!("expected OperationError, got {other:?}"),
+            }
+        }
+        // An older peer that omits `retryable` must not fail to decode.
+        let resp: Response =
+            serde_json::from_str(r#"{"OperationError":{"code":"not-authorized"}}"#).unwrap();
+        match resp {
+            Response::OperationError { retryable, .. } => assert!(!retryable),
+            other => panic!("expected OperationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_codes_serialize_as_the_published_kebab_case_names() {
+        // These strings are the public contract's codes; a rename here is a
+        // breaking change for every consumer.
+        let json = serde_json::to_string(&OperationErrorCode::NotAuthorized).unwrap();
+        assert_eq!(json, r#""not-authorized""#);
+        let json = serde_json::to_string(&OperationErrorCode::OperationFailed).unwrap();
+        assert_eq!(json, r#""operation-failed""#);
+    }
     use super::*;
 
     #[cfg(unix)]

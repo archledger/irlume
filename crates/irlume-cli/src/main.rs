@@ -267,7 +267,10 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let user = user_arg(args);
     let req = match sub {
-        None | Some("list") => Request::ListProfiles { user },
+        None | Some("list") => Request::ListProfiles {
+            user,
+            structured_errors: false,
+        },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
                 eprintln!("[profiles] adding a scan to '{p}'; stay in frame…");
@@ -2661,7 +2664,10 @@ fn doctor() -> std::process::ExitCode {
     let gesture_is_closure = irlume_common::config::consent_gesture_mode()
         == irlume_common::config::ConsentGesture::Closure;
     let closure_calibrated = matches!(
-        daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }),
+        daemon_request(&irlume_common::Request::ListProfiles {
+            user: user.clone(),
+            structured_errors: false,
+        }),
         Ok(irlume_common::Response::Enrollment {
             closure_calibrated: true,
             ..
@@ -2733,7 +2739,10 @@ fn doctor() -> std::process::ExitCode {
     // back to the password, so this is not a lockout, but face login silently
     // stopped working. Surface it with the one-command fix.
     let (enrolled, ir_ratio_calibrated) =
-        match daemon_request(&irlume_common::Request::ListProfiles { user: user.clone() }) {
+        match daemon_request(&irlume_common::Request::ListProfiles {
+            user: user.clone(),
+            structured_errors: false,
+        }) {
             Ok(irlume_common::Response::Enrollment {
                 ref profiles,
                 ir_ratio_calibrated,

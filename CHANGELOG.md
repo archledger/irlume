@@ -5,6 +5,29 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The machine API can tell a consumer why a request failed.** `profiles list
+  --json` previously reported one opaque `operation-failed` whether the caller
+  was not permitted to read that account or the engine genuinely broke, because
+  the daemon reports both to the CLI as prose. It now reports `not-authorized`
+  and `operation-failed` separately, so a desktop integration can show a
+  permission message instead of a generic failure, or retry instead of giving up.
+
+  `not-authorized` still says nothing about whether the named account exists. An
+  ordinary caller is refused before the enrollment store is consulted, so a real
+  account and an invented one give the identical answer, and the command cannot
+  be used to enumerate accounts.
+
+  The socket carries this without breaking an upgrade in either direction. A
+  request opts in with a defaulted `structured_errors` field, and the daemon
+  sends the typed response only to a request that asked for one, because a
+  client that predates the new response variant cannot decode it. An older
+  client omits the field and keeps receiving the prose it understands; a newer
+  client meeting an older daemon has its unknown field ignored and falls back to
+  the same prose. The human CLI and TUI keep the prose deliberately, since it is
+  written to be read.
+
 ### Fixed
 
 - **Face unlock on the KDE lock screen works again, and `irlume detect` stops

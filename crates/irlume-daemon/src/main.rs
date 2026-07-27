@@ -15,6 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use zeroize::Zeroize;
 
+mod arbiter;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -170,11 +171,11 @@ fn main() {
             ))
         });
     // Engine factory: (re)loads the models and rebinds devices/adapters. Used
-    // once at startup and again by the accept loop to rebuild the engine after a
-    // caught connection-handler panic, so a fresh request never runs against ONNX
-    // sessions left in an unproven state by an unwind. It only borrows the load
-    // inputs, so it is Fn and callable repeatedly.
-    let build_engine = || {
+    // once at startup and again by the camera worker to rebuild the engine after
+    // a caught panic, so a fresh request never runs against ONNX sessions left in
+    // an unproven state by an unwind. It owns its inputs so it can move to the
+    // worker thread, and it is Fn, so startup calls it before that move.
+    let build_engine = move || {
         irlume_auth::Engine::load(&det, &model)
             .map(|e| e.with_devices(&rgb_dev, &ir_dev))
             .and_then(|e| e.with_ir_adapter(&adapter))
@@ -327,56 +328,117 @@ fn main() {
         });
     }
 
+    // One worker owns the engine, and every camera operation happens on it, so
+    // nothing changes about V4L2 and ONNX being driven from a single thread.
+    // What changed is that connections are read elsewhere, which is the only way
+    // an authentication can overtake work already queued: a request nobody has
+    // read yet cannot be prioritised.
+    let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+    let worker = {
+        let arbiter = std::sync::Arc::clone(&arbiter);
+        std::thread::Builder::new()
+            .name("irlume-camera".into())
+            .spawn(move || {
+                while let Some(job) = arbiter.take() {
+                    let Queued { req, peer, reply } = job.payload;
+                    // Isolate each request behind catch_unwind. A panic deep in
+                    // frame decode or inference (e.g. a V4L2 driver echoing back
+                    // a 0-dimension or short-buffered frame) must deny THIS one
+                    // request and let PAM fall back to the password, never
+                    // unwind out of the worker and take down all face auth for
+                    // every user.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dispatch(req, &peer, &mut engine)
+                    }));
+                    // Release the slot before anything else can fail, so a
+                    // panicking request cannot lock its uid out of the camera
+                    // until the daemon restarts.
+                    arbiter.finish(job.class, job.uid);
+                    let resp = match outcome {
+                        Ok(resp) => resp,
+                        Err(_) => {
+                            eprintln!(
+                                "irlumed: request handler PANICKED; this request was denied \
+                                 (PAM falls back to the password). Rebuilding the engine for a \
+                                 clean state; please report this with the backtrace above."
+                            );
+                            // AssertUnwindSafe only silences the compiler, it
+                            // does not prove the ONNX sessions are in a
+                            // supported state after an unwind, so a fresh engine
+                            // removes that doubt. Chosen over exiting and
+                            // letting systemd restart because a reproducible
+                            // panic would become a restart loop that takes the
+                            // login path down entirely. If the rebuild fails,
+                            // the old engine is kept: still better than a dead
+                            // daemon.
+                            match build_engine() {
+                                Ok(fresh) => {
+                                    engine = fresh;
+                                    eprintln!("irlumed: engine rebuilt after panic");
+                                }
+                                Err(e) => eprintln!(
+                                    "irlumed: engine rebuild after panic FAILED ({e}); continuing \
+                                     with the existing engine"
+                                ),
+                            }
+                            Response::Error("request failed".into())
+                        }
+                    };
+                    // The client may already be gone; its thread owns that.
+                    let _ = reply.send(resp);
+                }
+            })
+            .unwrap_or_else(|e| {
+                // Without the worker nothing can be served, and a daemon that
+                // accepts connections it can never answer is worse than one that
+                // exits and lets systemd restart it.
+                eprintln!("irlumed: could not start the camera worker: {e}");
+                std::process::exit(1);
+            })
+    };
+
+    // A cap on connection threads, so a peer that opens sockets faster than it
+    // sends requests cannot exhaust memory. Well above any real client: the
+    // greeter, the lock screen, a TUI and sudo together are a handful.
+    const MAX_CONNECTION_THREADS: usize = 64;
+    let live_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                // Isolate each connection behind catch_unwind. A panic deep in
-                // frame decode or inference (e.g. a V4L2 driver echoing back a
-                // 0-dimension or short-buffered frame) must deny THIS one request
-                // and let PAM fall back to the password, never unwind out of the
-                // single-threaded accept loop and take down all face auth for
-                // every user. The panicking handler dropped the stream, so the
-                // client sees EOF and PAM treats it as a fail-safe decline.
-                //
-                // On a caught panic we REBUILD the engine before serving the next
-                // request rather than reuse it: AssertUnwindSafe only silences the
-                // compiler, it does not prove the ONNX sessions are in a supported
-                // state after an unwind, so a fresh engine removes that doubt. This
-                // is chosen over exiting-and-letting-systemd-restart because a
-                // reproducible panic would otherwise become a restart loop that
-                // takes the login path down entirely; a rebuild keeps the daemon
-                // up. It only runs on a real panic (the known frame-math panic
-                // sources are guarded at their site), so the reload cost is not on
-                // any normal path. If the rebuild itself fails, the old engine is
-                // kept: still better than a dead daemon.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle(stream, &mut engine)
-                }));
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => eprintln!("irlumed: connection error: {e}"),
-                    Err(_) => {
-                        eprintln!(
-                            "irlumed: connection handler PANICKED; this request was denied \
-                             (PAM falls back to the password). Rebuilding the engine for a \
-                             clean state; please report this with the backtrace above."
-                        );
-                        match build_engine() {
-                            Ok(fresh) => {
-                                engine = fresh;
-                                eprintln!("irlumed: engine rebuilt after panic");
-                            }
-                            Err(e) => eprintln!(
-                                "irlumed: engine rebuild after panic FAILED ({e}); continuing \
-                                 with the existing engine"
-                            ),
+                let live = std::sync::Arc::clone(&live_threads);
+                if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTION_THREADS
+                {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = respond(
+                        stream,
+                        &Response::Error("daemon busy: too many open connections".into()),
+                    );
+                    continue;
+                }
+                let arbiter = std::sync::Arc::clone(&arbiter);
+                // A connection thread reads, parses and writes; it never touches
+                // the engine, so a panic in it is contained by the thread itself
+                // and the queued job (if any) is still completed and released by
+                // the worker.
+                if let Err(e) = std::thread::Builder::new()
+                    .name("irlume-conn".into())
+                    .spawn(move || {
+                        if let Err(e) = serve(stream, &arbiter) {
+                            eprintln!("irlumed: connection error: {e}");
                         }
-                    }
+                        live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                {
+                    eprintln!("irlumed: could not start a connection thread: {e}");
+                    live_threads.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             Err(e) => eprintln!("irlumed: accept error: {e}"),
         }
     }
+    arbiter.close();
+    let _ = worker.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +604,7 @@ fn biopolicy_enforced() -> bool {
 }
 
 /// Peer identity from SO_PEERCRED.
+#[derive(Clone)]
 struct Peer {
     uid: u32,
     // gid/pid are unread today; kept for future audit logging, since
@@ -675,20 +738,58 @@ fn uid_of(user: &str) -> Option<u32> {
 /// from a peer that never sends a newline.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
-fn handle(stream: UnixStream, engine: &mut irlume_auth::Engine) -> std::io::Result<()> {
+/// One parsed request waiting for the camera worker, and where to send the
+/// answer. The reply travels back over a channel rather than being written by
+/// the worker, so a client that stops reading stalls its own connection thread
+/// instead of the one thread every login needs.
+struct Queued {
+    req: Request,
+    peer: Peer,
+    reply: std::sync::mpsc::Sender<Response>,
+}
+
+/// How long a connection thread waits for the worker before giving up.
+///
+/// Generous, because it bounds the whole operation: a ten-scan enrollment with
+/// retries is minutes of legitimate work. This is a backstop against a wedged
+/// worker leaving connection threads parked forever, not a latency control.
+const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Read and parse one connection, hand the request to the arbiter, write back
+/// what the worker answers.
+///
+/// Everything here runs on the connection's own thread. The only work that
+/// reaches the camera worker is a parsed, authorized-shaped request, which is
+/// what lets an authentication overtake a queue of preview work: before this,
+/// a request nobody had read yet was invisible to the daemon.
+fn serve(stream: UnixStream, arbiter: &arbiter::Arbiter<Queued>) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
-    // A read/write deadline stops one wedged peer from blocking the single-
-    // threaded daemon (and thus ALL logins) forever. Propagate a setsockopt
-    // failure (drop this one connection) rather than swallow it: a silently
-    // absent timeout is the exact unbounded-blocking-read this guards against,
-    // and the '?' returns before any read happens.
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
     match read_request(&stream)? {
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
-            let resp = dispatch(req, &peer, engine);
+            let class = arbiter::classify(&req);
+            let (reply, answer) = std::sync::mpsc::channel();
+            let queued = Queued {
+                req,
+                peer: peer.clone(),
+                reply,
+            };
+            if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
+                // Refused, not queued: answer now so the client can retry rather
+                // than hold a slot the login path may want.
+                return respond(stream, &Response::Error(refusal.message().into()));
+            }
+            let resp = match answer.recv_timeout(WORKER_REPLY_TIMEOUT) {
+                Ok(resp) => resp,
+                // The worker dropped the sender (it panicked and the reply never
+                // came) or took longer than the backstop. Either way this
+                // request has no answer, and a client that gets an error falls
+                // back to the password.
+                Err(_) => Response::Error("request did not complete".into()),
+            };
             respond(stream, &resp)
         }
     }
@@ -2328,6 +2429,79 @@ mod tests {
         assert_eq!(peer.uid, unsafe { libc::geteuid() });
         assert_eq!(peer.gid, unsafe { libc::getegid() });
         assert_eq!(peer.pid, std::process::id() as i32);
+    }
+
+    #[test]
+    fn serve_routes_a_request_through_the_arbiter_and_answers_the_client() {
+        // The whole path a client sees, minus the engine: parse, queue, worker,
+        // reply. A fake worker stands in for the camera so this stays a test of
+        // the wiring rather than of inference.
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                while let Some(job) = arbiter.take() {
+                    let Queued { reply, .. } = job.payload;
+                    arbiter.finish(job.class, job.uid);
+                    let _ = reply.send(Response::Pong);
+                }
+            })
+        };
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        (&ours).write_all(b"\"Ping\"\n").unwrap();
+        let a = std::sync::Arc::clone(&arbiter);
+        std::thread::spawn(move || serve(theirs, &a).unwrap());
+
+        let mut line = String::new();
+        BufReader::new(&ours).read_line(&mut line).unwrap();
+        let resp: Response = serde_json::from_str(line.trim()).unwrap();
+        assert!(matches!(resp, Response::Pong), "got {resp:?}");
+
+        arbiter.close();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_camera_request_is_refused_while_an_authentication_is_queued() {
+        // No worker: the refusal must be answered by the connection thread
+        // itself, without the request ever reaching the camera. If this only
+        // worked because a worker drained the queue, the test would hang here.
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let (_dead_reply, _) = std::sync::mpsc::channel();
+        arbiter
+            .submit(
+                arbiter::Class::Auth,
+                0,
+                Queued {
+                    req: Request::Ping,
+                    peer: Peer {
+                        uid: 0,
+                        gid: 0,
+                        pid: 0,
+                    },
+                    reply: _dead_reply,
+                },
+            )
+            .unwrap();
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        (&ours)
+            .write_all(b"{\"PositionSample\":{\"user\":null}}\n")
+            .unwrap();
+        let a = std::sync::Arc::clone(&arbiter);
+        std::thread::spawn(move || serve(theirs, &a).unwrap());
+
+        let mut line = String::new();
+        BufReader::new(&ours).read_line(&mut line).unwrap();
+        let resp: Response = serde_json::from_str(line.trim()).unwrap();
+        match resp {
+            Response::Error(msg) => assert!(
+                msg.contains("authentication has priority"),
+                "the client must be told why: {msg}"
+            ),
+            other => panic!("a queued authentication must refuse preview work, got {other:?}"),
+        }
     }
 
     #[test]

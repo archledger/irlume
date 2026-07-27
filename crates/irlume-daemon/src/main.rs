@@ -280,8 +280,16 @@ fn main() {
     //
     // Membership cannot fix it either: supplementary GIDs are process
     // credentials set at login, so adding a uid to the group does not reach an
-    // already-running desktop (see newgrp(1)), and greeter account names differ
-    // per display manager (`sddm`, `plasmalogin`, `gdm`, `Debian-gdm`).
+    // already-running desktop (see newgrp(1)).
+    //
+    // Note what the affected surface actually is, because it is not the login
+    // greeters. SDDM authenticates in `sddm-helper`, GDM in
+    // `gdm-session-worker`, LightDM in `lightdm --session-child`, and greetd in
+    // its session worker; all four keep uid 0 through `pam_authenticate` and
+    // drop privileges only when starting the session, so a dedicated `sddm` or
+    // `gdm` account never reached this socket in the first place. The surfaces
+    // that broke are the ones where the user's own process drives PAM: the KDE
+    // lock screen, and the CLI.
     //
     // 0666 plus connect-time peer credentials is the ordinary Linux pattern for
     // this: it is systemd's own documented default for filesystem sockets
@@ -1528,8 +1536,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             })
         }
         Request::CaptureEarMedian { user: _ } => {
-            // Fires the camera; root-gate like the other camera-bearing requests
-            // (on the 0666 socket fallback this is what keeps other uids out).
+            // Fires the camera; root-gate like the other camera-bearing requests.
+            // The socket is world-connectable, so this gate is what keeps other
+            // uids out.
             if peer.uid != 0 {
                 return Response::Error(format!(
                     "capture_ear_median requires root (peer uid {})",
@@ -1563,8 +1572,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // Fires the camera and returns raw liveness/alignment measurements
             // (IR brightness, center/edge, glint), which are a spoof-tuning oracle and
             // a way to tie up the single-threaded daemon. Gate to root, like the
-            // other camera-bearing requests; on the 0666 socket fallback this is
-            // the only thing keeping an arbitrary local uid out.
+            // other camera-bearing requests. The socket is world-connectable, so
+            // this gate is the only thing keeping an arbitrary local uid out.
             if peer.uid != 0 {
                 return Response::Error(format!("self_test requires root (peer uid {})", peer.uid));
             }

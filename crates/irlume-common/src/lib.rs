@@ -210,7 +210,9 @@ pub enum Request {
     /// enrolled user, no claimed identity. Unprivileged (no credential release).
     Identify,
     /// Switch the active RGB+IR camera pair, persisting it (cameras.conf) so it
-    /// survives a daemon restart. PRIVILEGED (root or self); writes /etc/irlume.
+    /// survives a daemon restart. ROOT ONLY: it writes a system-wide setting
+    /// under /etc/irlume, which is not an arbitrary peer's to change. (This said
+    /// "root or self", which never matched the dispatch gate.)
     SetCameras { rgb: String, ir: String },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
     AddScan { user: String, profile: String },

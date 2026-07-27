@@ -13,8 +13,12 @@ policy_module(irlume, 1.1.0)
 #   avc: denied { write } ... comm="plasmalogin-hel" name="irlume.sock"
 #        scontext=...:xdm_t tcontext=...:var_run_t tclass=sock_file
 #
-# sudo and the KDE lock screen work without this module because both run in
-# the user's UNCONFINED domain, which is already allowed.
+# sudo and the KDE lock screen need no rule here because both run in the user's
+# UNCONFINED domain, which SELinux already allows. Read that narrowly: it means
+# SELinux does not block them, and nothing more. It says nothing about the
+# socket's permission bits, and that gap is exactly how a `0660 root:irlume`
+# socket once broke lock-screen face unlock while this comment claimed the path
+# "works". DAC and MAC are independent; both have to permit the connect.
 #
 # We give the socket its own type via a name-based transition so the grant to
 # xdm_t is scoped to *our* socket rather than every var_run_t sock_file.

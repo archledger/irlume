@@ -211,8 +211,8 @@ in
         TimeoutStopSec = "10s";
         # Sandboxing, mirroring packaging/systemd/irlumed.service so the hardening
         # holds on NixOS too. Scoped to what the daemon needs: it opens
-        # /dev/video* and the TPM, binds a Unix socket, and chowns each target
-        # user's enrollment. ProtectHome / PrivateDevices / MemoryDenyWriteExecute
+        # /dev/video* and the TPM, binds a Unix socket, and writes root-owned
+        # state at mode 0600. ProtectHome / PrivateDevices / MemoryDenyWriteExecute
         # are deliberately NOT set (per-user $HOME state, camera + TPM access, and
         # the ONNX runtime JITs).
         NoNewPrivileges = true;
@@ -234,8 +234,10 @@ in
         RestrictSUIDSGID = true;
         LockPersonality = true;
         SystemCallArchitectures = "native";
+        # CAP_CHOWN is deliberately absent: nothing chowns. See the longer note in
+        # packaging/systemd/irlumed.service, including why this list must not be
+        # emptied (for a uid-0 service that would grant the full root set).
         CapabilityBoundingSet = [
-          "CAP_CHOWN"
           "CAP_DAC_OVERRIDE"
           "CAP_FOWNER"
         ];

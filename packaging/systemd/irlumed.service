@@ -52,8 +52,23 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-# The daemon chowns enrolled files to the target user; keep only those caps.
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+# Keep only the caps the daemon uses. CAP_CHOWN is deliberately absent: nothing
+# chowns. The old comment here claimed the daemon "chowns enrolled files to the
+# target user", which was never implemented; enrollment files are created by the
+# root daemon and left root-owned at mode 0600. The capability's one real user
+# was the socket's `root:irlume` chown, and that is gone.
+#
+# Do not delete this directive to "simplify" it. For a uid-0 service systemd
+# clears everything not listed before exec, and the root exec rule then makes
+# the listed set permitted and effective, so an empty or absent directive hands
+# the daemon the full root capability set (capabilities(7)). Removing the line
+# is a privilege expansion, not a cleanup.
+#
+# CAP_DAC_OVERRIDE and CAP_FOWNER stay: field installs may still hold state
+# created by older CLI or development workflows that is not root-owned, and
+# reading or re-moding that needs them. Dropping those two is a separate change
+# that needs a legacy-state migration test first.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER
 UMask=0027
 
 [Install]

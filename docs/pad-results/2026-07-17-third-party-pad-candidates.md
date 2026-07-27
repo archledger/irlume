@@ -112,3 +112,56 @@ contain the operator's face and are not committed. Model artifacts download
 from their publishers (URLs in the scripts); verify the sha256 values above.
 The live capture harness is `landmark_dump`
 ([DEVELOPMENT.md walkthrough](../DEVELOPMENT.md)) plus ffmpeg for RGB.
+
+## Addendum, 2026-07-27: threshold moved to 0.9 after a genuine-side denial
+
+The 0.5 operating point denied a genuine, present, enrolled user three times on
+the Zenbook (two at real logins, on 2026-07-25 and 2026-07-27, each costing a
+keyring unlock; one reproduced under instrumentation).
+
+**The denial.** Sixteen instrumented credential releases, seated, room ambient
+134. One flagged, and it was the dimmest frame of the session:
+
+```
+liveness(cross-spectrum): Live (...); ir_bright=79 ir_center_edge_ratio=1.45
+   glint=255.00 ambient=22 yaw_asym=0.09 pitch=0.59
+thirdparty-pad('flir'): p_fake 0.702 >= 0.50; downgrading Live to Spoof
+```
+
+Passing frames measured `ir_bright` 89-108 (median 100). `pitch=0.59` is a head
+tilted down: the user was performing the consent nod irlume itself requires
+before releasing a credential. The nod turns the face away from the emitter,
+which dims the lit frame, which is the regime this cue mishandles. The
+lit-phase-only restriction cannot see that, because the frame IS the lit one.
+
+Glasses were the initial hypothesis and the data did not support it: 1 spoof
+denial in 8 with glasses, 0 in 8 without. They do cost about 10 points of IR
+brightness (median 95 against 104), moving the frame toward the cliff without
+being the cause.
+
+**Why 0.5 was wrong.** Qualification measured genuine at 0.001-0.13 and attacks
+at medians 0.998-1.0000. Nothing occupied the space between, so 0.5 turned an
+out-of-distribution score into a denial. The ModelScope card states no
+threshold, so 0.5 was never a publisher recommendation being honoured.
+
+**Re-measured at 0.9, same vinyl banner, 2026-07-27:**
+
+| Presentations | Flagged | p_fake |
+|---|---|---|
+| 8 (varied angle and distance) | 6/6 that reached the cue | 0.941, 0.956, 0.995, 0.999, 0.999, 1.000 |
+
+The remaining 2 were denied by the consecutive-failure throttle before the cue
+ran, which is that throttle working as intended.
+
+**The attack floor is 0.941**, well below the 0.998-1.0000 medians reported
+above. The usable window on this hardware is therefore 0.702 (highest genuine
+observed) to 0.941 (lowest attack observed). A threshold of 0.95, chosen for a
+feeling of extra safety, would have dropped a real detection. A unit test now
+pins the threshold inside that window from both sides.
+
+**Genuine side after the change:** 16 releases, 0 denials, including 8 with
+continuous nodding, the condition that produced the original misfire. Caveat
+worth stating: no frame in that run scored inside the abstain band
+(`ir_bright` floor was 84, against 79 for the misfire), so the run demonstrates
+no regression rather than exercising the new path. The abstain logic is covered
+by unit tests.

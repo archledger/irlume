@@ -40,6 +40,11 @@ pub struct ThirdPartyModel {
     /// Honest provenance status, shown before the user confirms.
     pub provenance: &'static str,
     /// Decision threshold on the model's P(fake); measured basis in `summary`.
+    ///
+    /// Set from where the two classes were actually MEASURED to sit, not from
+    /// the publisher's default. A deny-only cue that fires in a score band
+    /// neither genuine faces nor attacks were observed in is guessing, and it
+    /// guesses against the user: every such fire costs a real login.
     pub threshold: f32,
     /// One-line measured result, with the repo doc that carries the details.
     pub summary: &'static str,
@@ -54,12 +59,40 @@ pub const CATALOG: &[ThirdPartyModel] = &[ThirdPartyModel {
     license: "MIT (Alibaba DAMO, ModelScope model card)",
     provenance: "training data undocumented by the publisher; not reproducible \
                  (fails ADR-0001 criteria 2-3, which is why it is opt-in)",
-    threshold: 0.5,
+    // 2026-07-17 qualification measured genuine at median 0.0000 (offline
+    // corpus 0.001-0.13) and the vinyl-print attack at medians 0.998-1.0000.
+    // Nothing was observed between 0.13 and 0.99 in either class, so 0.5 sat in
+    // an empty band and turned an out-of-distribution score into a denial. A
+    // genuine face measured 0.702 there on 2026-07-27 and lost its keyring.
+    //
+    // 0.5 was never the publisher's figure: the ModelScope card states no
+    // threshold at all, so it was a conventional binary default rather than an
+    // upstream recommendation being honoured.
+    //
+    // Deliberately conservative rather than calibrated. A deny-only cue has
+    // asymmetric harm (a false fire blocks a real login; a withheld veto only
+    // forgoes an auxiliary check), so the operating point favours the user.
+    // Re-measured at 0.9 on 2026-07-27 against the same vinyl banner: 6/6
+    // presentations flagged, p_fake 0.941 / 0.956 / 0.995 / 0.999 / 0.999 /
+    // 1.000. The attack FLOOR is 0.941, not the 0.998 the medians implied, so
+    // the usable window on this hardware is 0.702 (highest genuine) to 0.941
+    // (lowest attack). DO NOT raise this threshold toward 0.95 "to be safer":
+    // that crosses the measured attack floor and drops a real detection.
+    threshold: 0.9,
     summary: "IR anti-spoof cue; measured 2026-07-17: catches the vinyl-print \
               species the built-in gate misses (122/123 attack frames, 2 \
-              cameras) with 0/35 genuine flagged on the same camera \
+              cameras). Genuine-side failures are mapped, not absent: dim \
+              strobe frames and direct sun \
               (docs/pad-results/2026-07-17-third-party-pad-candidates.md)",
 }];
+
+/// Highest P(fake) a genuine face was measured at during qualification
+/// (offline corpus 0.001-0.13, live medians 0.0000).
+///
+/// A score above this but below the deny threshold is in the band neither class
+/// occupied. The cue abstains there; this constant exists so the abstention can
+/// be logged and counted rather than passing unnoticed.
+pub const MEASURED_GENUINE_CEILING: f32 = 0.13;
 
 pub fn by_name(name: &str) -> Option<&'static ThirdPartyModel> {
     CATALOG.iter().find(|m| m.name == name)

@@ -482,6 +482,17 @@ pub fn thirdparty_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f
     verdict == Verdict::Live && p_fake.is_some_and(|p| p >= threshold)
 }
 
+/// True when the cue scored in the band where neither genuine faces nor attacks
+/// were measured: above the highest genuine reading, below the deny threshold.
+///
+/// Nothing acts on this. It exists so an out-of-domain score is visible in the
+/// log instead of silently doing nothing, because the frequency of these is what
+/// says whether the cue still suits the hardware it is running on.
+pub fn thirdparty_abstains(p_fake: Option<f32>, threshold: f32) -> bool {
+    p_fake
+        .is_some_and(|p| p >= irlume_common::thirdparty::MEASURED_GENUINE_CEILING && p < threshold)
+}
+
 /// Highest-scoring detection: the face every pipeline stage keys on when a
 /// frame holds more than one.
 fn top_detection(faces: &[Detection]) -> Option<&Detection> {
@@ -1146,6 +1157,13 @@ impl Engine {
             _ => None,
         };
         let (verdict, reason) = if let Some((_, thr, name)) = self.tp_pad.as_ref() {
+            if thirdparty_abstains(thirdparty_fake, *thr) {
+                irlume_common::dlog!(
+                    "thirdparty-pad('{name}'): p_fake {:.3} is between the measured genuine \
+                     ceiling and the deny threshold {thr:.2}; abstaining",
+                    thirdparty_fake.unwrap_or(0.0)
+                );
+            }
             if thirdparty_downgrades(verdict, thirdparty_fake, *thr) {
                 let pf = thirdparty_fake.unwrap_or(1.0);
                 irlume_common::dlog!(
@@ -3749,7 +3767,8 @@ mod tests {
 
 #[cfg(test)]
 mod thirdparty_cue_tests {
-    use super::thirdparty_downgrades;
+    use super::{thirdparty_abstains, thirdparty_downgrades};
+    use irlume_common::thirdparty::{CATALOG, MEASURED_GENUINE_CEILING};
     use irlume_liveness::Verdict;
 
     #[test]
@@ -3758,6 +3777,65 @@ mod thirdparty_cue_tests {
         assert!(thirdparty_downgrades(Verdict::Live, Some(0.5), 0.5)); // at threshold
         assert!(!thirdparty_downgrades(Verdict::Live, Some(0.49), 0.5));
         assert!(!thirdparty_downgrades(Verdict::Live, None, 0.5));
+    }
+
+    #[test]
+    fn the_shipped_threshold_sits_above_every_score_a_genuine_face_produced() {
+        // The 2026-07-17 qualification measured genuine faces at 0.001-0.13 and
+        // the vinyl-print attack at 0.998-1.0000. A threshold inside that empty
+        // band denies on scores neither class was ever observed at, which is how
+        // a live face lost its keyring at 0.702 on 2026-07-27.
+        for m in CATALOG {
+            assert!(
+                m.threshold > MEASURED_GENUINE_CEILING,
+                "{}: threshold {} is at or below the measured genuine ceiling {}",
+                m.name,
+                m.threshold,
+                MEASURED_GENUINE_CEILING
+            );
+            assert!(
+                m.threshold >= 0.9,
+                "{}: threshold {} reaches into the band no attack was measured in",
+                m.name,
+                m.threshold
+            );
+        }
+    }
+
+    #[test]
+    fn the_threshold_stays_below_the_lowest_score_a_real_attack_produced() {
+        // 2026-07-27, same vinyl banner as the qualification, threshold 0.9:
+        // 6/6 flagged at 0.941, 0.956, 0.995, 0.999, 0.999, 1.000. The floor is
+        // 0.941, well under the 0.998-1.0000 medians the qualification reported,
+        // so raising this threshold for a feeling of safety would drop a real
+        // detection. The window is 0.702 (highest genuine) to 0.941.
+        const MEASURED_ATTACK_FLOOR: f32 = 0.941;
+        for m in CATALOG {
+            assert!(
+                m.threshold < MEASURED_ATTACK_FLOOR,
+                "{}: threshold {} is at or above the lowest score a real attack \
+                 produced ({MEASURED_ATTACK_FLOOR}); that loses a detection",
+                m.name,
+                m.threshold
+            );
+        }
+    }
+
+    #[test]
+    fn a_score_in_the_unmeasured_band_abstains_instead_of_denying() {
+        let thr = 0.9;
+        // 0.702 is the real reading that denied a genuine user before this fix.
+        assert!(thirdparty_abstains(Some(0.702), thr));
+        assert!(!thirdparty_downgrades(Verdict::Live, Some(0.702), thr));
+        // Below the genuine ceiling is an ordinary pass, not an abstention.
+        assert!(!thirdparty_abstains(Some(0.05), thr));
+        // At and above the threshold the cue still denies: the attack species
+        // measured 0.998-1.0000, well clear of this line.
+        assert!(!thirdparty_abstains(Some(0.9), thr));
+        assert!(thirdparty_downgrades(Verdict::Live, Some(0.9), thr));
+        assert!(thirdparty_downgrades(Verdict::Live, Some(0.998), thr));
+        // No score at all is neither.
+        assert!(!thirdparty_abstains(None, thr));
     }
 
     #[test]

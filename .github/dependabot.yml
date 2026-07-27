@@ -24,6 +24,15 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Do not adopt a release the day it appears. A compromised push to a
+    # popular action is a real and recent event: Trivy's own action and setup
+    # tags were force-pushed to credential-stealing code in March 2026
+    # (GHSA-69fq-xp46-6x23). A week of aging means a malicious release has time
+    # to be reported and yanked before it is proposed here. This delays version
+    # updates only; Dependabot security updates and the daily cargo-deny
+    # advisory job are unaffected.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
 
@@ -35,6 +44,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Same reasoning as the actions ecosystem above. Cargo supports SemVer-aware
+    # windows, so a major bump (the likeliest place for a hostile rewrite to
+    # hide) ages longer than a patch.
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
     groups:
       cargo-minor:
         update-types: ["minor", "patch"]

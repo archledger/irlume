@@ -40,6 +40,9 @@ jobs:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
 
       # The ONNX weights (~257 MB) are fetched from the models-v1 release, not
       # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
@@ -180,6 +183,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
 
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -234,6 +240,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
 
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

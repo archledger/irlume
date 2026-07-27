@@ -1,0 +1,16 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/).
+#
+# One deliberate exception to hash-pinning. The SLSA generic generator MUST be
+# referenced by an @vX.Y.Z tag rather than a commit SHA: its L3 model embeds the
+# tag in the signed provenance identity and slsa-verifier validates it, so a
+# SHA-pinned reference would produce provenance consumers cannot verify. The same
+# exception is carved out in scripts/check-action-pins.sh, for the same reason.
+#
+# Everything else stays hash-pinned, and the policy is scoped to that one
+# repository rather than the whole slsa-framework org.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        slsa-framework/slsa-github-generator/*: ref-pin
+        "*": hash-pin

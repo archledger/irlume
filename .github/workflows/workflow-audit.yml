@@ -1,0 +1,92 @@
+# Static analysis of the workflows themselves.
+#
+# scripts/check-action-pins.sh already enforces that every `uses:` is SHA-pinned,
+# but that is one property checked by one grep. It structurally cannot see a
+# floating CONTAINER image, a checkout that leaves its token in .git/config for
+# later steps, an expression interpolated into a `run:` block, or a job that
+# quietly gained more permissions than it needs. zizmor covers that class; both
+# findings it produced on its first run against this repo were real (a
+# `container: archlinux:latest`, and six checkouts without
+# `persist-credentials: false`, one of them in the workflow that holds
+# `contents: write`).
+#
+# actionlint is the correctness half: bad `if:` expressions, unknown contexts,
+# shellcheck over `run:` blocks. A workflow typo otherwise surfaces as a failed
+# run on main rather than a failed check on the PR.
+#
+# Deliberately hosted-runner only. Nothing here touches the self-hosted runner.
+name: Workflow audit
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/zizmor.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/zizmor.yml"
+  # Weekly, because the online audits (archived or deleted actions, known-bad
+  # refs) can start failing on a workflow nobody has edited.
+  schedule:
+    - cron: "20 6 * * 2" # Tuesdays 06:20 UTC, clear of the Monday install matrix
+  workflow_dispatch:
+
+# Read-only. Findings are printed in the job log rather than uploaded as SARIF,
+# which keeps this job from needing `security-events: write`.
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Config lives at .github/zizmor.yml and is auto-discovered. It carves out
+      # exactly one exception: the SLSA generator must be tag-referenced.
+      - uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        with:
+          # Pinned rather than `latest`, so a new zizmor release cannot turn a
+          # green PR red without a visible bump.
+          version: 1.28.0
+          # `regular` is the default persona. `auditor` reports 32 findings here,
+          # mostly stylistic (undocumented permissions, unnamed jobs), which
+          # would train everyone to ignore the job. Run auditor by hand when
+          # doing a deliberate hardening pass.
+          persona: regular
+          advanced-security: false
+
+  actionlint:
+    name: actionlint (workflow correctness)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        env:
+          # Pinned by version and verified by checksum. This downloads a release
+          # binary rather than using an action, so the digest is the only thing
+          # standing between CI and a swapped artifact. Both values come from the
+          # upstream checksums file; update them together.
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" actionlint
+          # shellcheck is preinstalled on the hosted runner, so `run:` blocks get
+          # linted too rather than silently skipped.
+          ./actionlint -color

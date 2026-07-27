@@ -22,6 +22,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
 
       # Same model cache as ci.yml (shared key): the ~257 MB weights are
       # fetched from the models-v1 release, cached so warm runs skip the pull.
@@ -82,7 +85,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      image: archlinux:latest
+      # Pinned by digest, not `:latest`: a mutable tag means the image can change
+      # under us between runs, and a compromised push would execute here. This
+      # does NOT weaken the "rolling toolchain" purpose of the job, because the
+      # first step runs a full `pacman -Syu`, so the packages under test are
+      # current regardless of how old the base layer is. Refresh the digest when
+      # the base drifts far enough that a full upgrade gets unwieldy.
+      # archlinux:latest as of 2026-07-20.
+      image: archlinux@sha256:592e11bd99ab579f933a0cb77a8f66e2f3ae57f5eafacf13aea44a6e98ef21ae
     steps:
       - name: Install toolchain and system deps
         run: |
@@ -90,6 +100,9 @@ jobs:
             base-devel git rust clang pam tpm2-tss curl ca-certificates
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
 
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

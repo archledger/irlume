@@ -129,6 +129,7 @@ fn main() -> std::process::ExitCode {
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
+        (Some("status"), _) if args.iter().any(|arg| arg == "--json") => machine::status(&args),
         (Some("version"), _) if args.iter().any(|arg| arg == "--json") => machine::version(&args),
         (Some("version"), _) | (Some("--version"), _) | (Some("-V"), _) => {
             println!("irlume {}", env!("CARGO_PKG_VERSION"));

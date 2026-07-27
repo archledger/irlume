@@ -23,7 +23,7 @@ fn version_json_is_one_machine_document() {
     assert_eq!(document["ok"], true);
     assert_eq!(
         document["data"]["capabilities"],
-        serde_json::json!(["version-json", "profiles-list-json"])
+        serde_json::json!(["version-json", "profiles-list-json", "status-json"])
     );
 }
 
@@ -84,4 +84,57 @@ fn unknown_machine_flags_are_a_typed_usage_error() {
     assert_eq!(document["ok"], false);
     assert_eq!(document["error"]["code"], "usage-error");
     assert_eq!(document["error"]["retryable"], false);
+}
+
+#[test]
+fn status_json_is_one_machine_document_with_no_device_paths() {
+    // status is the command a desktop integration polls, so it is also the one
+    // most likely to leak. It must carry camera CAPABILITY without camera
+    // IDENTITY, and must not name the account.
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["status", "--json"])
+        .env("IRLUME_SOCKET", "/nonexistent/irlume-status-test.sock")
+        .output()
+        .expect("run irlume");
+
+    assert!(output.stderr.is_empty(), "stdout must stay machine-only");
+    assert_eq!(
+        output.stdout.iter().filter(|&&b| b == b'\n').count(),
+        1,
+        "exactly one document"
+    );
+    let raw = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(
+        !raw.contains("/dev/video"),
+        "device paths must not appear in machine output: {raw}"
+    );
+
+    let document: Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(document["command"], "status");
+    assert_eq!(document["contract_version"], 1);
+    let data = &document["data"];
+    // Camera is a capability summary, so both spectra are booleans.
+    assert!(data["camera"]["rgb"].is_boolean());
+    assert!(data["camera"]["ir"].is_boolean());
+    // With no daemon reachable, the daemon-derived facts must say they are
+    // unknown rather than defaulting to a confident zero.
+    assert_eq!(data["daemon"], "unreachable");
+    assert_eq!(data["enrollment"]["known"], false);
+    assert!(
+        data["enrollment"].get("profiles").is_none(),
+        "an unknown enrollment must not report a count"
+    );
+    assert_eq!(data["keyring"]["known"], false);
+}
+
+#[test]
+fn status_json_refuses_an_unsupported_contract_before_reading_anything() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["status", "--contract", "9", "--json"])
+        .env("IRLUME_SOCKET", "/nonexistent/irlume-status-test.sock")
+        .output()
+        .expect("run irlume");
+    assert_eq!(output.status.code(), Some(2));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["error"]["code"], "unsupported-contract");
 }

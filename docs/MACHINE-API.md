@@ -120,6 +120,40 @@ machine.
 Does not contact the daemon. It returns the engine version, contract version,
 advertised capabilities, and public limits.
 
+### `irlume status --json [--user USER]`
+
+Capability: `status-json`.
+
+The readiness summary, as values rather than prose. Deliberately narrower than
+the human `status`: it reports camera **capability** and never camera identity,
+and it does not name the account, because the caller already knows which one it
+asked about.
+
+```json
+{
+  "daemon": "running",
+  "auth_method": "auto",
+  "face_disabled": false,
+  "enrollment": { "known": true, "profiles": 1, "scans": 10 },
+  "templates": "encrypted",
+  "keyring": { "known": true, "armed": true, "policy": "…" },
+  "recovery": { "known": true, "passphrase_set": true },
+  "camera": { "rgb": true, "ir": true },
+  "fingerprint": false
+}
+```
+
+`daemon` is one of `running`, `access-denied` or `unreachable`. An unreachable
+daemon is reported, not raised as an error, because the fields that do not need
+it are still worth having.
+
+Anything derived from the daemon carries `known`. **Unknown is not zero**: when
+`known` is false the counts are absent entirely rather than reported as `0`, so a
+consumer cannot mistake "we could not find out" for "this account has nothing
+enrolled".
+
+`templates` is `encrypted`, `plaintext`, or `unknown`.
+
 ### `irlume profiles list --json [--user USER]`
 
 Capability: `profiles-list-json`.

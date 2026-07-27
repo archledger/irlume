@@ -27,7 +27,7 @@ pub const CONTRACT_MAX: u32 = 1;
 /// never asked for it. "Newest" is the one thing a default must not mean here.
 pub const CONTRACT_DEFAULT: u32 = 1;
 
-const CAPABILITIES: &[&str] = &["version-json", "profiles-list-json"];
+const CAPABILITIES: &[&str] = &["version-json", "profiles-list-json", "status-json"];
 
 /// The contract the caller asked for, or the failure to report.
 ///
@@ -199,6 +199,140 @@ pub fn version(args: &[String]) -> ExitCode {
         ),
         ExitCode::SUCCESS,
     )
+}
+
+/// `irlume status --json`: the readiness summary a desktop integration needs,
+/// as values rather than prose.
+///
+/// Deliberately narrower than the human `status`. It omits camera device paths
+/// and the account name: a consumer needs to know whether an IR camera is
+/// usable, not which node it is, and it already knows which account it asked
+/// about. Everything here is derived from the same sources the human command
+/// reads, so the two cannot disagree about the machine's state, only about how
+/// it is worded.
+pub fn status(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "status";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    if !valid_status_args(args) {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    let user = crate::user_arg(args);
+
+    // Reachability is reported, not fatal: a consumer wants to render "the
+    // daemon is not answering" rather than receive an error with no detail, and
+    // the fields that do not need the daemon are still worth having.
+    let daemon = match crate::commands::daemon_reach() {
+        crate::commands::DaemonReach::Running => "running",
+        crate::commands::DaemonReach::AccessDenied => "access-denied",
+        crate::commands::DaemonReach::Down => "unreachable",
+    };
+
+    let method = irlume_core::policy::method();
+    let enrollment = match crate::daemon_request(&Request::ListProfiles {
+        user: user.clone(),
+        structured_errors: true,
+    }) {
+        Ok(Response::Enrollment { profiles, .. }) => {
+            let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
+            json!({ "known": true, "profiles": profiles.len(), "scans": scans })
+        }
+        // Unknown is not zero. A consumer must be able to tell "this account has
+        // no face enrolled" from "we could not find out".
+        _ => json!({ "known": false }),
+    };
+
+    let keyring = match crate::daemon_request(&Request::KeyringInfo { user: user.clone() }) {
+        Ok(Response::KeyringInfo { armed, policy, .. }) => {
+            json!({ "known": true, "armed": armed, "policy": policy })
+        }
+        _ => json!({ "known": false }),
+    };
+
+    let (templates, recovery) = match crate::daemon_request(&Request::RecoveryStatus { user }) {
+        Ok(Response::RecoveryStatus {
+            encrypted,
+            recovery_set,
+            ..
+        }) => (
+            json!(if encrypted { "encrypted" } else { "plaintext" }),
+            json!({ "known": true, "passphrase_set": recovery_set }),
+        ),
+        _ => (json!("unknown"), json!({ "known": false })),
+    };
+
+    // Camera capability, not camera identity: whether each spectrum resolved to
+    // a device, never which one.
+    let (rgb, ir) = irlume_camera::select_pair();
+    let camera = json!({
+        "rgb": !rgb.is_empty(),
+        "ir": !ir.is_empty(),
+    });
+
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "daemon": daemon,
+                "auth_method": format!("{method:?}").to_lowercase(),
+                "face_disabled": method.face_disabled(),
+                "enrollment": enrollment,
+                "templates": templates,
+                "keyring": keyring,
+                "recovery": recovery,
+                "camera": camera,
+                "fingerprint": irlume_fingerprint::device_name().is_some(),
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+fn valid_status_args(args: &[String]) -> bool {
+    if args.first().map(String::as_str) != Some("status") {
+        return false;
+    }
+    let mut saw_json = false;
+    let mut saw_user = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--user" if !saw_user => {
+                saw_user = true;
+                let Some(user) = args.get(index + 1) else {
+                    return false;
+                };
+                if user.is_empty() || user.starts_with('-') {
+                    return false;
+                }
+                index += 2;
+            }
+            _ => return false,
+        }
+    }
+    saw_json
 }
 
 pub fn profiles_list(args: &[String]) -> ExitCode {
@@ -413,7 +547,7 @@ mod tests {
         assert_eq!(document["ok"], true);
         assert_eq!(
             document["data"]["capabilities"],
-            json!(["version-json", "profiles-list-json"])
+            json!(["version-json", "profiles-list-json", "status-json"])
         );
         assert!(document.get("error").is_none());
     }

@@ -7,6 +7,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`irlume status --json`.** The readiness summary a desktop integration needs,
+  as values instead of prose. It reports the daemon state, auth method,
+  enrollment counts, template protection, keyring arming, recovery passphrase,
+  camera capability and fingerprint presence.
+
+  Two deliberate narrowings against the human command: it reports whether an RGB
+  and an IR camera resolved, never which device nodes, and it does not name the
+  account, since the caller already knows which one it asked about.
+
+  Anything that depends on the daemon carries a `known` flag, and when that is
+  false the counts are absent rather than zero. A consumer must not be able to
+  mistake "we could not find out" for "this account has nothing enrolled".
+
+  This exists because the alternative is what a real consumer is doing today:
+  matching English phrases and column spacing out of the human output, where a
+  reworded line silently degrades its interface.
+
 - **A consumer can state which contract it implements.** `--contract N` on any
   machine command makes the engine agree only to a version it actually speaks,
   and refuse anything else before the daemon is contacted or any side effect

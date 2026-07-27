@@ -807,8 +807,8 @@ enum ReadOutcome {
 }
 
 /// Read one request line (bounded by [`MAX_REQUEST_BYTES`]) and parse it.
-/// Extracted verbatim from [`handle`] (test seam: exercised over a socketpair
-/// without an [`irlume_auth::Engine`]); behavior unchanged.
+/// Called by [`serve`] on the connection's own thread (test seam: exercised
+/// over a socketpair without an [`irlume_auth::Engine`]).
 fn read_request(stream: &UnixStream) -> std::io::Result<ReadOutcome> {
     let mut reader = BufReader::new(stream.try_clone()?).take(MAX_REQUEST_BYTES);
     let mut line = String::new();

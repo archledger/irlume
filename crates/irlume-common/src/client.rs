@@ -86,14 +86,23 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
 }
 
-/// Map a "nobody is listening" error to the actionable start-the-daemon
-/// message. A missing socket / dead peer is the #1 first-run failure (fresh
-/// package install, unit disabled by distro preset policy), so name the daemon
-/// and the exact command instead of a raw errno. Covers every errno the
-/// no-listener case produces across kernels: ENOENT (no socket file),
-/// ECONNREFUSED (socket file, no accept), ECONNRESET / EPIPE (stale socket that
-/// connects then resets on first I/O, seen on newer kernels).
-fn map_not_running(e: io::Error) -> io::Error {
+/// Map a connect failure to an actionable message.
+///
+/// Two cases, and conflating them was a real bug: a user whose uid could not
+/// open the socket was told the daemon was down and sent to `systemctl status`
+/// on a healthy service.
+///
+/// "Nobody is listening" is the #1 first-run failure (fresh package install,
+/// unit disabled by distro preset policy), so name the daemon and the exact
+/// command instead of a raw errno. Covers every errno that case produces across
+/// kernels: ENOENT (no socket file), ECONNREFUSED (socket file, no accept),
+/// ECONNRESET / EPIPE (stale socket that connects then resets on first I/O,
+/// seen on newer kernels).
+///
+/// EACCES/EPERM means the opposite: the socket is there and the daemon is very
+/// likely fine, but this uid may not connect. Say that, and do not suggest
+/// `sudo` or a chmod, because both hide whatever set the mode.
+fn map_connect_failure(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::NotFound
         | io::ErrorKind::ConnectionRefused
@@ -101,6 +110,15 @@ fn map_not_running(e: io::Error) -> io::Error {
         | io::ErrorKind::BrokenPipe => io::Error::new(
             e.kind(),
             "irlumed is not running; start it with: sudo systemctl enable --now irlumed",
+        ),
+        io::ErrorKind::PermissionDenied => io::Error::new(
+            e.kind(),
+            format!(
+                "not permitted to connect to irlumed at {} (EACCES); the daemon may be \
+                 running fine. Check the socket permissions and, on SELinux systems, the \
+                 audit log for a denial.",
+                socket_path().display()
+            ),
         ),
         _ => e,
     }
@@ -111,7 +129,8 @@ fn request_with_timeouts(
     connect_timeout: Duration,
     rw_timeout: Duration,
 ) -> io::Result<Response> {
-    let stream = connect_with_timeout(&socket_path(), connect_timeout).map_err(map_not_running)?;
+    let stream =
+        connect_with_timeout(&socket_path(), connect_timeout).map_err(map_connect_failure)?;
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 
@@ -123,14 +142,14 @@ fn request_with_timeouts(
     // successfully and only resets on the first write/read, so a connect-only
     // mapping left a raw ECONNRESET. Before any bytes are exchanged, a reset or
     // broken pipe still means "nobody is really listening".
-    (&stream).write_all(&line).map_err(map_not_running)?;
-    (&stream).flush().map_err(map_not_running)?;
+    (&stream).write_all(&line).map_err(map_connect_failure)?;
+    (&stream).flush().map_err(map_connect_failure)?;
     // The request may carry a password (SealPassword/RecoverySetup); wipe it.
     line.zeroize();
 
     let mut reader = BufReader::new(&stream);
     let mut buf = String::new();
-    reader.read_line(&mut buf).map_err(map_not_running)?;
+    reader.read_line(&mut buf).map_err(map_connect_failure)?;
     if buf.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -392,5 +411,37 @@ mod tests {
         std::env::remove_var("IRLUME_SOCKET");
         unsafe { libc::close(fd) };
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn eacces_does_not_claim_the_daemon_is_down() {
+        // Regression: a mode-restricted socket made every unprivileged client
+        // report "irlumed is not running" and point the user at `systemctl
+        // status` for a healthy service. EACCES means the opposite.
+        let denied = io::Error::from_raw_os_error(libc::EACCES);
+        let mapped = map_connect_failure(denied);
+        assert_eq!(mapped.kind(), io::ErrorKind::PermissionDenied);
+        let text = mapped.to_string();
+        assert!(text.contains("not permitted to connect"), "got: {text}");
+        assert!(text.contains("EACCES"), "got: {text}");
+        // Must not tell the user to start a running daemon, and must not
+        // prescribe sudo or a chmod: both hide whatever set the mode.
+        assert!(!text.contains("is not running"), "got: {text}");
+        assert!(!text.contains("systemctl enable"), "got: {text}");
+        assert!(!text.contains("chmod"), "got: {text}");
+
+        // The no-listener errnos keep their actionable start-the-daemon message.
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let mapped = map_connect_failure(io::Error::new(kind, "x"));
+            assert!(
+                mapped.to_string().contains("irlumed is not running"),
+                "{kind:?} lost its message"
+            );
+        }
     }
 }

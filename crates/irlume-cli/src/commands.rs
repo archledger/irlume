@@ -543,8 +543,37 @@ const WARN: &str = "\u{26a0}";
 const NO: &str = "\u{2717}";
 
 /// Reachability: a Ping that returns true iff `irlumed` answered.
+/// What a `Ping` established about the daemon.
+///
+/// This used to be a bare bool, and that lost the one distinction that matters:
+/// a user whose uid could not open the socket was told "NOT reachable
+/// (systemctl status irlumed)" and sent to inspect a service that was running
+/// normally. EACCES and "nothing is listening" are different answers and get
+/// different words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonReach {
+    Running,
+    /// The socket is there but this uid may not connect. Carries no information
+    /// about whether the daemon is healthy, so never report it as "down".
+    AccessDenied,
+    /// Nothing is listening, or the reply was unusable.
+    Down,
+}
+
+/// Probe the daemon. Goes through the shared client directly rather than
+/// `daemon_request`, because the errno kind is the point here and the string
+/// conversion throws it away.
+pub(crate) fn daemon_reach() -> DaemonReach {
+    match irlume_common::client::request(&Request::Ping) {
+        Ok(Response::Pong) => DaemonReach::Running,
+        Ok(_) => DaemonReach::Down,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => DaemonReach::AccessDenied,
+        Err(_) => DaemonReach::Down,
+    }
+}
+
 fn daemon_up() -> bool {
-    matches!(daemon_request(&Request::Ping), Ok(Response::Pong))
+    daemon_reach() == DaemonReach::Running
 }
 
 /// `irlume status`: one-shot health dashboard. Always exits 0 (it reports state,
@@ -554,13 +583,16 @@ pub fn status(args: &[String]) -> ExitCode {
     println!("irlume status for '{user}'");
 
     // Daemon + method.
-    let up = daemon_up();
+    let reach = daemon_reach();
     println!(
         "  daemon        : {}",
-        if up {
-            format!("running {OK}")
-        } else {
-            format!("NOT reachable {NO} (systemctl status irlumed)")
+        match reach {
+            DaemonReach::Running => format!("running {OK}"),
+            DaemonReach::AccessDenied => format!(
+                "running, but this user may not connect {WARN} (EACCES on {})",
+                irlume_common::client::socket_path().display()
+            ),
+            DaemonReach::Down => format!("NOT reachable {NO} (systemctl status irlumed)"),
         }
     );
     let method = irlume_core::policy::method();
@@ -721,7 +753,19 @@ pub fn detect(args: &[String]) -> ExitCode {
         println!("absent: irlumed is not installed");
         return ExitCode::from(20);
     }
-    let up = daemon_up();
+    let reach = daemon_reach();
+    // Without socket access neither readiness nor enrollment is knowable, and
+    // claiming "not enrolled" would be a guess. Report the real obstacle and
+    // stay at 10 (partial): 0 would assert a readiness we cannot see.
+    if reach == DaemonReach::AccessDenied {
+        println!(
+            "partial: cannot determine readiness; not permitted to connect to {} (EACCES). \
+             The daemon may be running fine.",
+            irlume_common::client::socket_path().display()
+        );
+        return ExitCode::from(10);
+    }
+    let up = reach == DaemonReach::Running;
     let enrolled = matches!(
         daemon_request(&Request::ListProfiles { user }),
         Ok(Response::Enrollment { ref profiles, .. }) if !profiles.is_empty()

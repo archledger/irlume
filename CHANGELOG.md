@@ -5,6 +5,47 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Face unlock on the KDE lock screen works again, and `irlume detect` stops
+  lying to unprivileged callers.** An earlier change in this development cycle
+  had packaging create an `irlume` system group, which made the daemon restrict
+  its control socket to `0660 root:irlume`. Nothing ever added a member to that
+  group. `kscreenlocker_greet` is not setuid, so the lock screen's PAM
+  conversation runs as you, its `connect()` to the socket returned EACCES, and
+  face unlock silently fell through to the password along with the keyring
+  unseal that rides on it. `irlume detect` exited 10 (partial) as a user and 0
+  (ready) as root on the same healthy, enrolled machine, and `irlume status`
+  reported "daemon NOT reachable" while the daemon was serving requests
+  normally. `sudo`, the login greeter and polkit prompts were unaffected because
+  all three run as root.
+
+  The socket is now mode 0666 and the group is gone. Reachability was never the
+  authorization boundary: `SO_PEERCRED` is, it is supplied by the kernel at
+  connect time, and every request still requires either root or a target that
+  matches the calling uid. This is the ordinary arrangement for a local system
+  daemon. It is systemd's own documented default for filesystem sockets
+  (`SocketMode=` in `systemd.socket(5)`), pcscd ships the same, and fprintd
+  keeps its endpoint reachable and authorizes per operation. Group membership
+  could not have fixed it either: supplementary groups are process credentials
+  fixed at login, so adding your uid does not reach the desktop you are already
+  in, and greeter account names differ across display managers.
+
+  Requests remain bounded (64 KiB, read and write deadlines), each connection
+  stays isolated behind `catch_unwind`, and the unauthenticated dry-run emitter
+  probe now shares the per-uid camera interval that already covered `Identify`.
+  On Fedora the SELinux module is still the mandatory-access layer.
+
+- Connect failures now distinguish "nothing is listening" from "this uid may not
+  connect". EACCES no longer prints "irlumed is not running" or points you at
+  `systemctl status` for a healthy service, and it deliberately does not tell
+  you to run `sudo` or change the socket mode, because both hide whatever set it.
+
+- `irlume-reconcile.timer` is packaged on Fedora. It was installed into the
+  buildroot but never listed in `%files`, which fails the rpm build on an
+  unpackaged file, and it was missing from `%preun`/`%postun`, so an uninstall
+  left it enabled.
+
 ### Changed
 
 - **Releasing your keyring password now asks for a gesture, by default.** On a

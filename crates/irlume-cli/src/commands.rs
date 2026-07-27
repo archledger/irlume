@@ -1475,7 +1475,8 @@ ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
   profiles [list|add-scan|rename|delete|eyes-open|challenge <on|off>]   manage profiles
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
-  calibrate-closure     teach the eye-closure consent gesture for app prompts
+  calibrate-closure [--rounds N]   teach the eye-closure consent gesture for app
+                        prompts; captures N rounds (default 3) and stores the median
                         (sudo; the head nod is the default and needs no calibration)
 
 KEYRING / TPM

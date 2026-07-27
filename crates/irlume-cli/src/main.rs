@@ -14,7 +14,7 @@
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
 //!   irlume recovery <status|setup|restore|forget> template-key recovery passphrase
-//!   irlume calibrate-closure                     teach the eye-closure consent gesture
+//!   irlume calibrate-closure [--rounds N]        teach the eye-closure consent gesture
 //!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
 //!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
@@ -430,33 +430,166 @@ fn report_ok_response(
     }
 }
 
-/// `irlume calibrate-closure`: teach irlume the user's open and closed eye
-/// shape (EAR) for the deliberate-closure consent gesture used by polkit prompts
-/// ("close your eyes for a second to approve"). Captures two phases (eyes open,
-/// eyes closed), validates they are far enough apart, and stores the pair in the
-/// enrollment. Needs root (fires the camera through the daemon's privileged
-/// path); the daemon must be running.
+/// Ask before discarding an existing calibration. Defaults to NO, including on
+/// a read error: the safe answer is the one that keeps working settings.
+fn confirm_replace() -> bool {
+    use std::io::Write;
+    print!("    replace it? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    let s = line.trim();
+    s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes")
+}
+
+/// Ask whether to keep the reading just shown; Enter means yes. Defaults to
+/// keeping on any read error, so a closed stdin cannot spin the capture loop.
+fn keep_reading() -> bool {
+    use std::io::Write;
+    print!("    keep this reading? [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return true;
+    }
+    match line.trim() {
+        "" => true,
+        s => s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes"),
+    }
+}
+
+/// How many of the captured readings the resulting calibration would actually
+/// accept, as `(closures, reopens)`.
+///
+/// The gate is applied exactly as [`irlume_liveness::detect_deliberate_closure`]
+/// applies it, so the count cannot flatter a calibration the engine would then
+/// refuse: a closure must read strictly UNDER `closed_threshold`, and a reopen
+/// at or OVER `reopen_threshold`.
+fn rounds_that_would_register(
+    opens: &[f32],
+    closeds: &[f32],
+    cal: &irlume_liveness::ClosureCalibration,
+) -> (usize, usize) {
+    let (closed_thr, reopen_thr) = (cal.closed_threshold(), cal.reopen_threshold());
+    (
+        closeds.iter().filter(|c| **c < closed_thr).count(),
+        opens.iter().filter(|o| **o >= reopen_thr).count(),
+    )
+}
+
+/// Median of a non-empty slice. Takes `&mut` because selecting the middle
+/// element needs an ordering, and EAR readings are floats (`total_cmp`, so a
+/// stray NaN sorts to one end rather than corrupting the comparison).
+fn median_ear(values: &mut [f32]) -> f32 {
+    values.sort_by(|a, b| a.total_cmp(b));
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    }
+}
+
+/// How many rounds `calibrate-closure` captures unless `--rounds N` says
+/// otherwise. One reading of each phase is a coin toss: measured on real
+/// hardware, one user, one seated position, five consecutive closed captures
+/// spanned 0.0424 to 0.0894. Calibrating from whichever single value happened to
+/// land leaves a threshold that may sit almost on top of the user's own
+/// closures. Three rounds and a median cost about a minute and remove that.
+const CALIBRATION_ROUNDS_DEFAULT: usize = 3;
+
+/// `irlume calibrate-closure [--rounds N]`: teach irlume the user's open and
+/// closed eye shape (EAR) for the deliberate-closure consent gesture used by
+/// polkit prompts ("close your eyes for a second to approve").
+///
+/// Captures both phases [`CALIBRATION_ROUNDS_DEFAULT`] times and stores the
+/// median of each, then checks the thresholds that result back against every
+/// individual reading and says how many would have registered. A calibration
+/// that would reject the user's own captures is the failure this reports, and
+/// it is invisible from a single pair of numbers.
+///
+/// Each phase waits for Enter on a terminal, because a capture fired on a
+/// countdown while the user is still settling produces a reading that has to be
+/// thrown away. With no terminal (a script, a test) the waits and the keep/retry
+/// prompt are skipped and every reading is kept, so it stays automatable.
+///
+/// REPLACING an existing calibration asks first, and with no terminal refuses
+/// unless `--force`. Without that, running this command with stdin closed
+/// silently overwrites a good calibration with whatever the camera happened to
+/// see, and the previous values are gone: they live only inside the encrypted
+/// enrollment, so there is nothing to roll back to. That is not hypothetical; it
+/// is how this guard came to exist.
+///
+/// Needs root (fires the camera through the daemon's privileged path); the
+/// daemon must be running.
 fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
+    use std::io::{IsTerminal, Write};
     let user = user_arg(args);
     if !is_root() {
         eprintln!("[calibrate] needs root (fires the camera): sudo irlume calibrate-closure");
         return std::process::ExitCode::FAILURE;
     }
+    let rounds = match flag(args, "--rounds") {
+        None => CALIBRATION_ROUNDS_DEFAULT,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if (1..=10).contains(&n) => n,
+            _ => {
+                eprintln!("[calibrate] --rounds takes a number from 1 to 10 (got {v:?})");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+    };
+    let interactive = std::io::stdin().is_terminal();
+    // Ask BEFORE spending the user's time on captures, not after.
+    let already_calibrated = matches!(
+        daemon_request(&Request::ListProfiles {
+            user: user.clone(),
+            structured_errors: false,
+        }),
+        Ok(Response::Enrollment {
+            closure_calibrated: true,
+            ..
+        })
+    );
+    if already_calibrated && !args.iter().any(|a| a == "--force") {
+        if !interactive {
+            eprintln!(
+                "[calibrate] '{user}' already has a closure calibration, and replacing it here \
+                 would\n            \
+                 discard it with nothing to restore from. Re-run on a terminal, or pass \
+                 --force."
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+        println!("[calibrate] '{user}' already has a closure calibration.");
+        println!(
+            "[calibrate] replacing it discards the old values; they are not recoverable.\n            \
+             Do this in the light you actually use, or answer n to keep what you have."
+        );
+        if !confirm_replace() {
+            println!("[calibrate] keeping the existing calibration; nothing changed.");
+            return std::process::ExitCode::SUCCESS;
+        }
+    }
     println!("[calibrate] eye-closure consent calibration for '{user}'.");
     println!(
         "[calibrate] this teaches irlume your open/closed eye shape for the polkit\n            \
-         'close your eyes to approve' gesture. Two quick phases.\n"
+         'close your eyes to approve' gesture. {rounds} round(s), two phases each.\n            \
+         Sit the way you actually sit, in the light you actually use: what is stored\n            \
+         describes this position and this lighting.\n"
     );
 
     // Capture one phase, returning the median EAR or a printed error.
     let capture_phase = |label: &str| -> Result<f32, String> {
-        print!("[calibrate] {label}: hold still, capturing in 3");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        print!("    {label}\n    hold still, capturing in 3");
+        let _ = std::io::stdout().flush();
         for n in [2, 1] {
             std::thread::sleep(std::time::Duration::from_millis(800));
             print!(" {n}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let _ = std::io::stdout().flush();
         }
         println!(" GO");
         match daemon_request(&Request::CaptureEarMedian { user: user.clone() }) {
@@ -470,26 +603,77 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
         }
     };
 
-    let ear_open = match capture_phase("Phase 1/2: look at the camera with your eyes OPEN") {
-        Ok(v) => {
-            println!("  open EAR {v:.3}");
-            v
-        }
-        Err(e) => {
-            eprintln!("[calibrate] {e}");
-            return std::process::ExitCode::FAILURE;
+    // One phase, repeated until the user keeps a reading. A rejected reading is
+    // re-taken rather than averaged in: the person in front of the camera knows
+    // whether they actually held the pose, and no statistic recovers a capture
+    // taken while they were still moving.
+    let one_phase = |name: &str, instruction: &str| -> Result<f32, String> {
+        loop {
+            if interactive {
+                print!("    {instruction}\n    Press Enter when you are ready… ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return Err("could not read from the terminal".into());
+                }
+            }
+            match capture_phase(instruction) {
+                Ok(v) => {
+                    println!("    {name} EAR = {v:.4}");
+                    if !interactive || keep_reading() {
+                        return Ok(v);
+                    }
+                }
+                Err(e) => {
+                    if !interactive {
+                        return Err(e);
+                    }
+                    println!("    {e}");
+                }
+            }
         }
     };
-    let ear_closed = match capture_phase("Phase 2/2: CLOSE your eyes and HOLD them shut") {
-        Ok(v) => {
-            println!("  closed EAR {v:.3}");
-            v
+
+    let (mut opens, mut closeds) = (Vec::new(), Vec::new());
+    for r in 1..=rounds {
+        if rounds > 1 {
+            println!("--- round {r}/{rounds} ---");
         }
-        Err(e) => {
-            eprintln!("[calibrate] {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+        let o = match one_phase(
+            "open",
+            "Look at the camera with your eyes OPEN and hold still.",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[calibrate] {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let c = match one_phase(
+            "closed",
+            "CLOSE your eyes firmly and HOLD them shut through the countdown.",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[calibrate] {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "    round {r}: open {o:.4} | closed {c:.4} | gap {:.4}\n",
+            o - c
+        );
+        opens.push(o);
+        closeds.push(c);
+    }
+
+    let ear_open = median_ear(&mut opens.clone());
+    let ear_closed = median_ear(&mut closeds.clone());
+    if rounds > 1 {
+        println!(
+            "[calibrate] median of {rounds} rounds: open {ear_open:.4} closed {ear_closed:.4}"
+        );
+    }
 
     if ear_open - ear_closed < irlume_liveness::MIN_CALIBRATION_SEPARATION {
         eprintln!(
@@ -497,6 +681,35 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
              tell apart. Make sure you fully open then fully close your eyes, and retry."
         );
         return std::process::ExitCode::FAILURE;
+    }
+
+    // Check the thresholds this calibration produces back against every reading
+    // that produced it. A median can be perfectly sound while the spread around
+    // it is wide enough that some of the user's own closures would not register,
+    // which is the difference between a gesture that works and one that works
+    // most of the time. Reported, not fatal: it is still the best pair available
+    // from these captures, and the user is the one who decides whether to redo it.
+    let cal = irlume_liveness::ClosureCalibration {
+        ear_open,
+        ear_closed,
+    };
+    let (closed_thr, reopen_thr) = (cal.closed_threshold(), cal.reopen_threshold());
+    let (closures_ok, reopens_ok) = rounds_that_would_register(&opens, &closeds, &cal);
+    if closures_ok < rounds || reopens_ok < rounds {
+        println!(
+            "[calibrate] ⚠ with this calibration, {closures_ok}/{rounds} of your closures and \
+             {reopens_ok}/{rounds} of your\n            \
+             reopens would register (closed must read under {closed_thr:.4}, reopen at or \
+             over\n            {reopen_thr:.4}). Your readings varied more than the gate \
+             allows, so the gesture\n            \
+             will sometimes miss. Re-running in steadier light, holding each pose until \
+             GO,\n            usually tightens it. The head nod needs no calibration at all."
+        );
+    } else if rounds > 1 {
+        println!(
+            "[calibrate] ✓ all {rounds} rounds would register with this calibration \
+             (closed under {closed_thr:.4}, reopen over {reopen_thr:.4})."
+        );
     }
     match daemon_request(&Request::SetClosureCalibration {
         user: user.clone(),
@@ -3323,6 +3536,54 @@ mod tests {
     fn flag_takes_the_first_occurrence() {
         let a = argv(&["--user", "a", "--user", "b"]);
         assert_eq!(flag(&a, "--user"), Some("a"));
+    }
+
+    #[test]
+    fn median_ear_picks_the_middle_regardless_of_capture_order() {
+        // Odd count: the true middle, not the mean, so one bad capture in a
+        // round cannot drag the stored value the way an average would.
+        assert_eq!(median_ear(&mut [0.10, 0.30, 0.20]), 0.20);
+        // Even count: mean of the two middles.
+        assert_eq!(median_ear(&mut [0.10, 0.20, 0.30, 0.40]), 0.25);
+        assert_eq!(median_ear(&mut [0.17]), 0.17);
+        // The outlier that motivated the median: four tight readings and one
+        // shallow closure. The mean would be 0.0511, the median stays at 0.0450.
+        let mut real = [0.0424, 0.0450, 0.0661, 0.0727, 0.0894];
+        assert_eq!(median_ear(&mut real), 0.0661);
+    }
+
+    /// The self-check must agree with the engine's own gate, or it would tell the
+    /// user a calibration is fine while the daemon refuses their closures.
+    #[test]
+    fn the_self_check_counts_rounds_the_engine_would_accept() {
+        use irlume_liveness::ClosureCalibration;
+        // Tonight's measured session: open median 0.1658, closed median 0.0661.
+        let opens = [0.1635, 0.1652, 0.1658, 0.1861, 0.1868];
+        let closeds = [0.0424, 0.0450, 0.0661, 0.0727, 0.0894];
+        let cal = ClosureCalibration {
+            ear_open: 0.1658,
+            ear_closed: 0.0661,
+        };
+        let (c_ok, o_ok) = rounds_that_would_register(&opens, &closeds, &cal);
+        // Calibrated from its own session, every round registers: the median
+        // puts closed_threshold at 0.0960, above even the shallowest closure.
+        assert_eq!(o_ok, 5, "every reopen clears {}", cal.reopen_threshold());
+        assert_eq!(c_ok, 5, "closed_threshold {}", cal.closed_threshold());
+
+        // The calibration actually stored on that machine, taken in different
+        // light, applied to the same evening readings: the 0.0894 closure now
+        // sits above a 0.0739 threshold and would not register. This is the
+        // shortfall the warning exists to surface, and it is invisible from the
+        // stored pair alone.
+        let stored = ClosureCalibration {
+            ear_open: 0.1090,
+            ear_closed: 0.0588,
+        };
+        let (c2, o2) = rounds_that_would_register(&opens, &closeds, &stored);
+        assert_eq!((c2, o2), (4, 5));
+
+        // And the degenerate case: no readings cannot report false confidence.
+        assert_eq!(rounds_that_would_register(&[], &[], &cal), (0, 0));
     }
 
     #[test]

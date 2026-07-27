@@ -142,7 +142,9 @@ python3 scripts/machine-api-conformance.py --irlume /usr/bin/irlume
 
 It needs Python 3 and `jsonschema` (Fedora and Debian `python3-jsonschema`, Arch
 `python-jsonschema`). Without the validator it still runs the structural checks
-and tells you which checks it skipped.
+and tells you which checks it skipped. Pass `--strict` in a pipeline: it refuses
+to run at all without a validator, so a missing dependency fails the job instead
+of turning into a green run that checked less than you think.
 
 ## Developing without a camera, a TPM, or a face
 

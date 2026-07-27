@@ -334,6 +334,13 @@ def main():
     args = parser.parse_args()
 
     validate, validate_note = load_validator(args.schema, args.strict)
+    if validate is None and args.strict:
+        # A run that could not validate must not look like a run that validated.
+        # Permissive mode degrades to the structural checks and says so, which
+        # suits someone trying the script out; --strict is what a pipeline runs,
+        # and there a missing validator is a broken pipeline, not a green one.
+        print(f"cannot validate, and --strict will not pass without it: {validate_note}", file=sys.stderr)
+        return 2
     results = Results()
 
     if not args.no_engine:

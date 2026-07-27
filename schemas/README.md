@@ -18,6 +18,8 @@ file beside this one.
 
 `scripts/machine-api-conformance.py --strict` closes the objects for irlume's own
 CI, where an undescribed property should be a decision rather than a surprise.
+`--strict` also refuses to run without a validator, so a missing dependency
+cannot turn into a green run that validated nothing.
 
 ## Fixtures
 

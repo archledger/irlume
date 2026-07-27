@@ -1523,6 +1523,25 @@ impl Engine {
         if let Some(e) = err {
             return Err(e);
         }
+        // A gesture that never arrives is otherwise silent: the caller waits out
+        // its deadline and denies, which reads the same whether the user did
+        // nothing or nodded in a way the detector did not count. Say which.
+        if hit != Some(true) {
+            let (_, ev) = irlume_liveness::detect_nod_with_evidence(&poses);
+            irlume_common::dlog!(
+                "consent: no gesture in {} frames; nod evidence: usable_pitch_frames={} (need {}) \
+                 pitch_range={:.3} (need {:.3}) yaw_range={:.2} (max {:.2}) crossings={} (need {})",
+                poses.len(),
+                ev.frames,
+                irlume_liveness::NOD_MIN_FACE_FRAMES,
+                ev.pitch_range,
+                irlume_liveness::NOD_PITCH_MIN,
+                ev.yaw_range,
+                irlume_liveness::NOD_YAW_MAX,
+                ev.crossings,
+                irlume_liveness::NOD_MIN_CROSSINGS,
+            );
+        }
         Ok(hit == Some(true))
     }
 

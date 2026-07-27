@@ -605,6 +605,54 @@ pub const NOD_MIN_FACE_FRAMES: usize = 12;
 /// `Nod` = the gesture was seen; `None` = a face was tracked but no nod;
 /// `NoFace` = too few face frames to judge. `Shake` is not yet detected (returns
 /// `None` for a shake) pending its own tuning data.
+/// Why [`detect_nod`] reached its answer, for diagnosis.
+///
+/// A nod that is not detected leaves no trace otherwise: the caller simply waits
+/// out its deadline and denies, which is indistinguishable from a user who never
+/// moved. These are the four numbers that decide it, so a failure can be read
+/// instead of guessed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodEvidence {
+    /// Frames that produced a usable pitch reading.
+    pub frames: usize,
+    /// Peak-to-peak head pitch, against [`NOD_PITCH_MIN`].
+    pub pitch_range: f32,
+    /// Peak-to-peak yaw, against [`NOD_YAW_MAX`]: too much means head-shake.
+    pub yaw_range: f32,
+    /// Median crossings of sufficient amplitude, against [`NOD_MIN_CROSSINGS`].
+    pub crossings: usize,
+}
+
+/// [`detect_nod`], plus the measurements behind the verdict.
+pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvidence) {
+    let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
+    let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
+    let range = |v: &[f32]| -> f32 {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &x in v {
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        if v.is_empty() {
+            0.0
+        } else {
+            hi - lo
+        }
+    };
+    let pitch_range = range(&pitch);
+    let evidence = NodEvidence {
+        frames: pitch.len(),
+        pitch_range,
+        yaw_range: range(&yaw),
+        crossings: if pitch.is_empty() {
+            0
+        } else {
+            nod_crossings(&pitch, pitch_range)
+        },
+    };
+    (detect_nod(samples), evidence)
+}
+
 pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
     let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
     let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
@@ -1758,5 +1806,56 @@ mod tests {
         // Dark closet: frames captured but no face anywhere → NoEyes.
         let none = strobed(&[], &[None; 20]);
         assert_eq!(detect_blink(&none), BlinkResult::NoEyes);
+    }
+}
+
+#[cfg(test)]
+mod nod_evidence_tests {
+    use super::*;
+
+    fn samples(pitches: &[f32]) -> Vec<PoseSample> {
+        pitches
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| PoseSample {
+                idx: i,
+                pitch_frac: Some(p),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn evidence_agrees_with_the_verdict_and_names_the_shortfall() {
+        // Too few frames: the verdict is NoFace and the frame count says why.
+        let short = samples(&[0.5; 4]);
+        let (v, ev) = detect_nod_with_evidence(&short);
+        assert_eq!(v, HeadGesture::NoFace);
+        assert_eq!(ev.frames, 4);
+        assert!(ev.frames < NOD_MIN_FACE_FRAMES);
+
+        // Enough frames but a motionless head: the pitch range is the shortfall,
+        // which is the case a user reports as "I nodded and nothing happened".
+        let still = samples(&[0.5; 20]);
+        let (v, ev) = detect_nod_with_evidence(&still);
+        assert_eq!(v, HeadGesture::None);
+        assert_eq!(ev.frames, 20);
+        assert!(
+            ev.pitch_range < NOD_PITCH_MIN,
+            "a still head must show a pitch range under the threshold, got {}",
+            ev.pitch_range
+        );
+
+        // A real down-up-down nod, the same shape `deliberate_nod_is_detected`
+        // uses: the verdict is Nod and the evidence clears every bar.
+        let nod = [
+            0.53, 0.55, 0.60, 0.63, 0.58, 0.52, 0.51, 0.55, 0.62, 0.64, 0.57, 0.52, 0.53, 0.56,
+        ];
+        let (v, ev) = detect_nod_with_evidence(&samples(&nod));
+        assert_eq!(v, HeadGesture::Nod);
+        assert!(ev.pitch_range >= NOD_PITCH_MIN);
+        assert!(ev.yaw_range <= NOD_YAW_MAX);
+        assert!(ev.crossings >= NOD_MIN_CROSSINGS);
     }
 }

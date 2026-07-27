@@ -87,6 +87,8 @@ jobs:
           curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "$tarball" actionlint
-          # shellcheck is preinstalled on the hosted runner, so `run:` blocks get
-          # linted too rather than silently skipped.
+          # The hosted runner preinstalls shellcheck, so actionlint lints `run:`
+          # blocks too rather than silently skipping them. (This comment must not
+          # begin with the tool's name: shellcheck would read it as a directive
+          # and fail to parse it, which is exactly how this job first failed.)
           ./actionlint -color

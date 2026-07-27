@@ -138,7 +138,10 @@ jobs:
           IRLUME_TEST_SPARE_DEVICE: /dev/video10
           IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
         run: |
-          test -w /dev/video8 && test -w /dev/video9 || { echo "::error::loopback nodes missing — re-provision v4l2loopback"; exit 1; }
+          if [ ! -w /dev/video8 ] || [ ! -w /dev/video9 ]; then
+            echo "::error::loopback nodes missing — re-provision v4l2loopback"
+            exit 1
+          fi
           ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
           trap 'kill %1 %2 2>/dev/null || true' EXIT

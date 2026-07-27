@@ -449,9 +449,16 @@ pub(crate) fn polkit_wired() -> Option<bool> {
     service_present(&POLKIT).map(|p| file_has_module(&p))
 }
 
+/// The PAM service name in an /etc/pam.d path (e.g. "/etc/pam.d/gdm-password" →
+/// "gdm-password"). Borrows, so a `&'static str` path yields a `&'static str`
+/// name the machine output can publish as a stable id.
+fn service_name(etc: &str) -> &str {
+    etc.rsplit('/').next().unwrap_or(etc)
+}
+
 /// Short label from an /etc/pam.d path (e.g. "/etc/pam.d/gdm-password" → "gdm-password").
 fn label_of(etc: &str) -> String {
-    etc.rsplit('/').next().unwrap_or(etc).to_string()
+    service_name(etc).to_string()
 }
 
 /// The active login manager, from the `display-manager.service` symlink
@@ -615,6 +622,127 @@ pub(crate) fn fp_keyring_wired() -> bool {
     !present.is_empty() && present.iter().all(|&b| b)
 }
 
+// ---- Wiring facts (shared by the human report and `login status --json`) -----
+
+/// What a PAM surface is for. These strings are published by
+/// `login status --json`, so they are public API: a role may be added, never
+/// renamed and never repurposed.
+const ROLE_LOGIN: &str = "login-screen";
+const ROLE_LOGIN_FP: &str = "login-screen-fingerprint";
+const ROLE_LOCK: &str = "lock-screen";
+const ROLE_SUDO: &str = "sudo";
+const ROLE_POLKIT: &str = "polkit";
+
+/// One PAM surface irlume knows how to wire, as facts rather than a rendered
+/// row. The human report prints these and `login status --json` serializes
+/// them, so a single pass feeds both and the two cannot disagree about what is
+/// wired; they can only differ in how they word it.
+pub(crate) struct SurfaceFact {
+    /// The PAM service name (`plasmalogin`, `kde`, `sudo`, …). Stable public id.
+    pub(crate) id: &'static str,
+    pub(crate) role: &'static str,
+    /// The /etc path, for the human report only. Machine output publishes the
+    /// service name instead, in keeping with the no-paths rule.
+    pub(crate) path: &'static str,
+    /// Whether this service exists here at all: a real /etc file, or a vendor
+    /// copy an /etc override would be materialized from.
+    pub(crate) present: bool,
+    pub(crate) wired: bool,
+    /// How face fires here when wired: `face-first`, `on-demand`, `keyring`
+    /// (the fingerprint keyring-unlock line, which is not a face factor) or
+    /// `verify` (the plain sudo/polkit stanza). `None` when not wired.
+    pub(crate) mode: Option<&'static str>,
+}
+
+fn surface_fact(
+    etc: &'static str,
+    vendor: Option<&'static str>,
+    role: &'static str,
+) -> SurfaceFact {
+    let path = service_present(&Svc { etc, vendor });
+    let content = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let wired = content_has_module(&content);
+    // Name HOW face fires on this service: on-demand (the consent model) is
+    // invisible in the PAM file to a reader, and a keyring-only line is the
+    // fingerprint unlock rather than face at all.
+    let mode = if !wired {
+        None
+    } else if role == ROLE_SUDO || role == ROLE_POLKIT {
+        Some("verify")
+    } else if !content.contains("unseal") {
+        Some("keyring")
+    } else if content.contains("ondemand") {
+        Some("on-demand")
+    } else {
+        Some("face-first")
+    };
+    SurfaceFact {
+        id: service_name(etc),
+        role,
+        path: etc,
+        present: path.is_some(),
+        wired,
+        mode,
+    }
+}
+
+/// Every surface irlume can wire, present or not, in the order the human report
+/// prints them. Absent services are kept in the list with `present: false`: a
+/// consumer must be able to read an id it knows and cannot find as "this engine
+/// does not wire that service" rather than as "not wired here".
+pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
+    let mut out: Vec<SurfaceFact> = GREETERS
+        .iter()
+        .map(|s| surface_fact(s.etc, s.vendor, ROLE_LOGIN))
+        .chain(
+            FP_GREETERS
+                .iter()
+                .map(|s| surface_fact(s.etc, s.vendor, ROLE_LOGIN_FP)),
+        )
+        .collect();
+    out.push(surface_fact(LOCKSCREEN.etc, LOCKSCREEN.vendor, ROLE_LOCK));
+    out.push(surface_fact(SUDO, None, ROLE_SUDO));
+    out.push(surface_fact(POLKIT.etc, POLKIT.vendor, ROLE_POLKIT));
+    out
+}
+
+/// The active login manager and the PAM services it consults.
+pub(crate) struct LoginManagerFact {
+    /// `None` when no `display-manager.service` is set: a headless host, or a
+    /// greeter that does not register one. Not the same as "no face login".
+    pub(crate) name: Option<String>,
+    /// Whether irlume maps this login manager to PAM services at all. An
+    /// unrecognized manager cannot be targeted by `login enable`.
+    pub(crate) recognized: bool,
+    /// The greeter service, plus the separate fingerprint service on the login
+    /// managers that have one (GDM). Empty when unrecognized.
+    pub(crate) services: Vec<&'static str>,
+}
+
+pub(crate) fn login_manager_fact() -> LoginManagerFact {
+    let Some(dm) = active_display_manager() else {
+        return LoginManagerFact {
+            name: None,
+            recognized: false,
+            services: Vec::new(),
+        };
+    };
+    let (greeter, fp) = dm_pam_services(&dm);
+    let recognized = greeter != "(unknown)";
+    LoginManagerFact {
+        name: Some(dm),
+        recognized,
+        services: if recognized {
+            std::iter::once(greeter).chain(fp).collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
 fn status() -> ExitCode {
     println!("[login] wiring status (face auth in PAM):");
     if let Some(dm) = active_display_manager() {
@@ -626,55 +754,28 @@ fn status() -> ExitCode {
     }
     let mut any = false;
     let mut any_ondemand = false;
-    for s in GREETERS
-        .iter()
-        .chain(FP_GREETERS.iter())
-        .chain(std::iter::once(&LOCKSCREEN))
-    {
-        if let Some(present) = service_present(s) {
-            let content = std::fs::read_to_string(&present).unwrap_or_default();
-            let wired = content_has_module(&content);
-            any |= wired;
-            // Surface HOW face fires on this service: on-demand (the consent
-            // model) is invisible in the PAM file to a user, so name it here.
-            let label = if !wired {
-                "○ not wired"
-            } else if !content.contains("unseal") {
-                "● wired"
-            }
-            // keyring-only line
-            else if content.contains("ondemand") {
+    for f in surface_facts() {
+        if !f.present {
+            continue;
+        }
+        let label = match (f.role, f.mode) {
+            (ROLE_SUDO, Some(_)) => "● wired (sudo)",
+            (ROLE_SUDO, None) => "○ not wired (sudo)",
+            (ROLE_POLKIT, Some(_)) => "● wired (polkit app prompts)",
+            (ROLE_POLKIT, None) => "○ not wired (polkit app prompts)",
+            (_, None) => "○ not wired",
+            (_, Some("on-demand")) => {
                 any_ondemand = true;
                 "● wired (face on-demand)"
-            } else {
-                "● wired (face-first)"
-            };
-            println!("  {:<34} {}", present.display(), label);
-        }
-    }
-    if Path::new(SUDO).exists() {
-        let wired = file_has_module(Path::new(SUDO));
-        println!(
-            "  {:<34} {}",
-            SUDO,
-            if wired {
-                "● wired (sudo)"
-            } else {
-                "○ not wired (sudo)"
             }
-        );
-    }
-    if let Some(p) = service_present(&POLKIT) {
-        let wired = file_has_module(&p);
-        println!(
-            "  {:<34} {}",
-            p.display(),
-            if wired {
-                "● wired (polkit app prompts)"
-            } else {
-                "○ not wired (polkit app prompts)"
-            }
-        );
+            (_, Some("face-first")) => "● wired (face-first)",
+            // keyring-only line
+            (_, Some(_)) => "● wired",
+        };
+        // face-sudo alone does not make the login screen work, so it does not
+        // silence the "enable with" hint below.
+        any |= f.wired && f.role != ROLE_SUDO && f.role != ROLE_POLKIT;
+        println!("  {:<34} {}", f.path, label);
     }
     if any_ondemand {
         println!("  on-demand: {ONDEMAND_HINT}");
@@ -1898,6 +1999,37 @@ mod tests {
         assert_eq!(dm_pam_services("cosmic-greeter"), ("cosmic-greeter", None));
         // Anything unrecognised is named "(unknown)" with no fingerprint service.
         assert_eq!(dm_pam_services("mystery-dm"), ("(unknown)", None));
+    }
+
+    #[test]
+    fn surface_facts_cover_every_wirable_service_in_report_order() {
+        // The order is the order the human report prints, and the ids are
+        // published by `login status --json`. Both are API: the first would
+        // reshuffle a report people paste into bug threads, the second would
+        // break a consumer keying off an id.
+        let facts = surface_facts();
+        let seen: Vec<(&str, &str)> = facts.iter().map(|f| (f.id, f.role)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("gdm-password", ROLE_LOGIN),
+                ("sddm", ROLE_LOGIN),
+                ("lightdm", ROLE_LOGIN),
+                ("plasmalogin", ROLE_LOGIN),
+                ("cosmic-greeter", ROLE_LOGIN),
+                ("greetd", ROLE_LOGIN),
+                ("gdm-fingerprint", ROLE_LOGIN_FP),
+                ("kde", ROLE_LOCK),
+                ("sudo", ROLE_SUDO),
+                ("polkit-1", ROLE_POLKIT),
+            ]
+        );
+        for f in &facts {
+            // A mode describes how face fires here; without wiring nothing fires.
+            assert_eq!(f.mode.is_some(), f.wired, "{} mode vs wired", f.id);
+            // An absent service is still reported, and reports nothing wired.
+            assert!(f.present || !f.wired, "{} wired while absent", f.id);
+        }
     }
 
     #[test]

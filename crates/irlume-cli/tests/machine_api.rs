@@ -27,7 +27,8 @@ fn version_json_is_one_machine_document() {
             "version-json",
             "profiles-list-json",
             "status-json",
-            "doctor-json"
+            "doctor-json",
+            "login-status-json"
         ])
     );
 }
@@ -141,6 +142,125 @@ fn status_json_refuses_an_unsupported_contract_before_reading_anything() {
         .expect("run irlume");
     assert_eq!(output.status.code(), Some(2));
     let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["error"]["code"], "unsupported-contract");
+}
+
+#[test]
+fn login_status_json_lists_every_surface_by_service_name() {
+    // The surface list is COMPLETE: services that do not exist on this machine
+    // stay in the array with `present: false`, so a consumer reading an id it
+    // knows and cannot find may conclude the engine does not wire that service
+    // rather than that the service is unwired here. That distinction is the
+    // whole reason this command exists, so it is asserted on a machine where
+    // most of these files are certainly absent.
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["login", "status", "--json"])
+        .output()
+        .expect("run irlume");
+
+    assert!(output.stderr.is_empty(), "stdout must stay machine-only");
+    assert_eq!(
+        output.stdout.iter().filter(|&&b| b == b'\n').count(),
+        1,
+        "exactly one document"
+    );
+    let raw = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(
+        !raw.contains("/etc/pam.d"),
+        "machine output publishes service names, never PAM file paths: {raw}"
+    );
+    assert!(
+        !raw.contains("[login]"),
+        "the human report must not leak into machine mode: {raw}"
+    );
+
+    let document: Value = serde_json::from_str(&raw).expect("valid JSON");
+    assert_eq!(document["command"], "login.status");
+    assert_eq!(document["contract_version"], 1);
+    assert_eq!(document["ok"], true);
+
+    let surfaces = document["data"]["surfaces"]
+        .as_array()
+        .expect("surfaces must be an array");
+    // Public API: this list may grow, but an id is never renamed or reused.
+    for required in [
+        "gdm-password",
+        "sddm",
+        "lightdm",
+        "plasmalogin",
+        "cosmic-greeter",
+        "greetd",
+        "gdm-fingerprint",
+        "kde",
+        "sudo",
+        "polkit-1",
+    ] {
+        assert!(
+            surfaces.iter().any(|s| s["id"] == required),
+            "surface `{required}` is missing from the array"
+        );
+    }
+
+    for surface in surfaces {
+        assert!(surface["present"].is_boolean(), "{surface}");
+        assert!(surface["wired"].is_boolean(), "{surface}");
+        let role = surface["role"].as_str().expect("role must be a string");
+        assert!(
+            [
+                "login-screen",
+                "login-screen-fingerprint",
+                "lock-screen",
+                "sudo",
+                "polkit"
+            ]
+            .contains(&role),
+            "unexpected role `{role}`"
+        );
+        match surface["mode"].as_str() {
+            Some(mode) => {
+                assert_eq!(
+                    surface["wired"], true,
+                    "a mode without wiring would describe how nothing fires: {surface}"
+                );
+                assert!(
+                    ["face-first", "on-demand", "keyring", "verify"].contains(&mode),
+                    "unexpected mode `{mode}`"
+                );
+            }
+            // Absent, not null: there is no mode for an unwired surface.
+            None => assert!(surface.get("mode").is_none(), "{surface}"),
+        }
+    }
+
+    let mut ids: Vec<_> = surfaces.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    let before = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(before, ids.len(), "surface ids must be unique");
+
+    // A login manager the engine could not determine says so; it never reports
+    // a name it does not have.
+    let manager = &document["data"]["login_manager"];
+    if manager["known"] == false {
+        assert!(manager.get("name").is_none(), "{manager}");
+    } else {
+        assert!(manager["name"].is_string(), "{manager}");
+        assert!(manager["recognized"].is_boolean(), "{manager}");
+    }
+
+    assert!(["loaded", "not-loaded", "unknown"]
+        .contains(&document["data"]["selinux_module"].as_str().unwrap()));
+}
+
+#[test]
+fn login_status_json_refuses_an_unsupported_contract() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["login", "status", "--contract", "9", "--json"])
+        .output()
+        .expect("run irlume");
+    assert_eq!(output.status.code(), Some(2));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["command"], "login.status");
     assert_eq!(document["error"]["code"], "unsupported-contract");
 }
 

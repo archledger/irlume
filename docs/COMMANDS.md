@@ -20,9 +20,9 @@ Conventions that apply everywhere:
 |---|---|
 | `irlume tui` | guided setup + live dashboard; enroll and configure here |
 | `irlume setup` | scripted onboarding: enroll, keyring, recovery, PAM wiring, each step prompted y/N |
-| `irlume status` | health dashboard: daemon, enrollment, keyring, cameras |
+| `irlume status` | health dashboard: daemon, enrollment, keyring, cameras; `status --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume detect` | script-friendly probe; exit `0` = ready, `10` = partial, `20` = absent |
-| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones) |
+| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones); `doctor --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume deps` | verify runtime dependencies (onnxruntime, models, TPM) |
 | `irlume version` | print the installed version (`--version` / `-V` also work); `version --json` uses the public [machine API](MACHINE-API.md) |
 
@@ -53,7 +53,7 @@ Conventions that apply everywhere:
 
 | Command | Sudo | What it does |
 |---|---|---|
-| `irlume login <status\|enable\|disable\|reconcile> [--with-sudo] [--with-polkit] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`, `--with-polkit` adds app prompts (Bitwarden unlock, pkexec; see docs/APP-INTEGRATION.md); `reconcile` re-applies the wiring after a distro PAM regeneration (also run by the `irlume-reconcile.path` unit); without `--apply` it previews |
+| `irlume login <status\|enable\|disable\|reconcile> [--with-sudo] [--with-polkit] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`, `--with-polkit` adds app prompts (Bitwarden unlock, pkexec; see docs/APP-INTEGRATION.md); `reconcile` re-applies the wiring after a distro PAM regeneration (also run by the `irlume-reconcile.path` unit); without `--apply` it previews; `login status --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume logs [-f] [--since T]` | sometimes | the face-auth journal in one view (daemon, PAM, keyring); `-f` follows live, `--since "10 min ago"` widens the window |
 | `irlume logs debug <on\|off>` | yes | per-stage pipeline tracing in the daemon (numbers only, never frames) |
 | `irlume fingerprint <status\|add\|verify\|reset\|enable\|disable> [--fingerprint-only]` | for wiring | fprintd companion; `enable` = unlock with face OR fingerprint (both), `--fingerprint-only` replaces face |

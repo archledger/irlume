@@ -187,6 +187,67 @@ and cannot find as "this engine version does not run that check" rather than as
 `id` values are public API. The list may grow; an id is never renamed and never
 reused for a different meaning.
 
+### `irlume login status --json`
+
+Capability: `login-status-json`.
+
+Which PAM surfaces carry face auth, by service name:
+
+```json
+{
+  "login_manager": {
+    "known": true,
+    "name": "plasmalogin",
+    "recognized": true,
+    "services": ["plasmalogin"]
+  },
+  "surfaces": [
+    { "id": "plasmalogin", "role": "login-screen", "present": true, "wired": true, "mode": "on-demand" },
+    { "id": "sddm", "role": "login-screen", "present": false, "wired": false },
+    { "id": "kde", "role": "lock-screen", "present": true, "wired": true, "mode": "on-demand" },
+    { "id": "sudo", "role": "sudo", "present": true, "wired": true, "mode": "verify" }
+  ],
+  "selinux_module": "loaded"
+}
+```
+
+`id` is the PAM service name, and it is public API on the same terms as a doctor
+check id: the list may grow, an id is never renamed and never reused. Paths under
+`/etc/pam.d` are not published, for the reason `status --json` publishes camera
+capability and not camera nodes.
+
+`role` is one of `login-screen`, `login-screen-fingerprint`, `lock-screen`,
+`sudo` or `polkit`.
+
+`present` is whether the service exists on this machine at all, counting a vendor
+copy an override would be materialized from. `wired` is whether it currently
+carries the irlume line.
+
+**The surface array is complete.** A service absent from the machine is still
+reported, with `present: false`, so a consumer that knows an id and cannot find
+it may read that as "this engine version does not wire that service" rather than
+as "it is not wired here".
+
+`mode` says how face fires on a wired surface: `face-first` (the camera verifies
+as soon as the greeter prompts), `on-demand` (the user submits an empty password
+to trigger face), `keyring` (the fingerprint keyring-unlock line, which is not a
+face factor), or `verify` (the plain sudo and polkit stanza). It is absent, never
+null, when the surface is not wired.
+
+`login_manager.known` is false when no `display-manager.service` is set: a
+headless host, or a greeter that registers none. That is not the same as "no
+login manager is installed", and a consumer should not render it that way.
+`recognized` is whether irlume maps this login manager to PAM services at all; an
+unrecognized one cannot be targeted by `login enable`. `services` are the PAM
+services that login manager consults, which is how a consumer decides which
+surface entry describes its own login screen without matching on names. A service
+listed there with no matching entry in `surfaces` is one this engine has no
+wiring recipe for.
+
+`selinux_module` is `loaded`, `not-loaded` or `unknown`. Reading the policy store
+needs root, so an ordinary caller gets `unknown`, which is not a synonym for
+`not-loaded`.
+
 ### `irlume profiles list --json [--user USER]`
 
 Capability: `profiles-list-json`.

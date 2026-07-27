@@ -117,6 +117,9 @@ fn main() -> std::process::ExitCode {
         (Some("recovery"), sub) => recovery::run(sub, &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
+        (Some("login"), Some("status")) if args.iter().any(|arg| arg == "--json") => {
+            machine::login_status(&args)
+        }
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),

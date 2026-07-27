@@ -32,6 +32,7 @@ const CAPABILITIES: &[&str] = &[
     "profiles-list-json",
     "status-json",
     "doctor-json",
+    "login-status-json",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -380,6 +381,92 @@ pub fn doctor(args: &[String]) -> ExitCode {
     )
 }
 
+/// `irlume login status --json`: which PAM surfaces carry face auth.
+///
+/// Reads the same PAM files the human report reads, in the same pass, so the
+/// two cannot disagree about what is wired. It publishes PAM SERVICE NAMES
+/// rather than `/etc/pam.d` paths, for the same reason `status --json` reports
+/// camera capability rather than camera nodes: a consumer needs to know which
+/// surface is wired, not where the file lives.
+pub fn login_status(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.status";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    if without_contract(args) != ["login", "status", "--json"] {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+
+    let manager = crate::pamwire::login_manager_fact();
+    // Unknown is not "none". A host with no `display-manager.service` may be
+    // headless or may run a greeter that registers none; either way the engine
+    // did not find out, and a consumer must not render that as "no login
+    // manager is installed".
+    let login_manager = match &manager.name {
+        Some(name) => json!({
+            "known": true,
+            "name": name,
+            "recognized": manager.recognized,
+            "services": manager.services,
+        }),
+        None => json!({ "known": false }),
+    };
+
+    let surfaces: Vec<Value> = crate::pamwire::surface_facts()
+        .iter()
+        .map(|s| {
+            let mut entry = json!({
+                "id": s.id,
+                "role": s.role,
+                "present": s.present,
+                "wired": s.wired,
+            });
+            // Absent rather than null when not wired: there is no mode to
+            // report, and an explicit null invites a consumer to render one.
+            if let Some(mode) = s.mode {
+                entry["mode"] = json!(mode);
+            }
+            entry
+        })
+        .collect();
+
+    let selinux_module = match crate::pamwire::selinux_state() {
+        Some(true) => "loaded",
+        Some(false) => "not-loaded",
+        // The policy store needs root to read, so an ordinary caller gets
+        // `unknown` here. It is not a synonym for "not loaded".
+        None => "unknown",
+    };
+
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "login_manager": login_manager,
+                "surfaces": surfaces,
+                "selinux_module": selinux_module,
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
 pub fn profiles_list(args: &[String]) -> ExitCode {
     const COMMAND: &str = "profiles.list";
     // Negotiate first: an unsupported contract is refused before the daemon is
@@ -596,7 +683,8 @@ mod tests {
                 "version-json",
                 "profiles-list-json",
                 "status-json",
-                "doctor-json"
+                "doctor-json",
+                "login-status-json"
             ])
         );
         assert!(document.get("error").is_none());

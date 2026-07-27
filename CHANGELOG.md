@@ -7,6 +7,27 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`irlume login status --json`.** Which PAM surfaces carry face auth, as values
+  instead of the report's glyphs and column spacing. Each surface reports its PAM
+  service name, its role (`login-screen`, `login-screen-fingerprint`,
+  `lock-screen`, `sudo`, `polkit`), whether the service exists here, whether it is
+  wired, and how face fires on it (`face-first`, `on-demand`, `keyring`,
+  `verify`). The active login manager is named alongside the PAM services it
+  consults, so an integration can find the entry describing its own login screen
+  without guessing from service names.
+
+  The surface list is complete: a service absent from the machine still appears,
+  with `present: false`. Service names are published rather than `/etc/pam.d`
+  paths, on the same terms as the camera capability in `status --json`.
+
+  The human `login status` is unchanged, byte for byte. Both outputs are built
+  from one pass over the PAM files, so they can differ in wording but not in what
+  they claim is wired.
+
+  This completes the read-only machine API: `version`, `status`, `doctor`,
+  `profiles list` and `login status` all answer in JSON, and none of the five
+  commands a desktop integration needs requires parsing English.
+
 - **`irlume doctor --json`.** Every readiness check as an identified result with
   a state of `pass`, `warn`, `fail`, `unknown` or `info`, so an integration can
   show a diagnostic list without matching English.

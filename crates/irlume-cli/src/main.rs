@@ -506,6 +506,16 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
         Ok(Response::Ok(msg)) => {
             println!("[calibrate] ✓ {msg}");
             println!("[calibrate] the polkit consent gesture is now calibrated for '{user}'.");
+            // Said HERE, where the user still has the camera up and can redo it,
+            // rather than only in doctor. What was just stored describes the eye
+            // shape under the light in the room right now.
+            println!(
+                "[calibrate] this reading is tied to the light you are in now. Eye shape is \
+                 stored\n            as absolute values and they shift as the room changes, \
+                 so a calibration\n            taken in daylight can stop registering after \
+                 dark. Re-run this in the\n            light you actually use. The head nod \
+                 needs no calibration and is not\n            affected."
+            );
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
@@ -2449,6 +2459,36 @@ fn report_credential_release(
                 "close your eyes ~1s then open"
             } else {
                 "keep nodding your head"
+            }
+        );
+    }
+    // Only for users who actually have a closure calibration: it is stored as
+    // absolute EAR values, and those move with the light. Measured on one user's
+    // hardware the same seated position gave a median open EAR of 0.109 at an
+    // ambient of 22-42 and 0.166 at an ambient of 1, a 52% shift. No single
+    // calibration covers both: registering that session's deepest closure and
+    // its shallowest reopen needs a gap of 0.030, and the code requires 0.05.
+    //
+    // Nothing here can fix that, so doctor says it. Being told once beats
+    // discovering it as a keyring prompt that only happens after dark, and the
+    // nod is right there needing no calibration at all.
+    if closure_calibrated || gesture_is_closure {
+        dout!(
+            report,
+            "[doctor] note: your eye-closure calibration is tied to the LIGHT you \
+             calibrated in.\n     \
+             Eye shape is stored as absolute values, and they shift as the room \
+             changes, so a\n     \
+             calibration taken in daylight can stop registering after dark. \
+             Re-run `sudo irlume\n     \
+             calibrate-closure` in the light you actually use{}",
+            if gesture_is_closure {
+                ". consent_gesture=closure means there\n     \
+                 is no fallback gesture; unset it in settings.conf to also accept the head \
+                 nod,\n     which is pose-defined and needs no calibration."
+            } else {
+                ", or just use the head nod, which is\n     \
+                 pose-defined and unaffected by lighting."
             }
         );
     }

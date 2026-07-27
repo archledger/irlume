@@ -196,8 +196,10 @@ credential to it) and requires a deliberate consent gesture before approving,
 because the prompt starts scanning without any action from you. The default
 gesture is a **head nod** (no calibration; works at any angle or lighting). If
 you prefer to approve by closing your eyes for about a second, run `sudo irlume
-calibrate-closure` once and either gesture is accepted. Full walkthrough,
-Bitwarden setup, and the security stance: [APP-INTEGRATION.md](APP-INTEGRATION.md).
+calibrate-closure` once and either gesture is accepted; calibrate in the light
+you actually use, because the stored eye measurements shift as the room changes.
+Full walkthrough, Bitwarden setup, and the security stance:
+[APP-INTEGRATION.md](APP-INTEGRATION.md).
 
 ## Fingerprint companion (optional)
 

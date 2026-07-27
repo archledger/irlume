@@ -51,6 +51,15 @@ that either gesture is accepted. The eye-closure path is 2D and pose-sensitive,
 so it works best sitting square-on to the camera; the nod covers every other
 position. `consent_gesture=nod|closure` in settings.conf restricts to one.
 
+**Calibrate in the light you actually use.** The eye measurements are stored as
+absolute values, and they move with the room. Measured on one user's hardware,
+20 readings: the same seated position gave a median open EAR of 0.109 at an
+ambient of 22-42 and 0.166 at an ambient of 1, and no single calibration covers
+both, so one taken in daylight can stop registering after dark. Re-running
+`calibrate-closure` fixes it for the new condition. The head nod is pose-defined
+and carries none of this, which is why it is the default and the only gesture
+the prompts name.
+
 Check the state any time:
 
 ```console

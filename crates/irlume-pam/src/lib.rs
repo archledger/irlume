@@ -257,18 +257,25 @@ impl PamServiceModule for IrlumePam {
                 }
             }
 
-            // On a polkit prompt the daemon requires the deliberate eye-closure
-            // consent gesture, which is not discoverable from the dialog, so tell
-            // the user what to do. Best-effort text info (the KDE/GNOME agent
-            // shows it inline); shown once, before the capture, only for the
-            // polkit service so sudo / lock screen are unaffected.
+            // On a polkit prompt the daemon requires a deliberate consent gesture,
+            // which is not discoverable from the dialog, so tell the user what to do.
+            // Best-effort text info (the KDE/GNOME agent shows it inline); shown
+            // once, before the capture, only for the polkit service so sudo / lock
+            // screen are unaffected.
+            //
+            // The text comes from the same `consent_gesture_mode` parse the engine
+            // gates on, exactly as the credential-release probe below does. It used
+            // to be a hardcoded string naming both gestures, which told a
+            // `closure`-only user to nod at a gate that would not accept a nod: the
+            // failure `ConsentGesture` was introduced to prevent.
             let is_polkit = matches!(
                 pamh.get_service().ok().flatten().and_then(|c| c.to_str().ok().map(str::to_string)),
                 Some(ref s) if s == "polkit-1" || s == "polkit"
             );
             if is_polkit && !unseal {
+                let how = irlume_common::config::consent_gesture_mode().instruction("approve");
                 let _ = pamh.conv(
-                    Some("irlume: keep nodding your head to approve (or close your eyes ~1s then open)"),
+                    Some(&format!("irlume: {how}")),
                     pamsm::PamMsgStyle::TEXT_INFO,
                 );
             }

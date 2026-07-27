@@ -174,9 +174,19 @@ impl ConsentGesture {
             Self::Closure => {
                 format!("close your eyes for about a second, then open, to {what}")
             }
-            Self::Either => {
-                format!("keep nodding your head to {what} (or close your eyes ~1s then open)")
-            }
+            // `Either` accepts both, but the instruction names ONLY the nod. A
+            // one-line prompt at a greeter or a polkit dialog is read once, under
+            // time pressure, and the two gestures are not equally reliable: the nod
+            // needs no calibration at all, while the closure gate depends on a
+            // per-user EAR calibration that can be thin enough to miss. Measured
+            // 2026-07-27 on the maintainer's hardware, 20 self-paced readings:
+            // glasses HALVE the open-eye EAR (0.109-0.120 with, 0.249-0.255
+            // without), so one calibration spanning both conditions left a margin of
+            // 0.0095 EAR. Offering a gesture that thin, in the line someone reads
+            // while trying to log in, costs them the release window and then the
+            // password. Closure stays accepted, and stays documented in `irlume
+            // doctor` where there is room to explain the calibration it needs.
+            Self::Either => format!("keep nodding your head to {what}"),
         }
     }
 }
@@ -434,7 +444,8 @@ mod tests {
         assert_eq!(consent_gesture_mode(), ConsentGesture::Nod);
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
 
-        // The instruction names ONLY gestures that mode actually accepts.
+        // An instruction must never name a gesture its mode would REFUSE; naming
+        // fewer than it accepts is a deliberate choice, not a defect.
         let nod = ConsentGesture::Nod.instruction("unlock your keyring");
         assert!(nod.contains("nod") && !nod.contains("eyes"), "{nod}");
         let closure = ConsentGesture::Closure.instruction("unlock your keyring");
@@ -442,10 +453,14 @@ mod tests {
             closure.contains("eyes") && !closure.contains("nod"),
             "closure-only must not tell the user to nod: {closure}"
         );
+        // `Either` accepts both and names only the nod: it is the gesture that
+        // needs no calibration, and a prompt is read once under time pressure.
+        // Offering the closure here would send an uncalibrated user after the one
+        // gesture that cannot work for them.
         let either = ConsentGesture::Either.instruction("unlock your keyring");
         assert!(
-            either.contains("nod") && either.contains("eyes"),
-            "{either}"
+            either.contains("nod") && !either.contains("eyes"),
+            "the either-mode prompt must name the no-calibration gesture only: {either}"
         );
         // The subject is interpolated, so one wording serves keyring and polkit.
         assert!(nod.ends_with("unlock your keyring"), "{nod}");

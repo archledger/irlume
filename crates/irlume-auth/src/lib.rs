@@ -1681,9 +1681,10 @@ impl Engine {
                 ConsentGesture::Closure => {
                     "close your eyes for about a second, then open, to approve"
                 }
-                ConsentGesture::Either => {
-                    "keep nodding your head to approve (or, if you've calibrated it, close your eyes ~1s then open)"
-                }
+                // Names only the nod, for the reason given on
+                // `ConsentGesture::instruction`: a denial is the worst possible
+                // moment to offer the gesture that needs a calibration to work.
+                ConsentGesture::Either => "keep nodding your head to approve",
             }))
         }
     }

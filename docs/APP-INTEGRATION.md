@@ -19,15 +19,16 @@ pieces:
    the app and the action being approved, and starts a PAM conversation on the
    `polkit-1` service.
 3. `pam_irlume` in that stack asks `irlumed` to verify your face. For a polkit
-   prompt the daemon also requires a deliberate consent gesture: **nod your
-   head**, or **close your eyes for about a second then open them**, whichever
-   suits your position (see the security section). It then answers yes or no;
-   the app learns only the verdict.
+   prompt the daemon also requires a deliberate consent gesture: **keep nodding
+   your head**, or, if you have calibrated it, **close your eyes for about a
+   second then open them** (see the security section). It then answers yes or
+   no; the app learns only the verdict.
 
 Both the KDE and GNOME agents start the PAM conversation the moment the dialog
-appears, so the camera fires immediately. The dialog shows "irlume: nod your
-head to approve (or close your eyes ~1s then open)"; perform either gesture and
-it approves, no typing or clicking.
+appears, so the camera fires immediately. The dialog shows "irlume: keep
+nodding your head to approve"; do that and it approves, no typing or clicking.
+The eye closure is accepted too when calibrated, but the prompt names only the
+nod, because the nod is the gesture that works with no setup.
 
 ## Enabling
 

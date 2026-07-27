@@ -372,6 +372,69 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  units:
+    name: systemd units (verify + exposure ratchet)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: systemd-analyze verify (unit syntax)
+        run: |
+          set -euo pipefail
+          command -v systemd-analyze >/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq systemd; }
+          # verify resolves ExecStart and fails on a binary that is not present,
+          # which on a build runner it never is. Stub the two paths so the check
+          # is about unit syntax, which is what we actually want tested.
+          sudo install -Dm755 /bin/true /usr/bin/irlumed
+          sudo install -Dm755 /bin/true /usr/bin/irlume
+          for u in packaging/systemd/*.service packaging/systemd/*.timer packaging/systemd/*.path; do
+            echo "::group::verify $(basename "$u")"
+            systemd-analyze verify "$u"
+            echo "::endgroup::"
+          done
+
+      - name: systemd-analyze security (exposure must not regress)
+        run: |
+          set -euo pipefail
+          # Ratchet, in the same spirit as the coverage floor. These numbers are
+          # the CURRENT measured exposure, so any change that loosens sandboxing
+          # fails here instead of shipping quietly. --threshold compares on a
+          # 0-100 scale, so 3.7 as displayed is 37 here, and it fails only when
+          # exposure goes OVER the number.
+          #
+          # To re-baseline deliberately: run
+          #   systemd-analyze security --offline=true packaging/systemd/<unit>
+          # and move the number, in the same commit as whatever changed it.
+          #
+          # The score is systemd-version-sensitive. Measured on the ubuntu-24.04
+          # image (systemd 255); a runner image that moves to a systemd with new
+          # checks may need a re-baseline, which is a deliberate act, not a
+          # silent drift.
+          #
+          # irlume-reconcile.service is knowingly high: it is a root oneshot that
+          # rewrites /etc/pam.d, so it holds broad access by design. Locking it
+          # here stops it getting worse. Hardening it is its own change, with its
+          # own validation, because it is the self-heal that repairs broken PAM.
+          fail=0
+          check() {
+            local unit="$1" threshold="$2"
+            echo "::group::security $(basename "$unit") (threshold ${threshold})"
+            if systemd-analyze security --offline=true --threshold="$threshold" "$unit"; then
+              echo "OK: at or below the recorded exposure"
+            else
+              echo "::error::$(basename "$unit") exposure rose above ${threshold} (0-100 scale)"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          check packaging/systemd/irlumed.service 37
+          check packaging/systemd/irlume-reconcile.service 94
+          exit "$fail"
+
   nix:
     name: nix flake check
     runs-on: ubuntu-24.04

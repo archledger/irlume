@@ -111,6 +111,72 @@ jobs:
           # capture_ir keys on. A dead emitter shows as a flat, dark burst.
           awk '{print $2}' "$out/means.txt" | sort -n | awk 'NR==1{min=$1} END{max=$1; d=max-min; printf "mean spread: %.1f\n", d; exit (d < 5)}'
 
+      # Forensics on failure only. A hardware-only failure is otherwise
+      # reconstructed by reading raw job logs and guessing at machine state that
+      # has since changed: the first diagnosis of the CARGO_TARGET_DIR breakage
+      # in this very job started from a wrong hypothesis (that the runner was
+      # offline) because none of this was captured.
+      #
+      # Everything is best-effort and must never mask the real failure, so each
+      # command swallows its own error and the step force-succeeds. Scoped
+      # deliberately: the irlumed unit journal and kernel ring rather than the
+      # whole system journal, because this runner is a personal machine.
+      - name: Collect failure forensics
+        if: failure()
+        continue-on-error: true
+        run: |
+          set +e
+          out=hw-forensics
+          mkdir -p "$out"
+
+          {
+            echo "commit:  ${GITHUB_SHA}"
+            echo "run:     ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}"
+            echo "runner:  $(uname -a)"
+            echo "rustc:   $(rustc -vV 2>&1 | tr '\n' ' ')"
+            echo "target:  ${CARGO_TARGET_DIR:-target}"
+          } > "$out/context.txt" 2>&1
+
+          # Cameras: which nodes exist, what formats they claim, and whether the
+          # loopback module is loaded. "no IR camera" and "IR camera wedged" look
+          # identical in the job log without this.
+          {
+            ls -l /dev/video* /dev/media* 2>&1
+            echo "--- v4l2 devices ---"; v4l2-ctl --list-devices 2>&1
+            for d in /dev/video*; do
+              echo "--- $d formats ---"; v4l2-ctl -d "$d" --list-formats-ext 2>&1
+            done
+            echo "--- usb ---"; lsusb 2>&1
+            echo "--- v4l2loopback ---"; lsmod 2>&1 | grep -i v4l2 || echo "(module not loaded)"
+          } > "$out/cameras.txt" 2>&1
+
+          # TPM: presence and permissions. A tss-group or device-permission
+          # change is invisible in a "test failed" line.
+          { ls -l /dev/tpm* 2>&1; echo "--- groups ---"; id 2>&1; } > "$out/tpm.txt" 2>&1
+
+          # dmesg is root-only here (kernel.dmesg_restrict=1), but the journal is
+          # readable by the runner user, so take the kernel ring through it.
+          journalctl -k --since "-30 min" --no-pager > "$out/kernel.log" 2>&1
+          journalctl -u irlumed --since "-30 min" --no-pager > "$out/irlumed.log" 2>&1
+          coredumpctl list --no-pager > "$out/coredumps.txt" 2>&1
+
+          # Bound the bundle: a runaway log must not turn a failed run into a
+          # multi-gigabyte upload.
+          find "$out" -type f -size +5M -exec truncate -s 5M {} \;
+          ls -la "$out"
+
+      - name: Upload failure forensics
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hardware-forensics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: hw-forensics/
+          if-no-files-found: warn
+          # Short: this is debugging material from a personal machine, not an
+          # artifact anyone should be able to fetch weeks later.
+          retention-days: 7
+
   # Hardware-inclusive statement coverage: the same measurement the hosted
   # ratchet takes, but with the TPM-gated tests on REAL silicon and the
   # camera/PAM matrices included. Report-only (no floor): the number feeds

@@ -23,6 +23,7 @@
 mod bitwarden;
 mod blinkcap;
 mod commands;
+mod doctor_report;
 mod fingerprint;
 mod logs;
 mod machine;
@@ -2460,34 +2461,57 @@ fn report_polkit_sandbox() {
 }
 
 fn doctor() -> std::process::ExitCode {
+    let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Human);
+    doctor_run(&mut report)
+}
+
+/// One pass over the machine. Prints the human report or stays silent and
+/// records, depending on `report`.
+fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCode {
+    use crate::doctor_report::State;
     use irlume_common::secureboot;
     // --- platform / trust anchors ------------------------------------------
-    println!(
+    dout!(report, 
         "[doctor] platform: {}",
         irlume_common::platform::distro_family().as_str()
     );
+    report.check_detail(
+        "platform",
+        State::Info,
+        irlume_common::platform::distro_family().as_str(),
+    );
     let origin = commands::install_origin();
-    println!("[doctor] install origin: {}", origin.describe());
+    dout!(report, "[doctor] install origin: {}", origin.describe());
+    report.check_detail("install-origin", State::Info, origin.describe());
     match tpm_device() {
-        Some(d) => println!("[doctor] TPM 2.0: {d} ✓"),
-        None => println!("[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗; required for sealing"),
+        Some(d) => {
+            dout!(report, "[doctor] TPM 2.0: {d} ✓");
+            report.check("tpm", State::Pass);
+        }
+        None => {
+            dout!(
+                report,
+                "[doctor] TPM 2.0: none (/dev/tpmrm0 absent) ✗; required for sealing"
+            );
+            report.check("tpm", State::Fail);
+        }
     }
     if !secureboot::secure_boot_present() {
-        println!("[doctor] Secure Boot: unknown (not a UEFI boot?)");
+        dout!(report, "[doctor] Secure Boot: unknown (not a UEFI boot?)");
     } else if secureboot::is_secure_boot_enabled() {
-        println!("[doctor] Secure Boot: enabled ✓");
+        dout!(report, "[doctor] Secure Boot: enabled ✓");
     } else if secureboot::is_setup_mode() {
-        println!(
+        dout!(report, 
             "[doctor] Secure Boot: SETUP MODE ⚠ (keys not enrolled); PCR-7 binding is NOT enforcing"
         );
     } else {
-        println!("[doctor] Secure Boot: disabled ⚠ (TPM PCR-7 binding is weak; enable for trust)");
+        dout!(report, "[doctor] Secure Boot: disabled ⚠ (TPM PCR-7 binding is weak; enable for trust)");
     }
-    println!(
+    dout!(report, 
         "[doctor] boot mode: {}",
         secureboot::detect_boot_mode().as_str()
     );
-    println!(
+    dout!(report, 
         "[doctor] signed PCR policy: {}",
         if irlume_core::pcrsig::signed_policy_available() {
             "systemd PCR-11 signature present ✓; kernel updates won't need re-seal"
@@ -2495,7 +2519,7 @@ fn doctor() -> std::process::ExitCode {
             "none (no Tier 1 on this boot chain)"
         }
     );
-    println!(
+    dout!(report, 
         "[doctor] pcrlock: {}",
         match irlume_core::tpm::pcrlock_provisioned() {
             Some(nv) => format!(
@@ -2509,12 +2533,12 @@ fn doctor() -> std::process::ExitCode {
     );
 
     // --- cameras -----------------------------------------------------------
-    println!("[doctor] camera nodes (classified by pixel format):");
+    dout!(report, "[doctor] camera nodes (classified by pixel format):");
     let nodes = irlume_camera::discover_nodes();
     if nodes.is_empty() {
-        println!("  (none found under /dev/video0..9)");
+        dout!(report, "  (none found under /dev/video0..9)");
         if let Some(gen) = irlume_camera::intel_ipu_present() {
-            println!(
+            dout!(report, 
                 "  ⚠ this laptop has an Intel {gen} MIPI camera, which irlume cannot use:\n     \
                  - its capture nodes emit raw Bayer, not a directly-openable YUYV/GREY stream;\n     \
                  - the IR (Windows Hello) sensor is not exposed on Linux at all, so IR face\n       \
@@ -2531,7 +2555,7 @@ fn doctor() -> std::process::ExitCode {
         } else {
             ""
         };
-        println!("  {path}: {role:?}{priv_on}");
+        dout!(report, "  {path}: {role:?}{priv_on}");
         // An RGB node the capture path can't decode (MJPEG-only) classifies as
         // usable but would fail at capture; warn here instead.
         if *role == irlume_camera::Role::Rgb {
@@ -2549,7 +2573,7 @@ fn doctor() -> std::process::ExitCode {
                             .to_string()
                     })
                     .collect();
-                println!(
+                dout!(report, 
                     "     ⚠ offers only [{}]; irlume needs an uncompressed format\n       \
                      (YUYV or NV12). This camera will detect but fail at capture.",
                     list.join(", ")
@@ -2559,21 +2583,21 @@ fn doctor() -> std::process::ExitCode {
     }
 
     // --- models / runtime --------------------------------------------------
-    println!("[doctor] models:");
+    dout!(report, "[doctor] models:");
     if commands::daemon_models_loaded() == Some(true) {
-        println!("  loaded by the daemon ✓");
+        dout!(report, "  loaded by the daemon ✓");
     } else {
         for (f, env) in commands::REQUIRED_MODELS {
             match commands::resolve_model(f, env) {
-                Some(p) => println!("  {f}: present ✓ ({})", p.display()),
+                Some(p) => dout!(report, "  {f}: present ✓ ({})", p.display()),
                 None => {
-                    println!("  {f}: not found; install the irlume package (or run from the repo)")
+                    dout!(report, "  {f}: not found; install the irlume package (or run from the repo)")
                 }
             }
         }
     }
     let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
-    println!(
+    dout!(report, 
         "[doctor] ORT_DYLIB_PATH: {}",
         if ort.is_empty() {
             "(unset)".into()
@@ -2581,7 +2605,7 @@ fn doctor() -> std::process::ExitCode {
             ort
         }
     );
-    println!("[doctor] third-party PAD model: {}", models::doctor_line());
+    dout!(report, "[doctor] third-party PAD model: {}", models::doctor_line());
 
     // --- companion factors / data-at-rest ----------------------------------
     let fp_names = irlume_fingerprint::device_names();
@@ -2593,7 +2617,7 @@ fn doctor() -> std::process::ExitCode {
             fp_names.join(" + ")
         ),
     };
-    println!("[doctor] fingerprint reader: {fp}");
+    dout!(report, "[doctor] fingerprint reader: {fp}");
     if irlume_fingerprint::fprintd_present() {
         // Vendor stack behind the fprint bus name: open-fprintd/python-validity
         // answer the same D-Bus name with different failure modes (stale PPAs,
@@ -2601,7 +2625,7 @@ fn doctor() -> std::process::ExitCode {
         // remedies point at the right daemon.
         if let Some(unit) = irlume_fingerprint::bus_owner_unit() {
             if unit != "fprintd.service" {
-                println!(
+                dout!(report, 
                     "  ⚠ the fprint bus name is owned by '{unit}', not fprintd.service: a \
                      vendor driver stack is answering; its failure modes differ from stock \
                      fprintd"
@@ -2612,21 +2636,21 @@ fn doctor() -> std::process::ExitCode {
         // prompt never appears. The dominant post-suspend fingerprint failure.
         let user = user_arg(&[]);
         if irlume_fingerprint::reader_stuck(&user) {
-            println!(
+            dout!(report, 
                 "  ⚠ the reader is held by a stale fprintd claim (finger prompts will not \
                  appear; common after suspend/resume); fix: sudo systemctl restart fprintd"
             );
         }
         let pam_dir = std::path::Path::new("/etc/pam.d");
         if fingerprint::faillock_cohabits(pam_dir) {
-            println!(
+            dout!(report, 
                 "  ⚠ pam_faillock and pam_fprintd share a PAM stack: a touch-sensor misread \
                  can burn every fingerprint retry in seconds, and each one counts toward the \
                  account lockout. If you get locked out: faillock --user <you> --reset"
             );
         }
         if fingerprint::fprintd_in_sudo(pam_dir) && fingerprint::sshd_present() {
-            println!(
+            dout!(report, 
                 "  ⚠ pam_fprintd is reachable from the sudo stack and an SSH server is \
                  enabled: `sudo` inside an SSH session will stall for the fingerprint \
                  timeout (up to 30s) waiting on the local reader. Consider scoping \
@@ -2639,13 +2663,13 @@ fn doctor() -> std::process::ExitCode {
     let user = user_arg(&[]);
     match daemon_request(&irlume_common::Request::RecoveryStatus { user: user.clone() }) {
         Ok(irlume_common::Response::RecoveryStatus { encrypted, recovery_set, .. }) => {
-            println!(
+            dout!(report, 
                 "[doctor] templates ({user}): {} · recovery passphrase {}",
                 if encrypted { "ENCRYPTED ✓" } else { "plaintext at rest" },
                 if recovery_set { "SET ✓" } else { "not set (run `irlume recovery setup`)" },
             );
         }
-        _ => println!("[doctor] templates ({user}): unknown (daemon not reachable; run `irlume recovery status`)"),
+        _ => dout!(report, "[doctor] templates ({user}): unknown (daemon not reachable; run `irlume recovery status`)"),
     }
 
     // --- polkit app prompts ------------------------------------------------
@@ -2681,7 +2705,7 @@ fn doctor() -> std::process::ExitCode {
     report_credential_release(&user, gesture_is_closure, closure_calibrated);
 
     match crate::pamwire::polkit_wired() {
-        Some(true) if !gesture_is_closure => println!(
+        Some(true) if !gesture_is_closure => dout!(report, 
             "[doctor] polkit app prompts: wired ✓ (NOD your head to approve Bitwarden unlock,\n     \
              pkexec, …; no calibration needed{})",
             if closure_calibrated {
@@ -2690,21 +2714,21 @@ fn doctor() -> std::process::ExitCode {
                 ", or run calibrate-closure to also allow the eye-closure gesture"
             }
         ),
-        Some(true) if closure_calibrated => println!(
+        Some(true) if closure_calibrated => dout!(report, 
             "[doctor] polkit app prompts: wired ✓ and calibrated ✓ (close your eyes ~1s to \
              approve; consent_gesture=closure)"
         ),
-        Some(true) => println!(
+        Some(true) => dout!(report, 
             "[doctor] polkit app prompts: wired ✓ but consent_gesture=closure and NOT calibrated;\n     \
              prompts fall back to the password. Calibrate (sudo irlume calibrate-closure) or unset\n     \
              consent_gesture in settings.conf to use the no-calibration head nod."
         ),
-        Some(false) if bitwarden_action => println!(
+        Some(false) if bitwarden_action => dout!(report, 
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
              Its biometric unlock will fall back to the password prompt. Enable with:\n     \
              sudo irlume login enable --with-polkit --apply"
         ),
-        Some(false) => println!(
+        Some(false) => dout!(report, 
             "[doctor] polkit app prompts: not wired (opt-in: sudo irlume login enable \
              --with-polkit --apply)"
         ),
@@ -2722,7 +2746,7 @@ fn doctor() -> std::process::ExitCode {
         // Bitwarden is installed without its polkit action, so its biometric
         // unlock silently falls back to the password. One command fixes it.
         if !bitwarden_action && bitwarden::app_detected() {
-            println!(
+            dout!(report, 
                 "[doctor] Bitwarden is installed but its polkit action is not; its biometric \
                  unlock\n     falls back to the password. Fix: sudo irlume bitwarden setup --apply"
             );
@@ -2756,14 +2780,14 @@ fn doctor() -> std::process::ExitCode {
     // IR enrollments fit it automatically). Nudge a re-enroll to activate it.
     // Secure/IR hardware only, and only when actually enrolled.
     if enrolled && !ir_ratio_calibrated && irlume_camera::capabilities().ir_pair {
-        println!(
+        dout!(report, 
             "[doctor] {user}'s face enrollment predates the per-user IR center/edge floor\n     \
              (an anti-print check that new IR enrollments fit automatically).\n     \
              Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
         );
     }
     if enrolled && !crate::pamwire::login_wired() {
-        println!(
+        dout!(report, 
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
              A system update (authselect / pam-auth-update) may have regenerated the\n     \
              PAM stacks. The irlume-reconcile.path unit re-applies this automatically\n     \
@@ -2777,7 +2801,7 @@ fn doctor() -> std::process::ExitCode {
     // still resolves the symlink, so name the DM and point at the tracker; adding
     // one line to dm_pam_services is all support takes.
     if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
-        println!(
+        dout!(report, 
             "[doctor] ⚠ the active display manager '{dm}' is not recognized by irlume,\n     \
              so face login cannot be wired for it (your password still works). This is\n     \
              usually a display manager that is new, or was renamed by an update. Please\n     \

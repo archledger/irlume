@@ -2430,6 +2430,28 @@ fn report_credential_release(
             "keep nodding your head"
         }
     );
+    // The gate is on AND working; the remaining failure is that the user may never
+    // be TOLD. pam_irlume sends the instruction, but a login manager that drops
+    // PAM_TEXT_INFO turns a required gesture into a silent one, which reads as
+    // "face login worked but my keyring asked for a password anyway". Saying it
+    // here moves the discovery from the login screen, where the greeter can show
+    // nothing, to a command the user runs while set up and unhurried.
+    if let Some(dm) = crate::pamwire::active_dm_hides_pam_instructions() {
+        dout!(
+            report,
+            "[doctor] ⚠ your login manager ({dm}) does not display the gesture \
+             instruction.\n     \
+             It is still REQUIRED at the login screen after a reboot or logout: {}\n     \
+             while your face is being read. Nothing on screen will ask you to. Without \
+             it your\n     \
+             login still succeeds and only the keyring falls back to the typed password.",
+            if gesture_is_closure {
+                "close your eyes ~1s then open"
+            } else {
+                "keep nodding your head"
+            }
+        );
+    }
 }
 
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the

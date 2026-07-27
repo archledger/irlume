@@ -575,6 +575,38 @@ const DM_PAM_SERVICES: &[(&str, &str, Option<&str>)] = &[
     ("cosmic-greeter", "cosmic-greeter", None),
 ];
 
+/// Login managers MEASURED not to show the user a `PAM_TEXT_INFO` message.
+///
+/// `pam_irlume` sends the consent-gesture instruction as `PAM_TEXT_INFO` before
+/// the capture, because a greeter that just says "Password:" gives the user no
+/// way to know a gesture is required. A login manager that drops that message
+/// leaves the requirement undiscoverable: the user is asked for a gesture nobody
+/// told them about, the watch window expires, and the keyring falls back to the
+/// typed password with no explanation.
+///
+/// Only entries VERIFIED to drop it belong here. An empty warning is better than
+/// a wrong one, so a login manager nobody has checked stays absent and produces
+/// no warning at all; this is not a list of everything that might be broken.
+///
+/// `plasmalogin` (Plasma Login Manager 6.7.3): the helper forwards the message
+/// and `GreeterProxy` emits `informationMessage`, but the greeter QML connects no
+/// handler to that signal, so it is dropped before presentation. Confirmed on
+/// hardware 2026-07-27 across two greeter logins that showed nothing, while the
+/// same code path renders on the KDE lock screen, which is a different codebase.
+const DM_HIDES_PAM_TEXT_INFO: &[&str] = &["plasmalogin"];
+
+/// The active login manager, when it is one known to drop `PAM_TEXT_INFO`.
+///
+/// `None` covers both "no display manager" and "not known to drop it", because
+/// doctor treats them the same: it warns only on a positive finding.
+pub(crate) fn active_dm_hides_pam_instructions() -> Option<String> {
+    let dm = active_display_manager()?;
+    DM_HIDES_PAM_TEXT_INFO
+        .iter()
+        .any(|known| *known == dm)
+        .then_some(dm)
+}
+
 /// The PAM services THIS login manager actually uses, so wiring targets what the
 /// DM will really consult (and, above all, its separate FINGERPRINT service).
 /// Returns `(greeter_label, fingerprint_label_or_none)`.
@@ -2037,6 +2069,26 @@ mod tests {
         assert_eq!(dm_pam_services("cosmic-greeter"), ("cosmic-greeter", None));
         // Anything unrecognised is named "(unknown)" with no fingerprint service.
         assert_eq!(dm_pam_services("mystery-dm"), ("(unknown)", None));
+    }
+
+    /// The warning names a login manager, so every entry must be one irlume
+    /// actually knows; a typo would warn about a DM that never runs, or stay
+    /// silent on the one that does. The list is deliberately short: absence means
+    /// "not measured", never "displays it fine".
+    #[test]
+    fn every_dm_that_hides_pam_text_info_is_a_login_manager_irlume_knows() {
+        for dm in DM_HIDES_PAM_TEXT_INFO {
+            assert!(
+                DM_PAM_SERVICES.iter().any(|(name, _, _)| name == dm),
+                "{dm} is not in DM_PAM_SERVICES, so the warning names a login \
+                 manager irlume cannot otherwise identify"
+            );
+        }
+        // The finding that motivated this: measured on hardware, twice.
+        assert!(DM_HIDES_PAM_TEXT_INFO.contains(&"plasmalogin"));
+        // An unmeasured login manager must not be warned about. sddm is the
+        // near miss: same KDE family, different greeter, never checked here.
+        assert!(!DM_HIDES_PAM_TEXT_INFO.contains(&"sddm"));
     }
 
     #[test]

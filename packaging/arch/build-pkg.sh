@@ -44,6 +44,15 @@ package() {
     install -Dm0644 "\$startdir/models/\$m.onnx" "\$pkgdir/usr/share/irlume/models/\$m.onnx"
   done
   install -Dm0644 "\$startdir/systemd/irlumed.service" "\$pkgdir/usr/lib/systemd/system/irlumed.service"
+  # The PAM self-heal units. This package omitted them while shipping an
+  # irlume.install that runs \`systemctl enable --now irlume-reconcile.*\`, and
+  # those calls end in \`|| true\`, so every install of this package silently
+  # reported success while leaving the machine with no self-heal at all. Found on
+  # a box installed this way: all three units \`not-found\`, zero owned by the
+  # package. The AUR PKGBUILD has always shipped them; only this one did not.
+  install -Dm0644 "\$startdir/systemd/irlume-reconcile.path" "\$pkgdir/usr/lib/systemd/system/irlume-reconcile.path"
+  install -Dm0644 "\$startdir/systemd/irlume-reconcile.service" "\$pkgdir/usr/lib/systemd/system/irlume-reconcile.service"
+  install -Dm0644 "\$startdir/systemd/irlume-reconcile.timer" "\$pkgdir/usr/lib/systemd/system/irlume-reconcile.timer"
   install -Dm0644 "\$startdir/LICENSE" "\$pkgdir/usr/share/licenses/irlume/LICENSE"
   install -Dm0644 "\$startdir/README.md" "\$pkgdir/usr/share/doc/irlume/README.md"
 }

@@ -36,6 +36,16 @@ you certify the DCO. That's it: no forms, no rights assignment.
   `padreport` and
   include the per-species APCER/BPCER numbers. See
   [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
+- **A pull request from a fork is not CodeQL-scanned before merge.** GitHub's
+  default setup for code scanning does not analyse fork pull requests, so an
+  external contribution reaches review with the ordinary CI behind it (clippy as
+  `-D warnings`, cargo-deny, the fuzz corpus, zizmor and actionlint over
+  workflows) but without CodeQL. Measured on this repo: of the last 30 merged
+  pull requests, the 29 from repo branches each ran CodeQL and the one from a
+  fork ran none. main is analysed straight after the merge, so the code is
+  scanned, later than a maintainer would want. A maintainer who wants CodeQL on
+  a fork contribution first can push the branch into this repository and open
+  the pull request from there, which is the same shape as every scanned PR.
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a PR; CI
   runs the same checks (`cargo fmt --check`, `cargo clippy -D warnings`, build,
   test on Rust 1.88) on every push and PR, so a green local run means a green CI.

@@ -79,7 +79,9 @@ jobs:
         run: |
           sym=$(command -v llvm-symbolizer || true)
           if [ -z "$sym" ]; then
-            sym=$(ls -1 /usr/lib/llvm-*/bin/llvm-symbolizer 2>/dev/null | sort -V | tail -1 || true)
+            # Versioned installs land in /usr/lib/llvm-N/bin; take the newest.
+            sym=$(find /usr/lib -maxdepth 3 -path '*/bin/llvm-symbolizer' -type f 2>/dev/null \
+                  | sort -V | tail -1)
           fi
           if [ -z "$sym" ]; then
             echo "no llvm-symbolizer found; ASan reports would be bare addresses" >&2

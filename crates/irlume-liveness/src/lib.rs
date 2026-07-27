@@ -605,18 +605,27 @@ pub const NOD_MIN_FACE_FRAMES: usize = 12;
 /// `Nod` = the gesture was seen; `None` = a face was tracked but no nod;
 /// `NoFace` = too few face frames to judge. `Shake` is not yet detected (returns
 /// `None` for a shake) pending its own tuning data.
+pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
+    detect_nod_with_evidence(samples).0
+}
+
 /// Why [`detect_nod`] reached its answer, for diagnosis.
 ///
 /// A nod that is not detected leaves no trace otherwise: the caller simply waits
 /// out its deadline and denies, which is indistinguishable from a user who never
-/// moved. These are the four numbers that decide it, so a failure can be read
-/// instead of guessed at.
+/// moved. These are the numbers that decide it, so a failure can be read instead
+/// of guessed at.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodEvidence {
-    /// Frames that produced a usable pitch reading.
+    /// Frames that produced a usable pitch reading, against [`NOD_MIN_FACE_FRAMES`].
     pub frames: usize,
-    /// Peak-to-peak head pitch, against [`NOD_PITCH_MIN`].
+    /// Peak-to-peak head pitch, against `pitch_min`.
     pub pitch_range: f32,
+    /// The pitch threshold ACTUALLY applied to this window. Carried rather than
+    /// left for the reader to look up, because `IRLUME_NOD_PITCH_MIN` overrides
+    /// [`NOD_PITCH_MIN`]: a report naming the constant while the run enforced an
+    /// override would send the next investigation after the wrong number.
+    pub pitch_min: f32,
     /// Peak-to-peak yaw, against [`NOD_YAW_MAX`]: too much means head-shake.
     pub yaw_range: f32,
     /// Median crossings of sufficient amplitude, against [`NOD_MIN_CROSSINGS`].
@@ -624,6 +633,14 @@ pub struct NodEvidence {
 }
 
 /// [`detect_nod`], plus the measurements behind the verdict.
+///
+/// This holds the whole decision: [`detect_nod`] is a thin wrapper over it, so
+/// the evidence cannot describe one rule while the gate applies another. It is
+/// the single place the nod is judged.
+///
+/// `crossings` is computed even when the range gate has already failed, so a
+/// report is never missing the one number that would have explained it; the
+/// extra work lands only on the failure path.
 pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvidence) {
     let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
     let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
@@ -643,6 +660,7 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
     let evidence = NodEvidence {
         frames: pitch.len(),
         pitch_range,
+        pitch_min: nod_pitch_min(),
         yaw_range: range(&yaw),
         crossings: if pitch.is_empty() {
             0
@@ -650,33 +668,16 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
             nod_crossings(&pitch, pitch_range)
         },
     };
-    (detect_nod(samples), evidence)
-}
-
-pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
-    let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
-    let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
-    if pitch.len() < NOD_MIN_FACE_FRAMES {
-        return HeadGesture::NoFace;
-    }
-    let range = |v: &[f32]| -> f32 {
-        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for &x in v {
-            lo = lo.min(x);
-            hi = hi.max(x);
-        }
-        hi - lo
-    };
-    let pitch_range = range(&pitch);
-    let yaw_range = range(&yaw);
-    if pitch_range < nod_pitch_min() || yaw_range > NOD_YAW_MAX {
-        return HeadGesture::None;
-    }
-    if nod_crossings(&pitch, pitch_range) >= NOD_MIN_CROSSINGS {
+    let verdict = if evidence.frames < NOD_MIN_FACE_FRAMES {
+        HeadGesture::NoFace
+    } else if evidence.pitch_range < evidence.pitch_min || evidence.yaw_range > NOD_YAW_MAX {
+        HeadGesture::None
+    } else if evidence.crossings >= NOD_MIN_CROSSINGS {
         HeadGesture::Nod
     } else {
         HeadGesture::None
-    }
+    };
+    (verdict, evidence)
 }
 
 /// Count how many times the pitch signal alternates between clearly-above and
@@ -1854,8 +1855,157 @@ mod nod_evidence_tests {
         ];
         let (v, ev) = detect_nod_with_evidence(&samples(&nod));
         assert_eq!(v, HeadGesture::Nod);
-        assert!(ev.pitch_range >= NOD_PITCH_MIN);
+        assert!(ev.pitch_range >= ev.pitch_min);
         assert!(ev.yaw_range <= NOD_YAW_MAX);
         assert!(ev.crossings >= NOD_MIN_CROSSINGS);
+    }
+
+    /// The whole value of the evidence is that it describes the gate that
+    /// actually ran. `detect_nod` delegating here is what guarantees that, so
+    /// walk a spread of inputs and require the two to agree on every one; a
+    /// reintroduced second copy of the rules would show up as a mismatch.
+    #[test]
+    fn detect_nod_reports_exactly_what_the_evidence_judged() {
+        let nod = [
+            0.53, 0.55, 0.60, 0.63, 0.58, 0.52, 0.51, 0.55, 0.62, 0.64, 0.57, 0.52, 0.53, 0.56,
+        ];
+        let cases: Vec<Vec<PoseSample>> = vec![
+            Vec::new(),
+            samples(&[]),
+            samples(&[0.5; 4]),
+            samples(&[0.5; 20]),
+            samples(&[
+                0.50, 0.51, 0.50, 0.51, 0.50, 0.51, 0.50, 0.51, 0.50, 0.51, 0.50, 0.51,
+            ]),
+            samples(&nod),
+        ];
+        for case in cases {
+            let (verdict, _) = detect_nod_with_evidence(&case);
+            assert_eq!(
+                detect_nod(&case),
+                verdict,
+                "detect_nod disagreed with the evidence on a {}-frame window",
+                case.len()
+            );
+        }
+    }
+
+    /// An empty window must not panic or invent a reading. The peak-to-peak
+    /// helper starts from infinities, so a naive `hi - lo` yields NaN here and
+    /// every later comparison silently goes false.
+    #[test]
+    fn an_empty_window_reports_zeroes_rather_than_nan() {
+        let (v, ev) = detect_nod_with_evidence(&[]);
+        assert_eq!(v, HeadGesture::NoFace);
+        assert_eq!(ev.frames, 0);
+        assert_eq!(ev.crossings, 0);
+        assert!(ev.pitch_range.is_finite() && ev.pitch_range == 0.0);
+        assert!(ev.yaw_range.is_finite() && ev.yaw_range == 0.0);
+    }
+
+    /// The reported threshold is the one the gate applied, not the constant.
+    /// Without this the line reads plausibly while naming a limit no run used.
+    #[test]
+    fn the_evidence_carries_the_threshold_that_was_applied() {
+        let (_, ev) = detect_nod_with_evidence(&samples(&[0.5; 20]));
+        // No override is set in this process, so the effective value is the
+        // constant; `pitch_min` is read from the same source the gate reads.
+        assert_eq!(ev.pitch_min, NOD_PITCH_MIN);
+        assert!(ev.pitch_min > 0.0 && ev.pitch_min.is_finite());
+    }
+
+    /// The evidence must always JUSTIFY the verdict. This is the property the
+    /// whole feature rests on: a denial is reported to the user through these
+    /// numbers, so a line that clears every bar while the gate said no would
+    /// send the reader hunting for a fault that is not there.
+    ///
+    /// Randomised because the interesting failures live at combinations no
+    /// hand-written case thinks to try, and the generator is checked for
+    /// coverage at the end: an earlier version of this test produced ZERO Nod
+    /// verdicts in 20,000 windows and passed a deliberately broken gate.
+    #[test]
+    fn the_evidence_always_justifies_the_verdict() {
+        let mut seed: u64 = 0x2026_0727;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f64 / (u32::MAX as f64 / 2.0)) as f32
+        };
+        let mut checked = 0usize;
+        let mut counts = (0usize, 0usize, 0usize);
+        for case in 0..20_000 {
+            let n = (case % 40) as usize;
+            // Yaw must usually stay INSIDE NOD_YAW_MAX, or every window dies at
+            // the shake gate and the crossings branch is never reached.
+            let yaw_scale = if case % 5 == 0 { 1.4 } else { 0.12 };
+            // Amplitude straddles NOD_PITCH_MIN so both sides of that gate occur.
+            let amp = match case % 4 {
+                0 => 0.0,
+                1 => 0.02,
+                2 => 0.09,
+                _ => 0.30,
+            };
+            let mut v = Vec::with_capacity(n);
+            for i in 0..n {
+                // Flat, slow drift, and oscillation at several periods: the
+                // last is what actually produces crossings.
+                let base = match case % 3 {
+                    0 => 0.5 + amp * ((i % 4) as f32 - 1.5) / 1.5,
+                    1 => 0.4 + amp * i as f32 / n.max(1) as f32,
+                    _ => 0.5 + amp * ((i % 6) as f32 - 2.5) / 2.5,
+                };
+                v.push(PoseSample {
+                    idx: i,
+                    pitch_frac: if next() > 0.05 { Some(base) } else { None },
+                    yaw_signed: if next() > 0.05 {
+                        Some((next() - 0.5) * yaw_scale)
+                    } else {
+                        None
+                    },
+                    bri: 100.0,
+                });
+            }
+            let (got, ev) = detect_nod_with_evidence(&v);
+            assert_eq!(detect_nod(&v), got, "detect_nod disagreed on case {case}");
+            match got {
+                HeadGesture::NoFace => assert!(
+                    ev.frames < NOD_MIN_FACE_FRAMES,
+                    "case {case}: NoFace with {} usable frames",
+                    ev.frames
+                ),
+                HeadGesture::Nod => assert!(
+                    ev.frames >= NOD_MIN_FACE_FRAMES
+                        && ev.pitch_range >= ev.pitch_min
+                        && ev.yaw_range <= NOD_YAW_MAX
+                        && ev.crossings >= NOD_MIN_CROSSINGS,
+                    "case {case}: granted on evidence that fails a gate: {ev:?}"
+                ),
+                _ => assert!(
+                    ev.frames >= NOD_MIN_FACE_FRAMES
+                        && (ev.pitch_range < ev.pitch_min
+                            || ev.yaw_range > NOD_YAW_MAX
+                            || ev.crossings < NOD_MIN_CROSSINGS),
+                    "case {case}: denied but every number clears its bar: {ev:?}"
+                ),
+            }
+            match got {
+                HeadGesture::NoFace => counts.0 += 1,
+                HeadGesture::Nod => counts.2 += 1,
+                _ => counts.1 += 1,
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 20_000);
+        // A window that never reaches a verdict proves nothing about it. This
+        // test passed a deliberately broken refactor until the generator was
+        // fixed, because it produced zero Nod verdicts in 20,000 cases.
+        assert!(
+            counts.0 > 500 && counts.1 > 500 && counts.2 > 500,
+            "coverage too thin to be evidence: NoFace={} None={} Nod={}",
+            counts.0,
+            counts.1,
+            counts.2
+        );
     }
 }

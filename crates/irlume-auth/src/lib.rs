@@ -1528,6 +1528,10 @@ impl Engine {
         // nothing or nodded in a way the detector did not count. Say which.
         if hit != Some(true) {
             let (_, ev) = irlume_liveness::detect_nod_with_evidence(&poses);
+            // Every threshold printed here comes from the evidence or a constant
+            // the gate itself reads, never a restatement: `pitch_min` is carried
+            // because IRLUME_NOD_PITCH_MIN can override the constant, and a line
+            // naming a limit the run did not apply is worse than no line.
             irlume_common::dlog!(
                 "consent: no gesture in {} frames; nod evidence: usable_pitch_frames={} (need {}) \
                  pitch_range={:.3} (need {:.3}) yaw_range={:.2} (max {:.2}) crossings={} (need {})",
@@ -1535,7 +1539,7 @@ impl Engine {
                 ev.frames,
                 irlume_liveness::NOD_MIN_FACE_FRAMES,
                 ev.pitch_range,
-                irlume_liveness::NOD_PITCH_MIN,
+                ev.pitch_min,
                 ev.yaw_range,
                 irlume_liveness::NOD_YAW_MAX,
                 ev.crossings,

@@ -22,6 +22,11 @@
 #     apt-get update -qq && apt-get install -y -qq dput gnupg ca-certificates openssh-client
 #     gpg --import /pkg/release-key.asc   # else dput sig-verify fails "No public key"
 #     dput ppa:archledger/irlume irlume_<ver>-0ppa1~<series>1_source.changes'
+#   # then confirm it actually PUBLISHED -- dput only reports that Launchpad
+#   # accepted the upload, and the build and binary publication after it are
+#   # both silent (0.6.1 was accepted, failed to build, and left Ubuntu users
+#   # on 0.6.0 for four days):
+#   python3 scripts/verify-ppa-publish.py
 set -euo pipefail
 
 # resolute (26.04) is the PPA target series; digest-pinned for a reproducible
@@ -86,3 +91,8 @@ echo
 echo "Next (on this host, where the release key lives):"
 echo "  debsign -k <fingerprint> $OUT/irlume_${VERSION}-0ppa1~${SERIES}1_source.changes"
 echo "  # then dput (see the header of this script for the container upload one-liner)"
+echo "  python3 $REPO/scripts/verify-ppa-publish.py ${VERSION}"
+echo
+echo "The upload is not the release: dput reports only that Launchpad accepted"
+echo "it, and the build and binary publication after it are silent. The lane is"
+echo "done when verify-ppa-publish.py exits 0."

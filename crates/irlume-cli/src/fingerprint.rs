@@ -437,16 +437,42 @@ fn has_active_line(text: &str, needle: &str) -> bool {
     })
 }
 
-/// True when any file in `pam_dir` carries an ACTIVE (non-comment) line
-/// referencing `pam_fprintd.so`, i.e. something will actually drive the
+/// The contents of every file in `pam_dir` that PAM will actually load.
+///
+/// `pam_start()` opens `/etc/pam.d/<service>`, and a service name carries no
+/// dot: it is the application's own name (`login`, `sudo`, `plasmalogin`).
+/// Leftovers in that directory all do carry one. Package managers write
+/// `.rpmsave`/`.rpmnew`/`.pacsave`/`.pacnew`/`.dpkg-old`, editors write `.bak`,
+/// and irlume's own wiring backs each stack up to `.pre-irlume` BESIDE the
+/// original. Reading those as if they were live stacks is how a scan concludes
+/// "wired" about a file nothing loads.
+///
+/// Keying on the dot instead of a list of known backup suffixes is deliberate:
+/// a Fedora box in the field carried an active pam_fprintd line in
+/// `system-auth.pre-linhello-uninstall`, a name no such list would have held.
+///
+/// This governs DIRECTORY ENUMERATION only. A live stack may `include` a dotted
+/// file by name, and PAM does follow that; [`fprintd_in_sudo`] resolves include
+/// targets by name for exactly that reason. The cost here is a false negative in
+/// that exotic case, which leaves the method unchanged and face active.
+fn live_pam_stacks(pam_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(pam_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().contains('.'))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect()
+}
+
+/// True when a PAM stack PAM actually loads carries an ACTIVE (non-comment)
+/// line referencing `pam_fprintd.so`, i.e. something will really drive the
 /// fingerprint prompt. Unreadable dirs/files count as not wired.
 fn pam_fprintd_wired(pam_dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(pam_dir) else {
-        return false;
-    };
-    entries.flatten().any(|e| {
-        std::fs::read_to_string(e.path()).is_ok_and(|s| has_active_line(&s, "pam_fprintd.so"))
-    })
+    live_pam_stacks(pam_dir)
+        .iter()
+        .any(|s| has_active_line(s, "pam_fprintd.so"))
 }
 
 /// True when one PAM service file stacks BOTH pam_faillock and pam_fprintd.
@@ -455,14 +481,9 @@ fn pam_fprintd_wired(pam_dir: &std::path::Path) -> bool {
 /// faillock failure (fprintd#209/#215). Doctor surfaces it with the
 /// `faillock --reset` remedy.
 pub(crate) fn faillock_cohabits(pam_dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(pam_dir) else {
-        return false;
-    };
-    entries.flatten().any(|e| {
-        std::fs::read_to_string(e.path()).is_ok_and(|s| {
-            has_active_line(&s, "pam_faillock.so") && has_active_line(&s, "pam_fprintd.so")
-        })
-    })
+    live_pam_stacks(pam_dir)
+        .iter()
+        .any(|s| has_active_line(s, "pam_faillock.so") && has_active_line(s, "pam_fprintd.so"))
 }
 
 /// True when the sudo PAM service reaches pam_fprintd, either directly or via
@@ -637,6 +658,53 @@ mod tests {
         assert!(!pam_fprintd_wired(std::path::Path::new(
             "/nonexistent-irlume-test-pam.d"
         )));
+    }
+
+    #[test]
+    fn pam_scans_ignore_files_pam_never_loads() {
+        // A backup left in /etc/pam.d is not a PAM stack: pam_start() opens
+        // /etc/pam.d/<service>, and no application asks for a service named
+        // "system-auth.pre-irlume". Counting one as wiring hands `enable` the
+        // green light to stand face down while nothing drives the prompt --
+        // the exact password-only outcome the wiring gate exists to prevent.
+        // Observed in the field: a Fedora box carried an active pam_fprintd
+        // line in `system-auth.pre-linhello-uninstall`, a suffix no list of
+        // known backup extensions would have caught.
+        let dir = std::env::temp_dir().join(format!("irlume-deadpam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = "auth required pam_unix.so\n";
+        std::fs::write(dir.join("system-auth"), live).unwrap();
+        for dead in [
+            "system-auth.pre-irlume",
+            "system-auth.pre-linhello-uninstall",
+            "system-auth.rpmsave",
+            "system-auth.pacnew",
+            ".system-auth.irlume.tmp",
+        ] {
+            std::fs::write(
+                dir.join(dead),
+                "auth sufficient pam_fprintd.so\nauth required pam_faillock.so preauth\n",
+            )
+            .unwrap();
+        }
+        assert!(
+            !pam_fprintd_wired(&dir),
+            "a backup file is not wiring; enable must not record method=fingerprint from one"
+        );
+        assert!(
+            !faillock_cohabits(&dir),
+            "a backup file must not raise the doctor lockout warning"
+        );
+        // The live stack is still read: the skip is about which files count,
+        // not about narrowing what a real stack can say.
+        std::fs::write(
+            dir.join("system-auth"),
+            "auth sufficient pam_fprintd.so\nauth required pam_faillock.so preauth\n",
+        )
+        .unwrap();
+        assert!(pam_fprintd_wired(&dir));
+        assert!(faillock_cohabits(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1535,6 +1535,26 @@ impl Engine {
         // instead of measured. Debug-level, numbers only, never frames.
         {
             let (_, ev) = irlume_liveness::detect_nod_with_evidence(&poses);
+            // Raw pitch/yaw series, for developing a better discriminator than
+            // peak-to-peak pitch (#101). Summary statistics cannot show SHAPE:
+            // a deliberate nod and a slow postural drift can reach the same
+            // range, and the difference between them lives in the trajectory.
+            // Behind its own flag rather than IRLUME_LOG, because it is a long
+            // line nobody wants in an ordinary debug capture. Pose angles only,
+            // the same class of number the line above already prints, never
+            // frames or embeddings.
+            if std::env::var("IRLUME_DUMP_POSE_SERIES").is_ok_and(|v| v == "1") {
+                let pitch: Vec<String> = poses
+                    .iter()
+                    .map(|p| p.pitch_frac.map_or("-".into(), |v| format!("{v:.4}")))
+                    .collect();
+                let yaw: Vec<String> = poses
+                    .iter()
+                    .map(|p| p.yaw_signed.map_or("-".into(), |v| format!("{v:.4}")))
+                    .collect();
+                irlume_common::dlog!("consent-series: pitch={}", pitch.join(","));
+                irlume_common::dlog!("consent-series: yaw={}", yaw.join(","));
+            }
             // Every threshold printed here comes from the evidence or a constant
             // the gate itself reads, never a restatement: `pitch_min` is carried
             // because IRLUME_NOD_PITCH_MIN can override the constant, and a line

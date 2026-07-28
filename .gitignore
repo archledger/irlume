@@ -27,3 +27,7 @@ result
 # Locally-generated release checksum artifacts
 SHA256SUMS
 SHA256SUMS.asc
+
+# Bytecode from the scripts/*.py tooling
+__pycache__/
+*.pyc

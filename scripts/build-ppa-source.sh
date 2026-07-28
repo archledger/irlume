@@ -109,6 +109,14 @@ echo
 echo "Artifacts in $BUILDROOT:"
 ls -lh "$BUILDROOT"/irlume_"${DEBVER%%~*}"* "$BUILDROOT"/irlume_"${VERSION}".orig.tar.gz 2>/dev/null || ls -lh "$BUILDROOT"
 echo
-echo "Next: sign with the release key, then upload:"
+echo "Next: sign with the release key, upload, then VERIFY IT PUBLISHED:"
 echo "  debsign $BUILDROOT/irlume_${DEBVER}_source.changes"
 echo "  dput ppa:archledger/irlume $BUILDROOT/irlume_${DEBVER}_source.changes"
+echo "  python3 $REPO/scripts/verify-ppa-publish.py $VERSION"
+echo
+# dput's "Successfully uploaded packages." only means Launchpad accepted the
+# upload. 0.6.1 was accepted, then its build failed, and Ubuntu users sat on
+# 0.6.0 for four days because nothing checked the two silent steps after it.
+echo "The upload is NOT the release. dput reports that Launchpad accepted the"
+echo "upload; the build and the binary publication come after it and are silent."
+echo "The lane is done when verify-ppa-publish.py exits 0."

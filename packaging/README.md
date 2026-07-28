@@ -37,7 +37,14 @@ the weights, so a running system needs no download.
   source package built on Launchpad from a self-contained orig tarball
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled
   onnxruntime, real model weights; LP builders have no network). Update path:
-  plain `apt upgrade`.
+  plain `apt upgrade`. **The lane ends at "binary published", not at "upload
+  accepted"** — `dput` reports only that Launchpad took the upload, and the
+  build and binary publication after it are both silent. Finish with
+  `python3 scripts/verify-ppa-publish.py`, which polls Launchpad and exits
+  non-zero unless a binary is actually installable. 0.6.1 was accepted, failed
+  to build, and left Ubuntu users on 0.6.0 for four days unnoticed; this is the
+  only lane where a green upload and a broken package look the same from the
+  maintainer's side.
 - **Debian** (and Ubuntu series the PPA doesn't cover), `debian/` via nfpm or
   dpkg-buildpackage: **bundles onnxruntime** (the archive ships 1.22; irlume
   needs ≥1.24); ships the AppArmor profile; PAM to the multiarch dir. The

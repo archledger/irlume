@@ -402,6 +402,12 @@ jobs:
       - name: packaging parity (units in every lane, versions agree)
         run: ./scripts/check-packaging-parity.sh
 
+      # The PPA publish check decides whether a release reached Ubuntu users, so
+      # its verdict logic is worth pinning. The live check needs a real upload
+      # and cannot run here; --self-test is fixtures only, no network.
+      - name: PPA publish verifier (verdict logic)
+        run: python3 scripts/verify-ppa-publish.py --self-test
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

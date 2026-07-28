@@ -408,9 +408,43 @@ fn main() {
     const MAX_CONNECTION_THREADS: usize = 64;
     let live_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // How long a throttled connection is held before being closed, and how many
+    // may be held at once. The hold is what actually paces an abusive peer: its
+    // request never gets a reply, so its own loop waits. The cap bounds the file
+    // descriptors one peer can pin; past it, connections are closed immediately.
+    const REFUSAL_PENALTY: std::time::Duration = std::time::Duration::from_millis(250);
+    const MAX_PENALTY_BOX: usize = 64;
+    let mut penalty_box: Vec<(UnixStream, std::time::Instant)> = Vec::new();
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                // Release anyone whose penalty has expired. Dropping the stream
+                // closes it, which is the moment the client's blocked read
+                // returns. Done here rather than on a timer because the only
+                // thing that fills this list is a peer still connecting.
+                penalty_box.retain(|(_, until)| {
+                    if std::time::Instant::now() < *until {
+                        true
+                    } else {
+                        false // dropped, and closed with it
+                    }
+                });
+                // A peer spinning on refusals is HELD, not answered and not
+                // dropped: its read blocks until the penalty expires, which
+                // paces it. Dropping was measured to be worse than useless, as
+                // an instant EOF just let the client reconnect sooner: 10,501
+                // refusals/s became 15k connection attempts a second and the
+                // daemon still burned 206% of a core. Holding costs a file
+                // descriptor and no thread, no parse and no arbiter round trip.
+                if peer_cred(&stream).is_ok_and(|p| refusal_throttled(p.uid)) {
+                    if penalty_box.len() < MAX_PENALTY_BOX {
+                        penalty_box.push((stream, std::time::Instant::now() + REFUSAL_PENALTY));
+                    }
+                    // Over the cap the stream is dropped here, bounding the
+                    // descriptors one abusive peer can pin.
+                    continue;
+                }
                 let live = std::sync::Arc::clone(&live_threads);
                 if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTION_THREADS
                 {
@@ -760,6 +794,105 @@ struct Queued {
 /// worker leaving connection threads parked forever, not a latency control.
 const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+// ---------------------------------------------------------------------------
+// Per-uid refusal throttle (issue #142).
+//
+// #117 capped CONCURRENCY at MAX_CONNECTION_THREADS but not the RATE. Measured
+// 2026-07-27 with one client holding a uid's camera slot and 8 spinning behind
+// it: 10,501 refusals a second, the daemon burning 305% of one core, and an
+// ordinary `ListProfiles` going from 903ms to 4146ms. Connection threads peaked
+// at 44 against a cap of 64, so exhaustion was never the mechanism; CPU was, and
+// the cost is paid per CONNECTION, before the request is even parsed.
+//
+// So the throttle is enforced in the accept loop, where a dropped connection
+// costs no thread, no parse and no arbiter round trip. A short delay before
+// answering, the other obvious shape, would have made this worse: it holds a
+// connection thread for its whole duration and does nothing about the CPU.
+//
+// It is fed ONLY by requests the arbiter actually refused, so a peer doing
+// ordinary work is never throttled no matter how busy it is. Root is exempt:
+// every privileged PAM stack (greeter, sudo, polkit helper) runs as uid 0, and
+// starving those is worse than any flood.
+//
+// HONEST LIMIT: an unprivileged uid that floods itself into the throttle also
+// delays its OWN user-context authentications, the KDE lock screen being the
+// one that runs as the user rather than root. The window is deliberately short
+// so this self-heals in well under a second, and the password remains the
+// fallback throughout. A different uid can never cause it.
+// ---------------------------------------------------------------------------
+
+/// Refusals per second a single non-root uid may generate before its new
+/// connections are dropped. Set from `IRLUME_REFUSAL_RATE`; 0 disables the
+/// throttle. Well above any real client: a refusal means the camera was busy,
+/// and a legitimate caller retries on a human timescale, not thousands of times
+/// a second.
+fn refusal_rate_limit() -> f64 {
+    env_or("IRLUME_REFUSAL_RATE", "100")
+        .parse()
+        .unwrap_or(100.0)
+}
+
+/// A token bucket per uid, refilled at [`refusal_rate_limit`] per second.
+#[derive(Default)]
+struct RefusalBucket {
+    tokens: f64,
+    last: Option<std::time::Instant>,
+}
+
+fn refusal_state() -> &'static std::sync::Mutex<std::collections::HashMap<u32, RefusalBucket>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, RefusalBucket>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Charge one refusal to `uid`.
+fn record_refusal(uid: u32) {
+    let rate = refusal_rate_limit();
+    if rate <= 0.0 || uid == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut map = match refusal_state().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let b = map.entry(uid).or_insert(RefusalBucket {
+        tokens: rate,
+        last: Some(now),
+    });
+    refill(b, rate, now);
+    b.tokens = (b.tokens - 1.0).max(-rate);
+}
+
+/// Refill a bucket for the time elapsed, capped at one second's worth.
+fn refill(b: &mut RefusalBucket, rate: f64, now: std::time::Instant) {
+    if let Some(last) = b.last {
+        let dt = now.saturating_duration_since(last).as_secs_f64();
+        b.tokens = (b.tokens + dt * rate).min(rate);
+    }
+    b.last = Some(now);
+}
+
+/// Whether this peer has spent its refusal budget, so the connection should be
+/// dropped without spawning a thread. Root and a disabled limit are never
+/// throttled.
+fn refusal_throttled(uid: u32) -> bool {
+    let rate = refusal_rate_limit();
+    if rate <= 0.0 || uid == 0 {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    let mut map = match refusal_state().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let Some(b) = map.get_mut(&uid) else {
+        return false;
+    };
+    refill(b, rate, now);
+    b.tokens < 0.0
+}
+
 /// Read and parse one connection, hand the request to the arbiter, write back
 /// what the worker answers.
 ///
@@ -784,7 +917,10 @@ fn serve(stream: UnixStream, arbiter: &arbiter::Arbiter<Queued>) -> std::io::Res
             };
             if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
                 // Refused, not queued: answer now so the client can retry rather
-                // than hold a slot the login path may want.
+                // than hold a slot the login path may want. Charged to the peer,
+                // so a client that spins on refusals throttles itself at accept
+                // time rather than costing a thread per attempt (#142).
+                record_refusal(peer.uid);
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
             let resp = match answer.recv_timeout(WORKER_REPLY_TIMEOUT) {
@@ -2592,6 +2728,61 @@ mod tests {
             }
             other => panic!("expected PasswordUnsealed, got {other:?}"),
         }
+    }
+
+    /// The refusal throttle must spend down under sustained refusals, refill on
+    /// its own, and never apply to root. Serialised on the env lock because the
+    /// rate is read from the environment and the buckets are process-global.
+    #[test]
+    fn refusal_throttle_spends_down_refills_and_exempts_root() {
+        let _g = env_lock();
+        std::env::set_var("IRLUME_REFUSAL_RATE", "10");
+        refusal_state().lock().unwrap().clear();
+        const UID: u32 = 4242;
+
+        // A quiet peer is never throttled.
+        assert!(!refusal_throttled(UID));
+
+        // Spending the budget takes the bucket negative, which is what trips it.
+        for _ in 0..12 {
+            record_refusal(UID);
+        }
+        assert!(refusal_throttled(UID), "12 refusals against a budget of 10");
+
+        // Root is exempt no matter how many refusals are charged to it: every
+        // privileged PAM stack runs as uid 0 and starving those is worse than
+        // any flood.
+        for _ in 0..100 {
+            record_refusal(0);
+        }
+        assert!(!refusal_throttled(0), "root must never be throttled");
+
+        // It refills with time rather than needing an event to clear it.
+        {
+            let mut map = refusal_state().lock().unwrap();
+            let b = map.get_mut(&UID).unwrap();
+            b.last = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        }
+        assert!(!refusal_throttled(UID), "a five second pause must clear it");
+
+        std::env::remove_var("IRLUME_REFUSAL_RATE");
+        refusal_state().lock().unwrap().clear();
+    }
+
+    /// Zero disables the throttle outright, so an operator can turn it off and a
+    /// peer is never held no matter what it does.
+    #[test]
+    fn refusal_rate_zero_disables_the_throttle() {
+        let _g = env_lock();
+        std::env::set_var("IRLUME_REFUSAL_RATE", "0");
+        refusal_state().lock().unwrap().clear();
+        const UID: u32 = 4343;
+        for _ in 0..10_000 {
+            record_refusal(UID);
+        }
+        assert!(!refusal_throttled(UID));
+        std::env::remove_var("IRLUME_REFUSAL_RATE");
+        refusal_state().lock().unwrap().clear();
     }
 
     #[test]

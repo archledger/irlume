@@ -383,7 +383,9 @@ pub fn doctor(args: &[String]) -> ExitCode {
     }
     let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Collect);
     // Same pass the human report makes, printing nothing.
-    let _ = crate::doctor_run(&mut report);
+    // The machine path is deliberately strict about argv, so it passes none:
+    // `--user` is not part of contract 1.
+    let _ = crate::doctor_run(&mut report, &[]);
     let checks = report.into_checks();
     emit(
         &success(COMMAND, json!({ "checks": checks }), contract),

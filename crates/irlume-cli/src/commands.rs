@@ -720,7 +720,13 @@ pub fn status(args: &[String]) -> ExitCode {
         "  keyring gate  : {}",
         match irlume_common::config::credential_release_challenge_visible() {
             Some(true) => format!("gesture required {OK} (default)"),
-            Some(false) => format!("DISABLED {WARN} (a static IR print may release the password)"),
+            // Qualified, matching CREDENTIAL_RELEASE_RISK. Saying a print
+            // "may release the password" overstates it: it must pass the
+            // face and liveness checks first, and none of 24 measured
+            // presentations did.
+            Some(false) => format!(
+                "DISABLED {WARN} (an IR print that passes the face checks could release it)"
+            ),
             None => "root-only setting (re-run with sudo)".into(),
         }
     );
@@ -1168,8 +1174,11 @@ pub const CREDENTIAL_RELEASE_RISK: &str =
 /// restart is needed.
 ///
 /// Turning it off never locks anyone out (the typed password is always the
-/// fallback) but it does drop the only check that distinguishes a present person
-/// from a photograph of one, so `off` asks for confirmation and says why.
+/// fallback) but it does drop the deliberate-intent check on credential release,
+/// so `off` asks for confirmation and says why. It is INTENT that is dropped,
+/// not liveness: measured 2026-07-27, the gesture fired on a hand-held print 2
+/// times in 24, so it never was the layer standing between a photograph and the
+/// credential; cross-spectrum liveness and the PAD cue are.
 pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
     const TAG: &str = "[credential-release-challenge]";
     match sub {
@@ -1211,13 +1220,13 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                     if v == "on" {
                         println!(
                             "{TAG} temporal challenge REQUIRED {OK}: releasing your keyring \
-                             password now needs a nod (or a calibrated eye closure ~1s) after \
+                             password now needs continuous nodding (or a calibrated eye closure ~1s) after \
                              the face match. Takes effect on the next face auth."
                         );
                     } else {
                         eprintln!(
-                            "{TAG} WARNING: temporal liveness for credential release is \
-                             DISABLED. {CREDENTIAL_RELEASE_RISK}. Your typed password still \
+                            "{TAG} WARNING: the deliberate-consent gate on credential \
+                             release is DISABLED. {CREDENTIAL_RELEASE_RISK}. Your typed password still \
                              works either way. Re-enable: sudo irlume \
                              credential-release-challenge on"
                         );
@@ -1325,7 +1334,10 @@ pub(crate) fn prompt_login_password() -> Option<String> {
 
 /// `irlume setup`: guided onboarding that ties the existing pieces together:
 /// preflight → camera pick → enroll → keyring arm → recovery → fingerprint →
-/// login wiring. Each step is opt-in (y/N); nothing destructive runs unprompted.
+/// login wiring. Each step is opt-in (y/N) on a terminal. With stdin piped
+/// this is the SCRIPTED path: every prompt takes its documented default, so
+/// enrolment and keyring arming do proceed, which is what makes an unattended
+/// `irlume setup` possible.
 pub fn setup(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     println!("=== irlume setup for '{user}' ===\n");
@@ -1438,6 +1450,13 @@ fn run_enroll(user: &str, reset: bool) {
 /// Minimal y/N prompt (default applied on empty input or a non-tty).
 fn yes_no(q: &str, default_yes: bool) -> bool {
     use std::io::{IsTerminal, Write};
+    // No terminal takes the documented default. That is deliberate and covered
+    // by `setup_walks_every_step_noninteractively`: `setup` is the SCRIPTED
+    // onboarding path, so a piped run is expected to complete rather than stall
+    // on a prompt nobody can answer. Commands where the default would be
+    // destructive refuse instead: `calibrate-closure` will not overwrite an
+    // existing calibration without a terminal, and `models enable` refuses
+    // outright.
     if !std::io::stdin().is_terminal() {
         return default_yes;
     }
@@ -1475,7 +1494,7 @@ ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
   profiles [list|add-scan|rename|delete|eyes-open|challenge <on|off>]   manage profiles
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
-  calibrate-closure [--rounds N]   teach the eye-closure consent gesture for app
+  calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
                         prompts; captures N rounds (default 3) and stores the median
                         (sudo; the head nod is the default and needs no calibration)
 
@@ -1490,7 +1509,8 @@ SYSTEM INTEGRATION
   login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply]
                         PAM wiring: greeters, lock screen, sudo, and app prompts
                         (--with-polkit lets your face approve Bitwarden/pkexec);
-                        reconcile re-applies it after a distro PAM regeneration
+                        reconcile re-applies it after a distro PAM regeneration and
+                        applies immediately (no --apply; the self-heal unit runs it)
   logs [-f] [--since T]           the face-auth journal in one view (daemon, PAM, keyring)
   logs debug <on|off>             per-stage pipeline tracing in the daemon (sudo)
   fingerprint <status|add|verify|reset|enable|disable> [--fingerprint-only]
@@ -1511,14 +1531,22 @@ SYSTEM INTEGRATION
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   credential-release-challenge <on|off|status>
-                        require a nod (or calibrated eye closure) before your
+                        require continuous nodding (or a calibrated eye closure) before your
                         keyring password is released. ON by default; turning it
-                        off lets a static IR print release that password
+                        off lets an IR print that passes the face checks release it
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
-  uninstall [--keep-data]         un-wire PAM, stop the daemon, wipe enrolled
+  uninstall [--keep-data] [--yes] un-wire PAM, stop the daemon, wipe enrolled
                         data, then show the package-removal command (sudo)
   version                         print the installed irlume version
+
+MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
+  --json                on version, status, doctor, profiles list, login status:
+                        one line of JSON on stdout, stable check ids and error
+                        codes, nothing else printed
+  --contract N          declare the contract version you implement; omitted
+                        always means 1, and an unimplemented one is refused
+                        before anything runs
 
   (developer/benchmark tools are hidden; set IRLUME_DEV=1 to enable them)
 "

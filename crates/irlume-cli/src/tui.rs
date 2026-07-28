@@ -2023,7 +2023,9 @@ impl App {
                 crate::commands::update(&none);
             }
             Suspend::Doctor => {
-                let _ = crate::doctor();
+                // The TUI already knows its target account; pass it so doctor
+                // reports on the same user the rest of the screen does.
+                let _ = crate::doctor(&["--user".to_string(), self.user.clone()]);
             }
             Suspend::PcrlockMakePolicy => self.sudo_step(
                 "refresh the pcrlock policy (re-predict the boot measurements)",
@@ -2850,7 +2852,8 @@ impl App {
                 if buf.trim() == "uninstall" {
                     self.log(
                         '→',
-                        "uninstall confirmed; suspending to `sudo irlume uninstall`",
+                        "uninstall confirmed; suspending to `sudo irlume uninstall --yes` \
+                         (the TUI already confirmed)",
                     );
                     self.suspend = Some(Suspend::Uninstall);
                 } else {
@@ -3330,7 +3333,7 @@ impl App {
                             Some(false) => (
                                 "○",
                                 Style::new().fg(th().warn).add_modifier(Modifier::BOLD),
-                                "DISABLED   (a static IR print may release the password)"
+                                "DISABLED  (an IR print passing the face checks could release it)"
                                     .to_string(),
                             ),
                             None => (
@@ -3354,7 +3357,7 @@ impl App {
                 // Kept to FOUR lines: this panel does not scroll, so a fifth line
                 // pushes the bottom section off a short terminal.
                 Line::from(Span::styled(
-                    "  Releasing your TPM-sealed keyring password needs a NOD (or a calibrated",
+                    "  Releasing your TPM-sealed keyring password needs CONTINUOUS NODDING (or a",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(

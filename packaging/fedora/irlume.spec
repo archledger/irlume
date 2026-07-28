@@ -145,13 +145,8 @@ if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
 fi
 systemctl start irlume-reconcile.service &>/dev/null || :
 # PAM wiring is opt-in (irlume login enable); never auto-wire auth on install.
-# Upgrade from a version that shipped the IR adapter (< 0.2.0): dark/dim IR
-# login needs a re-enroll (RGB login keeps working). Bright-line the notice.
-if [ $1 -gt 1 ]; then
-    echo "irlume: this upgrade removed the IR adapter. If you enrolled before 0.2.0," >&2
-    echo "irlume: dark/dim face login needs a re-enroll: run 'irlume enroll'." >&2
-    echo "irlume: bright-light login keeps working; your password is unaffected." >&2
-fi
+# The pre-0.2.0 re-enroll notice lives in %%triggerpostun below, because $1 here
+# counts installed packages and cannot tell which version is being replaced.
 
 %preun
 %systemd_preun irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
@@ -159,6 +154,20 @@ fi
 %postun
 %systemd_postun_with_restart irlumed.service
 %systemd_postun irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
+
+# 0.2.0 removed the IR adapter, so IR templates enrolled under 0.1.x no longer
+# match; those users need `irlume enroll` for dark/dim login (RGB login and the
+# password are unaffected). This has to be a trigger: in %%post, $1 is the count
+# of installed packages, so `[ $1 -gt 1 ]` means "some upgrade" and never "an
+# upgrade from before 0.2.0". Gated that way it printed on EVERY Fedora upgrade
+# including 0.6.1 to 0.7.0, telling users an adapter had just been removed that
+# had in fact been gone for five releases. The Arch scriptlet already compares
+# the old version with vercmp and the PPA carries it in debian/NEWS; this makes
+# Fedora agree with them.
+%triggerpostun -- irlume < 0.2.0
+echo "irlume: 0.2.0 removed the IR adapter. Because you upgraded from an older" >&2
+echo "irlume: version, dark/dim face login needs a re-enroll: run 'irlume enroll'." >&2
+echo "irlume: bright-light login keeps working; your password is unaffected." >&2
 
 %post selinux
 semodule -i %{_datadir}/selinux/packages/irlume.pp 2>/dev/null || :
@@ -209,7 +218,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 - ly display manager support
 - Fix: the control socket is reachable again from a user-context PAM stack
 
-* Thu Jul 24 2026 archledger <archledger236@gmail.com> - 0.6.1-1
+* Fri Jul 24 2026 archledger <archledger236@gmail.com> - 0.6.1-1
 - Update resilience: login self-heal survives an inactive watcher and a
   pre-marker upgrade; doctor warns on an unrecognized display manager; a pinned
   camera pair re-anchors by device identity after a udev renumber.

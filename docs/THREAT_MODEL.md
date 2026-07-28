@@ -215,12 +215,26 @@ with a fabricated print.
   run in a less stable posture released 2 of 5, so incidental body movement
   drives that number.
 
-  **What it has NOT been measured against: a hand-held print.** The detections
-  above show the nod detector responding to incidental motion, and a photo held
-  in the hand produces exactly that. Until that case is measured, treat this gate
-  as raising the cost of the attack rather than closing it, and do not read the
-  9-in-10 refusal above as an anti-spoofing figure. Tracked in
-  [#101](https://github.com/archledger/irlume/issues/101).
+  **Measured against a hand-held print (2026-07-27, same camera, two sessions,
+  38 attempts).** The nod detector fired on a hand-held printed face 2 times in
+  24, and on the same user sitting still with consent withheld 2 times in 18.
+  Incidental motion and hand tremor do satisfy this gate, so it is not evidence
+  of a live person and must not be read as an anti-spoofing figure.
+
+  No printed attempt was ever granted. Every one was refused by cross-spectrum
+  liveness and the third-party PAD cue, at `p_fake` 0.996-1.000; the gesture was
+  never the layer standing between the print and a credential.
+
+  The gate's own separation was then measured directly, with the daemon
+  reporting the numbers behind each verdict: deliberate continuous nods produced
+  a pitch range of 0.082-0.108 (10 accepts), while sitting still and holding a
+  print produced 0.021-0.069 (18 rejects). `NOD_PITCH_MIN` was raised from 0.070
+  to 0.075, the midpoint of that gap. The crossings count did not separate the
+  populations in either direction and was left alone.
+
+  What this gate is for is deliberate INTENT on the credential-release path, and
+  the honest limit is that a present, non-consenting user can still satisfy it by
+  moving. Tracked in [#101](https://github.com/archledger/irlume/issues/101).
 - **Consecutive-failure throttle.** After a run of failed face attempts (5 by
   default, `IRLUME_RATE_LIMIT`), the daemon stops firing the camera on the
   gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls

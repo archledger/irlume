@@ -1526,15 +1526,27 @@ impl Engine {
         // A gesture that never arrives is otherwise silent: the caller waits out
         // its deadline and denies, which reads the same whether the user did
         // nothing or nodded in a way the detector did not count. Say which.
-        if hit != Some(true) {
+        // Report the evidence on BOTH outcomes, not just a miss. A refusal
+        // explains itself from the numbers that fell short, but an ACCEPT is the
+        // one that needs auditing: measured 2026-07-27 on real hardware, the gate
+        // fired on a user sitting still 2 times in 8, and on a hand-held printed
+        // face 2 times in 14. Without the numbers behind an accept there is no way
+        // to tell which reading cleared which bar, and thresholds get argued over
+        // instead of measured. Debug-level, numbers only, never frames.
+        {
             let (_, ev) = irlume_liveness::detect_nod_with_evidence(&poses);
             // Every threshold printed here comes from the evidence or a constant
             // the gate itself reads, never a restatement: `pitch_min` is carried
             // because IRLUME_NOD_PITCH_MIN can override the constant, and a line
             // naming a limit the run did not apply is worse than no line.
             irlume_common::dlog!(
-                "consent: no gesture in {} frames; nod evidence: usable_pitch_frames={} (need {}) \
+                "consent: {} in {} frames; nod evidence: usable_pitch_frames={} (need {}) \
                  pitch_range={:.3} (need {:.3}) yaw_range={:.2} (max {:.2}) crossings={} (need {})",
+                if hit == Some(true) {
+                    "GESTURE ACCEPTED"
+                } else {
+                    "no gesture"
+                },
                 poses.len(),
                 ev.frames,
                 irlume_liveness::NOD_MIN_FACE_FRAMES,

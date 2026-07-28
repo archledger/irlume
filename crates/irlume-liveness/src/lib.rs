@@ -572,11 +572,33 @@ pub enum HeadGesture {
 
 /// Deliberate head-nod consent gesture ([`detect_nod`]): minimum pitch RANGE
 /// (max-min of `pitch_frac`) over the window. A nod swings the head down and
-/// back; a still head barely moves. Validated on a hardware campaign 2026-07-22
-/// (upright + reclined): still heads ranged ≤0.061, deliberate nods 0.057-0.167,
-/// so 0.07 sits just above every still take with margin. Overridable via
-/// `IRLUME_NOD_PITCH_MIN`.
-pub const NOD_PITCH_MIN: f32 = 0.07;
+/// back; a still head barely moves. This is the gate that actually separates the
+/// two, which is why it carries the threshold.
+///
+/// Raised 0.070 → 0.075 on 2026-07-27 after measuring the live consent watch on
+/// one user, one camera, 28 watches, with the daemon reporting the numbers
+/// behind every verdict:
+///
+/// | population | n | pitch_range |
+/// |---|---|---|
+/// | accepted, deliberate continuous nods | 10 | 0.082 - 0.108 |
+/// | rejected, sitting still + hand-held printed face | 18 | 0.021 - 0.069 |
+///
+/// The populations do not overlap, and 0.070 sat on the very edge of the gap.
+/// 0.075 is its midpoint: 0.006 above the worst non-gesture and 0.007 below the
+/// weakest real nod. An earlier session the same evening, where the numbers were
+/// not captured, DID see the gate fire on a still user and on a print, so treat
+/// this as widening a measured margin rather than as proof the case is closed.
+///
+/// The 2026-07-22 campaign recorded genuine nods as low as 0.057, which this
+/// threshold rejects. Those were single nods; the instruction has since changed
+/// to keep nodding (a single nod released 0 times out of 3), and continuous
+/// nodding measured 0.082 at its weakest. The failure direction is also the safe
+/// one: a rejected gesture falls back to the typed password, while a false
+/// accept releases a credential the user never consented to release.
+///
+/// Overridable via `IRLUME_NOD_PITCH_MIN`.
+pub const NOD_PITCH_MIN: f32 = 0.075;
 /// ...and maximum yaw RANGE, so idle LOOKING-AROUND (which swings yaw a lot) and
 /// a head SHAKE are not read as a nod. Campaign: nods ranged ≤0.46 in yaw while
 /// look-around ranged 0.87-6.95, so 0.6 separates them cleanly.
@@ -588,6 +610,22 @@ pub const NOD_YAW_MAX: f32 = 0.6;
 /// capture window and slowed grants; the campaign data shows 1 crossing accepts
 /// more genuine nods (19/21 vs 17/21) with still ZERO false accepts on
 /// still/look-around (the pitch-range and yaw gates do that work).
+///
+/// DO NOT RAISE THIS TO FIX A FALSE ACCEPT. Measured 2026-07-27 over 28 live
+/// consent watches, crossings does not separate the populations at all, and is
+/// if anything inverted:
+///
+/// | population | crossings observed |
+/// |---|---|
+/// | accepted, deliberate nods | 1, 1, 1, 2, 2, 2, 2, 3, 3, 3 |
+/// | rejected, still + printed face | 0, 0, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 7 |
+///
+/// A still head reached 7 while real nods fired on 1, so requiring 2 would have
+/// rejected three genuine nods and still admitted every still take that produced
+/// 3 or more. The cause is [`NOD_CROSSING_AMP_FRAC`]: the amplitude bar is a
+/// fraction of the take's OWN pitch range, so a nearly-still head gets a tiny
+/// bar and sensor noise oscillates across it repeatedly. [`NOD_PITCH_MIN`] is
+/// the gate that discriminates; raise that instead.
 pub const NOD_MIN_CROSSINGS: usize = 1;
 /// A crossing counts only when the pitch moves past this fraction of the take's
 /// pitch range from the median, so sensor noise on a near-still head is ignored.
@@ -1913,6 +1951,44 @@ mod nod_evidence_tests {
         assert_eq!(ev.crossings, 0);
         assert!(ev.pitch_range.is_finite() && ev.pitch_range == 0.0);
         assert!(ev.yaw_range.is_finite() && ev.yaw_range == 0.0);
+    }
+
+    /// The threshold must keep separating the two populations MEASURED on
+    /// hardware 2026-07-27, or the false-accept this was raised to close comes
+    /// back. Pinned as data, not as a restatement of the constant: if someone
+    /// lowers `NOD_PITCH_MIN` toward the rejected side, this fails and says why.
+    #[test]
+    fn the_pitch_threshold_still_separates_the_measured_populations() {
+        // Deliberate continuous nods, 10 accepted watches.
+        const REAL_NODS: &[f32] = &[
+            0.082, 0.085, 0.088, 0.089, 0.094, 0.095, 0.096, 0.099, 0.107, 0.108,
+        ];
+        // Sitting still and holding a printed face, 18 rejected watches.
+        const NOT_GESTURES: &[f32] = &[
+            0.021, 0.022, 0.023, 0.023, 0.024, 0.024, 0.030, 0.033, 0.035, 0.038, 0.038, 0.042,
+            0.044, 0.052, 0.055, 0.055, 0.059, 0.069,
+        ];
+        let thr = NOD_PITCH_MIN;
+        for v in REAL_NODS {
+            assert!(
+                *v >= thr,
+                "a measured real nod at {v} would now be refused by NOD_PITCH_MIN {thr}"
+            );
+        }
+        for v in NOT_GESTURES {
+            assert!(
+                *v < thr,
+                "a measured still/print take at {v} would now be ACCEPTED by NOD_PITCH_MIN {thr}"
+            );
+        }
+        // And it sits inside the gap rather than on either edge, so neither side
+        // is one noisy capture away from crossing it.
+        let worst_real = REAL_NODS.iter().copied().fold(f32::INFINITY, f32::min);
+        let worst_fake = NOT_GESTURES.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            thr - worst_fake >= 0.004 && worst_real - thr >= 0.004,
+            "threshold {thr} is not centred in the gap {worst_fake}..{worst_real}"
+        );
     }
 
     /// The reported threshold is the one the gate applied, not the constant.

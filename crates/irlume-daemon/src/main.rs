@@ -84,6 +84,14 @@ fn models_to_verify<'a>(shipped: [&'a str; 4], adapter: &'a str) -> Vec<&'a str>
 }
 
 fn main() {
+    // FIRST, before models load. The watchdog deadline starts ticking the moment
+    // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
+    // cold cache; starting the pings after that made the daemon miss its own
+    // deadline during startup and get killed in a restart loop (measured with
+    // WatchdogSec=10s). An idle worker reports healthy, which is exactly right
+    // for a daemon that is still coming up. No-op unless the unit asked for a
+    // watchdog, so a hand-run daemon and the tests are unaffected (#141).
+    spawn_watchdog();
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
     let adapter = env_or("IRLUME_IR_ADAPTER", "/etc/irlume/ir_adapter.onnx");
@@ -343,8 +351,16 @@ fn main() {
                 // enrolment yields the camera to an authentication instead of
                 // making it wait for ten scans.
                 let token = arbiter.cancel_token();
-                engine.set_stop_signal(std::sync::Arc::new(move || token.stop_requested()));
+                // The engine polls this between whole captures, which makes it
+                // the one place that distinguishes a long-but-healthy job from a
+                // capture stuck inside a driver call. The watchdog (#141) reads
+                // the same signal, so both agree on what "still working" means.
+                engine.set_stop_signal(std::sync::Arc::new(move || {
+                    note_worker_progress();
+                    token.stop_requested()
+                }));
                 while let Some(job) = arbiter.take() {
+                    note_worker_progress();
                     let Queued { req, peer, reply } = job.payload;
                     // Isolate each request behind catch_unwind. A panic deep in
                     // frame decode or inference (e.g. a V4L2 driver echoing back
@@ -391,6 +407,9 @@ fn main() {
                     };
                     // The client may already be gone; its thread owns that.
                     let _ = reply.send(resp);
+                    // Back to waiting for work: idle is healthy, and leaving the
+                    // last job's timestamp behind would read as a wedge (#141).
+                    note_worker_idle();
                 }
             })
             .unwrap_or_else(|e| {
@@ -793,6 +812,132 @@ struct Queued {
 /// retries is minutes of legitimate work. This is a backstop against a wedged
 /// worker leaving connection threads parked forever, not a latency control.
 const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+// ---------------------------------------------------------------------------
+// Wedged-capture watchdog (issue #141).
+//
+// Cooperative cancellation (#117 stage 2) checks a stop signal before opening
+// the device and between whole captures, which covers everything that reaches a
+// yield point. A capture already inside a V4L2 call or an inference session has
+// no such point: if the driver never returns, the worker never comes back, and
+// an authentication queued behind it waits indefinitely. No amount of scheduling
+// fixes that, because there is nothing to schedule against.
+//
+// systemd is already supervising this process, so the deadline lives there
+// rather than in a bespoke watchdog: `WatchdogSec` in the unit, and a ping from
+// here while the worker is healthy. Stopping the ping is what asks for the
+// restart, so a wedge ends as a bounded restart instead of an indefinite hang.
+// PAM already treats a missing daemon as "fall back to the password", so the
+// failure mode is one the login path handles.
+//
+// Health is about the WORKER, not the process. A process that is alive while its
+// camera thread is stuck in the kernel is exactly the case this exists for, so
+// pinging from a bare timer would report a wedged daemon as healthy.
+
+/// When the worker last made progress, or `None` when it is idle.
+///
+/// Idle is healthy: a worker blocked waiting for the next job is doing its job.
+/// Only a job that has been in flight without progress is a wedge candidate.
+fn worker_progress() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+/// Mark forward progress: a job was picked up, or a capture boundary was
+/// reached. Called from the same points cooperative cancellation is polled at,
+/// so long-but-healthy work (an enrolment capturing ten scans) keeps reporting
+/// while a capture stuck inside one driver call does not.
+fn note_worker_progress() {
+    let mut p = match worker_progress().lock() {
+        Ok(p) => p,
+        Err(e) => e.into_inner(),
+    };
+    *p = Some(std::time::Instant::now());
+}
+
+/// Mark the worker idle again; it is healthy until it takes the next job.
+fn note_worker_idle() {
+    let mut p = match worker_progress().lock() {
+        Ok(p) => p,
+        Err(e) => e.into_inner(),
+    };
+    *p = None;
+}
+
+/// Whether a job has been in flight with no progress for longer than `limit`.
+fn worker_wedged(limit: std::time::Duration) -> bool {
+    let p = match worker_progress().lock() {
+        Ok(p) => p,
+        Err(e) => e.into_inner(),
+    };
+    p.is_some_and(|since| since.elapsed() > limit)
+}
+
+/// Send one `WATCHDOG=1` to the notify socket systemd handed us.
+///
+/// Written directly rather than pulling in a crate: it is one datagram. An
+/// abstract socket (the usual case) arrives with a leading `@`.
+fn notify_watchdog(socket: &str) -> std::io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let sock = UnixDatagram::unbound()?;
+    let addr = match socket.strip_prefix('@') {
+        Some(name) => SocketAddr::from_abstract_name(name.as_bytes())?,
+        None => SocketAddr::from_pathname(socket)?,
+    };
+    sock.send_to_addr(b"WATCHDOG=1", &addr)?;
+    Ok(())
+}
+
+/// Ping systemd while the worker is healthy, and stop when it is not.
+///
+/// Does nothing unless systemd asked for a watchdog (`WATCHDOG_USEC`), so a
+/// hand-run daemon and the test suite are unaffected. The no-progress deadline
+/// is half the watchdog period, so a wedge is reported after one missed ping
+/// rather than sitting until the period expires twice.
+fn spawn_watchdog() {
+    let (Ok(socket), Ok(usec)) = (
+        std::env::var("NOTIFY_SOCKET"),
+        std::env::var("WATCHDOG_USEC"),
+    ) else {
+        return;
+    };
+    let Ok(usec) = usec.parse::<u64>() else {
+        return;
+    };
+    if socket.is_empty() || usec == 0 {
+        return;
+    }
+    let period = std::time::Duration::from_micros(usec);
+    let interval = period / 2;
+    std::thread::Builder::new()
+        .name("irlume-watchdog".into())
+        .spawn(move || {
+            let mut complained = false;
+            loop {
+                std::thread::sleep(interval);
+                if worker_wedged(interval) {
+                    if !complained {
+                        eprintln!(
+                            "irlumed: the camera worker has made no progress for {}s; \
+                             withholding the systemd watchdog ping so this is restarted \
+                             rather than left hung (face auth falls back to the password \
+                             meanwhile)",
+                            interval.as_secs()
+                        );
+                        complained = true;
+                    }
+                    continue;
+                }
+                complained = false;
+                if let Err(e) = notify_watchdog(&socket) {
+                    eprintln!("irlumed: watchdog ping failed: {e}");
+                }
+            }
+        })
+        .ok();
+}
 
 // ---------------------------------------------------------------------------
 // Per-uid refusal throttle (issue #142).
@@ -2728,6 +2873,47 @@ mod tests {
             }
             other => panic!("expected PasswordUnsealed, got {other:?}"),
         }
+    }
+
+    /// Idle is healthy, work in flight is healthy while it reports progress, and
+    /// only a job that has gone quiet past the deadline counts as wedged. Getting
+    /// this backwards either restarts a busy daemon or never restarts a hung one.
+    #[test]
+    fn worker_is_wedged_only_when_a_job_stops_reporting_progress() {
+        let short = std::time::Duration::from_millis(40);
+
+        // Idle: nothing in flight, so nothing to be wedged about. A bare timer
+        // would have to invent an answer here; this one does not.
+        note_worker_idle();
+        assert!(!worker_wedged(short), "an idle worker is not wedged");
+
+        // A job just picked up is healthy.
+        note_worker_progress();
+        assert!(!worker_wedged(short));
+
+        // Gone quiet past the deadline: this is the wedge.
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        assert!(
+            worker_wedged(short),
+            "no progress for longer than the limit"
+        );
+
+        // A long job that keeps reporting stays healthy, which is what stops an
+        // enrolment capturing ten scans from being killed as a hang.
+        for _ in 0..4 {
+            note_worker_progress();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                !worker_wedged(short),
+                "progress between captures is healthy"
+            );
+        }
+
+        // Finishing returns it to idle rather than leaving the last timestamp to
+        // age into a false wedge.
+        note_worker_idle();
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        assert!(!worker_wedged(short), "idle after a job is still healthy");
     }
 
     /// The refusal throttle must spend down under sustained refusals, refill on

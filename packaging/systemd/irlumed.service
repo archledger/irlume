@@ -19,6 +19,16 @@ Environment="IRLUME_SOCKET=/run/irlume.sock"
 # the target user per request, so no global STATE_DIR is set here.
 Restart=on-failure
 RestartSec=2
+# Wedged-capture watchdog (issue #141). Cooperative cancellation covers every
+# capture that reaches a yield point; a capture stuck inside a V4L2 call or an
+# inference session has none, and an authentication queued behind it would wait
+# indefinitely. The daemon pings only while its CAMERA WORKER is making
+# progress, so a process that is alive with a stuck worker still gets restarted.
+# Generous on purpose: an enrolment captures many scans, and it reports progress
+# between them, so this only has to exceed one capture plus inference.
+WatchdogSec=90s
+# Type=simple, so sd_notify is refused unless this says who may send it.
+NotifyAccess=main
 # The socket loop exits promptly on SIGTERM (no long-held camera handle:
 # captures open and drop the device per request). Cap the stop wait so a
 # package-upgrade restart can never stall on the default 90s if a request is

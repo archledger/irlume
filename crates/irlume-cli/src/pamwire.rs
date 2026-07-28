@@ -105,6 +105,10 @@ const GREETERS: &[Svc] = &[
         etc: "/etc/pam.d/greetd",
         vendor: None,
     }, // greetd (sway / wayland / tuigreet)
+    Svc {
+        etc: "/etc/pam.d/ly",
+        vendor: None,
+    }, // ly (TUI display manager; `auth include login`, unit is ly@<tty>)
 ];
 // KDE lock: wire the submit-driven `kde` password service with the on-demand
 // face block, NOT KDE's ambient `kde-fingerprint` parallel-biometric slot, so
@@ -464,10 +468,63 @@ fn label_of(etc: &str) -> String {
 /// The active login manager, from the `display-manager.service` symlink
 /// (`gdm`, `gdm3`, `sddm`, `lightdm`, `greetd`, `ly`, …). None on a
 /// non-graphical / greeter-less host.
+/// Login managers that never create the `display-manager.service` symlink, so
+/// the mechanism every other DM is found by does not apply to them.
+///
+/// `ly` is the case that motivated this. Measured on Arch's `ly` 1.4.1: the unit
+/// is TEMPLATED (`ly@.service`, one instance per TTY) and carries no
+/// `Alias=display-manager.service`, only `WantedBy=multi-user.target`. Enabling
+/// it creates exactly one link, `multi-user.target.wants/ly@tty2.service`, so
+/// `read_link` on the usual path fails and irlume reported "no display manager"
+/// on a host that plainly has one.
+const WANTS_ONLY_DMS: &[&str] = &["ly"];
+
+/// The `.wants` directories an enabled display manager can land in.
+const WANTS_DIRS: &[&str] = &[
+    "/etc/systemd/system/multi-user.target.wants",
+    "/etc/systemd/system/graphical.target.wants",
+];
+
+/// A display manager enabled without a `display-manager.service` symlink.
+///
+/// Deliberately narrow: it matches only names in [`WANTS_ONLY_DMS`], so this
+/// cannot start reporting arbitrary enabled units as the login manager. Returns
+/// the BASE name (`ly@tty2.service` → `ly`), which is what the PAM service and
+/// the rest of the wiring are keyed on.
+fn display_manager_from_wants() -> Option<String> {
+    for dir in WANTS_DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".service") else {
+                continue;
+            };
+            // Templated or plain: `ly@tty2` and `ly` both answer `ly`.
+            let base = stem.split('@').next().unwrap_or(stem);
+            if WANTS_ONLY_DMS.contains(&base) {
+                return Some(base.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The active login manager's base name.
+///
+/// The `display-manager.service` symlink first, since that is what every DM that
+/// sets one is found by, then the `.wants` fallback for the ones that do not.
+/// A TEMPLATE INSTANCE is reduced to its base name (`ly@tty2` → `ly`): systemd
+/// writes the instance into the unit name, while PAM services and this file's
+/// tables are keyed on the bare name, so leaving the instance attached made a
+/// supported DM read as unknown.
 fn active_display_manager() -> Option<String> {
-    std::fs::read_link("/etc/systemd/system/display-manager.service")
+    let symlinked = std::fs::read_link("/etc/systemd/system/display-manager.service")
         .ok()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .map(|stem| stem.split('@').next().unwrap_or(&stem).to_string());
+    symlinked.or_else(display_manager_from_wants)
 }
 
 /// Minimum GNOME Shell major version that wires GDM with the consent-driven
@@ -564,9 +621,9 @@ const DM_PAM_SERVICES: &[(&str, &str, Option<&str>)] = &[
     ("plasmalogin", "plasmalogin", None),
     ("lightdm", "lightdm", None),
     ("greetd", "greetd", None),
-    // ly: named here because the symlink resolves to it, but there is no `Svc`
-    // for /etc/pam.d/ly, so nothing wires it and `dm_wirable` reports false.
-    // Adding the recipe needs validation on a real ly host (issue #128).
+    // ly: a TUI display manager whose `/etc/pam.d/ly` is `auth include login`,
+    // so irlume's line goes in that file like any other greeter. Found via
+    // `display_manager_from_wants`, since ly sets no display-manager.service.
     ("ly", "ly", None),
     // COSMIC (System76 / Pop!_OS): cosmic-greeter drives BOTH the cold login
     // and the live lock screen through the SAME `cosmic-greeter` PAM service;
@@ -778,8 +835,9 @@ pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
 
 /// The active login manager and the PAM services it consults.
 pub(crate) struct LoginManagerFact {
-    /// `None` when no `display-manager.service` is set: a headless host, or a
-    /// greeter that does not register one. Not the same as "no face login".
+    /// `None` when no login manager could be found at all: a headless host. A
+    /// greeter that registers no `display-manager.service` is still found when
+    /// it is one of [`WANTS_ONLY_DMS`]. Not the same as "no face login".
     pub(crate) name: Option<String>,
     /// Whether irlume can wire face login here. False covers both a login
     /// manager it has no mapping for and one whose mapped service it has no
@@ -2091,18 +2149,60 @@ mod tests {
         assert!(!DM_HIDES_PAM_TEXT_INFO.contains(&"sddm"));
     }
 
+    /// A templated unit carries its instance in the unit name, and the tables
+    /// here are keyed on the bare name. `ly@tty2` must reduce to `ly`, or a DM
+    /// irlume fully supports reads as unknown and gets no wiring.
+    #[test]
+    fn a_template_instance_reduces_to_the_base_display_manager_name() {
+        for (unit, want) in [
+            ("ly@tty2.service", "ly"),
+            ("ly@tty1.service", "ly"),
+            ("ly.service", "ly"),
+            ("sddm.service", "sddm"),
+        ] {
+            let stem = std::path::Path::new(unit)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let base = stem.split('@').next().unwrap_or(&stem);
+            assert_eq!(base, want, "{unit}");
+            assert!(
+                dm_pam_services(base).0 != "(unknown)",
+                "{unit} must resolve to a known PAM service"
+            );
+        }
+    }
+
+    /// The `.wants` fallback exists for display managers that set no
+    /// `display-manager.service`, and must not start reporting arbitrary enabled
+    /// units as the login manager.
+    #[test]
+    fn the_wants_fallback_only_matches_known_display_managers() {
+        for dm in WANTS_ONLY_DMS {
+            assert!(
+                DM_PAM_SERVICES.iter().any(|(name, _, _)| name == dm),
+                "{dm} is matched in .wants but is not a login manager irlume knows"
+            );
+            assert!(dm_wirable(dm), "{dm} is detected but cannot be wired");
+        }
+        // Plenty of unrelated services live in these directories.
+        for other in ["NetworkManager", "sshd", "docker", "bluetooth"] {
+            assert!(
+                !WANTS_ONLY_DMS.contains(&other),
+                "{other} must never be read as a display manager"
+            );
+        }
+    }
+
     #[test]
     fn a_login_manager_is_recognized_only_when_something_can_wire_it() {
         // Walk the whole table, so a login manager added later cannot claim
-        // support without a recipe. `ly` is the case that motivated this: it maps
-        // to a `ly` PAM service that no `Svc` covers, so `login enable` never
-        // touched it while doctor called the machine supported.
-        const NO_RECIPE_YET: &[&str] = &["ly"];
+        // support without a recipe. `ly` is the case that motivated this: it
+        // mapped to a `ly` PAM service that no `Svc` covered, so `login enable`
+        // never touched it while doctor called the machine supported. Every row
+        // now has a recipe, and this fails if one is added without.
         for (dm, greeter, fp) in DM_PAM_SERVICES {
-            if NO_RECIPE_YET.contains(dm) {
-                assert!(!dm_wirable(dm), "{dm} has no Svc entry, so it cannot wire");
-                continue;
-            }
             assert!(dm_wirable(dm), "{dm} is claimed as supported");
             assert!(service_wirable(greeter), "{dm} greeter {greeter}");
             if let Some(fp) = fp {
@@ -2130,6 +2230,7 @@ mod tests {
                 ("plasmalogin", ROLE_LOGIN),
                 ("cosmic-greeter", ROLE_LOGIN),
                 ("greetd", ROLE_LOGIN),
+                ("ly", ROLE_LOGIN),
                 ("gdm-fingerprint", ROLE_LOGIN_FP),
                 ("kde", ROLE_LOCK),
                 ("sudo", ROLE_SUDO),
@@ -2336,6 +2437,7 @@ mod tests {
                 "plasmalogin",
                 "cosmic-greeter",
                 "greetd",
+                "ly",
                 "gdm-fingerprint",
                 "kde",
                 "sudo",

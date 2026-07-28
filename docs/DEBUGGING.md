@@ -114,7 +114,7 @@ sudo pamtester <service> $USER authenticate
 ```
 
 `<service>` is your greeter's PAM service: `plasmalogin`, `sddm`, `lightdm`,
-`greetd`, `gdm-password`, `cosmic-greeter`, or `polkit-1` for app prompts.
+`greetd`, `gdm-password`, `cosmic-greeter`, `ly`, or `polkit-1` for app prompts.
 `irlume login status` prints the active ones. On an on-demand wiring, press **Enter on the empty password
 prompt** to trigger face; type the password to confirm the no-camera path.
 Watch `irlume logs -f` in a second terminal.

@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.6.1
+Version:        0.7.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -201,6 +201,14 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Jul 28 2026 archledger <archledger236@gmail.com> - 0.7.0-1
+- Camera arbitration: an authentication is no longer queued behind preview work
+- Versioned read-only JSON machine API for desktop integrations
+- Consent gesture: measured thresholds, discoverable prompts, diagnosable refusals
+- Daemon hardening: per-uid refusal throttle and a wedged-capture watchdog
+- ly display manager support
+- Fix: the control socket is reachable again from a user-context PAM stack
+
 * Thu Jul 24 2026 archledger <archledger236@gmail.com> - 0.6.1-1
 - Update resilience: login self-heal survives an inactive watcher and a
   pre-marker upgrade; doctor warns on an unrecognized display manager; a pinned

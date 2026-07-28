@@ -244,6 +244,14 @@ def check_engine(results, binary, validate, validate_note):
         (["status", "--contract", "not-a-number", "--json"], "usage-error"),
         (["status", "--contract", "--json"], "usage-error"),
         (["version", "--json", "--no-such-flag"], "usage-error"),
+        # The flag BEFORE the subcommand, on the two commands that have one.
+        # Every case above puts it last, which is why this script could not see
+        # that `profiles --contract 9 list --json` and `login --contract 9 status
+        # --json` used to fall through to the human handler and answer a machine
+        # caller with prose on stderr. The contract states no ordering rule, so
+        # neither may this.
+        (["profiles", "--contract", "999", "list", "--json"], "unsupported-contract"),
+        (["login", "--contract", "999", "status", "--json"], "unsupported-contract"),
     ]
     for argv, expected in negotiation:
         what = f"refusal: irlume {' '.join(argv)} -> {expected}"

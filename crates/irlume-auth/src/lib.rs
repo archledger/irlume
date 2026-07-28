@@ -20,8 +20,8 @@ pub use irlume_camera::{capabilities, device_identity, select_pair};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
-    ensure_ir_emitter, list_ir_controls, measure_contention, setup_ir_emitter, store_capture_mode,
-    CaptureMode, ContentionReport,
+    ensure_ir_emitter, list_ir_controls, measure_contention, measure_contention_with_progress,
+    setup_ir_emitter, store_capture_mode, CaptureMode, ContentionReport,
 };
 
 /// Loaded models + camera device selection. Build once, reuse per request.

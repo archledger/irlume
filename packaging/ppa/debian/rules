@@ -43,6 +43,11 @@ override_dh_auto_install:
 		debian/irlume/usr/share/irlume/models/face_landmark.onnx
 	install -D -m0644 models/blaze_face_short_range.onnx \
 		debian/irlume/usr/share/irlume/models/blaze_face_short_range.onnx
+# The machine-API JSON Schema. Fedora, Arch, Debian-nfpm and Nix all ship it and
+# the integration docs point consumers at this exact path, so a PPA install that
+# omitted it made those docs wrong for every Ubuntu user.
+	install -D -m0644 schemas/machine-api-v1.schema.json \
+		debian/irlume/usr/share/irlume/schemas/machine-api-v1.schema.json
 	mkdir -p debian/irlume/opt/irlume/onnxruntime
 	cp -a ort-prebuilt/lib debian/irlume/opt/irlume/onnxruntime/
 	install -D -m0644 packaging/systemd/irlumed.service \

@@ -1,1 +1,1 @@
-{"contract_version":1,"engine_version":"0.6.1","command":"status","ok":false,"error":{"code":"unsupported-contract","retryable":false}}
+{"contract_version":1,"engine_version":"0.7.0","command":"status","ok":false,"error":{"code":"unsupported-contract","retryable":false}}

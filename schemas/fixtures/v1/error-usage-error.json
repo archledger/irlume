@@ -1,1 +1,1 @@
-{"contract_version":1,"engine_version":"0.6.1","command":"version","ok":false,"error":{"code":"usage-error","retryable":false}}
+{"contract_version":1,"engine_version":"0.7.0","command":"version","ok":false,"error":{"code":"usage-error","retryable":false}}

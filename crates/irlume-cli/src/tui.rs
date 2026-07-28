@@ -495,7 +495,7 @@ struct App {
     quit: bool,
 }
 
-pub fn run() -> std::io::Result<()> {
+pub fn run(args: &[String]) -> std::io::Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         eprintln!("irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.");
@@ -506,7 +506,7 @@ pub fn run() -> std::io::Result<()> {
         std::io::stdout(),
         ratatui::crossterm::event::EnableMouseCapture
     );
-    let mut app = App::new();
+    let mut app = App::new(crate::user_arg(args));
     app.log('·', format!("irlume: managing '{}' (live)", app.user));
     app.refresh();
     let res = app.main_loop(&mut terminal);
@@ -519,10 +519,18 @@ pub fn run() -> std::io::Result<()> {
 }
 
 impl App {
-    fn new() -> Self {
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .unwrap_or_else(|_| "user".into());
+    /// `user` is resolved by the caller through `crate::user_arg`, NOT from
+    /// $USER here.
+    ///
+    /// Under `sudo irlume tui` the environment says USER=root and LOGNAME=root
+    /// while SUDO_USER holds the person who actually ran it, and this screen
+    /// tells users to run it with sudo to see root-only settings. Reading $USER
+    /// therefore pointed every one of this file's requests at the account
+    /// `root`: an empty dashboard for a fully configured user, and worse, `[a]`
+    /// sealing the typed login password and `[e]` enrolling a face under the
+    /// wrong account. `user_arg` is the single rule the rest of the CLI already
+    /// follows, and it also honours an explicit `--user`.
+    fn new(user: String) -> Self {
         // Hardware-adaptive screens: only show what the device can actually do, so
         // a fingerprint-only box never offers face/camera setup steps.
         let caps = irlume_camera::capabilities();
@@ -5033,8 +5041,35 @@ mod tests {
     use ratatui::Terminal;
     use std::sync::atomic::AtomicUsize;
 
+    /// The TUI must resolve its target account the way the rest of the CLI does.
+    ///
+    /// Reading $USER here pointed every request in this file at `root` under
+    /// `sudo irlume tui`, which is the documented way to see root-only settings.
+    /// That meant an empty dashboard for a configured user, and `[a]`/`[e]`
+    /// sealing a password and enrolling a face under the wrong account. The rule
+    /// lives in `user_arg`; this pins the TUI to it.
+    #[test]
+    fn the_tui_targets_the_invoking_user_not_the_sudo_environment() {
+        // The rule itself: SUDO_USER wins over the root $USER that sudo sets.
+        let _g = ();
+        let explicit = crate::user_arg(&["--user".to_string(), "someone".to_string()]);
+        assert_eq!(explicit, "someone", "an explicit --user must win");
+
+        // And App stores exactly what it is handed, with no environment read of
+        // its own to reintroduce the bug.
+        let app = app_with_user("handed-in");
+        assert_eq!(app.user, "handed-in");
+    }
+
     /// A bare App for tests: no hardware probes, no daemon socket, no terminal.
     /// Mirrors `App::new()` but every probe-derived field is inert.
+    /// `test_app` with a chosen account, for the user-resolution test.
+    fn app_with_user(user: &str) -> App {
+        let mut a = test_app();
+        a.user = user.into();
+        a
+    }
+
     fn test_app() -> App {
         let caps = irlume_camera::Caps {
             ir_pair: false,

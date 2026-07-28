@@ -1898,18 +1898,39 @@ pub fn measure_contention(
     ir_dev: &str,
     rounds: usize,
 ) -> irlume_common::Result<ContentionReport> {
+    measure_contention_with_progress(rgb_dev, ir_dev, rounds, &|| {})
+}
+
+/// [`measure_contention`], reporting between captures.
+///
+/// The daemon's watchdog (#141) decides a capture has wedged when the worker
+/// stops reporting progress. Engine work reports through its stop-signal
+/// callback; this loop does not use the Engine at all, so a long tune was
+/// indistinguishable from a hang: `camera-tune --rounds 30` runs many sequential
+/// and concurrent captures and can exceed the no-progress deadline, at which
+/// point systemd would kill a daemon that is working perfectly. Reporting at the
+/// same granularity the Engine does, between whole captures, keeps the wedge
+/// detection honest while removing the false kill.
+pub fn measure_contention_with_progress(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+    progress: &dyn Fn(),
+) -> irlume_common::Result<ContentionReport> {
     verify_pinned(rgb_dev)?;
     verify_pinned(ir_dev)?;
     let rounds = rounds.max(1);
     let mut report = ContentionReport::default();
 
     for _ in 0..rounds {
+        progress();
         let t0 = std::time::Instant::now();
         let rgb = capture_rgb_denoised(rgb_dev);
         let ir = capture_ir_with_stats(ir_dev);
         accumulate(&mut report.sequential, &rgb, &ir, t0.elapsed());
     }
     for _ in 0..rounds {
+        progress();
         let t0 = std::time::Instant::now();
         let (rgb, ir) = std::thread::scope(|s| {
             let ir_t = s.spawn(|| capture_ir_with_stats(ir_dev));

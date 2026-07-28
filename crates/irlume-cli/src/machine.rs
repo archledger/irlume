@@ -285,11 +285,21 @@ pub fn status(args: &[String]) -> ExitCode {
     };
 
     // Camera capability, not camera identity: whether each spectrum resolved to
-    // a device, never which one.
+    // a device that is actually THERE, never which one.
+    //
+    // Emptiness is not the test. `select_pair` falls back to the compiled
+    // default node names when discovery finds nothing, so the strings are never
+    // empty and this reported `{"rgb":true,"ir":true}` on a machine with no
+    // camera at all: in a container, on a desktop without one, or before the
+    // nodes appear at boot. A consumer reading that offers face setup, or shows
+    // Secure-tier hardware, that does not exist. The daemon's own Health reply
+    // has always paired the capability probe with an existence check; this now
+    // agrees with it.
+    let caps = irlume_camera::capabilities();
     let (rgb, ir) = irlume_camera::select_pair();
     let camera = json!({
-        "rgb": !rgb.is_empty(),
-        "ir": !ir.is_empty(),
+        "rgb": caps.rgb && std::path::Path::new(&rgb).exists(),
+        "ir": caps.ir_pair && std::path::Path::new(&ir).exists(),
     });
 
     emit(

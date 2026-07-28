@@ -89,6 +89,15 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     }
+    // `--help` ANYWHERE means help, not "run the command and also I asked for
+    // help". Matching it only in position 0 meant `irlume detect --help` printed
+    // readiness, `irlume enroll --help` fired a capture, `irlume keyring arm
+    // --help` prompted for the login password, and `irlume uninstall --help`
+    // opened the uninstall confirmation. Asking a program what it does should
+    // never be the thing that does it.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return commands::help();
+    }
     match (
         args.first().map(String::as_str),
         args.get(1).map(String::as_str),
@@ -107,7 +116,15 @@ fn main() -> std::process::ExitCode {
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
-        (Some("profiles"), Some("list")) if args.iter().any(|arg| arg == "--json") => {
+        // Matched on PRESENCE of the subcommand, not on its position. Binding it
+        // to args[1] meant a flag before it displaced it: `profiles --contract 9
+        // list --json` fell through to the human handler and answered a machine
+        // caller with prose on stderr and exit 2, while `doctor`/`status`/
+        // `version` accepted the same flag anywhere. The contract documents no
+        // ordering rule, so all five now behave the same way.
+        (Some("profiles"), _)
+            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
+        {
             machine::profiles_list(&args)
         }
         (Some("profiles"), sub) => profiles(sub, &args),
@@ -117,7 +134,9 @@ fn main() -> std::process::ExitCode {
         (Some("recovery"), sub) => recovery::run(sub, &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
-        (Some("login"), Some("status")) if args.iter().any(|arg| arg == "--json") => {
+        (Some("login"), _)
+            if args.iter().any(|a| a == "status") && args.iter().any(|a| a == "--json") =>
+        {
             machine::login_status(&args)
         }
         (Some("login"), sub) => pamwire::run(sub, &args),
@@ -151,7 +170,7 @@ fn main() -> std::process::ExitCode {
         (Some("selinux"), sub) => commands::selinux(sub, &args),
         (Some("setup"), _) => commands::setup(&args),
         (Some("help" | "--help" | "-h"), _) => commands::help(),
-        (Some("tui"), _) => match tui::run() {
+        (Some("tui"), _) => match tui::run(&args) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("tui: {e}");

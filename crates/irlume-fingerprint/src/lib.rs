@@ -326,6 +326,45 @@ struct StreamedRun {
     status: Option<std::process::ExitStatus>,
 }
 
+/// How long [`spawn_retrying_etxtbsy`] keeps trying. ETXTBSY clears as soon as
+/// the writer closes its descriptor, so this only has to outlast a fork that has
+/// not reached its `execve` yet, or a package manager finishing a file it is
+/// replacing. Long enough to cover both, short enough that a genuinely stuck
+/// writer still surfaces as an error rather than a hang.
+const ETXTBSY_RETRY_BUDGET: Duration = Duration::from_millis(500);
+
+/// Spawn a child, retrying while the executable reports `ETXTBSY`.
+///
+/// `execve` fails with `ETXTBSY` when ANY process holds the binary open for
+/// writing, and the condition is transient in both situations irlume meets it:
+///
+/// - a package manager replacing `fprintd-enroll` while we run it, and
+/// - a sibling thread that forked while some file was open for writing. The
+///   child inherits that descriptor until its own `execve` clears it (Rust marks
+///   files `CLOEXEC`), so an unrelated spawn can briefly make an unrelated
+///   binary unexecutable.
+///
+/// The second one is what broke `enroll_runs_end_to_end_against_fake_fprintd`
+/// under AddressSanitizer: instrumentation widens the fork-to-exec window enough
+/// to collide with the test writing its fake tool. Failing the whole operation
+/// on a condition that clears itself in microseconds is the wrong answer, so
+/// retry within a budget and report the error only if it persists.
+fn spawn_retrying_etxtbsy(
+    cmd: &mut Command,
+    budget: Duration,
+) -> std::io::Result<std::process::Child> {
+    const ETXTBSY: i32 = 26;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Spawn `cmd`, stream its stdout/stderr live (stdout to ours, stderr to ours)
 /// while capturing both, and enforce `deadline`: a child that stops making
 /// progress is killed instead of hanging the caller forever (libfprint#795 is
@@ -335,11 +374,11 @@ fn run_streamed(mut cmd: Command, deadline: Duration) -> Result<StreamedRun, Str
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
 
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
+    let mut child = spawn_retrying_etxtbsy(
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()),
+        ETXTBSY_RETRY_BUDGET,
+    )
+    .map_err(|e| format!("spawn: {e}"))?;
     let captured = Arc::new(Mutex::new(String::new()));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -663,6 +702,35 @@ mod tests {
     }
 
     #[test]
+    fn spawn_retries_while_the_binary_is_held_open_for_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("irlume-etxtbsy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("held.sh");
+        std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // An open write descriptor is exactly what makes execve return ETXTBSY.
+        let writer = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+
+        // With no budget the condition is reported, not masked: a writer that
+        // never lets go must still surface as an error.
+        let err = spawn_retrying_etxtbsy(&mut Command::new(&p), Duration::ZERO)
+            .expect_err("a held-open binary must not spawn");
+        assert_eq!(err.raw_os_error(), Some(26), "expected ETXTBSY, got {err}");
+
+        // Released mid-flight, which is how the real races resolve.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let mut child = spawn_retrying_etxtbsy(&mut Command::new(&p), Duration::from_secs(10))
+            .expect("retry must outlast a writer that closes");
+        assert!(child.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_streamed_captures_stdout_and_stderr() {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "echo out-line; echo err-line >&2"]);
@@ -701,6 +769,30 @@ mod tests {
             *TOOL_DIR_OVERRIDE.lock().unwrap() = None;
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Regression for the ASan failure on 41ddf2e: a sibling thread forking
+    /// while the fake tool was being written leaked a write descriptor into its
+    /// child, and the enroll spawn landed in that window with ETXTBSY. Here the
+    /// writer is explicit instead of raced for, so the path is pinned rather
+    /// than left to timing. Without the retry this returns
+    /// `Failed("fprintd-enroll: spawn: Text file busy (os error 26)")`.
+    #[test]
+    fn enroll_survives_a_writer_briefly_holding_the_tool_open() {
+        let ft = FakeTools::new("etxtbsy-enroll");
+        ft.script("fprintd-enroll", "echo 'Enroll result: enroll-completed'");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(ft.dir.join("fprintd-enroll"))
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(held);
+        });
+        assert_eq!(
+            enroll_finger("tester", "right-index-finger"),
+            EnrollOutcome::Enrolled
+        );
     }
 
     #[test]

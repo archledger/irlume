@@ -813,6 +813,23 @@ struct Queued {
 /// worker leaving connection threads parked forever, not a latency control.
 const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// True the first time this uid is refused an unseal for not being root.
+///
+/// The explanatory line is worth printing once per surface, not once per screen
+/// unlock: it describes why a user-context greeter gets verification instead of
+/// a credential, which does not change. Keeping it to once per uid also means a
+/// local process cannot fill the journal by spinning on a request it knows will
+/// be refused.
+fn first_nonroot_unseal(uid: u32) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+        std::sync::OnceLock::new();
+    let mut seen = match SEEN.get_or_init(Default::default).lock() {
+        Ok(s) => s,
+        Err(e) => e.into_inner(),
+    };
+    seen.insert(uid)
+}
+
 // ---------------------------------------------------------------------------
 // Wedged-capture watchdog (issue #141).
 //
@@ -1528,10 +1545,42 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::UnsealPassword { user, service } => {
-            // The sealed LOGIN password is released ONLY to a root peer (the
-            // login/lockscreen PAM stack runs as root). A non-root caller never
-            // gets it, even with a matching face.
+            // The sealed LOGIN password is released ONLY to a root peer. A
+            // non-root caller never gets it, even with a matching face.
+            //
+            // NOT every login surface is root, and the comment here used to say
+            // it was. Greeters are (SDDM, GDM, plasmalogin, greetd all run PAM
+            // in a privileged helper), and so are sudo and the polkit helper.
+            // The KDE LOCK SCREEN is not: `kscreenlocker_greet` is not setuid
+            // and runs as the user, so its `unseal` is refused here every time
+            // and `pam_irlume`'s `ondemand` fallback then verifies identity
+            // instead. That is working as intended, and it is why a warm screen
+            // unlock never releases a credential.
+            //
+            // Refusing SILENTLY is what was wrong. This returns before
+            // `do_unseal_password` logs its `attempt` line, so the whole
+            // exchange left no trace: a field investigation into "face unlocked
+            // the screen but the keyring still asked for a password" reads an
+            // empty journal and concludes the daemon was never contacted, which
+            // is exactly the wrong conclusion. Measured 2026-07-27, that cost
+            // hours.
+            //
+            // Logged once per uid per daemon lifetime, not once per unlock: the
+            // line exists to explain a surface, not to narrate every lock
+            // screen, and a local process could otherwise flood the journal by
+            // spinning on a request it knows will be refused.
             if peer.uid != 0 {
+                if first_nonroot_unseal(peer.uid) {
+                    eprintln!(
+                        "irlumed: UnsealPassword refused for uid {} (not root): no sealed \
+                         credential is released to a user-context caller. A greeter that runs \
+                         PAM as the user, notably the KDE lock screen, gets identity \
+                         verification only; this is expected and is logged once per uid.",
+                        peer.uid
+                    );
+                } else {
+                    irlume_common::dlog!("UnsealPassword refused for uid {} (not root)", peer.uid);
+                }
                 return Response::Error(format!(
                     "unseal_password requires root (peer uid {})",
                     peer.uid
@@ -1574,9 +1623,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             if biopolicy_enforced() {
                 use irlume_core::biopolicy::{classify, decide, Action, SessionState, Tier};
                 let svc = service.as_deref().unwrap_or("");
-                // UnsealPassword is the cold-login path (the lock screen uses
-                // verify-only `wait`), so Cold. irlume's liveness already
-                // requires IR for any grant, so a granted match is Secure tier.
+                // UnsealPassword is the cold-login path, so Cold. Not because
+                // the lock screen asks for something different: `/etc/pam.d/kde`
+                // is wired `unseal ondemand` like the greeters. It is because a
+                // lock-screen unseal is refused above for running as the user,
+                // so what reaches here is the cold path in practice. irlume's
+                // liveness already requires IR for any grant, so a granted match
+                // is Secure tier.
                 let action = decide(classify(svc, SessionState::Cold), Tier::Secure);
                 if action != Action::Unseal {
                     eprintln!("irlumed: biopolicy denies unseal for service '{svc}' ({action:?}) -> password");
@@ -2914,6 +2967,27 @@ mod tests {
         note_worker_idle();
         std::thread::sleep(std::time::Duration::from_millis(70));
         assert!(!worker_wedged(short), "idle after a job is still healthy");
+    }
+
+    /// The explanatory refusal line is printed once per uid, so a local process
+    /// spinning on a request it knows will be refused cannot fill the journal,
+    /// while each distinct surface still gets its one explanation.
+    #[test]
+    fn a_non_root_unseal_is_explained_once_per_uid() {
+        const A: u32 = 90001;
+        const B: u32 = 90002;
+        assert!(
+            first_nonroot_unseal(A),
+            "first refusal for a uid explains itself"
+        );
+        for _ in 0..1000 {
+            assert!(!first_nonroot_unseal(A), "every later refusal stays quiet");
+        }
+        assert!(
+            first_nonroot_unseal(B),
+            "a different uid is a different surface"
+        );
+        assert!(!first_nonroot_unseal(B));
     }
 
     /// The refusal throttle must spend down under sustained refusals, refill on

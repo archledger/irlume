@@ -35,11 +35,22 @@ jobs:
         # GPG-signed off-CI), so at publish time there are zero assets and this
         # step failed on every release, v0.7.0 included. That red run says
         # nothing about the release; it only says the maintainer has not
-        # uploaded yet. Tolerate the empty case and let the next step decide.
+        # uploaded yet.
+        #
+        # Tolerating it with `|| echo` was too broad: a bad token, a rate limit,
+        # a network blip and a nonexistent tag were all swallowed into the same
+        # empty directory, and the job went green having attested nothing. Ask
+        # the API for the asset count and accept only a confirmed zero; a failing
+        # count query is an error, not an empty release.
         run: |
+          set -euo pipefail
           mkdir -p assets
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets \
-            || echo "no assets on the release yet"
+          count=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets | length')
+          if [ "$count" -gt 0 ]; then
+            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
+          else
+            echo "::notice::release $GITHUB_REF_NAME has no assets yet"
+          fi
       - name: Base64 subjects for the deb + rpm
         id: hash
         working-directory: assets

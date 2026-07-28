@@ -10,8 +10,15 @@ on:
   release:
     types: [published, edited]
   # Assets are GPG-signed off-CI and uploaded one at a time; a re-verify from
-  # the complete state can always be requested here.
+  # the complete state can always be requested here. The tag is REQUIRED: a
+  # dispatch carries no release context, so without it the download fell back
+  # to the branch name and tried to fetch a release called `main`.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v0.7.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -22,7 +29,7 @@ permissions:
 # training them to ignore the check. Cancelling supersedes the intermediate
 # runs (grey, no email); only the final complete state is verified.
 concurrency:
-  group: verify-release-${{ github.event.release.tag_name || github.ref }}
+  group: verify-release-${{ inputs.tag || github.event.release.tag_name || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -37,16 +44,30 @@ jobs:
       - name: Download release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
         # `gh release download` exits 1 on "no assets to download", which is the
         # state every release is in at `published`: the assets are built and
         # GPG-signed off-CI and uploaded afterwards. The steps below already
         # treat a partial upload as "skip, not fail"; this step used to fail
         # before they got the chance, so v0.7.0 published with a red check that
-        # meant nothing was uploaded yet. Same handling, one step earlier.
+        # meant nothing was uploaded yet.
+        #
+        # Tolerating that with `|| echo` was too broad: it also swallowed a bad
+        # token, a rate limit, a network blip and a tag that does not exist,
+        # each of which produced an empty directory and a GREEN no-op run. Ask
+        # the API how many assets the release has instead, and accept only a
+        # confirmed count of zero. Anything else, including the count query
+        # failing, is an error.
         run: |
+          set -euo pipefail
           mkdir -p assets
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets \
-            || echo "no assets on the release yet"
+          count=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets | length')
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::release $TAG has no assets yet; nothing to verify in this run"
+            echo "incomplete=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
 
       - name: Skip until the signed checksums are present
         working-directory: assets

@@ -125,10 +125,13 @@ IRLUME_DEV=1 irlume irbench --lfw --impostor-only --dir <lfw-image-dir> \
   --model /usr/share/irlume/models/glintr100.onnx
 ```
 
-On the full set (13,233 images, ~87M impostor pairs) you get FAR ≈ **2.3×10⁻³
-at threshold 0.50**, the same figure `FAIRNESS.md` reports and reasons about
-(it is higher than the curated-dataset per-group numbers because LFW is
-unconstrained real-world imagery). Embedding all 13k images takes roughly an
+On the full set (13,233 images, ~87M PAIRS) you get an all-pairs false-match
+rate of **2.3×10⁻³ at threshold 0.50**. Read that as an UPPER BOUND, not an
+impostor rate: the mode that produces it pairs every image with every other and
+does not group by identity, so LFW's several-images-per-person means genuine
+pairs are counted in the numerator too. A true impostor rate would be lower by
+an amount this measurement does not establish. `irbench` now refuses
+`--impostor-only --lfw` together for exactly this reason. Embedding all 13k images takes roughly an
 hour on a CPU; `--max-images N` bounds it for a quick look, at the cost of a
 noisier estimate. `FAIRNESS.md` has the full protocol and the per-group
 FairFace table.

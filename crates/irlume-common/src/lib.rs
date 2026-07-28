@@ -206,8 +206,11 @@ pub enum Request {
         #[serde(default)]
         reset: bool,
     },
-    /// 1:N identify ("who is this?"): one live capture matched against every
-    /// enrolled user, no claimed identity. Unprivileged (no credential release).
+    /// 1:N identify ("who is this?"): one live capture, no claimed identity.
+    /// Unprivileged (no credential release), but NOT unscoped: a root peer is
+    /// matched against every enrolled user, and a non-root peer only against its
+    /// own account. The CLI help has always said so; this wire doc did not, and
+    /// it is the contract the machine surface keys off.
     Identify,
     /// Switch the active RGB+IR camera pair, persisting it (cameras.conf) so it
     /// survives a daemon restart. ROOT ONLY: it writes a system-wide setting

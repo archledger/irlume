@@ -89,8 +89,10 @@ The measured points (from [results-lfw.json](../benchmarks/results-lfw.json),
 LFW 6000-pair verification, shipped AuraFace recognizer):
 
 - EER 1.4%; 10-fold accuracy 98.7% (±0.5%); TAR 97.6% at FAR 0.1%.
-- All-pairs FAR at the 0.50 measurement threshold across 87M LFW impostor
-  pairs: 2.3×10⁻³ ([FAIRNESS.md](FAIRNESS.md), with the reproduce command).
+- All-pairs false-match rate at the 0.50 measurement threshold across 87M LFW
+  pairs: 2.3×10⁻³, an UPPER BOUND rather than an impostor rate because that
+  measurement does not group by identity and LFW has several images per person
+  ([FAIRNESS.md](FAIRNESS.md), with the reproduce command).
 
 Demographic differentials, the subject of NIST FRVT Part 3, are published
 rather than averaged away: [FAIRNESS.md](FAIRNESS.md) reports within-group FAR

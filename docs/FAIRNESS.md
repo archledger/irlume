@@ -29,11 +29,17 @@ throughout this document):
 best-served group meets NIST FMR ≤ 1×10⁻⁴; the others exceed it within-group.
 A single fixed threshold that holds FAR ≤ 1×10⁻⁴ for **every** group requires
 ≈ **0.69** (bound by the worst groups). A cross-check on real faces (LFW,
-13,233 images, 87M impostor pairs, same YuNet→AuraFace pipeline) measured the
-all-pairs RGB FAR at 0.50 at **2.3×10⁻³** (reproduce it with the command under
-[Reproducing these numbers](#reproducing-these-numbers)). That is *higher* than the FairFace per-group figures above, not
-lower: LFW is unconstrained web imagery (varied pose and lighting, with some
-near-duplicate identities) that aligns less cleanly than FairFace's curated
+13,233 images, 87M PAIRS, same YuNet→AuraFace pipeline) measured an all-pairs
+RGB false-match rate at 0.50 of **2.3×10⁻³** (reproduce it with the command
+under [Reproducing these numbers](#reproducing-these-numbers)). Read it as an
+UPPER BOUND rather than an impostor rate: that mode assumes every image is a
+different person and does not group by identity, so LFW's several images per
+person put genuine pairs in the numerator as well. An earlier version of this
+paragraph attributed the excess to near-duplicate identities; the larger part
+of it is mechanical. That it is *higher* than the FairFace per-group figures
+above is therefore expected for two reasons: the counting above, and that LFW
+is unconstrained web imagery (varied pose and lighting) which aligns less
+cleanly than FairFace's curated
 crops, so real-world faces are the harder test. The shipped RGB threshold is
 stricter than the 0.50 measurement point (0.55, with template-count scaling up
 to +0.10; the IR path uses 0.55 native / 0.40 adapted, and calibrated RGB+IR

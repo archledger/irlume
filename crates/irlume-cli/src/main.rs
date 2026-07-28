@@ -1132,6 +1132,21 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
     // (e.g. SFHQ synthetic faces; every file is a different person), so every
     // pair is an impostor pair. Measures FAR only (no genuine pairs / FRR).
     if args.iter().any(|a| a == "--impostor-only") {
+        // `--lfw` is an identity-GROUPING rule, and this mode has no grouping:
+        // it assumes every file is a different person and pairs all of them.
+        // Accepting both silently counted same-person pairs as impostor pairs,
+        // which inflates the reported FAR on any set with repeated identities.
+        // Refuse rather than return a number that does not mean what it says.
+        if args.iter().any(|a| a == "--lfw") {
+            eprintln!(
+                "[irbench] --impostor-only and --lfw are incompatible: --impostor-only \
+                 assumes every image is a DIFFERENT person and pairs all of them, so on a \
+                 set with several images per identity (which is what --lfw describes) the \
+                 same-person pairs would be counted as impostor pairs and the reported FAR \
+                 would be an upper bound, not an impostor rate. Drop one of the two flags."
+            );
+            return std::process::ExitCode::from(2);
+        }
         return farbench(dir, det_path, model, args);
     }
 

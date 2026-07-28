@@ -3135,8 +3135,11 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
         },
     );
     match crate::pamwire::polkit_wired() {
+        // "KEEP nodding", matching the prompt the user will actually see: a
+        // single nod released 0 times out of 3 on hardware, because the detector
+        // needs a run of frames showing the motion.
         Some(true) if !gesture_is_closure => dout!(report,
-            "[doctor] polkit app prompts: wired ✓ (NOD your head to approve Bitwarden unlock,\n     \
+            "[doctor] polkit app prompts: wired ✓ (KEEP NODDING to approve Bitwarden unlock,\n     \
              pkexec, …; no calibration needed{})",
             if closure_calibrated {
                 "; closing your eyes ~1s also works"
@@ -3262,14 +3265,23 @@ fn doctor_run(report: &mut crate::doctor_report::Report) -> std::process::ExitCo
     // password no matter how the reconcile self-heal runs. `active_display_manager`
     // still resolves the symlink, so name the DM and point at the tracker; adding
     // one line to dm_pam_services is all support takes.
-    report.check(
-        "display-manager",
-        match crate::pamwire::active_dm_recognized() {
-            Some((_, true)) => State::Pass,
-            Some((_, false)) => State::Warn,
-            None => State::Info,
-        },
-    );
+    // The machine answer carries the instruction-display limitation too, as
+    // DETAIL rather than a new id or a changed state: the check means "irlume can
+    // wire this display manager", which stays true when the greeter cannot show a
+    // PAM message. Without it a desktop integration reading `doctor --json` would
+    // see `pass` while the human output shows a warning, and this file's own rule
+    // is that the two must not disagree.
+    match crate::pamwire::active_dm_recognized() {
+        Some((dm, true)) if crate::pamwire::active_dm_hides_pam_instructions().is_some() => report
+            .check_detail(
+                "display-manager",
+                State::Pass,
+                format!("{dm}; does not display PAM instructions to the user"),
+            ),
+        Some((_, true)) => report.check("display-manager", State::Pass),
+        Some((_, false)) => report.check("display-manager", State::Warn),
+        None => report.check("display-manager", State::Info),
+    }
     if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
         dout!(
             report,

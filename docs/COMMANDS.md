@@ -37,7 +37,7 @@ Conventions that apply everywhere:
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles eyes-open <on\|off>` | require eyes open to unlock |
 | `irlume profiles challenge <on\|off>` | opt-in passive blink liveness |
-| `sudo irlume calibrate-closure` | teach the eye-closure consent gesture for app prompts (captures eyes-open/closed EAR); the head nod is the default and needs no calibration |
+| `sudo irlume calibrate-closure [--rounds N] [--force]` | teach the eye-closure consent gesture for app prompts. Captures eyes-open/closed EAR over N rounds (default 3) and stores the median, because a single capture varies enough to leave the threshold sitting on top of your own closures; it then reports how many of your readings the result would actually accept. Replacing an existing calibration asks first, and `--force` is required to do it with no terminal. The head nod is the default and needs no calibration |
 | `irlume identify` | 1:N "who is this?"; as root it checks all users, otherwise scoped to you |
 
 ## Keyring, TPM, and recovery

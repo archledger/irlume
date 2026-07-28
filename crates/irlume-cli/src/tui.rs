@@ -3337,20 +3337,28 @@ impl App {
                         Span::styled(label, Style::new().dim()),
                     ])
                 },
+                // Says what this gate was MEASURED to do, not what it was hoped
+                // to do. It read "so a photo or a screen cannot pull the password
+                // out" until 2026-07-27, when the detector was measured firing on
+                // a hand-held print 2 times in 24; liveness and the PAD cue
+                // refused every one of those, so the claim belonged to them and
+                // never to the gesture. THREAT_MODEL.md carries the numbers.
+                // Kept to FOUR lines: this panel does not scroll, so a fifth line
+                // pushes the bottom section off a short terminal.
                 Line::from(Span::styled(
                     "  Releasing your TPM-sealed keyring password needs a NOD (or a calibrated",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  eye closure) after the face match, so a photo or a screen cannot pull the",
+                    "  eye closure). It proves INTENT, not liveness: a hand-held print can satisfy",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  password out. Login, lock screen and sudo are unaffected, and a missed",
+                    "  it, and the IR liveness check is what stops the print. Login, lock screen",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  gesture just falls back to typing the password.",
+                    "  and sudo are unaffected; a missed gesture falls back to typing the password.",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
@@ -4325,10 +4333,13 @@ impl App {
             "Wire app prompts",
             "opt-in; face approves Bitwarden and pkexec",
         ));
+        // Names the nod first, matching the prompts: it needs no calibration and
+        // is unaffected by lighting, while what [c] teaches is stored as absolute
+        // eye measurements that shift as the room changes.
         lines.push(act(
             "[c]",
             "Calibrate gesture",
-            "approve app prompts by closing your eyes ~1s (the nod needs none)",
+            "optional eye-closure alternative; the head nod needs no calibration",
         ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.

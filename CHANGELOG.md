@@ -3,6 +3,8 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
 ## [0.7.0] - 2026-07-28
 
 ### Added
@@ -1352,6 +1354,7 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/archledger/irlume/releases/tag/v0.7.0
 [0.6.1]: https://github.com/archledger/irlume/releases/tag/v0.6.1
 [0.6.0]: https://github.com/archledger/irlume/releases/tag/v0.6.0

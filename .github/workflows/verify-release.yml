@@ -37,7 +37,16 @@ jobs:
       - name: Download release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
+        # `gh release download` exits 1 on "no assets to download", which is the
+        # state every release is in at `published`: the assets are built and
+        # GPG-signed off-CI and uploaded afterwards. The steps below already
+        # treat a partial upload as "skip, not fail"; this step used to fail
+        # before they got the chance, so v0.7.0 published with a red check that
+        # meant nothing was uploaded yet. Same handling, one step earlier.
+        run: |
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets \
+            || echo "no assets on the release yet"
 
       - name: Skip until the signed checksums are present
         working-directory: assets

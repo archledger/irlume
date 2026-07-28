@@ -43,7 +43,21 @@ jobs:
           # ...)"` hides the failure, because the exit status belongs to echo:
           # a release with no packages produced an EMPTY digests output, this
           # job went green, and the generator failed later with a bare exit 27.
-          digests="$(sha256sum irlume_*.deb irlume-selinux-*.rpm | base64 -w0)"
+          # Glob into an array with nullglob, so a pattern that matches nothing
+          # contributes nothing instead of reaching sha256sum as a literal.
+          # `irlume-selinux-*.rpm` has never been a release asset (the subpackage
+          # is built in Copr, not uploaded here), so under `set -euo pipefail`
+          # the substitution failed and this job went red on every publish. The
+          # RPM stays listed so it is covered the day it does ship.
+          shopt -s nullglob
+          packages=(irlume_*.deb irlume-selinux-*.rpm)
+          shopt -u nullglob
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::no release packages found; refusing to request provenance over nothing"
+            exit 1
+          fi
+          echo "covering: ${packages[*]}"
+          digests="$(sha256sum "${packages[@]}" | base64 -w0)"
           if [ -z "$digests" ]; then
             echo "::error::no package digests computed; refusing to request provenance over nothing"
             exit 1

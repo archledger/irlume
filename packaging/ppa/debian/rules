@@ -61,6 +61,13 @@ override_dh_auto_install:
 		debian/irlume/usr/lib/systemd/system/irlume-reconcile.path
 	install -D -m0644 packaging/systemd/irlume-reconcile.service \
 		debian/irlume/usr/lib/systemd/system/irlume-reconcile.service
+# The timer, which Fedora, Arch and the universal .deb all ship and this lane
+# missed. It is not redundant with the .path unit: a path unit watches an inode,
+# and a config regenerator REPLACES the file by rename, which the watch cannot
+# see. Without the timer, PPA users get self-heal that silently misses the exact
+# failure it was built for.
+	install -D -m0644 packaging/systemd/irlume-reconcile.timer \
+		debian/irlume/usr/lib/systemd/system/irlume-reconcile.timer
 	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
 		debian/irlume/etc/apparmor.d/usr.bin.irlumed
 

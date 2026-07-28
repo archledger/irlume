@@ -73,7 +73,7 @@ Enrollment on IR hardware offers to enable it. See [Honest limitations](#-honest
 
 ## 📦 Install
 
-> **v0.6.1.** Works end-to-end on real hardware across all three families,
+> **v0.7.0.** Works end-to-end on real hardware across all three families,
 > including face-approved app prompts (Bitwarden). Not yet certified (no iBeta
 > lab pass); see [Honest limitations](#-honest-limitations).
 
@@ -226,7 +226,7 @@ back to the password; there is no lockout.
 flowchart TD
     A["Greeter / lock screen:<br/>leave password empty, press Enter"] --> B["Camera fires, on demand<br/>captures RGB + IR in parallel"]
     B --> DET["Detect face<br/>YuNet → BlazeFace rescue"]
-    DET --> L{"IR liveness gate<br/>depth · reflectance · glint"}
+    DET --> L{"IR liveness gate<br/>relief ratio · reflectance · glint"}
     L -->|spoof or no face| PW["Type your password<br/>no lockout, ever"]
     L -->|live| M{"Match embedding<br/>at or above threshold?"}
     M -->|no| PW
@@ -279,9 +279,12 @@ The current gaps:
   and the [PAD self-test results](docs/pad-results/).
 - **RGB-only laptops get the Convenience tier:** face unlocks the *screen only*,
   never `sudo`, login, or the keyring (those keep the password). By design.
-- **Bright IR behind you defeats the depth check.** The anti-spoof gate reads 3D
-  shape from the IR emitter's light; when the scene's own infrared floods it, no
-  shape signal is left, and a genuine face is rejected to the password. Measured
+- **Bright IR behind you defeats the relief check.** The anti-spoof gate infers
+  shape from how the IR emitter's light falls across the face; when the scene's
+  own infrared floods it, no such signal is left, and a genuine face is rejected
+  to the password. It is a brightness ratio, not a range measurement: the sensor
+  does not measure distance, and a glossy print with a hot centre passes it.
+  Measured
   in a 430-sample field session (2026-07-16, cloudy-bright sky): reliable below
   ambient ~120 on the 0-255 IR scale (indoors, inside vehicles, shade, a closed
   car with 20% tint passed 99/99), marginal to ~170, and 0/129 genuine samples
@@ -414,7 +417,8 @@ IR captures run in parallel, which cuts the capture stage by about a third;
 own hardware.
 
 The **opt-in blink challenge** (`irlume profiles challenge on`) is a deterrent
-against a glossy print or vinyl that mimics infrared depth: it watches for a
+against a glossy print or vinyl that mimics the infrared relief pattern: it
+watches for a
 natural blink, which a static image cannot do. Detecting a blink is inherently
 temporal, so it captures a roughly 5-second infrared sequence, and the login
 takes about **10 seconds** (measured across six runs, glasses on and off). That
@@ -444,7 +448,7 @@ default IR-structure gate already rejects photos, screens, and video replays.
 
 ## 🛠️ Status
 
-**v0.6.1: working and validated on real hardware.** Fedora runs the full IR
+**v0.7.0: working and validated on real hardware.** Fedora runs the full IR
 Secure tier end to end, including face-approved app prompts (Bitwarden biometric
 unlock via polkit, verified live); Ubuntu / Pop!_OS runs the RGB Convenience tier
 plus a fingerprint; Arch is validated for packaging and the CLI/daemon on a
@@ -464,7 +468,7 @@ Interfaces may still shift before 1.0.
   [developer guide](docs/DEVELOPMENT.md); CI runs fmt / clippy / build / test on
   every push and PR.
 
-The per-release detail (0.1.x through 0.6.1) lives in [`CHANGELOG.md`](CHANGELOG.md).
+The per-release detail (0.1.x through 0.7.0) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🙏 Credits
 

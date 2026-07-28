@@ -3,9 +3,29 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] - 2026-07-28
 
 ### Added
+
+- **Camera arbitration.** An authentication is no longer queued behind preview
+  or enrolment work. Connections are read on their own threads, authentication
+  is taken first, and a running enrolment yields between whole captures rather
+  than holding the camera to the end. Measured on the Zenbook's real IR pair:
+  authentication under an eight-client flood 5.25s to 0.16s, and a lock-screen
+  unlock under the same flood 14.39s to 4.27s. An enrolment displaced this way
+  returns `preempted` and persists nothing.
+
+- **`ly` display manager.** Detected even though `ly` registers no
+  `display-manager.service` (its unit is templated and carries no alias), and
+  wired through `/etc/pam.d/ly`. Validated on a real `ly` install.
+
+- **Wedged-capture watchdog.** `WatchdogSec` in the unit, answered only while
+  the camera worker reports progress, so a capture stuck inside a driver call
+  ends as a bounded restart instead of an indefinite hang.
+
+- **Per-uid refusal throttle.** A local process spinning on refused camera work
+  no longer costs the daemon 161 points of CPU: measured 11,327 refusals/s down
+  to 72/s, with unrelated requests answered throughout.
 
 - **AddressSanitizer over the test suite, weekly and on pull requests that touch
   the code.** irlume is mostly safe Rust, so this is aimed at the places where it
@@ -150,7 +170,105 @@ All notable changes to irlume are documented here. This project adheres to
   the same prose. The human CLI and TUI keep the prose deliberately, since it is
   written to be read.
 
+- **Desktop integrations now have a small, versioned JSON foundation.**
+  `irlume version --json` advertises only implemented public capabilities, and
+  `irlume profiles list --json` exposes the existing read-only enrollment
+  summary without daemon prose or private socket access. The documented
+  contract keeps stdout machine-only, uses stable error codes, and deliberately
+  withholds mutation capabilities until the enrollment store owns opaque IDs.
+
+- **`sudo irlume camera-tune` measures whether your camera can read both sensors
+  at once.** Some Hello modules stop exposing their colour stream properly while
+  their infrared sibling is streaming. On a NexiGo HelloCam N930W the colour
+  frame parks near a brightness of 60 no matter the room: with the light behind
+  the camera it measured 142.9 captured alone against 59.8 captured alongside
+  infrared, 42% of the signal, while the infrared stream was untouched. The same
+  colour sensor paired with a *different* camera's infrared node kept 99%, so it
+  is the two interfaces of one module competing, not concurrency itself. An ASUS
+  FHD built-in measured in the same light kept 102%.
+
+  The command runs both capture orders a few times, compares them, and stores the
+  answer per camera in `cameras.conf`; authentication then captures one sensor at
+  a time on cameras that need it and keeps the faster overlapped path on cameras
+  that do not. Overlapping saves 716ms per capture on the ASUS and 1410ms on the
+  NexiGo, which is what it costs those cameras to switch.
+
+  A dim room hides the fault, since a scene that genuinely reads ~60 looks the
+  same either way. The command says so instead of reporting a clean result: below
+  a sequential brightness of 100 it reports the measurement as inconclusive and
+  asks for a re-run in normal light. A detected loss needs no such caveat.
+
+- **Enrolling no longer re-opens the camera for every attempt.** The capture
+  loop holds both streams open for its duration instead of paying the open,
+  format negotiation, buffer mapping, stream start and auto-exposure warm-up per
+  attempt. Measured on an ASUS FHD built-in, a colour+infrared capture pair costs
+  1912ms through the per-call path and 797ms on a held stream, so 58% of every
+  attempt was setup rather than frames. It also stops the capture light blinking
+  once per attempt, which is what the old lifecycle looked like from the outside.
+
+  Holding the stream is safe because the emitter does not go dark: after a single
+  control write it stayed lit through 30 seconds of continuous streaming on both
+  modules tested, and the control survives even closing the stream. Streams are
+  still never held between requests, so an idle daemon keeps reserving nothing.
+
+### Changed
+
+- **Releasing your keyring password now asks for a gesture, by default.** On a
+  face login that unlocks the login keyring, irlume waits for a deliberate nod
+  (or a calibrated eye closure, if you set that up) after the face match before
+  the TPM releases your stored password. The watch ends the instant the nod is
+  seen; only a login where you never nod pays the whole watch window (120 frames,
+  roughly 8 seconds) before the password prompt. Nothing else changes: login, the
+  lock screen, `sudo` and app prompts behave exactly as before.
+
+  Why only this operation: a session grant ends with the session, but a released
+  keyring password is a reusable secret that also unlocks your password manager.
+  irlume's own PAD self-test recorded the default single-frame IR gate accepting a
+  life-size glossy vinyl print 69 times out of 70, an APCER of 98.6%
+  ([2026-06-30](docs/pad-results/2026-06-30-ir-liveness-selftest.md)), against the
+  15% ceiling FIDO's Level 1 biometric certification allows. A nod is something
+  that print cannot produce, which is why the credential path no longer rests on
+  the single-frame cues alone.
+
+  Nothing here can lock you out. A missed gesture, a camera that is busy, no IR
+  camera, or a FaceMesh model that is not deployed all fall back to typing your
+  password, and your keyring then unlocks from what you typed exactly as it would
+  have from a released password. A nod needs no calibration, so an existing
+  enrollment keeps working with no re-enroll.
+
+  Prefer the old behavior? `sudo irlume credential-release-challenge off` (it
+  warns and asks first), the `[g]` key on the TUI's Settings page, or
+  `credential_release_challenge=0` in `/etc/irlume/settings.conf`. `irlume
+  doctor` reports the state, and flags the case where the gate is on but cannot
+  run on this machine.
+
+  What it was measured to do, on one camera with a seated user, 17 attempts
+  against the real login stack: nodding continuously released the password 4
+  times out of 4, and holding still with consent withheld released it once in 10.
+  A single nod released it 0 times out of 3, which is why the prompt asks you to
+  keep nodding rather than to nod. It has not been measured against a photo held
+  in the hand, and the same detections show the detector responding to incidental
+  movement, so treat this as raising the cost of a print attack rather than
+  closing it. See docs/THREAT_MODEL.md and issue #101.
+
+- **The IR "depth" cue is now called what it is: a center/edge brightness
+  ratio.** Nothing in irlume measures range. The cue compares the middle of the
+  IR face region to its rim, which a lit 3D face brightens and a flat matte print
+  does not, and a glossy print defeats. Calling it depth oversold it. Renamed
+  throughout: the `depth_ok` cue is `center_edge_ratio_ok`, `DEPTH_MIN_RATIO` is
+  `MIN_CENTER_EDGE_RATIO`, the per-user floor accessor is
+  `ir_center_edge_ratio_floor`, and the debug and doctor lines, the PAD self-test
+  cue attribution (`depth` → `center_edge`), and the capture-dump JSON key follow.
+  Stored enrollments are untouched: the on-disk key stays `ir_depth` so a
+  downgrade still reads your fitted floor. The denial text now says the face
+  region is flatter than your enrolled face instead of asserting you are a photo.
+
 ### Fixed
+
+- The consent gesture's pitch threshold was raised from 0.070 to 0.075, the
+  midpoint of the measured gap between deliberate nods (0.082-0.108) and
+  sitting still or holding a print (0.021-0.069). The crossings count was
+  deliberately left alone: measured, it does not separate the two.
 
 - **A display manager irlume could name but not wire was reported as supported.**
   `doctor` recorded `display-manager: pass` whenever the active login manager had
@@ -166,7 +284,8 @@ All notable changes to irlume are documented here. This project adheres to
 
   The mapping became a table rather than a `match` so a test can walk every entry:
   adding a login manager without adding its wiring recipe now fails the suite.
-  Wiring `ly` itself still needs validation on a real `ly` host (#128).
+  Wiring `ly` itself is now supported and was validated on a real `ly` host
+  (#128, #144).
 
 - **`mlock_refusal_warns_and_continues` failed under a sanitizer instead of
   saying why.** The sanitizer runtime defines its own `mlock`, so the call never
@@ -223,103 +342,6 @@ All notable changes to irlume are documented here. This project adheres to
   buildroot but never listed in `%files`, which fails the rpm build on an
   unpackaged file, and it was missing from `%preun`/`%postun`, so an uninstall
   left it enabled.
-
-### Changed
-
-- **Releasing your keyring password now asks for a gesture, by default.** On a
-  face login that unlocks the login keyring, irlume waits for a deliberate nod
-  (or a calibrated eye closure, if you set that up) after the face match before
-  the TPM releases your stored password. The watch ends the instant the nod is
-  seen; only a login where you never nod pays the whole watch window (120 frames,
-  roughly 8 seconds) before the password prompt. Nothing else changes: login, the
-  lock screen, `sudo` and app prompts behave exactly as before.
-
-  Why only this operation: a session grant ends with the session, but a released
-  keyring password is a reusable secret that also unlocks your password manager.
-  irlume's own PAD self-test recorded the default single-frame IR gate accepting a
-  life-size glossy vinyl print 69 times out of 70, an APCER of 98.6%
-  ([2026-06-30](docs/pad-results/2026-06-30-ir-liveness-selftest.md)), against the
-  15% ceiling FIDO's Level 1 biometric certification allows. A nod is something
-  that print cannot produce, which is why the credential path no longer rests on
-  the single-frame cues alone.
-
-  Nothing here can lock you out. A missed gesture, a camera that is busy, no IR
-  camera, or a FaceMesh model that is not deployed all fall back to typing your
-  password, and your keyring then unlocks from what you typed exactly as it would
-  have from a released password. A nod needs no calibration, so an existing
-  enrollment keeps working with no re-enroll.
-
-  Prefer the old behavior? `sudo irlume credential-release-challenge off` (it
-  warns and asks first), the `[g]` key on the TUI's Settings page, or
-  `credential_release_challenge=0` in `/etc/irlume/settings.conf`. `irlume
-  doctor` reports the state, and flags the case where the gate is on but cannot
-  run on this machine.
-
-  What it was measured to do, on one camera with a seated user, 17 attempts
-  against the real login stack: nodding continuously released the password 4
-  times out of 4, and holding still with consent withheld released it once in 10.
-  A single nod released it 0 times out of 3, which is why the prompt asks you to
-  keep nodding rather than to nod. It has not been measured against a photo held
-  in the hand, and the same detections show the detector responding to incidental
-  movement, so treat this as raising the cost of a print attack rather than
-  closing it. See docs/THREAT_MODEL.md and issue #101.
-
-- **The IR "depth" cue is now called what it is: a center/edge brightness
-  ratio.** Nothing in irlume measures range. The cue compares the middle of the
-  IR face region to its rim, which a lit 3D face brightens and a flat matte print
-  does not, and a glossy print defeats. Calling it depth oversold it. Renamed
-  throughout: the `depth_ok` cue is `center_edge_ratio_ok`, `DEPTH_MIN_RATIO` is
-  `MIN_CENTER_EDGE_RATIO`, the per-user floor accessor is
-  `ir_center_edge_ratio_floor`, and the debug and doctor lines, the PAD self-test
-  cue attribution (`depth` → `center_edge`), and the capture-dump JSON key follow.
-  Stored enrollments are untouched: the on-disk key stays `ir_depth` so a
-  downgrade still reads your fitted floor. The denial text now says the face
-  region is flatter than your enrolled face instead of asserting you are a photo.
-
-### Added
-
-- **Desktop integrations now have a small, versioned JSON foundation.**
-  `irlume version --json` advertises only implemented public capabilities, and
-  `irlume profiles list --json` exposes the existing read-only enrollment
-  summary without daemon prose or private socket access. The documented
-  contract keeps stdout machine-only, uses stable error codes, and deliberately
-  withholds mutation capabilities until the enrollment store owns opaque IDs.
-
-- **`sudo irlume camera-tune` measures whether your camera can read both sensors
-  at once.** Some Hello modules stop exposing their colour stream properly while
-  their infrared sibling is streaming. On a NexiGo HelloCam N930W the colour
-  frame parks near a brightness of 60 no matter the room: with the light behind
-  the camera it measured 142.9 captured alone against 59.8 captured alongside
-  infrared, 42% of the signal, while the infrared stream was untouched. The same
-  colour sensor paired with a *different* camera's infrared node kept 99%, so it
-  is the two interfaces of one module competing, not concurrency itself. An ASUS
-  FHD built-in measured in the same light kept 102%.
-
-  The command runs both capture orders a few times, compares them, and stores the
-  answer per camera in `cameras.conf`; authentication then captures one sensor at
-  a time on cameras that need it and keeps the faster overlapped path on cameras
-  that do not. Overlapping saves 716ms per capture on the ASUS and 1410ms on the
-  NexiGo, which is what it costs those cameras to switch.
-
-  A dim room hides the fault, since a scene that genuinely reads ~60 looks the
-  same either way. The command says so instead of reporting a clean result: below
-  a sequential brightness of 100 it reports the measurement as inconclusive and
-  asks for a re-run in normal light. A detected loss needs no such caveat.
-
-- **Enrolling no longer re-opens the camera for every attempt.** The capture
-  loop holds both streams open for its duration instead of paying the open,
-  format negotiation, buffer mapping, stream start and auto-exposure warm-up per
-  attempt. Measured on an ASUS FHD built-in, a colour+infrared capture pair costs
-  1912ms through the per-call path and 797ms on a held stream, so 58% of every
-  attempt was setup rather than frames. It also stops the capture light blinking
-  once per attempt, which is what the old lifecycle looked like from the outside.
-
-  Holding the stream is safe because the emitter does not go dark: after a single
-  control write it stayed lit through 30 seconds of continuous streaming on both
-  modules tested, and the control survives even closing the stream. Streams are
-  still never held between requests, so an idle daemon keeps reserving nothing.
-
-### Fixed
 
 - **The RGB and IR frames of one decision had no bound on how far apart they were
   taken.** The liveness gate treats them as one scene: the face must appear in
@@ -1330,6 +1352,10 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
+[0.7.0]: https://github.com/archledger/irlume/releases/tag/v0.7.0
+[0.6.1]: https://github.com/archledger/irlume/releases/tag/v0.6.1
+[0.6.0]: https://github.com/archledger/irlume/releases/tag/v0.6.0
+[0.5.0]: https://github.com/archledger/irlume/releases/tag/v0.5.0
 [0.4.0]: https://github.com/archledger/irlume/releases/tag/v0.4.0
 [0.3.0]: https://github.com/archledger/irlume/releases/tag/v0.3.0
 [0.2.1]: https://github.com/archledger/irlume/releases/tag/v0.2.1

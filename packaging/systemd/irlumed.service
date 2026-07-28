@@ -50,6 +50,14 @@ IPAddressDeny=any
 # + per-user enrollment live there). Not =strict, which would need the enrolled
 # users' homes in ReadWritePaths.
 ProtectSystem=full
+# ...but the daemon owns two files under the config root: the camera pin written
+# by `set-cameras` (which is also the anti-injection binding, re-anchored by
+# vid:pid:serial after a udev renumber) and the capture mode stored by
+# `camera-tune`. ProtectSystem=full mounts /etc read-only, so without this both
+# writes fail on a packaged install and neither setting survives a restart. The
+# leading `-` is required: no lane creates /etc/irlume, so a host that has never
+# had one would otherwise fail to start.
+ReadWritePaths=-/etc/irlume
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

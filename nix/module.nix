@@ -209,6 +209,12 @@ in
         # loop exits promptly on SIGTERM; captures open and drop the device per
         # request, so no long-held camera handle).
         TimeoutStopSec = "10s";
+        # Wedged-capture watchdog, matching packaging/systemd/irlumed.service.
+        # The daemon pings only while its camera worker reports progress, so a
+        # capture stuck inside a driver call ends as a bounded restart rather
+        # than an indefinite hang. NotifyAccess is required for Type=simple.
+        WatchdogSec = "90s";
+        NotifyAccess = "main";
         # Sandboxing, mirroring packaging/systemd/irlumed.service so the hardening
         # holds on NixOS too. Scoped to what the daemon needs: it opens
         # /dev/video* and the TPM, binds a Unix socket, and writes root-owned
@@ -222,6 +228,10 @@ in
         ];
         IPAddressDeny = "any";
         ProtectSystem = "full";
+        # The daemon writes the camera pin and the stored capture mode under
+        # /etc/irlume, which ProtectSystem=full would otherwise mount read-only.
+        # Leading "-" so a host that has never had the directory still starts.
+        ReadWritePaths = [ "-/etc/irlume" ];
         PrivateTmp = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;

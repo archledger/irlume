@@ -394,6 +394,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # Every unit in packaging/systemd must be shipped by every packaging lane,
+      # and every lane must agree on the version. Both failures have shipped
+      # before: the 0.6.x rpm installed a timer it left out of %files, PR #98
+      # existed to resync drifted version fields, and the 0.7.0 audit found the
+      # PPA lane missing the reconcile timer entirely.
+      - name: packaging parity (units in every lane, versions agree)
+        run: ./scripts/check-packaging-parity.sh
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

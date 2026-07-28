@@ -780,8 +780,14 @@ fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     key.extend_from_slice(password);
     key.push(0);
     let setting = std::ffi::CString::new(stored.as_str()).ok()?;
-    // SAFETY: single-threaded daemon (crypt's static buffer is not shared); the
-    // pointers are valid NUL-terminated C strings for the call's duration.
+    // SAFETY: `crypt` returns a pointer into a STATIC buffer, so concurrent calls
+    // would race. The daemon is NOT single-threaded, which an earlier version of
+    // this comment claimed: it runs up to 64 connection threads plus a watchdog
+    // and a penalty-box janitor. The invariant that actually holds is narrower
+    // and must be preserved: this is reached only from `dispatch`, and `dispatch`
+    // runs only on the one camera worker thread. Calling it from a connection
+    // thread would be a data race. The pointers are valid NUL-terminated C
+    // strings for the call's duration.
     let out = unsafe { crypt(key.as_ptr() as *const libc::c_char, setting.as_ptr()) };
     if out.is_null() {
         return None; // unsupported hash format on this libcrypt
@@ -983,10 +989,12 @@ fn spawn_watchdog() {
 // at 44 against a cap of 64, so exhaustion was never the mechanism; CPU was, and
 // the cost is paid per CONNECTION, before the request is even parsed.
 //
-// So the throttle is enforced in the accept loop, where a dropped connection
-// costs no thread, no parse and no arbiter round trip. A short delay before
-// answering, the other obvious shape, would have made this worse: it holds a
-// connection thread for its whole duration and does nothing about the CPU.
+// So the throttle is enforced in the accept loop, where a throttled connection
+// costs no thread, no parse and no arbiter round trip. It is HELD there briefly
+// rather than dropped: measured, dropping was worse than useless, because an
+// instant EOF let the client reconnect sooner and CPU barely moved. A delay
+// before ANSWERING, the other obvious shape, would also have been worse: it
+// holds a connection thread for its whole duration and does nothing about CPU.
 //
 // It is fed ONLY by requests the arbiter actually refused, so a peer doing
 // ordinary work is never throttled no matter how busy it is. Root is exempt:
@@ -1001,7 +1009,7 @@ fn spawn_watchdog() {
 // ---------------------------------------------------------------------------
 
 /// Refusals per second a single non-root uid may generate before its new
-/// connections are dropped. Set from `IRLUME_REFUSAL_RATE`; 0 disables the
+/// connections are held. Set from `IRLUME_REFUSAL_RATE`; 0 disables the
 /// throttle. Well above any real client: a refusal means the camera was busy,
 /// and a legitimate caller retries on a human timescale, not thousands of times
 /// a second.

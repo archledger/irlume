@@ -20,6 +20,18 @@ profile irlumed /usr/local/bin/irlumed {
   # uid→name lookups for SO_PEERCRED authz (/etc/nsswitch.conf, passwd, group).
   include <abstractions/nameservice>
 
+  # uid→name lookups through systemd-userdb (Ubuntu 26.04+, systemd-homed).
+  # Kept in step with packaging/apparmor/usr.bin.irlumed; the two profiles had
+  # drifted and this one was missing both of these.
+  /run/systemd/userdb/ r,
+  /run/systemd/userdb/* rw,
+
+  # The systemd watchdog answers WatchdogSec by writing WATCHDOG=1 to this
+  # PATHNAME socket, which AppArmor mediates and abstractions/base does not
+  # cover. Without it every ping is denied, the daemon looks wedged, and systemd
+  # kills and restarts it every WatchdogSec forever.
+  /run/systemd/notify w,
+
   /usr/local/bin/irlumed mr,
 
   # Device-class enumeration (camera discovery walks /sys/class).

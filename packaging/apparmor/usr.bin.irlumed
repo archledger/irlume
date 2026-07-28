@@ -27,6 +27,14 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /run/systemd/userdb/ r,
   /run/systemd/userdb/* rw,
 
+  # The systemd watchdog (WatchdogSec in the unit) is answered by writing
+  # WATCHDOG=1 to this datagram socket. It is a PATHNAME socket, so AppArmor
+  # mediates it and abstractions/base does not cover it: without this rule every
+  # ping is denied, the daemon looks wedged to systemd, and it is killed and
+  # restarted every WatchdogSec forever. The profile predates the watchdog, so
+  # its enforce soak proves nothing about this path.
+  /run/systemd/notify w,
+
   /usr/bin/irlumed mr,
 
   # Device-class enumeration (camera discovery walks /sys/class).

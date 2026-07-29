@@ -677,28 +677,57 @@ fn zeroed_buffer(index: u32) -> V4l2Buffer {
 /// on the interface rather than on `videoN + 1` is what keeps this correct on a
 /// machine with several cameras, where numbering interleaves.
 fn metadata_node_for(ir_device: &str) -> Option<String> {
-    let name = std::path::Path::new(ir_device).file_name()?.to_owned();
     let sysfs = std::path::Path::new("/sys/class/video4linux");
-    let want = std::fs::canonicalize(sysfs.join(&name).join("device")).ok()?;
+    let found = siblings_on_same_interface(ir_device, sysfs)
+        .into_iter()
+        .find(|c| offers_uvcm(c));
+    if found.is_none() {
+        irlume_common::dlog!(
+            "{ir_device}: no sibling node offers UVCM metadata; illumination will come from brightness"
+        );
+    }
+    found
+}
+
+/// Every other v4l2 node registered against the same physical interface as
+/// `video_device`, lowest node number first.
+///
+/// A node whose sysfs entry cannot be read is SKIPPED, not fatal. Virtual
+/// devices (v4l2loopback, for one) have no `device` link at all, and treating
+/// the first of those as the end of the search made this return nothing on any
+/// machine with a loopback device present — measured on a box where a real
+/// camera's metadata node existed and was never found because dummy nodes were
+/// enumerated first.
+fn siblings_on_same_interface(video_device: &str, sysfs: &std::path::Path) -> Vec<String> {
+    let Some(name) = std::path::Path::new(video_device).file_name() else {
+        return Vec::new();
+    };
+    let Ok(want) = std::fs::canonicalize(sysfs.join(name).join("device")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(sysfs) else {
+        return Vec::new();
+    };
 
     let mut candidates: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(sysfs).ok()? {
-        let entry = entry.ok()?;
+    for entry in entries.flatten() {
         if entry.file_name() == name {
             continue;
         }
-        if std::fs::canonicalize(entry.path().join("device")).ok()? != want {
-            continue;
-        }
-        let Some(node) = entry.file_name().to_str().map(|n| format!("/dev/{n}")) else {
+        let Ok(interface) = std::fs::canonicalize(entry.path().join("device")) else {
             continue;
         };
-        candidates.push(node);
+        if interface != want {
+            continue;
+        }
+        if let Some(node) = entry.file_name().to_str().map(|n| format!("/dev/{n}")) {
+            candidates.push(node);
+        }
     }
     // Lowest node number first, so the pairing is deterministic on a device
     // that somehow exposes more than one metadata node per interface.
     candidates.sort();
-    candidates.into_iter().find(|c| offers_uvcm(c))
+    candidates
 }
 
 /// Whether `node` is a metadata node that offers the Microsoft format.
@@ -909,6 +938,73 @@ mod tests {
         assert_eq!(ambient_partner(0, &means, &flags), Some(1));
         assert_eq!(ambient_partner(1, &means, &flags), Some(0));
         assert_eq!(ambient_partner(0, &[42.0], &[None]), None);
+    }
+
+    /// Build a throwaway `/sys/class/video4linux` lookalike. `nodes` is a list
+    /// of (node name, interface it belongs to); an interface of `None` means
+    /// the node has no `device` link, like a v4l2loopback dummy.
+    fn fake_sysfs(tag: &str, nodes: &[(&str, Option<&str>)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("irlume-sysfs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let devices = root.join("devices");
+        std::fs::create_dir_all(&devices).expect("fake sysfs");
+        for (node, interface) in nodes {
+            let dir = root.join("class").join(node);
+            std::fs::create_dir_all(&dir).expect("node dir");
+            if let Some(interface) = interface {
+                let target = devices.join(interface);
+                std::fs::create_dir_all(&target).expect("interface dir");
+                std::os::unix::fs::symlink(&target, dir.join("device")).expect("device link");
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn a_node_with_no_device_link_does_not_end_the_search() {
+        // The layout measured on a machine with both a real camera and three
+        // v4l2loopback dummies: read_dir yields the dummies, which have no
+        // `device` link at all. Aborting on the first of those made a real
+        // camera's metadata node unreachable, and the capture path silently
+        // fell back to brightness on hardware that could have answered.
+        let root = fake_sysfs(
+            "loopback",
+            &[
+                ("video2", Some("3-2.1:1.2")),
+                ("video3", Some("3-2.1:1.2")),
+                ("video8", None),
+                ("video9", None),
+                ("video10", None),
+            ],
+        );
+        let found = siblings_on_same_interface("/dev/video2", &root.join("class"));
+        assert_eq!(found, vec!["/dev/video3".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_camera_on_another_interface_is_not_a_sibling() {
+        // Node numbering interleaves across cameras, so pairing by "the next
+        // node number" would cross between two cameras here.
+        let root = fake_sysfs(
+            "twocams",
+            &[
+                ("video0", Some("3-5:1.0")),
+                ("video1", Some("3-5:1.0")),
+                ("video2", Some("3-5:1.2")),
+                ("video3", Some("3-5:1.2")),
+            ],
+        );
+        let found = siblings_on_same_interface("/dev/video2", &root.join("class"));
+        assert_eq!(found, vec!["/dev/video3".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_device_that_is_not_in_sysfs_yields_no_siblings() {
+        let root = fake_sysfs("missing", &[("video0", Some("3-5:1.0"))]);
+        assert!(siblings_on_same_interface("/dev/video99", &root.join("class")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

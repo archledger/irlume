@@ -865,6 +865,27 @@ pub(crate) struct PlannedSurface {
     pub(crate) id: &'static str,
     pub(crate) role: &'static str,
     pub(crate) change: PlannedChange,
+    /// Digest of the file this decision was made against, or `ABSENT`.
+    ///
+    /// The outcome NAME is not enough to identify what was planned. An admin can
+    /// rewrite a stack and leave a valid anchor in place: the outcome stays
+    /// `wire`, so a plan id built from names alone is unchanged, and an apply
+    /// carrying that id would overwrite a stack the consumer was never shown.
+    /// The digest is what makes the id describe a state rather than an intent.
+    pub(crate) state: String,
+}
+
+/// A surface's current content digest, or `ABSENT`, or `unreadable`.
+///
+/// Three distinct answers on purpose. Folding "cannot read" into either of the
+/// others would let a plan id stay stable across a state it could not actually
+/// observe.
+pub(crate) fn surface_state(path: &Path) -> String {
+    match crate::logintx::file_sha256(path) {
+        Ok(Some(digest)) => digest,
+        Ok(None) => crate::logintx::ABSENT.to_string(),
+        Err(_) => "unreadable".to_string(),
+    }
 }
 
 /// What `login enable`/`login disable` would change, computed without writing.
@@ -934,6 +955,7 @@ pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<Plan
                 id: service_name(svc.etc),
                 role,
                 change,
+                state: surface_state(Path::new(svc.etc)),
             });
         },
     );
@@ -963,7 +985,12 @@ pub(crate) struct AppliedSurface {
 /// only moment it exists to be read; afterwards the file has already changed.
 /// Every surface is recorded even when a later one fails, since a partial apply
 /// is exactly the case a rollback has to be able to undo.
-pub(crate) fn apply(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<AppliedSurface> {
+pub(crate) fn apply(
+    enable: bool,
+    with_sudo: bool,
+    with_polkit: bool,
+    expected: &[PlannedSurface],
+) -> Vec<AppliedSurface> {
     let mut out = Vec::new();
     walk_surfaces(
         enable,
@@ -971,6 +998,35 @@ pub(crate) fn apply(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<App
         with_polkit,
         &mut |svc, role, wire, want| {
             let path = Path::new(svc.etc);
+            // Re-check the state THIS surface was planned against, immediately
+            // before writing it. Comparing plan ids once up front leaves a
+            // window: `plan` and `apply` are separate filesystem walks, so a
+            // change landing between them is never compared to anything. Doing
+            // it per surface narrows that window to the gap between this check
+            // and this write, which is as tight as it gets without holding a
+            // lock nothing else in the system takes.
+            let planned_state = expected
+                .iter()
+                .find(|candidate| candidate.id == service_name(svc.etc))
+                .map(|candidate| candidate.state.as_str());
+            let now = surface_state(path);
+            if let Some(planned_state) = planned_state {
+                if planned_state != now {
+                    out.push(AppliedSurface {
+                        id: service_name(svc.etc),
+                        role,
+                        path: svc.etc.to_string(),
+                        change: PlannedChange::NotInstalled,
+                        before: None,
+                        after_sha256: crate::logintx::ABSENT.to_string(),
+                        error: Some(format!(
+                            "{} changed between the plan and the write; not touched",
+                            svc.etc
+                        )),
+                    });
+                    return;
+                }
+            }
             // A file that exists but cannot be read is NOT the same as an
             // absent one. Collapsing the two with `.ok()` would record
             // `before: None`, and a later rollback would then DELETE a file it

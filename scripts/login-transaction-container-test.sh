@@ -107,7 +107,20 @@ assert "rollback refuses a drifted stack" "$out" test "$(echo "$out" | field cod
 assert "the admin's line survived the refusal" "lost" \
     grep -q "an admin added this later" "$SUDO_PAM"
 
-echo "=== 8. a record is root-only ==="
+echo "=== 8. an edit between plan and apply is refused ==="
+# The defect this guards: a plan id built from outcome LABELS alone is unchanged
+# when an admin rewrites a stack but leaves the anchor in place, so apply would
+# overwrite a stack the consumer was never shown.
+cp "$SUDO_PAM" "$SUDO_PAM.pre-irlume" 2>/dev/null
+grep -q pam_irlume "$SUDO_PAM" || sed -i '1i auth       sufficient   pam_irlume.so' "$SUDO_PAM"
+pid3=$($B login plan --action disable --json | field plan_id)
+echo "# admin edit after the plan was shown" >>"$SUDO_PAM"
+out=$($B login apply --action disable --plan-id "$pid3" --json)
+assert "an edit after the plan makes it stale" "$out" test "$(echo "$out" | field code)" = "plan-stale"
+assert "the admin's edit survived" "overwritten" grep -q "admin edit after the plan was shown" "$SUDO_PAM"
+assert "the stack was not rewritten" "rewritten" grep -q pam_irlume "$SUDO_PAM"
+
+echo "=== 9. a record is root-only ==="
 perms=$(stat -c %a "$IRLUME_STATE_DIR/login-transactions/$tx.json" 2>/dev/null)
 assert "record is 0600" "got $perms" test "$perms" = "600"
 

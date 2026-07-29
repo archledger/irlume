@@ -688,6 +688,12 @@ fn plan_id(action: &str, planned: &[crate::pamwire::PlannedSurface]) -> String {
         material.push_str(surface.id);
         material.push(' ');
         material.push_str(surface.change.id());
+        material.push(' ');
+        // The observed state, not just the intended outcome. Without this an
+        // admin could rewrite a stack, leave the anchor intact so the outcome
+        // stays `wire`, and an apply carrying the old id would overwrite a stack
+        // the consumer never saw.
+        material.push_str(&surface.state);
     }
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(material.as_bytes());
@@ -899,7 +905,9 @@ pub fn login_apply(args: &[String]) -> ExitCode {
         );
     }
 
-    let applied = crate::pamwire::apply(enable, false, false);
+    // The plan is handed to apply so each surface can be re-checked against the
+    // state it was planned against, immediately before that surface is written.
+    let applied = crate::pamwire::apply(enable, false, false, &planned);
     let record = crate::logintx::Transaction {
         id: random_id(),
         action: action.to_string(),
@@ -2049,6 +2057,37 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_id_changes_when_the_file_changes_but_the_outcome_does_not() {
+        use crate::pamwire::{PlannedChange, PlannedSurface};
+        // Codex found this on #178: the id hashed the outcome LABEL only. An
+        // admin can rewrite a stack and leave a valid anchor in place, so the
+        // outcome stays `wire` while the file is entirely different. An apply
+        // carrying the old id would then overwrite a stack the consumer was
+        // never shown, which is the exact thing plan-stale exists to prevent.
+        let with_state = |state: &str| {
+            vec![PlannedSurface {
+                id: "plasmalogin",
+                role: "login-screen",
+                change: PlannedChange::Wire,
+                state: state.to_string(),
+            }]
+        };
+        let before = plan_id("enable", &with_state("aaaa"));
+        let after = plan_id("enable", &with_state("bbbb"));
+        assert_ne!(
+            before, after,
+            "the same outcome over different file content must not share a plan id"
+        );
+        // And the id is still stable when genuinely nothing moved.
+        assert_eq!(before, plan_id("enable", &with_state("aaaa")));
+        // An unreadable surface is its own state, not folded into absent.
+        assert_ne!(
+            plan_id("enable", &with_state("unreadable")),
+            plan_id("enable", &with_state(crate::logintx::ABSENT))
+        );
+    }
+
+    #[test]
     fn a_plan_id_covers_the_action_and_the_outcomes() {
         use crate::pamwire::{PlannedChange, PlannedSurface};
         let surfaces = |change| {
@@ -2056,6 +2095,7 @@ mod tests {
                 id: "plasmalogin",
                 role: "login-screen",
                 change,
+                state: "same-state".into(),
             }]
         };
         let base = plan_id("enable", &surfaces(PlannedChange::Wire));

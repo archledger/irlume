@@ -60,6 +60,31 @@ pub(crate) struct SurfaceRecord {
     /// Digest of the file as apply left it. Rollback requires this to still
     /// match, which is what stops it reverting somebody else's later edit.
     pub(crate) after_sha256: String,
+    /// Permission bits before the change.
+    ///
+    /// Content alone does not restore a file. `write_atomic` copies permissions
+    /// from the CURRENT file, which does not exist when apply removed it, so a
+    /// recreated PAM stack would otherwise take the root process's umask
+    /// default. Absent on records written before this field existed, in which
+    /// case the old behaviour is kept rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<u32>,
+    /// Owner before the change. Restored alongside `mode` for the same reason:
+    /// a stack owned root:some-group and readable by it is not the same file
+    /// once it comes back owned root:root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gid: Option<u32>,
+}
+
+/// A file's ownership and permission bits, or `None` when it does not exist.
+pub(crate) fn file_metadata(path: &Path) -> Option<(u32, u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    // symlink_metadata, not metadata: a PAM path that is a symlink should be
+    // described as itself rather than as whatever it points at.
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.mode() & 0o7777, meta.uid(), meta.gid()))
 }
 
 /// What one `login apply` did.
@@ -268,6 +293,9 @@ mod tests {
             change: "wire".into(),
             before: before.map(str::to_string),
             after_sha256: after_sha.into(),
+            mode: None,
+            uid: None,
+            gid: None,
         }
     }
 

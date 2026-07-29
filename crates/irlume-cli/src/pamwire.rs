@@ -972,6 +972,9 @@ pub(crate) struct AppliedSurface {
     /// Content before the change; `None` when the file did not exist, so a
     /// rollback removes it rather than writing an empty file.
     pub(crate) before: Option<String>,
+    /// Mode, uid and gid before the change. Content alone does not describe a
+    /// file, and these cannot be recovered later once it has been rewritten.
+    pub(crate) before_metadata: Option<(u32, u32, u32)>,
     pub(crate) after_sha256: String,
     /// Set when this surface failed. The apply as a whole is reported as failed,
     /// and the surfaces that DID change are still recorded, so a rollback can
@@ -993,6 +996,7 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
         with_polkit,
         &mut |svc, role, wire, want| {
             let path = Path::new(svc.etc);
+            let before_metadata = crate::logintx::file_metadata(path);
             let (before, error) = match std::fs::read_to_string(path) {
                 Ok(content) => (Some(content), None),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
@@ -1015,6 +1019,7 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
                 path: svc.etc.to_string(),
                 change,
                 before,
+                before_metadata,
                 // Not written yet, so there is no after-state. A record in this
                 // condition is recognisable by its `prepared` status.
                 after_sha256: crate::logintx::ABSENT.to_string(),
@@ -1064,6 +1069,7 @@ pub(crate) fn apply(
                         path: svc.etc.to_string(),
                         change: PlannedChange::NotInstalled,
                         before: None,
+                        before_metadata: None,
                         after_sha256: crate::logintx::ABSENT.to_string(),
                         error: Some(format!(
                             "{} changed between the plan and the write; not touched",
@@ -1077,6 +1083,7 @@ pub(crate) fn apply(
             // absent one. Collapsing the two with `.ok()` would record
             // `before: None`, and a later rollback would then DELETE a file it
             // never captured. Only a genuine NotFound may become None.
+            let before_metadata = crate::logintx::file_metadata(path);
             let (before, mut read_error) = match std::fs::read_to_string(path) {
                 Ok(content) => (Some(content), None),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
@@ -1097,6 +1104,7 @@ pub(crate) fn apply(
                     path: svc.etc.to_string(),
                     change: PlannedChange::NotInstalled,
                     before: None,
+                    before_metadata: None,
                     after_sha256: crate::logintx::ABSENT.to_string(),
                     error: Some(message),
                 });
@@ -1130,6 +1138,7 @@ pub(crate) fn apply(
                 path: svc.etc.to_string(),
                 change,
                 before,
+                before_metadata,
                 after_sha256,
                 error,
             });
@@ -1147,9 +1156,31 @@ pub(crate) fn apply(
 /// `None` content means the file did not exist before, so it is removed rather
 /// than written empty: an empty PAM file is not the same as an absent one, and
 /// leaving one behind would shadow a vendor copy.
-pub(crate) fn restore_surface(path: &Path, before: Option<&str>) -> Result<(), String> {
+pub(crate) fn restore_surface(
+    path: &Path,
+    before: Option<&str>,
+    metadata: Option<(u32, u32, u32)>,
+) -> Result<(), String> {
     match before {
-        Some(content) => write_atomic(path, content),
+        Some(content) => {
+            write_atomic(path, content)?;
+            // Applied AFTER the atomic rename. write_atomic copies permissions
+            // from the file it is replacing, which is the wrong source here and
+            // does not exist at all when apply removed the file, so the recorded
+            // values are reapplied explicitly.
+            if let Some((mode, uid, gid)) = metadata {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+                // Ownership needs privilege irlume has here (rollback --apply is
+                // root-only) but may not on an unusual filesystem, so a failure
+                // is reported rather than silently accepted: a PAM file with the
+                // wrong group is a real access change.
+                std::os::unix::fs::chown(path, Some(uid), Some(gid))
+                    .map_err(|e| format!("chown {}: {e}", path.display()))?;
+            }
+            Ok(())
+        }
         None => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2947,10 +2978,41 @@ mod tests {
         let file = dir.join("sudo");
         std::fs::write(&file, "changed by apply\n").expect("write");
 
-        restore_surface(&file, Some("the original\n")).expect("restore");
+        restore_surface(&file, Some("the original\n"), None).expect("restore");
         assert_eq!(
             std::fs::read_to_string(&file).expect("read"),
             "the original\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restoring_puts_back_the_mode_not_just_the_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        // Codex found this on #178: write_atomic copies permissions from the
+        // file it replaces, which is the wrong source and does not exist at all
+        // when apply removed the file. A PAM stack that was 0640 coming back
+        // 0644 is a real access change, not a cosmetic one.
+        let dir = std::env::temp_dir().join(format!("irlume-restore-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("greeter");
+        std::fs::write(&file, "rewritten by apply\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // The recorded pre-change state: same bytes, but a tighter mode.
+        let meta = crate::logintx::file_metadata(&file).expect("metadata");
+        restore_surface(&file, Some("the original\n"), Some((0o640, meta.1, meta.2)))
+            .expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "the original\n"
+        );
+        let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o640,
+            "the recorded mode must come back, not the current one"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2967,12 +3029,12 @@ mod tests {
         let file = dir.join("materialized-override");
         std::fs::write(&file, "irlume made this\n").expect("write");
 
-        restore_surface(&file, None).expect("restore");
+        restore_surface(&file, None, None).expect("restore");
         assert!(!file.exists(), "the file must be gone, not empty");
 
         // Restoring an already-absent file is not an error: a rollback that
         // partly ran and is run again must be able to finish.
-        restore_surface(&file, None).expect("restoring an absent file is fine");
+        restore_surface(&file, None, None).expect("restoring an absent file is fine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

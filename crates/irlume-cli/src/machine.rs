@@ -858,9 +858,41 @@ fn rollback_restore(
     }
     let mut restored = Vec::new();
     for surface in &record.surfaces {
+        // Re-check THIS surface immediately before restoring it. The blanket
+        // check above happens before any write, which is what stops a rollback
+        // half-completing, but it leaves a window: by the time the loop reaches
+        // the last surface, the earlier ones have been written and time has
+        // passed. Checking again here narrows the window to a single
+        // check-and-write. Skipped for an unconfirmed record, whose digests were
+        // never confirmed and so cannot gate anything.
+        if !unconfirmed {
+            if let Err(reason) = crate::logintx::unchanged_since_apply(surface) {
+                irlume_common::dlog!(
+                    "{command}: {} moved while the rollback was running: {reason:?}",
+                    surface.id
+                );
+                return emit_with_extra(
+                    &failure(command, "changed-since-apply", false, contract),
+                    json!({
+                        "transaction_id": record.id,
+                        "restored": restored,
+                        "stopped_at": surface.id,
+                    }),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+        // Mode and ownership are restored with the content. All three come
+        // from the same record, so a partial record restores what it has rather
+        // than inventing values.
+        let metadata = match (surface.mode, surface.uid, surface.gid) {
+            (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
+            _ => None,
+        };
         match crate::pamwire::restore_surface(
             std::path::Path::new(&surface.path),
             surface.before.as_deref(),
+            metadata,
         ) {
             Ok(()) => restored.push(surface.id.clone()),
             Err(message) => {
@@ -993,6 +1025,9 @@ pub fn login_apply(args: &[String]) -> ExitCode {
                 change: surface.change.id().to_string(),
                 before: surface.before.clone(),
                 after_sha256: surface.after_sha256.clone(),
+                mode: surface.before_metadata.map(|(mode, _, _)| mode),
+                uid: surface.before_metadata.map(|(_, uid, _)| uid),
+                gid: surface.before_metadata.map(|(_, _, gid)| gid),
             })
             .collect::<Vec<_>>()
     };
@@ -1848,6 +1883,9 @@ mod tests {
                     change: "wire".into(),
                     before: Some("before\n".into()),
                     after_sha256: (*after).to_string(),
+                    mode: None,
+                    uid: None,
+                    gid: None,
                 })
                 .collect(),
         }

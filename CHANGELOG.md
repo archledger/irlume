@@ -5,6 +5,83 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-29
+
+Security release. Please upgrade.
+
+### Fixed
+
+- **irlume could permanently destroy a camera, and did.** Looking for the control
+  that lights a Windows-Hello illuminator, irlume wrote guessed payloads to every
+  UVC extension unit from 0 to 31 and every selector from 0 to 15 until the
+  infrared image got brighter. On a Lenovo ThinkPad camera (USB `174f:11b4`)
+  those writes reached an undocumented vendor unit, the camera stopped answering,
+  and by the next boot it no longer enumerated on the USB bus at all. A full
+  shutdown and the laptop's emergency reset hole did not bring it back. Reported
+  as [#159].
+
+  It ran without anyone asking for it. From 0.1.0, enrolling a face could start
+  the search. From 0.3.0, so could every daemon start, meaning every boot. What
+  triggered it was a dark infrared frame, which is also what an unlit room or an
+  empty chair looks like, so the search could run on hardware that never needed
+  it. Setting the documented `IRLUME_IR_EMITTER=off` did not prevent it, and on a
+  camera irlume already knew how to drive it made the search more likely by
+  leaving the picture dark.
+
+  Nothing guesses any more. Discovery reads the camera's USB descriptor, which
+  states which extension units exist, identifies each one by GUID, and lists
+  exactly which selectors each implements. Only Microsoft's documented
+  camera-control unit is addressed, only selectors that unit advertises are
+  touched, `GET_INFO` must say the control accepts a write, and the value written comes
+  from the camera's own answers. For IR Torch, which Microsoft specifies
+  completely, that value is checked against the specification before it is
+  written. Anything that cannot be put back afterwards is not written at all, and
+  a change is only believed if it follows the control in both directions, and the
+  first failed request ends the whole operation.
+
+  Where a value has to be chosen rather than read, it is derived from what the
+  camera advertises. Microsoft's Face Authentication control cannot use the
+  device's default: the specification says an interface that is also usable for
+  ordinary capture defaults to general-purpose mode, and both cameras this was
+  validated against do exactly that. The mode is therefore taken from the
+  camera's own `GET_MAX`, which states which face-authentication mode each of its
+  interfaces supports, and every structural contradiction is a refusal. On both
+  cameras that derivation produces the payload separately validated on each of
+  them, byte for byte.
+
+  Discovery now only happens when someone runs `irlume ir-setup`. It is not a
+  side effect of starting the daemon or enrolling a face.
+
+  `IRLUME_LOG_EMITTER_WRITES=1` prints every emitter write irlume makes, byte for
+  byte. Every one goes through a single function, so none can escape it.
+
+- **Upgrading stops the writes.** A control found by the old search was persisted
+  and re-applied on every capture. Those files are refused: the persisted control
+  now records which camera it was found on, files written before 0.7.1 carry no
+  such record, and a control found by writing invented payloads cannot be assumed
+  harmless because the current camera has something at the same numbers. Machines
+  that relied on one either fall back to the built-in table or re-run
+  `irlume ir-setup`. The second line of that file, a "brightness boost" found by
+  writing `0xFF` across a control of unknown meaning, is no longer written or read.
+
+- **A camera is identified by what the USB bus says it is.** The built-in table
+  matched a substring of the V4L card name, so any camera whose name contained
+  "ASUS" received nine bytes at unit 14, selector 6. It is keyed on
+  `idVendor:idProduct`, and the descriptor is checked before the write either
+  way. Identity is resolved from the file descriptor that will receive the write,
+  so the descriptor that authorises a write always describes the device that
+  gets it.
+
+### Added
+
+- **`scripts/diagnose-missing-camera.sh`** collects evidence from an affected
+  machine and sends the camera nothing. There is no software recovery once a
+  camera stops enumerating: every firmware path runs over USB control transfers,
+  which need a device that answers. The script says so rather than offering false
+  hope, and it lists what not to try.
+
+[#159]: https://github.com/archledger/irlume/issues/159
+
 ## [0.7.0] - 2026-07-28
 
 ### Added

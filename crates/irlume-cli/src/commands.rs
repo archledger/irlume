@@ -1520,8 +1520,9 @@ SYSTEM INTEGRATION
                         install Bitwarden's biometric-unlock polkit action
                         (flatpak/native; snap is handled by snapd already)
   selinux <status|load>           SELinux module for the login greeter
-  ir-setup [--dry-run]            auto-configure the IR emitter (sudo; rarely
-                        needed; enroll auto-runs it when IR frames are dark)
+  ir-setup [--dry-run]            configure the IR emitter (sudo; rarely needed,
+                        and only ever run when you ask; it writes to the
+                        camera, so --dry-run first)
   set-cameras <rgb> <ir>          persist the RGB+IR camera pair (sudo; the TUI
                         camera picker runs this for you)
   camera-tune [--rounds N]        measure whether this camera can stream RGB and

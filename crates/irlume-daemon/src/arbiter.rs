@@ -41,7 +41,7 @@ pub enum Class {
     /// follows it. Never refused, always served before other camera work.
     Auth,
     /// Opens the camera without being an authentication: the framing guide,
-    /// 1:N identify, enrollment, emitter probes, self-tests.
+    /// 1:N identify, enrollment, emitter setup, self-tests.
     Camera,
     /// Touches no camera: listings, keyring metadata, settings. Cheap enough
     /// that arbitration would cost more than it saves.

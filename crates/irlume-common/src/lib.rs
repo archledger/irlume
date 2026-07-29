@@ -275,7 +275,7 @@ pub enum Request {
         ear_open: f32,
         ear_closed: f32,
     },
-    /// Auto-configure the IR emitter (integrated linux-enable-ir-emitter): find
+    /// Configure the IR emitter from what the camera's USB descriptor documents: find
     /// and persist the UVC control that lights the 850nm illuminator, using IR
     /// brightness to detect success. `dry_run` only enumerates XU controls.
     SetupIrEmitter { dry_run: bool },

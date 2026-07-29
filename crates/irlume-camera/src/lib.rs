@@ -23,6 +23,8 @@
 //! panic on some drivers. Probe, don't assume.
 
 pub mod ir_emitter;
+mod ir_metadata;
+pub mod uvc_descriptor;
 
 use irlume_common::Error;
 use v4l::buffer::Type;
@@ -101,6 +103,12 @@ pub struct IrCaptureStats {
     pub lit_mean: f32,
     pub ambient_mean: f32,
     pub burst_frames: usize,
+    /// How many burst frames the camera itself classified as lit or dark, via
+    /// its UVC illumination metadata. Zero means the camera reported nothing
+    /// and the two means above are the burst's brightness extremes, as they
+    /// always were. Recorded so "the metadata path ran" is something callers
+    /// can check rather than assume.
+    pub camera_classified_frames: usize,
 }
 
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
@@ -150,11 +158,25 @@ struct SafeStream<'a> {
     device: String,
 }
 
+/// How long a single frame dequeue may block.
+///
+/// Generous next to a 30fps stream, short enough that a wedged camera surfaces
+/// as an error instead of a hang. The daemon's watchdog is 90s, so this has to
+/// be well inside it.
+const STREAM_DEQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl<'a> SafeStream<'a> {
     /// Open a stream on `dev` with the standard buffer ring.
+    ///
+    /// A dequeue timeout is set explicitly. v4l leaves it unset, which polls
+    /// with -1 and waits forever, so a camera that stops delivering frames
+    /// without erroring blocks the caller indefinitely. That matters most
+    /// during emitter setup: a stall there would hang with a control changed and
+    /// the restore never reached. Every wait now ends.
     fn open(device: &str, dev: &'a Device) -> irlume_common::Result<Self> {
-        let inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
+        let mut inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| map_io(device, e))?;
+        inner.set_timeout(STREAM_DEQUEUE_TIMEOUT);
         Ok(Self {
             inner: Some(inner),
             device: device.to_string(),
@@ -1215,18 +1237,25 @@ impl IrCamera {
     /// they are the only protection for modules we have never seen.
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
         let mut stream = SafeStream::open(&self.device, &self.dev)?;
+        // The metadata queue has to be streaming before the image queue starts,
+        // or uvcvideo produces no metadata at all (measured: zero bytes over
+        // 25s when video went first). `SafeStream::open` only allocates
+        // buffers; STREAMON happens on the first dequeue, which is inside
+        // `warm_up_stream` below. This is the window, and it is the only one.
+        let meta = ir_metadata::IlluminationLog::open(&self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream)?;
         // Fire the active-IR emitter on the open fd (Hello modules reset it
         // per-open, so we must do it here, while streaming, not via an external
         // one-shot).
-        let lit = ir_emitter::enable(self.dev.handle().fd(), &self.card);
+        let lit = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         Ok(IrSession {
             cam: self,
             stream,
             dec: IrDecoder::new(self.pix),
             lit,
+            meta,
         })
     }
 }
@@ -1237,6 +1266,9 @@ pub struct IrSession<'a> {
     stream: SafeStream<'a>,
     dec: IrDecoder,
     lit: bool,
+    /// The camera's own per-frame illumination reporting, when it has any.
+    /// `None` means this camera cannot say, and brightness decides as before.
+    meta: Option<ir_metadata::IlluminationLog>,
 }
 
 impl IrSession<'_> {
@@ -1259,29 +1291,79 @@ impl IrSession<'_> {
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
         let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
         let mut taken: Vec<std::time::Instant> = Vec::with_capacity(IR_BURST);
+        // Each frame's V4L2 buffer timestamp, the key that ties it to the
+        // camera's illumination record. Measured identical across the image and
+        // metadata queues for every frame of a 24-frame run; dequeue order is
+        // NOT used, because the two queues are drained independently.
+        let mut stamps: Vec<i64> = Vec::with_capacity(IR_BURST);
+        let mut meta = self.meta.as_mut();
+        // A session is reused across captures, so last burst's records are both
+        // useless and unbounded growth if kept.
+        if let Some(log) = meta.as_mut() {
+            log.begin_burst();
+        }
         for i in 0..IR_BURST {
             if i == IR_BURST / 2 {
-                ir_emitter::enable(fd, card);
+                ir_emitter::enable(fd, card, device);
             }
-            let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            let (buf, bmeta) = stream.next().map_err(|e| map_io(device, e))?;
+            stamps.push(bmeta.timestamp.sec * 1_000_000 + bmeta.timestamp.usec);
             taken.push(std::time::Instant::now());
+            // Drain every iteration, not once at the end. The metadata ring is
+            // smaller than a burst, so a single drain afterwards silently loses
+            // the earliest frames' records: measured 7 of 10 frames classified
+            // with an end-of-burst drain, 10 of 10 draining per frame. A
+            // non-blocking dequeue that finds nothing costs microseconds
+            // against a 67ms frame interval.
+            if let Some(log) = meta.as_mut() {
+                log.drain();
+            }
             let data = dec.decode(buf, w, h);
             means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
             frames.push(data);
         }
-        let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
-        let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        // First frame holding the max mean (strictly-greater scan), matching the
-        // original incremental behaviour exactly so the flag-off path is unchanged
-        // (max_by would keep the LAST tie, changing the chosen frame on ties).
-        let mut best_i = 0usize;
-        let mut best_mean = -1.0f64;
-        for (i, &m) in means.iter().enumerate() {
-            if m > best_mean {
-                best_mean = m;
-                best_i = i;
+        let flags: Vec<Option<ir_metadata::Illumination>> = match meta {
+            Some(log) => {
+                // The last frame's record can land just after its image buffer.
+                log.drain();
+                stamps.iter().map(|&t| log.illumination_at(t)).collect()
+            }
+            None => vec![None; means.len()],
+        };
+        let from_camera = flags.iter().filter(|f| f.is_some()).count();
+        // Per-frame comparison of the two answers, for measuring how often the
+        // old threshold disagreed with the camera. A disagreement is the whole
+        // reason this path exists, and it can only be observed against a scene
+        // that produces one, so the instrument is kept rather than reasoned about.
+        if std::env::var("IRLUME_DEBUG_IR_FRAMES").is_ok() {
+            for (i, (&m, f)) in means.iter().zip(&flags).enumerate() {
+                let camera = match f {
+                    Some(ir_metadata::Illumination::Lit) => "lit",
+                    Some(ir_metadata::Illumination::Dark) => "dark",
+                    None => "unsaid",
+                };
+                let threshold = if m >= f64::from(ir_emitter::IR_LIT_MEAN) {
+                    "lit"
+                } else {
+                    "dark"
+                };
+                let verdict = match f {
+                    Some(_) if camera != threshold => "DISAGREE",
+                    Some(_) => "agree",
+                    None => "-",
+                };
+                eprintln!(
+                    "[ir_frame] {i:2} mean {m:6.1}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    ir_emitter::IR_LIT_MEAN
+                );
             }
         }
+        let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
+        let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        // The brightest frame the CAMERA flagged lit. With no flags this is the
+        // first frame holding the max mean, exactly the original incremental
+        // scan, so the no-metadata path is unchanged.
+        let best_i = ir_metadata::brightest_lit(&means, &flags).unwrap_or(0);
         let mut best = Some(frames[best_i].clone());
         let mut ir_window = CaptureWindow::at(taken[best_i]);
 
@@ -1313,12 +1395,11 @@ impl IrSession<'_> {
         let subtract = std::env::var("IRLUME_IR_AMBIENT_SUBTRACT").is_ok_and(|v| v.trim() == "1");
         let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
         if subtract {
-            let neighbors = [best_i.wrapping_sub(1), best_i + 1];
-            let ambient_i = neighbors
-                .iter()
-                .filter(|&&j| j < means.len())
-                .min_by(|&&a, &&b| means[a].total_cmp(&means[b]))
-                .copied();
+            // An adjacent frame the camera flagged dark, else the darker
+            // neighbour as before. Adjacency still bounds auto-exposure drift
+            // between the pair; metadata only settles which neighbour is
+            // genuinely the emitter-off exposure.
+            let ambient_i = ir_metadata::ambient_partner(best_i, &means, &flags);
             if let Some(ai) = ambient_i {
                 let (lit_mean, amb_mean) = (means[best_i], means[ai]);
                 // Subtract only when there is a real strobe gap (a genuine off-frame,
@@ -1360,8 +1441,34 @@ impl IrSession<'_> {
                 }
             }
         }
+        // Lit and ambient levels follow the camera's own classification when it
+        // gave one. `bmax` is the wrong answer precisely in the case this exists
+        // to fix: a frame the camera flagged dark can hold the burst's highest
+        // mean, and reporting that as the lit level would feed the ambient-relative
+        // gates a strobe gap that never happened. With no metadata both fall back
+        // to the burst extremes, unchanged.
+        let best_mean = means.get(best_i).copied().unwrap_or(0.0);
+        let (lit_level, ambient_level) = if from_camera == 0 {
+            (bmax, bmin)
+        } else {
+            let dark_min = means
+                .iter()
+                .zip(&flags)
+                .filter(|(_, f)| matches!(f, Some(ir_metadata::Illumination::Dark)))
+                .map(|(m, _)| *m)
+                .fold(f64::INFINITY, f64::min);
+            (
+                best_mean,
+                if dark_min.is_finite() { dark_min } else { bmin },
+            )
+        };
         if debug_ir {
             eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
+            eprintln!(
+                "[ir] illumination: {from_camera}/{} frames classified by the camera; \
+                 chose frame {best_i} (mean {best_mean:.1}), lit {lit_level:.1} / ambient {ambient_level:.1}",
+                means.len()
+            );
         }
         // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
         // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
@@ -1386,9 +1493,10 @@ impl IrSession<'_> {
                 captured: ir_window,
             },
             IrCaptureStats {
-                lit_mean: bmax as f32,
-                ambient_mean: bmin as f32,
+                lit_mean: lit_level as f32,
+                ambient_mean: ambient_level as f32,
                 burst_frames: IR_BURST,
+                camera_classified_frames: from_camera,
             },
         ))
     }
@@ -1504,7 +1612,7 @@ pub mod ir_probe {
         let (w, h) = (fmt.width, fmt.height);
         let mut stream = super::SafeStream::open(device, &dev)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-        ir_emitter::enable(dev.handle().fd(), &card);
+        ir_emitter::enable(dev.handle().fd(), &card, device);
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
@@ -1589,7 +1697,7 @@ pub fn capture_ir_streaming<B>(
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = SafeStream::open(device, &dev)?;
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    ir_emitter::enable(dev.handle().fd(), &card);
+    ir_emitter::enable(dev.handle().fd(), &card, device);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
     // constant mid-grey for the rest of the window); real sensor noise never
@@ -1602,7 +1710,7 @@ pub fn capture_ir_streaming<B>(
     for attempt in 0..max_frames {
         // Keep the emitter lit across the whole window (some controls self-clear).
         if attempt % 8 == 0 {
-            ir_emitter::enable(dev.handle().fd(), &card);
+            ir_emitter::enable(dev.handle().fd(), &card, device);
         }
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
         let taken = std::time::Instant::now();
@@ -1619,7 +1727,7 @@ pub fn capture_ir_streaming<B>(
                 last_sig = None;
                 drop(stream); // stop + release buffers before re-arming
                 stream = SafeStream::open(device, &dev)?;
-                ir_emitter::enable(dev.handle().fd(), &card);
+                ir_emitter::enable(dev.handle().fd(), &card, device);
             }
             continue;
         }
@@ -1670,7 +1778,7 @@ pub fn capture_ir_sequence(
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = Some(SafeStream::open(device, &dev)?);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    ir_emitter::enable(dev.handle().fd(), &card);
+    ir_emitter::enable(dev.handle().fd(), &card, device);
     let mut frames = Vec::with_capacity(samples);
     let max_attempts = samples * 2 + 30;
     let (mut dead_run, mut restarts) = (0usize, 0usize);
@@ -1680,7 +1788,7 @@ pub fn capture_ir_sequence(
             break;
         }
         if attempt % 8 == 0 {
-            ir_emitter::enable(dev.handle().fd(), &card);
+            ir_emitter::enable(dev.handle().fd(), &card, device);
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
@@ -1714,7 +1822,7 @@ pub fn capture_ir_sequence(
                 last_sig = None;
                 drop(stream.take()); // stop + release buffers before re-arming
                 stream = Some(SafeStream::open(device, &dev)?);
-                ir_emitter::enable(dev.handle().fd(), &card);
+                ir_emitter::enable(dev.handle().fd(), &card, device);
             }
             continue;
         }
@@ -2009,13 +2117,19 @@ pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Res
         .map_err(|e| Error::Io(e.to_string()))
 }
 
-/// Auto-configure the IR emitter for `device`, irlume's integrated
-/// linux-enable-ir-emitter: enumerate the camera's UVC extension-unit controls,
-/// try candidate payloads, and keep the one that makes the IR image bright
-/// (success detected automatically from IR brightness; no phone-camera step).
-/// Persists the discovered control so every later capture uses it. Returns a
-/// human description, or errors if nothing worked. Non-destructive: controls
-/// that don't help are restored.
+/// Configure the IR emitter for `device` from what the camera documents about
+/// itself.
+///
+/// Reads the USB descriptor, addresses only Microsoft's camera-control extension
+/// unit, writes only a value built from the camera's own answers, verifies the
+/// change follows the control before keeping it, and stops at the
+/// first failed request, and once measuring begins, the first frame that does
+/// not arrive. Persists what worked so later
+/// captures apply it. Errors if the camera documents no control irlume can use;
+/// it does not fall back to guessing (#159).
+///
+/// A control is only written when its current value could be read back first, so
+/// anything changed can be undone.
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
@@ -2030,63 +2144,75 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // Mean IR brightness over a short burst (catches a strobed emitter's lit
     // phase). Measured on the DECODED 8-bit frame so the brightness scale is
     // comparable across native-grey and 16-bit/luma-extracted nodes.
-    let mut measure = || -> f32 {
-        let mut best = 0.0f32;
+    // None means the camera stopped delivering frames.
+    //
+    // The first failed dequeue ends the measurement. Swallowing failures and
+    // carrying on multiplies the per-frame timeout by the number of frames: at
+    // eighteen dequeues and five seconds each that is ninety seconds, which is
+    // exactly the daemon's watchdog deadline, so a stall during setup could get
+    // the daemon killed before the control it changed was restored. A fix for a
+    // hang is not worth a race with systemd.
+    let mut measure = || -> Option<f32> {
+        // Frames already in flight were captured before the control changed, and
+        // taking the brightest of the burst makes one stale frame decide the
+        // answer. Discard a stream's worth before believing anything.
+        for _ in 0..IR_BURST {
+            stream.next().ok()?;
+        }
+        let mut best: Option<f32> = None;
         for _ in 0..8 {
-            if let Ok((buf, _)) = stream.next() {
-                let data = dec.decode(buf, w, h);
-                let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
-                best = best.max(m as f32);
-            }
+            let (buf, _) = stream.next().ok()?;
+            let data = dec.decode(buf, w, h);
+            let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
+            best = Some(best.map_or(m as f32, |b: f32| b.max(m as f32)));
         }
         best
     };
-    match ir_emitter::autoconfigure(fd, &mut measure) {
-        Some(ctrl) => {
-            // With the emitter lit, look for a companion control that brightens
-            // the IR further (an exposure/gain-like vendor XU control); persist
-            // it alongside the emitter so every capture applies both.
-            let boost = ir_emitter::discover_boost(fd, &ctrl, &mut measure);
-            ir_emitter::save_conf_full(&ctrl, boost.as_ref()).map_err(|e| Error::Io(e.to_string()))?;
-            Ok(match &boost {
-                Some(b) => format!(
-                    "IR emitter enabled: control {} + brightness boost {} (saved; future captures use both)",
-                    ctrl.encode(), b.encode()
-                ),
-                None => format!(
-                    "IR emitter enabled: control {} (saved; no extra brightness control found)",
-                    ctrl.encode()
-                ),
-            })
+
+    let id = crate::uvc_descriptor::identity_from_fd(fd)
+        .map_err(|e| Error::Hardware(format!("could not identify the camera: {e}")))?;
+    match ir_emitter::discover(fd, &id, &mut measure) {
+        Ok(ctrl) => {
+            ir_emitter::save_conf(&id, &ctrl).map_err(|e| Error::Io(e.to_string()))?;
+            Ok(format!(
+                "IR emitter enabled: {} on the camera's Microsoft camera-control unit, \
+                 using a value built from what the camera reports about that control \
+                 (saved; future captures rebuild it the same way)",
+                ctrl.encode()
+            ))
         }
-        None => Err(Error::Hardware(
-            "could not auto-enable the IR emitter: no extension-unit control brightened the IR image. \
-             The camera may have no software-controllable emitter, or need a vendor-specific config.".into(),
-        )),
+        Err(e) => Err(Error::Hardware(e.to_string())),
     }
 }
 
-/// Read-only list of the IR camera's UVC extension-unit controls (unit, selector,
-/// size), for `ir-setup --dry-run` diagnostics. Touches no settings.
-pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<(u8, u8, usize)>> {
+/// What the IR camera's extension units are, for `ir-setup --dry-run`.
+///
+/// Read entirely from the USB descriptors, so it sends the camera nothing at
+/// all. The previous version issued `GET_LEN` to all 512 unit and selector
+/// combinations, which is traffic to controls the camera never claimed to have.
+pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<String>> {
     verify_pinned(device)?;
-    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-    Ok(ir_emitter::list_controls(dev.handle().fd()))
+    ir_emitter::describe_units(device).map_err(|e| map_io(device, e))
 }
 
-/// Ensure the IR emitter is working: a normal IR capture first (fires the
-/// known/configured emitter); only if that's dark does it run auto-setup. So a
-/// camera that already works (table/conf/env) is never brute-forced. Returns
-/// whether IR is bright after. `Some(true/false)` distinguishes "auto-setup ran"
-/// in the bool; the caller logs accordingly. Best-effort.
-pub fn ensure_ir_emitter(device: &str) -> irlume_common::Result<bool> {
+/// Apply the KNOWN emitter control (env override, persisted conf, or the
+/// built-in table) and report whether IR came up lit.
+///
+/// This never searches for an unknown control, and nothing that runs without the
+/// user asking for it may ever do so. Blind extension-unit writes destroyed a
+/// reporter's camera in #159: guessed `SET_CUR` payloads on an undocumented
+/// vendor unit of a Lenovo ThinkPad camera left it unable to enumerate on the bus,
+/// and neither a power cycle nor the laptop's reset hole brought it back.
+///
+/// Discovery is now an explicit, acknowledged operation (`irlume ir-setup`), not
+/// a side effect of starting the daemon or enrolling a face. A dark IR frame
+/// means the room is dark, or nobody is in front of the camera, or the emitter
+/// needs a control this machine does not know. None of those justify writing
+/// guessed values to camera firmware.
+pub fn apply_known_ir_emitter(device: &str) -> irlume_common::Result<bool> {
     let mean_of =
         |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
-    if mean_of(&capture_ir(device)?) >= ir_emitter::IR_LIT_MEAN as f64 {
-        return Ok(true); // already working; do not touch the camera
-    }
-    // Dark: attempt integrated auto-setup, then re-check.
-    setup_ir_emitter(device)?;
+    // capture_ir applies the known control on open; see `ir_emitter::enable`.
     Ok(mean_of(&capture_ir(device)?) >= ir_emitter::IR_LIT_MEAN as f64)
 }
 

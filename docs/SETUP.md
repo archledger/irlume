@@ -214,14 +214,50 @@ sudo irlume fingerprint enable   # unlock with face OR fingerprint (keeps face o
 
 ## IR emitter (rarely needed)
 
-Enrollment auto-enables the 850 nm emitter if the IR frames come back dark, so
-there's normally nothing to do. Only if IR stays dark after enrolling:
+Most Hello cameras need nothing here: irlume applies the control for modules it
+has been validated against, and re-applies it on every capture.
+
+If IR frames stay dark and you believe your camera has an emitter irlume is not
+driving:
 
 ```sh
+sudo irlume ir-setup --dry-run   # lists the camera's extension units, writes nothing
 sudo irlume ir-setup
 ```
 
-(IR cameras only; on an RGB webcam it exits without touching anything.)
+`ir-setup` writes to your camera. It only ever addresses Microsoft's documented
+camera-control extension unit, and only selectors that unit advertises in its USB
+descriptor. The value it writes comes from the camera: for the IR Torch control it is that
+control's own default, and for the Face Authentication control it is built from
+the modes the camera says each of its interfaces supports, because the default
+there is "ordinary capture" and would not light anything. If the control does not
+help, the value read from it beforehand is written back to undo the change.
+
+A change is only accepted if the picture brightens when the control is set and
+dims again when it is put back, so a passing cloud or someone moving is not
+mistaken for a working illuminator. Setup stops as soon as the camera fails to
+answer a request or to deliver a frame; it does not retry and does not move on
+to another control.
+
+What `ir-setup` finds is recorded as which control worked, never as a payload,
+so later captures rebuild the value from the camera rather than replaying bytes
+from a file.
+
+Before 0.7.1 it did something quite different: it wrote invented payloads to
+every extension unit and selector until the picture brightened, and it ran
+automatically at daemon start and during enrollment. That permanently destroyed a
+reporter's camera ([#159]). It is now only ever run when you ask for it.
+
+To see exactly what irlume sends to the camera, set `IRLUME_LOG_EMITTER_WRITES=1`
+and it prints each emitter write before making it.
+
+If your camera documents a control that irlume cannot discover, set it yourself:
+
+```sh
+IRLUME_IR_EMITTER=unit:selector:b,b,b
+```
+
+[#159]: https://github.com/archledger/irlume/issues/159
 
 ## Optional third-party liveness models
 
@@ -263,7 +299,7 @@ live in them; sealed envelopes are stored separately (see
 | `/etc/irlume/settings.conf` | `credential_release_challenge=0` opts OUT of the gesture required before your keyring password is released (default: required); `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in model; `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge on\|off`; `sudo irlume models enable/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
-| `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter (optional second line: a brightness-boost control) | `irlume ir-setup` / enrollment auto-setup |
+| `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
 
 Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env
 pair (both set), then `cameras.conf`, then auto-detection, then the compiled

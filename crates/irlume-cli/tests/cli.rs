@@ -553,19 +553,23 @@ fn set_cameras_usage_and_daemon_failure() {
     );
 }
 
+/// The real run tells the user it writes to their camera; the dry run must not,
+/// because it does not. Getting that backwards would either hide a write or
+/// warn about one that never happens, and after #159 neither is acceptable.
 #[test]
-fn ir_setup_daemon_failure_and_dry_run_skip_the_probe_banner() {
+fn ir_setup_warns_about_writing_and_dry_run_does_not() {
     let sb = Sandbox::new("irsetup");
     let (code, _, err) = run(&mut sb.cmd(&["ir-setup"]));
     assert_eq!(code, 1);
-    assert!(err.contains("probing the IR camera"), "{err}");
+    assert!(err.contains("writes to your camera"), "{err}");
+    assert!(err.contains("descriptor documents"), "{err}");
     assert!(err.contains("[ir-setup]"), "{err}");
 
     let (code, _, err) = run(&mut sb.cmd(&["ir-setup", "--dry-run"]));
     assert_eq!(code, 1);
     assert!(
-        !err.contains("probing the IR camera"),
-        "--dry-run must not print the probe banner: {err}"
+        !err.contains("writes to your camera"),
+        "--dry-run sends the camera nothing and must not claim otherwise: {err}"
     );
 }
 

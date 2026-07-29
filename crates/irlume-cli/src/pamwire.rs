@@ -979,6 +979,52 @@ pub(crate) struct AppliedSurface {
     pub(crate) error: Option<String>,
 }
 
+/// Read every surface's pre-change state, writing nothing.
+///
+/// Exists so a record can be persisted BEFORE the first PAM write. Without that
+/// ordering, a crash or a full disk between the writes and the record leaves a
+/// changed login stack with nothing describing how to undo it, which is worse
+/// than not having run at all.
+pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<AppliedSurface> {
+    let mut out = Vec::new();
+    walk_surfaces(
+        enable,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want| {
+            let path = Path::new(svc.etc);
+            let (before, error) = match std::fs::read_to_string(path) {
+                Ok(content) => (Some(content), None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "read {} before changing it: {error}",
+                        path.display()
+                    )),
+                ),
+            };
+            // The outcome this surface is expected to reach, so a record written
+            // now already says what was intended. Computed with writing off.
+            let change = wire_service(svc, enable && want, false, wire)
+                .map(|outcome| outcome.change)
+                .unwrap_or(PlannedChange::NotInstalled);
+            out.push(AppliedSurface {
+                id: service_name(svc.etc),
+                role,
+                path: svc.etc.to_string(),
+                change,
+                before,
+                // Not written yet, so there is no after-state. A record in this
+                // condition is recognisable by its `prepared` status.
+                after_sha256: crate::logintx::ABSENT.to_string(),
+                error,
+            });
+        },
+    );
+    out
+}
+
 /// Carry out an enable/disable, recording what each surface looked like first.
 ///
 /// The before-content is read BEFORE `wire_service` runs, because that is the

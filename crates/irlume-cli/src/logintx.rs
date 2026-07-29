@@ -66,6 +66,16 @@ pub(crate) struct SurfaceRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Transaction {
     pub(crate) id: String,
+    /// How far this transaction got.
+    ///
+    /// A record is written `Prepared` BEFORE the first PAM write and rewritten
+    /// `Applied` afterwards. A record left `Prepared` therefore means the writes
+    /// may have run partially and nothing confirmed them: its before-states are
+    /// still the authority for a rollback, but its after-digests are not, so
+    /// rollback must not gate on them. Defaulted for records written by an
+    /// engine that predates the field.
+    #[serde(default)]
+    pub(crate) status: TransactionStatus,
     /// `enable` or `disable`.
     pub(crate) action: String,
     /// The plan this was applied from, so a consumer can tie the two together.
@@ -74,6 +84,19 @@ pub(crate) struct Transaction {
     /// is still readable, but the difference is worth surfacing.
     pub(crate) engine_version: String,
     pub(crate) surfaces: Vec<SurfaceRecord>,
+}
+
+/// How far a transaction got before the process stopped writing.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TransactionStatus {
+    /// Before-states captured and persisted; the writes have not been confirmed.
+    /// A record found in this state after the process exited means a crash, a
+    /// full disk, or a kill landed mid-apply.
+    #[default]
+    Prepared,
+    /// Every surface was written and its after-state recorded.
+    Applied,
 }
 
 /// Hex sha256 of a byte slice.
@@ -274,6 +297,7 @@ mod tests {
         unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
         let tx = Transaction {
             id: "0123456789abcdef0123456789abcdef".into(),
+            status: TransactionStatus::Applied,
             action: "enable".into(),
             plan_id: "aaaabbbbccccddddaaaabbbbccccdddd".into(),
             engine_version: "0.0.0".into(),
@@ -299,6 +323,7 @@ mod tests {
         unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
         let tx = Transaction {
             id: "ffffffffffffffffffffffffffffffff".into(),
+            status: TransactionStatus::Applied,
             action: "disable".into(),
             plan_id: "0".repeat(32),
             engine_version: "0.0.0".into(),

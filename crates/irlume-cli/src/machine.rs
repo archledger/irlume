@@ -35,6 +35,7 @@ const CAPABILITIES: &[&str] = &[
     "login-status-json",
     "auth-test-events",
     "login-plan-json",
+    "login-transactions",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -731,6 +732,396 @@ fn valid_login_plan_args(args: &[String]) -> Option<&'static str> {
     }
 }
 
+/// Root, or the reason to refuse.
+///
+/// Checked in the command rather than left to the write failing with EACCES:
+/// a mutating command that gets partway before losing permission leaves a PAM
+/// stack half-changed, and `not-authorized` up front is a better answer than a
+/// partial apply.
+fn require_root(command: &'static str, contract: u32) -> Option<ExitCode> {
+    // SAFETY: geteuid cannot fail and touches no memory.
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
+    Some(emit(
+        &failure(command, "not-authorized", false, contract),
+        ExitCode::FAILURE,
+    ))
+}
+
+/// `irlume login apply --action X --plan-id ID --json`: carry out a plan.
+///
+/// The plan is re-derived from the machine and its id recomputed. A `plan_id`
+/// that no longer matches is refused as `plan-stale`, because the consumer
+/// displayed one set of changes and the machine now calls for another; applying
+/// anyway would change something nobody was shown. The id is never trusted as
+/// input, only compared.
+pub fn login_apply(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.apply";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some((action, supplied_plan)) = valid_login_apply_args(args) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    if let Some(refusal) = require_root(COMMAND, contract) {
+        return refusal;
+    }
+    let enable = action == "enable";
+    let planned = crate::pamwire::plan(enable, false, false);
+    let current_plan = plan_id(action, &planned);
+    if current_plan != supplied_plan {
+        return emit(
+            &failure(COMMAND, "plan-stale", false, contract),
+            ExitCode::FAILURE,
+        );
+    }
+
+    let applied = crate::pamwire::apply(enable, false, false);
+    let record = crate::logintx::Transaction {
+        id: random_id(),
+        action: action.to_string(),
+        plan_id: current_plan,
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        surfaces: applied
+            .iter()
+            .map(|surface| crate::logintx::SurfaceRecord {
+                id: surface.id.to_string(),
+                path: surface.path.clone(),
+                change: surface.change.id().to_string(),
+                before: surface.before.clone(),
+                after_sha256: surface.after_sha256.clone(),
+            })
+            .collect(),
+    };
+    // Recorded before the result is reported. Files have already changed; a
+    // record that could not be written would leave them changed with nothing
+    // describing how to undo it, which is worse than not having run.
+    if let Err(message) = record.save() {
+        irlume_common::dlog!("login.apply: recording the transaction failed: {message}");
+        return emit(
+            &failure(COMMAND, "operation-failed", false, contract),
+            ExitCode::FAILURE,
+        );
+    }
+
+    let failed: Vec<&crate::pamwire::AppliedSurface> =
+        applied.iter().filter(|s| s.error.is_some()).collect();
+    let changes: Vec<Value> = applied
+        .iter()
+        .map(|surface| {
+            json!({
+                "surface": surface.id,
+                "role": surface.role,
+                "change": surface.change.id(),
+                "applied": surface.error.is_none(),
+            })
+        })
+        .collect();
+    let data = json!({
+        "transaction_id": record.id,
+        "plan_id": record.plan_id,
+        "action": action,
+        "changes": changes,
+        "applied": applied.len() - failed.len(),
+        "failed": failed.len(),
+    });
+    if failed.is_empty() {
+        emit(&success(COMMAND, data, contract), ExitCode::SUCCESS)
+    } else {
+        // A partial apply is a failure that still has a transaction id, because
+        // the surfaces that DID change are recorded and can be rolled back. The
+        // id is on stderr rather than lost: the error document carries no data.
+        irlume_common::dlog!(
+            "login.apply: {} surface(s) failed; transaction {} can be rolled back",
+            failed.len(),
+            record.id
+        );
+        eprintln!("transaction {} recorded; roll back with: irlume login rollback --transaction-id {} --apply --json", record.id, record.id);
+        emit(
+            &failure(COMMAND, "operation-failed", false, contract),
+            ExitCode::FAILURE,
+        )
+    }
+}
+
+/// `irlume login verify --transaction-id ID --json`: is the machine still as
+/// that transaction left it?
+///
+/// Read-only, and deliberately usable without root: a desktop asking "did my
+/// change stick" should not need privilege to find out. Reading a record does,
+/// though, since the store is root-only, so an unprivileged caller gets
+/// `not-authorized` from the load rather than a wrong answer.
+pub fn login_verify(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.verify";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some(id) = valid_transaction_args(args, "verify", false) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    let Ok(record) = crate::logintx::Transaction::load(&id) else {
+        return emit(
+            &failure(COMMAND, "not-found", false, contract),
+            ExitCode::FAILURE,
+        );
+    };
+    let surfaces: Vec<Value> = record
+        .surfaces
+        .iter()
+        .map(|surface| {
+            let state = match crate::logintx::unchanged_since_apply(surface) {
+                Ok(()) => "as-applied",
+                Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => "changed-since-apply",
+                Err(crate::logintx::RollbackRefusal::Unreadable(_)) => "unreadable",
+            };
+            json!({ "surface": surface.id, "state": state })
+        })
+        .collect();
+    let drifted = surfaces
+        .iter()
+        .filter(|s| s["state"] != "as-applied")
+        .count();
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "transaction_id": record.id,
+                "action": record.action,
+                "plan_id": record.plan_id,
+                "surfaces": surfaces,
+                "drifted": drifted,
+                // Whether a rollback would be accepted right now. Stated by the
+                // engine so a consumer does not have to infer it from per-surface
+                // states it may not recognise.
+                "rollback_available": drifted == 0,
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+/// `irlume login rollback --transaction-id ID --apply --json`: put back what a
+/// transaction changed.
+///
+/// Refuses unless every surface is still exactly as apply left it. Restoring a
+/// file something else has edited since would revert a change this transaction
+/// never made, so drift stops the whole rollback rather than skipping the
+/// drifted surface: a half-rolled-back login stack is its own hazard.
+///
+/// Without `--apply` it reports what it would restore and touches nothing.
+pub fn login_rollback(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.rollback";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some(id) = valid_transaction_args(args, "rollback", true) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    let will_apply = args.iter().any(|a| a == "--apply");
+    if will_apply {
+        if let Some(refusal) = require_root(COMMAND, contract) {
+            return refusal;
+        }
+    }
+    let Ok(record) = crate::logintx::Transaction::load(&id) else {
+        return emit(
+            &failure(COMMAND, "not-found", false, contract),
+            ExitCode::FAILURE,
+        );
+    };
+    // Every surface is checked BEFORE any is written. A rollback that restored
+    // three files and then met a fourth it must refuse would leave the stack in
+    // a state neither the transaction nor the admin chose.
+    let drifted: Vec<&str> = record
+        .surfaces
+        .iter()
+        .filter(|s| crate::logintx::unchanged_since_apply(s).is_err())
+        .map(|s| s.id.as_str())
+        .collect();
+    if !drifted.is_empty() {
+        irlume_common::dlog!("login.rollback: refused; changed since apply: {drifted:?}");
+        return emit(
+            &failure(COMMAND, "changed-since-apply", false, contract),
+            ExitCode::FAILURE,
+        );
+    }
+    if !will_apply {
+        return emit(
+            &success(
+                COMMAND,
+                json!({
+                    "transaction_id": record.id,
+                    "action": record.action,
+                    "would_restore": record.surfaces.iter().map(|s| json!(s.id)).collect::<Vec<_>>(),
+                    "applied": false,
+                }),
+                contract,
+            ),
+            ExitCode::SUCCESS,
+        );
+    }
+    let mut restored = Vec::new();
+    for surface in &record.surfaces {
+        match crate::pamwire::restore_surface(
+            std::path::Path::new(&surface.path),
+            surface.before.as_deref(),
+        ) {
+            Ok(()) => restored.push(surface.id.clone()),
+            Err(message) => {
+                irlume_common::dlog!("login.rollback: {} failed: {message}", surface.id);
+                eprintln!(
+                    "rollback stopped after restoring {:?}; {} could not be written",
+                    restored, surface.id
+                );
+                return emit(
+                    &failure(COMMAND, "operation-failed", false, contract),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    }
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "transaction_id": record.id,
+                "action": record.action,
+                "restored": restored,
+                "applied": true,
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+fn valid_login_apply_args(args: &[String]) -> Option<(&'static str, String)> {
+    if args.first().map(String::as_str) != Some("login")
+        || args.get(1).map(String::as_str) != Some("apply")
+    {
+        return None;
+    }
+    let (mut action, mut plan, mut saw_json) = (None, None, false);
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--action" if action.is_none() => {
+                action = match args.get(index + 1).map(String::as_str) {
+                    Some("enable") => Some("enable"),
+                    Some("disable") => Some("disable"),
+                    _ => return None,
+                };
+                index += 2;
+            }
+            "--plan-id" if plan.is_none() => {
+                let value = args.get(index + 1)?;
+                if !crate::logintx::is_valid_id(value) {
+                    return None;
+                }
+                plan = Some(value.clone());
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    // The plan id is required. Applying without one would mean acting on
+    // changes the consumer never saw.
+    match (saw_json, action, plan) {
+        (true, Some(action), Some(plan)) => Some((action, plan)),
+        _ => None,
+    }
+}
+
+fn valid_transaction_args(args: &[String], sub: &str, allow_apply: bool) -> Option<String> {
+    if args.first().map(String::as_str) != Some("login")
+        || args.get(1).map(String::as_str) != Some(sub)
+    {
+        return None;
+    }
+    let (mut id, mut saw_json, mut saw_apply) = (None, false, false);
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--apply" if allow_apply && !saw_apply => {
+                saw_apply = true;
+                index += 1;
+            }
+            "--transaction-id" if id.is_none() => {
+                let value = args.get(index + 1)?;
+                if !crate::logintx::is_valid_id(value) {
+                    return None;
+                }
+                id = Some(value.clone());
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    if saw_json {
+        id
+    } else {
+        None
+    }
+}
+
 /// An exclusive per-user session, held for as long as the guard lives.
 ///
 /// The contract promises one session per user. That is enforced with an
@@ -1160,7 +1551,8 @@ mod tests {
                 "doctor-json",
                 "login-status-json",
                 "auth-test-events",
-                "login-plan-json"
+                "login-plan-json",
+                "login-transactions"
             ])
         );
         assert!(document.get("error").is_none());

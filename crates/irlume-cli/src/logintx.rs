@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
+//! Login transactions: a record of what a `login apply` changed, so it can be
+//! verified afterwards and put back.
+//!
+//! # Why a record rather than the backups
+//!
+//! `pamwire` already keeps a `.pre-irlume` backup per file, and its disable path
+//! restores it only when the live file still equals that backup plus irlume's
+//! lines, stripping in place otherwise so an admin's later edit is not reverted.
+//! That mechanism stays exactly as it is. This module does not replace it and
+//! must not become a second opinion about what a PAM file should contain.
+//!
+//! What it adds is the ability to answer two questions the backups cannot:
+//! *did the change I asked for actually land*, and *put back what was there
+//! before THIS operation*, for a consumer that ran one specific apply and holds
+//! its id.
+//!
+//! # The safety rule
+//!
+//! A record stores each file's digest as apply left it. Rollback recomputes
+//! that digest and restores only if it still matches. If anything edited the
+//! file in between, rollback refuses rather than reverting a change nobody
+//! asked it to revert. That is the same principle the disable path already
+//! follows, applied to a narrower question.
+//!
+//! # What is stored
+//!
+//! The pre-change content of each file irlume wrote. PAM stacks under
+//! `/etc/pam.d` are world-readable, so this is not secret material, but the
+//! store is kept root-only anyway: it describes exactly how a machine
+//! authenticates, and there is no reason for an ordinary process to read it.
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// Where transaction records live, unless `IRLUME_STATE_DIR` overrides the
+/// state root (tests and containers do).
+fn store_dir() -> PathBuf {
+    let root = std::env::var_os("IRLUME_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/irlume"));
+    root.join("login-transactions")
+}
+
+/// One file as it stood before and after a transaction.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SurfaceRecord {
+    /// PAM service name. The stable public identifier.
+    pub(crate) id: String,
+    /// The `/etc` path. Needed to restore, and deliberately never published in
+    /// machine output, which names surfaces by service.
+    pub(crate) path: String,
+    /// The planned change this surface was recorded for.
+    pub(crate) change: String,
+    /// The file's content before the change. `None` when it did not exist, so
+    /// rollback removes it rather than writing an empty file.
+    pub(crate) before: Option<String>,
+    /// Digest of the file as apply left it. Rollback requires this to still
+    /// match, which is what stops it reverting somebody else's later edit.
+    pub(crate) after_sha256: String,
+}
+
+/// What one `login apply` did.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Transaction {
+    pub(crate) id: String,
+    /// `enable` or `disable`.
+    pub(crate) action: String,
+    /// The plan this was applied from, so a consumer can tie the two together.
+    pub(crate) plan_id: String,
+    /// Which engine wrote the record. A record written by a different version
+    /// is still readable, but the difference is worth surfacing.
+    pub(crate) engine_version: String,
+    pub(crate) surfaces: Vec<SurfaceRecord>,
+}
+
+/// Hex sha256 of a byte slice.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The digest of a file's current content, or `None` when it does not exist.
+///
+/// An unreadable file that DOES exist is an error rather than `None`: treating
+/// "cannot read" as "absent" would let rollback decide a file was never there
+/// and delete it.
+pub(crate) fn file_sha256(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(sha256_hex(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+/// Digest of an absent file, as recorded. A distinct constant rather than an
+/// empty string, so "the file was absent" cannot be confused with "nobody
+/// recorded a digest".
+pub(crate) const ABSENT: &str = "absent";
+
+impl Transaction {
+    /// Persist the record, root-readable only.
+    ///
+    /// Written before the caller reports success. A transaction that changed
+    /// files but could not be recorded is worse than one that did not run: the
+    /// change is on disk with nothing describing how to undo it, so the write
+    /// failing is an error the caller must surface.
+    pub(crate) fn save(&self) -> Result<PathBuf, String> {
+        let dir = store_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        restrict(&dir, 0o700)?;
+        let path = dir.join(format!("{}.json", self.id));
+        let body = serde_json::to_string(self).map_err(|e| format!("serialize record: {e}"))?;
+        std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        restrict(&path, 0o600)?;
+        Ok(path)
+    }
+
+    /// Read a record back by id.
+    ///
+    /// The id is used as a filename, so it is checked to be plain hex first: a
+    /// consumer-supplied id containing a separator would otherwise reach
+    /// outside the store.
+    pub(crate) fn load(id: &str) -> Result<Self, String> {
+        if !is_valid_id(id) {
+            return Err("transaction id is not a hex identifier".into());
+        }
+        let path = store_dir().join(format!("{id}.json"));
+        let body =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+}
+
+/// Whether a transaction id is safe to use as a filename.
+///
+/// Hex only, and a fixed length. This is the whole defence against a supplied
+/// id escaping the store directory, so it rejects rather than sanitises: a
+/// `..` or a `/` makes the id invalid, it does not get stripped out.
+pub(crate) fn is_valid_id(id: &str) -> bool {
+    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn restrict(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+/// Why a surface could not be rolled back.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RollbackRefusal {
+    /// The file no longer matches what apply left, so restoring the recorded
+    /// content would revert an edit this transaction did not make.
+    ChangedSinceApply,
+    /// The file could not be read to check.
+    Unreadable(String),
+}
+
+/// Whether this surface is still exactly as apply left it.
+///
+/// The check rollback is gated on. Kept separate from the restore itself so it
+/// can be run on its own by `verify`, and so both answer from one rule.
+pub(crate) fn unchanged_since_apply(record: &SurfaceRecord) -> Result<(), RollbackRefusal> {
+    let current = match file_sha256(Path::new(&record.path)) {
+        Ok(value) => value,
+        Err(error) => return Err(RollbackRefusal::Unreadable(error)),
+    };
+    let current = current.unwrap_or_else(|| ABSENT.to_string());
+    if current == record.after_sha256 {
+        Ok(())
+    } else {
+        Err(RollbackRefusal::ChangedSinceApply)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialises tests that set IRLUME_STATE_DIR. Cargo runs tests on threads
+    /// and the variable is process-global, so two of these racing made one read
+    /// the other's store. Same reason pamwire's tests hold an env lock.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn temp_state(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("irlume-logintx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp state dir");
+        root
+    }
+
+    fn record(path: &Path, before: Option<&str>, after_sha: &str) -> SurfaceRecord {
+        SurfaceRecord {
+            id: "plasmalogin".into(),
+            path: path.display().to_string(),
+            change: "wire".into(),
+            before: before.map(str::to_string),
+            after_sha256: after_sha.into(),
+        }
+    }
+
+    #[test]
+    fn an_id_that_is_not_plain_hex_is_refused_rather_than_cleaned() {
+        // The id becomes a filename, so this is the whole defence against one
+        // reaching outside the store. Rejecting beats sanitising: a stripped
+        // separator leaves a plausible-looking id that addresses a different file.
+        assert!(is_valid_id("0123456789abcdef0123456789abcdef"));
+        for bad in [
+            "../../etc/passwd",
+            "0123456789abcdef0123456789abcde/",
+            "0123456789abcdef0123456789abcdeZ",
+            "short",
+            "",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            assert!(!is_valid_id(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_record_survives_a_round_trip() {
+        let _lock = env_lock();
+        let root = temp_state("roundtrip");
+        // SAFETY: single-threaded test, restored below.
+        unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+        let tx = Transaction {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            action: "enable".into(),
+            plan_id: "aaaabbbbccccddddaaaabbbbccccdddd".into(),
+            engine_version: "0.0.0".into(),
+            surfaces: vec![record(
+                Path::new("/etc/pam.d/plasmalogin"),
+                Some("old\n"),
+                "deadbeef",
+            )],
+        };
+        let path = tx.save().expect("save");
+        assert!(path.exists());
+        assert_eq!(Transaction::load(&tx.id).expect("load"), tx);
+        unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_store_is_not_readable_by_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = env_lock();
+        let root = temp_state("perms");
+        // SAFETY: single-threaded test, restored below.
+        unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+        let tx = Transaction {
+            id: "ffffffffffffffffffffffffffffffff".into(),
+            action: "disable".into(),
+            plan_id: "0".repeat(32),
+            engine_version: "0.0.0".into(),
+            surfaces: vec![],
+        };
+        let path = tx.save().expect("save");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a record describes how a machine authenticates"
+        );
+        let dir_mode = std::fs::metadata(path.parent().expect("parent"))
+            .expect("stat dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_is_refused_once_the_file_has_moved_on() {
+        let root = temp_state("changed");
+        let target = root.join("plasmalogin");
+        std::fs::write(&target, "as apply left it\n").expect("write");
+        let after = sha256_hex(b"as apply left it\n");
+        let rec = record(&target, Some("original\n"), &after);
+
+        // Untouched since apply: restoring is safe.
+        assert_eq!(unchanged_since_apply(&rec), Ok(()));
+
+        // Somebody else edited it. Restoring the recorded content now would
+        // revert a change this transaction never made.
+        std::fs::write(&target, "an admin added a line\n").expect("write");
+        assert_eq!(
+            unchanged_since_apply(&rec),
+            Err(RollbackRefusal::ChangedSinceApply)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_apply_created_is_recognised_when_it_is_still_absent() {
+        // `disable` can remove a file. Its recorded after-state is ABSENT, and
+        // an absent file must compare equal to that rather than read as drift.
+        let root = temp_state("absent");
+        let target = root.join("never-existed");
+        let rec = record(&target, Some("was here\n"), ABSENT);
+        assert_eq!(unchanged_since_apply(&rec), Ok(()));
+
+        std::fs::write(&target, "something put it back\n").expect("write");
+        assert_eq!(
+            unchanged_since_apply(&rec),
+            Err(RollbackRefusal::ChangedSinceApply)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_an_absent_one() {
+        // Treating "cannot read" as "absent" would let rollback conclude a file
+        // was never there and delete it.
+        let root = temp_state("unreadable");
+        let dir = root.join("a-directory-where-a-file-is-expected");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let rec = record(&dir, None, "deadbeef");
+        assert!(matches!(
+            unchanged_since_apply(&rec),
+            Err(RollbackRefusal::Unreadable(_))
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

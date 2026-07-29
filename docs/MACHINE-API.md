@@ -465,6 +465,52 @@ covers every surface, because turning login off leaves nothing behind.
 `login rollback` are not part of contract 1 and must not be inferred from this
 command or from human output.
 
+### `irlume login apply` / `verify` / `rollback`
+
+Capability: `login-transactions`. The mutating half of a login transaction;
+`login plan` above is the read-only half.
+
+```
+irlume login apply    --action {enable|disable} --plan-id ID --json   # root
+irlume login verify   --transaction-id ID --json
+irlume login rollback --transaction-id ID [--apply] --json            # root to apply
+```
+
+**apply** re-derives the plan from the machine and recomputes its id. A
+`plan_id` that no longer matches is refused as `plan-stale`: the consumer
+displayed one set of changes and the machine now calls for another, so applying
+would change something nobody was shown. The supplied id is never trusted as
+input, only compared. On success it returns a `transaction_id`.
+
+A partial apply is reported as a failure and still records its transaction, so
+the surfaces that did change can be rolled back. The id is written to standard
+error in that case, because an error document carries no `data`.
+
+**verify** answers whether the machine is still as that transaction left it,
+per surface: `as-applied`, `changed-since-apply`, or `unreadable`. It also
+states `rollback_available`, so a consumer does not have to infer it from
+per-surface states it may not recognise. Read-only.
+
+**rollback** restores what the transaction changed, and **refuses unless every
+surface is still exactly as apply left it**. Restoring a file something else has
+edited since would revert a change the transaction never made, so drift stops
+the whole rollback rather than skipping the drifted surface: a half-rolled-back
+login stack is its own hazard. Every surface is checked before any is written.
+Without `--apply` it reports what it would restore and touches nothing.
+
+Transaction records live under the state directory, `0600` in a `0700`
+directory. They contain the pre-change content of each file, which is not secret
+(PAM stacks are world-readable) but does describe exactly how a machine
+authenticates.
+
+A transaction id is a 32-character hex string. Anything else is a `usage-error`,
+rejected rather than sanitised, because the id becomes a filename.
+
+Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
+`not-authorized` (apply and `rollback --apply` need root, checked before
+anything is written rather than left to a write failing partway),
+`operation-failed`.
+
 ## Security and privacy
 
 Ordinary JSON output never includes camera frames, embeddings, templates,
@@ -478,5 +524,4 @@ from human output or the private socket protocol:
 - preview images and cancellation semantics;
 - profile or scan mutation;
 - camera configuration mutation;
-- login apply, verify, or rollback transactions (the read-only plan phase is
-  published above).
+- enrollment preview images and their cancellation semantics.

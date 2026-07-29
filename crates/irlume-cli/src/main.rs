@@ -25,6 +25,7 @@ mod blinkcap;
 mod commands;
 mod doctor_report;
 mod fingerprint;
+mod logintx;
 mod logs;
 mod machine;
 mod models;
@@ -143,6 +144,13 @@ fn main() -> std::process::ExitCode {
         // phase of a login transaction, and the human equivalent is the dry run
         // `login enable` already prints.
         (Some("login"), _) if args.iter().any(|a| a == "plan") => machine::login_plan(&args),
+        // The mutating half of a login transaction. Machine-only, like `plan`:
+        // the human equivalent is `login enable --apply`.
+        (Some("login"), _) if args.iter().any(|a| a == "apply") => machine::login_apply(&args),
+        (Some("login"), _) if args.iter().any(|a| a == "verify") => machine::login_verify(&args),
+        (Some("login"), _) if args.iter().any(|a| a == "rollback") => {
+            machine::login_rollback(&args)
+        }
         // `auth test` exists only as a machine command, so it routes here
         // whatever flags follow and answers a bad invocation with a JSON
         // usage-error rather than prose. Bare `auth` still falls through to the

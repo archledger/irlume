@@ -872,16 +872,58 @@ pub(crate) struct PlannedSurface {
 /// This runs the identical decision the apply path runs, with `apply` false, so
 /// the plan cannot describe an outcome the apply would not produce. It reads
 /// PAM files and needs no privilege; only applying does.
-pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<PlannedSurface> {
+/// Called once per surface: the service, its role, the wiring recipe for it,
+/// and whether this configuration wants it wired.
+type SurfaceVisitor<'a> = dyn FnMut(&Svc, &'static str, &dyn Fn(&str) -> (String, bool), bool) + 'a;
+
+/// Walk every surface an enable/disable would touch, calling `visit` for each.
+///
+/// One list, walked by both `plan` and `apply`. Deciding which surfaces are in
+/// scope, and with which wiring recipe, is the part that must not exist twice:
+/// a plan that walked a different set than the apply would describe changes
+/// that never happen, or miss ones that do.
+fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut SurfaceVisitor<'_>) {
     let Wants {
         face_login,
         face_lock,
         fp_keyring,
     } = wants();
     let gnome = gnome_shell_major();
+    for s in GREETERS {
+        let prof = dm_profile(s.etc, gnome);
+        let unified_login_lock =
+            s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
+        let face = face_login || (unified_login_lock && face_lock);
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face, fp_keyring, prof.ondemand);
+        visit(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
+    }
+    for s in FP_GREETERS {
+        visit(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
+    }
+    visit(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
+    if sudo_in_scope(enable, with_sudo) {
+        visit(
+            &Svc {
+                etc: SUDO,
+                vendor: None,
+            },
+            ROLE_SUDO,
+            &wire_verify_service,
+            true,
+        );
+    }
+    if polkit_in_scope(enable, with_polkit) {
+        visit(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
+    }
+}
+
+pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<PlannedSurface> {
     let mut out = Vec::new();
-    let mut record =
-        |svc: &Svc, role: &'static str, wire: &dyn Fn(&str) -> (String, bool), want: bool| {
+    walk_surfaces(
+        enable,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want| {
             // A service whose decision cannot even be computed (an unreadable file)
             // is reported as not-installed rather than omitted: a surface silently
             // missing from a plan is how a consumer comes to believe it was covered.
@@ -893,34 +935,82 @@ pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<Plan
                 role,
                 change,
             });
-        };
-    for s in GREETERS {
-        let prof = dm_profile(s.etc, gnome);
-        let unified_login_lock =
-            s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
-        let face = face_login || (unified_login_lock && face_lock);
-        let greeter_wire = |c: &str| wire_greeter_impl(c, face, fp_keyring, prof.ondemand);
-        record(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
-    }
-    for s in FP_GREETERS {
-        record(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
-    }
-    record(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
-    if sudo_in_scope(enable, with_sudo) {
-        record(
-            &Svc {
-                etc: SUDO,
-                vendor: None,
-            },
-            ROLE_SUDO,
-            &wire_verify_service,
-            true,
-        );
-    }
-    if polkit_in_scope(enable, with_polkit) {
-        record(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
-    }
+        },
+    );
     out
+}
+
+/// One surface after an apply, with what it took to undo it.
+pub(crate) struct AppliedSurface {
+    pub(crate) id: &'static str,
+    pub(crate) role: &'static str,
+    /// The `/etc` path. Needed to restore; never published in machine output.
+    pub(crate) path: String,
+    pub(crate) change: PlannedChange,
+    /// Content before the change; `None` when the file did not exist, so a
+    /// rollback removes it rather than writing an empty file.
+    pub(crate) before: Option<String>,
+    pub(crate) after_sha256: String,
+    /// Set when this surface failed. The apply as a whole is reported as failed,
+    /// and the surfaces that DID change are still recorded, so a rollback can
+    /// undo a partial run.
+    pub(crate) error: Option<String>,
+}
+
+/// Carry out an enable/disable, recording what each surface looked like first.
+///
+/// The before-content is read BEFORE `wire_service` runs, because that is the
+/// only moment it exists to be read; afterwards the file has already changed.
+/// Every surface is recorded even when a later one fails, since a partial apply
+/// is exactly the case a rollback has to be able to undo.
+pub(crate) fn apply(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<AppliedSurface> {
+    let mut out = Vec::new();
+    walk_surfaces(
+        enable,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want| {
+            let path = Path::new(svc.etc);
+            let before = std::fs::read_to_string(path).ok();
+            let (change, error) = match wire_service(svc, enable && want, true, wire) {
+                Ok(outcome) => (outcome.change, None),
+                Err(message) => (PlannedChange::NotInstalled, Some(message)),
+            };
+            let after_sha256 = std::fs::read(path)
+                .map(|bytes| crate::logintx::sha256_hex(&bytes))
+                .unwrap_or_else(|_| crate::logintx::ABSENT.to_string());
+            out.push(AppliedSurface {
+                id: service_name(svc.etc),
+                role,
+                path: svc.etc.to_string(),
+                change,
+                before,
+                after_sha256,
+                error,
+            });
+        },
+    );
+    out
+}
+
+/// Put one surface back to the content recorded before a transaction.
+///
+/// Reuses the same atomic write the wiring path uses, so a restore lands the
+/// way every other PAM write here does. The caller must have checked
+/// `unchanged_since_apply` first; this does the write, not the decision.
+///
+/// `None` content means the file did not exist before, so it is removed rather
+/// than written empty: an empty PAM file is not the same as an absent one, and
+/// leaving one behind would shadow a vendor copy.
+pub(crate) fn restore_surface(path: &Path, before: Option<&str>) -> Result<(), String> {
+    match before {
+        Some(content) => write_atomic(path, content),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove {}: {error}", path.display())),
+        },
+    }
 }
 
 /// The active login manager and the PAM services it consults.

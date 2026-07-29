@@ -181,11 +181,17 @@ face-auth journal line in one view, and `sudo irlume logs debug on` traces
 every pipeline stage (scores, liveness cues, thresholds, timings; numbers
 only, never frames or embeddings).
 
-No IR-emitter step needed: enrollment probes the IR camera and, if its frames
-come back black, auto-discovers and enables the 850 nm emitter itself. Only if
-IR stays dark after enrolling, run `sudo irlume ir-setup` manually. It applies
-to IR cameras only (on an RGB-only webcam it exits with "not an IR capture
-node" without touching anything).
+Usually no IR-emitter step is needed. Many Hello cameras drive their own
+illuminator whenever the infrared stream is open, and for the modules irlume has
+been validated against it applies the control those cameras document. Nothing
+runs on its own: if your infrared frames stay dark, `sudo irlume ir-setup` will
+look for a control, and it tells you first that it writes to your camera.
+
+It only ever addresses the extension unit your camera's USB descriptor
+identifies as Microsoft's camera-control unit, only selectors that unit
+advertises, and only with values built from the camera's own answers. Before
+0.7.1 it did something very different, and it destroyed a reporter's camera; see
+[#159](https://github.com/archledger/irlume/issues/159).
 
 **Safe to try.** Installing the package wires **nothing** into your login.
 Auth only changes when you run `login enable`, and without `--apply` it's a
@@ -483,7 +489,7 @@ The TPM and camera code builds on:
 
 - **[rust-tss-esapi](https://github.com/parallaxsecond/rust-tss-esapi)** (the Parsec project, Apache-2.0) wraps the TPM 2.0 ESAPI. irlume builds from a small patch branch that adds the `PolicyAuthorizeNV` wrapper (upstream [PR #486](https://github.com/parallaxsecond/rust-tss-esapi/pull/486)) plus the [PR #530](https://github.com/parallaxsecond/rust-tss-esapi/pull/530) session-leak fix, pinned to an exact commit.
 - **[systemd](https://github.com/systemd/systemd)** (LGPL-2.1-or-later): the Tier-2 pcrlock seal and unseal in `crates/irlume-core/src/tpm.rs` follows the scheme in systemd's `src/shared/tpm2-util.c` and `src/pcrlock/pcrlock.c`.
-- **[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)** documented the UVC Extension-Unit writes that fire the 850nm emitter on integrated Hello cameras.
+- **[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)** first showed that the 850nm emitter on integrated Hello cameras can be driven from userspace over UVC Extension Units. irlume no longer uses its search technique: irlume's own version of it destroyed a camera ([#159](https://github.com/archledger/irlume/issues/159)), and upstream gates that search behind an interactive warning about firmware corruption that irlume did not have.
 - **[ort](https://github.com/pykeio/ort)** binds Microsoft's ONNX Runtime, which irlume loads at runtime for every model above.
 
 Prior art that shaped the design: **Windows Hello** for the infrared, dual-sensor credential model, and [Howdy](https://github.com/boltgolt/howdy) and [visage](https://github.com/sovren-software/visage) as the existing Linux face-unlock projects (see the [comparison](#-comparison-windows-hello-howdy-visage)). irlume is the from-scratch successor to the author's earlier linhello.

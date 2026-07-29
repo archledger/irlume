@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.7.0
+Version:        0.7.1
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -210,6 +210,15 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Wed Jul 29 2026 archledger <archledger236@gmail.com> - 0.7.1-1
+- Security: irlume no longer searches for an IR-emitter control by writing
+  guessed values to UVC extension units. That search destroyed a reporter's
+  camera (#159) and ran unattended: from 0.1.0 on enrolment, from 0.3.0 on every
+  daemon start. Discovery now reads the camera's USB descriptor, addresses only
+  Microsoft's documented camera-control unit and only selectors it advertises,
+  builds the value from the camera's own answers, and runs only when asked.
+- Configurations written by the old search are refused on upgrade.
+
 * Tue Jul 28 2026 archledger <archledger236@gmail.com> - 0.7.0-1
 - Camera arbitration: an authentication is no longer queued behind preview work
 - Versioned read-only JSON machine API for desktop integrations

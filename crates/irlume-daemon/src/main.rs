@@ -121,19 +121,23 @@ fn main() {
             ),
         }
     }
-    // Self-heal the IR emitter at startup, not just on enroll. The emitter is a
-    // camera hardware state that resets on a USB/power cycle or a daemon
-    // restart; if the working control was never persisted, the first auth after
-    // a restart gets a dark IR frame and fails (exactly the "worked at enroll,
-    // failed at the lock screen" case). ensure_ir_emitter fires the known
-    // control (env/conf/table) and, only if IR is still dark, runs auto-setup
-    // and persists what it finds to ir_emitter.conf, so every later capture,
-    // and every later boot, applies it. No-op on RGB-only hardware; best-effort.
+    // Re-apply the KNOWN emitter control at startup. The emitter is camera
+    // hardware state that resets on a USB/power cycle or a daemon restart, so
+    // without this the first auth after a restart gets a dark IR frame (the
+    // "worked at enroll, failed at the lock screen" case).
+    //
+    // This used to fall through to a blind search when IR came back dark, which
+    // is what destroyed a reporter's camera in #159. A daemon start is not
+    // consent to write guessed values to camera firmware, and darkness does not
+    // even imply the emitter is the problem: an unlit room or an empty chair
+    // produces exactly the same measurement. Discovery now happens only when
+    // someone runs `irlume ir-setup` and accepts the warning.
     if std::path::Path::new(&ir_dev).exists() {
-        match irlume_auth::ensure_ir_emitter(&ir_dev) {
+        match irlume_auth::apply_known_ir_emitter(&ir_dev) {
             Ok(true) => eprintln!("irlumed: IR emitter ready"),
             Ok(false) => eprintln!(
-                "irlumed: IR still dark after emitter auto-setup (dark-mode unlock may be unavailable)"
+                "irlumed: IR is dark (dark-mode unlock may be unavailable). If this camera needs an \
+                 emitter control irlume does not know, run `sudo irlume ir-setup`."
             ),
             Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
         }
@@ -1430,12 +1434,17 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             }
             let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
-            // Auto-fix a dark/disabled IR emitter so dark-mode scans enroll
-            // cleanly; only runs the brute-force if IR is actually dark.
-            match irlume_auth::ensure_ir_emitter(engine.ir_device()) {
+            // Apply the known emitter control so dark-mode scans enroll cleanly.
+            // Asking to enroll a face is not consent to probe camera firmware
+            // for an unknown control, so this no longer falls through to a
+            // search when IR is dark (#159).
+            match irlume_auth::apply_known_ir_emitter(engine.ir_device()) {
                 Ok(true) => {}
-                Ok(false) => eprintln!("irlumed: IR still dark after auto-setup; enrolling RGB (dark unlock unavailable)"),
-                Err(e) => eprintln!("irlumed: IR emitter auto-setup skipped: {e}"),
+                Ok(false) => eprintln!(
+                    "irlumed: IR is dark; enrolling RGB (dark unlock unavailable). \
+                     If this camera needs an emitter control, run `sudo irlume ir-setup`."
+                ),
+                Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
             }
             match engine.enroll_profile(&user, profile, want) {
                 Ok(outcome) => enroll_response(outcome),
@@ -1502,11 +1511,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::SetupIrEmitter { dry_run } => {
-            // Hardware fix on the shared camera; non-destructive on failure.
+            // Writes to the camera. It addresses only controls the camera's own
+            // descriptor documents and undoes what it can, but a run that ends
+            // because the camera stopped answering can leave a control changed,
+            // so this is not called non-destructive.
             if dry_run {
-                // Enumerating XU controls opens the shared camera node. Harmless
-                // once, but it is unauthenticated and now reachable by any local
-                // uid, so it shares the camera-probe interval.
+                // Reads the camera's USB descriptors from sysfs and sends the
+                // device nothing, but it still names hardware and is reachable
+                // by any local uid, so it keeps the camera-probe interval.
                 if camera_probe_rate_limited(peer.uid) {
                     return Response::Error("rate limited; try again shortly".into());
                 }
@@ -1514,18 +1526,13 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     Ok(c) if c.is_empty() => {
                         Response::Ok("no UVC extension-unit controls found".into())
                     }
-                    Ok(c) => Response::Ok(format!(
-                        "XU controls: {}",
-                        c.iter()
-                            .map(|(u, s, l)| format!("unit{u}/sel{s}/{l}B"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
+                    Ok(c) => Response::Ok(format!("extension units: {}", c.join("; "))),
                     Err(e) => Response::Error(e.to_string()),
                 }
             } else {
-                // The non-dry path brute-forces UVC control writes on the shared
-                // camera; a local peer could thrash the hardware. Root only.
+                // The non-dry path writes to the camera's Microsoft-XU. It no
+                // longer guesses payloads (#159), but any write to camera
+                // firmware stays root-only.
                 if peer.uid != 0 {
                     return Response::Error(format!(
                         "setup_ir_emitter requires root (peer uid {})",

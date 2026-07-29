@@ -183,7 +183,7 @@ enum Suspend {
     /// Switch the active camera pair; root op (writes /etc), so it suspends to
     /// `sudo irlume set-cameras <rgb> <ir>`.
     SetCameras(String, String),
-    /// Auto-configure the IR emitter; root op, suspends to `sudo irlume ir-setup`.
+    /// Set up the IR emitter; root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
     /// View the face-auth journal (`sudo irlume logs`); the daemon's lines live
     /// in the system journal, so it runs under sudo to guarantee they show.
@@ -279,7 +279,6 @@ enum Fix {
 /// string id) so a check row can only name a fix that has a handler.
 #[derive(Clone, Copy)]
 enum RootFix {
-    IrSetup,
     /// `sudo irlume login reconcile`: re-apply wiring a distro PAM
     /// regeneration stripped (marker says wired, active greeter is not).
     LoginReconcile,
@@ -928,12 +927,16 @@ impl App {
             v.push(mk("Cameras", csev, cdetail, cfix));
             // Emitter fix only makes sense when an IR node exists.
             if h.ir_dev.is_some() {
-                v.push(mk(
-                    "IR emitter",
-                    Sev::Warn,
-                    "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Root(RootFix::IrSetup),
-                ));
+                // No row at all. This check has never measured the emitter: it
+                // was unconditionally a warning whenever an IR node existed,
+                // which cried wolf on every working machine and pointed its fix
+                // button at a write to the camera. Turning it into an OK just
+                // moved the false claim to the other side, telling someone with
+                // a genuinely dark feed that everything is fine.
+                //
+                // Repair states verdicts it can support. Emitter setup is not a
+                // verdict, it is an action, and it lives on the Cameras screen
+                // where it is offered without a diagnosis attached.
             }
         } else {
             let ort = std::env::var("ORT_DYLIB_PATH")
@@ -1020,12 +1023,16 @@ impl App {
             };
             v.push(mk("Cameras", csev, cdetail, cfix));
             if ir {
-                v.push(mk(
-                    "IR emitter",
-                    Sev::Warn,
-                    "if the IR feed is dark, auto-enable the 850nm illuminator".into(),
-                    Fix::Root(RootFix::IrSetup),
-                ));
+                // No row at all. This check has never measured the emitter: it
+                // was unconditionally a warning whenever an IR node existed,
+                // which cried wolf on every working machine and pointed its fix
+                // button at a write to the camera. Turning it into an OK just
+                // moved the false claim to the other side, telling someone with
+                // a genuinely dark feed that everything is fine.
+                //
+                // Repair states verdicts it can support. Emitter setup is not a
+                // verdict, it is an action, and it lives on the Cameras screen
+                // where it is offered without a diagnosis attached.
             }
         }
 
@@ -1451,10 +1458,6 @@ impl App {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
             // Emitter setup writes the persisted UVC control, a root op now.
-            Fix::Root(RootFix::IrSetup) => {
-                self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
-                self.suspend = Some(Suspend::IrSetup);
-            }
             Fix::Root(RootFix::RestartDaemon) => {
                 self.log(
                     '→',
@@ -2428,11 +2431,11 @@ impl App {
             // Cameras: IR emitter auto-setup (root; writes the persisted UVC
             // control) suspends to sudo; the [p] probe below is read-only.
             (SC_CAMERAS, KeyCode::Char('s')) => {
-                self.log('→', "sudo irlume ir-setup: enable the 850nm emitter (you'll be asked for your password)");
+                self.log('→', "sudo irlume ir-setup: set up the 850nm emitter; this writes to the camera (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
             }
             (SC_CAMERAS, KeyCode::Char('p')) => self.start_async(
-                "IR emitter probe",
+                "IR emitter units",
                 OpTag::Generic,
                 Request::SetupIrEmitter { dry_run: true },
                 map_ok,
@@ -3618,18 +3621,18 @@ impl App {
         lines.push(Line::raw(""));
         lines.push(section("IR emitter (850nm)"));
         lines.push(Line::from(Span::styled(
-            "  If the IR feed is dark irlume probes the UVC controls and enables",
+            "  Setting this up writes to your camera. It uses only the controls",
             Style::new().dim(),
         )));
         lines.push(Line::from(Span::styled(
-            "  the illuminator automatically (no phone-camera step).",
+            "  your camera's USB descriptor documents, and never runs on its own.",
             Style::new().dim(),
         )));
         lines.push(Line::from(vec![
             Span::styled("  [s]", Style::new().fg(th().accent)),
-            Span::styled(" auto-setup emitter   ", Style::new().dim()),
+            Span::styled(" set up emitter   ", Style::new().dim()),
             Span::styled("[p]", Style::new().fg(th().accent)),
-            Span::styled(" probe XU controls", Style::new().dim()),
+            Span::styled(" list units (writes nothing)", Style::new().dim()),
         ]));
         // Borderless (no box-in-box); the content panel is the only frame.
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info_area);
@@ -4556,7 +4559,11 @@ impl App {
                 ("g", "logs"),
                 ("t", "debug logs"),
             ],
-            SC_CAMERAS => &[("enter", "use"), ("s", "setup emitter"), ("p", "probe")],
+            SC_CAMERAS => &[
+                ("enter", "use"),
+                ("s", "setup emitter"),
+                ("p", "list units"),
+            ],
             SC_PROFILES => &[
                 ("e", "enroll"),
                 ("a", "add scan"),
@@ -6515,7 +6522,7 @@ mod tests {
         app.repair = vec![
             check_row("ok", Sev::Ok, Fix::None),
             check_row("man", Sev::Warn, Fix::Manual("run `foo --bar`".into())),
-            check_row("emitter", Sev::Warn, Fix::Root(RootFix::IrSetup)),
+            check_row("emitter", Sev::Warn, Fix::Root(RootFix::SelinuxLoad)),
             check_row("daemon", Sev::Fail, Fix::Root(RootFix::RestartDaemon)),
             check_row("reader", Sev::Fail, Fix::Root(RootFix::RestartFprintd)),
             check_row("wiring", Sev::Fail, Fix::Root(RootFix::LoginEnable)),
@@ -6536,7 +6543,10 @@ mod tests {
             app.apply_fix(idx);
             app.suspend.take()
         };
-        assert!(matches!(suspended_by(&mut app, 2), Some(Suspend::IrSetup)));
+        assert!(matches!(
+            suspended_by(&mut app, 2),
+            Some(Suspend::SelinuxLoad)
+        ));
         assert!(matches!(
             suspended_by(&mut app, 3),
             Some(Suspend::RestartDaemon)
@@ -7470,7 +7480,7 @@ mod tests {
         let cases: [(usize, &str, &str); 11] = [
             (SC_WELCOME, "enroll", "uninstall"),
             (SC_REPAIR, "fix", "debug logs"),
-            (SC_CAMERAS, "use", "probe"),
+            (SC_CAMERAS, "use", "list units"),
             (SC_PROFILES, "enroll", "delete"),
             (SC_IDENTIFY, "identify", "identify"),
             (SC_KEYRING, "arm", "forget"),
@@ -7644,9 +7654,15 @@ mod tests {
         let cams = find("Cameras");
         assert!(cams.sev == Sev::Ok);
         assert!(cams.detail.contains("secure tier"));
+        // Repair no longer carries an emitter row. It never measured the
+        // emitter: it was unconditionally a warning whenever an IR node
+        // existed, so it cried wolf on every working machine and pointed its
+        // fix button at a write to the camera. Setup lives on the Cameras
+        // screen, offered as an action rather than dressed as a diagnosis, and
+        // the daemon says when the feed is genuinely dark.
         assert!(
-            app.repair.iter().any(|c| c.label == "IR emitter"),
-            "an IR node earns the emitter fix row"
+            !app.repair.iter().any(|c| c.label == "IR emitter"),
+            "Repair must not state a verdict it has not measured"
         );
         assert!(
             !app.repair.iter().any(|c| c.label == "Daemon build"),

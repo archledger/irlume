@@ -39,7 +39,7 @@ cat <<'EOF'
 irlume installed. Next steps:
   irlume tui                         # enroll your face + configure
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
-(enrollment auto-enables the 850nm IR emitter when IR frames are black;
- manual fallback for IR cameras: sudo irlume ir-setup)
+(most Hello cameras need no emitter step; if IR frames stay dark,
+ sudo irlume ir-setup writes to the camera and tells you so first)
 Password is always the fallback; no lockout.
 EOF

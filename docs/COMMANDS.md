@@ -60,7 +60,7 @@ Conventions that apply everywhere:
 | `irlume bitwarden <status\|setup> [--apply]` | for setup | install Bitwarden's biometric-unlock polkit action, flavor-aware (flatpak/native install it; snap is snapd's job; ostree gets the layering steps); see docs/APP-INTEGRATION.md |
 | `irlume selinux <status\|load>` | for load | SELinux module for the login greeter (Fedora) |
 | `sudo irlume biopolicy <on\|off\|status>` | for on/off | the operation-class gate: when ENFORCING, a face match is accepted only for the operations its camera tier is trusted for (login and sudo require the Secure IR tier; screen unlock and app prompts stay allowed); off by default, and the password is always available either way |
-| `irlume ir-setup [--dry-run]` | yes | auto-configure the IR emitter; rarely needed, enroll runs it itself when IR frames come back dark |
+| `irlume ir-setup [--dry-run]` | yes | configure the IR emitter; rarely needed, and only ever run when you ask. Writes to the camera, so read the warning in SETUP.md. `--dry-run` lists the camera's extension units and writes nothing |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume camera-tune [--rounds N]` | yes | measure whether this camera keeps its brightness while both sensors stream, and store the resulting capture mode in `cameras.conf`; some modules starve their own RGB interface (measured: NexiGo HelloCam N930W keeps 56% of its RGB brightness), and this puts those on one-at-a-time capture |
 | `irlume models [list]` | no | show the opt-in third-party liveness models and their checksum state |

@@ -389,8 +389,9 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// `irlume ir-setup [--dry-run]`: auto-enable the IR emitter via the daemon
-/// (integrated linux-enable-ir-emitter). `--dry-run` only lists XU controls.
+/// `irlume ir-setup [--dry-run]`: enable the IR emitter via the daemon, using
+/// only controls the camera's USB descriptor documents. `--dry-run` lists the
+/// camera's extension units and sends it nothing.
 /// `irlume set-cameras <rgb> <ir>`: persist the active RGB+IR pair. Root only
 /// (the daemon writes /etc/irlume/cameras.conf); the TUI camera picker runs this
 /// via sudo, and headless setups call it directly.
@@ -759,7 +760,10 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
     use irlume_common::Request;
     let dry = args.iter().any(|a| a == "--dry-run");
     if !dry {
-        eprintln!("[ir-setup] probing the IR camera and trying to enable the 850nm emitter (a few seconds)…");
+        eprintln!(
+            "[ir-setup] this writes to your camera. It uses only the controls your camera's USB\n\
+             descriptor documents, and the values it reports for them. A few seconds…"
+        );
     }
     report_ok_response(
         "ir-setup",

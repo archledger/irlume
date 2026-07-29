@@ -47,25 +47,24 @@ jobs:
       - name: build (system rust, rolling Arch)
         run: cargo build --workspace --locked
 
+      # Guarded because `cargo test` exits 0 even when it discovers no tests at
+      # all. The floor sits well below the real count (707 at 0.7.0).
       - name: test (hardware-independent set)
-        run: cargo test --workspace --locked
+        run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
 
       # The same named tests ci.yml runs against swtpm, but with NO IRLUME_TCTI
       # override, so they hit the real TPM (device:/dev/tpmrm0, the built-in
       # default). Transient handles + round-trip verification only; validated
       # non-destructive on this hardware during the seal-ladder campaigns.
+      # The count assertion this step used to carry now lives in the shared
+      # guard, which names the set instead of counting it: renaming one of these
+      # while adding another would leave the total at 4 and hide the loss.
       - name: test (TPM-gated, against the REAL TPM)
         run: |
-          set -o pipefail
-          # Assert the named tests actually ran: `cargo test <names>` exits 0
-          # on a zero-match filter, so a renamed test would silently stop being
-          # exercised on the real TPM this runner exists to cover.
-          out="$(mktemp)"
-          cargo test -p irlume-core --lib --locked -- --ignored \
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle \
+            -- cargo test -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
-            tpm_key_and_recovery_lifecycle --test-threads=1 2>&1 | tee "$out"
-          ran=$(grep -oE 'test result: ok\. [0-9]+ passed' "$out" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')
-          [ "$ran" -ge 4 ] || { echo "::error::expected 4 real-TPM tests, ran $ran (renamed/typo'd filter?)"; exit 1; }
+            tpm_key_and_recovery_lifecycle --test-threads=1
 
       # Real-camera smoke: find the IR node by the same classifier users run,
       # then capture a strobe burst and require real frames. Skips cleanly when
@@ -215,13 +214,17 @@ jobs:
             if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
             sleep 1
           done
-          cargo llvm-cov --no-report --workspace --locked
-          cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+          # Each selection is guarded separately. Guarding the step as a whole
+          # would let the workspace run satisfy the minimum for every filtered
+          # lane after it, which is the failure being guarded against.
+          ./scripts/run-tests-guarded.sh --min 650 -- cargo llvm-cov --no-report --workspace --locked
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals,seal_unseal_pcrlock_roundtrip_provisioned_nv \
+            -- cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
             seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
             tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
-          cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
-          cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
-          cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
-          cargo llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
-          cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 15 -- cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 7 -- cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 5 -- cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 1 -- cargo llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 16 -- cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
           cargo llvm-cov report --summary-only

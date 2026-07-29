@@ -131,5 +131,7 @@ jobs:
       - name: build
         run: cargo build --workspace --locked
 
+      # Guarded because `cargo test` exits 0 even when it discovers no tests at
+      # all. The floor sits well below the real count (707 at 0.7.0).
       - name: test
-        run: cargo test --workspace --locked
+        run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked

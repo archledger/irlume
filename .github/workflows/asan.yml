@@ -126,6 +126,10 @@ jobs:
         run: |
           # print_suppressions puts "Suppressions used:" in the log, so a reader
           # can see the deliberate leak was matched rather than assume it.
+          # Guarded because `cargo test` exits 0 even when it discovers no tests
+          # at all. No cfg gates the test set by toolchain, so the nightly run
+          # selects the same tests the stable lanes do.
           LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt:print_suppressions=1" \
+            ./scripts/run-tests-guarded.sh --min 650 -- \
             cargo +nightly test --workspace --locked \
               --target x86_64-unknown-linux-gnu

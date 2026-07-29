@@ -16,8 +16,16 @@ set -euo pipefail
 # It is version-pinned by tag (@vX.Y.Z) by design and is itself provenanced.
 ALLOW_TAG_PREFIX="slsa-framework/slsa-github-generator/"
 
+# Discovery has to be counted, not assumed. `while ... done < <(grep ...)` runs
+# the loop zero times when grep matches nothing, and the exit status of a
+# process substitution is not checked by `set -e` or pipefail, so the script
+# would print success having examined no references at all. That is reachable
+# without anyone touching this file: reformatting to `uses :`, moving steps into
+# generated YAML, or a rename of the workflows directory all produce it.
+seen=0
 fail=0
 while IFS= read -r line; do
+  seen=$((seen + 1))
   file="${line%%:*}"
   rest="${line#*:}"
   # The reference is the token after `uses:` (strip a leading `- `).
@@ -35,10 +43,17 @@ while IFS= read -r line; do
   fi
 done < <(grep -rnE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows/)
 
+if [ "$seen" -eq 0 ]; then
+  echo "No 'uses:' references found under .github/workflows/."
+  echo "Every workflow here uses at least one action, so finding none means the"
+  echo "search stopped matching, not that the repository stopped using actions."
+  exit 1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo
   echo "All actions must be pinned to a full-length commit SHA."
   echo "The only allowed tag reference is ${ALLOW_TAG_PREFIX}* (SLSA generator)."
   exit 1
 fi
-echo "All action references are SHA-pinned (SLSA generator excepted)."
+echo "All $seen action references are SHA-pinned (SLSA generator excepted)."

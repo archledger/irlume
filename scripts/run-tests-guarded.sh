@@ -261,6 +261,12 @@ test result: ok. 2 passed; 0 failed'
   # zero tests and look like the very bug it is guarding against.
   expect "nextest is rejected rather than silently parsed as zero" 2 \
     "$0" --min 1 -- cargo nextest run
+  expect "nextest behind a +toolchain selector is still rejected" 2 \
+    "$0" --min 1 -- cargo +nightly nextest run
+  # The rejection is of the cargo SUBCOMMAND, not of the word. Filtering for a
+  # test named "nextest" is a legitimate run and must not be refused.
+  expect "a test named nextest is a filter, not the nextest harness" 0 \
+    "$0" --min 1 -- sh -c 'echo "$@"; printf "\ntest result: ok. 1 passed; 0 failed\n"' _ cargo test nextest
   expect "a JSON test format is rejected" 2 \
     "$0" --min 1 -- cargo test -- --format json
 
@@ -358,16 +364,29 @@ esac
 # for a test of that name.
 for arg in "$@"; do
   case "$arg" in
-    nextest)
-      echo "error: nextest output is not parsed by this guard; it needs its own check" >&2
-      exit 2
-      ;;
     --format | --format=*)
       echo "error: this guard requires libtest's default output format" >&2
       exit 2
       ;;
   esac
 done
+
+# nextest is rejected as a cargo SUBCOMMAND, not as any argument spelled that
+# way: `cargo test nextest` is a legitimate filter for a test of that name and
+# must run. The subcommand is the first argument after `cargo` that is not a
+# +toolchain selector, so `cargo +nightly nextest run` is still caught.
+if [ "${1:-}" = "cargo" ]; then
+  for arg in "${@:2}"; do
+    case "$arg" in
+      +*) continue ;;
+      nextest)
+        echo "error: nextest output is not parsed by this guard; it needs its own check" >&2
+        exit 2
+        ;;
+      *) break ;;
+    esac
+  done
+fi
 
 log="$(mktemp)"
 # shellcheck disable=SC2064  # $log is expanded now on purpose; it never changes.

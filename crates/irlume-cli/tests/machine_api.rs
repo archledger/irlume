@@ -488,3 +488,181 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
     ids.dedup();
     assert_eq!(before, ids.len(), "check ids must be unique");
 }
+
+/// The transaction commands, exercised through the real binary. Their bodies
+/// need root to reach the writing half, but every refusal and the read-only
+/// plan run as an ordinary user, which is also how a desktop first meets them.
+#[test]
+fn login_plan_answers_for_both_actions() {
+    for action in ["enable", "disable"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(["login", "plan", "--action", action, "--json"])
+            .output()
+            .expect("run irlume");
+        assert!(output.status.success(), "plan {action} should succeed");
+        let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        assert_eq!(document["command"], "login.plan");
+        assert_eq!(document["data"]["action"], action);
+        // Every wirable surface is listed, present or not, so a consumer that
+        // knows an id can always find it.
+        let changes = document["data"]["changes"]
+            .as_array()
+            .expect("changes is an array");
+        assert!(!changes.is_empty());
+        for change in changes {
+            assert!(change["surface"].is_string());
+            assert!(change["writes"].is_boolean());
+        }
+        // requires_root must agree with the write count rather than being an
+        // independent claim a consumer could act on wrongly.
+        let writes = document["data"]["writes"].as_u64().expect("writes");
+        assert_eq!(document["data"]["requires_root"], writes > 0);
+        let counted = changes
+            .iter()
+            .filter(|c| c["writes"] == serde_json::json!(true))
+            .count() as u64;
+        assert_eq!(writes, counted, "the count must match the entries");
+        // No PAM paths: surfaces are named by service.
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !text.contains("/etc/pam.d"),
+            "a plan must not publish paths"
+        );
+    }
+}
+
+#[test]
+fn a_plan_id_is_stable_for_an_unchanged_machine() {
+    let id = |action: &str| -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(["login", "plan", "--action", action, "--json"])
+            .output()
+            .expect("run irlume");
+        let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        document["data"]["plan_id"]
+            .as_str()
+            .expect("plan_id")
+            .to_string()
+    };
+    let first = id("enable");
+    assert_eq!(first.len(), 32);
+    assert_eq!(first, id("enable"), "same machine, same intent, same id");
+    assert_ne!(
+        first,
+        id("disable"),
+        "a different intent is a different plan"
+    );
+}
+
+#[test]
+fn the_transaction_commands_refuse_before_they_write() {
+    let cases: [(&[&str], &str, i32); 6] = [
+        // apply without a plan id would act on changes nobody was shown.
+        (
+            &["login", "apply", "--action", "enable", "--json"],
+            "usage-error",
+            2,
+        ),
+        (
+            &[
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "nothex",
+                "--json",
+            ],
+            "usage-error",
+            2,
+        ),
+        // An id shaped like a path is refused, not cleaned: it becomes a filename.
+        (
+            &[
+                "login",
+                "verify",
+                "--transaction-id",
+                "../../etc/passwd",
+                "--json",
+            ],
+            "usage-error",
+            2,
+        ),
+        (
+            &[
+                "login",
+                "rollback",
+                "--transaction-id",
+                "../../etc/shadow",
+                "--apply",
+                "--json",
+            ],
+            "usage-error",
+            2,
+        ),
+        (&["login", "verify", "--json"], "usage-error", 2),
+        // A well-formed id that names no record.
+        (
+            &[
+                "login",
+                "verify",
+                "--transaction-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            "not-found",
+            1,
+        ),
+    ];
+    for (args, expected, exit) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(args)
+            .output()
+            .expect("run irlume");
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{args:?}: {e}, stdout {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        assert_eq!(document["ok"], false, "{args:?}");
+        assert_eq!(document["error"]["code"], expected, "{args:?}");
+        assert_eq!(output.status.code(), Some(exit), "{args:?}");
+    }
+}
+
+/// Applying needs root, and that is checked BEFORE anything is written: a
+/// mutating command that loses permission partway leaves a stack half-changed.
+/// Skipped when the suite happens to run as root, rather than asserting the
+/// opposite and quietly testing nothing.
+#[test]
+fn applying_without_root_is_refused_up_front() {
+    // SAFETY: geteuid cannot fail and touches no memory.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("running as root; the unprivileged refusal cannot be exercised here");
+        return;
+    }
+    let plan = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["login", "plan", "--action", "enable", "--json"])
+        .output()
+        .expect("run irlume");
+    let plan: Value = serde_json::from_slice(&plan.stdout).expect("valid JSON");
+    let plan_id = plan["data"]["plan_id"].as_str().expect("plan_id");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args([
+            "login",
+            "apply",
+            "--action",
+            "enable",
+            "--plan-id",
+            plan_id,
+            "--json",
+        ])
+        .output()
+        .expect("run irlume");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["command"], "login.apply");
+    assert_eq!(document["error"]["code"], "not-authorized");
+    assert_eq!(document["error"]["retryable"], false);
+}

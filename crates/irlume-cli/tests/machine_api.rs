@@ -614,9 +614,17 @@ fn the_transaction_commands_refuse_before_they_write() {
             1,
         ),
     ];
+    // Point the store at an empty directory this test owns. Without it the
+    // answer depends on the machine: a host whose real /var/lib/irlume store
+    // exists but is not readable by this user correctly returns not-authorized
+    // rather than not-found, which is the very distinction this PR added. The
+    // test read the host's state and so passed here and failed on the runner.
+    let store = std::env::temp_dir().join(format!("irlume-tx-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&store).expect("temp store");
     for (args, expected, exit) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
             .args(args)
+            .env("IRLUME_STATE_DIR", &store)
             .output()
             .expect("run irlume");
         let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
@@ -629,6 +637,7 @@ fn the_transaction_commands_refuse_before_they_write() {
         assert_eq!(document["error"]["code"], expected, "{args:?}");
         assert_eq!(output.status.code(), Some(exit), "{args:?}");
     }
+    let _ = std::fs::remove_dir_all(&store);
 }
 
 /// Applying needs root, and that is checked BEFORE anything is written: a

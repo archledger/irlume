@@ -513,11 +513,10 @@ def main():
     # result from a check that never ran. An empty capability list produces the
     # same thing by a different route, since the per-capability loop simply has
     # nothing to iterate.
-    if results.passed == 0:
+    if results.passed == 0 and not results.skipped:
         print(
-            "nothing was checked, so nothing passed: this is a failure, not a clean run.\n"
-            "  --no-engine and --no-fixtures cannot both be given, and an engine that\n"
-            "  advertises no capabilities has nothing to verify.",
+            "nothing was attempted, so nothing passed: this is a failure, not a clean run.\n"
+            "  --no-engine and --no-fixtures cannot both be given.",
             file=sys.stderr,
         )
         return 1

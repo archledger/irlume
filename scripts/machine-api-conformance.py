@@ -39,6 +39,7 @@ CAPABILITY_COMMANDS = {
     "doctor-json": ["doctor", "--json"],
     "profiles-list-json": ["profiles", "list", "--json"],
     "login-status-json": ["login", "status", "--json"],
+    "login-plan-json": ["login", "plan", "--action", "enable", "--json"],
 }
 
 # Streaming capabilities operate the camera, so invoking them here would need

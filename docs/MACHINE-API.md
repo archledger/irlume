@@ -406,6 +406,59 @@ Stream lines validate against `$defs/event` in the schema, not against the
 document root. `schemas/fixtures/v1/auth-test-events.ndjson` is a capture from a
 real engine.
 
+### `irlume login plan --action {enable|disable} --json`
+
+Capability: `login-plan-json`.
+
+The plan phase of a login transaction: what `login enable` or `login disable`
+would change, without changing anything.
+
+```json
+{
+  "plan_id": "c574f96dba23c06bbb2e2f395a74f074",
+  "action": "disable",
+  "changes": [
+    { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true },
+    { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true },
+    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false }
+  ],
+  "writes": 4,
+  "requires_root": true
+}
+```
+
+This runs the identical decision the apply path runs, with writing switched off,
+so a plan cannot describe an outcome the apply would not produce. Reading the PAM
+stack needs no privilege; `requires_root` says whether applying would.
+
+Every surface irlume can wire appears, including absent ones, so a consumer
+reading an id it knows and cannot find learns "this engine does not wire that
+service" rather than "not wired here". Surfaces are named by PAM service, never
+by path, in keeping with the no-paths rule.
+
+`change` is one of `wire`, `materialize-override`, `restore-backup`,
+`remove-override`, `strip-in-place`, `already-correct`, `not-installed`,
+`no-anchor`, `not-wired`. `writes` on a change says whether applying it would
+touch disk, and the top-level `writes` counts them, so "nothing to do" is a fact
+the engine states rather than one a consumer infers from outcome names it may
+not recognise.
+
+`plan_id` is a digest of the action and the exact per-surface outcomes it was
+computed against. Two plans over an unchanged machine share an id; any change to
+what would happen produces a different one. It exists so that a later apply can
+refuse a plan that no longer matches the machine rather than silently doing
+something the consumer never displayed. It is an identifier, not a security
+boundary: apply will re-derive the plan from the machine rather than trusting
+anything the id encodes.
+
+Sudo and polkit are opt-in on the human command and are not included in a plan,
+so a panel never shows a user surfaces they did not ask for. Disabling still
+covers every surface, because turning login off leaves nothing behind.
+
+**Applying a plan is not implemented yet.** `login apply`, `login verify` and
+`login rollback` are not part of contract 1 and must not be inferred from this
+command or from human output.
+
 ## Security and privacy
 
 Ordinary JSON output never includes camera frames, embeddings, templates,
@@ -419,4 +472,5 @@ from human output or the private socket protocol:
 - preview images and cancellation semantics;
 - profile or scan mutation;
 - camera configuration mutation;
-- login plan, apply, verify, or rollback transactions.
+- login apply, verify, or rollback transactions (the read-only plan phase is
+  published above).

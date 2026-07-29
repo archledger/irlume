@@ -833,6 +833,96 @@ pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
     out
 }
 
+/// Which factors this machine's hardware and configured method call for.
+///
+/// Extracted so the human `login enable` report and the machine plan derive
+/// their intent from one place. Two copies of this rule drifting apart would
+/// have the plan promise one thing and the apply do another.
+pub(crate) struct Wants {
+    /// Face releases the login credential only on the Secure (IR) tier.
+    pub(crate) face_login: bool,
+    /// Face verifies the lock screen on any camera.
+    pub(crate) face_lock: bool,
+    /// Fingerprint drives the keyring unlock.
+    pub(crate) fp_keyring: bool,
+}
+
+/// `Auto` follows the hardware; an explicit method overrides it.
+pub(crate) fn wants() -> Wants {
+    let caps = irlume_camera::capabilities();
+    let method = irlume_core::policy::method();
+    let is_fp_method = method.face_disabled(); // Method::Fingerprint
+    let is_face_method = matches!(method, irlume_core::policy::Method::Face);
+    Wants {
+        face_login: caps.ir_pair && !is_fp_method,
+        face_lock: caps.rgb && !is_fp_method,
+        fp_keyring: irlume_fingerprint::available() && !is_face_method,
+    }
+}
+
+/// One surface's planned change, for machine output.
+pub(crate) struct PlannedSurface {
+    pub(crate) id: &'static str,
+    pub(crate) role: &'static str,
+    pub(crate) change: PlannedChange,
+}
+
+/// What `login enable`/`login disable` would change, computed without writing.
+///
+/// This runs the identical decision the apply path runs, with `apply` false, so
+/// the plan cannot describe an outcome the apply would not produce. It reads
+/// PAM files and needs no privilege; only applying does.
+pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<PlannedSurface> {
+    let Wants {
+        face_login,
+        face_lock,
+        fp_keyring,
+    } = wants();
+    let gnome = gnome_shell_major();
+    let mut out = Vec::new();
+    let mut record =
+        |svc: &Svc, role: &'static str, wire: &dyn Fn(&str) -> (String, bool), want: bool| {
+            // A service whose decision cannot even be computed (an unreadable file)
+            // is reported as not-installed rather than omitted: a surface silently
+            // missing from a plan is how a consumer comes to believe it was covered.
+            let change = wire_service(svc, enable && want, false, wire)
+                .map(|outcome| outcome.change)
+                .unwrap_or(PlannedChange::NotInstalled);
+            out.push(PlannedSurface {
+                id: service_name(svc.etc),
+                role,
+                change,
+            });
+        };
+    for s in GREETERS {
+        let prof = dm_profile(s.etc, gnome);
+        let unified_login_lock =
+            s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
+        let face = face_login || (unified_login_lock && face_lock);
+        let greeter_wire = |c: &str| wire_greeter_impl(c, face, fp_keyring, prof.ondemand);
+        record(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
+    }
+    for s in FP_GREETERS {
+        record(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
+    }
+    record(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
+    if sudo_in_scope(enable, with_sudo) {
+        record(
+            &Svc {
+                etc: SUDO,
+                vendor: None,
+            },
+            ROLE_SUDO,
+            &wire_verify_service,
+            true,
+        );
+    }
+    if polkit_in_scope(enable, with_polkit) {
+        record(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
+    }
+    out
+}
+
 /// The active login manager and the PAM services it consults.
 pub(crate) struct LoginManagerFact {
     /// `None` when no login manager could be found at all: a headless host. A
@@ -942,15 +1032,11 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     // factor; on disable everything is unwired.
     let caps = irlume_camera::capabilities();
     let method = irlume_core::policy::method();
-    let is_fp_method = method.face_disabled(); // Method::Fingerprint
-    let is_face_method = matches!(method, irlume_core::policy::Method::Face);
-    let fp_ready = irlume_fingerprint::available();
-    // Face releases the login credential only on the Secure (IR) tier; face
-    // verifies the lock screen on any camera; fingerprint drives the keyring
-    // unlock. `Auto` follows the hardware; an explicit method overrides.
-    let want_face_login = caps.ir_pair && !is_fp_method;
-    let want_face_lock = caps.rgb && !is_fp_method;
-    let want_fp_keyring = fp_ready && !is_face_method;
+    let Wants {
+        face_login: want_face_login,
+        face_lock: want_face_lock,
+        fp_keyring: want_fp_keyring,
+    } = wants();
     if enable {
         match active_display_manager() {
             Some(dm) => println!(
@@ -976,7 +1062,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
             onoff(want_face_lock),
             onoff(want_fp_keyring)
         );
-        if caps.rgb && !caps.ir_pair && !is_fp_method {
+        if caps.rgb && !caps.ir_pair && want_face_lock {
             println!(
                 "  (RGB-only: face satisfies the LOCK SCREEN only; login/sudo keep the password)"
             );
@@ -1113,12 +1199,86 @@ fn polkit_in_scope(enable: bool, with_polkit: bool) -> bool {
 }
 
 /// Wire (or unwire) one service, choosing override-materialize vs edit-in-place.
+/// What wiring a service would do, decided before anything is written.
+///
+/// Named outcomes rather than a rendered sentence, so the human report, the
+/// machine plan and the decision that actually writes all come from one pass.
+/// The alternative is a second implementation of the same rules for machine
+/// callers, and two copies of this logic disagreeing is how a PAM stack ends up
+/// in a state nobody chose.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PlannedChange {
+    /// Create an irlume-owned /etc override from the vendor copy.
+    MaterializeOverride,
+    /// Write irlume lines into the admin's file, taking a backup first.
+    Wire,
+    /// Remove the irlume-owned override, restoring the vendor copy.
+    RemoveOverride,
+    /// Rename the backup back over the live file.
+    RestoreBackup,
+    /// Strip irlume lines in place, preserving edits made since wiring.
+    StripInPlace,
+    /// The file is already exactly as wiring would leave it.
+    AlreadyCorrect,
+    /// This service is not installed on this machine.
+    NotInstalled,
+    /// The file has no anchor line to wire against.
+    NoAnchor,
+    /// Not wired, and unwiring was asked for.
+    NotWired,
+}
+
+impl PlannedChange {
+    /// Whether applying this outcome would write to disk. The plan reports it
+    /// so a consumer can say "3 files change" without interpreting outcome
+    /// names it may not know.
+    pub(crate) fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::MaterializeOverride
+                | Self::Wire
+                | Self::RemoveOverride
+                | Self::RestoreBackup
+                | Self::StripInPlace
+        )
+    }
+
+    /// A stable identifier for machine output. Kebab-case, never derived from
+    /// the human sentence.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::MaterializeOverride => "materialize-override",
+            Self::Wire => "wire",
+            Self::RemoveOverride => "remove-override",
+            Self::RestoreBackup => "restore-backup",
+            Self::StripInPlace => "strip-in-place",
+            Self::AlreadyCorrect => "already-correct",
+            Self::NotInstalled => "not-installed",
+            Self::NoAnchor => "no-anchor",
+            Self::NotWired => "not-wired",
+        }
+    }
+}
+
+/// The decision plus the sentence the human report prints for it.
+pub(crate) struct WireOutcome {
+    pub(crate) change: PlannedChange,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for WireOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 fn wire_service(
     s: &Svc,
     enable: bool,
     apply: bool,
     wire: &dyn Fn(&str) -> (String, bool),
-) -> Result<String, String> {
+) -> Result<WireOutcome, String> {
+    let out = |change: PlannedChange, message: String| Ok(WireOutcome { change, message });
     let etc = Path::new(s.etc);
     // vendor-only service with no admin /etc copy → override strategy.
     let use_override = s.vendor.is_some() && (!etc.exists() || file_is_created_override(etc));
@@ -1130,7 +1290,10 @@ fn wire_service(
         if use_override {
             let vendor = s.vendor.unwrap();
             if !Path::new(vendor).exists() {
-                return Ok(format!("· {}: not installed (skipped)", s.etc));
+                return out(
+                    PlannedChange::NotInstalled,
+                    format!("· {}: not installed (skipped)", s.etc),
+                );
             }
             let (base, _) = unwire_lines(&read(vendor)?);
             let (wired, _) = wire(&base);
@@ -1138,15 +1301,24 @@ fn wire_service(
                 "{CREATED_PREFIX}{vendor}; delete this file to restore the vendor copy\n{wired}"
             );
             if etc.exists() && read(s.etc).ok().as_deref() == Some(body.as_str()) {
-                return Ok(format!("· {}: already correctly wired", s.etc));
+                return out(
+                    PlannedChange::AlreadyCorrect,
+                    format!("· {}: already correctly wired", s.etc),
+                );
             }
             if apply {
                 write_atomic(etc, &body)?;
             }
-            Ok(format!("✓ {}: materialized override from {vendor}", s.etc))
+            out(
+                PlannedChange::MaterializeOverride,
+                format!("✓ {}: materialized override from {vendor}", s.etc),
+            )
         } else {
             if !etc.exists() {
-                return Ok(format!("· {}: not installed (skipped)", s.etc));
+                return out(
+                    PlannedChange::NotInstalled,
+                    format!("· {}: not installed (skipped)", s.etc),
+                );
             }
             let current = read(s.etc)?;
             // Rebuild from the pristine stock: the backup if we've wired before,
@@ -1160,16 +1332,25 @@ fn wire_service(
             let (base, _) = unwire_lines(&origin);
             let (wired, changed) = wire(&base);
             if !changed {
-                return Ok(format!("· {}: no anchor to wire (skipped)", s.etc));
+                return out(
+                    PlannedChange::NoAnchor,
+                    format!("· {}: no anchor to wire (skipped)", s.etc),
+                );
             }
             if wired == current {
-                return Ok(format!("· {}: already correctly wired", s.etc));
+                return out(
+                    PlannedChange::AlreadyCorrect,
+                    format!("· {}: already correctly wired", s.etc),
+                );
             }
             if apply {
                 backup(etc)?;
                 write_atomic(etc, &wired)?;
             }
-            Ok(format!("✓ {}: wired (backup {}{})", s.etc, s.etc, BACKUP))
+            out(
+                PlannedChange::Wire,
+                format!("✓ {}: wired (backup {}{})", s.etc, s.etc, BACKUP),
+            )
         }
     } else {
         // disable / unwire
@@ -1177,7 +1358,10 @@ fn wire_service(
             if apply {
                 std::fs::remove_file(etc).map_err(|e| format!("rm {}: {e}", s.etc))?;
             }
-            Ok(format!("✓ {}: removed override (vendor restored)", s.etc))
+            out(
+                PlannedChange::RemoveOverride,
+                format!("✓ {}: removed override (vendor restored)", s.etc),
+            )
         } else if !use_override && etc.exists() {
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
             if bak.exists() {
@@ -1194,24 +1378,30 @@ fn wire_service(
                         std::fs::rename(&bak, etc)
                             .map_err(|e| format!("restore {}: {e}", s.etc))?;
                     }
-                    Ok(format!("✓ {}: restored from backup", s.etc))
+                    out(
+                        PlannedChange::RestoreBackup,
+                        format!("✓ {}: restored from backup", s.etc),
+                    )
                 } else {
                     if apply {
                         write_atomic(etc, &stripped)?;
                     }
-                    Ok(format!("✓ {}: stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
+                    out(PlannedChange::StripInPlace, format!("✓ {}: stripped irlume lines (file changed since wiring; backup kept at {}{})", s.etc, s.etc, BACKUP))
                 }
             } else if file_has_module(etc) {
                 let (clean, _) = unwire_lines(&read(s.etc)?);
                 if apply {
                     write_atomic(etc, &clean)?;
                 }
-                Ok(format!("✓ {}: stripped irlume lines", s.etc))
+                out(
+                    PlannedChange::StripInPlace,
+                    format!("✓ {}: stripped irlume lines", s.etc),
+                )
             } else {
-                Ok(format!("· {}: not wired", s.etc))
+                out(PlannedChange::NotWired, format!("· {}: not wired", s.etc))
             }
         } else {
-            Ok(format!("· {}: not wired", s.etc))
+            out(PlannedChange::NotWired, format!("· {}: not wired", s.etc))
         }
     }
 }
@@ -2058,7 +2248,7 @@ mod tests {
             vendor: None,
         };
         let msg = wire_service(&svc, false, true, &wire_verify_service).unwrap();
-        assert!(msg.contains("stripped irlume lines"), "{msg}");
+        assert!(msg.message.contains("stripped irlume lines"), "{msg}");
         let after = std::fs::read_to_string(&etc).unwrap();
         assert!(
             after.contains(admin_line),
@@ -2086,7 +2276,7 @@ mod tests {
             vendor: None,
         };
         let msg = wire_service(&svc, false, true, &wire_verify_service).unwrap();
-        assert!(msg.contains("restored from backup"), "{msg}");
+        assert!(msg.message.contains("restored from backup"), "{msg}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), SUDO_STOCK);
         assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
     }
@@ -2528,7 +2718,7 @@ mod tests {
 
         // First enable → materialize the override from the vendor copy.
         let msg = wire_service(&svc, true, true, &wire).unwrap();
-        assert!(msg.contains("materialized override from"), "{msg}");
+        assert!(msg.message.contains("materialized override from"), "{msg}");
         assert!(etc.exists());
         let body = std::fs::read_to_string(&etc).unwrap();
         assert!(body.starts_with(CREATED_PREFIX));
@@ -2537,11 +2727,11 @@ mod tests {
 
         // Re-enable with the same inputs → recognised as already correct.
         let msg2 = wire_service(&svc, true, true, &wire).unwrap();
-        assert!(msg2.contains("already correctly wired"), "{msg2}");
+        assert!(msg2.message.contains("already correctly wired"), "{msg2}");
 
         // Disable → the created override is removed and the vendor copy restored.
         let msg3 = wire_service(&svc, false, true, &wire).unwrap();
-        assert!(msg3.contains("removed override"), "{msg3}");
+        assert!(msg3.message.contains("removed override"), "{msg3}");
         assert!(!etc.exists());
     }
 
@@ -2556,7 +2746,7 @@ mod tests {
         };
         let wire = |c: &str| wire_greeter_impl(c, true, false, true);
         let msg = wire_service(&svc, true, true, &wire).unwrap();
-        assert!(msg.contains("not installed (skipped)"), "{msg}");
+        assert!(msg.message.contains("not installed (skipped)"), "{msg}");
         assert!(!etc.exists());
     }
 
@@ -2572,7 +2762,7 @@ mod tests {
             vendor: None,
         };
         let msg = wire_service(&svc, true, true, &wire).unwrap();
-        assert!(msg.contains("not installed (skipped)"), "{msg}");
+        assert!(msg.message.contains("not installed (skipped)"), "{msg}");
 
         // Present but nothing to anchor to → skipped, no backup left behind.
         let dir2 = TestDir::new("wsvc-noanchor");
@@ -2583,7 +2773,7 @@ mod tests {
             vendor: None,
         };
         let msg2 = wire_service(&svc2, true, true, &wire).unwrap();
-        assert!(msg2.contains("no anchor to wire"), "{msg2}");
+        assert!(msg2.message.contains("no anchor to wire"), "{msg2}");
         assert!(!dir2.0.join(format!("greeter{BACKUP}")).exists());
     }
 
@@ -2599,14 +2789,14 @@ mod tests {
         let wire = |c: &str| wire_greeter_impl(c, true, true, false);
 
         let msg = wire_service(&svc, true, true, &wire).unwrap();
-        assert!(msg.contains("wired (backup"), "{msg}");
+        assert!(msg.message.contains("wired (backup"), "{msg}");
         assert!(dir.0.join(format!("gdm-password{BACKUP}")).exists());
         let after = std::fs::read_to_string(&etc).unwrap();
         assert!(content_has_module(&after));
 
         // Second identical enable is a recognised no-op (rebuilt from backup).
         let msg2 = wire_service(&svc, true, true, &wire).unwrap();
-        assert!(msg2.contains("already correctly wired"), "{msg2}");
+        assert!(msg2.message.contains("already correctly wired"), "{msg2}");
     }
 
     #[test]
@@ -2622,8 +2812,8 @@ mod tests {
         };
         let wire = |c: &str| wire_greeter_impl(c, true, true, false);
         let msg = wire_service(&svc, false, true, &wire).unwrap();
-        assert!(msg.contains("stripped irlume lines"), "{msg}");
-        assert!(!msg.contains("backup kept")); // the no-backup phrasing
+        assert!(msg.message.contains("stripped irlume lines"), "{msg}");
+        assert!(!msg.message.contains("backup kept")); // the no-backup phrasing
         let after = std::fs::read_to_string(&etc).unwrap();
         assert!(!content_has_module(&after));
     }
@@ -2639,6 +2829,6 @@ mod tests {
         };
         let wire = |c: &str| wire_greeter_impl(c, true, true, false);
         let msg = wire_service(&svc, false, true, &wire).unwrap();
-        assert!(msg.contains("not wired"), "{msg}");
+        assert!(msg.message.contains("not wired"), "{msg}");
     }
 }

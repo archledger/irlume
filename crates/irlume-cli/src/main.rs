@@ -139,6 +139,10 @@ fn main() -> std::process::ExitCode {
         {
             machine::login_status(&args)
         }
+        // `login plan` exists only as a machine command: it is the read-only
+        // phase of a login transaction, and the human equivalent is the dry run
+        // `login enable` already prints.
+        (Some("login"), _) if args.iter().any(|a| a == "plan") => machine::login_plan(&args),
         // `auth test` exists only as a machine command, so it routes here
         // whatever flags follow and answers a bad invocation with a JSON
         // usage-error rather than prose. Bare `auth` still falls through to the

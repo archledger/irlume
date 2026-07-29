@@ -34,6 +34,7 @@ const CAPABILITIES: &[&str] = &[
     "doctor-json",
     "login-status-json",
     "auth-test-events",
+    "login-plan-json",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -598,6 +599,138 @@ pub fn login_status(args: &[String]) -> ExitCode {
     )
 }
 
+/// `irlume login plan --json`: what `login enable` or `login disable` would
+/// change, without changing anything.
+///
+/// The plan phase of a login transaction. It runs the identical decision the
+/// apply path runs, with writing switched off, so a plan cannot describe an
+/// outcome the apply would not produce. Reading PAM files needs no privilege;
+/// `requires_root` says that applying does.
+///
+/// `plan_id` is a digest of the intended action and the state the plan was
+/// computed against. It exists so that a later apply can refuse a plan that no
+/// longer matches the machine, rather than silently doing something the
+/// consumer never displayed. Apply is not implemented yet, so nothing consumes
+/// the id; publishing it now means the identifier a consumer stores today is
+/// the one apply will check tomorrow.
+pub fn login_plan(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.plan";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some(action) = valid_login_plan_args(args) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    let enable = action == "enable";
+    // Sudo and polkit are opt-in on the human command and stay opt-in here, so
+    // a plan a panel shows never quietly includes surfaces the user did not ask
+    // for. Both default off.
+    let planned = crate::pamwire::plan(enable, false, false);
+    let changes: Vec<Value> = planned
+        .iter()
+        .map(|surface| {
+            json!({
+                "surface": surface.id,
+                "role": surface.role,
+                "change": surface.change.id(),
+                "writes": surface.change.writes(),
+            })
+        })
+        .collect();
+    let writes = planned.iter().filter(|s| s.change.writes()).count();
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "plan_id": plan_id(action, &planned),
+                "action": action,
+                "changes": changes,
+                // Counted here rather than left to the consumer, so "nothing to
+                // do" is a fact the engine states instead of one a panel infers
+                // from change names it may not recognise.
+                "writes": writes,
+                "requires_root": writes > 0,
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+/// A digest of the action and the exact per-surface outcomes it was computed
+/// against.
+///
+/// Deliberately covers the outcomes rather than a timestamp or a counter: two
+/// plans over an unchanged machine share an id, and any change to what would
+/// happen produces a different one. That is the property an apply needs to
+/// decide whether the plan it was handed still describes this machine.
+fn plan_id(action: &str, planned: &[crate::pamwire::PlannedSurface]) -> String {
+    let mut material = String::from(action);
+    for surface in planned {
+        material.push('\n');
+        material.push_str(surface.id);
+        material.push(' ');
+        material.push_str(surface.change.id());
+    }
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(material.as_bytes());
+    // Half the digest. This identifies a plan for a consumer to hand back; it
+    // is not a security boundary, and apply re-derives the plan from the
+    // machine rather than trusting anything the id encodes.
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+fn valid_login_plan_args(args: &[String]) -> Option<&'static str> {
+    if args.first().map(String::as_str) != Some("login")
+        || args.get(1).map(String::as_str) != Some("plan")
+    {
+        return None;
+    }
+    let mut action: Option<&'static str> = None;
+    let mut saw_json = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--action" if action.is_none() => {
+                action = match args.get(index + 1).map(String::as_str) {
+                    Some("enable") => Some("enable"),
+                    Some("disable") => Some("disable"),
+                    _ => return None,
+                };
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    // Both required: a plan with no stated action would have to guess whether
+    // the consumer meant to turn login on or off.
+    if saw_json {
+        action
+    } else {
+        None
+    }
+}
+
 /// An exclusive per-user session, held for as long as the guard lives.
 ///
 /// The contract promises one session per user. That is enforced with an
@@ -1026,7 +1159,8 @@ mod tests {
                 "status-json",
                 "doctor-json",
                 "login-status-json",
-                "auth-test-events"
+                "auth-test-events",
+                "login-plan-json"
             ])
         );
         assert!(document.get("error").is_none());
@@ -1115,6 +1249,110 @@ mod tests {
         assert_eq!(auth_reason(true, false), "granted");
         assert_eq!(auth_reason(false, false), "not-live");
         assert_eq!(auth_reason(false, true), "no-match");
+    }
+
+    #[test]
+    fn login_plan_requires_both_json_and_a_known_action() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        assert_eq!(
+            valid_login_plan_args(&a(&["login", "plan", "--action", "enable", "--json"])),
+            Some("enable")
+        );
+        assert_eq!(
+            valid_login_plan_args(&a(&["login", "plan", "--json", "--action", "disable"])),
+            Some("disable")
+        );
+        // An action is mandatory: guessing whether the consumer meant on or off
+        // is the one thing a plan must never do.
+        assert_eq!(
+            valid_login_plan_args(&a(&["login", "plan", "--json"])),
+            None
+        );
+        assert_eq!(
+            valid_login_plan_args(&a(&["login", "plan", "--action", "enable"])),
+            None
+        );
+        for bad in [
+            vec!["login", "plan", "--action", "wat", "--json"],
+            vec!["login", "plan", "--action", "--json"],
+            vec!["login", "plan", "--action", "enable", "--json", "--json"],
+            vec![
+                "login", "plan", "--action", "enable", "--action", "disable", "--json",
+            ],
+            vec!["login", "plan", "--action", "enable", "--json", "--wat"],
+        ] {
+            assert_eq!(valid_login_plan_args(&a(&bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_plan_id_covers_the_action_and_the_outcomes() {
+        use crate::pamwire::{PlannedChange, PlannedSurface};
+        let surfaces = |change| {
+            vec![PlannedSurface {
+                id: "plasmalogin",
+                role: "login-screen",
+                change,
+            }]
+        };
+        let base = plan_id("enable", &surfaces(PlannedChange::Wire));
+        // Same machine, same intent: the same id, so a consumer can tell that
+        // nothing moved between showing a plan and acting on it.
+        assert_eq!(base, plan_id("enable", &surfaces(PlannedChange::Wire)));
+        // A different intent over identical state is a different plan.
+        assert_ne!(base, plan_id("disable", &surfaces(PlannedChange::Wire)));
+        // The same intent over changed state is a different plan. This is the
+        // property that lets a later apply refuse a stale one.
+        assert_ne!(
+            base,
+            plan_id("enable", &surfaces(PlannedChange::AlreadyCorrect))
+        );
+        assert_eq!(base.len(), 32);
+    }
+
+    #[test]
+    fn a_change_that_writes_is_named_as_one() {
+        use crate::pamwire::PlannedChange;
+        // requires_root is derived from these, so a new outcome landing on the
+        // wrong side would tell a panel it needs no privilege when it does.
+        for change in [
+            PlannedChange::MaterializeOverride,
+            PlannedChange::Wire,
+            PlannedChange::RemoveOverride,
+            PlannedChange::RestoreBackup,
+            PlannedChange::StripInPlace,
+        ] {
+            assert!(change.writes(), "{change:?} writes to disk");
+        }
+        for change in [
+            PlannedChange::AlreadyCorrect,
+            PlannedChange::NotInstalled,
+            PlannedChange::NoAnchor,
+            PlannedChange::NotWired,
+        ] {
+            assert!(!change.writes(), "{change:?} does not write");
+        }
+    }
+
+    #[test]
+    fn every_planned_change_has_a_distinct_stable_id() {
+        use crate::pamwire::PlannedChange;
+        let all = [
+            PlannedChange::MaterializeOverride,
+            PlannedChange::Wire,
+            PlannedChange::RemoveOverride,
+            PlannedChange::RestoreBackup,
+            PlannedChange::StripInPlace,
+            PlannedChange::AlreadyCorrect,
+            PlannedChange::NotInstalled,
+            PlannedChange::NoAnchor,
+            PlannedChange::NotWired,
+        ];
+        let ids: std::collections::BTreeSet<&str> = all.iter().map(|c| c.id()).collect();
+        assert_eq!(ids.len(), all.len(), "two outcomes share a published id");
+        for id in ids {
+            assert!(!id.is_empty() && id.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+        }
     }
 
     #[test]

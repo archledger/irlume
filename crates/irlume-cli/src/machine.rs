@@ -894,7 +894,34 @@ fn rollback_restore(
             surface.before.as_deref(),
             metadata,
         ) {
-            Ok(()) => restored.push(surface.id.clone()),
+            Ok(()) => {
+                // The backup is put back with its surface. Leaving a stale one
+                // behind is not inert: a later enable rebuilds from it as the
+                // origin, so it would silently discard an administrator's edits.
+                if let Some(sidecar) = &surface.sidecar {
+                    let sidecar_metadata = match (sidecar.mode, sidecar.uid, sidecar.gid) {
+                        (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
+                        _ => None,
+                    };
+                    if let Err(message) = crate::pamwire::restore_surface(
+                        std::path::Path::new(&sidecar.path),
+                        sidecar.before.as_deref(),
+                        sidecar_metadata,
+                    ) {
+                        irlume_common::dlog!("{command}: {} backup failed: {message}", surface.id);
+                        return emit_with_extra(
+                            &failure(command, "operation-failed", false, contract),
+                            json!({
+                                "transaction_id": record.id,
+                                "restored": restored,
+                                "stopped_at": surface.id,
+                            }),
+                            ExitCode::FAILURE,
+                        );
+                    }
+                }
+                restored.push(surface.id.clone());
+            }
             Err(message) => {
                 irlume_common::dlog!("{command}: {} failed: {message}", surface.id);
                 // What was already restored travels in the document, because
@@ -1028,6 +1055,17 @@ pub fn login_apply(args: &[String]) -> ExitCode {
                 mode: surface.before_metadata.map(|(mode, _, _)| mode),
                 uid: surface.before_metadata.map(|(_, uid, _)| uid),
                 gid: surface.before_metadata.map(|(_, _, gid)| gid),
+                // Recorded only when there was a backup to speak of, so a
+                // surface irlume never wired carries no sidecar at all.
+                sidecar: (surface.sidecar_existed || surface.sidecar_before.is_some()).then(|| {
+                    crate::logintx::SidecarRecord {
+                        path: format!("{}{}", surface.path, crate::pamwire::BACKUP),
+                        before: surface.sidecar_before.clone(),
+                        mode: surface.sidecar_metadata.map(|(mode, _, _)| mode),
+                        uid: surface.sidecar_metadata.map(|(_, uid, _)| uid),
+                        gid: surface.sidecar_metadata.map(|(_, _, gid)| gid),
+                    }
+                }),
             })
             .collect::<Vec<_>>()
     };
@@ -1886,6 +1924,7 @@ mod tests {
                     mode: None,
                     uid: None,
                     gid: None,
+                    sidecar: None,
                 })
                 .collect(),
         }

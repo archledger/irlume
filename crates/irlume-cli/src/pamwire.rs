@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const MODULE: &str = "pam_irlume.so";
-const BACKUP: &str = ".pre-irlume";
+pub(crate) const BACKUP: &str = ".pre-irlume";
 const CREATED_PREFIX: &str = "# irlume: created from ";
 /// The one sentence that explains the on-demand trigger; shared so the status
 /// line, the plan line, and docs/SETUP.md's mirror never drift apart.
@@ -975,6 +975,13 @@ pub(crate) struct AppliedSurface {
     /// Mode, uid and gid before the change. Content alone does not describe a
     /// file, and these cannot be recovered later once it has been rewritten.
     pub(crate) before_metadata: Option<(u32, u32, u32)>,
+    /// The `.pre-irlume` backup as it stood before the change, since wiring
+    /// creates one and unwiring consumes one.
+    pub(crate) sidecar_before: Option<String>,
+    pub(crate) sidecar_metadata: Option<(u32, u32, u32)>,
+    /// Whether the backup existed at all beforehand. Distinguishes "was absent,
+    /// remove it on rollback" from "was present and empty".
+    pub(crate) sidecar_existed: bool,
     pub(crate) after_sha256: String,
     /// Set when this surface failed. The apply as a whole is reported as failed,
     /// and the surfaces that DID change are still recorded, so a rollback can
@@ -997,6 +1004,12 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
         &mut |svc, role, wire, want| {
             let path = Path::new(svc.etc);
             let before_metadata = crate::logintx::file_metadata(path);
+            // Wiring creates this and unwiring renames it away, so it is part of
+            // what the transaction changed.
+            let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
+            let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
+            let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
+            let sidecar_existed = sidecar_path.exists();
             let (before, error) = match std::fs::read_to_string(path) {
                 Ok(content) => (Some(content), None),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
@@ -1020,6 +1033,9 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
                 change,
                 before,
                 before_metadata,
+                sidecar_before,
+                sidecar_metadata,
+                sidecar_existed,
                 // Not written yet, so there is no after-state. A record in this
                 // condition is recognisable by its `prepared` status.
                 after_sha256: crate::logintx::ABSENT.to_string(),
@@ -1070,6 +1086,9 @@ pub(crate) fn apply(
                         change: PlannedChange::NotInstalled,
                         before: None,
                         before_metadata: None,
+                        sidecar_before: None,
+                        sidecar_metadata: None,
+                        sidecar_existed: false,
                         after_sha256: crate::logintx::ABSENT.to_string(),
                         error: Some(format!(
                             "{} changed between the plan and the write; not touched",
@@ -1084,6 +1103,12 @@ pub(crate) fn apply(
             // `before: None`, and a later rollback would then DELETE a file it
             // never captured. Only a genuine NotFound may become None.
             let before_metadata = crate::logintx::file_metadata(path);
+            // Wiring creates this and unwiring renames it away, so it is part of
+            // what the transaction changed.
+            let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
+            let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
+            let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
+            let sidecar_existed = sidecar_path.exists();
             let (before, mut read_error) = match std::fs::read_to_string(path) {
                 Ok(content) => (Some(content), None),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
@@ -1105,6 +1130,9 @@ pub(crate) fn apply(
                     change: PlannedChange::NotInstalled,
                     before: None,
                     before_metadata: None,
+                    sidecar_before: None,
+                    sidecar_metadata: None,
+                    sidecar_existed: false,
                     after_sha256: crate::logintx::ABSENT.to_string(),
                     error: Some(message),
                 });
@@ -1139,6 +1167,9 @@ pub(crate) fn apply(
                 change,
                 before,
                 before_metadata,
+                sidecar_before,
+                sidecar_metadata,
+                sidecar_existed,
                 after_sha256,
                 error,
             });

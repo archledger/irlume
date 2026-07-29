@@ -76,6 +76,30 @@ pub(crate) struct SurfaceRecord {
     pub(crate) uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gid: Option<u32>,
+    /// The `.pre-irlume` backup, when apply created or consumed one.
+    ///
+    /// Wiring creates a backup and unwiring renames it back over the live file,
+    /// so both change a second path the record would otherwise never mention.
+    /// An undo that does not know about a file cannot undo it, and the leftover
+    /// is not inert: a later enable rebuilds from the backup as its origin, so a
+    /// stale one silently discards whatever an administrator changed in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sidecar: Option<SidecarRecord>,
+}
+
+/// A file changed alongside a surface, restored with it and never published.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SidecarRecord {
+    pub(crate) path: String,
+    /// `None` when it did not exist, so a rollback removes it rather than
+    /// leaving one behind for a later enable to trust.
+    pub(crate) before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gid: Option<u32>,
 }
 
 /// A file's ownership and permission bits, or `None` when it does not exist.
@@ -296,6 +320,7 @@ mod tests {
             mode: None,
             uid: None,
             gid: None,
+            sidecar: None,
         }
     }
 

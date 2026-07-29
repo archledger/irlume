@@ -9,8 +9,27 @@ name: SLSA release provenance
 on:
   release:
     types: [published]
+  # A release is published BEFORE its assets are uploaded: they are built and
+  # GPG-signed off-CI, and GitHub has no asset-upload event. So the automatic
+  # run always fires against a release with nothing on it, goes green having
+  # attested nothing, and there was no way to ask for it again. Provenance for
+  # every release published so far is therefore missing. The tag is REQUIRED,
+  # matching verify-release: a dispatch carries no release context, so
+  # github.ref_name would be the branch and the download would look for a
+  # release called `main`.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attest (e.g. v0.7.1), after its assets are uploaded"
+        required: true
+        type: string
 
 permissions: read-all
+
+env:
+  # The one place the tag is resolved. Every step reads this rather than
+  # github.ref_name, which is only correct on the release trigger.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # Collect the sha256 of the release's distributable artifacts into the
@@ -19,7 +38,7 @@ jobs:
     # Version releases only. The model-weights release (`models-v1`) carries
     # .onnx files and no packages, so it has nothing for this workflow to
     # attest; it used to run anyway and fail in the generator's final step.
-    if: startsWith(github.ref_name, 'v')
+    if: startsWith(inputs.tag || github.ref_name, 'v')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -45,11 +64,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p assets
-          count=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets | length')
+          count=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.assets | length')
           if [ "$count" -gt 0 ]; then
-            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir assets
           else
-            echo "::notice::release $GITHUB_REF_NAME has no assets yet"
+            echo "::notice::release $RELEASE_TAG has no assets yet"
           fi
       - name: Base64 subjects for the deb + rpm
         id: hash

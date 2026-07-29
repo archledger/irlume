@@ -83,6 +83,7 @@ echo "=== 4/5 wire plasmalogin greeter (face → KWallet unlock) ==="
 if [[ -f "$PAM_GREETER" ]] && grep -q "pam_irlume.so unseal" "$PAM_GREETER"; then
     echo "    already wired; skipping"
 else
+    staged=$(mktemp)
     {
         echo "$MARKER"
         awk '
@@ -115,8 +116,26 @@ else
             }
             { print }
         ' "$VENDOR_GREETER"
-    } > "$PAM_GREETER"
-    chmod 644 "$PAM_GREETER"
+    } > "$staged"
+
+    # Both transforms above are anchored to a specific vendor line. If neither
+    # anchor is present, awk copies the file through unchanged and every
+    # variable stays unset, so the result is a PAM file carrying the marker and
+    # NO face line, written over the live stack and reported as success. Staging
+    # first means a stack that could not be wired is never written at all,
+    # rather than written wrong and then detected.
+    missing=()
+    grep -q "pam_irlume.so unseal" "$staged" || missing+=("auth unseal")
+    grep -q "^auth[[:space:]]*optional[[:space:]]*pam_irlume.so reseal" "$staged" || missing+=("auth reseal")
+    grep -q "^session[[:space:]]*optional[[:space:]]*pam_irlume.so reseal" "$staged" || missing+=("session reseal")
+    if (( ${#missing[@]} )); then
+        echo "    ERROR: $VENDOR_GREETER has no anchor for: ${missing[*]}" >&2
+        echo "    $PAM_GREETER left untouched; nothing was written." >&2
+        rm -f "$staged"
+        exit 1
+    fi
+    install -m 644 "$staged" "$PAM_GREETER"
+    rm -f "$staged"
     echo "    wrote $PAM_GREETER:"
     grep -nE "pam_irlume|password-auth|kwallet|gnome_keyring" "$PAM_GREETER" | sed 's/^/      /'
 fi

@@ -74,7 +74,18 @@ def analyze_log(log_path):
     if overlaps:
         print(f"average overlap:    {sum(overlaps) / len(overlaps):.2f}ms")
         print(f"average sequential: {sum(sequentials) / len(sequentials):.2f}ms")
-    return 0
+        return 0
+    # This report exists to compare RGB against IR, and zip() over an empty
+    # side iterates zero times, so a log with samples from only one spectrum
+    # produced no pair at all and still exited 0. The earlier guard used AND, so
+    # it only caught a log with nothing in it. Producing no pair statistics is
+    # the failure this is asked to detect, whichever side is missing.
+    print(
+        f"no pairs to compare: {len(rgb_times)} rgb and {len(ir_times)} ir samples, "
+        "so no overlap or sequential figure was produced",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

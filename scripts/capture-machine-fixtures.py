@@ -30,6 +30,33 @@ import sys
 
 UNREACHABLE_SOCKET = "/nonexistent/irlume-fixture-capture.sock"
 
+# What each fixture is supposed to be: "ok", or the error code it must carry.
+# Kept beside the capture list rather than derived from it, so a command that
+# starts failing is caught instead of quietly redefining the fixture.
+# Field values a fixture must carry to be the fixture it claims to be. Without
+# this, status-daemon-unreachable.json and status-daemon-running.json are both
+# just "an ok status document" and a capture run with the daemon up would
+# silently record two identical fixtures.
+REQUIRED_FIELDS = {
+    "status-daemon-running.json": [(("data", "daemon"), "running")],
+    "status-daemon-unreachable.json": [(("data", "daemon"), "unreachable")],
+}
+
+EXPECTED = {
+    "version.json": "ok",
+    "status-daemon-running.json": "ok",
+    # status reports daemon state as data rather than failing, so this is an
+    # ok document. What distinguishes it from status-daemon-running.json is
+    # data.daemon, asserted below.
+    "status-daemon-unreachable.json": "ok",
+    "doctor.json": "ok",
+    "login-status.json": "ok",
+    "profiles-list.json": "ok",
+    "error-daemon-unavailable.json": "daemon-unavailable",
+    "error-unsupported-contract.json": "unsupported-contract",
+    "error-usage-error.json": "usage-error",
+}
+
 
 def run(binary, argv, env_extra=None):
     env = dict(os.environ)
@@ -38,7 +65,11 @@ def run(binary, argv, env_extra=None):
     proc = subprocess.run([binary] + argv, capture_output=True, text=True, env=env, timeout=180)
     if proc.stderr:
         print(f"warning: {' '.join(argv)} wrote to stderr: {proc.stderr.strip()}", file=sys.stderr)
-    return proc.stdout
+    # The exit status is returned, not dropped. A fixture is a claim about what
+    # this engine writes, and a capture that silently recorded a failed command
+    # would make the conformance suite validate against a document the engine
+    # only produces when something is wrong.
+    return proc
 
 
 def redact_profiles(raw):
@@ -82,16 +113,56 @@ def main():
         ("error-usage-error.json", ["version", "--json", "--no-such-flag"], None, None),
     ]
 
+    failures = []
     for name, argv, env_extra, transform in captures:
-        raw = run(args.irlume, argv, env_extra)
+        proc = run(args.irlume, argv, env_extra)
+        raw = proc.stdout
+        expected = EXPECTED[name]
+        try:
+            document = json.loads(raw)
+        except json.JSONDecodeError as error:
+            failures.append(f"{name}: output is not JSON ({error}); fixture NOT written")
+            continue
+        # What the fixture is supposed to be, asserted before it is written.
+        # Valid JSON is not enough: an error document is valid JSON, and
+        # overwriting an ok fixture with one would leave the conformance suite
+        # validating the wrong shape while still reporting success.
+        actual = "ok" if document.get("ok") else document.get("error", {}).get("code")
+        if actual != expected:
+            failures.append(
+                f"{name}: expected {expected!r}, got {actual!r}; fixture NOT written"
+            )
+            continue
+        # An ok document must come from a command that succeeded, and an error
+        # document from one that did not.
+        if (expected == "ok") != (proc.returncode == 0):
+            failures.append(
+                f"{name}: {expected!r} document with exit {proc.returncode}; fixture NOT written"
+            )
+            continue
+        mismatched = None
+        for path_parts, want in REQUIRED_FIELDS.get(name, []):
+            node = document
+            for part in path_parts:
+                node = node.get(part) if isinstance(node, dict) else None
+            if node != want:
+                mismatched = f"{'.'.join(path_parts)} is {node!r}, expected {want!r}"
+                break
+        if mismatched:
+            failures.append(f"{name}: {mismatched}; fixture NOT written")
+            continue
         if transform is not None:
             raw = transform(raw)
         path = os.path.join(args.out, name)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(raw)
-        document = json.loads(raw)
-        state = "ok" if document.get("ok") else document.get("error", {}).get("code")
-        print(f"{name}: {document.get('command')} ({state})")
+        print(f"{name}: {document.get('command')} ({actual})")
+
+    if failures:
+        print("\nnot captured:", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
 
     print(
         "\nCaptured. Read the diff before committing: a fixture is a claim about "

@@ -254,6 +254,15 @@ def check_engine(results, binary, validate, validate_note):
 
     data = document.get("data", {})
     capabilities = data.get("capabilities", [])
+    # An engine that advertises nothing gives the per-capability loop below
+    # nothing to iterate, so every capability check silently does not happen and
+    # the run still ends green. Contract 1 requires version-json at minimum, so
+    # an empty list is a broken engine rather than a modest one.
+    if not capabilities:
+        results.fail(
+            "advertised capabilities",
+            "the engine advertises no capabilities, so no capability was checked",
+        )
     versions = data.get("contract_versions", {})
     if versions.get("min", 0) <= CONTRACT <= versions.get("max", 0):
         results.ok(f"engine speaks contract {CONTRACT} (range {versions.get('min')}-{versions.get('max')})")
@@ -497,6 +506,20 @@ def main():
         print("failures:")
         for what, detail in results.failed:
             print(f"  {what}: {detail}")
+        return 1
+    # A run that checked nothing is not a pass. `--no-engine --no-fixtures`
+    # disables both halves and used to print "0 passed, 0 failed" and exit 0,
+    # which is the exact shape this script exists to catch elsewhere: a green
+    # result from a check that never ran. An empty capability list produces the
+    # same thing by a different route, since the per-capability loop simply has
+    # nothing to iterate.
+    if results.passed == 0:
+        print(
+            "nothing was checked, so nothing passed: this is a failure, not a clean run.\n"
+            "  --no-engine and --no-fixtures cannot both be given, and an engine that\n"
+            "  advertises no capabilities has nothing to verify.",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

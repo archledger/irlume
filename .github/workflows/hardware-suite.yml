@@ -93,10 +93,25 @@ jobs:
             echo "::error::irlume doctor failed — not a clean camera-absent skip"
             cat "$doc"; exit 1
           fi
+          # An empty result has two very different causes, and reading both as
+          # "no camera" turned a classifier or doctor-format regression into a
+          # clean skip on the ONLY lane with a real camera. Tell them apart by
+          # asking whether doctor classified ANY node: none at all is a genuine
+          # absent-camera skip, while nodes present with no Ir among them is a
+          # regression on a runner that is supposed to have one.
+          if ! grep -q "camera nodes (classified by pixel format)" "$doc"; then
+            echo "::error::doctor produced no camera-nodes section — its output format changed"
+            cat "$doc"; exit 1
+          fi
+          nodes=$(awk '/camera nodes \(classified by pixel format\)/{f=1;next} f&&/^  \/dev\//{n++} f&&!/^  /{f=0} END{print n+0}' "$doc")
           ir=$(awk -F: '/: Ir$/{print $1}' "$doc" | tr -d " " | head -1)
           if [ -z "$ir" ]; then
-            echo "::notice::no IR camera present — camera stage skipped (borrowed for the OS bench?)"
-            exit 0
+            if [ "$nodes" -eq 0 ]; then
+              echo "::notice::no camera nodes at all — camera stage skipped (borrowed for the OS bench?)"
+              exit 0
+            fi
+            echo "::error::doctor classified $nodes camera node(s) but none as Ir on a runner that has one"
+            cat "$doc"; exit 1
           fi
           echo "IR node: $ir"
           out=$(mktemp -d)

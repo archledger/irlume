@@ -407,7 +407,14 @@ def check_stream_fixtures(results, fixtures_dir, validate, validate_note):
         if terminals.count(True) != 1 or not terminals[-1]:
             results.fail(what, "exactly one event must be terminal, and it must be last")
             continue
-        if len({line.get("operation_id") for line in lines}) != 1:
+        ids = {line.get("operation_id") for line in lines}
+        # Present and non-empty on EVERY line, not merely equal: a set of one
+        # None has length one, so an equality check alone accepts a fixture
+        # where no line carries an operation_id at all.
+        if None in ids or "" in ids:
+            results.fail(what, "every line must carry a non-empty operation_id")
+            continue
+        if len(ids) != 1:
             results.fail(what, "every line must carry the same operation_id")
             continue
         if validate is None:

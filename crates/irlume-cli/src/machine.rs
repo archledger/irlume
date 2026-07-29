@@ -611,9 +611,21 @@ struct SessionGuard {
     _file: std::fs::File,
 }
 
+/// Why a session could not be taken.
+///
+/// Distinguished because they mean opposite things to a caller: another session
+/// will finish, so retrying is right, while a runtime directory that cannot be
+/// written will not fix itself and retrying is a spin. Reporting both as
+/// `session-busy` told a consumer to keep trying against a permission error.
+enum SessionRefusal {
+    /// Another session for this user holds the lock.
+    Busy,
+    /// The lock itself could not be created or opened.
+    Unavailable,
+}
+
 impl SessionGuard {
-    /// `None` when another session for this user already holds the lock.
-    fn acquire() -> Option<Self> {
+    fn acquire() -> std::result::Result<Self, SessionRefusal> {
         use std::os::unix::io::AsRawFd;
         let dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(std::path::PathBuf::from)
@@ -629,13 +641,21 @@ impl SessionGuard {
             .truncate(false)
             .write(true)
             .open(dir.join("machine-session.lock"))
-            .ok()?;
+            .map_err(|_| SessionRefusal::Unavailable)?;
         // SAFETY: fd is owned by `file` and outlives the call.
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if locked != 0 {
-            return None;
+            // EWOULDBLOCK is the lock being held, which is the ordinary case
+            // and the only retryable one. Anything else is the lock mechanism
+            // failing, and telling a consumer to retry that would spin.
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            return Err(if errno == Some(libc::EWOULDBLOCK) {
+                SessionRefusal::Busy
+            } else {
+                SessionRefusal::Unavailable
+            });
         }
-        Some(Self {
+        Ok(Self {
             id: random_id(),
             _file: file,
         })
@@ -685,11 +705,20 @@ pub fn auth_test(args: &[String]) -> ExitCode {
     }
     let user = crate::user_arg(args);
 
-    let Some(session) = SessionGuard::acquire() else {
-        return emit(
-            &failure(COMMAND, "session-busy", true, contract),
-            ExitCode::FAILURE,
-        );
+    let session = match SessionGuard::acquire() {
+        Ok(session) => session,
+        Err(SessionRefusal::Busy) => {
+            return emit(
+                &failure(COMMAND, "session-busy", true, contract),
+                ExitCode::FAILURE,
+            )
+        }
+        Err(SessionRefusal::Unavailable) => {
+            return emit(
+                &failure(COMMAND, "operation-failed", false, contract),
+                ExitCode::FAILURE,
+            )
+        }
     };
     let mut stream = EventStream::new(COMMAND, contract, session.id.clone());
     // The account is not echoed back. Machine output does not carry usernames,

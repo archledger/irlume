@@ -391,7 +391,10 @@ for any local process, and the engine already refuses to let one account's face
 be tested against another's enrolment for the same reason.
 
 One session per user runs at a time. A second concurrent invocation is refused
-with `session-busy`, which is retryable. The lock is held by the running process
+with `session-busy`, which is retryable. A lock that cannot be taken at all,
+because the runtime directory is unwritable, is `operation-failed` and is not
+retryable: the two mean opposite things to a caller, and reporting both as busy
+would tell a consumer to keep trying against a permission error. The lock is held by the running process
 and released by the kernel when it exits, so a panel that is killed mid-capture
 does not strand the user.
 

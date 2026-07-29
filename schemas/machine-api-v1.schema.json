@@ -677,7 +677,52 @@
         "error": {
           "$ref": "#/$defs/error"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "event": {
+                "const": "error"
+              }
+            },
+            "required": [
+              "event"
+            ]
+          },
+          "then": {
+            "required": [
+              "error"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "const": "auth.test"
+              },
+              "event": {
+                "const": "result"
+              }
+            },
+            "required": [
+              "command",
+              "event"
+            ]
+          },
+          "then": {
+            "required": [
+              "data"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/authTestResultData"
+              }
+            }
+          }
+        }
+      ]
     },
     "authTestResultData": {
       "type": "object",

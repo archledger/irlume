@@ -97,7 +97,15 @@ fn the_event_stream_fixture_keeps_its_promises() {
         assert_eq!(line["sequence"], index as u64, "gapless from zero");
         assert_eq!(line["contract_version"], 1);
         assert_eq!(line["command"], "auth.test");
-        assert_eq!(line["operation_id"], lines[0]["operation_id"]);
+        // Asserted as a present, well-formed string rather than compared as
+        // values: two ABSENT fields both index to Null and would compare equal,
+        // so equality alone passes a stream that carries no operation_id.
+        let id = line["operation_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("line {index} has no operation_id"));
+        assert_eq!(id.len(), 32, "operation_id is 128 bits, hex encoded");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(id, lines[0]["operation_id"].as_str().expect("first id"));
         // No username, and no match score: a score would let a caller
         // hill-climb a presentation against the threshold.
         let text = line.to_string();

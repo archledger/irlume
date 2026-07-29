@@ -418,14 +418,20 @@ would change, without changing anything.
   "plan_id": "c574f96dba23c06bbb2e2f395a74f074",
   "action": "disable",
   "changes": [
+    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false },
     { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true },
     { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true },
-    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false }
+    { "surface": "sudo", "role": "sudo", "change": "restore-backup", "writes": true },
+    { "surface": "polkit-1", "role": "polkit", "change": "remove-override", "writes": true }
   ],
   "writes": 4,
   "requires_root": true
 }
 ```
+
+Absent surfaces are trimmed from this example for length; a real document lists
+every one. The top-level `writes` always equals the number of entries whose own
+`writes` is true.
 
 This runs the identical decision the apply path runs, with writing switched off,
 so a plan cannot describe an outcome the apply would not produce. Reading the PAM

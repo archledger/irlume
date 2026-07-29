@@ -68,12 +68,20 @@ count_passed() {
 # libtest writes one line per passing test:
 #   test keyring::tests::arm_and_unseal_roundtrip ... ok
 #
-# The workflows pass short filter names ("arm_and_unseal_roundtrip"), which
-# libtest reports under their full module path, so this matches a substring of
-# the reported name rather than the whole of it.
+# Emit each passing test twice, as its full path and as its final component, so
+# a workflow can name either form.
+passed_names() {
+  sed -n 's/^test \([^ ]*\) \.\.\. ok$/\1/p' "$1" \
+    | awk '{print; sub(/.*::/, ""); print}'
+}
+
+# Compared as a whole fixed string, never as a regex or a substring. A substring
+# test would accept arm_and_unseal_roundtrip_v2 for a required
+# arm_and_unseal_roundtrip, which is the rename this mode exists to catch, and
+# it would also let a metacharacter in a future test name change the match.
 ran_as_pass() {
   local name="$1" log="$2"
-  grep -qE "^test [^ ]*${name}[^ ]* \.\.\. ok$" "$log"
+  passed_names "$log" | grep -qxF "$name"
 }
 
 self_test() {
@@ -157,11 +165,40 @@ test m::tests::gamma ... ok
 
 test result: ok. 2 passed; 0 failed'
 
+  # A required name must match a whole test name, not a piece of a longer one.
+  # Accepting the longer name would pass the exact rename this mode catches.
+  expect "a longer test name does not satisfy a required shorter one" 1 \
+    "$0" --require arm_and_unseal_roundtrip -- printf '%s' 'test keyring::tests::arm_and_unseal_roundtrip_v2 ... ok
+
+test result: ok. 1 passed; 0 failed'
+
+  expect "a required name may be given as its full module path" 0 \
+    "$0" --require keyring::tests::alpha -- printf '%s' 'test keyring::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+
+  # The name is compared as data, so a metacharacter cannot widen the match.
+  expect "a required name is not treated as a regex" 1 \
+    "$0" --require 'a.pha' -- printf '%s' 'test m::tests::alpha ... ok
+
+test result: ok. 1 passed; 0 failed'
+
   expect "a required test that was ignored rather than run fails" 1 \
     "$0" --require alpha,beta -- printf '%s' 'test m::tests::alpha ... ok
 test m::tests::beta ... ignored
 
 test result: ok. 1 passed; 0 failed; 1 ignored'
+
+  # Regression: the real-TPM lane failed on this. A C library writing to stderr
+  # from inside a passing test lands between the "... " and the "ok", so a merged
+  # stream splits the result line and the test looks like it never ran. Only
+  # stdout is parsed, which puts the two halves back together.
+  expect "stderr written mid-line does not hide a passing test" 0 \
+    "$0" --require alpha -- sh -c '
+      printf "test m::tests::alpha ... "
+      printf "WARNING:esys:Esys_Load() Received TPM Error\n" >&2
+      printf "ok\n"
+      printf "\ntest result: ok. 1 passed; 0 failed\n"'
 
   expect "require implies its own minimum count" 1 \
     "$0" --require alpha,beta,gamma -- printf '%s' 'test m::tests::alpha ... ok
@@ -210,6 +247,15 @@ test result: ok. 2 passed; 0 failed'
   expect "a non-numeric minimum is a usage error" 2 "$0" --min abc -- true
   expect "neither --min nor --require is a usage error" 2 "$0" -- true
   expect "an unknown option is a usage error" 2 "$0" --nope 1 -- true
+
+  # A stray comma must be refused, not quietly shrink the required set.
+  expect "a trailing comma in --require is a usage error" 2 "$0" --require a, -- true
+  expect "a doubled comma in --require is a usage error" 2 "$0" --require a,,b -- true
+  expect "a leading comma in --require is a usage error" 2 "$0" --require ,a -- true
+
+  # A test named "terse" or "json" is a legitimate filter, not a format request.
+  expect "a test named terse is not mistaken for an output format" 0 \
+    "$0" --min 1 -- sh -c 'echo "$@"; printf "\ntest result: ok. 1 passed; 0 failed\n"' _ cargo test terse
 
   # A harness whose output this cannot parse must say so, rather than report
   # zero tests and look like the very bug it is guarding against.
@@ -265,14 +311,23 @@ if [ $# -eq 0 ]; then
   exit 2
 fi
 
-IFS=',' read -r -a required <<< "$require_csv"
-# A trailing or doubled comma would otherwise become an empty name that matches
-# every line.
-filtered=()
-for name in ${required+"${required[@]}"}; do
-  [ -n "$name" ] && filtered+=("$name")
-done
-required=(${filtered+"${filtered[@]}"})
+required=()
+if [ -n "$require_csv" ]; then
+  # Checked on the raw string, because `read -a` discards a trailing empty
+  # field: splitting "a," yields exactly one element, so the stray comma would
+  # be invisible afterwards.
+  #
+  # Rejected rather than tolerated. A stray comma left behind by an edit that
+  # also deleted a name would otherwise shrink the required set without saying
+  # so, which is the same silent weakening this script exists to prevent.
+  case "$require_csv" in
+    ,* | *, | *,,*)
+      echo "error: --require contains an empty name (stray or doubled comma): '$require_csv'" >&2
+      exit 2
+      ;;
+  esac
+  IFS=',' read -r -a required <<< "$require_csv"
+fi
 
 if [ -z "$expected_min" ] && [ ${#required[@]} -eq 0 ]; then
   echo "error: one of --min or --require is required" >&2
@@ -298,13 +353,16 @@ esac
 # does not produce it would yield zero and fail, which looks identical to the
 # silent-no-op bug being guarded against. Refuse up front instead, so the error
 # names the real cause.
+# Only the option itself is matched. Testing for a bare "json" or "terse"
+# anywhere in the command would reject a legitimate run that happens to filter
+# for a test of that name.
 for arg in "$@"; do
   case "$arg" in
     nextest)
       echo "error: nextest output is not parsed by this guard; it needs its own check" >&2
       exit 2
       ;;
-    --format | --format=* | json | terse)
+    --format | --format=*)
       echo "error: this guard requires libtest's default output format" >&2
       exit 2
       ;;
@@ -318,7 +376,16 @@ trap "rm -f '$log'" EXIT
 # Localised output would break the anchored patterns above.
 export LC_ALL=C
 
-"$@" 2>&1 | tee "$log"
+# Only stdout is captured. libtest writes its per-test lines and its summary to
+# stdout, while cargo's progress and any C library diagnostics go to stderr, so
+# merging the two corrupts the very lines this parses. The real-TPM lane proved
+# it: tss2-esys writes warnings from inside a passing test, landing between the
+# "... " and the "ok" of that test's result line and splitting it in three. All
+# six tests passed and the guard reported two missing.
+#
+# stderr is left on the script's own stderr, so it still streams live and still
+# reaches the CI log; it is simply not part of what gets parsed.
+"$@" | tee "$log"
 statuses=("${PIPESTATUS[@]}")
 command_status="${statuses[0]}"
 tee_status="${statuses[1]}"

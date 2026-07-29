@@ -920,6 +920,7 @@ dependencies = [
  "irlume-liveness",
  "irlume-vision",
  "libc",
+ "rand 0.10.2",
  "ratatui",
  "rpassword",
  "serde",

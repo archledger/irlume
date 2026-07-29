@@ -28,9 +28,99 @@ fn version_json_is_one_machine_document() {
             "profiles-list-json",
             "status-json",
             "doctor-json",
-            "login-status-json"
+            "login-status-json",
+            "auth-test-events"
         ])
     );
+}
+
+/// A refusal happens before the stream begins, so it must arrive as the single
+/// document every other refusal uses. A consumer that mis-invoked the command
+/// should not have to parse NDJSON to discover it mis-invoked the command.
+#[test]
+fn auth_test_refusals_are_one_document_not_a_stream() {
+    let cases: [(&[&str], &str); 3] = [
+        (&["auth", "test"], "usage-error"),
+        (
+            &["auth", "test", "--events=jsonl", "--contract", "9"],
+            "unsupported-contract",
+        ),
+        (
+            &["auth", "test", "--events=jsonl", "--preview=ir-jpeg"],
+            "usage-error",
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(args)
+            .output()
+            .expect("run irlume");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must exit 2, stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+            1,
+            "{args:?} must emit exactly one document"
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+        assert_eq!(document["command"], "auth.test");
+        assert_eq!(document["ok"], false);
+        assert_eq!(document["error"]["code"], expected, "for {args:?}");
+        // A refusal carries no stream fields: there is no stream.
+        assert!(document.get("sequence").is_none());
+        assert!(document.get("operation_id").is_none());
+    }
+}
+
+/// The published fixture is a real capture, so it is also the regression test
+/// for the three stream promises. Checked here as well as in the conformance
+/// script, because a Rust change can break the shape while nobody runs Python.
+#[test]
+fn the_event_stream_fixture_keeps_its_promises() {
+    let raw = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../schemas/fixtures/v1/auth-test-events.ndjson"
+    ))
+    .expect("read the published stream fixture");
+    let lines: Vec<Value> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each line is a JSON document"))
+        .collect();
+    assert!(!lines.is_empty(), "fixture must contain events");
+
+    for (index, line) in lines.iter().enumerate() {
+        assert_eq!(line["sequence"], index as u64, "gapless from zero");
+        assert_eq!(line["contract_version"], 1);
+        assert_eq!(line["command"], "auth.test");
+        assert_eq!(line["operation_id"], lines[0]["operation_id"]);
+        // No username, and no match score: a score would let a caller
+        // hill-climb a presentation against the threshold.
+        let text = line.to_string();
+        assert!(!text.contains("score"), "line {index} leaks a score");
+        assert!(!text.contains("/dev/video"), "line {index} leaks a device");
+    }
+    let terminals: Vec<bool> = lines
+        .iter()
+        .map(|line| line["terminal"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(
+        terminals.iter().filter(|t| **t).count(),
+        1,
+        "exactly one terminal event"
+    );
+    assert!(*terminals.last().expect("non-empty"), "terminal is last");
+
+    let result = lines.last().expect("non-empty");
+    assert_eq!(result["event"], "result");
+    assert!(matches!(
+        result["data"]["reason"].as_str(),
+        Some("granted") | Some("not-live") | Some("no-match")
+    ));
 }
 
 #[test]

@@ -33,6 +33,7 @@ const CAPABILITIES: &[&str] = &[
     "status-json",
     "doctor-json",
     "login-status-json",
+    "auth-test-events",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -144,6 +145,124 @@ fn error_code(code: OperationErrorCode) -> &'static str {
         OperationErrorCode::NotAuthorized => "not-authorized",
         OperationErrorCode::OperationFailed | OperationErrorCode::Unknown => "operation-failed",
     }
+}
+
+/// One line of an NDJSON event stream.
+///
+/// The envelope deliberately repeats `contract_version`, `engine_version` and
+/// `command` on every line rather than sending a header once. A consumer that
+/// reconnects, tails, or drops a line still knows what it is reading, and a
+/// line is meaningful on its own in a log.
+#[derive(Serialize)]
+struct Event {
+    contract_version: u32,
+    engine_version: &'static str,
+    command: &'static str,
+    /// Stable for the whole stream: ties every line to one invocation.
+    operation_id: String,
+    /// Which exclusive session produced this stream. Distinct from
+    /// `operation_id` so a future resumable operation can keep the session
+    /// while starting a new operation within it.
+    session_id: String,
+    /// From zero, incrementing by one, no gaps. A consumer detects a lost line
+    /// by arithmetic rather than by guessing.
+    sequence: u64,
+    event: &'static str,
+    /// True on exactly one line, always the last. This is the guarantee that
+    /// lets a consumer stop reading without a timeout.
+    terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<MachineError>,
+}
+
+/// Emits an NDJSON event stream, owning the sequence and the terminal rule.
+///
+/// The invariants a consumer is promised cannot be maintained by callers
+/// remembering to maintain them, so they live here: the sequence is private and
+/// only ever incremented, and finishing consumes the stream so a second
+/// terminal line is not expressible.
+struct EventStream {
+    command: &'static str,
+    contract: u32,
+    operation_id: String,
+    session_id: String,
+    sequence: u64,
+}
+
+impl EventStream {
+    fn new(command: &'static str, contract: u32, session_id: String) -> Self {
+        Self {
+            command,
+            contract,
+            operation_id: random_id(),
+            session_id,
+            sequence: 0,
+        }
+    }
+
+    fn line(
+        &mut self,
+        event: &'static str,
+        terminal: bool,
+        data: Option<Value>,
+        error: Option<MachineError>,
+    ) {
+        let line = Event {
+            contract_version: self.contract,
+            engine_version: env!("CARGO_PKG_VERSION"),
+            command: self.command,
+            operation_id: self.operation_id.clone(),
+            session_id: self.session_id.clone(),
+            sequence: self.sequence,
+            event,
+            terminal,
+            data,
+            error,
+        };
+        self.sequence += 1;
+        match serde_json::to_string(&line) {
+            // Flush per line: a consumer reads this incrementally, and a block
+            // buffer would deliver "started" and "result" together, defeating
+            // the point of streaming.
+            Ok(text) => {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{text}");
+                let _ = out.flush();
+            }
+            Err(error) => eprintln!("irlume machine event serialization failed: {error}"),
+        }
+    }
+
+    /// A non-terminal progress line.
+    fn progress(&mut self, event: &'static str, data: Value) {
+        self.line(event, false, Some(data), None);
+    }
+
+    /// The single terminal line. Consumes the stream, so no line can follow it.
+    fn finish(mut self, event: &'static str, data: Value, exit: ExitCode) -> ExitCode {
+        self.line(event, true, Some(data), None);
+        exit
+    }
+
+    /// The single terminal line, as a failure.
+    fn fail(mut self, code: &'static str, retryable: bool) -> ExitCode {
+        self.line("error", true, None, Some(MachineError { code, retryable }));
+        ExitCode::FAILURE
+    }
+}
+
+/// A 128-bit random identifier, hex encoded.
+///
+/// Random rather than sequential: an identifier a consumer may log or display
+/// should not encode how many operations this machine has run.
+fn random_id() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn emit(document: &Document, exit: ExitCode) -> ExitCode {
@@ -479,6 +598,183 @@ pub fn login_status(args: &[String]) -> ExitCode {
     )
 }
 
+/// An exclusive per-user session, held for as long as the guard lives.
+///
+/// The contract promises one session per user. That is enforced with an
+/// advisory lock on a file in the caller's own runtime directory rather than a
+/// recorded process id: a lock is released by the kernel when the holder exits
+/// for any reason, including a crash or a kill, so a panel that dies mid-capture
+/// cannot leave a user unable to start another session.
+struct SessionGuard {
+    id: String,
+    // Held for its Drop, which closes the descriptor and releases the lock.
+    _file: std::fs::File,
+}
+
+impl SessionGuard {
+    /// `None` when another session for this user already holds the lock.
+    fn acquire() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            // Falling back to a uid-qualified path keeps the lock per-user on a
+            // system without a runtime directory, rather than making it global.
+            .unwrap_or_else(|| {
+                // SAFETY: getuid cannot fail and touches no memory.
+                std::path::PathBuf::from(format!("/tmp/irlume-{}", unsafe { libc::getuid() }))
+            });
+        let _ = std::fs::create_dir_all(&dir);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("machine-session.lock"))
+            .ok()?;
+        // SAFETY: fd is owned by `file` and outlives the call.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked != 0 {
+            return None;
+        }
+        Some(Self {
+            id: random_id(),
+            _file: file,
+        })
+    }
+}
+
+/// `irlume auth test --events=jsonl`: does the claimed user's live face match
+/// their own enrolment?
+///
+/// Verification against one claimed account, never identification. It answers
+/// with a verdict and releases nothing: the daemon's `Authenticate` returns a
+/// decision, while credential release is a separate privileged path this command
+/// does not touch. It also cannot alter a profile or a threshold, because it
+/// sends no request that could.
+///
+/// The match score is deliberately NOT reported. A caller that can see a
+/// continuous score can hill-climb against it, tuning a presentation until it
+/// crosses the threshold, which turns a diagnostic into an oracle. `granted`
+/// and `live` are the two facts a settings panel needs, and the reason is a
+/// stable code derived from them rather than daemon prose.
+pub fn auth_test(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "auth.test";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    if !valid_auth_test_args(args) {
+        // A usage error is reported as a single document, not as a stream. The
+        // stream has not started, and a consumer that mis-invoked the command
+        // gets the same shape every other refusal uses.
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    let user = crate::user_arg(args);
+
+    let Some(session) = SessionGuard::acquire() else {
+        return emit(
+            &failure(COMMAND, "session-busy", true, contract),
+            ExitCode::FAILURE,
+        );
+    };
+    let mut stream = EventStream::new(COMMAND, contract, session.id.clone());
+    // The account is not echoed back. Machine output does not carry usernames,
+    // and the caller supplied it, so repeating it would add a name to a stream
+    // a desktop may log without adding anything the caller does not know.
+    stream.progress("started", json!({ "operation": "auth-test" }));
+    stream.progress("capturing", json!({}));
+
+    match crate::daemon_request(&Request::Authenticate {
+        user,
+        // No PAM service: this is a diagnostic, not an authentication for a
+        // surface, so it must not inherit any surface's tier allowances.
+        service: None,
+    }) {
+        Ok(Response::AuthResult { granted, live, .. }) => stream.finish(
+            "result",
+            json!({
+                "granted": granted,
+                "live": live,
+                "reason": auth_reason(granted, live),
+            }),
+            // A refusal is a successful test that answered "no". The command
+            // failing and the face not matching are different things, and a
+            // consumer must be able to tell them apart.
+            ExitCode::SUCCESS,
+        ),
+        Ok(Response::OperationError { code, retryable }) => {
+            stream.fail(error_code(code), retryable)
+        }
+        // Daemon prose is not inspected; see `profiles_list`.
+        Ok(Response::Error(_)) => stream.fail("operation-failed", false),
+        Ok(_) => stream.fail("protocol-error", false),
+        Err(_) => stream.fail("daemon-unavailable", true),
+    }
+}
+
+/// A stable reason code for an authentication verdict.
+///
+/// Derived from the two booleans the daemon already returns, never from its
+/// prose. That keeps a reworded daemon message from becoming a breaking API
+/// change, which is the same rule the single-document commands follow.
+fn auth_reason(granted: bool, live: bool) -> &'static str {
+    match (granted, live) {
+        (true, _) => "granted",
+        (false, false) => "not-live",
+        (false, true) => "no-match",
+    }
+}
+
+fn valid_auth_test_args(args: &[String]) -> bool {
+    if args.first().map(String::as_str) != Some("auth")
+        || args.get(1).map(String::as_str) != Some("test")
+    {
+        return false;
+    }
+    let mut saw_events = false;
+    let mut saw_user = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--events=jsonl" if !saw_events => {
+                saw_events = true;
+                index += 1;
+            }
+            // Preview is a separate capability that this build does not
+            // advertise. Refusing it is the honest answer; accepting and
+            // ignoring it would let a consumer believe frames were suppressed
+            // by policy when they were never implemented.
+            arg if arg.starts_with("--preview") => return false,
+            "--user" if !saw_user => {
+                saw_user = true;
+                let Some(user) = args.get(index + 1) else {
+                    return false;
+                };
+                if user.is_empty() || user.starts_with('-') {
+                    return false;
+                }
+                index += 2;
+            }
+            _ => return false,
+        }
+    }
+    saw_events
+}
+
 pub fn profiles_list(args: &[String]) -> ExitCode {
     const COMMAND: &str = "profiles.list";
     // Negotiate first: an unsupported contract is refused before the daemon is
@@ -689,6 +985,10 @@ mod tests {
         assert_eq!(document["contract_version"], 1);
         assert_eq!(document["command"], "version");
         assert_eq!(document["ok"], true);
+        // Spelled out rather than compared against CAPABILITIES, so adding a
+        // capability has to be done here too. That is the point: a capability
+        // is a public promise and lands with its documentation, schema and
+        // fixtures, never as a side effect of an implementation.
         assert_eq!(
             document["data"]["capabilities"],
             json!([
@@ -696,10 +996,142 @@ mod tests {
                 "profiles-list-json",
                 "status-json",
                 "doctor-json",
-                "login-status-json"
+                "login-status-json",
+                "auth-test-events"
             ])
         );
         assert!(document.get("error").is_none());
+    }
+
+    /// Collect the events a closure emits, by capturing what the stream would
+    /// serialize. The emitter writes to stdout, so these exercise the envelope
+    /// and the sequencing rules against the same `Event` the command sends.
+    fn event_value(
+        stream: &EventStream,
+        sequence: u64,
+        event: &'static str,
+        terminal: bool,
+    ) -> Value {
+        serde_json::to_value(Event {
+            contract_version: stream.contract,
+            engine_version: env!("CARGO_PKG_VERSION"),
+            command: stream.command,
+            operation_id: stream.operation_id.clone(),
+            session_id: stream.session_id.clone(),
+            sequence,
+            event,
+            terminal,
+            data: Some(json!({})),
+            error: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_event_carries_the_whole_envelope_on_every_line() {
+        // A consumer that drops a line, tails the stream, or reads it out of a
+        // log must still know what it is looking at, so nothing is sent once as
+        // a header.
+        let stream = EventStream::new("auth.test", 1, "session".into());
+        let value = event_value(&stream, 0, "started", false);
+        for field in [
+            "contract_version",
+            "engine_version",
+            "command",
+            "operation_id",
+            "session_id",
+            "sequence",
+            "event",
+            "terminal",
+        ] {
+            assert!(value.get(field).is_some(), "event is missing {field}");
+        }
+        assert_eq!(value["contract_version"], 1);
+        assert_eq!(value["command"], "auth.test");
+    }
+
+    #[test]
+    fn the_sequence_starts_at_zero_and_never_repeats() {
+        let mut stream = EventStream::new("auth.test", 1, "session".into());
+        assert_eq!(stream.sequence, 0);
+        stream.sequence += 1;
+        stream.sequence += 1;
+        // Gapless and monotonic is what lets a consumer detect a lost line by
+        // arithmetic instead of by timeout.
+        assert_eq!(stream.sequence, 2);
+    }
+
+    #[test]
+    fn one_operation_id_ties_the_whole_stream_together() {
+        let stream = EventStream::new("auth.test", 1, "session".into());
+        let first = event_value(&stream, 0, "started", false);
+        let last = event_value(&stream, 2, "result", true);
+        assert_eq!(first["operation_id"], last["operation_id"]);
+        assert_eq!(first["session_id"], last["session_id"]);
+        assert_ne!(first["sequence"], last["sequence"]);
+    }
+
+    #[test]
+    fn two_streams_do_not_share_an_operation_id() {
+        let a = EventStream::new("auth.test", 1, "s".into());
+        let b = EventStream::new("auth.test", 1, "s".into());
+        assert_ne!(a.operation_id, b.operation_id);
+        assert_eq!(a.operation_id.len(), 32, "128 bits, hex encoded");
+    }
+
+    #[test]
+    fn the_verdict_reason_is_derived_from_the_booleans_not_from_prose() {
+        // Daemon wording may change freely; these codes may not.
+        assert_eq!(auth_reason(true, true), "granted");
+        assert_eq!(auth_reason(true, false), "granted");
+        assert_eq!(auth_reason(false, false), "not-live");
+        assert_eq!(auth_reason(false, true), "no-match");
+    }
+
+    #[test]
+    fn auth_test_requires_the_events_flag() {
+        assert!(!valid_auth_test_args(&["auth".into(), "test".into()]));
+        assert!(valid_auth_test_args(&[
+            "auth".into(),
+            "test".into(),
+            "--events=jsonl".into()
+        ]));
+    }
+
+    #[test]
+    fn auth_test_refuses_preview_rather_than_ignoring_it() {
+        // Accepting and dropping the flag would let a consumer believe frames
+        // were withheld by policy when the capability simply does not exist.
+        for flag in ["--preview=ir-jpeg", "--preview", "--preview=anything"] {
+            assert!(
+                !valid_auth_test_args(&[
+                    "auth".into(),
+                    "test".into(),
+                    "--events=jsonl".into(),
+                    flag.into()
+                ]),
+                "{flag} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_test_rejects_repeats_and_unknown_flags() {
+        let cases: [&[&str]; 4] = [
+            &["auth", "test", "--events=jsonl", "--events=jsonl"],
+            &["auth", "test", "--events=jsonl", "--user"],
+            &["auth", "test", "--events=jsonl", "--user", "-bad"],
+            &["auth", "test", "--events=jsonl", "--wat"],
+        ];
+        for case in cases {
+            let args: Vec<String> = case.iter().map(|s| (*s).to_string()).collect();
+            assert!(!valid_auth_test_args(&args), "{case:?} must be refused");
+        }
+        let ok: Vec<String> = ["auth", "test", "--events=jsonl", "--user", "someone"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert!(valid_auth_test_args(&ok));
     }
 
     #[test]

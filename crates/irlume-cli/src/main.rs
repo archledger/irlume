@@ -139,6 +139,11 @@ fn main() -> std::process::ExitCode {
         {
             machine::login_status(&args)
         }
+        // `auth test` exists only as a machine command, so it routes here
+        // whatever flags follow and answers a bad invocation with a JSON
+        // usage-error rather than prose. Bare `auth` still falls through to the
+        // help, which is the useful answer to a typo.
+        (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test(&args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
         (Some("models"), sub) => models::run(sub, &args),

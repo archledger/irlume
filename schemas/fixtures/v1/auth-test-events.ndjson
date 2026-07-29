@@ -1,0 +1,3 @@
+{"contract_version":1,"engine_version":"0.7.1","command":"auth.test","operation_id":"8db410d15f623ed8d55e08c6af25ac35","session_id":"a14a8b6f994be3f44a8f54c5ded3bc2e","sequence":0,"event":"started","terminal":false,"data":{"operation":"auth-test"}}
+{"contract_version":1,"engine_version":"0.7.1","command":"auth.test","operation_id":"8db410d15f623ed8d55e08c6af25ac35","session_id":"a14a8b6f994be3f44a8f54c5ded3bc2e","sequence":1,"event":"capturing","terminal":false,"data":{}}
+{"contract_version":1,"engine_version":"0.7.1","command":"auth.test","operation_id":"8db410d15f623ed8d55e08c6af25ac35","session_id":"a14a8b6f994be3f44a8f54c5ded3bc2e","sequence":2,"event":"result","terminal":true,"data":{"granted":false,"live":true,"reason":"no-match"}}

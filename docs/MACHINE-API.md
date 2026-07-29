@@ -18,7 +18,15 @@ Every document contains:
 ```
 
 Machine-mode standard output contains exactly one JSON document. Diagnostics
-go to standard error. A successful command exits with zero. Usage errors exit
+go to standard error.
+
+**Streaming capabilities are the exception, and only ever by invitation.** A
+capability whose name ends in `-events` emits newline-delimited JSON: one event
+per line, many lines. A consumer reaches one only by invoking a command it found
+in `capabilities`, so a consumer that does not implement streaming never sees
+more than one document. The rule above is what every non-streaming command
+follows, and it is what a contract 1 consumer built before streaming existed
+will continue to observe. A successful command exits with zero. Usage errors exit
 with 2, while unavailable or failed operations exit nonzero and return:
 
 ```json
@@ -330,6 +338,71 @@ command cannot be used to discover which accounts exist or which are enrolled.
 caller changing anything. Only `daemon-unavailable` sets it today. It is not a
 promise that a retry will succeed, and it carries no suggested delay.
 
+### `irlume auth test --events=jsonl`
+
+Capability: `auth-test-events`.
+
+Does the claimed account's live face match its own enrolment? This is
+verification against one account, never identification, and it releases nothing:
+the answer is a verdict. It cannot alter a profile, a threshold, or a credential,
+because it issues no request that could.
+
+Output is newline-delimited JSON, one event per line:
+
+```
+{"contract_version":1,"engine_version":"0.7.1","command":"auth.test","operation_id":"8db4...","session_id":"a14a...","sequence":0,"event":"started","terminal":false,"data":{"operation":"auth-test"}}
+{"contract_version":1,...,"sequence":1,"event":"capturing","terminal":false,"data":{}}
+{"contract_version":1,...,"sequence":2,"event":"result","terminal":true,"data":{"granted":false,"live":true,"reason":"no-match"}}
+```
+
+Every line carries the whole envelope rather than relying on a header sent once,
+so a line remains meaningful on its own in a log or after a dropped read.
+
+Three properties a consumer may rely on:
+
+- `sequence` starts at zero and increments by one with no gaps, so a lost line
+  is detected by arithmetic rather than by timeout;
+- exactly one event has `terminal` true, and it is the last, so a reader knows
+  when to stop without waiting;
+- `operation_id` is identical on every line of one invocation.
+
+`reason` is one of `granted`, `not-live`, or `no-match`, derived from `granted`
+and `live`. It is never derived from daemon wording, so a reworded message is not
+a breaking change.
+
+**The match score is not reported.** A caller that can read a continuous score
+can hill-climb against it, adjusting a presentation until it crosses the
+threshold, which would turn a diagnostic into an oracle. `granted` and `live`
+are the facts a settings panel needs.
+
+The account is not echoed back, for the same reason ordinary machine output
+carries no usernames: the caller already knows which account it asked about, and
+a desktop may log the stream.
+
+An exit status of zero means the test ran. It does not mean the face matched;
+read `granted` for that. A refusal before the stream begins is reported as a
+single document with the usual error codes and exit 2, not as a stream. A
+failure once the stream has started is a terminal `error` event and exit 1.
+
+Naming an account the caller may not act on is one such failure, and it reports
+`operation-failed` rather than `not-authorized`. That flattening is deliberate:
+distinguishing the two would answer "does this account exist and is it enrolled"
+for any local process, and the engine already refuses to let one account's face
+be tested against another's enrolment for the same reason.
+
+One session per user runs at a time. A second concurrent invocation is refused
+with `session-busy`, which is retryable. The lock is held by the running process
+and released by the kernel when it exits, so a panel that is killed mid-capture
+does not strand the user.
+
+`--preview` is refused. Preview frames are a separate capability that this
+build does not advertise; accepting the flag and ignoring it would suggest that
+frames were withheld by policy rather than never implemented.
+
+Stream lines validate against `$defs/event` in the schema, not against the
+document root. `schemas/fixtures/v1/auth-test-events.ndjson` is a capture from a
+real engine.
+
 ## Security and privacy
 
 Ordinary JSON output never includes camera frames, embeddings, templates,
@@ -339,7 +412,7 @@ Errors contain stable codes instead of daemon prose.
 The following are not part of contract version 1 yet and must not be inferred
 from human output or the private socket protocol:
 
-- enrollment or authentication-test event streams;
+- enrollment event streams;
 - preview images and cancellation semantics;
 - profile or scan mutation;
 - camera configuration mutation;

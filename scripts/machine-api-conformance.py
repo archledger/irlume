@@ -41,6 +41,25 @@ CAPABILITY_COMMANDS = {
     "login-status-json": ["login", "status", "--json"],
 }
 
+# Streaming capabilities operate the camera, so invoking them here would need
+# hardware, a face, and tens of seconds. They are still checked, on the paths
+# that are deterministic without a capture: the command must exist, negotiate a
+# contract, and refuse a bad invocation with a single document rather than a
+# stream. Listing them separately is the point. An unlisted capability lands in
+# the "this script does not know that capability" skip, which reads as a pass
+# and would let a streaming capability ship with nothing verifying it at all.
+#
+# Capability name -> (argv that must be refused, expected error code).
+STREAMING_CAPABILITY_REFUSALS = {
+    "auth-test-events": [
+        (["auth", "test"], "usage-error"),
+        (["auth", "test", "--events=jsonl", "--contract", "9"], "unsupported-contract"),
+        # Preview is a separate capability. Accepting the flag and dropping it
+        # would tell a consumer that frames were withheld by policy.
+        (["auth", "test", "--events=jsonl", "--preview=ir-jpeg"], "usage-error"),
+    ],
+}
+
 # Commands whose output must never contain these, per the security and privacy
 # section of docs/MACHINE-API.md. Camera device nodes and PAM file paths are the
 # two that a well-meaning addition would most plausibly reintroduce.
@@ -164,13 +183,59 @@ def load_validator(schema_path, strict):
     Draft202012Validator.check_schema(schema)
     validator = Draft202012Validator(schema)
 
-    def validate(document):
+    # A stream line is not the single-document envelope, so it is validated
+    # against $defs/event instead of the root.
+    event_validator = Draft202012Validator(
+        {"$ref": "#/$defs/event", "$defs": schema.get("$defs", {})}
+    )
+
+    def validate(document, event=False):
+        chosen = event_validator if event else validator
         return [
             f"{'/'.join(str(p) for p in error.absolute_path) or '<root>'}: {error.message}"
-            for error in sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
+            for error in sorted(chosen.iter_errors(document), key=lambda e: list(e.absolute_path))
         ]
 
     return validate, None
+
+
+def check_streaming_capability(results, binary, validate, capability, refusals):
+    """Verify a streaming capability on the paths that need no camera.
+
+    A refusal must arrive as ONE document with the documented error code, not as
+    an event stream: the stream has not started, and a consumer that mis-invoked
+    the command should get the same shape every other refusal uses. Exit status
+    must be 2, matching the contract's usage-error rule.
+    """
+    for argv, expected in refusals:
+        what = f"capability {capability} refuses: irlume {' '.join(argv)}"
+        proc = run(binary, argv)
+        document = parse_document(results, what, proc)
+        if document is None:
+            continue
+        if document.get("ok") is not False:
+            results.fail(what, "a refusal must set ok=false")
+            continue
+        code = document.get("error", {}).get("code")
+        if code != expected:
+            results.fail(what, f"expected error code {expected!r}, got {code!r}")
+            continue
+        if proc.returncode != 2:
+            results.fail(what, f"a refusal must exit 2, got {proc.returncode}")
+            continue
+        # One document, not a stream. More than one line here would mean the
+        # command began streaming before it validated its arguments.
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        if len(lines) != 1:
+            results.fail(what, f"a refusal must be one document, got {len(lines)} lines")
+            continue
+        if validate is not None:
+            # validate returns a LIST of messages; empty means valid.
+            errors = validate(document)
+            if errors:
+                results.fail(what, "schema: " + "; ".join(errors[:5]))
+                continue
+        results.ok(what)
 
 
 def check_engine(results, binary, validate, validate_note):
@@ -201,6 +266,10 @@ def check_engine(results, binary, validate, validate_note):
     # Every advertised capability must answer. A capability that does not is
     # worse than a missing one: consumers enable behaviour on seeing the name.
     for capability in capabilities:
+        refusals = STREAMING_CAPABILITY_REFUSALS.get(capability)
+        if refusals is not None:
+            check_streaming_capability(results, binary, validate, capability, refusals)
+            continue
         argv = CAPABILITY_COMMANDS.get(capability)
         if argv is None:
             results.skip(
@@ -299,6 +368,58 @@ def check_fixtures(results, fixtures_dir, validate, validate_note):
         errors = validate(document)
         if errors:
             results.fail(what, "schema: " + "; ".join(errors[:5]))
+        else:
+            results.ok(what)
+
+    check_stream_fixtures(results, fixtures_dir, validate, validate_note)
+
+
+def check_stream_fixtures(results, fixtures_dir, validate, validate_note):
+    """Validate NDJSON stream captures, line by line, plus the stream rules.
+
+    Kept separate from the single-document fixtures because the loader above
+    matches only *.json. A stream capture dropped into the same directory would
+    otherwise be listed by nobody and checked by nothing, which reads exactly
+    like a directory that happens to hold no streams.
+    """
+    try:
+        names = sorted(n for n in os.listdir(fixtures_dir) if n.endswith(".ndjson"))
+    except OSError as error:
+        results.fail("stream fixtures", f"cannot read {fixtures_dir}: {error}")
+        return
+    for name in names:
+        what = f"stream fixture {name}"
+        try:
+            with open(os.path.join(fixtures_dir, name), encoding="utf-8") as handle:
+                lines = [json.loads(line) for line in handle if line.strip()]
+        except (OSError, json.JSONDecodeError) as error:
+            results.fail(what, str(error))
+            continue
+        if not lines:
+            results.fail(what, "a stream fixture must contain at least one event")
+            continue
+        # The three promises a consumer relies on, checked on a real capture.
+        sequences = [line.get("sequence") for line in lines]
+        if sequences != list(range(len(lines))):
+            results.fail(what, f"sequence must start at 0 and be gapless, got {sequences}")
+            continue
+        terminals = [bool(line.get("terminal")) for line in lines]
+        if terminals.count(True) != 1 or not terminals[-1]:
+            results.fail(what, "exactly one event must be terminal, and it must be last")
+            continue
+        if len({line.get("operation_id") for line in lines}) != 1:
+            results.fail(what, "every line must carry the same operation_id")
+            continue
+        if validate is None:
+            results.skip(what, validate_note)
+            continue
+        bad = []
+        for index, line in enumerate(lines):
+            errors = validate(line, event=True)
+            if errors:
+                bad.append(f"line {index}: {errors[0]}")
+        if bad:
+            results.fail(what, "schema: " + "; ".join(bad[:5]))
         else:
             results.ok(what)
 

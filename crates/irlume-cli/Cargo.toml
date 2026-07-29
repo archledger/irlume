@@ -21,6 +21,7 @@ irlume-fingerprint.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true   # restore default SIGPIPE so `irlume … | head` doesn't panic
+rand.workspace = true   # session and operation identifiers for the machine event stream
 image = { workspace = true }
 rpassword = "7"   # no-echo password prompt for `keyring arm`
 ratatui = "0.30"  # TUI (MIT), bundles crossterm; powers `irlume tui`

@@ -33,6 +33,20 @@
 //! - The selected metadata format persists after close, so it is restored on
 //!   drop rather than left changed for the next process on the device.
 //!
+//! # Three cameras, three answers
+//!
+//! - ASUS IR module and NexiGo HelloCam N930W: `UVCM` accepted, and every frame
+//!   of a burst carries a record. These are the cameras the path exists for.
+//! - Lenovo Integrated Camera (RGB only, no illuminator): `UVCM` accepted and
+//!   metadata buffers delivered, correlated 12 of 12, carrying **no
+//!   illumination record at all**. Offering the format is not a promise to
+//!   report illumination, so an absent record means "the camera did not say",
+//!   never "the illuminator was off". `parse_illumination` returns `None` here
+//!   and the burst keeps its brightness rule.
+//!
+//! A camera with no metadata node at all (v4l2loopback, for one) is the fourth
+//! case, and lands on the same fallback.
+//!
 //! # Failure policy
 //!
 //! Every step here is best-effort. A camera without a metadata node, without

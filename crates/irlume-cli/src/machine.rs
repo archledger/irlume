@@ -749,6 +749,41 @@ fn require_root(command: &'static str, contract: u32) -> Option<ExitCode> {
     ))
 }
 
+/// Each surface's state, and how many are not as apply left them.
+///
+/// Split out so it can be driven by a test with a record pointing at temporary
+/// files: the command around it needs root and a real PAM tree, but this is the
+/// part that decides the answer.
+fn verify_surfaces(record: &crate::logintx::Transaction) -> (Vec<Value>, usize) {
+    let surfaces: Vec<Value> = record
+        .surfaces
+        .iter()
+        .map(|surface| {
+            let state = match crate::logintx::unchanged_since_apply(surface) {
+                Ok(()) => "as-applied",
+                Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => "changed-since-apply",
+                Err(crate::logintx::RollbackRefusal::Unreadable(_)) => "unreadable",
+            };
+            json!({ "surface": surface.id, "state": state })
+        })
+        .collect();
+    let drifted = surfaces
+        .iter()
+        .filter(|entry| entry["state"] != "as-applied")
+        .count();
+    (surfaces, drifted)
+}
+
+/// The surfaces that block a rollback. Empty means it may proceed.
+fn drifted_surfaces(record: &crate::logintx::Transaction) -> Vec<&str> {
+    record
+        .surfaces
+        .iter()
+        .filter(|surface| crate::logintx::unchanged_since_apply(surface).is_err())
+        .map(|surface| surface.id.as_str())
+        .collect()
+}
+
 /// `irlume login apply --action X --plan-id ID --json`: carry out a plan.
 ///
 /// The plan is re-derived from the machine and its id recomputed. A `plan_id`
@@ -898,22 +933,7 @@ pub fn login_verify(args: &[String]) -> ExitCode {
             ExitCode::FAILURE,
         );
     };
-    let surfaces: Vec<Value> = record
-        .surfaces
-        .iter()
-        .map(|surface| {
-            let state = match crate::logintx::unchanged_since_apply(surface) {
-                Ok(()) => "as-applied",
-                Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => "changed-since-apply",
-                Err(crate::logintx::RollbackRefusal::Unreadable(_)) => "unreadable",
-            };
-            json!({ "surface": surface.id, "state": state })
-        })
-        .collect();
-    let drifted = surfaces
-        .iter()
-        .filter(|s| s["state"] != "as-applied")
-        .count();
+    let (surfaces, drifted) = verify_surfaces(&record);
     emit(
         &success(
             COMMAND,
@@ -982,12 +1002,7 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
     // Every surface is checked BEFORE any is written. A rollback that restored
     // three files and then met a fourth it must refuse would leave the stack in
     // a state neither the transaction nor the admin chose.
-    let drifted: Vec<&str> = record
-        .surfaces
-        .iter()
-        .filter(|s| crate::logintx::unchanged_since_apply(s).is_err())
-        .map(|s| s.id.as_str())
-        .collect();
+    let drifted = drifted_surfaces(&record);
     if !drifted.is_empty() {
         irlume_common::dlog!("login.rollback: refused; changed since apply: {drifted:?}");
         return emit(
@@ -1641,6 +1656,268 @@ mod tests {
         assert_eq!(auth_reason(true, false), "granted");
         assert_eq!(auth_reason(false, false), "not-live");
         assert_eq!(auth_reason(false, true), "no-match");
+    }
+
+    /// A record whose surfaces point at files a test controls, so the verify
+    /// and rollback decisions can be exercised without root or a PAM tree.
+    fn record_over(files: &[(&str, &std::path::Path, &str)]) -> crate::logintx::Transaction {
+        crate::logintx::Transaction {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            action: "disable".into(),
+            plan_id: "f".repeat(32),
+            engine_version: "0.0.0".into(),
+            surfaces: files
+                .iter()
+                .map(|(id, path, after)| crate::logintx::SurfaceRecord {
+                    id: (*id).to_string(),
+                    path: path.display().to_string(),
+                    change: "wire".into(),
+                    before: Some("before\n".into()),
+                    after_sha256: (*after).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn verify_reports_each_surface_and_counts_the_drift() {
+        let dir = std::env::temp_dir().join(format!("irlume-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let steady = dir.join("steady");
+        let moved = dir.join("moved");
+        std::fs::write(&steady, "as applied\n").expect("write");
+        std::fs::write(&moved, "somebody edited this\n").expect("write");
+
+        let record = record_over(&[
+            (
+                "kde",
+                steady.as_path(),
+                &crate::logintx::sha256_hex(b"as applied\n"),
+            ),
+            (
+                "sudo",
+                moved.as_path(),
+                &crate::logintx::sha256_hex(b"as applied\n"),
+            ),
+        ]);
+        let (surfaces, drifted) = verify_surfaces(&record);
+        assert_eq!(surfaces.len(), 2);
+        assert_eq!(surfaces[0]["surface"], "kde");
+        assert_eq!(surfaces[0]["state"], "as-applied");
+        assert_eq!(surfaces[1]["state"], "changed-since-apply");
+        assert_eq!(drifted, 1);
+
+        // Rollback is gated on the same rule, and names what blocks it.
+        assert_eq!(drifted_surfaces(&record), vec!["sudo"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rollback_is_allowed_only_when_nothing_drifted() {
+        let dir = std::env::temp_dir().join(format!("irlume-rollback-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("kde");
+        std::fs::write(&file, "as applied\n").expect("write");
+        let record = record_over(&[(
+            "kde",
+            file.as_path(),
+            &crate::logintx::sha256_hex(b"as applied\n"),
+        )]);
+        assert!(
+            drifted_surfaces(&record).is_empty(),
+            "clean stack rolls back"
+        );
+
+        std::fs::write(&file, "changed\n").expect("write");
+        assert_eq!(drifted_surfaces(&record), vec!["kde"]);
+
+        // An unreadable surface blocks a rollback too: it is not evidence the
+        // file is unchanged, so restoring over it would be a guess.
+        std::fs::remove_file(&file).expect("rm");
+        std::fs::create_dir(&file).expect("mkdir in its place");
+        assert_eq!(drifted_surfaces(&record), vec!["kde"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn login_apply_requires_an_action_and_a_plan_id() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        let good = a(&[
+            "login",
+            "apply",
+            "--action",
+            "enable",
+            "--plan-id",
+            "0123456789abcdef0123456789abcdef",
+            "--json",
+        ]);
+        assert_eq!(
+            valid_login_apply_args(&good),
+            Some(("enable", "0123456789abcdef0123456789abcdef".to_string()))
+        );
+        for bad in [
+            // No plan id: applying without one means acting on changes the
+            // consumer never saw.
+            vec!["login", "apply", "--action", "enable", "--json"],
+            vec![
+                "login",
+                "apply",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            // A plan id that is not a hex identifier.
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "../etc",
+                "--json",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "short",
+                "--json",
+            ],
+            // Unknown action, missing --json, repeats, junk.
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "wat",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--action",
+                "disable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+                "--wat",
+            ],
+            vec![
+                "login",
+                "plan",
+                "--action",
+                "enable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+        ] {
+            assert_eq!(valid_login_apply_args(&a(&bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_transaction_id_shaped_like_a_path_is_refused() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            valid_transaction_args(
+                &a(&["login", "verify", "--transaction-id", id, "--json"]),
+                "verify",
+                false
+            ),
+            Some(id.to_string())
+        );
+        // --apply is accepted only where it means something.
+        assert_eq!(
+            valid_transaction_args(
+                &a(&[
+                    "login",
+                    "rollback",
+                    "--transaction-id",
+                    id,
+                    "--apply",
+                    "--json"
+                ]),
+                "rollback",
+                true
+            ),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            valid_transaction_args(
+                &a(&[
+                    "login",
+                    "verify",
+                    "--transaction-id",
+                    id,
+                    "--apply",
+                    "--json"
+                ]),
+                "verify",
+                false
+            ),
+            None,
+            "verify writes nothing, so --apply is meaningless there"
+        );
+        for bad in [
+            vec![
+                "login",
+                "verify",
+                "--transaction-id",
+                "../../etc/passwd",
+                "--json",
+            ],
+            vec![
+                "login",
+                "verify",
+                "--transaction-id",
+                "../../etc/shadow",
+                "--json",
+            ],
+            vec!["login", "verify", "--json"],
+            vec!["login", "verify", "--transaction-id", id],
+            vec![
+                "login",
+                "verify",
+                "--transaction-id",
+                id,
+                "--transaction-id",
+                id,
+                "--json",
+            ],
+            vec!["login", "apply", "--transaction-id", id, "--json"],
+        ] {
+            assert_eq!(
+                valid_transaction_args(&a(&bad), "verify", false),
+                None,
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

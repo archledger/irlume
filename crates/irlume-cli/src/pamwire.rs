@@ -2795,6 +2795,43 @@ mod tests {
     const VENDOR_GREETER: &str = "#%PAM-1.0\nauth       substack      password-auth\nauth       optional      pam_gnome_keyring.so\naccount    include       password-auth\nsession    include       password-auth\n";
 
     #[test]
+    fn restoring_writes_the_recorded_content_back() {
+        let dir = std::env::temp_dir().join(format!("irlume-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("sudo");
+        std::fs::write(&file, "changed by apply\n").expect("write");
+
+        restore_surface(&file, Some("the original\n")).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "the original\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restoring_a_file_that_did_not_exist_removes_it() {
+        // `disable` can remove a file outright. Writing an empty one instead
+        // would leave a stub shadowing the vendor copy, which is not the same
+        // as the file being absent.
+        let dir =
+            std::env::temp_dir().join(format!("irlume-restore-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("materialized-override");
+        std::fs::write(&file, "irlume made this\n").expect("write");
+
+        restore_surface(&file, None).expect("restore");
+        assert!(!file.exists(), "the file must be gone, not empty");
+
+        // Restoring an already-absent file is not an error: a rollback that
+        // partly ran and is run again must be able to finish.
+        restore_surface(&file, None).expect("restoring an absent file is fine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn wire_service_override_materialize_idempotent_then_remove() {
         let dir = TestDir::new("wsvc-override");
         let vendor = dir.0.join("plasmalogin.vendor");

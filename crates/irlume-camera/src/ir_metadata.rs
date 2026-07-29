@@ -527,6 +527,16 @@ impl IlluminationLog {
         )
     }
 
+    /// Drop the previous burst's records.
+    ///
+    /// Correlation only ever looks at the burst being captured, and a session
+    /// is held across many captures in `irlume-auth`, so without this the map
+    /// would grow for the life of the session. Called once before a burst
+    /// rather than inside `drain`, which runs per frame.
+    pub(crate) fn begin_burst(&mut self) {
+        self.by_timestamp.clear();
+    }
+
     /// Pull every metadata buffer the driver has ready, without blocking.
     ///
     /// Called between image dequeues rather than from its own thread: the two
@@ -738,10 +748,28 @@ fn siblings_on_same_interface(video_device: &str, sysfs: &std::path::Path) -> Ve
             candidates.push(node);
         }
     }
-    // Lowest node number first, so the pairing is deterministic on a device
-    // that somehow exposes more than one metadata node per interface.
-    candidates.sort();
+    // Lowest node NUMBER first, so the pairing is deterministic on a device
+    // that somehow exposes more than one metadata node per interface. Sorting
+    // the strings would order /dev/video10 before /dev/video2, which is the
+    // opposite of what the rule says and is reachable on any host with
+    // double-digit node numbers.
+    candidates.sort_by_key(|node| (node_number(node), node.clone()));
     candidates
+}
+
+/// The trailing integer of a `/dev/videoN` path, for ordering. A path with no
+/// trailing digits sorts last and then by name, so an unexpected shape is
+/// merely deprioritised rather than treated as node zero.
+fn node_number(node: &str) -> u32 {
+    let digits: String = node
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().unwrap_or(u32::MAX)
 }
 
 /// Whether `node` is a metadata node that offers the Microsoft format.
@@ -994,6 +1022,41 @@ mod tests {
         let found = siblings_on_same_interface("/dev/video2", &root.join("class"));
         assert_eq!(found, vec!["/dev/video3".to_string()]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn siblings_are_ordered_by_node_number_not_by_name() {
+        // Sorting the strings puts /dev/video10 before /dev/video2, which is
+        // the opposite of the documented rule and reachable on any host that
+        // has reached double-digit node numbers.
+        let root = fake_sysfs(
+            "ordering",
+            &[
+                ("video4", Some("1-1:1.0")),
+                ("video10", Some("1-1:1.0")),
+                ("video2", Some("1-1:1.0")),
+                ("video9", Some("1-1:1.0")),
+            ],
+        );
+        let found = siblings_on_same_interface("/dev/video4", &root.join("class"));
+        assert_eq!(
+            found,
+            vec![
+                "/dev/video2".to_string(),
+                "/dev/video9".to_string(),
+                "/dev/video10".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_node_name_with_no_number_sorts_last_rather_than_first() {
+        assert_eq!(node_number("/dev/video10"), 10);
+        assert_eq!(node_number("/dev/video2"), 2);
+        // Not "node zero": an unexpected shape must not outrank a real node.
+        assert_eq!(node_number("/dev/videoX"), u32::MAX);
+        assert_eq!(node_number(""), u32::MAX);
     }
 
     #[test]

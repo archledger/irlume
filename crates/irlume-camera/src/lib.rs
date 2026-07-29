@@ -1297,6 +1297,11 @@ impl IrSession<'_> {
         // NOT used, because the two queues are drained independently.
         let mut stamps: Vec<i64> = Vec::with_capacity(IR_BURST);
         let mut meta = self.meta.as_mut();
+        // A session is reused across captures, so last burst's records are both
+        // useless and unbounded growth if kept.
+        if let Some(log) = meta.as_mut() {
+            log.begin_burst();
+        }
         for i in 0..IR_BURST {
             if i == IR_BURST / 2 {
                 ir_emitter::enable(fd, card, device);
@@ -1326,6 +1331,33 @@ impl IrSession<'_> {
             None => vec![None; means.len()],
         };
         let from_camera = flags.iter().filter(|f| f.is_some()).count();
+        // Per-frame comparison of the two answers, for measuring how often the
+        // old threshold disagreed with the camera. A disagreement is the whole
+        // reason this path exists, and it can only be observed against a scene
+        // that produces one, so the instrument is kept rather than reasoned about.
+        if std::env::var("IRLUME_DEBUG_IR_FRAMES").is_ok() {
+            for (i, (&m, f)) in means.iter().zip(&flags).enumerate() {
+                let camera = match f {
+                    Some(ir_metadata::Illumination::Lit) => "lit",
+                    Some(ir_metadata::Illumination::Dark) => "dark",
+                    None => "unsaid",
+                };
+                let threshold = if m >= f64::from(ir_emitter::IR_LIT_MEAN) {
+                    "lit"
+                } else {
+                    "dark"
+                };
+                let verdict = match f {
+                    Some(_) if camera != threshold => "DISAGREE",
+                    Some(_) => "agree",
+                    None => "-",
+                };
+                eprintln!(
+                    "[ir_frame] {i:2} mean {m:6.1}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    ir_emitter::IR_LIT_MEAN
+                );
+            }
+        }
         let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
         let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         // The brightest frame the CAMERA flagged lit. With no flags this is the

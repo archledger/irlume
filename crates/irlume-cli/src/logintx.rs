@@ -116,7 +116,23 @@ impl Transaction {
         restrict(&dir, 0o700)?;
         let path = dir.join(format!("{}.json", self.id));
         let body = serde_json::to_string(self).map_err(|e| format!("serialize record: {e}"))?;
-        std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        // Created 0600 rather than created-then-chmodded. Between a default-mode
+        // create and a later chmod there is a window, however brief, where the
+        // record is readable by anyone the umask allows, and it describes exactly
+        // how this machine authenticates.
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        // An existing record from an earlier run keeps its old mode through
+        // OpenOptions, so the mode is asserted either way.
         restrict(&path, 0o600)?;
         Ok(path)
     }
@@ -126,15 +142,38 @@ impl Transaction {
     /// The id is used as a filename, so it is checked to be plain hex first: a
     /// consumer-supplied id containing a separator would otherwise reach
     /// outside the store.
-    pub(crate) fn load(id: &str) -> Result<Self, String> {
+    pub(crate) fn load(id: &str) -> Result<Self, LoadFailure> {
         if !is_valid_id(id) {
-            return Err("transaction id is not a hex identifier".into());
+            return Err(LoadFailure::NotFound);
         }
         let path = store_dir().join(format!("{id}.json"));
-        let body =
-            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))
+        let body = match std::fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LoadFailure::NotFound)
+            }
+            // The store is root-only, so an ordinary caller lands here. Saying
+            // "not found" would tell them their transaction id was wrong when
+            // the truth is that they may not read it.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(LoadFailure::NotAuthorized)
+            }
+            Err(error) => return Err(LoadFailure::Unreadable(format!("{error}"))),
+        };
+        serde_json::from_str(&body).map_err(|e| LoadFailure::Unreadable(format!("{e}")))
     }
+}
+
+/// Why a record could not be loaded.
+///
+/// Separated because they mean different things to a caller: a missing record
+/// is a wrong or expired id, while a record that cannot be read is a permission
+/// or storage problem the id has nothing to do with.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoadFailure {
+    NotFound,
+    NotAuthorized,
+    Unreadable(String),
 }
 
 /// Whether a transaction id is safe to use as a filename.

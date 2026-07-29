@@ -461,9 +461,8 @@ Sudo and polkit are opt-in on the human command and are not included in a plan,
 so a panel never shows a user surfaces they did not ask for. Disabling still
 covers every surface, because turning login off leaves nothing behind.
 
-**Applying a plan is not implemented yet.** `login apply`, `login verify` and
-`login rollback` are not part of contract 1 and must not be inferred from this
-command or from human output.
+A plan is carried out by `login apply` below, which re-derives it and refuses a
+`plan_id` that no longer matches.
 
 ### `irlume login apply` / `verify` / `rollback`
 

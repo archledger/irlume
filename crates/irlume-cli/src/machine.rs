@@ -749,6 +749,53 @@ fn require_root(command: &'static str, contract: u32) -> Option<ExitCode> {
     ))
 }
 
+/// Emit a document with extra top-level fields merged in.
+///
+/// Used where a FAILURE still carries something the caller needs, such as the
+/// transaction id of a partial apply. Contract 1 permits fields to be added, so
+/// this stays inside the contract; putting the value on stderr would not,
+/// because machine mode promises stderr is empty.
+fn emit_with_extra(document: &Document, extra: Value, exit: ExitCode) -> ExitCode {
+    let mut value = match serde_json::to_value(document) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("irlume machine output serialization failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let (Some(object), Some(fields)) = (value.as_object_mut(), extra.as_object()) {
+        for (key, field) in fields {
+            object.insert(key.clone(), field.clone());
+        }
+    }
+    match serde_json::to_string(&value) {
+        Ok(line) => {
+            println!("{line}");
+            exit
+        }
+        Err(error) => {
+            eprintln!("irlume machine output serialization failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Report why a transaction record could not be loaded, without flattening the
+/// reasons into one code. A caller told "not found" for a permission problem
+/// would go looking for a wrong transaction id.
+fn emit_load_failure(
+    command: &'static str,
+    reason: crate::logintx::LoadFailure,
+    contract: u32,
+) -> ExitCode {
+    let code = match reason {
+        crate::logintx::LoadFailure::NotFound => "not-found",
+        crate::logintx::LoadFailure::NotAuthorized => "not-authorized",
+        crate::logintx::LoadFailure::Unreadable(_) => "operation-failed",
+    };
+    emit(&failure(command, code, false, contract), ExitCode::FAILURE)
+}
+
 /// Each surface's state, and how many are not as apply left them.
 ///
 /// Split out so it can be driven by a test with a record pointing at temporary
@@ -774,14 +821,38 @@ fn verify_surfaces(record: &crate::logintx::Transaction) -> (Vec<Value>, usize) 
     (surfaces, drifted)
 }
 
-/// The surfaces that block a rollback. Empty means it may proceed.
-fn drifted_surfaces(record: &crate::logintx::Transaction) -> Vec<&str> {
-    record
-        .surfaces
-        .iter()
-        .filter(|surface| crate::logintx::unchanged_since_apply(surface).is_err())
-        .map(|surface| surface.id.as_str())
-        .collect()
+/// What blocks a rollback, kept apart by reason.
+///
+/// A file that CHANGED and one that cannot be READ are different problems: a
+/// consumer told "changed-since-apply" goes looking for an edit, when the truth
+/// may be a permission or storage fault the transaction had nothing to do with.
+/// Both still stop the rollback, since neither is safe to restore over.
+#[derive(Default)]
+pub(crate) struct RollbackBlockers<'a> {
+    pub(crate) changed: Vec<&'a str>,
+    pub(crate) unreadable: Vec<&'a str>,
+}
+
+impl RollbackBlockers<'_> {
+    pub(crate) fn any(&self) -> bool {
+        !self.changed.is_empty() || !self.unreadable.is_empty()
+    }
+}
+
+fn rollback_blockers(record: &crate::logintx::Transaction) -> RollbackBlockers<'_> {
+    let mut blockers = RollbackBlockers::default();
+    for surface in &record.surfaces {
+        match crate::logintx::unchanged_since_apply(surface) {
+            Ok(()) => {}
+            Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => {
+                blockers.changed.push(surface.id.as_str());
+            }
+            Err(crate::logintx::RollbackRefusal::Unreadable(_)) => {
+                blockers.unreadable.push(surface.id.as_str());
+            }
+        }
+    }
+    blockers
 }
 
 /// `irlume login apply --action X --plan-id ID --json`: carry out a plan.
@@ -881,16 +952,21 @@ pub fn login_apply(args: &[String]) -> ExitCode {
         emit(&success(COMMAND, data, contract), ExitCode::SUCCESS)
     } else {
         // A partial apply is a failure that still has a transaction id, because
-        // the surfaces that DID change are recorded and can be rolled back. The
-        // id is on stderr rather than lost: the error document carries no data.
+        // the surfaces that DID change are recorded and can be rolled back.
+        //
+        // The id travels IN THE DOCUMENT, not on stderr. Machine mode promises
+        // stdout carries the answer and stderr is empty, and the conformance
+        // suite enforces that, so a hint printed there would break a caller that
+        // trusts the envelope. Contract 1 permits fields to be added, which is
+        // what makes carrying it here possible without a contract bump.
         irlume_common::dlog!(
             "login.apply: {} surface(s) failed; transaction {} can be rolled back",
             failed.len(),
             record.id
         );
-        eprintln!("transaction {} recorded; roll back with: irlume login rollback --transaction-id {} --apply --json", record.id, record.id);
-        emit(
+        emit_with_extra(
             &failure(COMMAND, "operation-failed", false, contract),
+            json!({ "transaction_id": record.id, "failed": failed.len() }),
             ExitCode::FAILURE,
         )
     }
@@ -927,11 +1003,9 @@ pub fn login_verify(args: &[String]) -> ExitCode {
             ExitCode::from(2),
         );
     };
-    let Ok(record) = crate::logintx::Transaction::load(&id) else {
-        return emit(
-            &failure(COMMAND, "not-found", false, contract),
-            ExitCode::FAILURE,
-        );
+    let record = match crate::logintx::Transaction::load(&id) {
+        Ok(record) => record,
+        Err(reason) => return emit_load_failure(COMMAND, reason, contract),
     };
     let (surfaces, drifted) = verify_surfaces(&record);
     emit(
@@ -993,22 +1067,28 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
             return refusal;
         }
     }
-    let Ok(record) = crate::logintx::Transaction::load(&id) else {
-        return emit(
-            &failure(COMMAND, "not-found", false, contract),
-            ExitCode::FAILURE,
-        );
+    let record = match crate::logintx::Transaction::load(&id) {
+        Ok(record) => record,
+        Err(reason) => return emit_load_failure(COMMAND, reason, contract),
     };
     // Every surface is checked BEFORE any is written. A rollback that restored
     // three files and then met a fourth it must refuse would leave the stack in
     // a state neither the transaction nor the admin chose.
-    let drifted = drifted_surfaces(&record);
-    if !drifted.is_empty() {
-        irlume_common::dlog!("login.rollback: refused; changed since apply: {drifted:?}");
-        return emit(
-            &failure(COMMAND, "changed-since-apply", false, contract),
-            ExitCode::FAILURE,
+    let blockers = rollback_blockers(&record);
+    if blockers.any() {
+        irlume_common::dlog!(
+            "login.rollback: refused; changed {:?}, unreadable {:?}",
+            blockers.changed,
+            blockers.unreadable
         );
+        // A surface that cannot be READ is its own failure, not drift. Calling
+        // it drift would send a consumer hunting for an edit nobody made.
+        let code = if blockers.changed.is_empty() {
+            "operation-failed"
+        } else {
+            "changed-since-apply"
+        };
+        return emit(&failure(COMMAND, code, false, contract), ExitCode::FAILURE);
     }
     if !will_apply {
         return emit(
@@ -1034,12 +1114,18 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
             Ok(()) => restored.push(surface.id.clone()),
             Err(message) => {
                 irlume_common::dlog!("login.rollback: {} failed: {message}", surface.id);
-                eprintln!(
-                    "rollback stopped after restoring {:?}; {} could not be written",
-                    restored, surface.id
-                );
-                return emit(
+                // What was already restored travels in the document, for the
+                // same reason as in apply: machine mode promises an empty
+                // stderr. A caller stopped partway needs to know exactly how far
+                // it got, and that is not something to lose to a channel the
+                // envelope says is unused.
+                return emit_with_extra(
                     &failure(COMMAND, "operation-failed", false, contract),
+                    json!({
+                        "transaction_id": record.id,
+                        "restored": restored,
+                        "stopped_at": surface.id,
+                    }),
                     ExitCode::FAILURE,
                 );
             }
@@ -1709,7 +1795,9 @@ mod tests {
         assert_eq!(drifted, 1);
 
         // Rollback is gated on the same rule, and names what blocks it.
-        assert_eq!(drifted_surfaces(&record), vec!["sudo"]);
+        let blockers = rollback_blockers(&record);
+        assert_eq!(blockers.changed, vec!["sudo"]);
+        assert!(blockers.unreadable.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1725,19 +1813,25 @@ mod tests {
             file.as_path(),
             &crate::logintx::sha256_hex(b"as applied\n"),
         )]);
-        assert!(
-            drifted_surfaces(&record).is_empty(),
-            "clean stack rolls back"
-        );
+        assert!(!rollback_blockers(&record).any(), "clean stack rolls back");
 
         std::fs::write(&file, "changed\n").expect("write");
-        assert_eq!(drifted_surfaces(&record), vec!["kde"]);
+        let blockers = rollback_blockers(&record);
+        assert_eq!(blockers.changed, vec!["kde"]);
+        assert!(
+            blockers.unreadable.is_empty(),
+            "an edit is not a read fault"
+        );
 
-        // An unreadable surface blocks a rollback too: it is not evidence the
-        // file is unchanged, so restoring over it would be a guess.
+        // An unreadable surface blocks a rollback too, but as its OWN reason:
+        // it is not evidence the file changed, and reporting it as drift would
+        // send a consumer hunting for an edit nobody made.
         std::fs::remove_file(&file).expect("rm");
         std::fs::create_dir(&file).expect("mkdir in its place");
-        assert_eq!(drifted_surfaces(&record), vec!["kde"]);
+        let blockers = rollback_blockers(&record);
+        assert!(blockers.any(), "unreadable still stops the rollback");
+        assert_eq!(blockers.unreadable, vec!["kde"]);
+        assert!(blockers.changed.is_empty(), "unreadable is not drift");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

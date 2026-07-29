@@ -971,14 +971,57 @@ pub(crate) fn apply(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<App
         with_polkit,
         &mut |svc, role, wire, want| {
             let path = Path::new(svc.etc);
-            let before = std::fs::read_to_string(path).ok();
+            // A file that exists but cannot be read is NOT the same as an
+            // absent one. Collapsing the two with `.ok()` would record
+            // `before: None`, and a later rollback would then DELETE a file it
+            // never captured. Only a genuine NotFound may become None.
+            let (before, mut read_error) = match std::fs::read_to_string(path) {
+                Ok(content) => (Some(content), None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "read {} before changing it: {error}",
+                        path.display()
+                    )),
+                ),
+            };
+            if let Some(message) = read_error {
+                // Not touched at all: without a usable before-state there is
+                // nothing to roll back to, so writing would be irreversible.
+                out.push(AppliedSurface {
+                    id: service_name(svc.etc),
+                    role,
+                    path: svc.etc.to_string(),
+                    change: PlannedChange::NotInstalled,
+                    before: None,
+                    after_sha256: crate::logintx::ABSENT.to_string(),
+                    error: Some(message),
+                });
+                return;
+            }
             let (change, error) = match wire_service(svc, enable && want, true, wire) {
                 Ok(outcome) => (outcome.change, None),
                 Err(message) => (PlannedChange::NotInstalled, Some(message)),
             };
-            let after_sha256 = std::fs::read(path)
-                .map(|bytes| crate::logintx::sha256_hex(&bytes))
-                .unwrap_or_else(|_| crate::logintx::ABSENT.to_string());
+            // Same rule after the write: only a real NotFound is ABSENT. An
+            // unreadable file would otherwise record a digest
+            // `unchanged_since_apply` can never match, so rollback would report
+            // drift forever instead of the read problem it actually has.
+            let after_sha256 = match std::fs::read(path) {
+                Ok(bytes) => crate::logintx::sha256_hex(&bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::logintx::ABSENT.to_string()
+                }
+                Err(error) => {
+                    read_error = Some(format!(
+                        "read {} after changing it: {error}",
+                        path.display()
+                    ));
+                    crate::logintx::ABSENT.to_string()
+                }
+            };
+            let error = error.or(read_error);
             out.push(AppliedSurface {
                 id: service_name(svc.etc),
                 role,

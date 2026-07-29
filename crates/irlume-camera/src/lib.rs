@@ -23,6 +23,7 @@
 //! panic on some drivers. Probe, don't assume.
 
 pub mod ir_emitter;
+mod ir_metadata;
 pub mod uvc_descriptor;
 
 use irlume_common::Error;
@@ -102,6 +103,12 @@ pub struct IrCaptureStats {
     pub lit_mean: f32,
     pub ambient_mean: f32,
     pub burst_frames: usize,
+    /// How many burst frames the camera itself classified as lit or dark, via
+    /// its UVC illumination metadata. Zero means the camera reported nothing
+    /// and the two means above are the burst's brightness extremes, as they
+    /// always were. Recorded so "the metadata path ran" is something callers
+    /// can check rather than assume.
+    pub camera_classified_frames: usize,
 }
 
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
@@ -1230,6 +1237,12 @@ impl IrCamera {
     /// they are the only protection for modules we have never seen.
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
         let mut stream = SafeStream::open(&self.device, &self.dev)?;
+        // The metadata queue has to be streaming before the image queue starts,
+        // or uvcvideo produces no metadata at all (measured: zero bytes over
+        // 25s when video went first). `SafeStream::open` only allocates
+        // buffers; STREAMON happens on the first dequeue, which is inside
+        // `warm_up_stream` below. This is the window, and it is the only one.
+        let meta = ir_metadata::IlluminationLog::open(&self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream)?;
@@ -1242,6 +1255,7 @@ impl IrCamera {
             stream,
             dec: IrDecoder::new(self.pix),
             lit,
+            meta,
         })
     }
 }
@@ -1252,6 +1266,9 @@ pub struct IrSession<'a> {
     stream: SafeStream<'a>,
     dec: IrDecoder,
     lit: bool,
+    /// The camera's own per-frame illumination reporting, when it has any.
+    /// `None` means this camera cannot say, and brightness decides as before.
+    meta: Option<ir_metadata::IlluminationLog>,
 }
 
 impl IrSession<'_> {
@@ -1274,29 +1291,47 @@ impl IrSession<'_> {
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
         let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
         let mut taken: Vec<std::time::Instant> = Vec::with_capacity(IR_BURST);
+        // Each frame's V4L2 buffer timestamp, the key that ties it to the
+        // camera's illumination record. Measured identical across the image and
+        // metadata queues for every frame of a 24-frame run; dequeue order is
+        // NOT used, because the two queues are drained independently.
+        let mut stamps: Vec<i64> = Vec::with_capacity(IR_BURST);
+        let mut meta = self.meta.as_mut();
         for i in 0..IR_BURST {
             if i == IR_BURST / 2 {
                 ir_emitter::enable(fd, card, device);
             }
-            let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            let (buf, bmeta) = stream.next().map_err(|e| map_io(device, e))?;
+            stamps.push(bmeta.timestamp.sec * 1_000_000 + bmeta.timestamp.usec);
             taken.push(std::time::Instant::now());
+            // Drain every iteration, not once at the end. The metadata ring is
+            // smaller than a burst, so a single drain afterwards silently loses
+            // the earliest frames' records: measured 7 of 10 frames classified
+            // with an end-of-burst drain, 10 of 10 draining per frame. A
+            // non-blocking dequeue that finds nothing costs microseconds
+            // against a 67ms frame interval.
+            if let Some(log) = meta.as_mut() {
+                log.drain();
+            }
             let data = dec.decode(buf, w, h);
             means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
             frames.push(data);
         }
+        let flags: Vec<Option<ir_metadata::Illumination>> = match meta {
+            Some(log) => {
+                // The last frame's record can land just after its image buffer.
+                log.drain();
+                stamps.iter().map(|&t| log.illumination_at(t)).collect()
+            }
+            None => vec![None; means.len()],
+        };
+        let from_camera = flags.iter().filter(|f| f.is_some()).count();
         let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
         let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        // First frame holding the max mean (strictly-greater scan), matching the
-        // original incremental behaviour exactly so the flag-off path is unchanged
-        // (max_by would keep the LAST tie, changing the chosen frame on ties).
-        let mut best_i = 0usize;
-        let mut best_mean = -1.0f64;
-        for (i, &m) in means.iter().enumerate() {
-            if m > best_mean {
-                best_mean = m;
-                best_i = i;
-            }
-        }
+        // The brightest frame the CAMERA flagged lit. With no flags this is the
+        // first frame holding the max mean, exactly the original incremental
+        // scan, so the no-metadata path is unchanged.
+        let best_i = ir_metadata::brightest_lit(&means, &flags).unwrap_or(0);
         let mut best = Some(frames[best_i].clone());
         let mut ir_window = CaptureWindow::at(taken[best_i]);
 
@@ -1328,12 +1363,11 @@ impl IrSession<'_> {
         let subtract = std::env::var("IRLUME_IR_AMBIENT_SUBTRACT").is_ok_and(|v| v.trim() == "1");
         let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
         if subtract {
-            let neighbors = [best_i.wrapping_sub(1), best_i + 1];
-            let ambient_i = neighbors
-                .iter()
-                .filter(|&&j| j < means.len())
-                .min_by(|&&a, &&b| means[a].total_cmp(&means[b]))
-                .copied();
+            // An adjacent frame the camera flagged dark, else the darker
+            // neighbour as before. Adjacency still bounds auto-exposure drift
+            // between the pair; metadata only settles which neighbour is
+            // genuinely the emitter-off exposure.
+            let ambient_i = ir_metadata::ambient_partner(best_i, &means, &flags);
             if let Some(ai) = ambient_i {
                 let (lit_mean, amb_mean) = (means[best_i], means[ai]);
                 // Subtract only when there is a real strobe gap (a genuine off-frame,
@@ -1375,8 +1409,34 @@ impl IrSession<'_> {
                 }
             }
         }
+        // Lit and ambient levels follow the camera's own classification when it
+        // gave one. `bmax` is the wrong answer precisely in the case this exists
+        // to fix: a frame the camera flagged dark can hold the burst's highest
+        // mean, and reporting that as the lit level would feed the ambient-relative
+        // gates a strobe gap that never happened. With no metadata both fall back
+        // to the burst extremes, unchanged.
+        let best_mean = means.get(best_i).copied().unwrap_or(0.0);
+        let (lit_level, ambient_level) = if from_camera == 0 {
+            (bmax, bmin)
+        } else {
+            let dark_min = means
+                .iter()
+                .zip(&flags)
+                .filter(|(_, f)| matches!(f, Some(ir_metadata::Illumination::Dark)))
+                .map(|(m, _)| *m)
+                .fold(f64::INFINITY, f64::min);
+            (
+                best_mean,
+                if dark_min.is_finite() { dark_min } else { bmin },
+            )
+        };
         if debug_ir {
             eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
+            eprintln!(
+                "[ir] illumination: {from_camera}/{} frames classified by the camera; \
+                 chose frame {best_i} (mean {best_mean:.1}), lit {lit_level:.1} / ambient {ambient_level:.1}",
+                means.len()
+            );
         }
         // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
         // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
@@ -1401,9 +1461,10 @@ impl IrSession<'_> {
                 captured: ir_window,
             },
             IrCaptureStats {
-                lit_mean: bmax as f32,
-                ambient_mean: bmin as f32,
+                lit_mean: lit_level as f32,
+                ambient_mean: ambient_level as f32,
                 burst_frames: IR_BURST,
+                camera_classified_frames: from_camera,
             },
         ))
     }

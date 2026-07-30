@@ -541,27 +541,74 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
     // `IRLUME_IR_EMITTER=off` still means irlume sends the camera nothing. A
     // record pending on a machine set that way surfaces through `irlume doctor`
     // instead.
-    report_recovery(&id, recover_pending_write(fd, &id));
+    let recovery = recover_pending_write(fd, &id);
+    let action = planned_action(&recovery, wanted, &id);
+    report_recovery(&id, recovery);
 
-    if let Some(ctrl) = wanted {
-        return apply_override(fd, &id, &ctrl);
+    match action {
+        CaptureAction::Nothing => false,
+        CaptureAction::Override(ctrl) => apply_override(fd, &id, &ctrl),
+        CaptureAction::DeviceDefault { unit, selector } => {
+            apply_device_default(fd, unit, selector).is_ok()
+        }
+        CaptureAction::KnownPayload(ctrl) => apply_known_payload(fd, &ctrl).is_ok(),
+    }
+}
+
+/// Which control, if any, a capture should apply to this camera.
+///
+/// Extracted so the decision is a VALUE. Every input is either pure or a file
+/// read a test can point somewhere else, which `enable` itself is not: it needs
+/// an open camera to reach any of this, so nothing below could be tested at all
+/// while it lived inline. The gap was not theoretical. `enable` used to run the
+/// recovery pass, log that a camera must not be written to, and then apply the
+/// configured control to the very unit and selector the unresolved record named,
+/// at every stream open and every eighth frame of a burst.
+fn planned_action(
+    recovery: &RecoveryOutcome,
+    wanted: Option<EmitterControl>,
+    id: &crate::uvc_descriptor::CameraIdentity,
+) -> CaptureAction {
+    // First, before any of the three sources are consulted: all three write to
+    // the same extension unit an unresolved record is about.
+    //
+    // The cost of refusing is the emitter, so IR authentication does not light
+    // and the user falls back to a password until a human resolves it. #159 is
+    // a camera that never enumerated again after unverified extension-unit
+    // writes, and a control that has already failed to read back what was
+    // written to it is the clearest available sign of that territory.
+    if !recovery.permits_capture_write() {
+        return CaptureAction::Nothing;
     }
 
-    if let Some((unit, selector)) = load_conf(&id) {
+    if let Some(ctrl) = wanted {
+        return CaptureAction::Override(ctrl);
+    }
+
+    if let Some((unit, selector)) = load_conf(id) {
         let recorded = EmitterControl {
             unit,
             selector,
             payload: Vec::new(),
         };
-        if control_is_documented(&id, &recorded) {
-            return apply_device_default(fd, unit, selector).is_ok();
+        if control_is_documented(id, &recorded) {
+            return CaptureAction::DeviceDefault { unit, selector };
         }
     }
 
-    match known_control(id.vid, id.pid).filter(|c| control_is_documented(&id, c)) {
-        Some(ctrl) => apply_known_payload(fd, &ctrl).is_ok(),
-        None => false,
+    match known_control(id.vid, id.pid).filter(|c| control_is_documented(id, c)) {
+        Some(ctrl) => CaptureAction::KnownPayload(ctrl),
+        None => CaptureAction::Nothing,
     }
+}
+
+/// What `enable` decided to send the camera. `Nothing` means no ioctl at all.
+#[derive(Debug, Clone, PartialEq)]
+enum CaptureAction {
+    Nothing,
+    Override(EmitterControl),
+    DeviceDefault { unit: u8, selector: u8 },
+    KnownPayload(EmitterControl),
 }
 
 /// Why an `IRLUME_IR_EMITTER` override was not written to the camera.
@@ -1401,10 +1448,27 @@ pub(crate) fn recover_pending_write(
     let record = match journal::load(id) {
         Ok(None) => return RecoveryOutcome::NothingPending,
         Ok(Some(record)) => record,
-        Err(why) => return RecoveryOutcome::Unreadable(why),
+        // A store that cannot be read may be hiding a change to THIS camera, so
+        // it is unresolved rather than "nothing pending".
+        Err(why) => return RecoveryOutcome::Unresolved(why),
     };
     if let Err(mismatch) = journal::record_applies(&record, id) {
-        return RecoveryOutcome::NotApplicable(mismatch);
+        use journal::Mismatch;
+        return match mismatch {
+            // Not about this camera. Everything else is.
+            Mismatch::DifferentCamera => RecoveryOutcome::ForAnotherCamera,
+            Mismatch::OwnerStillRunning { pid } => RecoveryOutcome::OwnerStillRunning { pid },
+            Mismatch::OutOfAttempts { attempts } => RecoveryOutcome::Unresolved(format!(
+                "{attempts} attempts to put it back did not take, so no more will be made"
+            )),
+            Mismatch::SchemaTooNew { found, supported } => RecoveryOutcome::Unresolved(format!(
+                "the record is schema {found} and this build implements {supported}"
+            )),
+            Mismatch::Malformed(why) => RecoveryOutcome::Unresolved(format!("malformed: {why}")),
+            Mismatch::ControlNotPublished => RecoveryOutcome::Unresolved(
+                "the record names a control this camera does not publish".into(),
+            ),
+        };
     }
 
     // Read the control before deciding anything. A restore that is not needed is
@@ -1423,16 +1487,18 @@ pub(crate) fn recover_pending_write(
             current,
         },
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            return RecoveryOutcome::Unreadable(format!("query the control: {e}"))
+            return RecoveryOutcome::Unresolved(format!("query the control: {e}"))
         }
     };
 
     match journal::restore_decision(&record, &now) {
         journal::Restore::AlreadyRestored => match journal::clear(&record.descriptor_sha256) {
             Ok(()) => RecoveryOutcome::AlreadyRestored,
-            Err(why) => RecoveryOutcome::Unreadable(why),
+            // The control holds its original. Only the store is unhappy, and the
+            // store does not decide what the camera holds.
+            Err(why) => RecoveryOutcome::RestoredRecordKept(why),
         },
-        journal::Restore::Refuse(why) => RecoveryOutcome::Refused(why),
+        journal::Restore::Refuse(why) => RecoveryOutcome::Unresolved(why),
         journal::Restore::Write(original) => {
             // Count the attempt BEFORE the write and make it durable. Counting
             // after would leave a kill during the restore uncounted, and a
@@ -1449,10 +1515,12 @@ pub(crate) fn recover_pending_write(
             spent.boot_id = None;
             spent.pid = None;
             if let Err(why) = journal::save(&spent) {
-                return RecoveryOutcome::Unreadable(why);
+                // The attempt could not be counted, so making it would be an
+                // uncounted write: exactly the loop the counter exists to stop.
+                return RecoveryOutcome::Unresolved(format!("count the attempt: {why}"));
             }
             if let Err(e) = set_cur(fd, record.unit, record.selector, &original) {
-                return RecoveryOutcome::Refused(format!("restore: {e}"));
+                return RecoveryOutcome::Unresolved(format!("restore: {e}"));
             }
             match get_cur(fd, record.unit, record.selector, original.len()) {
                 Ok(back) if back == original => match journal::clear(&record.descriptor_sha256) {
@@ -1460,12 +1528,12 @@ pub(crate) fn recover_pending_write(
                         unit: record.unit,
                         selector: record.selector,
                     },
-                    Err(why) => RecoveryOutcome::Unreadable(why),
+                    Err(why) => RecoveryOutcome::RestoredRecordKept(why),
                 },
-                Ok(back) => RecoveryOutcome::Refused(format!(
+                Ok(back) => RecoveryOutcome::Unresolved(format!(
                     "the control reads {back:02x?} after being restored to {original:02x?}"
                 )),
-                Err(e) => RecoveryOutcome::Unreadable(format!("read the control back: {e}")),
+                Err(e) => RecoveryOutcome::Unresolved(format!("read the control back: {e}")),
             }
         }
     }
@@ -1499,41 +1567,61 @@ fn report_recovery(id: &crate::uvc_descriptor::CameraIdentity, outcome: Recovery
     }
 }
 
-/// What a recovery pass did. Reported rather than swallowed: this is a write to
-/// camera firmware on a path nobody asked for, so it says so in the journal.
+/// What a recovery pass did.
+///
+/// The variants are split by what the CALLER must do next, not by what went
+/// wrong. Three call sites ask this type two questions — may I write to this
+/// camera, and may discovery start — and both answers live here rather than
+/// being re-derived from a reason string at each site.
+///
+/// "Could not read" used to be one variant covering the store, the control, and
+/// the removal of a record after a confirmed restore. Those call for opposite
+/// actions: a control that will not answer means stop, while a record that will
+/// not delete after the control is provably back means the camera is fine and
+/// the store is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecoveryOutcome {
     NothingPending,
-    /// The control already held the original; the record was dropped and nothing
-    /// was written.
+    /// A record exists for a DIFFERENT camera. Ordinary on a machine with two of
+    /// them, and none of this camera's business: it must not stop the emitter
+    /// here, which is the whole reason this is not folded in with the refusals.
+    ForAnotherCamera,
+    /// The control already held the original and the record was dropped.
     AlreadyRestored,
     Restored {
         unit: u8,
         selector: u8,
     },
-    /// A record exists for a different camera, a newer schema, or a control this
-    /// camera no longer publishes. Left exactly as it is.
-    NotApplicable(crate::emitter_journal::Mismatch),
-    /// The record stands and could not be acted on. It stays on disk.
-    Refused(String),
-    Unreadable(String),
+    /// The control is confirmed back at its original, but the record could not be
+    /// removed. The camera is in the right state, so capture may proceed; the
+    /// store is not, so discovery may not, because it could not record its own
+    /// next write either.
+    RestoredRecordKept(String),
+    /// A run that opened a record on this camera is still going. Silent, and it
+    /// stops both a capture write and a second discovery: the control is
+    /// SUPPOSED to be changed right now.
+    OwnerStillRunning {
+        pid: u32,
+    },
+    /// An outstanding change on THIS camera that could not be resolved. Nothing
+    /// further may be written to it by any path.
+    Unresolved(String),
 }
 
 impl RecoveryOutcome {
     /// One line for the log, or nothing when there was nothing to do.
     ///
-    /// `NotApplicable` is silent for a different camera, which is the ordinary
-    /// case on a machine with two of them and would otherwise print at every
-    /// capture. Everything else is loud: a pending firmware change that cannot
-    /// be undone is the operator's problem, not a debug detail.
+    /// A different camera and a live setup run are silent: both are ordinary and
+    /// both would otherwise print at every capture. Everything else is loud. A
+    /// pending firmware change that cannot be undone is the operator's problem,
+    /// not a debug detail, and each of those messages now also says that the
+    /// emitter is off as a result, because a user whose face login stopped
+    /// working is owed the reason in the same line.
     pub(crate) fn message(&self) -> Option<String> {
-        use crate::emitter_journal::Mismatch;
+        let store = crate::emitter_journal::store_dir();
         match self {
-            Self::NothingPending => None,
-            Self::NotApplicable(Mismatch::DifferentCamera) => None,
-            // A setup run in flight is the normal reason to see this, and it is
-            // about to resolve its own record.
-            Self::NotApplicable(Mismatch::OwnerStillRunning { .. }) => None,
+            Self::NothingPending | Self::ForAnotherCamera => None,
+            Self::OwnerStillRunning { .. } => None,
             Self::AlreadyRestored => Some(
                 "irlume: an interrupted emitter setup was already undone; \
                  dropped its undo record"
@@ -1543,24 +1631,18 @@ impl RecoveryOutcome {
                 "irlume: an interrupted emitter setup had left unit {unit} selector {selector} \
                  changed; put it back to the value the camera reported before that run"
             )),
-            Self::NotApplicable(Mismatch::OutOfAttempts { attempts }) => Some(format!(
-                "irlume: an emitter control was changed by an interrupted setup and {attempts} \
-                 attempts to put it back did not take. Nothing further will be written to it. \
-                 The recorded original is in {}",
-                crate::emitter_journal::store_dir().display()
+            Self::RestoredRecordKept(why) => Some(format!(
+                "irlume: an emitter control was put back and confirmed, but its undo record in \
+                 {} could not be removed ({why}). The camera is in the right state; \
+                 `irlume ir-setup` will refuse until the record can be written",
+                store.display()
             )),
-            Self::NotApplicable(why) => Some(format!(
-                "irlume: an emitter undo record cannot be applied to this camera ({why:?}); \
-                 left in {}",
-                crate::emitter_journal::store_dir().display()
-            )),
-            Self::Refused(why) => Some(format!(
-                "irlume: an emitter control left changed by an interrupted setup was not put \
-                 back ({why}); the undo record stays in {}",
-                crate::emitter_journal::store_dir().display()
-            )),
-            Self::Unreadable(why) => Some(format!(
-                "irlume: could not process the emitter undo record ({why})"
+            Self::Unresolved(why) => Some(format!(
+                "irlume: an emitter control on this camera was left changed by an interrupted \
+                 setup and has not been put back ({why}). irlume will not write to this \
+                 camera's emitter until it is resolved, so IR face authentication will not \
+                 light. The recorded original is in {}",
+                store.display()
             )),
         }
     }
@@ -1569,35 +1651,67 @@ impl RecoveryOutcome {
     fn kind(&self) -> &'static str {
         match self {
             Self::NothingPending => "nothing",
+            Self::ForAnotherCamera => "another-camera",
             Self::AlreadyRestored => "already-restored",
             Self::Restored { .. } => "restored",
-            Self::NotApplicable(_) => "not-applicable",
-            Self::Refused(_) => "refused",
-            Self::Unreadable(_) => "unreadable",
+            Self::RestoredRecordKept(_) => "restored-record-kept",
+            Self::OwnerStillRunning { .. } => "owner-running",
+            Self::Unresolved(_) => "unresolved",
         }
     }
 
-    /// Whether an unresolved change is still outstanding on this camera.
+    /// Whether a capture may go on to apply an emitter control to this camera.
     ///
-    /// Discovery refuses to start when it is. Its first act is to read the
-    /// control and call the answer the original, so running it against a control
-    /// that is still holding a previous run's exploratory value would record the
-    /// wrong bytes as the thing to go back to, and destroy the real ones.
+    /// Reporting that a camera must not be written to and then writing to it is
+    /// worse than never having checked. `enable` used to do exactly that: it
+    /// logged "nothing further will be written to it" and then applied the
+    /// configured control to that same unit and selector on the next line, at
+    /// every stream open and every eighth frame of a burst.
+    ///
+    /// Refusing costs the IR emitter, so face authentication does not light and
+    /// the user falls back to a password until a human resolves it. That is the
+    /// cheaper side of the trade: #159 is a camera that never enumerated again
+    /// after unverified extension-unit writes, and a control that has already
+    /// failed to read back what was written to it is the clearest sign available
+    /// that this camera is in that territory.
+    ///
+    /// A record for ANOTHER camera permits the write. It has nothing to say about
+    /// this one, and treating it as a refusal would put a machine with a detached
+    /// second camera into password-only login for no reason.
+    pub(crate) fn permits_capture_write(&self) -> bool {
+        match self {
+            Self::NothingPending
+            | Self::ForAnotherCamera
+            | Self::AlreadyRestored
+            | Self::Restored { .. }
+            // The control is confirmed back at its original. Only the store is
+            // unhappy, and the store does not decide what the camera holds.
+            | Self::RestoredRecordKept(_) => true,
+            Self::OwnerStillRunning { .. } | Self::Unresolved(_) => false,
+        }
+    }
+
+    /// Whether discovery may start.
+    ///
+    /// Stricter than [`Self::permits_capture_write`] in one place: a record that
+    /// could not be removed also stops discovery, because discovery's first act
+    /// is to write a record of its own, and a store that cannot be written to
+    /// cannot hold one.
+    ///
+    /// Discovery's second act is to read the control and call the answer the
+    /// original, so running it against a control still holding a previous run's
+    /// exploratory value would record the wrong bytes as the thing to go back to
+    /// and destroy the real ones.
     pub(crate) fn blocks_discovery(&self) -> bool {
-        matches!(self, Self::Refused(_) | Self::Unreadable(_))
-            || matches!(
-                self,
-                Self::NotApplicable(
-                    crate::emitter_journal::Mismatch::OutOfAttempts { .. }
-                        | crate::emitter_journal::Mismatch::SchemaTooNew { .. }
-                        | crate::emitter_journal::Mismatch::Malformed(_)
-                        | crate::emitter_journal::Mismatch::ControlNotPublished
-                        // Another setup run holds this camera. Two of them
-                        // interleaving reads and writes on one control would
-                        // each record the other's value as the original.
-                        | crate::emitter_journal::Mismatch::OwnerStillRunning { .. }
-                )
-            )
+        match self {
+            Self::NothingPending
+            | Self::ForAnotherCamera
+            | Self::AlreadyRestored
+            | Self::Restored { .. } => false,
+            Self::RestoredRecordKept(_) | Self::OwnerStillRunning { .. } | Self::Unresolved(_) => {
+                true
+            }
+        }
     }
 }
 
@@ -2223,6 +2337,178 @@ mod tests {
         }
     }
 
+    /// Every outcome, and what each one lets the two callers do.
+    ///
+    /// Written as one exhaustive table rather than a test per variant because
+    /// the defect was not a wrong answer for one case: `enable` did not ask the
+    /// question at all, logged "nothing further will be written to it", and then
+    /// wrote to that same unit and selector on the next line. A table makes
+    /// adding a variant without deciding its policy impossible to miss.
+    #[test]
+    fn each_recovery_outcome_decides_what_the_callers_may_do() {
+        // (outcome, may capture write, blocks discovery, is logged)
+        let table = [
+            (RecoveryOutcome::NothingPending, true, false, false),
+            (RecoveryOutcome::ForAnotherCamera, true, false, false),
+            (RecoveryOutcome::AlreadyRestored, true, false, true),
+            (
+                RecoveryOutcome::Restored {
+                    unit: 14,
+                    selector: 6,
+                },
+                true,
+                false,
+                true,
+            ),
+            // The camera is provably right and only the store is wrong, so a
+            // capture proceeds; discovery cannot, because its first act is to
+            // write a record into that same store.
+            (
+                RecoveryOutcome::RestoredRecordKept("read-only fs".into()),
+                true,
+                true,
+                true,
+            ),
+            // Silent: a setup run in flight is ordinary, and it is about to
+            // resolve its own record. It still stops both writers.
+            (
+                RecoveryOutcome::OwnerStillRunning { pid: 1234 },
+                false,
+                true,
+                false,
+            ),
+            (
+                RecoveryOutcome::Unresolved("3 attempts did not take".into()),
+                false,
+                true,
+                true,
+            ),
+        ];
+        for (outcome, may_write, blocks, logged) in table {
+            assert_eq!(
+                outcome.permits_capture_write(),
+                may_write,
+                "capture policy for {outcome:?}"
+            );
+            assert_eq!(
+                outcome.blocks_discovery(),
+                blocks,
+                "discovery policy for {outcome:?}"
+            );
+            assert_eq!(
+                outcome.message().is_some(),
+                logged,
+                "logging for {outcome:?}"
+            );
+        }
+    }
+
+    /// An unresolved record stops ALL THREE of the sources a capture can apply
+    /// from, not just the recovery write.
+    ///
+    /// This is the finding review caught: the refusal was logged and then the
+    /// configured control was applied to the very unit and selector the record
+    /// named, on the next line, at every stream open and every eighth frame of a
+    /// burst. Each source is checked separately, because a guard placed before
+    /// the override alone would leave the other two writing.
+    #[test]
+    fn an_unresolved_record_stops_every_source_a_capture_could_write_from() {
+        let _lock = crate::testenv::env_lock();
+        let id = identity(0x3277, 0x0059);
+        let blocked = [
+            RecoveryOutcome::Unresolved("3 attempts did not take".into()),
+            RecoveryOutcome::OwnerStillRunning { pid: 4321 },
+        ];
+
+        for recovery in &blocked {
+            // Source 1: the env override, the only path the user asked for.
+            assert_eq!(
+                planned_action(
+                    recovery,
+                    Some(EmitterControl {
+                        unit: 14,
+                        selector: 6,
+                        payload: vec![1, 3, 2],
+                    }),
+                    &id
+                ),
+                CaptureAction::Nothing,
+                "override under {recovery:?}"
+            );
+
+            // Source 2: the control ir-setup recorded. Pointed at a real conf so
+            // the branch is genuinely reachable, otherwise this would pass
+            // because there was nothing to apply.
+            let dir = std::env::temp_dir().join("irlume-planned-action");
+            let _ = std::fs::create_dir_all(&dir);
+            let conf = dir.join("ir_emitter.conf");
+            let (unit, selector) = {
+                let ms = id.microsoft_xu().expect("fixture publishes a Microsoft XU");
+                let selector = [
+                    crate::uvc_descriptor::MSXU_IR_TORCH,
+                    crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+                ]
+                .into_iter()
+                .find(|s| ms.advertises(*s))
+                .expect("fixture advertises an emitter selector");
+                (ms.unit_id, selector)
+            };
+            std::fs::write(&conf, format!("{} {unit}:{selector}", id.usb_id()))
+                .expect("write conf");
+            let _env = EnvGuard::set("IRLUME_IR_EMITTER_CONF", &conf);
+
+            assert_eq!(
+                planned_action(&RecoveryOutcome::NothingPending, None, &id),
+                CaptureAction::DeviceDefault { unit, selector },
+                "the conf branch must be reachable, or the next assertion proves nothing"
+            );
+            assert_eq!(
+                planned_action(recovery, None, &id),
+                CaptureAction::Nothing,
+                "recorded control under {recovery:?}"
+            );
+            drop(_env);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A record belonging to a DIFFERENT camera must not turn this camera's
+    /// emitter off. A machine with a detached second camera would otherwise drop
+    /// to password-only login for no reason.
+    #[test]
+    fn a_record_for_another_camera_does_not_stop_this_one() {
+        let _lock = crate::testenv::env_lock();
+        let _env = EnvGuard::unset("IRLUME_IR_EMITTER_CONF");
+        let id = identity(0x3277, 0x0059);
+        let ctrl = EmitterControl {
+            unit: 14,
+            selector: 6,
+            payload: vec![1, 3, 2],
+        };
+        assert_eq!(
+            planned_action(&RecoveryOutcome::ForAnotherCamera, Some(ctrl.clone()), &id),
+            CaptureAction::Override(ctrl),
+            "another camera's record is not this camera's business"
+        );
+    }
+
+    /// The message an operator reads has to say why face authentication stopped,
+    /// not only that a record exists. A refusal that does not explain the symptom
+    /// sends someone hunting through the wrong subsystem.
+    #[test]
+    fn a_refusal_says_the_emitter_will_not_light() {
+        let msg = RecoveryOutcome::Unresolved("the control reads [1, 3, 2]".into())
+            .message()
+            .expect("a refusal is always reported");
+        assert!(msg.contains("will not write"), "{msg}");
+        assert!(msg.contains("will not light"), "{msg}");
+        // And where to find the bytes that would put it back.
+        assert!(
+            msg.contains(&crate::emitter_journal::store_dir().display().to_string()),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn encode_parse_roundtrip() {
         let c = EmitterControl {
@@ -2232,6 +2518,8 @@ mod tests {
         };
         assert_eq!(parse_control(&c.encode()), Some(c));
     }
+
+    use crate::testenv::EnvGuard;
 
     /// Serializes access to the process env vars these tests flip
     /// (`IRLUME_IR_EMITTER`, `IRLUME_IR_EMITTER_CONF`).

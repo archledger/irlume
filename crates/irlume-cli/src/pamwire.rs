@@ -2329,7 +2329,15 @@ fn fsync_dir(dir: &Path) -> Result<(), String> {
 /// content.
 fn backup(path: &Path) -> Result<(), String> {
     let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
-    if bak.exists() {
+    // The backup is held to the same standard as the stack it came from, and it
+    // was not. `exists()` follows a symlink, so a `.pre-irlume` pointing
+    // somewhere else was accepted and then used as the pristine origin a later
+    // enable rebuilds from. A DANGLING one was worse: `exists()` said no, and the
+    // publishing link then failed with EEXIST against the symlink's own name,
+    // which read as "a backup is already there" when there was none at all.
+    // A complete backup already there is left alone; it must not be replaced
+    // with the now-wired content.
+    if inspect_target(&bak)?.is_some() {
         return Ok(());
     }
     let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -2838,6 +2846,32 @@ mod tests {
             "a retry overwrote the pristine backup with wired content"
         );
         assert!(strays(&dir).is_empty());
+
+        // An EXISTING backup is held to the same standard as the stack, and was
+        // not. `exists()` follows a symlink, so a `.pre-irlume` pointing
+        // elsewhere was accepted and then used as the pristine origin a later
+        // enable rebuilds from.
+        let linked = dir.join("sddm");
+        std::fs::write(&linked, "the stack\n").unwrap();
+        let elsewhere = dir.join("somewhere-else");
+        std::fs::write(&elsewhere, "not this camera's business\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join(format!("sddm{BACKUP}"))).unwrap();
+        let refused = backup(&linked).expect_err("a symlinked backup must be refused");
+        assert!(refused.contains("symlink"), "{refused}");
+
+        // A DANGLING one was worse: `exists()` said no, and publishing then
+        // failed with EEXIST against the symlink's own name, which read as "a
+        // backup is already there" when there was none at all.
+        let dangling = dir.join("lightdm");
+        std::fs::write(&dangling, "the stack\n").unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("nothing-here"),
+            dir.join(format!("lightdm{BACKUP}")),
+        )
+        .unwrap();
+        let refused = backup(&dangling).expect_err("a dangling backup link must be refused");
+        assert!(refused.contains("symlink"), "{refused}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

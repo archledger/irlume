@@ -399,10 +399,22 @@ pub(crate) fn note_rollback_progress(id: &str, done: &[String]) -> Result<(), St
 }
 
 /// Drop the note once every surface is back.
-pub(crate) fn clear_rollback_progress(id: &str) {
-    if let Some(path) = progress_path(id) {
-        let _ = std::fs::remove_file(path);
+///
+/// Durably, and reported. Discarding the outcome meant a note could survive the
+/// success that should have removed it: a power loss after the report resurrects
+/// it, and the NEXT rollback trusts it and skips those files without checking
+/// them. If an administrator changed a restored stack in between, that rollback
+/// would report success having left the change untouched.
+pub(crate) fn clear_rollback_progress(id: &str) -> Result<(), String> {
+    let Some(path) = progress_path(id) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("remove {}: {e}", path.display())),
     }
+    fsync_dir(&store_dir())
 }
 
 /// How a surface's backup is named in the progress note.
@@ -480,6 +492,11 @@ pub(crate) fn snapshot_before_rollback(record: &Transaction) -> Result<PathBuf, 
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                         Err(e) => return Err(format!("write {}: {e}", dest.display())),
                     }
+                    // The link and the temp's removal are directory changes, and
+                    // the rollback that follows destroys what was just copied. A
+                    // snapshot that does not survive the power loss it exists for
+                    // is not a snapshot.
+                    fsync_dir(&dir)?;
                 }
                 // Absent is a state worth knowing about, but there is nothing to
                 // copy and a rollback that recreates the file destroys nothing.
@@ -817,7 +834,7 @@ mod tests {
         assert!(rollback_progress(&id).is_empty());
         note_rollback_progress(&id, &["kde".to_string()]).expect("note");
         assert_eq!(rollback_progress(&id), vec!["kde".to_string()]);
-        clear_rollback_progress(&id);
+        clear_rollback_progress(&id).expect("clear");
         assert!(rollback_progress(&id).is_empty());
 
         // An unreadable note means "no progress", never "all done": redoing a
@@ -830,7 +847,7 @@ mod tests {
         // An id that is not plain hex never becomes a path.
         assert!(note_rollback_progress("../../etc/passwd", &[]).is_err());
         assert!(rollback_progress("../../etc/passwd").is_empty());
-        clear_rollback_progress(&id);
+        clear_rollback_progress(&id).expect("clear");
 
         // A surface is TWO writes, so it is two entries. Noting it only once
         // both landed left a crash between them unresumable at a finer

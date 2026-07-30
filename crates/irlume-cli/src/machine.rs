@@ -1050,7 +1050,25 @@ fn rollback_restore(
     }
     // Every surface is back, so the resume note has nothing left to describe.
     // The snapshot stays: it is for a person, not for the next run.
-    crate::logintx::clear_rollback_progress(&record.id);
+    //
+    // A note that outlives the success it describes is not harmless: the next
+    // rollback trusts it and skips those files unchecked, so failing to clear it
+    // is reported rather than swallowed.
+    if let Err(message) = crate::logintx::clear_rollback_progress(&record.id) {
+        irlume_common::dlog!(
+            "{command}: restored everything but could not clear progress: {message}"
+        );
+        return emit_with_extra(
+            &failure(command, "operation-failed", true, contract),
+            json!({
+                "transaction_id": record.id,
+                "restored": restored,
+                "applied": true,
+                "snapshot": snapshot,
+            }),
+            ExitCode::FAILURE,
+        );
+    }
     emit(
         &success(
             command,

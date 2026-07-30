@@ -262,6 +262,11 @@ These bytes go to your camera's firmware. Use a value the vendor documents; do
 not try numbers to see what happens, which is what destroyed the camera in
 [#159].
 
+A value that is set but is not `unit:selector:bytes` drives nothing and says so.
+It does not fall back to the camera's own control: setting the variable is
+consent to the control named in it, so a typo refuses rather than writing
+something you did not ask for. Unset it to go back to the built-in behaviour.
+
 The unit may be a vendor's rather than Microsoft's, since this exists for
 cameras with no Microsoft unit at all. Before writing anything, irlume checks
 the camera's USB descriptor publishes that unit and advertises that selector,

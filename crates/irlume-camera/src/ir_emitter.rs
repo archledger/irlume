@@ -256,8 +256,48 @@ fn parse_control(raw: &str) -> Option<EmitterControl> {
     })
 }
 
-fn env_control() -> Option<EmitterControl> {
-    parse_control(&std::env::var("IRLUME_IR_EMITTER").ok()?)
+/// What `IRLUME_IR_EMITTER` says, with "not set" kept distinct from "set to
+/// something unusable".
+///
+/// Those were one case. `std::env::var(..).ok()` and a failed parse both became
+/// `None`, and `None` meant "no override, carry on to the persisted config or
+/// the built-in table". So a typo in a value written to REPLACE the built-in
+/// payload caused irlume to write the built-in payload, repeatedly, and said
+/// nothing.
+#[derive(Debug, PartialEq)]
+enum OverrideSetting {
+    /// Not set. The persisted config and the built-in table still apply.
+    Absent,
+    /// `off` or `none`: drive nothing at all.
+    Disabled,
+    /// A control to apply, subject to every check in `apply_override`.
+    Control(EmitterControl),
+    /// Set to something that is not a control. Carries why, for the message.
+    Malformed(String),
+}
+
+fn override_setting(raw: std::result::Result<String, std::env::VarError>) -> OverrideSetting {
+    let raw = match raw {
+        Err(std::env::VarError::NotPresent) => return OverrideSetting::Absent,
+        // Set, and not readable as text. Refusing is the only honest answer:
+        // irlume cannot tell what was asked for.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return OverrideSetting::Malformed("is not valid text".into())
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "off" | "none" => OverrideSetting::Disabled,
+        // An empty value is someone clearing the variable, not a typo.
+        "" => OverrideSetting::Absent,
+        trimmed => match parse_control(trimmed) {
+            Some(ctrl) => OverrideSetting::Control(ctrl),
+            None => OverrideSetting::Malformed(format!(
+                "is set to {trimmed:?}, which is not unit:selector:bytes, so nothing was driven; \
+                 unset it to use the camera's own control"
+            )),
+        },
+    }
 }
 
 fn parse_u8(s: &str) -> Option<u8> {
@@ -439,14 +479,21 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 /// failed to accept the first is how the search in #159 kept going.
 pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
     let _ = (card, device);
-    match std::env::var("IRLUME_IR_EMITTER")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some("off") | Some("none") => return false,
-        _ => {}
-    }
+    let setting = override_setting(std::env::var("IRLUME_IR_EMITTER"));
+    let wanted = match setting {
+        OverrideSetting::Disabled => return false,
+        // A value that is set but cannot be read as a control is NOT the same as
+        // no value. Treating it as absent fell through to the built-in table, so
+        // one mistyped byte in an override meant to replace that payload made
+        // irlume write the payload instead, every eighth frame. Setting the
+        // variable is consent to the control named in it and to nothing else.
+        OverrideSetting::Malformed(why) => {
+            eprintln!("irlume: refusing to drive the IR emitter: IRLUME_IR_EMITTER {why}");
+            return false;
+        }
+        OverrideSetting::Absent => None,
+        OverrideSetting::Control(ctrl) => Some(ctrl),
+    };
 
     // Identity comes from the descriptor that will receive the write, not from a
     // path that could point somewhere else by the time the ioctl runs.
@@ -459,7 +506,7 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
         return false;
     };
 
-    if let Some(ctrl) = env_control() {
+    if let Some(ctrl) = wanted {
         return apply_override(fd, &id, &ctrl);
     }
 
@@ -2068,6 +2115,8 @@ mod tests {
 
     // --- the IRLUME_IR_EMITTER override's gate (#179) ------------------------
 
+    use OverrideSetting::{Absent, Disabled, Malformed};
+
     fn ctrl(unit: u8, selector: u8, payload: Vec<u8>) -> EmitterControl {
         EmitterControl {
             unit,
@@ -2213,6 +2262,50 @@ mod tests {
             sent, 0,
             "an override was sent to a device whose descriptors were never read"
         );
+    }
+
+    /// A variable that is SET but unusable must not read as "not set".
+    ///
+    /// Found in review of this PR, and it is defect pattern 3: `.ok()` and a
+    /// failed parse both became `None`, and `None` meant "carry on to the
+    /// built-in table". So typing one bad byte into an override intended to
+    /// REPLACE the built-in payload made irlume write the built-in payload
+    /// instead, every eighth frame, silently. Setting the variable is consent to
+    /// the control named in it and to nothing else.
+    #[test]
+    fn a_malformed_override_is_not_the_same_as_no_override() {
+        use std::env::VarError;
+        let set = |s: &str| override_setting(Ok(s.to_string()));
+
+        assert_eq!(override_setting(Err(VarError::NotPresent)), Absent);
+        assert_eq!(set("off"), Disabled);
+        assert_eq!(set("  none  "), Disabled);
+        assert_eq!(set(""), Absent, "an empty value is someone clearing it");
+        assert_eq!(
+            set("14:6:1,3,2"),
+            OverrideSetting::Control(ctrl(14, 6, vec![1, 3, 2]))
+        );
+
+        // The exact shape from the review: one unparseable byte in a payload
+        // meant to replace the N930W's built-in nine.
+        for bad in [
+            "4:6:1,3,bad,0,0,0,0,0,0",
+            "4:6:",
+            "4:6",
+            "garbage",
+            "4:6:1:2",
+            "999:6:1",
+        ] {
+            assert!(
+                matches!(set(bad), Malformed(_)),
+                "{bad:?} must refuse, not fall through to the built-in table"
+            );
+        }
+        // Set, and not text at all.
+        assert!(matches!(
+            override_setting(Err(VarError::NotUnicode("x".into()))),
+            Malformed(_)
+        ));
     }
 
     /// The record has to name the same object the check did, and the bytes it

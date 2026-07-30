@@ -34,6 +34,13 @@ All notable changes to irlume are documented here. This project adheres to
   per camera per process, and not at all if the control already holds the value.
   Reported as [#179].
 
+  A value that is set but unusable no longer reads as no value. Both a parse
+  failure and a non-text value became "no override", which meant carrying on to
+  the built-in table, so one mistyped byte in an override written to *replace*
+  that payload made irlume write the payload instead, every eighth frame, and
+  say nothing. A malformed value now drives nothing and prints what it could not
+  read.
+
   The dark-infrared hint told users to run `linux-enable-ir-emitter configure`.
   That tool finds a control by writing invented payloads until the picture
   brightens, which is the search irlume removed from its own code after [#159].

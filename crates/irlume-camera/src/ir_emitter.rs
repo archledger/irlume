@@ -1696,10 +1696,20 @@ impl ExploratoryWrite {
             original: crate::emitter_journal::to_hex(original),
             attempted: crate::emitter_journal::to_hex(attempted),
             restore_attempts: 0,
-            // So a capture running beside this one leaves the control alone
-            // while the run that changed it is still going.
-            boot_id: crate::emitter_journal::current_boot_id(),
-            pid: Some(std::process::id()),
+            // Deliberately NOT recorded any more. The per-camera `flock` is what
+            // excludes a concurrent run, held across the whole of discovery, and
+            // a capture beside it gets `Busy` before it reads anything.
+            //
+            // A pid was worse than redundant. `save` publishes by rename and
+            // fsyncs afterwards, so a failure in those durability steps returns
+            // an error while leaving the record visible — carrying the pid of a
+            // daemon that lives for days. Every later recovery would then see
+            // the owner still running and refuse, turning IR authentication off
+            // until the machine was restarted, over a record whose camera was
+            // never written to. Old records carrying the pair are still read and
+            // still honoured.
+            boot_id: None,
+            pid: None,
             serial: id.serial.clone(),
             usb_devpath: id.usb_devpath.clone(),
         };
@@ -2421,7 +2431,24 @@ impl Discovered {
         id: &crate::uvc_descriptor::CameraIdentity,
     ) -> std::result::Result<(), String> {
         self.pending.confirm_applied()?;
-        save_conf(id, &self.control).map_err(|e| format!("save the emitter config: {e}"))?;
+        if let Err(e) = save_conf(id, &self.control) {
+            // "It returned an error" is not "nothing became visible". The
+            // configuration is published by a rename, which is atomic and
+            // immediate, and the fsyncs that make it DURABLE come afterwards. A
+            // failure in those leaves the file in place, and every later capture
+            // reads it and applies that control automatically.
+            //
+            // So when the configuration is visible, the camera is not put back
+            // and the record is not cleared: the undo data must outlive a
+            // half-published configuration, or a crash that loses the file would
+            // leave a lit emitter with nothing describing it. The next capture
+            // recovers from the record first and then applies the configuration
+            // through the ordinary guarded path.
+            if load_conf(id) == Some((self.control.unit, self.control.selector)) {
+                self.pending.exploratory_value_is_live = false;
+            }
+            return Err(format!("save the emitter config: {e}"));
+        }
         self.pending.commit()
     }
 }
@@ -3352,6 +3379,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A record this build writes carries no owner, so a leftover one is always
+    /// recoverable.
+    ///
+    /// `save` publishes by rename and fsyncs afterwards. A failure in those
+    /// durability steps returns an error while leaving the record visible, and a
+    /// record carrying the pid of the long-lived daemon would then be refused by
+    /// every later recovery as "somebody else's" until the machine restarted —
+    /// over a record whose camera was never written to. The per-camera lock is
+    /// what excludes a concurrent run.
+    #[test]
+    fn a_new_record_records_no_owning_process() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-record-no-owner");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        let _fake = fake_camera::install(a_working_camera());
+        let pending =
+            ExploratoryWrite::open(-1, &id, ms.unit_id, selector, 3, &[1, 3, 1], &[1, 3, 2])
+                .expect("open the record");
+        std::mem::forget(pending); // leave the record exactly as `open` wrote it
+
+        let record = match crate::emitter_journal::load(&id).expect("load") {
+            crate::emitter_journal::Situation::Mine(r) => *r,
+            other => panic!("expected this camera's own record: {other:?}"),
+        };
+        assert_eq!(record.pid, None, "a live pid would strand this record");
+        assert_eq!(record.boot_id, None);
+        // And it is recoverable rather than somebody else's business.
+        assert_eq!(
+            crate::emitter_journal::record_applies(&record, &id),
+            Ok(()),
+            "a leftover record must be actionable once the lock is released"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A camera that stops answering a READ during verification is not written
     /// to again either.
     ///
@@ -3412,6 +3488,93 @@ mod tests {
         assert_eq!(
             writes_after, writes_before,
             "nothing further may be sent to a camera that stopped answering"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A configuration that IS visible after a failed save keeps its undo record
+    /// and leaves the camera alone.
+    ///
+    /// The config is published by a rename and made durable afterwards, so a
+    /// failure in the durability half returns an error while the file stays in
+    /// place, and every later capture reads it and applies that control. Putting
+    /// the camera back and clearing the record there would leave a machine that
+    /// re-lights the emitter from a config with no undo data behind it.
+    #[test]
+    fn a_visible_config_after_a_failed_save_keeps_the_record() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-conf-half-published");
+        let _ = std::fs::remove_dir_all(&dir);
+        let confdir = dir.join("etc");
+        std::fs::create_dir_all(&confdir).expect("scratch dirs");
+        let conf = confdir.join("ir_emitter.conf");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let _confenv = EnvGuard::set("IRLUME_IR_EMITTER_CONF", &conf);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        // The state the finding describes: the configuration naming this control
+        // is READABLE, and the save nevertheless reports failure. Provoked by
+        // taking write permission off the directory, so the temp file cannot be
+        // created, with the published file already there.
+        std::fs::write(&conf, format!("{} {}:{selector}", id.usb_id(), ms.unit_id))
+            .expect("publish a config");
+        std::fs::set_permissions(&confdir, std::fs::Permissions::from_mode(0o500))
+            .expect("make the directory unwritable");
+
+        let _fake = fake_camera::install(a_working_camera());
+        let mut pending =
+            ExploratoryWrite::open(-1, &id, ms.unit_id, selector, 3, &[1, 3, 1], &[1, 3, 2])
+                .expect("open the record");
+        pending
+            .apply_exploratory(&[1, 3, 2])
+            .expect("write accepted");
+        let writes_before = fake_camera::log()
+            .iter()
+            .filter(|r| matches!(r, fake_camera::Request::Set(_)))
+            .count();
+
+        let found = Discovered {
+            control: EmitterControl {
+                unit: ms.unit_id,
+                selector,
+                payload: vec![1, 3, 2],
+            },
+            pending,
+            _lock: crate::emitter_journal::lock_camera(&id)
+                .expect("lock")
+                .expect("not busy"),
+        };
+        let err = found.finish(&id).expect_err("the save must fail");
+        assert!(err.contains("save the emitter config"), "{err}");
+
+        std::fs::set_permissions(&confdir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore");
+        assert!(conf.exists(), "the premise: the config is still visible");
+        assert_eq!(
+            std::fs::read_dir(dir.join("ir-emitter-journal"))
+                .map(|d| d.filter_map(|e| e.ok()).count())
+                .unwrap_or(0),
+            1,
+            "the undo record must outlive a half-published configuration"
+        );
+        assert_eq!(
+            fake_camera::log()
+                .iter()
+                .filter(|r| matches!(r, fake_camera::Request::Set(_)))
+                .count(),
+            writes_before,
+            "and the camera must not be put back behind a config that will re-apply it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

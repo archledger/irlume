@@ -59,6 +59,11 @@ assert() {
     shift 2
     if "$@"; then ok "$d"; else bad "$d" "$x"; fi
 }
+assert_not() {
+    local desc="$1" detail="$2"
+    shift 2
+    if "$@"; then bad "$desc" "$detail"; else ok "$desc"; fi
+}
 skip() {
     skipped=$((skipped + 1))
     echo "  NOT EXERCISED  $1"
@@ -234,9 +239,14 @@ assert "B's own run did write to its own unit" \
 # control unusable. That is a hardware outcome and has nothing to do with the
 # other camera's record. Asserting "IR emitter enabled" made a legitimate
 # NotUsable read as "B was blocked", which is a different claim entirely.
-assert "B's setup was not refused because of A's record" \
+# `grep -qv` is NOT "does not contain": it succeeds as soon as ONE line fails to
+# match, so a file holding the forbidden refusal plus any other line passed. This
+# assertion reported ok while the very thing it forbids was in the output, and
+# the 8/8 it was part of did not establish it. Absence is a POSITIVE grep,
+# negated by the caller.
+assert_not "B's setup was not refused because of A's record" \
     "B was blocked by another camera's pending change" \
-    grep -qvE "not at that address|earlier setup run left a control" "$S/b-setup.out"
+    grep -qE "not at that address|earlier setup run left a control" "$S/b-setup.out"
 if grep -q "IR emitter enabled" "$S/b-setup.out"; then
     echo "  (B found a usable control)"
 else

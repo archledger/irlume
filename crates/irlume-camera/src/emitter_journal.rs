@@ -356,8 +356,8 @@ pub(crate) fn describes_this_camera(record: &PendingWrite, id: &CameraIdentity) 
 pub(crate) enum Mismatch {
     /// Written for a different camera. Leave it where it is.
     DifferentCamera,
-    /// Written to a schema this build does not implement.
-    SchemaTooNew { found: u32, supported: u32 },
+    /// Written to a schema this build does not implement, in either direction.
+    UnsupportedSchema { found: u32, supported: u32 },
     /// The record's own two identities disagree, or a field will not parse.
     Malformed(String),
     /// The camera no longer publishes the unit or advertises the selector the
@@ -376,8 +376,13 @@ pub(crate) enum Mismatch {
 /// Pure, so the decision can be tested without a camera. Every check that gates
 /// a firmware write lives here rather than in the ioctl wrapper.
 pub(crate) fn record_applies(record: &PendingWrite, id: &CameraIdentity) -> Result<(), Mismatch> {
-    if record.schema_version > SCHEMA_VERSION {
-        return Err(Mismatch::SchemaTooNew {
+    // Equality, not an upper bound. `> SCHEMA_VERSION` let schema 0 through, and
+    // there is no schema 0: a corrupted or hand-repaired record carrying one
+    // would have passed every remaining check and authorised a firmware write.
+    // A record this build cannot read is a record this build must not act on,
+    // whichever side of the version it falls.
+    if record.schema_version != SCHEMA_VERSION {
+        return Err(Mismatch::UnsupportedSchema {
             found: record.schema_version,
             supported: SCHEMA_VERSION,
         });
@@ -598,30 +603,53 @@ pub(crate) enum Situation {
 /// treating a permission or IO failure as absence would silently drop the one
 /// description of how to undo a firmware write.
 pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
+    // The filename is a fast path, never the authority. Two things make it
+    // unreliable on its own, and both were found by review:
+    //
+    //   * It is derived from the serial, and `identity_from_fd` maps EVERY
+    //     failure to read the sysfs `serial` file to `None`. One transient read
+    //     failure changes the key, the exact lookup misses, and a record that
+    //     describes this camera perfectly well by descriptor and device path
+    //     would have been dismissed as another camera's — leaving the camera
+    //     changed and its emitter disabled, which is the opposite of the point.
+    //   * A record could be sitting under this name without describing this
+    //     camera at all.
+    //
+    // So a hit is checked, a miss falls through, and the scan below decides.
     let path = record_path(&filing_key(id));
     match std::fs::read_to_string(&path) {
         Ok(body) => {
             let record: PendingWrite = serde_json::from_str(&body)
                 .map_err(|e| format!("parse {}: {e}", path.display()))?;
-            // The filename is a convenience, never the authority. A record that
-            // landed under this name but does not describe this camera is
-            // treated as what it says it is, not as what it is called.
             if describes_this_camera(&record, id) {
                 return Ok(Situation::Mine(Box::new(record)));
             }
-            return Ok(Situation::SameModelElsewhere(Box::new(record)));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     }
 
+    // EVERY same-model record is examined, not the first one `read_dir` happens
+    // to hand back. Directory order is unspecified, so stopping at the first
+    // match could report another camera's record while this camera's own record
+    // sat further down the list.
     let model = fingerprint(id);
+    let mut elsewhere = None;
     for record in all_records()? {
-        if record.descriptor_sha256 == model {
-            return Ok(Situation::SameModelElsewhere(Box::new(record)));
+        if record.descriptor_sha256 != model {
+            continue;
+        }
+        if describes_this_camera(&record, id) {
+            return Ok(Situation::Mine(Box::new(record)));
+        }
+        if elsewhere.is_none() {
+            elsewhere = Some(record);
         }
     }
-    Ok(Situation::Nothing)
+    Ok(match elsewhere {
+        Some(record) => Situation::SameModelElsewhere(Box::new(record)),
+        None => Situation::Nothing,
+    })
 }
 
 /// Every parseable record in the store.
@@ -1010,6 +1038,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A record must still be found when the serial's AVAILABILITY changes.
+    ///
+    /// `identity_from_fd` maps every failure to read the sysfs `serial` file to
+    /// `None`, and the filename is derived from it. One transient read failure
+    /// therefore changes the key the lookup uses. The record still describes
+    /// this camera by descriptor and device path, and dismissing it as another
+    /// camera's would leave the camera changed with its emitter disabled — the
+    /// exact opposite of what the record is for.
+    #[test]
+    fn a_record_is_found_when_the_serial_becomes_unreadable() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-serial-flip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let with_serial = identity();
+        let record = record_for(&with_serial);
+        save(&record).expect("save with a serial");
+
+        // Same camera, same port, same descriptors; the serial simply did not
+        // read this time.
+        let no_serial = CameraIdentity {
+            serial: None,
+            ..identity()
+        };
+        assert_ne!(
+            filing_key(&with_serial),
+            filing_key(&no_serial),
+            "the premise: the key really does change"
+        );
+        assert_eq!(
+            load(&no_serial).expect("load"),
+            Situation::Mine(Box::new(record.clone())),
+            "the record describes this camera and must be found"
+        );
+
+        // And the reverse: written without one, read with one.
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut no_serial_record = record_for(&no_serial);
+        no_serial_record.serial = None;
+        save(&no_serial_record).expect("save without a serial");
+        assert_eq!(
+            load(&with_serial).expect("load"),
+            Situation::Mine(Box::new(no_serial_record)),
+            "a record with no serial still describes a camera that has one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With several same-model records in the store, this camera's own must be
+    /// found wherever the directory listing happens to put it.
+    #[test]
+    fn this_cameras_record_is_found_whatever_the_directory_order() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-scan-order");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let mine = identity();
+        let other = identical_unit_elsewhere();
+        // A foreign same-model record and this camera's own, both present.
+        save(&record_for(&other)).expect("save the other unit's");
+        let my_record = record_for(&mine);
+        save(&my_record).expect("save mine");
+
+        assert_eq!(
+            load(&mine).expect("load"),
+            Situation::Mine(Box::new(my_record)),
+            "stopping at the first same-model record found would report the wrong one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// There is no schema 0, so a record claiming one describes nothing this
+    /// build knows how to act on.
+    #[test]
+    fn a_record_from_a_schema_this_build_does_not_implement_is_refused() {
+        let id = identity();
+        for version in [0, SCHEMA_VERSION + 1] {
+            let mut record = record_for(&id);
+            record.schema_version = version;
+            assert_eq!(
+                record_applies(&record, &id),
+                Err(Mismatch::UnsupportedSchema {
+                    found: version,
+                    supported: SCHEMA_VERSION,
+                }),
+                "schema {version} must not authorise a firmware write"
+            );
+        }
+    }
+
     #[test]
     fn a_record_for_another_camera_is_left_alone() {
         let id = identity();
@@ -1029,7 +1149,7 @@ mod tests {
         record.schema_version = SCHEMA_VERSION + 1;
         assert_eq!(
             record_applies(&record, &id),
-            Err(Mismatch::SchemaTooNew {
+            Err(Mismatch::UnsupportedSchema {
                 found: SCHEMA_VERSION + 1,
                 supported: SCHEMA_VERSION,
             })

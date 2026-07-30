@@ -1881,9 +1881,9 @@ fn recover_pending_write_locked(
             Mismatch::OutOfAttempts { attempts } => RecoveryOutcome::Unresolved(format!(
                 "{attempts} attempts to put it back did not take, so no more will be made"
             )),
-            Mismatch::SchemaTooNew { found, supported } => RecoveryOutcome::Unresolved(format!(
-                "the record is schema {found} and this build implements {supported}"
-            )),
+            Mismatch::UnsupportedSchema { found, supported } => RecoveryOutcome::Unresolved(
+                format!("the record is schema {found} and this build implements {supported}"),
+            ),
             Mismatch::Malformed(why) => RecoveryOutcome::Unresolved(format!("malformed: {why}")),
             Mismatch::ControlNotPublished => RecoveryOutcome::Unresolved(
                 "the record names a control this camera does not publish".into(),

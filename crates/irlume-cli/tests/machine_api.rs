@@ -675,3 +675,146 @@ fn applying_without_root_is_refused_up_front() {
     assert_eq!(document["error"]["code"], "not-authorized");
     assert_eq!(document["error"]["retryable"], false);
 }
+
+/// Drive verify and rollback against a record this test writes, so the paths
+/// that need root to reach through apply are still exercised. The store is a
+/// temporary directory, so nothing here touches a real transaction or a real
+/// PAM file: rollback runs only as a dry run.
+#[test]
+fn verify_and_rollback_read_a_record_and_report_its_state() {
+    let dir = std::env::temp_dir().join(format!("irlume-hw-rec-{}", std::process::id()));
+    let store = dir.join("login-transactions");
+    std::fs::create_dir_all(&store).expect("store");
+    let subject = dir.join("greeter");
+    std::fs::write(&subject, "as applied\n").expect("write");
+
+    let digest = {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(b"as applied\n")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let id = "0123456789abcdef0123456789abcdef";
+    let record = serde_json::json!({
+        "id": id,
+        "status": "applied",
+        "action": "disable",
+        "plan_id": "f".repeat(32),
+        "engine_version": "0.0.0",
+        "surfaces": [{
+            "id": "kde",
+            "path": subject.display().to_string(),
+            "change": "wire",
+            "before": "the original\n",
+            "after_sha256": digest,
+        }],
+    });
+    std::fs::write(store.join(format!("{id}.json")), record.to_string()).expect("record");
+
+    let run = |args: &[&str]| -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(args)
+            .env("IRLUME_STATE_DIR", &dir)
+            .output()
+            .expect("run irlume");
+        serde_json::from_slice(&output.stdout).expect("valid JSON")
+    };
+
+    // Untouched since apply: no drift, rollback offered, status reported.
+    let verified = run(&["login", "verify", "--transaction-id", id, "--json"]);
+    assert_eq!(verified["data"]["status"], "applied");
+    assert_eq!(verified["data"]["drifted"], 0);
+    assert_eq!(verified["data"]["rollback_available"], true);
+    assert_eq!(verified["data"]["surfaces"][0]["state"], "as-applied");
+
+    // A dry run reports what it would restore and writes nothing.
+    let dry = run(&["login", "rollback", "--transaction-id", id, "--json"]);
+    assert_eq!(dry["data"]["applied"], false);
+    assert_eq!(dry["data"]["would_restore"][0], "kde");
+    assert_eq!(
+        std::fs::read_to_string(&subject).expect("read"),
+        "as applied\n",
+        "a dry run must not write"
+    );
+
+    // Once something else edits the file, both refuse rather than clobber it.
+    std::fs::write(&subject, "an admin edited this\n").expect("write");
+    let drifted = run(&["login", "verify", "--transaction-id", id, "--json"]);
+    assert_eq!(drifted["data"]["drifted"], 1);
+    assert_eq!(drifted["data"]["rollback_available"], false);
+    assert_eq!(
+        drifted["data"]["surfaces"][0]["state"],
+        "changed-since-apply"
+    );
+
+    let refused = run(&["login", "rollback", "--transaction-id", id, "--json"]);
+    assert_eq!(refused["error"]["code"], "changed-since-apply");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A record whose writes were never confirmed cannot be rolled back silently:
+/// its after-digests mean nothing, so restoring gives up the protection against
+/// reverting an edit the transaction did not make.
+#[test]
+fn an_unconfirmed_record_needs_the_acknowledgement() {
+    let dir = std::env::temp_dir().join(format!("irlume-hw-unconf-{}", std::process::id()));
+    let store = dir.join("login-transactions");
+    std::fs::create_dir_all(&store).expect("store");
+    let subject = dir.join("greeter");
+    std::fs::write(&subject, "half applied\n").expect("write");
+
+    let id = "abcdefabcdefabcdefabcdefabcdef01";
+    let record = serde_json::json!({
+        "id": id,
+        "status": "prepared",
+        "action": "enable",
+        "plan_id": "0".repeat(32),
+        "engine_version": "0.0.0",
+        "surfaces": [{
+            "id": "kde",
+            "path": subject.display().to_string(),
+            "change": "wire",
+            "before": "the original\n",
+            "after_sha256": "absent",
+        }],
+    });
+    std::fs::write(store.join(format!("{id}.json")), record.to_string()).expect("record");
+
+    let run = |args: &[&str]| -> Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(args)
+            .env("IRLUME_STATE_DIR", &dir)
+            .output()
+            .expect("run irlume");
+        serde_json::from_slice(&output.stdout).expect("valid JSON")
+    };
+
+    let verified = run(&["login", "verify", "--transaction-id", id, "--json"]);
+    assert_eq!(verified["data"]["status"], "prepared");
+    assert_eq!(
+        verified["data"]["rollback_available"], false,
+        "an unconfirmed record is not offered for rollback"
+    );
+
+    let refused = run(&["login", "rollback", "--transaction-id", id, "--json"]);
+    assert_eq!(refused["error"]["code"], "unconfirmed-transaction");
+
+    // With the acknowledgement it is reachable, and a dry run still writes
+    // nothing while reporting that the record is unconfirmed.
+    let dry = run(&[
+        "login",
+        "rollback",
+        "--transaction-id",
+        id,
+        "--accept-unconfirmed",
+        "--json",
+    ]);
+    assert_eq!(dry["data"]["unconfirmed"], true);
+    assert_eq!(dry["data"]["applied"], false);
+    assert_eq!(
+        std::fs::read_to_string(&subject).expect("read"),
+        "half applied\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

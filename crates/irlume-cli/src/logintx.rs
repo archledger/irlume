@@ -234,17 +234,20 @@ impl Transaction {
         // the machine would again be left changed with nothing describing how
         // to undo it — the same defect as the truncate above, one level up.
         //
-        // Unconditional, and deliberately not skipped when the store already
-        // exists. Testing `exists()` first and syncing only when this process
-        // created it looks like a free optimisation and is not: another process
-        // that finds the directory already there, writes its record and rewrites
-        // PAM has inherited a durability guarantee nobody has made yet, because
-        // the process that created the directory may not have synced its parent
-        // yet, or at all. Two fsyncs per apply is not a price worth an
-        // unrecoverable machine.
-        if let Some(parent) = dir.parent() {
-            fsync_dir(parent)?;
-        }
+        // The WHOLE chain, unconditionally, and not just the immediate parent:
+        // `create_dir_all` can create several levels, and syncing only the
+        // store's parent leaves the parent's own entry in ITS parent unsynced.
+        //
+        // Unconditional because every way of narrowing it is the same
+        // check-then-act split. Skipping the sync when the directory already
+        // exists means a second process finds it there, writes its record and
+        // rewrites PAM having inherited a guarantee nobody has made yet: the
+        // process that created it may not have synced anything yet, or may have
+        // died. Probing which ancestors are missing has the identical hole one
+        // level up. So it is not narrowed. Syncing a directory with nothing
+        // dirty is cheap, this runs twice per `login apply`, and `login apply`
+        // is an administrator rewriting a login stack, not a hot path.
+        fsync_ancestors(&dir)?;
         let path = dir.join(format!("{}.json", self.id));
         let body = serde_json::to_string(self).map_err(|e| format!("serialize record: {e}"))?;
         // The temp is created 0600 and renamed over the path, so the record is
@@ -303,6 +306,27 @@ pub(crate) enum LoadFailure {
 /// `..` or a `/` makes the id invalid, it does not get stripped out.
 pub(crate) fn is_valid_id(id: &str) -> bool {
     id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Make every directory above `dir` durable, so the names leading to it survive
+/// a power loss.
+///
+/// Shallowest first, because a directory's entry lives in its parent: syncing
+/// `/var/lib/irlume` makes `login-transactions` findable, and does nothing for
+/// `irlume` itself, whose entry is in `/var/lib`. A record fsynced into a
+/// directory whose name did not survive is not a record.
+fn fsync_ancestors(dir: &Path) -> Result<(), String> {
+    let mut chain: Vec<&Path> = dir
+        .ancestors()
+        .skip(1) // `dir` itself is synced by the atomic write that fills it
+        // A relative path's last ancestor is "", which names nothing.
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    chain.reverse();
+    for parent in chain {
+        fsync_dir(parent)?;
+    }
+    Ok(())
 }
 
 /// Make a directory's own contents durable, so entries created in it survive a
@@ -371,6 +395,49 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Holds the env lock AND puts `IRLUME_STATE_DIR` back to whatever it was.
+    ///
+    /// These tests used to end with `remove_var`, which is not a restore: a
+    /// suite started with `IRLUME_STATE_DIR` pointing at a sandbox came out of
+    /// them with it unset, and a later test would then resolve the store to the
+    /// real `/var/lib/irlume`. The lock stops tests overlapping; it does not
+    /// stop one handing the next a different world than it found. Restoring in
+    /// `Drop` also covers the panicking test, which is when it matters most.
+    struct StateDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        root: PathBuf,
+    }
+
+    impl StateDirGuard {
+        fn new(tag: &str) -> Self {
+            let lock = env_lock();
+            let previous = std::env::var_os("IRLUME_STATE_DIR");
+            let root = temp_state(tag);
+            // SAFETY: the env lock is held for this guard's whole lifetime, so
+            // no other test in this process reads or writes the variable here.
+            unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+            Self {
+                _lock: lock,
+                previous,
+                root,
+            }
+        }
+    }
+
+    impl Drop for StateDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: as above; the lock is released after this runs.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+                    None => std::env::remove_var("IRLUME_STATE_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn temp_state(tag: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("irlume-logintx-{tag}-{}", std::process::id()));
@@ -413,10 +480,7 @@ mod tests {
 
     #[test]
     fn a_record_survives_a_round_trip() {
-        let _lock = env_lock();
-        let root = temp_state("roundtrip");
-        // SAFETY: single-threaded test, restored below.
-        unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+        let _env = StateDirGuard::new("roundtrip");
         let tx = Transaction {
             id: "0123456789abcdef0123456789abcdef".into(),
             status: TransactionStatus::Applied,
@@ -432,8 +496,6 @@ mod tests {
         let path = tx.save().expect("save");
         assert!(path.exists());
         assert_eq!(Transaction::load(&tx.id).expect("load"), tx);
-        unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Confirming a transaction must never be able to destroy the record that
@@ -457,10 +519,7 @@ mod tests {
     fn confirming_a_transaction_replaces_its_record_instead_of_emptying_it() {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
-        let _lock = env_lock();
-        let root = temp_state("atomic");
-        // SAFETY: single-threaded test, restored below.
-        unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+        let _env = StateDirGuard::new("atomic");
 
         let mut tx = Transaction {
             id: "abcdef0123456789abcdef0123456789".into(),
@@ -504,18 +563,12 @@ mod tests {
             .filter(|n| n != "abcdef0123456789abcdef0123456789.json")
             .collect();
         assert!(strays.is_empty(), "stray files in the store: {strays:?}");
-
-        unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn the_store_is_not_readable_by_other_accounts() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = env_lock();
-        let root = temp_state("perms");
-        // SAFETY: single-threaded test, restored below.
-        unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+        let _env = StateDirGuard::new("perms");
         let tx = Transaction {
             id: "ffffffffffffffffffffffffffffffff".into(),
             status: TransactionStatus::Applied,
@@ -536,8 +589,6 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
-        unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

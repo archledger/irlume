@@ -962,6 +962,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE CONSEQUENCE OF TWO IDENTICAL CAMERAS: one camera's pending record
+    /// darkens the other one too.
+    ///
+    /// Two units of one model publish the same descriptors and, on the module
+    /// this was developed against, no serial at all. So when the second camera
+    /// looks for its own record and finds none, the scan turns up the first
+    /// camera's, and nothing can prove it is not about this camera. It is
+    /// reported as `SameModelElsewhere`, which stops the emitter here as well.
+    ///
+    /// That is the conservative answer and it is deliberate — the alternative is
+    /// writing one camera's recorded bytes into another — but the cost is real
+    /// and wider than the camera that was actually changed, so it is pinned by a
+    /// test rather than left as a surprise.
+    #[test]
+    fn an_identical_cameras_pending_record_also_stops_this_one() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-identical-blocks");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let first = identity();
+        let second = identical_unit_elsewhere();
+        // Only the FIRST has an outstanding change.
+        save(&record_for(&first)).expect("save the first unit's record");
+
+        match load(&second).expect("load for the second unit") {
+            Situation::SameModelElsewhere(found) => {
+                assert_eq!(found.usb_devpath, first.usb_devpath)
+            }
+            other => panic!("expected the other unit's record to be visible: {other:?}"),
+        }
+        // A different MODEL is unaffected: its descriptors differ, so the record
+        // is plainly not about it and its emitter keeps working.
+        let mut other_model = identity();
+        other_model
+            .descriptors
+            .extend_from_slice(b"a different model entirely");
+        assert_eq!(
+            load(&other_model).expect("load for a different model"),
+            Situation::Nothing,
+            "only cameras indistinguishable from the recorded one are held back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A record written before records carried a port cannot be confirmed to
     /// belong to anything, so it is reported rather than acted on.
     #[test]

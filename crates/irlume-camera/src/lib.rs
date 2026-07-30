@@ -2221,9 +2221,16 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // hang is not worth a race with systemd.
     let mut measure = || -> Option<f32> {
         // A stop signal aborts through the same path a dead stream does, which
-        // is the path that puts the control back. The measurement loop is the
-        // only part of discovery that blocks for any length of time, so this is
-        // where the abort has to be noticed.
+        // is the path that puts the control back.
+        //
+        // Polled between frames rather than relied on to interrupt one. A
+        // process-directed signal goes to an ARBITRARY thread that has it
+        // unblocked, and the daemon has a watchdog, a listener and a connection
+        // thread besides this worker; only the syscall in the thread the kernel
+        // picks is interrupted, so dropping SA_RESTART does not guarantee this
+        // frame wait ever returns EINTR (signal(7)). Checking each iteration
+        // bounds the abort by one frame timeout, which this crate sets to five
+        // seconds, instead of by a whole measurement.
         if ir_emitter::abort_requested() {
             return None;
         }
@@ -2231,10 +2238,16 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         // taking the brightest of the burst makes one stale frame decide the
         // answer. Discard a stream's worth before believing anything.
         for _ in 0..IR_BURST {
+            if ir_emitter::abort_requested() {
+                return None;
+            }
             stream.next().ok()?;
         }
         let mut best: Option<f32> = None;
         for _ in 0..8 {
+            if ir_emitter::abort_requested() {
+                return None;
+            }
             let (buf, _) = stream.next().ok()?;
             let data = dec.decode(buf, w, h);
             let m = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;

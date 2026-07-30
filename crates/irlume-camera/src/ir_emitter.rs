@@ -360,6 +360,22 @@ impl std::fmt::Display for XuError {
 type XuResult<T> = std::result::Result<T, XuError>;
 
 fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> XuResult<()> {
+    // A test may stand in for the camera here. Every read and every write in
+    // this module funnels through this one call, so a fake installed here can
+    // drive the whole discovery sequence, record the exact order of requests,
+    // and make a chosen one fail.
+    //
+    // That matters more than usual. The guards on this path are ORDERINGS
+    // between ioctls — the record durable before the first write, no second
+    // write after the camera refuses one, the attempt counted before the retry —
+    // and an ordering leaves nothing behind for a test to inspect afterwards.
+    // Four mutants that each reintroduced a hardware-destructive defect survived
+    // the entire suite before this existed, because nothing without a camera
+    // could reach the code at all.
+    #[cfg(test)]
+    if let Some(result) = fake_camera::intercept(unit, selector, query, data) {
+        return result;
+    }
     let mut q = UvcXuControlQuery {
         unit,
         selector,
@@ -375,6 +391,168 @@ fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> Xu
     Err(XuError::from_errno(
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
     ))
+}
+
+/// A stand-in camera for tests, installed in front of [`xu_query`].
+///
+/// Thread-local, so tests that use it need no lock and cannot disturb each
+/// other. Absent by default, in which case every query goes to the real ioctl
+/// exactly as before.
+#[cfg(test)]
+pub(crate) mod fake_camera {
+    use super::{XuError, XuResult, UVC_GET_CUR, UVC_GET_INFO, UVC_GET_LEN, UVC_SET_CUR};
+    use std::cell::RefCell;
+
+    /// One request the code under test made, in order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Request {
+        Get { query: u8, size: usize },
+        Set(Vec<u8>),
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Camera {
+        /// What `GET_CUR` answers. Updated by an accepted `SET_CUR`, like a real
+        /// control, so a read-back reflects what was written.
+        pub(crate) current: Vec<u8>,
+        pub(crate) len: usize,
+        /// `GET_INFO`: D0 get, D1 set.
+        pub(crate) info: u8,
+        /// `GET_DEF`, `GET_MAX`, `GET_MIN`, `GET_RES`. Separate from `current`
+        /// because the payload discovery intends is DERIVED from them: a fake
+        /// that answered every query with the same bytes would make
+        /// `intended_value` equal the current value and the run would stop
+        /// before writing anything, which is a pass for the wrong reason.
+        pub(crate) def: Vec<u8>,
+        pub(crate) max: Vec<u8>,
+        pub(crate) min: Vec<u8>,
+        pub(crate) res: Vec<u8>,
+        /// Fail the Nth `SET_CUR` (1-based) with this errno, and every one after
+        /// it. Models a camera that stops answering, which is the state this
+        /// module must send nothing further to.
+        pub(crate) fail_set_from: Option<(usize, i32)>,
+        /// `SET_CUR`s seen so far, so `fail_set_from` can count.
+        pub(crate) sets_seen: usize,
+        /// Every request, in order.
+        pub(crate) log: Vec<Request>,
+    }
+
+    thread_local! {
+        static CAMERA: RefCell<Option<Camera>> = const { RefCell::new(None) };
+    }
+
+    /// Install a fake for the rest of this test, and take it back at the end.
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            CAMERA.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(camera: Camera) -> Installed {
+        CAMERA.with(|c| *c.borrow_mut() = Some(camera));
+        Installed
+    }
+
+    /// Everything the fake was asked, in order.
+    pub(crate) fn log() -> Vec<Request> {
+        CAMERA.with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|cam| cam.log.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// What the control holds now.
+    pub(crate) fn current() -> Vec<u8> {
+        CAMERA.with(|c| {
+            c.borrow()
+                .as_ref()
+                .map(|cam| cam.current.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// `None` when no fake is installed, so the real ioctl runs.
+    pub(crate) fn intercept(
+        _unit: u8,
+        _selector: u8,
+        query: u8,
+        data: &mut [u8],
+    ) -> Option<XuResult<()>> {
+        CAMERA.with(|cell| {
+            let mut borrowed = cell.borrow_mut();
+            let cam = borrowed.as_mut()?;
+            Some(match query {
+                UVC_SET_CUR => {
+                    cam.sets_seen += 1;
+                    cam.log.push(Request::Set(data.to_vec()));
+                    match cam.fail_set_from {
+                        Some((from, errno)) if cam.sets_seen >= from => {
+                            Err(XuError::from_errno(errno))
+                        }
+                        _ => {
+                            // An accepted write changes what the control holds,
+                            // so a read-back sees it. A fake whose GET_CUR never
+                            // moved would make the read-back check pass for the
+                            // wrong reason.
+                            cam.current = data.to_vec();
+                            Ok(())
+                        }
+                    }
+                }
+                UVC_GET_LEN => {
+                    cam.log.push(Request::Get {
+                        query,
+                        size: data.len(),
+                    });
+                    // Little-endian u16, as the UVC specification defines it.
+                    data[0] = (cam.len & 0xff) as u8;
+                    if data.len() > 1 {
+                        data[1] = ((cam.len >> 8) & 0xff) as u8;
+                    }
+                    Ok(())
+                }
+                UVC_GET_INFO => {
+                    cam.log.push(Request::Get {
+                        query,
+                        size: data.len(),
+                    });
+                    data[0] = cam.info;
+                    Ok(())
+                }
+                UVC_GET_CUR => {
+                    cam.log.push(Request::Get {
+                        query,
+                        size: data.len(),
+                    });
+                    for (slot, byte) in data.iter_mut().zip(cam.current.iter()) {
+                        *slot = *byte;
+                    }
+                    Ok(())
+                }
+                other => {
+                    cam.log.push(Request::Get {
+                        query: other,
+                        size: data.len(),
+                    });
+                    let source = match other {
+                        super::UVC_GET_DEF => &cam.def,
+                        super::UVC_GET_MAX => &cam.max,
+                        super::UVC_GET_MIN => &cam.min,
+                        super::UVC_GET_RES => &cam.res,
+                        _ => &cam.current,
+                    };
+                    for (slot, byte) in data.iter_mut().zip(source.iter()) {
+                        *slot = *byte;
+                    }
+                    Ok(())
+                }
+            })
+        })
+    }
 }
 
 /// GET_LEN bounds check: a plausible XU control reports 1..=64 payload bytes;
@@ -1270,9 +1448,17 @@ pub fn abort_requested() -> bool {
 /// but it covers it at the NEXT capture, which is minutes or a reboot away. This
 /// closes it now for every signal that can actually be caught.
 ///
-/// Installed without `SA_RESTART` on purpose: the blocking `VIDIOC_DQBUF` in the
-/// measurement loop then fails with `EINTR` instead of resuming, so the abort is
-/// noticed in milliseconds rather than at the end of a frame burst.
+/// Installed without `SA_RESTART`, which HELPS but cannot be relied on. A
+/// process-directed signal is delivered to an arbitrary thread that has it
+/// unblocked, and only that thread's syscall is interrupted (signal(7)); the
+/// daemon runs a watchdog, a listener and a connection thread besides the camera
+/// worker, so the frame wait may never see `EINTR` at all. An earlier version of
+/// this comment claimed the abort was therefore noticed in milliseconds, which
+/// was not true for any delivery that landed on another thread.
+///
+/// What makes the abort effective is that [`abort_requested`] is polled between
+/// frames and again immediately before each write to the camera, so the delay is
+/// bounded by one frame timeout rather than by which thread the kernel chose.
 ///
 /// `SIGKILL` and a power loss are exactly the cases a handler cannot reach. They
 /// are the record's job.
@@ -1354,6 +1540,21 @@ struct ExploratoryWrite {
     /// value is durably recorded in the configuration. Until then the record
     /// stays on disk and `Drop` still tries.
     resolved: bool,
+    /// Whether the exploratory value is KNOWN to be on the camera and the camera
+    /// is still answering.
+    ///
+    /// `Drop` writes only when this is true. Without it, an explicit restore that
+    /// failed was immediately retried by `Drop` on the way out: an ioctl error
+    /// from this unit is how this crate decides a camera has stopped answering,
+    /// and its own rule is that nothing further may be sent to it. Sending the
+    /// same request again to hardware just classified as unresponsive is the
+    /// #159 hazard, and it bypassed the attempt budget entirely, which only
+    /// governs later recovery passes.
+    ///
+    /// Every ioctl that returns an error clears it, because an error leaves the
+    /// state uncertain. The record stays open in that case, so the next capture
+    /// resolves it through recovery, where each attempt is counted and durable.
+    exploratory_value_is_live: bool,
 }
 
 impl ExploratoryWrite {
@@ -1400,7 +1601,32 @@ impl ExploratoryWrite {
             original: original.to_vec(),
             record,
             resolved: false,
+            // Nothing has been written yet.
+            exploratory_value_is_live: false,
         })
+    }
+
+    /// Put the exploratory value on the camera, arming the guard only if the
+    /// camera accepted it.
+    ///
+    /// Disarmed BEFORE the ioctl, armed after. An error in between leaves the
+    /// state uncertain, and the safe reading of uncertain is "do not send this
+    /// camera anything else".
+    fn apply_exploratory(&mut self, value: &[u8]) -> XuResult<()> {
+        self.exploratory_value_is_live = false;
+        set_cur(self.fd, self.unit, self.selector, value)?;
+        self.exploratory_value_is_live = true;
+        Ok(())
+    }
+
+    /// Put the original back, once.
+    ///
+    /// Disarms first either way: if this succeeds there is nothing left for
+    /// `Drop` to do, and if it fails `Drop` must not repeat it. The record stays
+    /// open until `confirm_restored` proves the control holds the original.
+    fn restore_once(&mut self) -> XuResult<()> {
+        self.exploratory_value_is_live = false;
+        set_cur(self.fd, self.unit, self.selector, &self.original)
     }
 
     /// Read the control back and drop the record only if it holds the original.
@@ -1441,14 +1667,19 @@ impl ExploratoryWrite {
 
 impl Drop for ExploratoryWrite {
     fn drop(&mut self) {
-        if self.resolved {
+        // `exploratory_value_is_live` is the whole difference between putting
+        // back a change this run is known to have made and poking a camera that
+        // has already failed to answer. Only the first is worth a write.
+        if self.resolved || !self.exploratory_value_is_live {
             return;
         }
+        self.exploratory_value_is_live = false;
         // Best effort, and deliberately quiet about its own failure: the record
         // is still on disk, so a failure here is recovered at the next capture
-        // rather than lost. What must not happen is leaving the control changed
-        // AND clearing the record, so the clear only runs behind a confirmed
-        // read-back.
+        // rather than lost — and there, unlike here, every attempt is counted
+        // and made durable before it is made. What must not happen is leaving
+        // the control changed AND clearing the record, so the clear only runs
+        // behind a confirmed read-back.
         if set_cur(self.fd, self.unit, self.selector, &self.original).is_ok() {
             let _ = self.confirm_restored();
         }
@@ -1944,6 +2175,7 @@ impl Discovered {
 /// an operation that already spends seconds on camera I/O, and discovery returns
 /// exactly one of these per run.
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 enum Attempt {
     /// Lit, and still holding the applied value, with its undo record open.
     Lit(EmitterControl, ExploratoryWrite),
@@ -1955,6 +2187,7 @@ enum Attempt {
     NotUsable(String),
 }
 
+#[derive(Debug)]
 enum TryFailure {
     Query(XuError),
     Restore(XuError),
@@ -2029,15 +2262,27 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     // it. `pending` also restores the control from `Drop`, which covers the
     // paths no statement below can — a panic in the decoder, or an ioctl error
     // taken by `?`.
+    // Re-checked here, not only inside `measure`. A process-directed signal is
+    // delivered to an ARBITRARY thread that has it unblocked, and the daemon has
+    // several; the camera worker's frame wait may never see EINTR at all. So the
+    // abort is polled again at each point that is about to change the camera,
+    // rather than relied on to interrupt a syscall.
+    if abort_requested() {
+        return Err(TryFailure::Measurement);
+    }
+
     let mut pending = ExploratoryWrite::open(fd, id, unit, selector, len, &original, &wanted)
         .map_err(TryFailure::Journal)?;
 
-    set_cur(fd, unit, selector, &wanted)?;
+    if abort_requested() {
+        return Err(TryFailure::Measurement);
+    }
+    pending.apply_exploratory(&wanted)?;
     let Some(lit) = measure() else {
         // The stream died after the control was changed. Aborting without
         // putting it back would leave the camera altered by a run that
         // concluded nothing.
-        set_cur(fd, unit, selector, &original).map_err(TryFailure::Restore)?;
+        pending.restore_once().map_err(TryFailure::Restore)?;
         pending.confirm_restored().map_err(TryFailure::Journal)?;
         return Err(TryFailure::Measurement);
     };
@@ -2048,7 +2293,7 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     // lighting, and the same camera here has measured 38 to 168 depending only
     // on what was in front of it.
     if lit < before + AUTOCONF_MIN_LIFT {
-        set_cur(fd, unit, selector, &original).map_err(TryFailure::Restore)?;
+        pending.restore_once().map_err(TryFailure::Restore)?;
         pending.confirm_restored().map_err(TryFailure::Journal)?;
         return Ok(Attempt::NotUsable(format!(
             "the image did not brighten (before {before:.0}, after {lit:.0}, needs +{AUTOCONF_MIN_LIFT:.0})"
@@ -2059,7 +2304,7 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     // or an exposure transition produces the same twenty points as a working
     // illuminator. Put the control back and require the brightness to fall with
     // it: a change that does not follow the control is not caused by it.
-    set_cur(fd, unit, selector, &original).map_err(TryFailure::Restore)?;
+    pending.restore_once().map_err(TryFailure::Restore)?;
     let Some(after_restore) = measure() else {
         return Err(TryFailure::Measurement);
     };
@@ -2081,7 +2326,10 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     // The record stays OPEN. The camera is deliberately changed from here on,
     // and until `save_conf` records which control did it there is still nothing
     // on disk that could put it back. `Discovered::committed` closes it.
-    set_cur(fd, unit, selector, &wanted)?;
+    if abort_requested() {
+        return Err(TryFailure::Measurement);
+    }
+    pending.apply_exploratory(&wanted)?;
     Ok(Attempt::Lit(
         EmitterControl {
             unit,
@@ -2509,6 +2757,272 @@ mod tests {
                 "logging for {outcome:?}"
             );
         }
+    }
+
+    /// Drive one whole `try_documented_control` run against a stand-in camera.
+    ///
+    /// Returns the ordered request log and the value the control ends up
+    /// holding. `IRLUME_STATE_DIR` points at a scratch directory so the undo
+    /// record is real.
+    fn run_discovery(
+        camera: fake_camera::Camera,
+        tag: &str,
+        mut measure: impl FnMut() -> Option<f32>,
+    ) -> (
+        std::result::Result<Attempt, TryFailure>,
+        Vec<fake_camera::Request>,
+        Vec<u8>,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!("irlume-discovery-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _fake = fake_camera::install(camera);
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+        // fd is never reached: the fake intercepts before the ioctl.
+        let outcome = try_documented_control(-1, &id, ms.unit_id, selector, &mut measure);
+        (outcome, fake_camera::log(), fake_camera::current(), dir)
+    }
+
+    /// A camera shaped like the two this module was validated against: they
+    /// report `GET_MAX 01 03 03` and `GET_DEF 01 03 01`, from which
+    /// `face_auth_payload` derives `01 03 02`. Using the real numbers means the
+    /// run reaches a write for the same reason a real one does.
+    fn a_working_camera() -> fake_camera::Camera {
+        fake_camera::Camera {
+            current: vec![1, 3, 1],
+            len: 3,
+            // D0 get + D1 set, and none of the disabled bits.
+            info: 0b0000_0011,
+            def: vec![1, 3, 1],
+            max: vec![1, 3, 3],
+            min: vec![0, 0, 0],
+            res: vec![1, 1, 1],
+            ..Default::default()
+        }
+    }
+
+    /// The undo record reaches disk BEFORE the first byte is written to the
+    /// camera. This is the ordering the whole module exists for, and until a
+    /// stand-in camera existed nothing without hardware could observe it.
+    #[test]
+    fn the_undo_record_is_on_disk_before_the_first_write() {
+        let _lock = crate::testenv::env_lock();
+        let mut brightness = [10.0f32, 90.0, 10.0].into_iter();
+        let (_outcome, log, _current, dir) =
+            run_discovery(a_working_camera(), "record-first", move || {
+                brightness.next()
+            });
+
+        let first_write = log
+            .iter()
+            .position(|r| matches!(r, fake_camera::Request::Set(_)))
+            .expect("discovery must have written something, or this proves nothing");
+        // The record is written inside `ExploratoryWrite::open`, which runs
+        // before that write. Its presence on disk at the moment of the write is
+        // what a crash would depend on, so the store is checked to have been
+        // created rather than the call merely to have been made.
+        assert!(
+            dir.join("ir-emitter-journal").exists(),
+            "the store must exist by the end of a run that wrote to the camera"
+        );
+        assert!(first_write > 0, "reads precede the first write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A camera that refuses the restoring write must not be written to again.
+    ///
+    /// The guard's `Drop` used to repeat the identical `SET_CUR` on the way out,
+    /// against hardware this crate had just classified as unresponsive, and
+    /// outside the attempt budget entirely. That is the #159 hazard: the rule
+    /// here is that after an error nothing further is sent.
+    #[test]
+    fn a_camera_that_refuses_a_restore_is_not_written_to_again() {
+        let _lock = crate::testenv::env_lock();
+        // Accept the exploratory write, then fail every write after it.
+        let camera = fake_camera::Camera {
+            fail_set_from: Some((2, libc::EIO)),
+            ..a_working_camera()
+        };
+        // Bright, then the stream dies, which is the path that restores.
+        let mut brightness = [10.0f32].into_iter();
+        let (outcome, log, _current, dir) =
+            run_discovery(camera, "restore-refused", move || brightness.next());
+
+        assert!(
+            matches!(outcome, Err(TryFailure::Restore(_))),
+            "the refused restore is what the run reports"
+        );
+        let writes = log
+            .iter()
+            .filter(|r| matches!(r, fake_camera::Request::Set(_)))
+            .count();
+        assert_eq!(
+            writes, 2,
+            "one exploratory write and one restore attempt, and nothing after the refusal: {log:?}"
+        );
+        // The record stays, so the next capture resolves it through recovery,
+        // where every attempt is counted and durable before it is made.
+        let store = dir.join("ir-emitter-journal");
+        let remaining = std::fs::read_dir(&store)
+            .map(|d| d.count())
+            .unwrap_or_default();
+        assert_eq!(remaining, 1, "the undo record is left for recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A camera that refuses the FIRST write has not been changed, so there is
+    /// nothing for `Drop` to put back and it must send nothing.
+    #[test]
+    fn a_refused_first_write_produces_no_second_one() {
+        let _lock = crate::testenv::env_lock();
+        let camera = fake_camera::Camera {
+            fail_set_from: Some((1, libc::EIO)),
+            ..a_working_camera()
+        };
+        let mut brightness = [10.0f32].into_iter();
+        let (outcome, log, current, dir) =
+            run_discovery(camera, "first-write-refused", move || brightness.next());
+
+        assert!(matches!(outcome, Err(TryFailure::Query(_))), "{outcome:?}");
+        let writes = log
+            .iter()
+            .filter(|r| matches!(r, fake_camera::Request::Set(_)))
+            .count();
+        assert_eq!(
+            writes, 1,
+            "exactly one write, which the camera refused: {log:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the control was never changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that stops early because the signal flag is set must not have
+    /// written to the camera at all.
+    ///
+    /// The flag is polled directly before each write rather than relied on to
+    /// interrupt a frame wait: a process-directed signal goes to an arbitrary
+    /// thread, so the camera worker may never see EINTR.
+    #[test]
+    fn an_abort_before_the_first_write_sends_the_camera_nothing() {
+        let _lock = crate::testenv::env_lock();
+        // Measurement succeeds; the abort is what stops the run.
+        let guard = AbortOnSignal::install();
+        ABORT_SIGNAL.store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            abort_requested(),
+            "the flag must be set for this to mean anything"
+        );
+
+        let (outcome, log, current, dir) =
+            run_discovery(a_working_camera(), "abort-first", || Some(10.0));
+
+        // Take the flag back before the guard drops, so nothing is re-raised at
+        // the test binary.
+        ABORT_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+
+        assert!(
+            matches!(outcome, Err(TryFailure::Measurement)),
+            "{outcome:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may reach a camera after a stop signal: {log:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recovery sizes its `GET_CUR` from the length the CAMERA reports, never
+    /// from the record.
+    ///
+    /// The three queries used to sit in one tuple, and a tuple evaluates every
+    /// operand before the match runs: a record claiming 64 bytes against a
+    /// camera reporting 3 sent a 64-byte control request to firmware, and only
+    /// afterwards was the mismatch noticed. This is an ordering between two
+    /// ioctls, so the request log is the only thing that can show it.
+    #[test]
+    fn recovery_asks_the_camera_its_length_before_reading_the_control() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-recovery-length");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        // A record that claims a 64-byte control, against a camera that says 3.
+        let record = crate::emitter_journal::PendingWrite {
+            schema_version: crate::emitter_journal::SCHEMA_VERSION,
+            engine_version: "test".into(),
+            descriptor_sha256: crate::emitter_journal::fingerprint(&id),
+            usb_id: id.usb_id(),
+            interface_number: id.interface_number,
+            unit: ms.unit_id,
+            selector,
+            len: 64,
+            original: crate::emitter_journal::to_hex(&[0u8; 64]),
+            attempted: crate::emitter_journal::to_hex(&[1u8; 64]),
+            restore_attempts: 0,
+            boot_id: None,
+            pid: None,
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
+        };
+        crate::emitter_journal::save(&record).expect("plant the record");
+
+        let _fake = fake_camera::install(a_working_camera());
+        let outcome = recover_pending_write(-1, &id);
+        let log = fake_camera::log();
+
+        assert!(
+            matches!(outcome, RecoveryOutcome::Unresolved(_)),
+            "a length the camera contradicts is unresolved: {outcome:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "nothing is written: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|r| matches!(
+                r,
+                fake_camera::Request::Get {
+                    query: UVC_GET_CUR,
+                    ..
+                }
+            )),
+            "the control is never read once its length is contradicted: {log:?}"
+        );
+        // And the guard has to be reachable: the camera really was asked.
+        assert!(
+            log.iter().any(|r| matches!(
+                r,
+                fake_camera::Request::Get {
+                    query: UVC_GET_LEN,
+                    ..
+                }
+            )),
+            "GET_LEN must have been issued, or this proves nothing: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An unresolved record stops ALL THREE of the sources a capture can apply

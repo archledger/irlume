@@ -323,10 +323,19 @@ mod tests {
 
     /// Serialises tests that set IRLUME_STATE_DIR. Cargo runs tests on threads
     /// and the variable is process-global, so two of these racing made one read
-    /// the other's store. Same reason pamwire's tests hold an env lock.
+    /// the other's store.
+    ///
+    /// This is `crate::testenv::ENV_LOCK`, the one every other env-mutating test
+    /// in this crate holds, and it has to be: a second mutex guarding the same
+    /// variable serialises a test against its own module and against nothing
+    /// else. These tests used a private one, so `logintx` and `pamwire` could
+    /// both be inside their own lock, holding different values of
+    /// IRLUME_STATE_DIR, at the same moment. It passed here and failed in CI,
+    /// which is what a lock that guards the wrong scope looks like.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn temp_state(tag: &str) -> PathBuf {

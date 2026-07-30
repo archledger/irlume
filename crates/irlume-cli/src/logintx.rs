@@ -223,25 +223,27 @@ impl Transaction {
     /// synced too, on the run that creates it, for the same reason.
     pub(crate) fn save(&self) -> Result<PathBuf, String> {
         let dir = store_dir();
-        let store_is_new = !dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         restrict(&dir, 0o700)?;
         // Creating the store is itself a directory entry that has to survive a
         // power loss, and `create_dir_all` does not make one durable.
         // `write_0600_atomic` fsyncs the record and the directory holding it,
-        // but on the first run of a fresh install the entry for that directory
-        // is still only in its parent's page cache: the record could be fsynced
-        // into a directory that does not come back. PAM is rewritten
-        // immediately afterwards, so the machine would again be left changed
-        // with nothing describing how to undo it — the same defect as the
-        // truncate above, one level up.
+        // but on a fresh install the entry FOR that directory is still only in
+        // its parent's page cache: the record would be fsynced into a directory
+        // that does not come back. PAM is rewritten immediately afterwards, so
+        // the machine would again be left changed with nothing describing how
+        // to undo it — the same defect as the truncate above, one level up.
         //
-        // Only on creation: an fsync of the parent on every save would cost two
-        // per apply to re-prove something already durable.
-        if store_is_new {
-            if let Some(parent) = dir.parent() {
-                fsync_dir(parent)?;
-            }
+        // Unconditional, and deliberately not skipped when the store already
+        // exists. Testing `exists()` first and syncing only when this process
+        // created it looks like a free optimisation and is not: another process
+        // that finds the directory already there, writes its record and rewrites
+        // PAM has inherited a durability guarantee nobody has made yet, because
+        // the process that created the directory may not have synced its parent
+        // yet, or at all. Two fsyncs per apply is not a price worth an
+        // unrecoverable machine.
+        if let Some(parent) = dir.parent() {
+            fsync_dir(parent)?;
         }
         let path = dir.join(format!("{}.json", self.id));
         let body = serde_json::to_string(self).map_err(|e| format!("serialize record: {e}"))?;

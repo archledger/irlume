@@ -35,6 +35,7 @@ const CAPABILITIES: &[&str] = &[
     "login-status-json",
     "auth-test-events",
     "login-plan-json",
+    "login-transactions",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -687,6 +688,12 @@ fn plan_id(action: &str, planned: &[crate::pamwire::PlannedSurface]) -> String {
         material.push_str(surface.id);
         material.push(' ');
         material.push_str(surface.change.id());
+        material.push(' ');
+        // The observed state, not just the intended outcome. Without this an
+        // admin could rewrite a stack, leave the anchor intact so the outcome
+        // stays `wire`, and an apply carrying the old id would overwrite a stack
+        // the consumer never saw.
+        material.push_str(&surface.state);
     }
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(material.as_bytes());
@@ -726,6 +733,888 @@ fn valid_login_plan_args(args: &[String]) -> Option<&'static str> {
     // the consumer meant to turn login on or off.
     if saw_json {
         action
+    } else {
+        None
+    }
+}
+
+/// Root, or the reason to refuse.
+///
+/// Checked in the command rather than left to the write failing with EACCES:
+/// a mutating command that gets partway before losing permission leaves a PAM
+/// stack half-changed, and `not-authorized` up front is a better answer than a
+/// partial apply.
+fn require_root(command: &'static str, contract: u32) -> Option<ExitCode> {
+    // SAFETY: geteuid cannot fail and touches no memory.
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
+    Some(emit(
+        &failure(command, "not-authorized", false, contract),
+        ExitCode::FAILURE,
+    ))
+}
+
+/// Emit a document with extra top-level fields merged in.
+///
+/// Used where a FAILURE still carries something the caller needs, such as the
+/// transaction id of a partial apply. Contract 1 permits fields to be added, so
+/// this stays inside the contract; putting the value on stderr would not,
+/// because machine mode promises stderr is empty.
+fn emit_with_extra(document: &Document, extra: Value, exit: ExitCode) -> ExitCode {
+    let mut value = match serde_json::to_value(document) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("irlume machine output serialization failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let (Some(object), Some(fields)) = (value.as_object_mut(), extra.as_object()) {
+        for (key, field) in fields {
+            object.insert(key.clone(), field.clone());
+        }
+    }
+    match serde_json::to_string(&value) {
+        Ok(line) => {
+            println!("{line}");
+            exit
+        }
+        Err(error) => {
+            eprintln!("irlume machine output serialization failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Report why a transaction record could not be loaded, without flattening the
+/// reasons into one code. A caller told "not found" for a permission problem
+/// would go looking for a wrong transaction id.
+fn emit_load_failure(
+    command: &'static str,
+    reason: crate::logintx::LoadFailure,
+    contract: u32,
+) -> ExitCode {
+    let code = match reason {
+        crate::logintx::LoadFailure::NotFound => "not-found",
+        crate::logintx::LoadFailure::NotAuthorized => "not-authorized",
+        crate::logintx::LoadFailure::Unreadable(_) => "operation-failed",
+        // Distinct from operation-failed: retrying will never help, and the
+        // action a consumer should take is to run the newer irlume, not to
+        // report a storage problem.
+        crate::logintx::LoadFailure::TooNew { .. } => "unsupported-record",
+    };
+    emit(&failure(command, code, false, contract), ExitCode::FAILURE)
+}
+
+/// Each surface's state, and how many are not as apply left them.
+///
+/// Split out so it can be driven by a test with a record pointing at temporary
+/// files: the command around it needs root and a real PAM tree, but this is the
+/// part that decides the answer.
+fn verify_surfaces(record: &crate::logintx::Transaction) -> (Vec<Value>, usize) {
+    let surfaces: Vec<Value> = record
+        .surfaces
+        .iter()
+        .map(|surface| {
+            let state = match crate::logintx::unchanged_since_apply(surface) {
+                Ok(()) => "as-applied",
+                Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => "changed-since-apply",
+                Err(crate::logintx::RollbackRefusal::Unreadable(_)) => "unreadable",
+            };
+            json!({ "surface": surface.id, "state": state })
+        })
+        .collect();
+    let drifted = surfaces
+        .iter()
+        .filter(|entry| entry["state"] != "as-applied")
+        .count();
+    (surfaces, drifted)
+}
+
+/// Restore every surface of a transaction, or report what it would restore.
+///
+/// Shared by the confirmed and the unconfirmed path so the restore itself has
+/// one implementation. `unconfirmed` only changes what is reported: the writes
+/// are identical, and the decision about whether restoring is safe was already
+/// made by the caller.
+fn rollback_restore(
+    command: &'static str,
+    record: &crate::logintx::Transaction,
+    will_apply: bool,
+    contract: u32,
+    unconfirmed: bool,
+) -> ExitCode {
+    if !will_apply {
+        return emit(
+            &success(
+                command,
+                json!({
+                    "transaction_id": record.id,
+                    "action": record.action,
+                    "unconfirmed": unconfirmed,
+                    "would_restore": record.surfaces.iter().map(|s| json!(s.id)).collect::<Vec<_>>(),
+                    "applied": false,
+                }),
+                contract,
+            ),
+            ExitCode::SUCCESS,
+        );
+    }
+    // Refuse the whole record if it names anything irlume does not manage,
+    // BEFORE restoring any of it. Checked here rather than at load so a record
+    // can still be read and reported by verify; it is writing that is gated.
+    if let Some(stray) = record
+        .surfaces
+        .iter()
+        .find(|s| !crate::pamwire::is_managed_path(&s.path))
+    {
+        irlume_common::dlog!(
+            "{command}: refusing, record names an unmanaged path: {}",
+            stray.path
+        );
+        return emit(
+            &failure(command, "unmanaged-path", false, contract),
+            ExitCode::FAILURE,
+        );
+    }
+    // An unconfirmed rollback writes over whatever is there without checking,
+    // because its after-digests were never confirmed. That is how a machine
+    // whose apply was interrupted gets recovered, and equally how a package
+    // update or an administrator's later edit gets reverted. Copy it first, and
+    // say where: nothing else captures what this is about to overwrite.
+    let snapshot = if unconfirmed {
+        match crate::logintx::snapshot_before_rollback(record) {
+            Ok(dir) => Some(dir.display().to_string()),
+            Err(message) => {
+                irlume_common::dlog!("{command}: cannot snapshot before restoring: {message}");
+                return emit(
+                    &failure(command, "operation-failed", true, contract),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // What a previous run of this rollback already put back. Those surfaces are
+    // skipped: they hold their before-content now, so re-restoring is pointless
+    // and re-checking them against the after-digest would refuse the whole
+    // record — which is what made a stopped rollback unfinishable.
+    let mut progress = crate::logintx::rollback_progress(&record.id);
+    // Marking a restore BEGUN before doing it, and finished after, is the same
+    // write-ahead ordering the transaction record itself uses. Noting only
+    // completions left the window between the write and the note: a kill there
+    // leaves a surface holding its before-image with nothing recording it, and
+    // the re-run refuses it as drift. Thirty killed rollbacks in a row were
+    // unfinishable that way on real hardware.
+    let begin = |progress: &mut crate::logintx::RollbackProgress, key: &str| {
+        if !progress.started.iter().any(|k| k == key) {
+            progress.started.push(key.to_string());
+        }
+        crate::logintx::note_rollback_progress(&record.id, progress)
+    };
+    for surface in &record.surfaces {
+        let sidecar_key = crate::logintx::sidecar_progress_id(&surface.id);
+        let live_done = progress.finished(&surface.id);
+        let sidecar_done = progress.finished(&sidecar_key);
+        if live_done && sidecar_done {
+            continue;
+        }
+        // Re-check THIS surface immediately before restoring it. The blanket
+        // check above happens before any write, which is what stops a rollback
+        // half-completing, but it leaves a window: by the time the loop reaches
+        // the last surface, the earlier ones have been written and time has
+        // passed. Checking again here narrows the window to a single
+        // check-and-write. Skipped for an unconfirmed record, whose digests were
+        // never confirmed and so cannot gate anything.
+        if !unconfirmed {
+            if let Err(reason) = crate::logintx::unchanged_since_apply_excluding(surface, &progress)
+            {
+                irlume_common::dlog!(
+                    "{command}: {} moved while the rollback was running: {reason:?}",
+                    surface.id
+                );
+                return emit_with_extra(
+                    &failure(command, "changed-since-apply", false, contract),
+                    json!({
+                        "transaction_id": record.id,
+                        "restored": progress.done,
+                        "stopped_at": surface.id,
+                        // Where the pre-rollback copies are, so a caller that
+                        // stopped partway can still find what was overwritten.
+                        "snapshot": snapshot,
+                    }),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+        // Mode and ownership are restored with the content. All three come
+        // from the same record, so a partial record restores what it has rather
+        // than inventing values.
+        let metadata = match (surface.mode, surface.uid, surface.gid) {
+            (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
+            _ => None,
+        };
+        let live = if live_done {
+            Ok(())
+        } else {
+            // Announced before it happens. Restoring writes the recorded
+            // before-content, so doing it twice is the same as doing it once,
+            // which is what makes an interrupted one safe to repeat.
+            begin(&mut progress, &surface.id).and_then(|()| {
+                crate::pamwire::restore_surface(
+                    std::path::Path::new(&surface.path),
+                    surface.before.as_deref(),
+                    metadata,
+                )
+            })
+        };
+        match live {
+            Ok(()) => {
+                // Noted BEFORE the backup is touched. Recording the two together
+                // is what left a stop between them unresumable: the live file
+                // held its before-image and nothing said so, so the re-run
+                // checked it against the after-digest and refused it as drift.
+                if !live_done {
+                    progress.done.push(surface.id.clone());
+                    if let Err(message) =
+                        crate::logintx::note_rollback_progress(&record.id, &progress)
+                    {
+                        irlume_common::dlog!("{command}: cannot record progress: {message}");
+                        return emit_with_extra(
+                            &failure(command, "operation-failed", false, contract),
+                            json!({
+                                "transaction_id": record.id,
+                                "restored": progress.done,
+                                "stopped_at": surface.id,
+                                "snapshot": snapshot,
+                            }),
+                            ExitCode::FAILURE,
+                        );
+                    }
+                }
+                // The backup is put back with its surface. Leaving a stale one
+                // behind is not inert: a later enable rebuilds from it as the
+                // origin, so it would silently discard an administrator's edits.
+                if let Some(sidecar) = &surface
+                    .sidecar
+                    .as_ref()
+                    .filter(|_| !sidecar_done)
+                    .filter(|s| crate::pamwire::is_managed_path(&s.path))
+                {
+                    let sidecar_metadata = match (sidecar.mode, sidecar.uid, sidecar.gid) {
+                        (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
+                        _ => None,
+                    };
+                    if let Err(message) = crate::pamwire::restore_surface(
+                        std::path::Path::new(&sidecar.path),
+                        sidecar.before.as_deref(),
+                        sidecar_metadata,
+                    ) {
+                        irlume_common::dlog!("{command}: {} backup failed: {message}", surface.id);
+                        return emit_with_extra(
+                            &failure(command, "operation-failed", false, contract),
+                            json!({
+                                "transaction_id": record.id,
+                                "restored": progress.done,
+                                "stopped_at": surface.id,
+                            }),
+                            ExitCode::FAILURE,
+                        );
+                    }
+                }
+                // The sidecar half, noted on its own. Durably, before moving
+                // to the next surface: a note written after the whole loop would
+                // describe only the runs that did not need it.
+                progress.done.push(sidecar_key.clone());
+                if let Err(message) = crate::logintx::note_rollback_progress(&record.id, &progress)
+                {
+                    irlume_common::dlog!("{command}: cannot record progress: {message}");
+                    return emit_with_extra(
+                        &failure(command, "operation-failed", false, contract),
+                        json!({
+                            "transaction_id": record.id,
+                            "restored": progress.done,
+                            "stopped_at": surface.id,
+                            "snapshot": snapshot,
+                        }),
+                        ExitCode::FAILURE,
+                    );
+                }
+            }
+            Err(message) => {
+                irlume_common::dlog!("{command}: {} failed: {message}", surface.id);
+                // What was already restored travels in the document, because
+                // machine mode promises an empty stderr and a caller stopped
+                // partway needs to know exactly how far it got.
+                return emit_with_extra(
+                    &failure(command, "operation-failed", false, contract),
+                    json!({
+                        "transaction_id": record.id,
+                        "restored": progress.done,
+                        "stopped_at": surface.id,
+                        // Where the pre-rollback copies are, so a caller that
+                        // stopped partway can still find what was overwritten.
+                        "snapshot": snapshot,
+                    }),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    }
+    // Every surface is back, so the resume note has nothing left to describe.
+    // The snapshot stays: it is for a person, not for the next run.
+    //
+    // A note that outlives the success it describes is not harmless: the next
+    // rollback trusts it and skips those files unchecked, so failing to clear it
+    // is reported rather than swallowed.
+    if let Err(message) = crate::logintx::clear_rollback_progress(&record.id) {
+        irlume_common::dlog!(
+            "{command}: restored everything but could not clear progress: {message}"
+        );
+        return emit_with_extra(
+            &failure(command, "operation-failed", true, contract),
+            json!({
+                "transaction_id": record.id,
+                "restored": progress.done,
+                "applied": true,
+                "snapshot": snapshot,
+            }),
+            ExitCode::FAILURE,
+        );
+    }
+    emit(
+        &success(
+            command,
+            json!({
+                "transaction_id": record.id,
+                "action": record.action,
+                "unconfirmed": unconfirmed,
+                "restored": progress.done,
+                "applied": true,
+                "snapshot": snapshot,
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+/// What blocks a rollback, kept apart by reason.
+///
+/// A file that CHANGED and one that cannot be READ are different problems: a
+/// consumer told "changed-since-apply" goes looking for an edit, when the truth
+/// may be a permission or storage fault the transaction had nothing to do with.
+/// Both still stop the rollback, since neither is safe to restore over.
+#[derive(Default)]
+pub(crate) struct RollbackBlockers<'a> {
+    pub(crate) changed: Vec<&'a str>,
+    pub(crate) unreadable: Vec<&'a str>,
+}
+
+impl RollbackBlockers<'_> {
+    pub(crate) fn any(&self) -> bool {
+        !self.changed.is_empty() || !self.unreadable.is_empty()
+    }
+}
+
+fn rollback_blockers(record: &crate::logintx::Transaction) -> RollbackBlockers<'_> {
+    rollback_blockers_excluding(record, &crate::logintx::rollback_progress(&record.id))
+}
+
+/// The blanket precheck, minus the surfaces a stopped run already put back.
+///
+/// A restored surface holds its BEFORE content, so it no longer matches the
+/// recorded after-digest and reads as drift. Checking it anyway refused the
+/// whole record, which is precisely what made a stopped rollback unfinishable:
+/// the operator was told their stack had been edited when what had happened is
+/// that irlume itself restored part of it.
+fn rollback_blockers_excluding<'a>(
+    record: &'a crate::logintx::Transaction,
+    done: &crate::logintx::RollbackProgress,
+) -> RollbackBlockers<'a> {
+    let mut blockers = RollbackBlockers::default();
+    for surface in &record.surfaces {
+        match crate::logintx::unchanged_since_apply_excluding(surface, done) {
+            Ok(()) => {}
+            Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => {
+                blockers.changed.push(surface.id.as_str());
+            }
+            Err(crate::logintx::RollbackRefusal::Unreadable(_)) => {
+                blockers.unreadable.push(surface.id.as_str());
+            }
+        }
+    }
+    blockers
+}
+
+/// `irlume login apply --action X --plan-id ID --json`: carry out a plan.
+///
+/// The plan is re-derived from the machine and its id recomputed. A `plan_id`
+/// that no longer matches is refused as `plan-stale`, because the consumer
+/// displayed one set of changes and the machine now calls for another; applying
+/// anyway would change something nobody was shown. The id is never trusted as
+/// input, only compared.
+pub fn login_apply(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.apply";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some((action, supplied_plan)) = valid_login_apply_args(args) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    if let Some(refusal) = require_root(COMMAND, contract) {
+        return refusal;
+    }
+    // Taken BEFORE the plan is revalidated and held past the confirming record,
+    // so the whole transaction is one unit. Acquiring it later would leave the
+    // staleness check comparing against a stack another irlume process is
+    // partway through rewriting, and the record would then describe a state that
+    // never existed on disk.
+    let _lock = match crate::pamwire::lock_pam() {
+        Ok(lock) => lock,
+        Err(message) => {
+            irlume_common::dlog!("login.apply: refusing, cannot serialise: {message}");
+            return emit(
+                &failure(COMMAND, "operation-failed", true, contract),
+                ExitCode::FAILURE,
+            );
+        }
+    };
+    let enable = action == "enable";
+    let planned = crate::pamwire::plan(enable, false, false);
+    let current_plan = plan_id(action, &planned);
+    if current_plan != supplied_plan {
+        return emit(
+            &failure(COMMAND, "plan-stale", false, contract),
+            ExitCode::FAILURE,
+        );
+    }
+
+    // WRITE-AHEAD. The before-states are captured and persisted BEFORE the first
+    // PAM write, because the alternative has no safe ordering: writing the files
+    // first leaves a crash, a kill or a full disk able to strand a changed login
+    // stack with nothing describing how to undo it. A record left `prepared`
+    // says exactly that happened, and its before-states are still the authority
+    // for a rollback.
+    //
+    // Failing to record is therefore a refusal, not a warning: nothing has been
+    // touched yet, so refusing costs the caller a retry rather than a login.
+    let transaction_id = random_id();
+    let to_records = |surfaces: &[crate::pamwire::AppliedSurface]| {
+        surfaces
+            .iter()
+            .map(|surface| crate::logintx::SurfaceRecord {
+                id: surface.id.to_string(),
+                path: surface.path.clone(),
+                change: surface.change.id().to_string(),
+                before: surface.before.clone(),
+                after_sha256: surface.after_sha256.clone(),
+                mode: surface.before_metadata.map(|(mode, _, _)| mode),
+                uid: surface.before_metadata.map(|(_, uid, _)| uid),
+                gid: surface.before_metadata.map(|(_, _, gid)| gid),
+                // Recorded only when there was a backup to speak of, so a
+                // surface irlume never wired carries no sidecar at all.
+                sidecar: (surface.sidecar_existed || surface.sidecar_before.is_some()).then(|| {
+                    crate::logintx::SidecarRecord {
+                        path: format!("{}{}", surface.path, crate::pamwire::BACKUP),
+                        after_sha256: surface.sidecar_after_sha256.clone(),
+                        before: surface.sidecar_before.clone(),
+                        mode: surface.sidecar_metadata.map(|(mode, _, _)| mode),
+                        uid: surface.sidecar_metadata.map(|(_, uid, _)| uid),
+                        gid: surface.sidecar_metadata.map(|(_, _, gid)| gid),
+                    }
+                }),
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut record = crate::logintx::Transaction {
+        id: transaction_id,
+        schema_version: crate::logintx::SCHEMA_VERSION,
+        status: crate::logintx::TransactionStatus::Prepared,
+        action: action.to_string(),
+        plan_id: current_plan,
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        surfaces: to_records(&crate::pamwire::prepare(enable, false, false)),
+    };
+    if let Err(message) = record.save() {
+        irlume_common::dlog!("login.apply: refusing, cannot record beforehand: {message}");
+        return emit(
+            &failure(COMMAND, "operation-failed", true, contract),
+            ExitCode::FAILURE,
+        );
+    }
+
+    // The plan is handed to apply so each surface can be re-checked against the
+    // state it was planned against, immediately before that surface is written.
+    let applied = crate::pamwire::apply(enable, false, false, &planned);
+    record.surfaces = to_records(&applied);
+    record.status = crate::logintx::TransactionStatus::Applied;
+    // Rewriting this can fail, and by now the files HAVE changed. The prepared
+    // record is already on disk with the before-states, so a rollback remains
+    // possible; what is lost is the confirmed after-state, which is why the
+    // status matters and why this is still reported as a failure.
+    if let Err(message) = record.save() {
+        irlume_common::dlog!("login.apply: applied, but confirming the record failed: {message}");
+        return emit_with_extra(
+            &failure(COMMAND, "operation-failed", false, contract),
+            json!({ "transaction_id": record.id, "status": "prepared" }),
+            ExitCode::FAILURE,
+        );
+    }
+
+    let failed: Vec<&crate::pamwire::AppliedSurface> =
+        applied.iter().filter(|s| s.error.is_some()).collect();
+    // Keep the self-heal marker in step with what was just written, exactly as
+    // the human path does. Without this the machine API unwires the files and
+    // leaves the marker saying "wired", so `irlume-reconcile.path` fires on the
+    // change it just made, re-wires every greeter, and the transaction that
+    // asked for the disable is drifted and no longer rollbackable — irlume
+    // fighting its own writes.
+    //
+    // Found on a machine where login was genuinely wired and the path unit
+    // active. Neither the container suite nor a bed with nothing wired can show
+    // it: there is no reconcile unit in one and nothing to re-wire in the other.
+    //
+    // The scopes match what `apply` planned: this command wires the greeter and
+    // lock screen, and never sudo or polkit, which are their own opt-in.
+    if failed.is_empty() {
+        // Only the scopes this command is responsible for. `login apply` wires
+        // the greeter and the lock screen and never touches sudo or polkit, so
+        // it must not overwrite their flags: a machine `enable` on a host where
+        // someone had opted into face-polkit would otherwise record
+        // with_polkit=false and reconcile would quietly stop maintaining it.
+        //
+        // On disable the marker goes entirely, because a disable unwires every
+        // surface including those two.
+        let (with_sudo, with_polkit, _) = crate::pamwire::read_wired_marker().unwrap_or_default();
+        crate::pamwire::write_wired_marker(enable, with_sudo, with_polkit, enable);
+    }
+    let changes: Vec<Value> = applied
+        .iter()
+        .map(|surface| {
+            json!({
+                "surface": surface.id,
+                "role": surface.role,
+                "change": surface.change.id(),
+                "applied": surface.error.is_none(),
+            })
+        })
+        .collect();
+    let data = json!({
+        "transaction_id": record.id,
+        "plan_id": record.plan_id,
+        "action": action,
+        "changes": changes,
+        "applied": applied.len() - failed.len(),
+        "failed": failed.len(),
+    });
+    if failed.is_empty() {
+        emit(&success(COMMAND, data, contract), ExitCode::SUCCESS)
+    } else {
+        // A partial apply is a failure that still has a transaction id, because
+        // the surfaces that DID change are recorded and can be rolled back.
+        //
+        // The id travels IN THE DOCUMENT, not on stderr. Machine mode promises
+        // stdout carries the answer and stderr is empty, and the conformance
+        // suite enforces that, so a hint printed there would break a caller that
+        // trusts the envelope. Contract 1 permits fields to be added, which is
+        // what makes carrying it here possible without a contract bump.
+        irlume_common::dlog!(
+            "login.apply: {} surface(s) failed; transaction {} can be rolled back",
+            failed.len(),
+            record.id
+        );
+        emit_with_extra(
+            &failure(COMMAND, "operation-failed", false, contract),
+            json!({ "transaction_id": record.id, "failed": failed.len() }),
+            ExitCode::FAILURE,
+        )
+    }
+}
+
+/// `irlume login verify --transaction-id ID --json`: is the machine still as
+/// that transaction left it?
+///
+/// Read-only, and deliberately usable without root: a desktop asking "did my
+/// change stick" should not need privilege to find out. Reading a record does,
+/// though, since the store is root-only, so an unprivileged caller gets
+/// `not-authorized` from the load rather than a wrong answer.
+pub fn login_verify(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.verify";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some(id) = valid_transaction_args(args, "verify", false) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    let record = match crate::logintx::Transaction::load(&id) {
+        Ok(record) => record,
+        Err(reason) => return emit_load_failure(COMMAND, reason, contract),
+    };
+    // Unknown is a status a newer engine wrote. This build cannot know what it
+    // guarantees, so it is treated as cautiously as an unconfirmed one.
+    let unconfirmed = !matches!(record.status, crate::logintx::TransactionStatus::Applied);
+    let (surfaces, drifted) = verify_surfaces(&record);
+    // A rollback that stopped partway left the surfaces it restored holding
+    // their BEFORE content, which reads as drift here. Counting those would tell
+    // an operator a rollback is unavailable when re-running it is exactly what
+    // finishes the job, so they are excluded from the availability answer and
+    // named instead.
+    let restored = crate::logintx::rollback_progress(&record.id);
+    let blocking = rollback_blockers_excluding(&record, &restored);
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "transaction_id": record.id,
+                "action": record.action,
+                "plan_id": record.plan_id,
+                // `prepared` means the writes were never confirmed: the process
+                // stopped between persisting the before-states and recording the
+                // result. The before-states are still usable, the after-digests
+                // are not, so drift is not meaningful for such a record.
+                // Reported as it is, not folded into "prepared": a consumer
+                // meeting `unknown` is looking at a record from a newer engine,
+                // which is a different thing to diagnose than an interrupted one.
+                "status": match record.status {
+                    crate::logintx::TransactionStatus::Applied => "applied",
+                    crate::logintx::TransactionStatus::Prepared => "prepared",
+                    crate::logintx::TransactionStatus::Unknown => "unknown",
+                },
+                "surfaces": surfaces,
+                "drifted": drifted,
+                // Whether a rollback would be accepted right now. Stated by the
+                // engine so a consumer does not have to infer it from per-surface
+                // states it may not recognise.
+                // An unconfirmed record can still be rolled back, but only on
+                // request: see login rollback --accept-unconfirmed.
+                "rollback_available": !unconfirmed && !blocking.any(),
+                // Present only when a previous rollback stopped partway. A
+                // consumer seeing it knows the drift below is irlume's own
+                // work, not somebody's edit.
+                "already_restored": restored,
+            }),
+            contract,
+        ),
+        ExitCode::SUCCESS,
+    )
+}
+
+/// `irlume login rollback --transaction-id ID --apply --json`: put back what a
+/// transaction changed.
+///
+/// Refuses unless every surface is still exactly as apply left it. Restoring a
+/// file something else has edited since would revert a change this transaction
+/// never made, so drift stops the whole rollback rather than skipping the
+/// drifted surface: a half-rolled-back login stack is its own hazard.
+///
+/// Without `--apply` it reports what it would restore and touches nothing.
+pub fn login_rollback(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "login.rollback";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = &without_contract(args);
+    let Some(id) = valid_transaction_args(args, "rollback", true) else {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    };
+    let will_apply = args.iter().any(|a| a == "--apply");
+    // Restoring an unconfirmed record gives up the protection against reverting
+    // somebody else's later edit, so it has to be asked for by name.
+    let accept_unconfirmed = args.iter().any(|a| a == "--accept-unconfirmed");
+    // Held across the precheck and every restore, for the same reason apply
+    // holds it: the per-surface drift check and the write it authorises are two
+    // moments, and another irlume process writing between them is exactly what
+    // the check cannot see. A dry run writes nothing and does not take it.
+    let _lock = if will_apply {
+        if let Some(refusal) = require_root(COMMAND, contract) {
+            return refusal;
+        }
+        match crate::pamwire::lock_pam() {
+            Ok(lock) => Some(lock),
+            Err(message) => {
+                irlume_common::dlog!("login.rollback: refusing, cannot serialise: {message}");
+                return emit(
+                    &failure(COMMAND, "operation-failed", true, contract),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let record = match crate::logintx::Transaction::load(&id) {
+        Ok(record) => record,
+        Err(reason) => return emit_load_failure(COMMAND, reason, contract),
+    };
+    // Every surface is checked BEFORE any is written. A rollback that restored
+    // three files and then met a fourth it must refuse would leave the stack in
+    // a state neither the transaction nor the admin chose.
+    // A `prepared` record never confirmed its writes, so its after-digests
+    // cannot gate anything: every existing file would read as drift and rollback
+    // would refuse exactly when recovery is most needed. Its before-states are
+    // still the authority, so a restore IS possible, but it gives up the
+    // protection against reverting somebody else's later edit. That trade is the
+    // operator's to make, not something to do silently.
+    if !matches!(record.status, crate::logintx::TransactionStatus::Applied) {
+        if !accept_unconfirmed {
+            irlume_common::dlog!(
+                "login.rollback: {} is unconfirmed; needs --accept-unconfirmed",
+                record.id
+            );
+            return emit(
+                &failure(COMMAND, "unconfirmed-transaction", false, contract),
+                ExitCode::FAILURE,
+            );
+        }
+        return rollback_restore(COMMAND, &record, will_apply, contract, true);
+    }
+    let blockers = rollback_blockers(&record);
+    if blockers.any() {
+        irlume_common::dlog!(
+            "login.rollback: refused; changed {:?}, unreadable {:?}",
+            blockers.changed,
+            blockers.unreadable
+        );
+        // A surface that cannot be READ is its own failure, not drift. Calling
+        // it drift would send a consumer hunting for an edit nobody made.
+        let code = if blockers.changed.is_empty() {
+            "operation-failed"
+        } else {
+            "changed-since-apply"
+        };
+        return emit(&failure(COMMAND, code, false, contract), ExitCode::FAILURE);
+    }
+    rollback_restore(COMMAND, &record, will_apply, contract, false)
+}
+
+fn valid_login_apply_args(args: &[String]) -> Option<(&'static str, String)> {
+    if args.first().map(String::as_str) != Some("login")
+        || args.get(1).map(String::as_str) != Some("apply")
+    {
+        return None;
+    }
+    let (mut action, mut plan, mut saw_json) = (None, None, false);
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--action" if action.is_none() => {
+                action = match args.get(index + 1).map(String::as_str) {
+                    Some("enable") => Some("enable"),
+                    Some("disable") => Some("disable"),
+                    _ => return None,
+                };
+                index += 2;
+            }
+            "--plan-id" if plan.is_none() => {
+                let value = args.get(index + 1)?;
+                if !crate::logintx::is_valid_id(value) {
+                    return None;
+                }
+                plan = Some(value.clone());
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    // The plan id is required. Applying without one would mean acting on
+    // changes the consumer never saw.
+    match (saw_json, action, plan) {
+        (true, Some(action), Some(plan)) => Some((action, plan)),
+        _ => None,
+    }
+}
+
+fn valid_transaction_args(args: &[String], sub: &str, allow_apply: bool) -> Option<String> {
+    if args.first().map(String::as_str) != Some("login")
+        || args.get(1).map(String::as_str) != Some(sub)
+    {
+        return None;
+    }
+    let (mut id, mut saw_json, mut saw_apply) = (None, false, false);
+    let mut saw_unconfirmed = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--apply" if allow_apply && !saw_apply => {
+                saw_apply = true;
+                index += 1;
+            }
+            // Only meaningful where a restore can happen, so it is refused on
+            // verify rather than accepted and ignored.
+            "--accept-unconfirmed" if allow_apply && !saw_unconfirmed => {
+                saw_unconfirmed = true;
+                index += 1;
+            }
+            "--transaction-id" if id.is_none() => {
+                let value = args.get(index + 1)?;
+                if !crate::logintx::is_valid_id(value) {
+                    return None;
+                }
+                id = Some(value.clone());
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    if saw_json {
+        id
     } else {
         None
     }
@@ -1160,7 +2049,8 @@ mod tests {
                 "doctor-json",
                 "login-status-json",
                 "auth-test-events",
-                "login-plan-json"
+                "login-plan-json",
+                "login-transactions"
             ])
         );
         assert!(document.get("error").is_none());
@@ -1251,6 +2141,282 @@ mod tests {
         assert_eq!(auth_reason(false, true), "no-match");
     }
 
+    /// A record whose surfaces point at files a test controls, so the verify
+    /// and rollback decisions can be exercised without root or a PAM tree.
+    fn record_over(files: &[(&str, &std::path::Path, &str)]) -> crate::logintx::Transaction {
+        crate::logintx::Transaction {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            schema_version: crate::logintx::SCHEMA_VERSION,
+            status: crate::logintx::TransactionStatus::Applied,
+            action: "disable".into(),
+            plan_id: "f".repeat(32),
+            engine_version: "0.0.0".into(),
+            surfaces: files
+                .iter()
+                .map(|(id, path, after)| crate::logintx::SurfaceRecord {
+                    id: (*id).to_string(),
+                    path: path.display().to_string(),
+                    change: "wire".into(),
+                    before: Some("before\n".into()),
+                    after_sha256: (*after).to_string(),
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    sidecar: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn verify_reports_each_surface_and_counts_the_drift() {
+        let dir = std::env::temp_dir().join(format!("irlume-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let steady = dir.join("steady");
+        let moved = dir.join("moved");
+        std::fs::write(&steady, "as applied\n").expect("write");
+        std::fs::write(&moved, "somebody edited this\n").expect("write");
+
+        let record = record_over(&[
+            (
+                "kde",
+                steady.as_path(),
+                &crate::logintx::sha256_hex(b"as applied\n"),
+            ),
+            (
+                "sudo",
+                moved.as_path(),
+                &crate::logintx::sha256_hex(b"as applied\n"),
+            ),
+        ]);
+        let (surfaces, drifted) = verify_surfaces(&record);
+        assert_eq!(surfaces.len(), 2);
+        assert_eq!(surfaces[0]["surface"], "kde");
+        assert_eq!(surfaces[0]["state"], "as-applied");
+        assert_eq!(surfaces[1]["state"], "changed-since-apply");
+        assert_eq!(drifted, 1);
+
+        // Rollback is gated on the same rule, and names what blocks it.
+        let blockers = rollback_blockers(&record);
+        assert_eq!(blockers.changed, vec!["sudo"]);
+        assert!(blockers.unreadable.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rollback_is_allowed_only_when_nothing_drifted() {
+        let dir = std::env::temp_dir().join(format!("irlume-rollback-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("kde");
+        std::fs::write(&file, "as applied\n").expect("write");
+        let record = record_over(&[(
+            "kde",
+            file.as_path(),
+            &crate::logintx::sha256_hex(b"as applied\n"),
+        )]);
+        assert!(!rollback_blockers(&record).any(), "clean stack rolls back");
+
+        std::fs::write(&file, "changed\n").expect("write");
+        let blockers = rollback_blockers(&record);
+        assert_eq!(blockers.changed, vec!["kde"]);
+        assert!(
+            blockers.unreadable.is_empty(),
+            "an edit is not a read fault"
+        );
+
+        // An unreadable surface blocks a rollback too, but as its OWN reason:
+        // it is not evidence the file changed, and reporting it as drift would
+        // send a consumer hunting for an edit nobody made.
+        std::fs::remove_file(&file).expect("rm");
+        std::fs::create_dir(&file).expect("mkdir in its place");
+        let blockers = rollback_blockers(&record);
+        assert!(blockers.any(), "unreadable still stops the rollback");
+        assert_eq!(blockers.unreadable, vec!["kde"]);
+        assert!(blockers.changed.is_empty(), "unreadable is not drift");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn login_apply_requires_an_action_and_a_plan_id() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        let good = a(&[
+            "login",
+            "apply",
+            "--action",
+            "enable",
+            "--plan-id",
+            "0123456789abcdef0123456789abcdef",
+            "--json",
+        ]);
+        assert_eq!(
+            valid_login_apply_args(&good),
+            Some(("enable", "0123456789abcdef0123456789abcdef".to_string()))
+        );
+        for bad in [
+            // No plan id: applying without one means acting on changes the
+            // consumer never saw.
+            vec!["login", "apply", "--action", "enable", "--json"],
+            vec![
+                "login",
+                "apply",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            // A plan id that is not a hex identifier.
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "../etc",
+                "--json",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "short",
+                "--json",
+            ],
+            // Unknown action, missing --json, repeats, junk.
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "wat",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--action",
+                "disable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+            vec![
+                "login",
+                "apply",
+                "--action",
+                "enable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+                "--wat",
+            ],
+            vec![
+                "login",
+                "plan",
+                "--action",
+                "enable",
+                "--plan-id",
+                "0123456789abcdef0123456789abcdef",
+                "--json",
+            ],
+        ] {
+            assert_eq!(valid_login_apply_args(&a(&bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_transaction_id_shaped_like_a_path_is_refused() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            valid_transaction_args(
+                &a(&["login", "verify", "--transaction-id", id, "--json"]),
+                "verify",
+                false
+            ),
+            Some(id.to_string())
+        );
+        // --apply is accepted only where it means something.
+        assert_eq!(
+            valid_transaction_args(
+                &a(&[
+                    "login",
+                    "rollback",
+                    "--transaction-id",
+                    id,
+                    "--apply",
+                    "--json"
+                ]),
+                "rollback",
+                true
+            ),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            valid_transaction_args(
+                &a(&[
+                    "login",
+                    "verify",
+                    "--transaction-id",
+                    id,
+                    "--apply",
+                    "--json"
+                ]),
+                "verify",
+                false
+            ),
+            None,
+            "verify writes nothing, so --apply is meaningless there"
+        );
+        for bad in [
+            vec![
+                "login",
+                "verify",
+                "--transaction-id",
+                "../../etc/passwd",
+                "--json",
+            ],
+            vec![
+                "login",
+                "verify",
+                "--transaction-id",
+                "../../etc/shadow",
+                "--json",
+            ],
+            vec!["login", "verify", "--json"],
+            vec!["login", "verify", "--transaction-id", id],
+            vec![
+                "login",
+                "verify",
+                "--transaction-id",
+                id,
+                "--transaction-id",
+                id,
+                "--json",
+            ],
+            vec!["login", "apply", "--transaction-id", id, "--json"],
+        ] {
+            assert_eq!(
+                valid_transaction_args(&a(&bad), "verify", false),
+                None,
+                "{bad:?}"
+            );
+        }
+    }
+
     #[test]
     fn login_plan_requires_both_json_and_a_known_action() {
         let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
@@ -1286,6 +2452,37 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_id_changes_when_the_file_changes_but_the_outcome_does_not() {
+        use crate::pamwire::{PlannedChange, PlannedSurface};
+        // Codex found this on #178: the id hashed the outcome LABEL only. An
+        // admin can rewrite a stack and leave a valid anchor in place, so the
+        // outcome stays `wire` while the file is entirely different. An apply
+        // carrying the old id would then overwrite a stack the consumer was
+        // never shown, which is the exact thing plan-stale exists to prevent.
+        let with_state = |state: &str| {
+            vec![PlannedSurface {
+                id: "plasmalogin",
+                role: "login-screen",
+                change: PlannedChange::Wire,
+                state: state.to_string(),
+            }]
+        };
+        let before = plan_id("enable", &with_state("aaaa"));
+        let after = plan_id("enable", &with_state("bbbb"));
+        assert_ne!(
+            before, after,
+            "the same outcome over different file content must not share a plan id"
+        );
+        // And the id is still stable when genuinely nothing moved.
+        assert_eq!(before, plan_id("enable", &with_state("aaaa")));
+        // An unreadable surface is its own state, not folded into absent.
+        assert_ne!(
+            plan_id("enable", &with_state("unreadable")),
+            plan_id("enable", &with_state(crate::logintx::ABSENT))
+        );
+    }
+
+    #[test]
     fn a_plan_id_covers_the_action_and_the_outcomes() {
         use crate::pamwire::{PlannedChange, PlannedSurface};
         let surfaces = |change| {
@@ -1293,6 +2490,7 @@ mod tests {
                 id: "plasmalogin",
                 role: "login-screen",
                 change,
+                state: "same-state".into(),
             }]
         };
         let base = plan_id("enable", &surfaces(PlannedChange::Wire));

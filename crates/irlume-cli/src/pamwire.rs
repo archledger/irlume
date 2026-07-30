@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const MODULE: &str = "pam_irlume.so";
-const BACKUP: &str = ".pre-irlume";
+pub(crate) const BACKUP: &str = ".pre-irlume";
 const CREATED_PREFIX: &str = "# irlume: created from ";
 /// The one sentence that explains the on-demand trigger; shared so the status
 /// line, the plan line, and docs/SETUP.md's mirror never drift apart.
@@ -203,7 +203,12 @@ fn wired_marker_path() -> std::path::PathBuf {
 /// Persist (on enable) or remove (on disable) the wiring marker. The body is a
 /// tiny stable key=value record of the extra scopes so reconcile re-applies the
 /// same `--with-sudo` / `--with-polkit` choice, not a bare login wiring.
-fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool, with_lock: bool) {
+pub(crate) fn write_wired_marker(
+    enable: bool,
+    with_sudo: bool,
+    with_polkit: bool,
+    with_lock: bool,
+) {
     let path = wired_marker_path();
     if !enable {
         let _ = std::fs::remove_file(&path);
@@ -232,7 +237,7 @@ fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool, with_loc
 
 /// Re-read the marker's recorded flags. Returns `None` when login was never
 /// enabled (no marker), so reconcile does nothing on machines that opted out.
-fn read_wired_marker() -> Option<(bool, bool, bool)> {
+pub(crate) fn read_wired_marker() -> Option<(bool, bool, bool)> {
     let path = wired_marker_path();
     // In production (default state dir) the marker must be root-owned: reconcile
     // acts on its with_sudo flag as root, so a marker a non-root user could plant
@@ -268,6 +273,16 @@ fn read_wired_marker() -> Option<(bool, bool, bool)> {
 /// but the PAM stack is no longer wired, re-apply the recorded configuration;
 /// otherwise exit quietly. Always root (the path unit's service runs as root).
 fn reconcile() -> ExitCode {
+    // This unit fires when a PAM file changes, which is exactly what every other
+    // irlume path does, so without the lock reconcile is the most likely thing
+    // to be writing a stack somebody else is halfway through writing.
+    let _lock = match lock_pam() {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("[login] reconcile cannot serialise: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Some((with_sudo, with_polkit, with_lock)) = read_wired_marker() else {
         // No marker. Two sub-cases:
         //  - Login IS currently wired (an upgrade from a pre-marker version, or
@@ -865,6 +880,37 @@ pub(crate) struct PlannedSurface {
     pub(crate) id: &'static str,
     pub(crate) role: &'static str,
     pub(crate) change: PlannedChange,
+    /// Digest of the file this decision was made against, or `ABSENT`.
+    ///
+    /// The outcome NAME is not enough to identify what was planned. An admin can
+    /// rewrite a stack and leave a valid anchor in place: the outcome stays
+    /// `wire`, so a plan id built from names alone is unchanged, and an apply
+    /// carrying that id would overwrite a stack the consumer was never shown.
+    /// The digest is what makes the id describe a state rather than an intent.
+    pub(crate) state: String,
+}
+
+/// A surface's current content digest, or `ABSENT`, or `unreadable`.
+///
+/// Three distinct answers on purpose. Folding "cannot read" into either of the
+/// others would let a plan id stay stable across a state it could not actually
+/// observe.
+pub(crate) fn surface_state(path: &Path) -> String {
+    // The backup as well as the live file. Wiring rebuilds from `.pre-irlume`
+    // when one exists, so the content an apply produces depends on it: a backup
+    // that changed between the plan and the apply changes the outcome while the
+    // live file, and therefore the plan id, stayed identical. The consumer would
+    // be shown one result and the machine would get another.
+    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
+    format!("{} {}", surface_digest(path), surface_digest(&bak))
+}
+
+pub(crate) fn surface_digest(path: &Path) -> String {
+    match crate::logintx::file_sha256(path) {
+        Ok(Some(digest)) => digest,
+        Ok(None) => crate::logintx::ABSENT.to_string(),
+        Err(_) => "unreadable".to_string(),
+    }
 }
 
 /// What `login enable`/`login disable` would change, computed without writing.
@@ -872,42 +918,37 @@ pub(crate) struct PlannedSurface {
 /// This runs the identical decision the apply path runs, with `apply` false, so
 /// the plan cannot describe an outcome the apply would not produce. It reads
 /// PAM files and needs no privilege; only applying does.
-pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<PlannedSurface> {
+/// Called once per surface: the service, its role, the wiring recipe for it,
+/// and whether this configuration wants it wired.
+type SurfaceVisitor<'a> = dyn FnMut(&Svc, &'static str, &dyn Fn(&str) -> (String, bool), bool) + 'a;
+
+/// Walk every surface an enable/disable would touch, calling `visit` for each.
+///
+/// One list, walked by both `plan` and `apply`. Deciding which surfaces are in
+/// scope, and with which wiring recipe, is the part that must not exist twice:
+/// a plan that walked a different set than the apply would describe changes
+/// that never happen, or miss ones that do.
+fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut SurfaceVisitor<'_>) {
     let Wants {
         face_login,
         face_lock,
         fp_keyring,
     } = wants();
     let gnome = gnome_shell_major();
-    let mut out = Vec::new();
-    let mut record =
-        |svc: &Svc, role: &'static str, wire: &dyn Fn(&str) -> (String, bool), want: bool| {
-            // A service whose decision cannot even be computed (an unreadable file)
-            // is reported as not-installed rather than omitted: a surface silently
-            // missing from a plan is how a consumer comes to believe it was covered.
-            let change = wire_service(svc, enable && want, false, wire)
-                .map(|outcome| outcome.change)
-                .unwrap_or(PlannedChange::NotInstalled);
-            out.push(PlannedSurface {
-                id: service_name(svc.etc),
-                role,
-                change,
-            });
-        };
     for s in GREETERS {
         let prof = dm_profile(s.etc, gnome);
         let unified_login_lock =
             s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
         let face = face_login || (unified_login_lock && face_lock);
         let greeter_wire = |c: &str| wire_greeter_impl(c, face, fp_keyring, prof.ondemand);
-        record(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
+        visit(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
     }
     for s in FP_GREETERS {
-        record(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
+        visit(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
     }
-    record(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
+    visit(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
     if sudo_in_scope(enable, with_sudo) {
-        record(
+        visit(
             &Svc {
                 etc: SUDO,
                 vendor: None,
@@ -918,9 +959,368 @@ pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<Plan
         );
     }
     if polkit_in_scope(enable, with_polkit) {
-        record(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
+        visit(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
     }
+}
+
+pub(crate) fn plan(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<PlannedSurface> {
+    let mut out = Vec::new();
+    walk_surfaces(
+        enable,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want| {
+            // A service whose decision cannot even be computed (an unreadable file)
+            // is reported as not-installed rather than omitted: a surface silently
+            // missing from a plan is how a consumer comes to believe it was covered.
+            let change = wire_service(svc, enable && want, false, wire)
+                .map(|outcome| outcome.change)
+                .unwrap_or(PlannedChange::NotInstalled);
+            out.push(PlannedSurface {
+                id: service_name(svc.etc),
+                role,
+                change,
+                state: surface_state(Path::new(svc.etc)),
+            });
+        },
+    );
     out
+}
+
+/// One surface after an apply, with what it took to undo it.
+pub(crate) struct AppliedSurface {
+    pub(crate) id: &'static str,
+    pub(crate) role: &'static str,
+    /// The `/etc` path. Needed to restore; never published in machine output.
+    pub(crate) path: String,
+    pub(crate) change: PlannedChange,
+    /// Content before the change; `None` when the file did not exist, so a
+    /// rollback removes it rather than writing an empty file.
+    pub(crate) before: Option<String>,
+    /// Mode, uid and gid before the change. Content alone does not describe a
+    /// file, and these cannot be recovered later once it has been rewritten.
+    pub(crate) before_metadata: Option<(u32, u32, u32)>,
+    /// The `.pre-irlume` backup as it stood before the change, since wiring
+    /// creates one and unwiring consumes one.
+    pub(crate) sidecar_before: Option<String>,
+    pub(crate) sidecar_metadata: Option<(u32, u32, u32)>,
+    /// Whether the backup existed at all beforehand. Distinguishes "was absent,
+    /// remove it on rollback" from "was present and empty".
+    pub(crate) sidecar_existed: bool,
+    pub(crate) after_sha256: String,
+    /// The backup's digest as apply left it, so a rollback can tell whether the
+    /// backup it is about to overwrite is still the one it created.
+    pub(crate) sidecar_after_sha256: Option<String>,
+    /// Set when this surface failed. The apply as a whole is reported as failed,
+    /// and the surfaces that DID change are still recorded, so a rollback can
+    /// undo a partial run.
+    pub(crate) error: Option<String>,
+}
+
+/// Read every surface's pre-change state, writing nothing.
+///
+/// Exists so a record can be persisted BEFORE the first PAM write. Without that
+/// ordering, a crash or a full disk between the writes and the record leaves a
+/// changed login stack with nothing describing how to undo it, which is worse
+/// than not having run at all.
+pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<AppliedSurface> {
+    let mut out = Vec::new();
+    walk_surfaces(
+        enable,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want| {
+            let path = Path::new(svc.etc);
+            let before_metadata = crate::logintx::file_metadata(path);
+            // Wiring creates this and unwiring renames it away, so it is part of
+            // what the transaction changed.
+            let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
+            let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
+            let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
+            let sidecar_existed = sidecar_path.exists();
+            let (before, error) = match std::fs::read_to_string(path) {
+                Ok(content) => (Some(content), None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "read {} before changing it: {error}",
+                        path.display()
+                    )),
+                ),
+            };
+            // The outcome this surface is expected to reach, so a record written
+            // now already says what was intended. Computed with writing off.
+            let change = wire_service(svc, enable && want, false, wire)
+                .map(|outcome| outcome.change)
+                .unwrap_or(PlannedChange::NotInstalled);
+            out.push(AppliedSurface {
+                id: service_name(svc.etc),
+                role,
+                path: svc.etc.to_string(),
+                change,
+                before,
+                before_metadata,
+                sidecar_before,
+                sidecar_metadata,
+                sidecar_existed,
+                // Not written yet, so there is no after-state. A record in this
+                // condition is recognisable by its `prepared` status.
+                after_sha256: crate::logintx::ABSENT.to_string(),
+                sidecar_after_sha256: None,
+                error,
+            });
+        },
+    );
+    out
+}
+
+/// Carry out an enable/disable, recording what each surface looked like first.
+///
+/// The before-content is read BEFORE `wire_service` runs, because that is the
+/// only moment it exists to be read; afterwards the file has already changed.
+/// Every surface is recorded even when a later one fails, since a partial apply
+/// is exactly the case a rollback has to be able to undo.
+pub(crate) fn apply(
+    enable: bool,
+    with_sudo: bool,
+    with_polkit: bool,
+    expected: &[PlannedSurface],
+) -> Vec<AppliedSurface> {
+    let mut out = Vec::new();
+    walk_surfaces(
+        enable,
+        with_sudo,
+        with_polkit,
+        &mut |svc, role, wire, want| {
+            let path = Path::new(svc.etc);
+            // Re-check the state THIS surface was planned against, immediately
+            // before writing it. Comparing plan ids once up front leaves a
+            // window: `plan` and `apply` are separate filesystem walks, so a
+            // change landing between them is never compared to anything. Doing
+            // it per surface narrows that window to the gap between this check
+            // and this write, which is as tight as it gets without holding a
+            // lock nothing else in the system takes.
+            // A symlinked surface is refused rather than written. write_atomic
+            // renames over the path, which REPLACES the link with a regular
+            // file, and a rollback restores content rather than the link, so the
+            // conversion is silent and permanent. Writing through the link
+            // instead is no better: on Fedora these point into /etc/authselect
+            // and on Debian into /etc/alternatives, both shared targets that
+            // other tooling owns. Neither choice is irlume's to make quietly.
+            // Asked here as well as inside the write, so the refusal reaches the
+            // consumer as a per-surface state with a reason rather than as one
+            // failed operation. `inspect_target` also covers hard links, which
+            // this check did not: a rename replaces one directory entry and
+            // leaves every other name for the inode on the old content.
+            if let Err(message) = inspect_target(path) {
+                out.push(AppliedSurface {
+                    id: service_name(svc.etc),
+                    role,
+                    path: svc.etc.to_string(),
+                    change: PlannedChange::NotInstalled,
+                    before: None,
+                    before_metadata: None,
+                    sidecar_before: None,
+                    sidecar_metadata: None,
+                    sidecar_existed: false,
+                    after_sha256: crate::logintx::ABSENT.to_string(),
+                    sidecar_after_sha256: None,
+                    error: Some(message),
+                });
+                return;
+            }
+            let planned_state = expected
+                .iter()
+                .find(|candidate| candidate.id == service_name(svc.etc))
+                .map(|candidate| candidate.state.as_str());
+            let now = surface_state(path);
+            if let Some(planned_state) = planned_state {
+                if planned_state != now {
+                    out.push(AppliedSurface {
+                        id: service_name(svc.etc),
+                        role,
+                        path: svc.etc.to_string(),
+                        change: PlannedChange::NotInstalled,
+                        before: None,
+                        before_metadata: None,
+                        sidecar_before: None,
+                        sidecar_metadata: None,
+                        sidecar_existed: false,
+                        after_sha256: crate::logintx::ABSENT.to_string(),
+                        sidecar_after_sha256: None,
+                        error: Some(format!(
+                            "{} changed between the plan and the write; not touched",
+                            svc.etc
+                        )),
+                    });
+                    return;
+                }
+            }
+            // A file that exists but cannot be read is NOT the same as an
+            // absent one. Collapsing the two with `.ok()` would record
+            // `before: None`, and a later rollback would then DELETE a file it
+            // never captured. Only a genuine NotFound may become None.
+            let before_metadata = crate::logintx::file_metadata(path);
+            // Wiring creates this and unwiring renames it away, so it is part of
+            // what the transaction changed.
+            let sidecar_path = PathBuf::from(format!("{}{BACKUP}", svc.etc));
+            let sidecar_before = std::fs::read_to_string(&sidecar_path).ok();
+            let sidecar_metadata = crate::logintx::file_metadata(&sidecar_path);
+            let sidecar_existed = sidecar_path.exists();
+            let (before, mut read_error) = match std::fs::read_to_string(path) {
+                Ok(content) => (Some(content), None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "read {} before changing it: {error}",
+                        path.display()
+                    )),
+                ),
+            };
+            if let Some(message) = read_error {
+                // Not touched at all: without a usable before-state there is
+                // nothing to roll back to, so writing would be irreversible.
+                out.push(AppliedSurface {
+                    id: service_name(svc.etc),
+                    role,
+                    path: svc.etc.to_string(),
+                    change: PlannedChange::NotInstalled,
+                    before: None,
+                    before_metadata: None,
+                    sidecar_before: None,
+                    sidecar_metadata: None,
+                    sidecar_existed: false,
+                    after_sha256: crate::logintx::ABSENT.to_string(),
+                    sidecar_after_sha256: None,
+                    error: Some(message),
+                });
+                return;
+            }
+            let (change, error) = match wire_service(svc, enable && want, true, wire) {
+                Ok(outcome) => (outcome.change, None),
+                Err(message) => (PlannedChange::NotInstalled, Some(message)),
+            };
+            // Same rule after the write: only a real NotFound is ABSENT. An
+            // unreadable file would otherwise record a digest
+            // `unchanged_since_apply` can never match, so rollback would report
+            // drift forever instead of the read problem it actually has.
+            let after_sha256 = match std::fs::read(path) {
+                Ok(bytes) => crate::logintx::sha256_hex(&bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    crate::logintx::ABSENT.to_string()
+                }
+                Err(error) => {
+                    read_error = Some(format!(
+                        "read {} after changing it: {error}",
+                        path.display()
+                    ));
+                    crate::logintx::ABSENT.to_string()
+                }
+            };
+            let error = error.or(read_error);
+            // The same question for the backup: what did apply leave there. A
+            // rollback that overwrites a backup somebody replaced afterwards is
+            // the same defect as one that overwrites a stack, and the backup is
+            // the origin a later enable rebuilds from.
+            let sidecar_after_sha256 = Some(surface_digest(&sidecar_path));
+            out.push(AppliedSurface {
+                id: service_name(svc.etc),
+                role,
+                path: svc.etc.to_string(),
+                change,
+                before,
+                before_metadata,
+                sidecar_before,
+                sidecar_metadata,
+                sidecar_existed,
+                after_sha256,
+                sidecar_after_sha256,
+                error,
+            });
+        },
+    );
+    out
+}
+
+/// Whether irlume manages this path at all.
+///
+/// A transaction record names the paths a rollback will write, and nothing
+/// previously checked that those were paths irlume had any business touching. A
+/// record naming /etc/shadow with a correct digest rewrote it: verified, not
+/// theorised. Only root can plant a record, and root can already write that
+/// file, so it was not an escalation, but it made `login rollback` a
+/// general-purpose write-anywhere-as-root primitive whose only gate was a
+/// directory mode. Any future way to plant a record would then be total.
+///
+/// So the paths are checked against the surfaces irlume wires, plus their
+/// `.pre-irlume` sidecars, and nothing else is restorable.
+pub(crate) fn is_managed_path(path: &str) -> bool {
+    let bare = path.strip_suffix(BACKUP).unwrap_or(path);
+    // Built from the same lists the wiring uses, so a surface added there is
+    // restorable without anyone remembering to update a second list.
+    GREETERS
+        .iter()
+        .chain(FP_GREETERS.iter())
+        .map(|s| s.etc)
+        .chain([LOCKSCREEN.etc, POLKIT.etc, SUDO])
+        .any(|managed| managed == bare)
+}
+
+/// Put one surface back to the content recorded before a transaction.
+///
+/// Reuses the same atomic write the wiring path uses, so a restore lands the
+/// way every other PAM write here does. The caller must have checked
+/// `unchanged_since_apply` first; this does the write, not the decision.
+///
+/// `None` content means the file did not exist before, so it is removed rather
+/// than written empty: an empty PAM file is not the same as an absent one, and
+/// leaving one behind would shadow a vendor copy.
+pub(crate) fn restore_surface(
+    path: &Path,
+    before: Option<&str>,
+    metadata: Option<(u32, u32, u32)>,
+) -> Result<(), String> {
+    match before {
+        Some(content) => {
+            // The recorded mode and owner go on before the rename, not after.
+            // Applying them afterwards published a PAM stack that was briefly
+            // whatever the root umask produced, and on this path in particular
+            // the file may have been REMOVED by apply, so there was nothing to
+            // copy attributes from and the default was all it ever got.
+            //
+            // `None` keeps the old behaviour for records written before those
+            // fields existed: the replacing file inherits the current one's
+            // attributes rather than a guess.
+            let attrs = metadata.or_else(|| {
+                std::fs::symlink_metadata(path).ok().as_ref().map(|m| {
+                    use std::os::unix::fs::MetadataExt as _;
+                    use std::os::unix::fs::PermissionsExt as _;
+                    (m.permissions().mode() & 0o7777, m.uid(), m.gid())
+                })
+            });
+            write_atomic_inner(path, content, attrs)
+        }
+        None => {
+            // The same refusal the replacing branch gets. Removing was a direct
+            // `remove_file`, so a path recorded as previously absent that is now
+            // a symlink was unlinked despite the claim that every write path
+            // refuses one, and a multiply-linked file lost a name irlume cannot
+            // put back.
+            inspect_target(path)?;
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("remove {}: {error}", path.display())),
+            }
+            // A deletion is a directory change like any other. Without this the
+            // unlink could be lost to a power cut while the durable progress
+            // note said the surface was done, so a resume would skip a file that
+            // is still there.
+            fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+        }
+    }
 }
 
 /// The active login manager and the PAM services it consults.
@@ -1023,6 +1423,20 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         );
         return ExitCode::FAILURE;
     }
+    // Held for the whole run, so a machine transaction or the reconcile unit
+    // cannot be writing the same stacks at the same time. A dry run changes
+    // nothing and does not take it.
+    let _lock = if apply {
+        match lock_pam() {
+            Ok(lock) => Some(lock),
+            Err(message) => {
+                eprintln!("[login] cannot serialise this change: {message}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
@@ -1706,25 +2120,366 @@ fn service_present(s: &Svc) -> Option<PathBuf> {
         .filter(|v| Path::new(v).exists())
         .map(|_| PathBuf::from(s.etc))
 }
-fn backup(path: &Path) -> Result<(), String> {
-    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
-    if !bak.exists() {
-        std::fs::copy(path, &bak).map_err(|e| format!("backup {}: {e}", path.display()))?;
-    }
-    Ok(())
+/// Held for as long as a process is changing PAM. Released when dropped.
+pub(crate) struct PamLock {
+    _file: std::fs::File,
 }
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+
+/// Where the PAM lock lives. `IRLUME_PAM_LOCK` overrides it for tests and
+/// containers, the same way `IRLUME_STATE_DIR` overrides the state root.
+fn pam_lock_path() -> PathBuf {
+    std::env::var_os("IRLUME_PAM_LOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/lock/irlume-pam.lock"))
+}
+
+/// Take the exclusive lock every irlume path that changes PAM must hold.
+///
+/// Nothing serialised these before. `login apply`, `login rollback`, human
+/// `login enable`/`disable`, and `reconcile` could all run at once, and the
+/// combinations are not theoretical: the reconcile path unit fires when a PAM
+/// file changes, which is exactly what the other three do. Two of them
+/// interleaving produced a stack that was a mixture of both, and the record
+/// written by either then described a machine state that never existed.
+///
+/// The lock covers the whole operation, not each write: revalidating a plan,
+/// writing the prepared record, every PAM and sidecar write, and the confirming
+/// record all have to be one indivisible unit, or the record still describes
+/// something other than what is on disk.
+///
+/// `flock` is released by the kernel when the process exits however it exits, so
+/// a killed irlume does not strand it. It does not exclude package managers or
+/// an administrator with an editor: only irlume takes it, which is why every
+/// path still re-checks the file it is about to write.
+pub(crate) fn lock_pam() -> Result<PamLock, String> {
+    use std::os::unix::io::AsRawFd as _;
+    let path = pam_lock_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is owned by `file`, which outlives the call and the guard.
+    let busy = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0;
+    if busy {
+        // Said on stderr, because machine output is JSON on stdout. Then wait:
+        // refusing outright would make the reconcile path unit give up exactly
+        // when an apply is in flight, which is when it most needs to run after.
+        eprintln!("irlume: another irlume PAM operation is in progress, waiting for it…");
+        // SAFETY: as above.
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    sweep_abandoned_scratch();
+    Ok(PamLock { _file: file })
+}
+
+/// Remove scratch files a killed irlume left in `/etc/pam.d`.
+///
+/// A `SIGKILL` between creating the scratch file and renaming it skips every
+/// cleanup path, so real hardware runs that interrupt an apply leave
+/// `.sudo.irlume-new.1234.0.tmp` behind. PAM selects a stack by exact filename,
+/// so a dotfile is never read as a service and this is litter rather than a
+/// hazard — but it is irlume's litter, and it accumulates.
+///
+/// Done while holding the lock, which is what makes it safe: the name is one
+/// only this module produces, and no other irlume can be mid-write. Nothing
+/// outside that pattern is ever considered, because a cleanup that reasons about
+/// what "looks unexpected" is how a harness in this project deleted a real
+/// conffile.
+fn sweep_abandoned_scratch() {
+    let dir = std::path::Path::new("/etc/pam.d");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') && name.contains(".irlume-") && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Test-only: replace a target during the window between the first look and the
+/// rename, so the recheck has something to catch.
+///
+/// The window cannot be reached from outside — it is entirely inside one
+/// function call — so a test that only sets up a symlink beforehand proves the
+/// FIRST check, never the second. Without this, removing the pre-rename recheck
+/// left every test green.
+#[cfg(test)]
+fn swap_target_for_test(path: &Path) {
+    let mut armed = SWAP_DURING_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    if armed.as_deref() != Some(path) {
+        return;
+    }
+    *armed = None;
+    // A different inode under the same name: what an administrator, a package
+    // or another writer does in that window.
+    //
+    // Written elsewhere and renamed over, NOT removed and recreated. Removing
+    // frees the inode number, and a filesystem is free to hand the same one
+    // straight back: this test passed locally and failed in CI for exactly that
+    // reason. Both files exist at once here, so the numbers cannot coincide.
+    let replacement = path.with_extension("irlume-swap-source");
+    let _ = std::fs::write(&replacement, "SOMEONE ELSE'S FILE\n");
+    let _ = std::fs::rename(&replacement, path);
+}
+
+#[cfg(test)]
+static SWAP_DURING_WRITE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// What a PAM path is, for deciding whether irlume may replace it.
+///
+/// `None` means it does not exist, which is a legitimate state: apply removes an
+/// override it created, and rollback recreates a file that was absent.
+type TargetState = Option<(u64, u64)>;
+
+/// Establish that a PAM path is something irlume may replace, and identify it.
+///
+/// Two things are refused, and previously each was refused in one place or in
+/// none:
+///
+/// - **A symlink.** Renaming over it REPLACES the link with a regular file, and
+///   a rollback restores content rather than the link, so the conversion is
+///   silent and permanent. Writing through it instead is no better: on Fedora
+///   these point into `/etc/authselect` and on Debian into `/etc/alternatives`,
+///   shared targets other tooling owns. `apply` checked this; human
+///   enable/disable, reconcile and rollback did not, so one command refused a
+///   file another would quietly convert.
+/// - **More than one link to the inode.** A rename replaces one directory entry;
+///   every other name for that inode keeps referring to the OLD content. PAM
+///   then reads one inode while package tooling updates another. The link
+///   topology is recorded nowhere, so irlume could not put it back, which makes
+///   breaking it silently the wrong default.
+///
+/// The identity returned is the device and inode, which is what the caller
+/// compares to decide the name still refers to the same file. That is the usual
+/// answer and not a perfect one: a filesystem may hand the same inode number
+/// back for a file created right after the old one was unlinked, so a
+/// replacement can in principle wear the identity of what it replaced. irlume's
+/// own paths cannot collide here because they hold the PAM lock; against an
+/// external writer this narrows the window rather than closing it.
+fn inspect_target(path: &Path) -> Result<TargetState, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink; irlume will not replace it with a regular file, because that \
+             conversion cannot be undone and the target belongs to another tool \
+             (authselect, alternatives)",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.nlink() > 1 {
+        return Err(format!(
+            "{} has {} hard links; replacing it would leave the other names referring to the \
+             old content, and irlume does not record the link topology so it could not put \
+             it back",
+            path.display(),
+            meta.nlink()
+        ));
+    }
+    Ok(Some((meta.dev(), meta.ino())))
+}
+
+/// A scratch path in the same directory as `path`, unique to this call.
+///
+/// Every write here used to share one name per service, `.{service}.irlume.tmp`.
+/// Two irlume processes writing the same PAM file would open that one inode and
+/// interleave their bodies, and whichever renamed first published whatever was
+/// in it: an atomic rename makes the NAME change indivisible, it does not make
+/// concurrent production of the source safe. The PAM lock now keeps irlume's own
+/// paths apart, and a unique name means a leftover from a killed run is never
+/// adopted either.
+fn scratch_path(path: &Path, kind: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("pam");
-    let tmp = dir.join(format!(".{fname}.irlume.tmp"));
-    std::fs::write(&tmp, contents).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    dir.join(format!(
+        ".{fname}.irlume-{kind}.{}.{seq}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Create the scratch file, never adopting one that is already there.
+fn create_scratch(tmp: &Path) -> Result<std::fs::File, String> {
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+    };
+    match open() {
+        // Same pid and counter as a crashed earlier run. Drop it rather than
+        // write into a file whose contents are somebody else's.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp).map_err(|e| format!("remove {}: {e}", tmp.display()))?;
+            open().map_err(|e| format!("create {}: {e}", tmp.display()))
+        }
+        other => other.map_err(|e| format!("create {}: {e}", tmp.display())),
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
+}
+
+/// Make a directory durable, so an entry created in it survives a power loss.
+fn fsync_dir(dir: &Path) -> Result<(), String> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync {}: {e}", dir.display()))
+}
+
+/// Copy `path` to its `.pre-irlume` backup, atomically, if there is not one yet.
+///
+/// The copy used to go straight to the final name. A kill or an ENOSPC part way
+/// through left a TRUNCATED file at `.pre-irlume`, and the next enable treats an
+/// existing backup as the pristine origin to rebuild from, so a half-copied
+/// stack became the authority for what the machine's PAM should contain. A
+/// backup that only ever appears complete cannot be believed part way.
+///
+/// The destination is published with `hard_link`, which fails if the name
+/// already exists rather than replacing it. An `exists()` test followed by a
+/// rename would be the same check-then-act split this file has been bitten by
+/// before, and would let a retry overwrite a good backup with the already-wired
+/// content.
+fn backup(path: &Path) -> Result<(), String> {
+    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
+    // The backup is held to the same standard as the stack it came from, and it
+    // was not. `exists()` follows a symlink, so a `.pre-irlume` pointing
+    // somewhere else was accepted and then used as the pristine origin a later
+    // enable rebuilds from. A DANGLING one was worse: `exists()` said no, and the
+    // publishing link then failed with EEXIST against the symlink's own name,
+    // which read as "a backup is already there" when there was none at all.
+    // A complete backup already there is left alone; it must not be replaced
+    // with the now-wired content.
+    if inspect_target(&bak)?.is_some() {
+        return Ok(());
+    }
+    let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let tmp = scratch_path(path, "bak");
+    let written = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut file = create_scratch(&tmp)?;
+        file.write_all(&contents)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        apply_metadata(&tmp, &meta)?;
+        // Before the link, so the name never points at bytes that are not there.
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        // Fails with EEXIST if another run got there first, which is the answer
+        // wanted: that backup is complete and this one is redundant.
+        match std::fs::hard_link(&tmp, &bak) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(format!("backup {}: {e}", path.display())),
+        }
+        fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    written
+}
+
+/// Copy mode and ownership onto a path.
+fn apply_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()))
+        .map_err(|e| format!("chown {}: {e}", path.display()))
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let existing = std::fs::symlink_metadata(path).ok();
+    write_atomic_inner(path, contents, existing.as_ref().map(mode_uid_gid))
+}
+
+fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.mode() & 0o7777, meta.uid(), meta.gid())
+}
+
+/// Replace `path` with `contents`, durably, carrying the given mode and owner.
+///
+/// Attributes are set on the scratch file BEFORE the rename, so the name never
+/// resolves to a PAM file with the wrong mode or owner. Setting them afterwards
+/// leaves a window in which the live stack is whatever the root process's umask
+/// produced, and on the restore path the file did not exist to copy from at all.
+///
+/// `sync_all` before the rename and an fsync of `/etc/pam.d` after it: without
+/// them a successful `close` says nothing about what survives a power loss, and
+/// a PAM stack that comes back as a mixture of two versions is the failure this
+/// whole module exists to avoid.
+pub(crate) fn write_atomic_inner(
+    path: &Path,
+    contents: &str,
+    attrs: Option<(u32, u32, u32)>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    // What the target is right now. A rename REPLACES whatever the name refers
+    // to, so this has to be settled before anything is written, and confirmed
+    // again before the name is taken over.
+    let before = inspect_target(path)?;
+    let tmp = scratch_path(path, "new");
+    let result = (|| -> Result<(), String> {
+        let mut file = create_scratch(&tmp)?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        if let Some((mode, uid, gid)) = attrs {
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+            // Ownership needs privilege, which every caller that writes PAM has,
+            // but an unusual filesystem can still refuse. A PAM file with the
+            // wrong group is a real access change, so it is reported.
+            std::os::unix::fs::chown(&tmp, Some(uid), Some(gid))
+                .map_err(|e| format!("chown {}: {e}", tmp.display()))?;
+        }
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(file);
+        #[cfg(test)]
+        swap_target_for_test(path);
+        // Immediately before the name is taken over, not once at the start. The
+        // first look and the rename are two moments, and what matters is what
+        // the name refers to at the instant it is replaced.
+        if inspect_target(path)? != before {
+            return Err(format!(
+                "{} changed while irlume was writing it, so it was left alone",
+                path.display()
+            ));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+        fsync_dir(&dir)
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        format!("rename into {}: {e}", path.display())
-    })
+    }
+    result
 }
 
 // ---- SELinux (Fedora) --------------------------------------------------------
@@ -1836,6 +2591,322 @@ mod tests {
 
     // Fedora gdm-password layout (real /etc file, the GDM greeter).
     const GDM: &str = "#%PAM-1.0\nauth     [success=done ...] pam_selinux_permit.so\nauth     substack      password-auth\nauth     optional      pam_gnome_keyring.so\naccount  include       password-auth\nsession  include       password-auth\nsession  optional      pam_gnome_keyring.so auto_start\n";
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("irlume-pamfile-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn strays(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect()
+    }
+
+    /// The PAM lock actually excludes, and releases on drop.
+    ///
+    /// Asserted against a SECOND PROCESS, because `flock` is per open file
+    /// description: two locks taken in one process from separate opens do not
+    /// block each other on Linux the way two processes do, so an in-process test
+    /// could report exclusion that does not exist between the commands this is
+    /// meant to serialise.
+    #[test]
+    fn the_pam_lock_excludes_another_process_and_frees_on_drop() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("pamlock");
+        let lock_path = dir.join("irlume-pam.lock");
+        let previous = std::env::var_os("IRLUME_PAM_LOCK");
+        // SAFETY: the env lock is held for the whole test.
+        unsafe { std::env::set_var("IRLUME_PAM_LOCK", &lock_path) };
+
+        // `flock -n` exits 1 when the lock is held; the shell is a separate
+        // process, which is the case that matters.
+        let contended = || {
+            std::process::Command::new("flock")
+                .arg("-n")
+                .arg(&lock_path)
+                .arg("true")
+                .status()
+                .expect("run flock")
+                .success()
+        };
+
+        assert!(contended(), "nothing held the lock yet");
+        let held = lock_pam().expect("take the lock");
+        assert!(
+            !contended(),
+            "a second process took the PAM lock while irlume held it"
+        );
+        drop(held);
+        assert!(contended(), "the lock was not released when dropped");
+
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("IRLUME_PAM_LOCK", value),
+                None => std::env::remove_var("IRLUME_PAM_LOCK"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two writes must never share a scratch name.
+    ///
+    /// Every write used to go through `.{service}.irlume.tmp`. Two irlume
+    /// processes writing one PAM file opened that single inode and interleaved
+    /// their bodies; whichever renamed first published whatever was in it. An
+    /// atomic rename makes the NAME change indivisible, it does not make
+    /// concurrent production of the source safe.
+    #[test]
+    fn each_write_gets_its_own_scratch_file() {
+        let target = Path::new("/etc/pam.d/sudo");
+        let a = scratch_path(target, "new");
+        let b = scratch_path(target, "new");
+        assert_ne!(a, b, "two writes shared one scratch path");
+        assert_eq!(
+            a.parent(),
+            target.parent(),
+            "scratch must be same-directory"
+        );
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with('.'), "{name} is not hidden");
+            assert!(name.contains("sudo"), "{name} does not name its target");
+        }
+        // A scratch file left by a crashed run is dropped, not written into: its
+        // contents are somebody else's.
+        let dir = scratch_dir("scratch");
+        let stale = dir.join(".sudo.irlume-new.stale.tmp");
+        std::fs::write(&stale, "SOMEBODY ELSE'S HALF-WRITTEN BODY").unwrap();
+        create_scratch(&stale).expect("stale scratch must be replaced");
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write carries the mode and owner across, and leaves nothing behind.
+    #[test]
+    fn a_write_preserves_attributes_and_leaves_no_scratch() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("attrs");
+        let target = dir.join("sudo");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&target).unwrap().ino()
+        };
+
+        write_atomic(&target, "new\n").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o640,
+            "the replacement did not carry the mode across"
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(meta.ino(), before_inode, "the file was rewritten in place");
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+
+        // Restoring a file apply had REMOVED: there is no current file to copy
+        // attributes from, so the recorded ones are the only source. Recorded as
+        // this account rather than root, because the test does not run as root
+        // and a chown to another owner is refused; production rollback --apply
+        // is root-only and the refusal is reported there rather than ignored.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let gone = dir.join("kde-fingerprint");
+        restore_surface(&gone, Some("restored\n"), Some((0o600, uid, gid))).expect("restore");
+        assert_eq!(
+            std::fs::metadata(&gone).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(strays(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink and a multiply-linked file are refused by EVERY write path.
+    ///
+    /// The check lived only in the machine `apply` path, so human
+    /// enable/disable, reconcile and rollback would silently replace a symlink
+    /// with a regular file. Nothing anywhere refused a hard link: a rename
+    /// replaces one directory entry, so the other names keep referring to the
+    /// old inode, PAM reads one and package tooling updates the other, and the
+    /// link topology is recorded nowhere so it could not be restored.
+    ///
+    /// Asserted through `write_atomic`, the funnel every path uses, rather than
+    /// on the checker alone: what matters is that a write is refused.
+    #[test]
+    fn a_symlink_or_a_hard_link_is_never_replaced_by_any_write_path() {
+        let dir = scratch_dir("links");
+
+        // A symlink standing in for the authselect/alternatives layout.
+        let real = dir.join("password-auth");
+        std::fs::write(&real, "the shared target\n").unwrap();
+        let link = dir.join("gdm-password");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let refused = write_atomic(&link, "wired\n").expect_err("a symlink must be refused");
+        assert!(refused.contains("symlink"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "the shared target\n",
+            "the symlink's target was written through"
+        );
+        assert!(link.is_symlink(), "the symlink was replaced");
+
+        // Two names for one inode.
+        let a = dir.join("sudo");
+        std::fs::write(&a, "the original stack\n").unwrap();
+        let b = dir.join("sudo-peer");
+        std::fs::hard_link(&a, &b).unwrap();
+        let refused = write_atomic(&a, "wired\n").expect_err("a hard link must be refused");
+        assert!(refused.contains("hard link"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "the original stack\n");
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "the original stack\n",
+            "the peer name was detached from the content"
+        );
+        // Restore refuses on the same terms; it used to have no check at all.
+        assert!(restore_surface(&a, Some("restored\n"), None).is_err());
+
+        // REMOVING a surface is a write path too. Rollback removes a file that
+        // was absent before the transaction, and that branch called remove_file
+        // directly: a path now holding a symlink was unlinked despite the claim
+        // that every path refuses one, and a multiply-linked file lost a name
+        // irlume cannot put back.
+        let gone_link = dir.join("was-absent");
+        std::os::unix::fs::symlink(&real, &gone_link).unwrap();
+        let refused = restore_surface(&gone_link, None, None)
+            .expect_err("removing a symlink must be refused too");
+        assert!(refused.contains("symlink"), "{refused}");
+        assert!(gone_link.is_symlink(), "the symlink was unlinked");
+        let peer = dir.join("linked-peer");
+        std::fs::hard_link(&a, &peer).unwrap();
+        assert!(
+            restore_surface(&a, None, None).is_err(),
+            "removing one name of a multiply-linked file must be refused"
+        );
+        std::fs::remove_file(&peer).unwrap();
+
+        // Unlinking the peer makes it an ordinary file again, and writable.
+        std::fs::remove_file(&b).unwrap();
+        write_atomic(&a, "wired\n").expect("a single-linked regular file is fine");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "wired\n");
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target replaced DURING the write is not overwritten.
+    ///
+    /// The first look at the file and the rename that replaces it are two
+    /// moments. Checking once up front proves what the name meant when the write
+    /// started, and the rename acts on what it means when it finishes; between
+    /// them a package, an administrator or another tool can put a different file
+    /// — or a symlink into /etc/authselect — under that name.
+    ///
+    /// Reachable only from inside the write, hence the test hook. Removing the
+    /// pre-rename recheck left every other test green.
+    #[test]
+    fn a_target_swapped_mid_write_is_left_alone() {
+        let dir = scratch_dir("swap");
+        let target = dir.join("sudo");
+        std::fs::write(&target, "the original stack\n").unwrap();
+
+        *SWAP_DURING_WRITE.lock().unwrap() = Some(target.clone());
+        let refused = write_atomic(&target, "wired\n")
+            .expect_err("a target replaced mid-write must not be overwritten");
+        *SWAP_DURING_WRITE.lock().unwrap() = None;
+
+        assert!(
+            refused.contains("changed while irlume was writing"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "SOMEONE ELSE'S FILE\n",
+            "irlume overwrote the file that replaced its target"
+        );
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backup is complete or absent, and an existing one is never replaced.
+    ///
+    /// `std::fs::copy` straight to `.pre-irlume` could be killed part way, and a
+    /// later enable treats an existing backup as the pristine origin to rebuild
+    /// the live stack from. A truncated backup therefore became the authority
+    /// for what the machine's PAM should contain.
+    #[test]
+    fn a_backup_is_never_published_half_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("backup");
+        let target = dir.join("sudo");
+        std::fs::write(&target, "the original stack\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        backup(&target).expect("backup");
+        let bak = dir.join(format!("sudo{BACKUP}"));
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "the original stack\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&bak).unwrap().permissions().mode() & 0o7777,
+            0o644,
+            "the backup did not carry the mode across"
+        );
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+
+        // The live file is now wired. A second backup must NOT overwrite the
+        // pristine one with the already-wired content.
+        std::fs::write(
+            &target,
+            "auth sufficient pam_irlume.so\nthe original stack\n",
+        )
+        .unwrap();
+        backup(&target).expect("second backup");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "the original stack\n",
+            "a retry overwrote the pristine backup with wired content"
+        );
+        assert!(strays(&dir).is_empty());
+
+        // An EXISTING backup is held to the same standard as the stack, and was
+        // not. `exists()` follows a symlink, so a `.pre-irlume` pointing
+        // elsewhere was accepted and then used as the pristine origin a later
+        // enable rebuilds from.
+        let linked = dir.join("sddm");
+        std::fs::write(&linked, "the stack\n").unwrap();
+        let elsewhere = dir.join("somewhere-else");
+        std::fs::write(&elsewhere, "not this camera's business\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join(format!("sddm{BACKUP}"))).unwrap();
+        let refused = backup(&linked).expect_err("a symlinked backup must be refused");
+        assert!(refused.contains("symlink"), "{refused}");
+
+        // A DANGLING one was worse: `exists()` said no, and publishing then
+        // failed with EEXIST against the symlink's own name, which read as "a
+        // backup is already there" when there was none at all.
+        let dangling = dir.join("lightdm");
+        std::fs::write(&dangling, "the stack\n").unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("nothing-here"),
+            dir.join(format!("lightdm{BACKUP}")),
+        )
+        .unwrap();
+        let refused = backup(&dangling).expect_err("a dangling backup link must be refused");
+        assert!(refused.contains("symlink"), "{refused}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn path_regressed_flags_only_a_stripped_existing_file() {
@@ -2703,6 +3774,105 @@ mod tests {
     // A vendor-shipped greeter (Fedora substack layout), the kind plasmalogin/kde
     // materialize an /etc override from.
     const VENDOR_GREETER: &str = "#%PAM-1.0\nauth       substack      password-auth\nauth       optional      pam_gnome_keyring.so\naccount    include       password-auth\nsession    include       password-auth\n";
+
+    #[test]
+    fn restoring_writes_the_recorded_content_back() {
+        let dir = std::env::temp_dir().join(format!("irlume-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("sudo");
+        std::fs::write(&file, "changed by apply\n").expect("write");
+
+        restore_surface(&file, Some("the original\n"), None).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "the original\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_paths_irlume_manages_are_restorable() {
+        // Found by attacking, not by review: a record naming /etc/shadow with a
+        // CORRECT digest rewrote it. Only root can plant a record and root can
+        // already write that file, so it was not an escalation, but it made
+        // rollback a write-anywhere-as-root primitive gated on a directory mode.
+        for managed in [
+            "/etc/pam.d/sudo",
+            "/etc/pam.d/kde",
+            "/etc/pam.d/plasmalogin",
+            "/etc/pam.d/polkit-1",
+            "/etc/pam.d/gdm-password",
+            // A sidecar is restorable because its surface is.
+            "/etc/pam.d/sudo.pre-irlume",
+        ] {
+            assert!(is_managed_path(managed), "{managed} must be restorable");
+        }
+        for stray in [
+            "/etc/shadow",
+            "/etc/passwd",
+            "/etc/sudoers",
+            "/root/.ssh/authorized_keys",
+            "/etc/pam.d/../shadow",
+            "/etc/pam.d/sshd",
+            "/etc/pam.d/system-auth",
+            "",
+        ] {
+            assert!(!is_managed_path(stray), "{stray} must NOT be restorable");
+        }
+    }
+
+    #[test]
+    fn restoring_puts_back_the_mode_not_just_the_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        // Codex found this on #178: write_atomic copies permissions from the
+        // file it replaces, which is the wrong source and does not exist at all
+        // when apply removed the file. A PAM stack that was 0640 coming back
+        // 0644 is a real access change, not a cosmetic one.
+        let dir = std::env::temp_dir().join(format!("irlume-restore-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("greeter");
+        std::fs::write(&file, "rewritten by apply\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // The recorded pre-change state: same bytes, but a tighter mode.
+        let meta = crate::logintx::file_metadata(&file).expect("metadata");
+        restore_surface(&file, Some("the original\n"), Some((0o640, meta.1, meta.2)))
+            .expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "the original\n"
+        );
+        let mode = std::fs::metadata(&file).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o640,
+            "the recorded mode must come back, not the current one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restoring_a_file_that_did_not_exist_removes_it() {
+        // `disable` can remove a file outright. Writing an empty one instead
+        // would leave a stub shadowing the vendor copy, which is not the same
+        // as the file being absent.
+        let dir =
+            std::env::temp_dir().join(format!("irlume-restore-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("materialized-override");
+        std::fs::write(&file, "irlume made this\n").expect("write");
+
+        restore_surface(&file, None, None).expect("restore");
+        assert!(!file.exists(), "the file must be gone, not empty");
+
+        // Restoring an already-absent file is not an error: a rollback that
+        // partly ran and is run again must be able to finish.
+        restore_surface(&file, None, None).expect("restoring an absent file is fine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wire_service_override_materialize_idempotent_then_remove() {

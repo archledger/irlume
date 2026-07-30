@@ -363,7 +363,12 @@ Three properties a consumer may rely on:
 - `sequence` starts at zero and increments by one with no gaps, so a lost line
   is detected by arithmetic rather than by timeout;
 - exactly one event has `terminal` true, and it is the last, so a reader knows
-  when to stop without waiting;
+  when to stop without waiting. **A stream that ends without one means the
+  producer died**: it was killed, lost power, or hit a signal it could not
+  handle. Treat end-of-file as terminal as well, because a reader that waits for
+  the flag alone will wait forever. Verified: killing the command mid-stream
+  leaves the lines already emitted and no terminal event, which is the only
+  honest thing a dead process can do;
 - `operation_id` is identical on every line of one invocation.
 
 `reason` is one of `granted`, `not-live`, or `no-match`, derived from `granted`
@@ -461,9 +466,102 @@ Sudo and polkit are opt-in on the human command and are not included in a plan,
 so a panel never shows a user surfaces they did not ask for. Disabling still
 covers every surface, because turning login off leaves nothing behind.
 
-**Applying a plan is not implemented yet.** `login apply`, `login verify` and
-`login rollback` are not part of contract 1 and must not be inferred from this
-command or from human output.
+A plan is carried out by `login apply` below, which re-derives it and refuses a
+`plan_id` that no longer matches.
+
+### `irlume login apply` / `verify` / `rollback`
+
+Capability: `login-transactions`. The mutating half of a login transaction;
+`login plan` above is the read-only half.
+
+```
+irlume login apply    --action {enable|disable} --plan-id ID --json   # root
+irlume login verify   --transaction-id ID --json
+irlume login rollback --transaction-id ID [--apply] --json            # root to apply
+```
+
+**apply** re-derives the plan from the machine and recomputes its id. A
+`plan_id` that no longer matches is refused as `plan-stale`: the consumer
+displayed one set of changes and the machine now calls for another, so applying
+would change something nobody was shown. The supplied id is never trusted as
+input, only compared. On success it returns a `transaction_id`.
+
+A partial apply is reported as a failure and still records its transaction, so
+the surfaces that did change can be rolled back. The id is written to standard
+error in that case, because an error document carries no `data`.
+
+**verify** answers whether the machine is still as that transaction left it,
+per surface: `as-applied`, `changed-since-apply`, or `unreadable`. It also
+states `rollback_available`, so a consumer does not have to infer it from
+per-surface states it may not recognise. Read-only.
+
+**rollback** restores what the transaction changed, and **refuses unless every
+surface is still exactly as apply left it**. Restoring a file something else has
+edited since would revert a change the transaction never made, so drift stops
+the whole rollback rather than skipping the drifted surface: a half-rolled-back
+login stack is its own hazard. Every surface is checked before any is written.
+Without `--apply` it reports what it would restore and touches nothing.
+
+Transaction records live under the state directory, `0600` in a `0700`
+directory. They contain the pre-change content of each file, which is not secret
+(PAM stacks are world-readable) but does describe exactly how a machine
+authenticates.
+
+A transaction id is a 32-character hex string. Anything else is a `usage-error`,
+rejected rather than sanitised, because the id becomes a filename.
+
+Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
+`not-authorized` (apply and `rollback --apply` need root, checked before
+anything is written rather than left to a write failing partway),
+`unconfirmed-transaction`, `unsupported-record`, `operation-failed`.
+
+A surface's `.pre-irlume` backup is part of the surface. The plan id covers it,
+so a backup that changes between `plan` and `apply` makes the plan stale: wiring
+rebuilds from the backup when one exists, so the content an apply produces
+depends on it, and a consumer would otherwise be shown one outcome while the
+machine got another. Rollback checks it too and refuses the whole record if it
+is not as apply left it. That matters more than it sounds: a later `login
+enable` rebuilds the live stack FROM the backup, so a wrong one reaches PAM at
+the next enable rather than sitting inert.
+
+A rollback that stops partway records which surfaces it put back, durably, as it
+goes. Re-running it resumes: those surfaces are skipped rather than re-checked,
+because a restored file deliberately no longer matches the digest apply left and
+checking it would refuse the whole record — which used to leave the operator
+rebuilding the rest from the JSON by hand. `verify` reports them as
+`already_restored` and excludes them from `rollback_available`, so drift caused
+by irlume's own restore is not reported as somebody's edit.
+
+`rollback --accept-unconfirmed --apply` copies every surface and sidecar as it
+currently stands into a root-only directory before restoring anything, and
+returns that path as `snapshot`. An unconfirmed record has no trustworthy
+after-digest, so the restore does not check what it overwrites; that is how an
+interrupted apply is recovered, and equally how a package update made after the
+crash gets reverted. The copies are for a person to find, and feed no automatic
+path. A confirmed rollback has no `snapshot`: its drift check has already
+established every file is byte-for-byte what apply left.
+
+`unsupported-record` means the record was written to a record schema this engine
+does not implement, and it is not retryable: run the newer irlume. A record
+carries a `schema_version`, which is a gate rather than a description. It is
+raised only when the MEANING of a record changes, so a purely descriptive
+addition does not raise it and an older engine keeps reading such records. What
+an engine will not do is act on the parts of a newer record it recognises: the
+fields would parse and look reasonable while meaning something else, and a
+record is the recovery path for a machine's login stack.
+
+Every irlume path that changes PAM — `login apply`, `login rollback --apply`,
+the human `login enable`/`disable`, and the self-heal reconcile — holds one
+exclusive lock for the whole operation, so a consumer's transaction cannot
+interleave with another irlume process. The lock does not cover package managers
+or an administrator with an editor, which is why each surface is re-checked
+immediately before it is written.
+
+irlume refuses to write a PAM path that is a symlink or that has more than one
+hard link, on every one of those paths. Renaming over a symlink would silently
+convert it to a regular file, and replacing a multiply-linked file would leave
+the other names on the old content; neither is recorded, so neither could be
+undone. Such a surface is reported as not installed with the reason.
 
 ## Security and privacy
 
@@ -478,5 +576,4 @@ from human output or the private socket protocol:
 - preview images and cancellation semantics;
 - profile or scan mutation;
 - camera configuration mutation;
-- login apply, verify, or rollback transactions (the read-only plan phase is
-  published above).
+- enrollment preview images and their cancellation semantics.

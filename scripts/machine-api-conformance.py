@@ -52,6 +52,19 @@ CAPABILITY_COMMANDS = {
 #
 # Capability name -> (argv that must be refused, expected error code).
 STREAMING_CAPABILITY_REFUSALS = {
+    # login-transactions mutates PAM stacks, so this script must never invoke it
+    # for real. Its refusals are checked instead, and they are the ones that
+    # matter: apply without a plan id, an id that is not a hex identifier, and a
+    # transaction id shaped like a path. Same reason streaming capabilities are
+    # listed here rather than left to the unknown-capability skip.
+    "login-transactions": [
+        (["login", "apply", "--json"], "usage-error"),
+        (["login", "apply", "--action", "enable", "--json"], "usage-error"),
+        (["login", "apply", "--action", "enable", "--plan-id", "nothex", "--json"], "usage-error"),
+        (["login", "verify", "--json"], "usage-error"),
+        (["login", "verify", "--transaction-id", "../../etc/passwd", "--json"], "usage-error"),
+        (["login", "rollback", "--transaction-id", "../../etc/shadow", "--apply", "--json"], "usage-error"),
+    ],
     "auth-test-events": [
         (["auth", "test"], "usage-error"),
         (["auth", "test", "--events=jsonl", "--contract", "9"], "unsupported-contract"),

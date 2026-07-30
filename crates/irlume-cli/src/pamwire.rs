@@ -891,6 +891,16 @@ pub(crate) struct PlannedSurface {
 /// others would let a plan id stay stable across a state it could not actually
 /// observe.
 pub(crate) fn surface_state(path: &Path) -> String {
+    // The backup as well as the live file. Wiring rebuilds from `.pre-irlume`
+    // when one exists, so the content an apply produces depends on it: a backup
+    // that changed between the plan and the apply changes the outcome while the
+    // live file, and therefore the plan id, stayed identical. The consumer would
+    // be shown one result and the machine would get another.
+    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
+    format!("{} {}", surface_digest(path), surface_digest(&bak))
+}
+
+pub(crate) fn surface_digest(path: &Path) -> String {
     match crate::logintx::file_sha256(path) {
         Ok(Some(digest)) => digest,
         Ok(None) => crate::logintx::ABSENT.to_string(),
@@ -993,6 +1003,9 @@ pub(crate) struct AppliedSurface {
     /// remove it on rollback" from "was present and empty".
     pub(crate) sidecar_existed: bool,
     pub(crate) after_sha256: String,
+    /// The backup's digest as apply left it, so a rollback can tell whether the
+    /// backup it is about to overwrite is still the one it created.
+    pub(crate) sidecar_after_sha256: Option<String>,
     /// Set when this surface failed. The apply as a whole is reported as failed,
     /// and the surfaces that DID change are still recorded, so a rollback can
     /// undo a partial run.
@@ -1049,6 +1062,7 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
                 // Not written yet, so there is no after-state. A record in this
                 // condition is recognisable by its `prepared` status.
                 after_sha256: crate::logintx::ABSENT.to_string(),
+                sidecar_after_sha256: None,
                 error,
             });
         },
@@ -1106,6 +1120,7 @@ pub(crate) fn apply(
                     sidecar_metadata: None,
                     sidecar_existed: false,
                     after_sha256: crate::logintx::ABSENT.to_string(),
+                    sidecar_after_sha256: None,
                     error: Some(message),
                 });
                 return;
@@ -1128,6 +1143,7 @@ pub(crate) fn apply(
                         sidecar_metadata: None,
                         sidecar_existed: false,
                         after_sha256: crate::logintx::ABSENT.to_string(),
+                        sidecar_after_sha256: None,
                         error: Some(format!(
                             "{} changed between the plan and the write; not touched",
                             svc.etc
@@ -1172,6 +1188,7 @@ pub(crate) fn apply(
                     sidecar_metadata: None,
                     sidecar_existed: false,
                     after_sha256: crate::logintx::ABSENT.to_string(),
+                    sidecar_after_sha256: None,
                     error: Some(message),
                 });
                 return;
@@ -1198,6 +1215,11 @@ pub(crate) fn apply(
                 }
             };
             let error = error.or(read_error);
+            // The same question for the backup: what did apply leave there. A
+            // rollback that overwrites a backup somebody replaced afterwards is
+            // the same defect as one that overwrites a stack, and the backup is
+            // the origin a later enable rebuilds from.
+            let sidecar_after_sha256 = Some(surface_digest(&sidecar_path));
             out.push(AppliedSurface {
                 id: service_name(svc.etc),
                 role,
@@ -1209,6 +1231,7 @@ pub(crate) fn apply(
                 sidecar_metadata,
                 sidecar_existed,
                 after_sha256,
+                sidecar_after_sha256,
                 error,
             });
         },

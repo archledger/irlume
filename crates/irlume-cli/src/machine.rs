@@ -1171,6 +1171,7 @@ pub fn login_apply(args: &[String]) -> ExitCode {
                 sidecar: (surface.sidecar_existed || surface.sidecar_before.is_some()).then(|| {
                     crate::logintx::SidecarRecord {
                         path: format!("{}{}", surface.path, crate::pamwire::BACKUP),
+                        after_sha256: surface.sidecar_after_sha256.clone(),
                         before: surface.sidecar_before.clone(),
                         mode: surface.sidecar_metadata.map(|(mode, _, _)| mode),
                         uid: surface.sidecar_metadata.map(|(_, uid, _)| uid),

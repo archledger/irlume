@@ -91,6 +91,19 @@ pub(crate) struct SurfaceRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SidecarRecord {
     pub(crate) path: String,
+    /// The backup's digest as apply left it.
+    ///
+    /// Rollback used to restore the backup with no check at all, so a backup an
+    /// administrator or a package replaced afterwards was silently overwritten —
+    /// the same defect the surface's own digest exists to prevent, and worse in
+    /// one way: a later enable rebuilds the live stack FROM the backup, so a
+    /// wrong one propagates into PAM at the next enable.
+    ///
+    /// Absent on records written before this field existed, in which case the
+    /// backup is restored unchecked as it was then; the schema gate is what
+    /// stops an older engine reading a newer record and skipping the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) after_sha256: Option<String>,
     /// `None` when it did not exist, so a rollback removes it rather than
     /// leaving one behind for a later enable to trust.
     pub(crate) before: Option<String>,
@@ -174,7 +187,10 @@ pub(crate) enum TransactionStatus {
 }
 
 /// The record format this build writes and is willing to act on.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// 2 since the sidecar carries an after-digest a rollback must honour: an engine
+/// that ignored it would overwrite a backup somebody replaced, which is the
+/// behaviour the field exists to stop.
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 fn schema_version_1() -> u32 {
     1
@@ -536,11 +552,30 @@ pub(crate) fn unchanged_since_apply(record: &SurfaceRecord) -> Result<(), Rollba
         Err(error) => return Err(RollbackRefusal::Unreadable(error)),
     };
     let current = current.unwrap_or_else(|| ABSENT.to_string());
-    if current == record.after_sha256 {
-        Ok(())
-    } else {
-        Err(RollbackRefusal::ChangedSinceApply)
+    if current != record.after_sha256 {
+        return Err(RollbackRefusal::ChangedSinceApply);
     }
+    // The backup counts as part of the surface. Rollback restores it too, so
+    // leaving it out of the check meant a backup an administrator or a package
+    // replaced afterwards was silently overwritten — and a later `login enable`
+    // rebuilds the LIVE stack from the backup, so a wrong one reaches PAM at the
+    // next enable rather than sitting inert.
+    //
+    // Asked here rather than in the restore loop so it refuses BEFORE anything
+    // is written: a rollback that stops halfway through is the thing the blanket
+    // precheck exists to prevent.
+    if let Some(sidecar) = &record.sidecar {
+        if let Some(expected) = &sidecar.after_sha256 {
+            let now = match file_sha256(Path::new(&sidecar.path)) {
+                Ok(value) => value.unwrap_or_else(|| ABSENT.to_string()),
+                Err(error) => return Err(RollbackRefusal::Unreadable(error)),
+            };
+            if &now != expected {
+                return Err(RollbackRefusal::ChangedSinceApply);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -709,6 +744,7 @@ mod tests {
         };
         tx.surfaces[0].sidecar = Some(SidecarRecord {
             path: sidecar.display().to_string(),
+            after_sha256: None,
             before: None,
             mode: None,
             uid: None,

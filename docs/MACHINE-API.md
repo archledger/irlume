@@ -515,6 +515,15 @@ Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
 anything is written rather than left to a write failing partway),
 `unconfirmed-transaction`, `unsupported-record`, `operation-failed`.
 
+A surface's `.pre-irlume` backup is part of the surface. The plan id covers it,
+so a backup that changes between `plan` and `apply` makes the plan stale: wiring
+rebuilds from the backup when one exists, so the content an apply produces
+depends on it, and a consumer would otherwise be shown one outcome while the
+machine got another. Rollback checks it too and refuses the whole record if it
+is not as apply left it. That matters more than it sounds: a later `login
+enable` rebuilds the live stack FROM the backup, so a wrong one reaches PAM at
+the next enable rather than sitting inert.
+
 A rollback that stops partway records which surfaces it put back, durably, as it
 goes. Re-running it resumes: those surfaces are skipped rather than re-checked,
 because a restored file deliberately no longer matches the digest apply left and

@@ -232,6 +232,30 @@ else
     bad "unconfirmed rollback setup" "no record at $rec"
 fi
 
+echo "=== 14. a backup replaced after apply blocks the rollback ==="
+# Rollback restored the .pre-irlume backup with no check at all, so a backup an
+# administrator or a package replaced afterwards was silently overwritten. That
+# is sharper than it sounds: a later `login enable` rebuilds the LIVE stack from
+# the backup, so a wrong one reaches PAM at the next enable.
+# A backup has to EXIST before the apply, or the record carries no sidecar and
+# there is nothing for the check to be about. A branch reporting success when
+# there was nothing to check is how a guard passes without ever running, so this
+# is set up rather than skipped.
+grep -q pam_irlume "$SUDO_PAM" || sed -i '1i auth       sufficient   pam_irlume.so' "$SUDO_PAM"
+cp "$SUDO_PAM" "$SUDO_PAM.pre-irlume"
+pid6=$($B login plan --action disable --json | field plan_id)
+tx6=$($B login apply --action disable --plan-id "$pid6" --json | field transaction_id)
+assert "apply for the backup case: $tx6" "no id" test -n "$tx6"
+assert "the record carries a sidecar for $SUDO_PAM" "no sidecar recorded" \
+    grep -q '"sidecar"' "$IRLUME_STATE_DIR/login-transactions/$tx6.json"
+echo "# somebody put a backup here afterwards" >"$SUDO_PAM.pre-irlume"
+out=$($B login rollback --transaction-id "$tx6" --apply --json)
+assert "the rollback refuses when the backup is not as apply left it" "$out" \
+    test "$(echo "$out" | field code)" = "changed-since-apply"
+assert "the backup survived the refusal" "overwritten" \
+    grep -q "somebody put a backup here afterwards" "$SUDO_PAM.pre-irlume"
+rm -f "$SUDO_PAM.pre-irlume"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

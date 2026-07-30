@@ -54,10 +54,22 @@ STORE="$STATE/ir-emitter-journal"
 CONF="$STATE/ir_emitter.conf"
 LOCKS="$STATE/locks"
 MODELS="${IRLUME_MODEL_DIR:-/usr/share/irlume/models}"
+# Two things a sandboxed daemon needs that only the packaged unit supplies.
+# Without the first it never reaches its socket and sits on a futex, which reads
+# as a hung build; without the second, startup stops on a warning about weights
+# a sandboxed state directory does not have.
+ORT="${ORT_DYLIB_PATH:-$(systemctl cat irlumed 2>/dev/null |
+    sed -n 's/^Environment="\?ORT_DYLIB_PATH=\([^"]*\)"\?$/\1/p' | head -1)}"
 # The camera's own default for the Microsoft face-authentication control, as both
 # validated modules report it via GET_DEF. Section 1 refuses to draw conclusions
 # if parking to it changed nothing.
 PARK="${PARK_VALUE:-1,3,1,0,0,0,0,0,0}"
+# The Microsoft unit and selector are DERIVED from the camera in section 0, not
+# assumed. They were hardcoded to one module's unit 4, which meant every
+# unit-specific assertion here silently checked nothing on any other camera: the
+# ASUS module in the same drawer publishes its Microsoft XU as unit 14.
+UNIT=""
+SEL=""
 
 pass=0
 fail=0
@@ -111,6 +123,9 @@ trap cleanup EXIT
 
 rm -rf "$OUT"
 mkdir -p "$OUT" "$STATE" "$LOCKS"
+if [ -d /var/lib/irlume/models-thirdparty ]; then
+    ln -sfn /var/lib/irlume/models-thirdparty "$STATE/models-thirdparty"
+fi
 systemctl stop irlumed 2>/dev/null
 sleep 1
 
@@ -119,7 +134,10 @@ sleep 1
 start_daemon() {
     local tag="$1" override="${2:-off}"
     rm -f "$SOCK"
-    IRLUME_SOCKET="$SOCK" \
+    # `env`, not bare assignments: `${ORT:+VAR=val}` expands to a WORD, and a
+    # word in a prefix-assignment list is taken as the command to run, not as an
+    # assignment. Bash duly tried to execute it.
+    env IRLUME_SOCKET="$SOCK" \
         IRLUME_STATE_DIR="$STATE" \
         IRLUME_IR_EMITTER_CONF="$CONF" \
         IRLUME_EMITTER_LOCK_DIR="$LOCKS" \
@@ -131,13 +149,22 @@ start_daemon() {
         IRLUME_MODEL="$MODELS/glintr100.onnx" \
         IRLUME_MESH_MODEL="$MODELS/face_landmark.onnx" \
         IRLUME_BLAZE_MODEL="$MODELS/blaze_face_short_range.onnx" \
+        ${ORT:+ORT_DYLIB_PATH="$ORT"} \
         "$D" >"$OUT/daemon-$tag.log" 2>&1 &
     daemon_pid=$!
-    for _ in $(seq 1 300); do
+    # Four ONNX models load before it listens, which on a laptop takes longer
+    # than the camera work that follows.
+    for _ in $(seq 1 1800); do
         [ -S "$SOCK" ] && return 0
-        kill -0 "$daemon_pid" 2>/dev/null || return 1
+        kill -0 "$daemon_pid" 2>/dev/null || {
+            echo "  the daemon exited during startup:"
+            tail -4 "$OUT/daemon-$tag.log" | sed 's/^/    /'
+            return 1
+        }
         sleep 0.1
     done
+    echo "  the daemon never listened; last lines:"
+    tail -4 "$OUT/daemon-$tag.log" | sed 's/^/    /'
     return 1
 }
 stop_daemon() {
@@ -159,6 +186,17 @@ setup --dry-run >"$OUT/units-before.txt" 2>&1
 sed 's/^/    /' "$OUT/units-before.txt"
 echo "    devpath: $(udevadm info -q path -n "$IR" 2>/dev/null | sed 's,/video4linux.*,,')"
 stop_daemon
+
+# "unit 14 (Microsoft camera control): advertises [0x06, 0x09]"
+UNIT=$(sed -n 's/.*unit \([0-9]*\) (Microsoft camera control).*/\1/p' "$OUT/units-before.txt" | head -1)
+SEL=$(sed -n 's/.*unit '"${UNIT:-x}"' (Microsoft camera control): advertises \[\(0x[0-9a-f]*\).*/\1/p' \
+    "$OUT/units-before.txt" | head -1)
+if [ -z "$UNIT" ] || [ -z "$SEL" ]; then
+    echo "refusing: no Microsoft camera-control unit on this camera; nothing here applies"
+    exit 2
+fi
+SEL=$((SEL))
+echo "    Microsoft XU: unit $UNIT, first advertised selector $SEL"
 if [ -n "$(find "$STORE" -name '*.json' 2>/dev/null)" ]; then
     echo "refusing: $STORE already holds a record; resolve it first"
     find "$STORE" -name '*.json' -exec cat {} \;
@@ -166,15 +204,22 @@ if [ -n "$(find "$STORE" -name '*.json' 2>/dev/null)" ]; then
 fi
 
 echo "=== 1. park the control at the camera's own default ==="
-start_daemon park "4:6:$PARK" || {
+start_daemon park "$UNIT:$SEL:$PARK" || {
     echo "  daemon would not start"
     exit 2
 }
 stop_daemon
-parked=$(grep -ac "SET_CUR unit4/sel6: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null)
-assert "the control was parked at its default" \
-    "no parking write traced; PARK=$PARK may not be this camera's GET_DEF" \
-    test "${parked:-0}" -ge 1
+parked=$(grep -ac "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null)
+if [ "${parked:-0}" -ge 1 ]; then
+    ok "the control was parked at its default"
+else
+    # No write does NOT mean the park failed: the override reads the control
+    # first and writes nothing when it already holds the value, which is the
+    # ordinary state on a camera nothing has driven. What actually matters is
+    # whether discovery then had a difference to measure, and section 2 asserts
+    # that independently by requiring a SET_CUR of its own.
+    skip "the control already held the default, so no parking write was needed"
+fi
 
 echo "=== 2. discovery: record before the write, cleared after a read-back ==="
 start_daemon discover off || {
@@ -241,7 +286,7 @@ else
 fi
 
 echo "=== 4. a SIGKILL mid-run leaves the record ==="
-start_daemon park2 "4:6:$PARK" >/dev/null 2>&1 && stop_daemon
+start_daemon park2 "$UNIT:$SEL:$PARK" >/dev/null 2>&1 && stop_daemon
 start_daemon killed off || {
     echo "  daemon would not start"
     exit 2

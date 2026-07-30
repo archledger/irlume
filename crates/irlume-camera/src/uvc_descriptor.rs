@@ -274,11 +274,20 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         // `dev_dir` came from `canonicalize`, so it is already the resolved
-        // physical path. Stripping `/sys` keeps the value comparable to the
-        // `DEVPATH` the kernel publishes for the same device.
+        // physical path. Stripping `/sys` makes the value the kernel's own
+        // `DEVPATH` for this device, which is what `udevadm info -q path` prints
+        // and therefore what a person comparing a record against their machine
+        // will have in front of them.
+        //
+        // The leading slash is put back deliberately. `strip_prefix` removes the
+        // component and leaves a RELATIVE path, so this recorded
+        // `devices/pci0000:00/...` while every other source of the same string
+        // says `/devices/pci0000:00/...`. A hardware run is what showed it: the
+        // record on disk did not match the path printed beside it.
         usb_devpath: dev_dir
             .strip_prefix("/sys")
-            .unwrap_or(&dev_dir)
+            .map(|p| std::path::Path::new("/").join(p))
+            .unwrap_or_else(|_| dev_dir.clone())
             .to_string_lossy()
             .into_owned(),
     })
@@ -491,6 +500,32 @@ mod tests {
 
     /// Every descriptor in the real chain must be consumed exactly, with no
     /// trailing slop, or the walk is mis-stepping through the buffer.
+    #[test]
+    /// The recorded device path is the kernel's own `DEVPATH`, leading slash and
+    /// all.
+    ///
+    /// `strip_prefix` leaves a RELATIVE path, so this recorded
+    /// `devices/pci0000:00/...` while `udevadm info -q path` prints
+    /// `/devices/pci0000:00/...` for the same device. Both sides of the match
+    /// computed it the same way, so nothing broke, which is exactly why only a
+    /// transcript from real hardware showed it: the record on disk did not look
+    /// like the path printed next to it.
+    #[test]
+    fn a_recorded_device_path_looks_like_the_kernels_own() {
+        let sys = std::path::Path::new("/sys/devices/pci0000:00/0000:00:14.0/usb3/3-5");
+        let devpath = sys
+            .strip_prefix("/sys")
+            .map(|p| std::path::Path::new("/").join(p))
+            .unwrap_or_else(|_| sys.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(devpath, "/devices/pci0000:00/0000:00:14.0/usb3/3-5");
+        assert!(
+            devpath.starts_with('/'),
+            "a relative path here is not a DEVPATH"
+        );
+    }
+
     #[test]
     fn the_walk_consumes_the_whole_real_descriptor_chain() {
         let mut i = 0usize;

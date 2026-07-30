@@ -515,6 +515,23 @@ Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
 anything is written rather than left to a write failing partway),
 `unconfirmed-transaction`, `unsupported-record`, `operation-failed`.
 
+A rollback that stops partway records which surfaces it put back, durably, as it
+goes. Re-running it resumes: those surfaces are skipped rather than re-checked,
+because a restored file deliberately no longer matches the digest apply left and
+checking it would refuse the whole record — which used to leave the operator
+rebuilding the rest from the JSON by hand. `verify` reports them as
+`already_restored` and excludes them from `rollback_available`, so drift caused
+by irlume's own restore is not reported as somebody's edit.
+
+`rollback --accept-unconfirmed --apply` copies every surface and sidecar as it
+currently stands into a root-only directory before restoring anything, and
+returns that path as `snapshot`. An unconfirmed record has no trustworthy
+after-digest, so the restore does not check what it overwrites; that is how an
+interrupted apply is recovered, and equally how a package update made after the
+crash gets reverted. The copies are for a person to find, and feed no automatic
+path. A confirmed rollback has no `snapshot`: its drift check has already
+established every file is byte-for-byte what apply left.
+
 `unsupported-record` means the record was written to a record schema this engine
 does not implement, and it is not retryable: run the newer irlume. A record
 carries a `schema_version`, which is a gate rather than a description. It is

@@ -877,8 +877,35 @@ fn rollback_restore(
             ExitCode::FAILURE,
         );
     }
-    let mut restored = Vec::new();
+    // An unconfirmed rollback writes over whatever is there without checking,
+    // because its after-digests were never confirmed. That is how a machine
+    // whose apply was interrupted gets recovered, and equally how a package
+    // update or an administrator's later edit gets reverted. Copy it first, and
+    // say where: nothing else captures what this is about to overwrite.
+    let snapshot = if unconfirmed {
+        match crate::logintx::snapshot_before_rollback(record) {
+            Ok(dir) => Some(dir.display().to_string()),
+            Err(message) => {
+                irlume_common::dlog!("{command}: cannot snapshot before restoring: {message}");
+                return emit(
+                    &failure(command, "operation-failed", true, contract),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // What a previous run of this rollback already put back. Those surfaces are
+    // skipped: they hold their before-content now, so re-restoring is pointless
+    // and re-checking them against the after-digest would refuse the whole
+    // record — which is what made a stopped rollback unfinishable.
+    let mut restored = crate::logintx::rollback_progress(&record.id);
+    let already: std::collections::HashSet<String> = restored.iter().cloned().collect();
     for surface in &record.surfaces {
+        if already.contains(&surface.id) {
+            continue;
+        }
         // Re-check THIS surface immediately before restoring it. The blanket
         // check above happens before any write, which is what stops a rollback
         // half-completing, but it leaves a window: by the time the loop reaches
@@ -898,6 +925,9 @@ fn rollback_restore(
                         "transaction_id": record.id,
                         "restored": restored,
                         "stopped_at": surface.id,
+                        // Where the pre-rollback copies are, so a caller that
+                        // stopped partway can still find what was overwritten.
+                        "snapshot": snapshot,
                     }),
                     ExitCode::FAILURE,
                 );
@@ -946,6 +976,23 @@ fn rollback_restore(
                     }
                 }
                 restored.push(surface.id.clone());
+                // Durably, before moving to the next surface. A note written
+                // after the whole loop would describe only the runs that did not
+                // need it.
+                if let Err(message) = crate::logintx::note_rollback_progress(&record.id, &restored)
+                {
+                    irlume_common::dlog!("{command}: cannot record progress: {message}");
+                    return emit_with_extra(
+                        &failure(command, "operation-failed", false, contract),
+                        json!({
+                            "transaction_id": record.id,
+                            "restored": restored,
+                            "stopped_at": surface.id,
+                            "snapshot": snapshot,
+                        }),
+                        ExitCode::FAILURE,
+                    );
+                }
             }
             Err(message) => {
                 irlume_common::dlog!("{command}: {} failed: {message}", surface.id);
@@ -958,12 +1005,18 @@ fn rollback_restore(
                         "transaction_id": record.id,
                         "restored": restored,
                         "stopped_at": surface.id,
+                        // Where the pre-rollback copies are, so a caller that
+                        // stopped partway can still find what was overwritten.
+                        "snapshot": snapshot,
                     }),
                     ExitCode::FAILURE,
                 );
             }
         }
     }
+    // Every surface is back, so the resume note has nothing left to describe.
+    // The snapshot stays: it is for a person, not for the next run.
+    crate::logintx::clear_rollback_progress(&record.id);
     emit(
         &success(
             command,
@@ -973,6 +1026,7 @@ fn rollback_restore(
                 "unconfirmed": unconfirmed,
                 "restored": restored,
                 "applied": true,
+                "snapshot": snapshot,
             }),
             contract,
         ),
@@ -999,8 +1053,25 @@ impl RollbackBlockers<'_> {
 }
 
 fn rollback_blockers(record: &crate::logintx::Transaction) -> RollbackBlockers<'_> {
+    rollback_blockers_excluding(record, &crate::logintx::rollback_progress(&record.id))
+}
+
+/// The blanket precheck, minus the surfaces a stopped run already put back.
+///
+/// A restored surface holds its BEFORE content, so it no longer matches the
+/// recorded after-digest and reads as drift. Checking it anyway refused the
+/// whole record, which is precisely what made a stopped rollback unfinishable:
+/// the operator was told their stack had been edited when what had happened is
+/// that irlume itself restored part of it.
+fn rollback_blockers_excluding<'a>(
+    record: &'a crate::logintx::Transaction,
+    done: &[String],
+) -> RollbackBlockers<'a> {
     let mut blockers = RollbackBlockers::default();
     for surface in &record.surfaces {
+        if done.iter().any(|id| id == &surface.id) {
+            continue;
+        }
         match crate::logintx::unchanged_since_apply(surface) {
             Ok(()) => {}
             Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => {
@@ -1228,6 +1299,13 @@ pub fn login_verify(args: &[String]) -> ExitCode {
     // guarantees, so it is treated as cautiously as an unconfirmed one.
     let unconfirmed = !matches!(record.status, crate::logintx::TransactionStatus::Applied);
     let (surfaces, drifted) = verify_surfaces(&record);
+    // A rollback that stopped partway left the surfaces it restored holding
+    // their BEFORE content, which reads as drift here. Counting those would tell
+    // an operator a rollback is unavailable when re-running it is exactly what
+    // finishes the job, so they are excluded from the availability answer and
+    // named instead.
+    let restored = crate::logintx::rollback_progress(&record.id);
+    let blocking = rollback_blockers_excluding(&record, &restored);
     emit(
         &success(
             COMMAND,
@@ -1254,7 +1332,11 @@ pub fn login_verify(args: &[String]) -> ExitCode {
                 // states it may not recognise.
                 // An unconfirmed record can still be rolled back, but only on
                 // request: see login rollback --accept-unconfirmed.
-                "rollback_available": !unconfirmed && drifted == 0,
+                "rollback_available": !unconfirmed && !blocking.any(),
+                // Present only when a previous rollback stopped partway. A
+                // consumer seeing it knows the drift below is irlume's own
+                // work, not somebody's edit.
+                "already_restored": restored,
             }),
             contract,
         ),

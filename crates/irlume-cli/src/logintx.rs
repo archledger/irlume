@@ -343,6 +343,112 @@ pub(crate) enum LoadFailure {
     },
 }
 
+/// How far a rollback got, so a stopped one can be finished rather than
+/// restarted.
+///
+/// A rollback restores surfaces one at a time. A write failure, an ENOSPC or a
+/// signal after the second of four leaves a stack that is neither the
+/// transaction's nor the administrator's, and re-running made it worse rather
+/// than better: the surfaces already restored no longer match the recorded
+/// after-digest, so the drift check refused the whole record and the operator
+/// was left reconstructing the rest out of the JSON by hand.
+///
+/// Recording what is done, durably, after each surface, turns that into a
+/// resume. A surface named here is skipped and not re-checked, because its
+/// digest is deliberately no longer the one apply left.
+pub(crate) fn rollback_progress(id: &str) -> Vec<String> {
+    let Some(path) = progress_path(id) else {
+        return Vec::new();
+    };
+    // A progress note that cannot be parsed is treated as no progress: redoing a
+    // restore is safe, since it writes the same recorded content, while skipping
+    // one that never happened is not.
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Vec<String>>(&body).ok())
+        .unwrap_or_default()
+}
+
+/// Note that a surface is restored, before moving to the next one.
+///
+/// Atomic and fsynced, for the same reason the record itself is: a note that
+/// does not survive the crash it exists to describe is not a note.
+pub(crate) fn note_rollback_progress(id: &str, done: &[String]) -> Result<(), String> {
+    let Some(path) = progress_path(id) else {
+        return Err("invalid transaction id".into());
+    };
+    let body = serde_json::to_string(done).map_err(|e| format!("serialize progress: {e}"))?;
+    irlume_common::write_0600_atomic(&path, body.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Drop the note once every surface is back.
+pub(crate) fn clear_rollback_progress(id: &str) {
+    if let Some(path) = progress_path(id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn progress_path(id: &str) -> Option<PathBuf> {
+    is_valid_id(id).then(|| store_dir().join(format!("{id}.progress")))
+}
+
+/// Copy what is on disk NOW, before an unconfirmed rollback overwrites it.
+///
+/// A `prepared` record has no trustworthy after-digest, so `--accept-unconfirmed`
+/// restores its before-images without checking the current state. That is the
+/// only way to recover a machine whose apply was interrupted, and it is equally
+/// a way to revert a package security update or an administrator's change made
+/// after the crash. Nothing captured what it overwrote.
+///
+/// So it is captured first. This is not a second transaction record and feeds no
+/// automatic path: it is files in a directory whose location the command
+/// reports, for the person who finds their change gone.
+///
+/// Confirmed rollbacks do not need it. Their drift check has already established
+/// that every file is byte-for-byte what apply left, so there is nothing
+/// unrelated to lose.
+pub(crate) fn snapshot_before_rollback(record: &Transaction) -> Result<PathBuf, String> {
+    let dir = store_dir().join(format!("{}.before-rollback", record.id));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    restrict(&dir, 0o700)?;
+    fsync_ancestors(&dir)?;
+    for surface in &record.surfaces {
+        let paths = [
+            Some(surface.path.clone()),
+            surface.sidecar.as_ref().map(|s| s.path.clone()),
+        ];
+        for path in paths.into_iter().flatten() {
+            let source = Path::new(&path);
+            // Copied under the file's own name, flattened. `sudo` and
+            // `sudo.pre-irlume` therefore do not collide, and a name is checked
+            // rather than trusted so nothing can point outside this directory.
+            let Some(name) = source.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                || name.starts_with('.')
+            {
+                return Err(format!("{path} has a name irlume will not copy"));
+            }
+            match std::fs::read(source) {
+                Ok(bytes) => {
+                    let dest = dir.join(name);
+                    irlume_common::write_0600_atomic(&dest, &bytes)
+                        .map_err(|e| format!("write {}: {e}", dest.display()))?;
+                }
+                // Absent is a state worth knowing about, but there is nothing to
+                // copy and a rollback that recreates the file destroys nothing.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("read {path}: {e}")),
+            }
+        }
+    }
+    Ok(dir)
+}
+
 /// Whether a transaction id is safe to use as a filename.
 ///
 /// Hex only, and a fixed length. This is the whole defence against a supplied
@@ -579,6 +685,73 @@ mod tests {
     /// inode and passes through a moment where the file is empty; replacing by
     /// rename gives a new inode and never does. A test that only checked the
     /// final contents would pass either way.
+    /// A stopped rollback can be finished, and an unconfirmed one keeps a copy
+    /// of what it is about to overwrite.
+    #[test]
+    fn a_rollback_records_its_progress_and_snapshots_what_it_overwrites() {
+        let _env = StateDirGuard::new("resume");
+        let live = store_dir().parent().unwrap().join("etc");
+        std::fs::create_dir_all(&live).unwrap();
+        let greeter = live.join("kde");
+        let sidecar = live.join("kde.pre-irlume");
+        std::fs::write(&greeter, "what an administrator put here later\n").unwrap();
+        std::fs::write(&sidecar, "the backup as it stands\n").unwrap();
+
+        let id = "ab".repeat(16);
+        let mut tx = Transaction {
+            id: id.clone(),
+            schema_version: SCHEMA_VERSION,
+            status: TransactionStatus::Prepared,
+            action: "enable".into(),
+            plan_id: "1".repeat(32),
+            engine_version: "0.0.0".into(),
+            surfaces: vec![record(&greeter, Some("the original\n"), "deadbeef")],
+        };
+        tx.surfaces[0].sidecar = Some(SidecarRecord {
+            path: sidecar.display().to_string(),
+            before: None,
+            mode: None,
+            uid: None,
+            gid: None,
+        });
+
+        // The snapshot holds what is on disk NOW, which is precisely what an
+        // unconfirmed rollback would overwrite without checking.
+        let dir = snapshot_before_rollback(&tx).expect("snapshot");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("kde")).unwrap(),
+            "what an administrator put here later\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("kde.pre-irlume")).unwrap(),
+            "the backup as it stands\n",
+            "the sidecar is overwritten too, so it is copied too"
+        );
+
+        // A surface that does not exist is not an error: recreating it destroys
+        // nothing.
+        std::fs::remove_file(&greeter).unwrap();
+        assert!(snapshot_before_rollback(&tx).is_ok());
+
+        // Progress: nothing, then something, then cleared.
+        assert!(rollback_progress(&id).is_empty());
+        note_rollback_progress(&id, &["kde".to_string()]).expect("note");
+        assert_eq!(rollback_progress(&id), vec!["kde".to_string()]);
+        clear_rollback_progress(&id);
+        assert!(rollback_progress(&id).is_empty());
+
+        // An unreadable note means "no progress", never "all done": redoing a
+        // restore writes the same recorded content, while skipping one that
+        // never happened leaves a half-rolled-back stack.
+        note_rollback_progress(&id, &["kde".to_string()]).expect("note");
+        std::fs::write(store_dir().join(format!("{id}.progress")), "{ not a list").unwrap();
+        assert!(rollback_progress(&id).is_empty());
+
+        // An id that is not plain hex never becomes a path.
+        assert!(note_rollback_progress("../../etc/passwd", &[]).is_err());
+        assert!(rollback_progress("../../etc/passwd").is_empty());
+    }
+
     /// A record from a schema this build does not implement is refused, not
     /// half-read.
     ///

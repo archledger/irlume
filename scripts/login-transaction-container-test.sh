@@ -166,6 +166,72 @@ assert "sudo still has its own auth stack" "lost the original body" \
 # And the lock file itself is left behind for the next run, not deleted.
 assert "the PAM lock exists after the race" "missing" test -e /run/lock/irlume-pam.lock
 
+echo "=== 12. a stopped rollback resumes instead of refusing itself ==="
+# A rollback restores surfaces one at a time. Stopping partway used to be
+# unrecoverable by irlume: the surfaces already restored no longer match the
+# recorded after-digest, so a re-run refused the WHOLE record as drifted and the
+# operator had to reconstruct the rest from JSON by hand. Simulated here by
+# noting one surface as done and checking the re-run skips it rather than
+# refusing.
+grep -q pam_irlume "$SUDO_PAM" || sed -i '1i auth       sufficient   pam_irlume.so' "$SUDO_PAM"
+pid4=$($B login plan --action disable --json | field plan_id)
+tx4=$($B login apply --action disable --plan-id "$pid4" --json | field transaction_id)
+assert "apply for the resume case: $tx4" "no id" test -n "$tx4"
+rec4="$IRLUME_STATE_DIR/login-transactions/$tx4.json"
+# The surface whose path is the one about to drift, not merely the first in the
+# record: the greeters come first and picking one of those would exclude the
+# wrong surface and prove nothing.
+sid=$(grep -o "{\"id\":\"[^\"]*\",\"path\":\"$SUDO_PAM\"" "$rec4" |
+    sed 's/.*"id":"\([^"]*\)".*/\1/')
+assert "found the surface id for $SUDO_PAM" "$rec4" test -n "$sid"
+prog="$IRLUME_STATE_DIR/login-transactions/$tx4.progress"
+
+# A surface already put back no longer matches the recorded after-digest. That
+# is what made a stopped rollback unfinishable: WITHOUT a progress note the
+# re-run refuses the whole record as drifted.
+echo "# this surface was already restored by the run that stopped" >>"$SUDO_PAM"
+rm -f "$prog"
+out=$($B login rollback --transaction-id "$tx4" --apply --json)
+assert "without the note, the re-run refuses the whole record" "$out" \
+    test "$(echo "$out" | field code)" = "changed-since-apply"
+
+# WITH the note, that surface is skipped and the rollback completes.
+printf '["%s"]' "$sid" >"$prog"
+out=$($B login rollback --transaction-id "$tx4" --apply --json)
+assert "with the note, the rollback resumes and completes" "$out" \
+    test "$(echo "$out" | field applied)" = "true"
+assert "the already-restored surface was left as it was" "it was rewritten" \
+    grep -q "already restored by the run that stopped" "$SUDO_PAM"
+assert "the resume note is cleared once everything is back" "left behind" test ! -e "$prog"
+
+echo "=== 13. an unconfirmed rollback keeps what it overwrites ==="
+# --accept-unconfirmed restores before-images without checking current state,
+# which is how an interrupted apply is recovered and equally how a package
+# update made after the crash gets reverted. Nothing used to capture that.
+# A container has no camera, so `enable` plans nothing; the disable path is what
+# exercises real writes here, as in the sections above.
+grep -q pam_irlume "$SUDO_PAM" || sed -i '1i auth       sufficient   pam_irlume.so' "$SUDO_PAM"
+pid5=$($B login plan --action disable --json | field plan_id)
+tx5=$($B login apply --action disable --plan-id "$pid5" --json | field transaction_id)
+rec="$IRLUME_STATE_DIR/login-transactions/$tx5.json"
+assert "apply for the unconfirmed case: $tx5" "no id" test -n "$tx5"
+if [ -f "$rec" ]; then
+    # Exactly what an apply killed between its two record writes leaves behind.
+    sed -i 's/"status":"applied"/"status":"prepared"/' "$rec"
+    echo "# a security update landed after the crash" >>"$SUDO_PAM"
+    out=$($B login rollback --transaction-id "$tx5" --accept-unconfirmed --apply --json)
+    snap=$(echo "$out" | field snapshot)
+    assert "the rollback applied" "$out" test "$(echo "$out" | field applied)" = "true"
+    assert "it reports where the copies are" "$out" test -n "$snap"
+    assert "the snapshot directory exists" "$snap missing" test -d "$snap"
+    assert "the overwritten edit is preserved in the snapshot" "not captured" \
+        grep -rq "a security update landed after the crash" "$snap"
+    assert "the snapshot is root-only" "$(stat -c %a "$snap" 2>/dev/null)" \
+        test "$(stat -c %a "$snap")" = "700"
+else
+    bad "unconfirmed rollback setup" "no record at $rec"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

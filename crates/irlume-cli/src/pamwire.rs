@@ -1244,23 +1244,23 @@ pub(crate) fn restore_surface(
 ) -> Result<(), String> {
     match before {
         Some(content) => {
-            write_atomic(path, content)?;
-            // Applied AFTER the atomic rename. write_atomic copies permissions
-            // from the file it is replacing, which is the wrong source here and
-            // does not exist at all when apply removed the file, so the recorded
-            // values are reapplied explicitly.
-            if let Some((mode, uid, gid)) = metadata {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-                    .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-                // Ownership needs privilege irlume has here (rollback --apply is
-                // root-only) but may not on an unusual filesystem, so a failure
-                // is reported rather than silently accepted: a PAM file with the
-                // wrong group is a real access change.
-                std::os::unix::fs::chown(path, Some(uid), Some(gid))
-                    .map_err(|e| format!("chown {}: {e}", path.display()))?;
-            }
-            Ok(())
+            // The recorded mode and owner go on before the rename, not after.
+            // Applying them afterwards published a PAM stack that was briefly
+            // whatever the root umask produced, and on this path in particular
+            // the file may have been REMOVED by apply, so there was nothing to
+            // copy attributes from and the default was all it ever got.
+            //
+            // `None` keeps the old behaviour for records written before those
+            // fields existed: the replacing file inherits the current one's
+            // attributes rather than a guess.
+            let attrs = metadata.or_else(|| {
+                std::fs::symlink_metadata(path).ok().as_ref().map(|m| {
+                    use std::os::unix::fs::MetadataExt as _;
+                    use std::os::unix::fs::PermissionsExt as _;
+                    (m.permissions().mode() & 0o7777, m.uid(), m.gid())
+                })
+            });
+            write_atomic_inner(path, content, attrs)
         }
         None => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -2053,25 +2053,162 @@ fn service_present(s: &Svc) -> Option<PathBuf> {
         .filter(|v| Path::new(v).exists())
         .map(|_| PathBuf::from(s.etc))
 }
-fn backup(path: &Path) -> Result<(), String> {
-    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
-    if !bak.exists() {
-        std::fs::copy(path, &bak).map_err(|e| format!("backup {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+/// A scratch path in the same directory as `path`, unique to this call.
+///
+/// Every write here used to share one name per service, `.{service}.irlume.tmp`.
+/// Two irlume processes writing the same PAM file would open that one inode and
+/// interleave their bodies, and whichever renamed first published whatever was
+/// in it: an atomic rename makes the NAME change indivisible, it does not make
+/// concurrent production of the source safe. The PAM lock now keeps irlume's own
+/// paths apart, and a unique name means a leftover from a killed run is never
+/// adopted either.
+fn scratch_path(path: &Path, kind: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("pam");
-    let tmp = dir.join(format!(".{fname}.irlume.tmp"));
-    std::fs::write(&tmp, contents).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    dir.join(format!(
+        ".{fname}.irlume-{kind}.{}.{seq}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Create the scratch file, never adopting one that is already there.
+fn create_scratch(tmp: &Path) -> Result<std::fs::File, String> {
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+    };
+    match open() {
+        // Same pid and counter as a crashed earlier run. Drop it rather than
+        // write into a file whose contents are somebody else's.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp).map_err(|e| format!("remove {}: {e}", tmp.display()))?;
+            open().map_err(|e| format!("create {}: {e}", tmp.display()))
+        }
+        other => other.map_err(|e| format!("create {}: {e}", tmp.display())),
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
+}
+
+/// Make a directory durable, so an entry created in it survives a power loss.
+fn fsync_dir(dir: &Path) -> Result<(), String> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync {}: {e}", dir.display()))
+}
+
+/// Copy `path` to its `.pre-irlume` backup, atomically, if there is not one yet.
+///
+/// The copy used to go straight to the final name. A kill or an ENOSPC part way
+/// through left a TRUNCATED file at `.pre-irlume`, and the next enable treats an
+/// existing backup as the pristine origin to rebuild from, so a half-copied
+/// stack became the authority for what the machine's PAM should contain. A
+/// backup that only ever appears complete cannot be believed part way.
+///
+/// The destination is published with `hard_link`, which fails if the name
+/// already exists rather than replacing it. An `exists()` test followed by a
+/// rename would be the same check-then-act split this file has been bitten by
+/// before, and would let a retry overwrite a good backup with the already-wired
+/// content.
+fn backup(path: &Path) -> Result<(), String> {
+    let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
+    if bak.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let tmp = scratch_path(path, "bak");
+    let written = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut file = create_scratch(&tmp)?;
+        file.write_all(&contents)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        apply_metadata(&tmp, &meta)?;
+        // Before the link, so the name never points at bytes that are not there.
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        // Fails with EEXIST if another run got there first, which is the answer
+        // wanted: that backup is complete and this one is redundant.
+        match std::fs::hard_link(&tmp, &bak) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(format!("backup {}: {e}", path.display())),
+        }
+        fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    written
+}
+
+/// Copy mode and ownership onto a path.
+fn apply_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()))
+        .map_err(|e| format!("chown {}: {e}", path.display()))
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let existing = std::fs::symlink_metadata(path).ok();
+    write_atomic_inner(path, contents, existing.as_ref().map(mode_uid_gid))
+}
+
+fn mode_uid_gid(meta: &std::fs::Metadata) -> (u32, u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.mode() & 0o7777, meta.uid(), meta.gid())
+}
+
+/// Replace `path` with `contents`, durably, carrying the given mode and owner.
+///
+/// Attributes are set on the scratch file BEFORE the rename, so the name never
+/// resolves to a PAM file with the wrong mode or owner. Setting them afterwards
+/// leaves a window in which the live stack is whatever the root process's umask
+/// produced, and on the restore path the file did not exist to copy from at all.
+///
+/// `sync_all` before the rename and an fsync of `/etc/pam.d` after it: without
+/// them a successful `close` says nothing about what survives a power loss, and
+/// a PAM stack that comes back as a mixture of two versions is the failure this
+/// whole module exists to avoid.
+pub(crate) fn write_atomic_inner(
+    path: &Path,
+    contents: &str,
+    attrs: Option<(u32, u32, u32)>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let tmp = scratch_path(path, "new");
+    let result = (|| -> Result<(), String> {
+        let mut file = create_scratch(&tmp)?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        if let Some((mode, uid, gid)) = attrs {
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+            // Ownership needs privilege, which every caller that writes PAM has,
+            // but an unusual filesystem can still refuse. A PAM file with the
+            // wrong group is a real access change, so it is reported.
+            std::os::unix::fs::chown(&tmp, Some(uid), Some(gid))
+                .map_err(|e| format!("chown {}: {e}", tmp.display()))?;
+        }
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+        fsync_dir(&dir)
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        format!("rename into {}: {e}", path.display())
-    })
+    }
+    result
 }
 
 // ---- SELinux (Fedora) --------------------------------------------------------
@@ -2183,6 +2320,141 @@ mod tests {
 
     // Fedora gdm-password layout (real /etc file, the GDM greeter).
     const GDM: &str = "#%PAM-1.0\nauth     [success=done ...] pam_selinux_permit.so\nauth     substack      password-auth\nauth     optional      pam_gnome_keyring.so\naccount  include       password-auth\nsession  include       password-auth\nsession  optional      pam_gnome_keyring.so auto_start\n";
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("irlume-pamfile-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn strays(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect()
+    }
+
+    /// Two writes must never share a scratch name.
+    ///
+    /// Every write used to go through `.{service}.irlume.tmp`. Two irlume
+    /// processes writing one PAM file opened that single inode and interleaved
+    /// their bodies; whichever renamed first published whatever was in it. An
+    /// atomic rename makes the NAME change indivisible, it does not make
+    /// concurrent production of the source safe.
+    #[test]
+    fn each_write_gets_its_own_scratch_file() {
+        let target = Path::new("/etc/pam.d/sudo");
+        let a = scratch_path(target, "new");
+        let b = scratch_path(target, "new");
+        assert_ne!(a, b, "two writes shared one scratch path");
+        assert_eq!(
+            a.parent(),
+            target.parent(),
+            "scratch must be same-directory"
+        );
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with('.'), "{name} is not hidden");
+            assert!(name.contains("sudo"), "{name} does not name its target");
+        }
+        // A scratch file left by a crashed run is dropped, not written into: its
+        // contents are somebody else's.
+        let dir = scratch_dir("scratch");
+        let stale = dir.join(".sudo.irlume-new.stale.tmp");
+        std::fs::write(&stale, "SOMEBODY ELSE'S HALF-WRITTEN BODY").unwrap();
+        create_scratch(&stale).expect("stale scratch must be replaced");
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write carries the mode and owner across, and leaves nothing behind.
+    #[test]
+    fn a_write_preserves_attributes_and_leaves_no_scratch() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("attrs");
+        let target = dir.join("sudo");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&target).unwrap().ino()
+        };
+
+        write_atomic(&target, "new\n").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o640,
+            "the replacement did not carry the mode across"
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(meta.ino(), before_inode, "the file was rewritten in place");
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+
+        // Restoring a file apply had REMOVED: there is no current file to copy
+        // attributes from, so the recorded ones are the only source. Recorded as
+        // this account rather than root, because the test does not run as root
+        // and a chown to another owner is refused; production rollback --apply
+        // is root-only and the refusal is reported there rather than ignored.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let gone = dir.join("kde-fingerprint");
+        restore_surface(&gone, Some("restored\n"), Some((0o600, uid, gid))).expect("restore");
+        assert_eq!(
+            std::fs::metadata(&gone).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(strays(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backup is complete or absent, and an existing one is never replaced.
+    ///
+    /// `std::fs::copy` straight to `.pre-irlume` could be killed part way, and a
+    /// later enable treats an existing backup as the pristine origin to rebuild
+    /// the live stack from. A truncated backup therefore became the authority
+    /// for what the machine's PAM should contain.
+    #[test]
+    fn a_backup_is_never_published_half_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("backup");
+        let target = dir.join("sudo");
+        std::fs::write(&target, "the original stack\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        backup(&target).expect("backup");
+        let bak = dir.join(format!("sudo{BACKUP}"));
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "the original stack\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&bak).unwrap().permissions().mode() & 0o7777,
+            0o644,
+            "the backup did not carry the mode across"
+        );
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+
+        // The live file is now wired. A second backup must NOT overwrite the
+        // pristine one with the already-wired content.
+        std::fs::write(
+            &target,
+            "auth sufficient pam_irlume.so\nthe original stack\n",
+        )
+        .unwrap();
+        backup(&target).expect("second backup");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "the original stack\n",
+            "a retry overwrote the pristine backup with wired content"
+        );
+        assert!(strays(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn path_regressed_flags_only_a_stripped_existing_file() {

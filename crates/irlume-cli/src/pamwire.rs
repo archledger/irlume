@@ -1089,7 +1089,12 @@ pub(crate) fn apply(
             // instead is no better: on Fedora these point into /etc/authselect
             // and on Debian into /etc/alternatives, both shared targets that
             // other tooling owns. Neither choice is irlume's to make quietly.
-            if path.is_symlink() {
+            // Asked here as well as inside the write, so the refusal reaches the
+            // consumer as a per-surface state with a reason rather than as one
+            // failed operation. `inspect_target` also covers hard links, which
+            // this check did not: a rename replaces one directory entry and
+            // leaves every other name for the inode on the old content.
+            if let Err(message) = inspect_target(path) {
                 out.push(AppliedSurface {
                     id: service_name(svc.etc),
                     role,
@@ -1101,10 +1106,7 @@ pub(crate) fn apply(
                     sidecar_metadata: None,
                     sidecar_existed: false,
                     after_sha256: crate::logintx::ABSENT.to_string(),
-                    error: Some(format!(
-                        "{} is a symlink; irlume will not replace it or write through it",
-                        svc.etc
-                    )),
+                    error: Some(message),
                 });
                 return;
             }
@@ -2140,6 +2142,85 @@ pub(crate) fn lock_pam() -> Result<PamLock, String> {
     Ok(PamLock { _file: file })
 }
 
+/// Test-only: replace a target during the window between the first look and the
+/// rename, so the recheck has something to catch.
+///
+/// The window cannot be reached from outside — it is entirely inside one
+/// function call — so a test that only sets up a symlink beforehand proves the
+/// FIRST check, never the second. Without this, removing the pre-rename recheck
+/// left every test green.
+#[cfg(test)]
+fn swap_target_for_test(path: &Path) {
+    let mut armed = SWAP_DURING_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    if armed.as_deref() != Some(path) {
+        return;
+    }
+    *armed = None;
+    // A different inode under the same name: what an administrator, a package
+    // or another writer does in that window.
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::write(path, "SOMEONE ELSE'S FILE\n");
+}
+
+#[cfg(test)]
+static SWAP_DURING_WRITE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// What a PAM path is, for deciding whether irlume may replace it.
+///
+/// `None` means it does not exist, which is a legitimate state: apply removes an
+/// override it created, and rollback recreates a file that was absent.
+type TargetState = Option<(u64, u64)>;
+
+/// Establish that a PAM path is something irlume may replace, and identify it.
+///
+/// Two things are refused, and previously each was refused in one place or in
+/// none:
+///
+/// - **A symlink.** Renaming over it REPLACES the link with a regular file, and
+///   a rollback restores content rather than the link, so the conversion is
+///   silent and permanent. Writing through it instead is no better: on Fedora
+///   these point into `/etc/authselect` and on Debian into `/etc/alternatives`,
+///   shared targets other tooling owns. `apply` checked this; human
+///   enable/disable, reconcile and rollback did not, so one command refused a
+///   file another would quietly convert.
+/// - **More than one link to the inode.** A rename replaces one directory entry;
+///   every other name for that inode keeps referring to the OLD content. PAM
+///   then reads one inode while package tooling updates another. The link
+///   topology is recorded nowhere, so irlume could not put it back, which makes
+///   breaking it silently the wrong default.
+///
+/// The identity returned is the device and inode, which is what the caller
+/// compares to decide the name still refers to the same file.
+fn inspect_target(path: &Path) -> Result<TargetState, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{} is a symlink; irlume will not replace it with a regular file, because that \
+             conversion cannot be undone and the target belongs to another tool \
+             (authselect, alternatives)",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.nlink() > 1 {
+        return Err(format!(
+            "{} has {} hard links; replacing it would leave the other names referring to the \
+             old content, and irlume does not record the link topology so it could not put \
+             it back",
+            path.display(),
+            meta.nlink()
+        ));
+    }
+    Ok(Some((meta.dev(), meta.ino())))
+}
+
 /// A scratch path in the same directory as `path`, unique to this call.
 ///
 /// Every write here used to share one name per service, `.{service}.irlume.tmp`.
@@ -2272,6 +2353,10 @@ pub(crate) fn write_atomic_inner(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
+    // What the target is right now. A rename REPLACES whatever the name refers
+    // to, so this has to be settled before anything is written, and confirmed
+    // again before the name is taken over.
+    let before = inspect_target(path)?;
     let tmp = scratch_path(path, "new");
     let result = (|| -> Result<(), String> {
         let mut file = create_scratch(&tmp)?;
@@ -2289,6 +2374,17 @@ pub(crate) fn write_atomic_inner(
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         drop(file);
+        #[cfg(test)]
+        swap_target_for_test(path);
+        // Immediately before the name is taken over, not once at the start. The
+        // first look and the rename are two moments, and what matters is what
+        // the name refers to at the instant it is replaced.
+        if inspect_target(path)? != before {
+            return Err(format!(
+                "{} changed while irlume was writing it, so it was left alone",
+                path.display()
+            ));
+        }
         std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
         fsync_dir(&dir)
     })();
@@ -2545,6 +2641,93 @@ mod tests {
             0o600
         );
         assert!(strays(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink and a multiply-linked file are refused by EVERY write path.
+    ///
+    /// The check lived only in the machine `apply` path, so human
+    /// enable/disable, reconcile and rollback would silently replace a symlink
+    /// with a regular file. Nothing anywhere refused a hard link: a rename
+    /// replaces one directory entry, so the other names keep referring to the
+    /// old inode, PAM reads one and package tooling updates the other, and the
+    /// link topology is recorded nowhere so it could not be restored.
+    ///
+    /// Asserted through `write_atomic`, the funnel every path uses, rather than
+    /// on the checker alone: what matters is that a write is refused.
+    #[test]
+    fn a_symlink_or_a_hard_link_is_never_replaced_by_any_write_path() {
+        let dir = scratch_dir("links");
+
+        // A symlink standing in for the authselect/alternatives layout.
+        let real = dir.join("password-auth");
+        std::fs::write(&real, "the shared target\n").unwrap();
+        let link = dir.join("gdm-password");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let refused = write_atomic(&link, "wired\n").expect_err("a symlink must be refused");
+        assert!(refused.contains("symlink"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "the shared target\n",
+            "the symlink's target was written through"
+        );
+        assert!(link.is_symlink(), "the symlink was replaced");
+
+        // Two names for one inode.
+        let a = dir.join("sudo");
+        std::fs::write(&a, "the original stack\n").unwrap();
+        let b = dir.join("sudo-peer");
+        std::fs::hard_link(&a, &b).unwrap();
+        let refused = write_atomic(&a, "wired\n").expect_err("a hard link must be refused");
+        assert!(refused.contains("hard link"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "the original stack\n");
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "the original stack\n",
+            "the peer name was detached from the content"
+        );
+        // Restore refuses on the same terms; it used to have no check at all.
+        assert!(restore_surface(&a, Some("restored\n"), None).is_err());
+
+        // Unlinking the peer makes it an ordinary file again, and writable.
+        std::fs::remove_file(&b).unwrap();
+        write_atomic(&a, "wired\n").expect("a single-linked regular file is fine");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "wired\n");
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target replaced DURING the write is not overwritten.
+    ///
+    /// The first look at the file and the rename that replaces it are two
+    /// moments. Checking once up front proves what the name meant when the write
+    /// started, and the rename acts on what it means when it finishes; between
+    /// them a package, an administrator or another tool can put a different file
+    /// — or a symlink into /etc/authselect — under that name.
+    ///
+    /// Reachable only from inside the write, hence the test hook. Removing the
+    /// pre-rename recheck left every other test green.
+    #[test]
+    fn a_target_swapped_mid_write_is_left_alone() {
+        let dir = scratch_dir("swap");
+        let target = dir.join("sudo");
+        std::fs::write(&target, "the original stack\n").unwrap();
+
+        *SWAP_DURING_WRITE.lock().unwrap() = Some(target.clone());
+        let refused = write_atomic(&target, "wired\n")
+            .expect_err("a target replaced mid-write must not be overwritten");
+        *SWAP_DURING_WRITE.lock().unwrap() = None;
+
+        assert!(
+            refused.contains("changed while irlume was writing"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "SOMEONE ELSE'S FILE\n",
+            "irlume overwrote the file that replaced its target"
+        );
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

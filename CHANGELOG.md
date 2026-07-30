@@ -33,8 +33,6 @@ Fixes a camera-firmware hazard present in 0.7.1. Please upgrade.
 ### Fixed
 
 - **`IRLUME_IR_EMITTER` wrote to the camera with none of the checks 0.7.1 added.**
-
-- **`IRLUME_IR_EMITTER` wrote to the camera with none of the checks 0.7.1 added.**
   0.7.1 stopped irlume guessing its way around a camera's extension units, but
   left one path exempt: the override applied its bytes before irlume had read the
   camera's descriptor at all, so an arbitrary payload went to an arbitrary unit
@@ -1535,6 +1533,7 @@ is always the fallback: no lockout, ever.
 
 [Unreleased]: https://github.com/archledger/irlume/compare/v0.7.2...HEAD
 [0.7.2]: https://github.com/archledger/irlume/releases/tag/v0.7.2
+[0.7.1]: https://github.com/archledger/irlume/releases/tag/v0.7.1
 [0.7.0]: https://github.com/archledger/irlume/releases/tag/v0.7.0
 [0.6.1]: https://github.com/archledger/irlume/releases/tag/v0.6.1
 [0.6.0]: https://github.com/archledger/irlume/releases/tag/v0.6.0

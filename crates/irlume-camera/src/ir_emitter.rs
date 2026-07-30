@@ -3411,8 +3411,15 @@ mod tests {
         let pending =
             ExploratoryWrite::open(-1, &id, ms.unit_id, selector, 3, &[1, 3, 1], &[1, 3, 2])
                 .expect("open the record");
-        std::mem::forget(pending); // leave the record exactly as `open` wrote it
+        // Dropped normally, not forgotten. `open` leaves the guard disarmed —
+        // nothing has been written to the camera yet — so `Drop` returns without
+        // touching the control or the record, which is exactly the state this
+        // test wants and is worth exercising rather than stepping around.
+        // `mem::forget` leaked everything the guard owned, which LeakSanitizer
+        // caught in CI and no ordinary test run would have.
+        drop(pending);
 
+        // Which also proves the disarmed drop left the record alone.
         let record = match crate::emitter_journal::load(&id).expect("load") {
             crate::emitter_journal::Situation::Mine(r) => *r,
             other => panic!("expected this camera's own record: {other:?}"),

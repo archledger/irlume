@@ -215,6 +215,17 @@ pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// torn write. Temp and target must share a directory so the rename stays within
 /// one filesystem (where rename is atomic).
 pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode(path, bytes, 0o600)
+}
+
+/// [`write_0600_atomic`] at a caller-chosen mode.
+///
+/// Exists because not everything that needs the atomic, fsynced write is secret.
+/// `ir_emitter.conf` names a camera and a control number, is read by the
+/// diagnostic script, and has always been world-readable; it needed durability,
+/// not privacy, and quietly narrowing its mode while fixing that would have been
+/// an unrelated change to something a user-run script depends on.
+pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -238,7 +249,7 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(mode)
                 .open(&tmp)
         };
         let mut f = match open_tmp() {
@@ -264,7 +275,10 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
         Ok(())
     }
     #[cfg(not(unix))]
-    std::fs::write(path, bytes)
+    {
+        let _ = mode;
+        std::fs::write(path, bytes)
+    }
 }
 
 /// Request from an (untrusted) client to the (privileged) daemon.

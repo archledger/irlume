@@ -482,6 +482,71 @@ pub(crate) fn restore_decision(record: &PendingWrite, now: &ControlNow) -> Resto
     Restore::Write(original)
 }
 
+/// Held for the whole of a recovery pass or a discovery run, so no other
+/// process can act on the same camera's record in between.
+#[derive(Debug)]
+pub(crate) struct CameraLock {
+    _file: std::fs::File,
+}
+
+/// Where a camera's lock file lives.
+///
+/// `/run/lock`, not beside the records, for the same reason `pamwire` puts its
+/// lock there: a lock's lifetime is a boot, not the machine's. Under the store it
+/// would create `/var/lib/irlume/ir-emitter-journal/` on every machine that ever
+/// opens a camera, including the overwhelming majority that never run `ir-setup`
+/// and have nothing to record, and leave a lock file behind for each camera
+/// forever. `IRLUME_EMITTER_LOCK_DIR` moves it for tests and containers.
+fn lock_path(id: &CameraIdentity) -> PathBuf {
+    std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/lock"))
+        .join(format!("irlume-emitter-{}.lock", filing_key(id)))
+}
+
+/// Take this camera's lock, or report that somebody else holds it.
+///
+/// Reading a record and acting on it is a check and an act with a long window
+/// between: `GET_LEN`, `GET_INFO`, `GET_CUR`, the attempt counter, `SET_CUR`,
+/// the read-back, and only then the removal. Nothing re-read the record at the
+/// end, so a second process that resolved that record, started its own setup and
+/// saved a NEW record at the same name would have it deleted by the first
+/// process finishing — and its exploratory value would then be live with no undo
+/// data at all. That is the loss this whole module exists to prevent, arriving
+/// through the module itself.
+///
+/// The pid and boot id in a record narrow the window; they do not close it. They
+/// describe the record that happened to be loaded before the window opened.
+/// `flock` is kernel-enforced, covers the whole operation, and is released
+/// however the process exits, so a killed irlume strands nothing.
+///
+/// NON-BLOCKING on purpose. This is taken on the capture path, which runs at
+/// every stream open during authentication; waiting behind a discovery run that
+/// takes tens of seconds would stall a login. A camera whose lock is held is a
+/// camera somebody else is already looking after.
+pub(crate) fn lock_camera(id: &CameraIdentity) -> Result<Option<CameraLock>, String> {
+    use std::os::unix::io::AsRawFd as _;
+    let path = lock_path(id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    // SAFETY: `fd` is owned by `file`, which outlives the call and the guard.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.kind() {
+            std::io::ErrorKind::WouldBlock => Ok(None),
+            _ => Err(format!("lock {}: {err}", path.display())),
+        };
+    }
+    Ok(Some(CameraLock { _file: file }))
+}
+
 /// What the store has to say about the camera in front of us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Situation {
@@ -877,6 +942,50 @@ mod tests {
             !describes_this_camera(&different_serial, &id),
             "two serials that disagree are two cameras"
         );
+    }
+
+    /// The lock excludes a second PROCESS.
+    ///
+    /// Asserted against one, because `flock` is per open file description: two
+    /// calls in the same process each open the file and each succeed, so a test
+    /// that took the lock twice here would pass no matter what the code did. The
+    /// external `flock -n` is the only thing that answers the question the lock
+    /// exists to answer.
+    #[test]
+    fn the_camera_lock_excludes_another_process() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-camera-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let id = identity();
+        let path = lock_path(&id);
+
+        let held = lock_camera(&id).expect("take the lock").expect("not busy");
+
+        // `flock -n` exits 1 when the lock is held; the shell is a separate
+        // process, which is the whole point.
+        let refused = std::process::Command::new("flock")
+            .args(["-n", path.to_str().expect("path"), "-c", "true"])
+            .status()
+            .expect("run flock");
+        assert!(
+            !refused.success(),
+            "a second process must not get the lock while it is held"
+        );
+
+        drop(held);
+        let granted = std::process::Command::new("flock")
+            .args(["-n", path.to_str().expect("path"), "-c", "true"])
+            .status()
+            .expect("run flock");
+        assert!(
+            granted.success(),
+            "and must get it once released, or the previous assertion could pass \
+             for any reason at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

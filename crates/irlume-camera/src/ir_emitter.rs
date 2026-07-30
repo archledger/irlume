@@ -2942,7 +2942,48 @@ mod tests {
                 true,
                 true,
             ),
+            // Another irlume process holds this camera. Silent, and it stops
+            // both writers: it is being looked after already.
+            (RecoveryOutcome::Busy, false, true, false),
+            // A same-model record this run cannot confirm belongs here.
+            (
+                RecoveryOutcome::Unconfirmed {
+                    unit: 14,
+                    selector: 6,
+                    original: "010301".into(),
+                    recorded_at: "/devices/pci0000:00/0000:00:14.0/usb3/3-5".into(),
+                },
+                false,
+                true,
+                true,
+            ),
         ];
+
+        // The comment above this test used to claim a table made "adding a
+        // variant without deciding its policy impossible to miss", and then two
+        // variants were added and missed exactly that way. A comment cannot
+        // enforce anything. This match can: it is exhaustive, so a new variant
+        // stops the crate compiling until somebody writes down what it means.
+        fn stated_policy(outcome: &RecoveryOutcome) -> (bool, bool) {
+            match outcome {
+                RecoveryOutcome::NothingPending => (true, false),
+                RecoveryOutcome::ForAnotherCamera => (true, false),
+                RecoveryOutcome::AlreadyRestored => (true, false),
+                RecoveryOutcome::Restored { .. } => (true, false),
+                RecoveryOutcome::RestoredRecordKept(_) => (true, true),
+                RecoveryOutcome::OwnerStillRunning { .. } => (false, true),
+                RecoveryOutcome::Busy => (false, true),
+                RecoveryOutcome::Unresolved(_) => (false, true),
+                RecoveryOutcome::Unconfirmed { .. } => (false, true),
+            }
+        }
+        for (outcome, may_write, blocks, _) in &table {
+            assert_eq!(
+                stated_policy(outcome),
+                (*may_write, *blocks),
+                "the table and the exhaustive statement disagree for {outcome:?}"
+            );
+        }
         for (outcome, may_write, blocks, logged) in table {
             assert_eq!(
                 outcome.permits_capture_write(),

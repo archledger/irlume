@@ -1870,8 +1870,13 @@ impl App {
     /// Run a privileged sub-step via `sudo` and surface its ACTUAL outcome. A
     /// cancelled or failed sudo (wrong password ×3, subcommand error) must not
     /// look like success: `refresh()` re-probes what it can, but a one-shot like
-    /// `ir-setup` leaves no re-checkable state, so we log ✓ on success and raise
-    /// the error banner on failure.
+    /// `ir-setup` reports its own outcome and is not re-probed here, so we log ✓
+    /// on success and raise the error banner on failure.
+    ///
+    /// It DOES leave re-checkable state now: an interrupted run leaves an undo
+    /// record, which `irlume doctor` reports as `emitter-undo-pending`. This
+    /// step does not read it, because the record is about a camera control and
+    /// this is the sudo wrapper's own success or failure.
     /// Absolute path to the running binary, for re-invoking ourselves as root
     /// instead of whatever `irlume` PATH resolves to (a running TUI must not
     /// shell out to a different, older installed build for its privileged half).

@@ -141,6 +141,31 @@ for r in "$store"/*.json; do
         grep -q '}$' "$r"
 done
 
+echo "=== 11. concurrent writers cannot interleave into one PAM file ==="
+# Nothing serialised login apply, rollback, human enable/disable and reconcile.
+# write_atomic also shared ONE scratch name per service, so two processes opened
+# the same inode, interleaved their bodies, and whichever renamed first published
+# the mixture. Run several writers at once and require the result to be one of
+# the two whole outcomes, never a blend.
+$B login disable --apply >/dev/null 2>&1
+for _ in 1 2 3 4 5; do
+    $B login enable --with-sudo --apply >/dev/null 2>&1 &
+    $B login disable --apply >/dev/null 2>&1 &
+done
+wait
+assert "no scratch files survive the race" "leftovers in /etc/pam.d" \
+    test -z "$(find /etc/pam.d -name '.*irlume*tmp*' 2>/dev/null)"
+# A blended file is the failure: irlume's own line appearing more than once, or a
+# truncated final line, are both signatures of two bodies in one inode.
+dupes=$(grep -c pam_irlume "$SUDO_PAM" 2>/dev/null || true)
+assert "sudo carries irlume's line at most once" "found $dupes" test "$dupes" -le 1
+assert "sudo ends with a newline" "truncated mid-line" \
+    test -z "$(tail -c 1 "$SUDO_PAM")"
+assert "sudo still has its own auth stack" "lost the original body" \
+    grep -qE 'auth|@include' "$SUDO_PAM"
+# And the lock file itself is left behind for the next run, not deleted.
+assert "the PAM lock exists after the race" "missing" test -e /run/lock/irlume-pam.lock
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

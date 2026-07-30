@@ -268,6 +268,16 @@ fn read_wired_marker() -> Option<(bool, bool, bool)> {
 /// but the PAM stack is no longer wired, re-apply the recorded configuration;
 /// otherwise exit quietly. Always root (the path unit's service runs as root).
 fn reconcile() -> ExitCode {
+    // This unit fires when a PAM file changes, which is exactly what every other
+    // irlume path does, so without the lock reconcile is the most likely thing
+    // to be writing a stack somebody else is halfway through writing.
+    let _lock = match lock_pam() {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("[login] reconcile cannot serialise: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Some((with_sudo, with_polkit, with_lock)) = read_wired_marker() else {
         // No marker. Two sub-cases:
         //  - Login IS currently wired (an upgrade from a pre-marker version, or
@@ -1370,6 +1380,20 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         );
         return ExitCode::FAILURE;
     }
+    // Held for the whole run, so a machine transaction or the reconcile unit
+    // cannot be writing the same stacks at the same time. A dry run changes
+    // nothing and does not take it.
+    let _lock = if apply {
+        match lock_pam() {
+            Ok(lock) => Some(lock),
+            Err(message) => {
+                eprintln!("[login] cannot serialise this change: {message}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
@@ -2053,6 +2077,69 @@ fn service_present(s: &Svc) -> Option<PathBuf> {
         .filter(|v| Path::new(v).exists())
         .map(|_| PathBuf::from(s.etc))
 }
+/// Held for as long as a process is changing PAM. Released when dropped.
+pub(crate) struct PamLock {
+    _file: std::fs::File,
+}
+
+/// Where the PAM lock lives. `IRLUME_PAM_LOCK` overrides it for tests and
+/// containers, the same way `IRLUME_STATE_DIR` overrides the state root.
+fn pam_lock_path() -> PathBuf {
+    std::env::var_os("IRLUME_PAM_LOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/lock/irlume-pam.lock"))
+}
+
+/// Take the exclusive lock every irlume path that changes PAM must hold.
+///
+/// Nothing serialised these before. `login apply`, `login rollback`, human
+/// `login enable`/`disable`, and `reconcile` could all run at once, and the
+/// combinations are not theoretical: the reconcile path unit fires when a PAM
+/// file changes, which is exactly what the other three do. Two of them
+/// interleaving produced a stack that was a mixture of both, and the record
+/// written by either then described a machine state that never existed.
+///
+/// The lock covers the whole operation, not each write: revalidating a plan,
+/// writing the prepared record, every PAM and sidecar write, and the confirming
+/// record all have to be one indivisible unit, or the record still describes
+/// something other than what is on disk.
+///
+/// `flock` is released by the kernel when the process exits however it exits, so
+/// a killed irlume does not strand it. It does not exclude package managers or
+/// an administrator with an editor: only irlume takes it, which is why every
+/// path still re-checks the file it is about to write.
+pub(crate) fn lock_pam() -> Result<PamLock, String> {
+    use std::os::unix::io::AsRawFd as _;
+    let path = pam_lock_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is owned by `file`, which outlives the call and the guard.
+    let busy = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0;
+    if busy {
+        // Said on stderr, because machine output is JSON on stdout. Then wait:
+        // refusing outright would make the reconcile path unit give up exactly
+        // when an apply is in flight, which is when it most needs to run after.
+        eprintln!("irlume: another irlume PAM operation is in progress, waiting for it…");
+        // SAFETY: as above.
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(PamLock { _file: file })
+}
+
 /// A scratch path in the same directory as `path`, unique to this call.
 ///
 /// Every write here used to share one name per service, `.{service}.irlume.tmp`.
@@ -2335,6 +2422,55 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp"))
             .collect()
+    }
+
+    /// The PAM lock actually excludes, and releases on drop.
+    ///
+    /// Asserted against a SECOND PROCESS, because `flock` is per open file
+    /// description: two locks taken in one process from separate opens do not
+    /// block each other on Linux the way two processes do, so an in-process test
+    /// could report exclusion that does not exist between the commands this is
+    /// meant to serialise.
+    #[test]
+    fn the_pam_lock_excludes_another_process_and_frees_on_drop() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("pamlock");
+        let lock_path = dir.join("irlume-pam.lock");
+        let previous = std::env::var_os("IRLUME_PAM_LOCK");
+        // SAFETY: the env lock is held for the whole test.
+        unsafe { std::env::set_var("IRLUME_PAM_LOCK", &lock_path) };
+
+        // `flock -n` exits 1 when the lock is held; the shell is a separate
+        // process, which is the case that matters.
+        let contended = || {
+            std::process::Command::new("flock")
+                .arg("-n")
+                .arg(&lock_path)
+                .arg("true")
+                .status()
+                .expect("run flock")
+                .success()
+        };
+
+        assert!(contended(), "nothing held the lock yet");
+        let held = lock_pam().expect("take the lock");
+        assert!(
+            !contended(),
+            "a second process took the PAM lock while irlume held it"
+        );
+        drop(held);
+        assert!(contended(), "the lock was not released when dropped");
+
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("IRLUME_PAM_LOCK", value),
+                None => std::env::remove_var("IRLUME_PAM_LOCK"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Two writes must never share a scratch name.

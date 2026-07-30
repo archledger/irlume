@@ -1044,6 +1044,21 @@ pub fn login_apply(args: &[String]) -> ExitCode {
     if let Some(refusal) = require_root(COMMAND, contract) {
         return refusal;
     }
+    // Taken BEFORE the plan is revalidated and held past the confirming record,
+    // so the whole transaction is one unit. Acquiring it later would leave the
+    // staleness check comparing against a stack another irlume process is
+    // partway through rewriting, and the record would then describe a state that
+    // never existed on disk.
+    let _lock = match crate::pamwire::lock_pam() {
+        Ok(lock) => lock,
+        Err(message) => {
+            irlume_common::dlog!("login.apply: refusing, cannot serialise: {message}");
+            return emit(
+                &failure(COMMAND, "operation-failed", true, contract),
+                ExitCode::FAILURE,
+            );
+        }
+    };
     let enable = action == "enable";
     let planned = crate::pamwire::plan(enable, false, false);
     let current_plan = plan_id(action, &planned);
@@ -1279,11 +1294,27 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
     // Restoring an unconfirmed record gives up the protection against reverting
     // somebody else's later edit, so it has to be asked for by name.
     let accept_unconfirmed = args.iter().any(|a| a == "--accept-unconfirmed");
-    if will_apply {
+    // Held across the precheck and every restore, for the same reason apply
+    // holds it: the per-surface drift check and the write it authorises are two
+    // moments, and another irlume process writing between them is exactly what
+    // the check cannot see. A dry run writes nothing and does not take it.
+    let _lock = if will_apply {
         if let Some(refusal) = require_root(COMMAND, contract) {
             return refusal;
         }
-    }
+        match crate::pamwire::lock_pam() {
+            Ok(lock) => Some(lock),
+            Err(message) => {
+                irlume_common::dlog!("login.rollback: refusing, cannot serialise: {message}");
+                return emit(
+                    &failure(COMMAND, "operation-failed", true, contract),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let record = match crate::logintx::Transaction::load(&id) {
         Ok(record) => record,
         Err(reason) => return emit_load_failure(COMMAND, reason, contract),

@@ -903,6 +903,8 @@ version = "0.7.2"
 dependencies = [
  "irlume-common",
  "libc",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "v4l",
 ]

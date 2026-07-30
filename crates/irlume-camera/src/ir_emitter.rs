@@ -525,6 +525,24 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
         }
     };
 
+    // Before anything is applied. A control an interrupted setup left changed is
+    // not where its owner left it, and the value applied below would be layered
+    // on top of it.
+    //
+    // This is a write to camera firmware on a path nobody explicitly asked for,
+    // which everything else in this file is written to avoid. It is allowed here
+    // because it is not a new class of write: the bytes are the camera's own,
+    // read from this control moments before an earlier run changed it, the
+    // control is one this camera publishes, and this path is already about to
+    // write to that same control. It is the difference between putting something
+    // back and trying something out.
+    //
+    // The `off` and malformed branches returned above and are not reached, so
+    // `IRLUME_IR_EMITTER=off` still means irlume sends the camera nothing. A
+    // record pending on a machine set that way surfaces through `irlume doctor`
+    // instead.
+    report_recovery(&id, recover_pending_write(fd, &id));
+
     if let Some(ctrl) = wanted {
         return apply_override(fd, &id, &ctrl);
     }
@@ -1072,6 +1090,15 @@ pub enum DiscoveryError {
         selector: u8,
         err: XuError,
     },
+    /// An earlier run left a control changed and this one could not undo it.
+    ///
+    /// Discovery's first act is to read a control and treat the answer as the
+    /// value to go back to. Run against a control still holding a previous run's
+    /// exploratory value, it would record that as the original and the real one
+    /// would be gone for good.
+    UnresolvedChange,
+    /// The undo record could not be written, so nothing was sent to the camera.
+    JournalUnwritable(String),
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -1127,7 +1154,363 @@ impl std::fmt::Display for DiscoveryError {
                 "unit {unit} selector {selector} was changed and could not be restored ({err}); \
                  power the camera down fully before using it again"
             ),
+            Self::UnresolvedChange => write!(
+                f,
+                "an earlier setup run left a control on this camera changed and it could not be \
+                 put back, so this run stopped before reading anything: it would have recorded \
+                 the changed value as the one to go back to. The original bytes are in {}. \
+                 Unplug and reconnect the camera, or power it down fully, and try again",
+                crate::emitter_journal::store_dir().display()
+            ),
+            Self::JournalUnwritable(why) => write!(
+                f,
+                "nothing was sent to the camera because the record of how to undo it could not \
+                 be written ({why}). Setup writes that record first on purpose, so that a crash \
+                 or a power loss part-way through still leaves something that can put the \
+                 control back"
+            ),
         }
+    }
+}
+
+/// Holds the undo data for an exploratory write for as long as the control is
+/// not known to be back where it was found.
+///
+/// The record reaches disk before the first `SET_CUR` and is removed only after
+/// the control has been read back holding the original again. In between, the
+/// guard's `Drop` puts the control back on any path that leaves the function
+/// early — a panic in the frame decoder, a `?` on an ioctl — which the explicit
+/// restores in `try_documented_control` cannot cover because they are statements
+/// that only run when control reaches them.
+///
+/// `Drop` is best-effort by nature: it cannot report a failure and it does not
+/// run for `SIGKILL` or a power loss. The record is what covers those, and it is
+/// deliberately left in place when the restore cannot be confirmed.
+#[derive(Debug)]
+struct ExploratoryWrite {
+    fd: c_int,
+    unit: u8,
+    selector: u8,
+    original: Vec<u8>,
+    descriptor_sha256: String,
+    /// Set once the control is confirmed back at `original`, or once the applied
+    /// value is durably recorded in the configuration. Until then the record
+    /// stays on disk and `Drop` still tries.
+    resolved: bool,
+}
+
+impl ExploratoryWrite {
+    /// Record the undo data durably. Call BEFORE the first `SET_CUR`.
+    ///
+    /// A failure here is a refusal to write to the camera at all. Discovery
+    /// without a durable record of the original is the behaviour this exists to
+    /// end, so "the journal could not be written" cannot degrade into "write
+    /// anyway and hope".
+    fn open(
+        fd: c_int,
+        id: &crate::uvc_descriptor::CameraIdentity,
+        unit: u8,
+        selector: u8,
+        len: usize,
+        original: &[u8],
+        attempted: &[u8],
+    ) -> Result<Self, String> {
+        let descriptor_sha256 = crate::emitter_journal::fingerprint(id);
+        crate::emitter_journal::save(&crate::emitter_journal::PendingWrite {
+            schema_version: crate::emitter_journal::SCHEMA_VERSION,
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            descriptor_sha256: descriptor_sha256.clone(),
+            usb_id: id.usb_id(),
+            interface_number: id.interface_number,
+            unit,
+            selector,
+            len,
+            original: crate::emitter_journal::to_hex(original),
+            attempted: crate::emitter_journal::to_hex(attempted),
+            restore_attempts: 0,
+            // So a capture running beside this one leaves the control alone
+            // while the run that changed it is still going.
+            boot_id: crate::emitter_journal::current_boot_id(),
+            pid: Some(std::process::id()),
+        })?;
+        Ok(Self {
+            fd,
+            unit,
+            selector,
+            original: original.to_vec(),
+            descriptor_sha256,
+            resolved: false,
+        })
+    }
+
+    /// Read the control back and drop the record only if it holds the original.
+    ///
+    /// The caller has already issued the restoring `SET_CUR`. That call
+    /// returning success says the ioctl was accepted, not that the control now
+    /// holds those bytes, and assuming the two are the same thing is what left
+    /// the camera changed in the first place.
+    fn confirm_restored(&mut self) -> Result<(), String> {
+        let now = get_cur(self.fd, self.unit, self.selector, self.original.len())
+            .map_err(|e| format!("read the control back: {e}"))?;
+        if now != self.original {
+            return Err(format!(
+                "the control reads {:02x?} after being restored to {:02x?}",
+                now, self.original
+            ));
+        }
+        crate::emitter_journal::clear(&self.descriptor_sha256)?;
+        self.resolved = true;
+        Ok(())
+    }
+
+    /// The control is deliberately left at the applied value, and the
+    /// configuration naming it is durable. Drop the record.
+    ///
+    /// Ordering matters: called only AFTER `save_conf`. A crash between a
+    /// successful discovery and that write leaves the camera lit with nothing on
+    /// disk saying which control did it, which is the same unrecorded change
+    /// this module exists to prevent, so until the configuration lands the
+    /// record stays open and the guard would put the control back.
+    fn commit(&mut self) -> Result<(), String> {
+        crate::emitter_journal::clear(&self.descriptor_sha256)?;
+        self.resolved = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExploratoryWrite {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        // Best effort, and deliberately quiet about its own failure: the record
+        // is still on disk, so a failure here is recovered at the next capture
+        // rather than lost. What must not happen is leaving the control changed
+        // AND clearing the record, so the clear only runs behind a confirmed
+        // read-back.
+        if set_cur(self.fd, self.unit, self.selector, &self.original).is_ok() {
+            let _ = self.confirm_restored();
+        }
+    }
+}
+
+/// Put back anything an interrupted run left changed on this camera.
+///
+/// Runs before discovery and before any capture applies a control, because both
+/// of those would otherwise build on a control that is not where its owner left
+/// it — discovery worst of all, since its first act is to read the current value
+/// and call it the original.
+///
+/// Returns what happened, for the caller to log. Every decision it makes is in
+/// [`crate::emitter_journal::record_applies`] and
+/// [`crate::emitter_journal::restore_decision`], which are pure and tested; this
+/// function is the ioctls and the bookkeeping around them.
+pub(crate) fn recover_pending_write(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+) -> RecoveryOutcome {
+    use crate::emitter_journal as journal;
+
+    let record = match journal::load(id) {
+        Ok(None) => return RecoveryOutcome::NothingPending,
+        Ok(Some(record)) => record,
+        Err(why) => return RecoveryOutcome::Unreadable(why),
+    };
+    if let Err(mismatch) = journal::record_applies(&record, id) {
+        return RecoveryOutcome::NotApplicable(mismatch);
+    }
+
+    // Read the control before deciding anything. A restore that is not needed is
+    // still a write to firmware.
+    let now = match (
+        get_len(fd, record.unit, record.selector),
+        get_info(fd, record.unit, record.selector),
+        // Length comes from the record here only to size the read; the decision
+        // below compares it against what the camera just reported and refuses if
+        // they differ.
+        get_cur(fd, record.unit, record.selector, record.len),
+    ) {
+        (Ok(len), Ok(info), Ok(current)) => journal::ControlNow {
+            len,
+            writable: info_allows_set(info),
+            current,
+        },
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            return RecoveryOutcome::Unreadable(format!("query the control: {e}"))
+        }
+    };
+
+    match journal::restore_decision(&record, &now) {
+        journal::Restore::AlreadyRestored => match journal::clear(&record.descriptor_sha256) {
+            Ok(()) => RecoveryOutcome::AlreadyRestored,
+            Err(why) => RecoveryOutcome::Unreadable(why),
+        },
+        journal::Restore::Refuse(why) => RecoveryOutcome::Refused(why),
+        journal::Restore::Write(original) => {
+            // Count the attempt BEFORE the write and make it durable. Counting
+            // after would leave a kill during the restore uncounted, and a
+            // control that never reads back as restored would then be written to
+            // at every capture forever.
+            let mut spent = record.clone();
+            spent.restore_attempts += 1;
+            // Drop the owner rather than claiming it. The recorded owner is
+            // already known dead, and writing THIS process in would be worse:
+            // recovery usually runs inside the long-lived daemon, so a refusal
+            // would leave a record owned by a process that stays alive for days
+            // and every later pass would skip it as somebody else's business.
+            // The attempt counter is what limits repeats.
+            spent.boot_id = None;
+            spent.pid = None;
+            if let Err(why) = journal::save(&spent) {
+                return RecoveryOutcome::Unreadable(why);
+            }
+            if let Err(e) = set_cur(fd, record.unit, record.selector, &original) {
+                return RecoveryOutcome::Refused(format!("restore: {e}"));
+            }
+            match get_cur(fd, record.unit, record.selector, original.len()) {
+                Ok(back) if back == original => match journal::clear(&record.descriptor_sha256) {
+                    Ok(()) => RecoveryOutcome::Restored {
+                        unit: record.unit,
+                        selector: record.selector,
+                    },
+                    Err(why) => RecoveryOutcome::Unreadable(why),
+                },
+                Ok(back) => RecoveryOutcome::Refused(format!(
+                    "the control reads {back:02x?} after being restored to {original:02x?}"
+                )),
+                Err(e) => RecoveryOutcome::Unreadable(format!("read the control back: {e}")),
+            }
+        }
+    }
+}
+
+/// Log a recovery outcome once per camera per process.
+///
+/// `enable` runs at every stream open AND every eighth frame of a burst, so an
+/// outcome that repeats — a record that cannot be acted on stays on disk and is
+/// re-read every time — would otherwise put the same line into the journal
+/// several times a second. Keyed by the camera and the kind of outcome, so a
+/// later change of outcome on the same camera still prints.
+fn report_recovery(id: &crate::uvc_descriptor::CameraIdentity, outcome: RecoveryOutcome) {
+    let Some(line) = outcome.message() else {
+        return;
+    };
+    static REPORTED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let key = format!(
+        "{}:{}",
+        crate::emitter_journal::fingerprint(id),
+        outcome.kind()
+    );
+    // A poisoned lock means another thread panicked while holding it. Recovering
+    // the set is right here: the worst case of a wrong answer is a duplicated or
+    // a dropped log line, and taking the panic instead would turn a logging
+    // detail into a failed capture.
+    let mut guard = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.get_or_insert_with(Default::default).insert(key) {
+        eprintln!("{line}");
+    }
+}
+
+/// What a recovery pass did. Reported rather than swallowed: this is a write to
+/// camera firmware on a path nobody asked for, so it says so in the journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryOutcome {
+    NothingPending,
+    /// The control already held the original; the record was dropped and nothing
+    /// was written.
+    AlreadyRestored,
+    Restored {
+        unit: u8,
+        selector: u8,
+    },
+    /// A record exists for a different camera, a newer schema, or a control this
+    /// camera no longer publishes. Left exactly as it is.
+    NotApplicable(crate::emitter_journal::Mismatch),
+    /// The record stands and could not be acted on. It stays on disk.
+    Refused(String),
+    Unreadable(String),
+}
+
+impl RecoveryOutcome {
+    /// One line for the log, or nothing when there was nothing to do.
+    ///
+    /// `NotApplicable` is silent for a different camera, which is the ordinary
+    /// case on a machine with two of them and would otherwise print at every
+    /// capture. Everything else is loud: a pending firmware change that cannot
+    /// be undone is the operator's problem, not a debug detail.
+    pub(crate) fn message(&self) -> Option<String> {
+        use crate::emitter_journal::Mismatch;
+        match self {
+            Self::NothingPending => None,
+            Self::NotApplicable(Mismatch::DifferentCamera) => None,
+            // A setup run in flight is the normal reason to see this, and it is
+            // about to resolve its own record.
+            Self::NotApplicable(Mismatch::OwnerStillRunning { .. }) => None,
+            Self::AlreadyRestored => Some(
+                "irlume: an interrupted emitter setup was already undone; \
+                 dropped its undo record"
+                    .into(),
+            ),
+            Self::Restored { unit, selector } => Some(format!(
+                "irlume: an interrupted emitter setup had left unit {unit} selector {selector} \
+                 changed; put it back to the value the camera reported before that run"
+            )),
+            Self::NotApplicable(Mismatch::OutOfAttempts { attempts }) => Some(format!(
+                "irlume: an emitter control was changed by an interrupted setup and {attempts} \
+                 attempts to put it back did not take. Nothing further will be written to it. \
+                 The recorded original is in {}",
+                crate::emitter_journal::store_dir().display()
+            )),
+            Self::NotApplicable(why) => Some(format!(
+                "irlume: an emitter undo record cannot be applied to this camera ({why:?}); \
+                 left in {}",
+                crate::emitter_journal::store_dir().display()
+            )),
+            Self::Refused(why) => Some(format!(
+                "irlume: an emitter control left changed by an interrupted setup was not put \
+                 back ({why}); the undo record stays in {}",
+                crate::emitter_journal::store_dir().display()
+            )),
+            Self::Unreadable(why) => Some(format!(
+                "irlume: could not process the emitter undo record ({why})"
+            )),
+        }
+    }
+
+    /// A stable tag for the kind of outcome, for de-duplicating log lines.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::NothingPending => "nothing",
+            Self::AlreadyRestored => "already-restored",
+            Self::Restored { .. } => "restored",
+            Self::NotApplicable(_) => "not-applicable",
+            Self::Refused(_) => "refused",
+            Self::Unreadable(_) => "unreadable",
+        }
+    }
+
+    /// Whether an unresolved change is still outstanding on this camera.
+    ///
+    /// Discovery refuses to start when it is. Its first act is to read the
+    /// control and call the answer the original, so running it against a control
+    /// that is still holding a previous run's exploratory value would record the
+    /// wrong bytes as the thing to go back to, and destroy the real ones.
+    pub(crate) fn blocks_discovery(&self) -> bool {
+        matches!(self, Self::Refused(_) | Self::Unreadable(_))
+            || matches!(
+                self,
+                Self::NotApplicable(
+                    crate::emitter_journal::Mismatch::OutOfAttempts { .. }
+                        | crate::emitter_journal::Mismatch::SchemaTooNew { .. }
+                        | crate::emitter_journal::Mismatch::Malformed(_)
+                        | crate::emitter_journal::Mismatch::ControlNotPublished
+                        // Another setup run holds this camera. Two of them
+                        // interleaving reads and writes on one control would
+                        // each record the other's value as the original.
+                        | crate::emitter_journal::Mismatch::OwnerStillRunning { .. }
+                )
+            )
     }
 }
 
@@ -1158,12 +1541,24 @@ pub fn discover<F: FnMut() -> Option<f32>>(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     measure: &mut F,
-) -> std::result::Result<EmitterControl, DiscoveryError> {
+) -> std::result::Result<Discovered, DiscoveryError> {
     let ms = id
         .microsoft_xu()
         .ok_or_else(|| DiscoveryError::NoMicrosoftXu {
             seen: id.extension_units().iter().map(|u| u.unit_id).collect(),
         })?;
+
+    // Before the first GET_CUR, not after. Discovery reads the control and calls
+    // the answer the original; against a control still holding an earlier run's
+    // exploratory value that reading is wrong, and recording it would overwrite
+    // the only copy of the real one.
+    let recovery = recover_pending_write(fd, id);
+    if let Some(line) = recovery.message() {
+        eprintln!("{line}");
+    }
+    if recovery.blocks_discovery() {
+        return Err(DiscoveryError::UnresolvedChange);
+    }
 
     let mut tried = Vec::new();
 
@@ -1175,8 +1570,8 @@ pub fn discover<F: FnMut() -> Option<f32>>(
             tried.push(format!("selector {selector:#04x} not advertised"));
             continue;
         }
-        match try_documented_control(fd, ms.unit_id, selector, measure) {
-            Ok(Attempt::Lit(ctrl)) => return Ok(ctrl),
+        match try_documented_control(fd, id, ms.unit_id, selector, measure) {
+            Ok(Attempt::Lit(control, pending)) => return Ok(Discovered { control, pending }),
             Ok(Attempt::AlreadyApplied) => tried.push(format!(
                 "selector {selector:#04x} is already set to the value setup would apply"
             )),
@@ -1189,6 +1584,7 @@ pub fn discover<F: FnMut() -> Option<f32>>(
                     err,
                 })
             }
+            Err(TryFailure::Journal(why)) => return Err(DiscoveryError::JournalUnwritable(why)),
             // Any error at all stops everything. Only selectors the descriptor
             // advertises are reached, so a failure here is the camera
             // contradicting its own descriptor, and the errno cannot be relied
@@ -1212,9 +1608,36 @@ pub fn discover<F: FnMut() -> Option<f32>>(
     })
 }
 
+/// A discovery run that has left the camera lit, and the undo record that stays
+/// open until the configuration naming that control is on disk.
+///
+/// The record is deliberately not resolved by a successful discovery. Between
+/// `discover` returning and `save_conf` landing, the camera is changed and
+/// nothing on disk says which control did it; dropping this value without
+/// calling [`Discovered::committed`] puts the control back, which is the right
+/// outcome when the configuration could not be written.
+#[derive(Debug)]
+pub struct Discovered {
+    control: EmitterControl,
+    pending: ExploratoryWrite,
+}
+
+impl Discovered {
+    pub fn control(&self) -> &EmitterControl {
+        &self.control
+    }
+
+    /// Release the undo record. Call only once the configuration naming this
+    /// control is durable.
+    pub fn committed(mut self) -> std::result::Result<(), String> {
+        self.pending.commit()
+    }
+}
+
 /// What one advertised control turned out to be.
 enum Attempt {
-    Lit(EmitterControl),
+    /// Lit, and still holding the applied value, with its undo record open.
+    Lit(EmitterControl, ExploratoryWrite),
     /// The control is already set to the value setup would apply, so writing it
     /// again could not demonstrate anything.
     AlreadyApplied,
@@ -1226,6 +1649,9 @@ enum Attempt {
 enum TryFailure {
     Query(XuError),
     Restore(XuError),
+    /// The undo record could not be written, or could not be confirmed dropped.
+    /// A refusal to touch the camera rather than a reason to write anyway.
+    Journal(String),
     /// The camera stopped delivering frames. The streaming side going quiet is
     /// as much a sign of trouble as a control request going unanswered, and the
     /// old code turned it into "the picture is dark" and carried on.
@@ -1242,6 +1668,7 @@ impl From<XuError> for TryFailure {
 /// worked.
 fn try_documented_control<F: FnMut() -> Option<f32>>(
     fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
     unit: u8,
     selector: u8,
     measure: &mut F,
@@ -1287,12 +1714,22 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
         return Err(TryFailure::Measurement);
     };
 
+    // Durable before the write, not after. Everything from here to the last
+    // restore is the window a kill used to make unrecoverable: the original
+    // existed only in this stack frame, and two camera measurements sit inside
+    // it. `pending` also restores the control from `Drop`, which covers the
+    // paths no statement below can — a panic in the decoder, or an ioctl error
+    // taken by `?`.
+    let mut pending = ExploratoryWrite::open(fd, id, unit, selector, len, &original, &wanted)
+        .map_err(TryFailure::Journal)?;
+
     set_cur(fd, unit, selector, &wanted)?;
     let Some(lit) = measure() else {
         // The stream died after the control was changed. Aborting without
         // putting it back would leave the camera altered by a run that
         // concluded nothing.
         set_cur(fd, unit, selector, &original).map_err(TryFailure::Restore)?;
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
         return Err(TryFailure::Measurement);
     };
 
@@ -1303,6 +1740,7 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     // on what was in front of it.
     if lit < before + AUTOCONF_MIN_LIFT {
         set_cur(fd, unit, selector, &original).map_err(TryFailure::Restore)?;
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
         return Ok(Attempt::NotUsable(format!(
             "the image did not brighten (before {before:.0}, after {lit:.0}, needs +{AUTOCONF_MIN_LIFT:.0})"
         )));
@@ -1317,6 +1755,11 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
         return Err(TryFailure::Measurement);
     };
     if after_restore >= lit - AUTOCONF_MIN_LIFT {
+        // Restored above, and this branch writes nothing further, so the record
+        // is resolvable here. The read-back is what resolves it: the restoring
+        // `set_cur` returning success says the ioctl was accepted, not that the
+        // control holds those bytes.
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
         return Ok(Attempt::NotUsable(format!(
             "the image brightened but stayed bright when the control was put back \
              ({before:.0} before, {lit:.0} with it set, {after_restore:.0} after undoing it), \
@@ -1325,12 +1768,19 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     }
 
     // It followed the control both ways. Apply it and report it.
+    //
+    // The record stays OPEN. The camera is deliberately changed from here on,
+    // and until `save_conf` records which control did it there is still nothing
+    // on disk that could put it back. `Discovered::committed` closes it.
     set_cur(fd, unit, selector, &wanted)?;
-    Ok(Attempt::Lit(EmitterControl {
-        unit,
-        selector,
-        payload: wanted,
-    }))
+    Ok(Attempt::Lit(
+        EmitterControl {
+            unit,
+            selector,
+            payload: wanted,
+        },
+        pending,
+    ))
 }
 
 /// Build a Face Authentication `SET_CUR` payload from what the camera says it
@@ -1647,12 +2097,14 @@ mod tests {
     }
 
     /// Serializes access to the process env vars these tests flip
-    /// (`IRLUME_IR_EMITTER`, `IRLUME_IR_EMITTER_CONF`); cargo runs tests on
-    /// parallel threads sharing one environment.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// (`IRLUME_IR_EMITTER`, `IRLUME_IR_EMITTER_CONF`).
+    ///
+    /// `crate::testenv::ENV_LOCK`, not a private one. A module-private mutex
+    /// over a process-global serialises the module against itself and nothing
+    /// else, so these raced the capture tests in `lib.rs` that flip their own
+    /// variables in the same process.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::testenv::env_lock()
     }
 
     /// An fd that is open but is not a UVC device, so every XU ioctl fails

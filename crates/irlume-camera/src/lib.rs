@@ -22,9 +22,63 @@
 //! to RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
+pub mod emitter_journal;
 pub mod ir_emitter;
 mod ir_metadata;
 pub mod uvc_descriptor;
+
+/// Serializes unit tests that mutate process-global environment variables, and
+/// the RAII guard that restores them.
+///
+/// One lock for the whole crate, deliberately. Three modules here flip env vars
+/// in tests and two of them had grown their OWN private mutex; a second mutex
+/// guarding the same process-global serialises a module against itself and
+/// nothing else, which passes locally and fails under load. Rust's `set_var`
+/// also races any concurrent env READ anywhere in the process, so the lock has
+/// to cover every mutator in the crate to mean anything.
+///
+/// `EnvGuard` restores the PREVIOUS value rather than unsetting: unsetting is
+/// not restoring, and a test that leaves `IRLUME_STATE_DIR` cleared changes what
+/// the next one resolves.
+#[cfg(test)]
+pub(crate) mod testenv {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A panic under the lock (a failed assert) must not cascade into every
+        // later env test; the environment is per-test state, not shared data.
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII env-var override: restores the previous value (or absence) on drop,
+    /// so a panicking assertion cannot leak state into later tests.
+    pub(crate) struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn set(key: &'static str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+        pub(crate) fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 use irlume_common::Error;
 use v4l::buffer::Type;
@@ -2181,13 +2235,19 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| Error::Hardware(format!("could not identify the camera: {e}")))?;
     match ir_emitter::discover(fd, &id, &mut measure) {
-        Ok(ctrl) => {
-            ir_emitter::save_conf(&id, &ctrl).map_err(|e| Error::Io(e.to_string()))?;
+        Ok(found) => {
+            let encoded = found.control().encode();
+            // `save_conf` first, then release the undo record. Until the
+            // configuration naming this control is on disk, the camera is
+            // changed and nothing says which control did it — so if this write
+            // fails, `found` drops unresolved and puts the control back rather
+            // than leaving a lit emitter nobody has a record of.
+            ir_emitter::save_conf(&id, found.control()).map_err(|e| Error::Io(e.to_string()))?;
+            found.committed().map_err(Error::Io)?;
             Ok(format!(
-                "IR emitter enabled: {} on the camera's Microsoft camera-control unit, \
+                "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
                  using a value built from what the camera reports about that control \
-                 (saved; future captures rebuild it the same way)",
-                ctrl.encode()
+                 (saved; future captures rebuild it the same way)"
             ))
         }
         Err(e) => Err(Error::Hardware(e.to_string())),
@@ -3073,41 +3133,11 @@ mod tests {
         std::env::var("IRLUME_TEST_SPARE_DEVICE").ok()
     }
 
-    /// Serializes tests that mutate process-global env vars (cargo runs tests
-    /// on threads, and setters would otherwise race readers in other tests).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// RAII env-var override: restores the previous value (or absence) on
-    /// drop, so a panicking assertion cannot leak state into later tests.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, val: &str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, val);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    // The lock and the guard live in `crate::testenv` so every env-mutating
+    // test in this crate contends on ONE mutex. They used to be private here,
+    // which serialised this module against itself and left it racing the
+    // `ir_emitter` tests that flip a different variable in the same process.
+    use crate::testenv::{env_lock, EnvGuard};
 
     /// Extend the exact-path virtual-camera escape with `device` for the
     /// test's lifetime (`verify_pinned` refuses loopback nodes otherwise),

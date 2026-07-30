@@ -551,8 +551,11 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
 /// Each variant names something the camera itself failed to say, so the message
 /// can tell the person who set the variable which claim was not backed up rather
 /// than leaving them to conclude the value was wrong and try another one.
+/// Crate-private: `ir_emitter` is a `pub mod`, so a `pub` type in it becomes
+/// part of `irlume-camera`'s public API, and this one is only ever produced and
+/// consumed inside this file.
 #[derive(Debug, Clone, PartialEq)]
-pub enum OverrideRefusal {
+pub(crate) enum OverrideRefusal {
     /// The USB descriptor has no extension unit with that id.
     NoSuchUnit { unit: u8, seen: Vec<u8> },
     /// The unit exists but its `bmControls` does not advertise that selector.

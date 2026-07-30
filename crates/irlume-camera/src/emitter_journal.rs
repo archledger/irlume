@@ -1238,10 +1238,18 @@ mod tests {
             writable: true,
             current: vec![1, 3, 2, 0],
         };
-        assert!(matches!(
-            restore_decision(&record, &now),
-            Restore::Refuse(_)
-        ));
+        // The REASON, not merely that it refused. Once the "something else moved
+        // this control" check existed, a build with no width check at all still
+        // refused this input, because a 4-byte current value does not equal a
+        // 3-byte recorded one either. Asserting on the outcome alone stopped
+        // discriminating and the mutant survived.
+        match restore_decision(&record, &now) {
+            Restore::Refuse(why) => assert!(
+                why.contains("4 bytes now") && why.contains("3 when"),
+                "the refusal must be about the control's WIDTH: {why}"
+            ),
+            other => panic!("a control of a different width must be refused: {other:?}"),
+        }
     }
 
     /// Checked AFTER the already-restored case: a camera that refuses writes but

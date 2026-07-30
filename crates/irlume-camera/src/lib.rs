@@ -2261,13 +2261,9 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     match ir_emitter::discover(fd, &id, &mut measure) {
         Ok(found) => {
             let encoded = found.control().encode();
-            // `save_conf` first, then release the undo record. Until the
-            // configuration naming this control is on disk, the camera is
-            // changed and nothing says which control did it — so if this write
-            // fails, `found` drops unresolved and puts the control back rather
-            // than leaving a lit emitter nobody has a record of.
-            ir_emitter::save_conf(&id, found.control()).map_err(|e| Error::Io(e.to_string()))?;
-            found.committed().map_err(Error::Io)?;
+            // Confirm, publish, release, in that order. The sequence lives in
+            // `finish` rather than here so it is reachable by a test.
+            found.finish(&id).map_err(Error::Hardware)?;
             Ok(format!(
                 "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
                  using a value built from what the camera reports about that control \

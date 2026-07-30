@@ -516,6 +516,39 @@ pub(crate) struct CameraLock {
     _file: std::fs::File,
 }
 
+/// The lock path, for tests in sibling modules that must hold the same lock the
+/// daemon does rather than rebuild its name.
+#[cfg(test)]
+pub(crate) fn lock_path_for_test(id: &CameraIdentity) -> PathBuf {
+    lock_path(id)
+}
+
+/// One camera at one physical address, for the purpose of EXCLUDING a second
+/// writer. Deliberately not [`filing_key`].
+///
+/// The serial is excluded because `identity_from_fd` maps every failure to read
+/// the sysfs `serial` file to absence. A key that changes when a read
+/// transiently fails is fine for a filename — the lookup falls back to scanning
+/// the store — but it is fatal for a lock: two processes opening the same camera
+/// with different serial-read outcomes would take DIFFERENT lock files, both
+/// `flock` calls would succeed, and both would go on to drive the same control.
+/// `flock` excludes on the open file description, so two names are two locks.
+///
+/// The descriptor pins the model and the device path pins which attached unit of
+/// that model this is. Neither can quietly become unavailable the way the serial
+/// can.
+fn synchronization_key(id: &CameraIdentity) -> String {
+    irlume_common::sha256_hex(
+        format!(
+            "descriptors:{}|devpath:{}:{}",
+            fingerprint(id),
+            id.usb_devpath.len(),
+            id.usb_devpath
+        )
+        .as_bytes(),
+    )
+}
+
 /// Where a camera's lock file lives.
 ///
 /// `/run/lock`, not beside the records, for the same reason `pamwire` puts its
@@ -528,7 +561,7 @@ fn lock_path(id: &CameraIdentity) -> PathBuf {
     std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/lock"))
-        .join(format!("irlume-emitter-{}.lock", filing_key(id)))
+        .join(format!("irlume-emitter-{}.lock", synchronization_key(id)))
 }
 
 /// Take this camera's lock, or report that somebody else holds it.
@@ -1173,6 +1206,72 @@ mod tests {
                 "schema {version} must not authorise a firmware write"
             );
         }
+    }
+
+    /// One physical camera must always resolve to ONE lock, whether or not its
+    /// serial happened to read this time.
+    ///
+    /// The filing key deliberately includes the serial and the lookup tolerates
+    /// it changing by scanning the store. A lock cannot do that: two names are
+    /// two locks, so two processes whose serial reads disagreed would each take
+    /// their own and both would proceed to drive the same control. Asserted
+    /// against a SECOND PROCESS, because `flock` is per open file description
+    /// and two calls inside this one would both succeed regardless.
+    #[test]
+    fn serial_availability_does_not_change_the_camera_lock() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-lock-key");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let with_serial = identity();
+        let without_serial = CameraIdentity {
+            serial: None,
+            ..identity()
+        };
+        // The premise: the FILING key really does differ between these two, so
+        // an equal lock path is a property of the lock key and not a
+        // coincidence.
+        assert_ne!(filing_key(&with_serial), filing_key(&without_serial));
+        assert_eq!(
+            lock_path(&with_serial),
+            lock_path(&without_serial),
+            "one camera, one lock"
+        );
+
+        let held = lock_camera(&with_serial)
+            .expect("take the lock")
+            .expect("not busy");
+        let path = lock_path(&without_serial);
+        let ready = dir.join("holder-ready");
+        let mut holder = std::process::Command::new("flock")
+            .args([
+                "-n",
+                path.to_str().expect("path"),
+                "-c",
+                &format!("touch {}", ready.display()),
+            ])
+            .status()
+            .expect("run flock");
+        assert!(
+            !holder.success(),
+            "a second process must not get the lock for the same camera just \
+             because its serial read came back empty"
+        );
+        assert!(!ready.exists(), "the holder should never have run");
+
+        drop(held);
+        holder = std::process::Command::new("flock")
+            .args(["-n", path.to_str().expect("path"), "-c", "true"])
+            .status()
+            .expect("run flock");
+        assert!(
+            holder.success(),
+            "and must get it once released, or the assertion above could pass \
+             for any reason at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

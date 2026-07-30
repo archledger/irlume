@@ -3531,10 +3531,11 @@ mod tests {
         let held = crate::emitter_journal::lock_camera(&id)
             .expect("take the lock")
             .expect("not busy");
-        let path = dir.join(format!(
-            "irlume-emitter-{}.lock",
-            crate::emitter_journal::filing_key(&id)
-        ));
+        // Asked for by the same code the daemon uses, not rebuilt from the
+        // filing key: the lock is deliberately keyed on something narrower, and
+        // a test that constructs the name itself stops holding the lock the
+        // moment that changes. It did, and this caught it.
+        let path = crate::emitter_journal::lock_path_for_test(&id);
         drop(held);
 
         // The child signals readiness by creating a marker AFTER `flock` has

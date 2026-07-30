@@ -372,16 +372,50 @@ pub(crate) enum LoadFailure {
 /// Recording what is done, durably, after each surface, turns that into a
 /// resume. A surface named here is skipped and not re-checked, because its
 /// digest is deliberately no longer the one apply left.
-pub(crate) fn rollback_progress(id: &str) -> Vec<String> {
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RollbackProgress {
+    /// Restores that were BEGUN. Each may or may not have landed.
+    ///
+    /// This is the half that was missing, and hardware found it: noting a
+    /// restore only AFTER it succeeded leaves the window between the write and
+    /// the note, and a kill there leaves a surface holding its before-image with
+    /// nothing recording it. The re-run then checks it against the after-digest
+    /// and refuses. Thirty killed rollbacks in a row were unfinishable for
+    /// exactly this reason — write-then-record, the same ordering mistake the
+    /// transaction record itself exists to avoid.
+    ///
+    /// An entry here means "do not trust this file's digest, and just do it
+    /// again": restoring writes the recorded before-content, so doing it twice
+    /// is the same as doing it once.
+    pub(crate) started: Vec<String>,
+    /// Restores known to have completed. Skipped entirely on a re-run.
+    pub(crate) done: Vec<String>,
+}
+
+impl RollbackProgress {
+    /// Whether this item's on-disk digest can still be believed.
+    ///
+    /// Anything begun is untrustworthy whether or not it finished, so both lists
+    /// exempt an item from the drift check.
+    pub(crate) fn touched(&self, key: &str) -> bool {
+        self.started.iter().any(|k| k == key) || self.done.iter().any(|k| k == key)
+    }
+
+    pub(crate) fn finished(&self, key: &str) -> bool {
+        self.done.iter().any(|k| k == key)
+    }
+}
+
+pub(crate) fn rollback_progress(id: &str) -> RollbackProgress {
     let Some(path) = progress_path(id) else {
-        return Vec::new();
+        return RollbackProgress::default();
     };
     // A progress note that cannot be parsed is treated as no progress: redoing a
     // restore is safe, since it writes the same recorded content, while skipping
     // one that never happened is not.
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|body| serde_json::from_str::<Vec<String>>(&body).ok())
+        .and_then(|body| serde_json::from_str::<RollbackProgress>(&body).ok())
         .unwrap_or_default()
 }
 
@@ -389,11 +423,11 @@ pub(crate) fn rollback_progress(id: &str) -> Vec<String> {
 ///
 /// Atomic and fsynced, for the same reason the record itself is: a note that
 /// does not survive the crash it exists to describe is not a note.
-pub(crate) fn note_rollback_progress(id: &str, done: &[String]) -> Result<(), String> {
+pub(crate) fn note_rollback_progress(id: &str, progress: &RollbackProgress) -> Result<(), String> {
     let Some(path) = progress_path(id) else {
         return Err("invalid transaction id".into());
     };
-    let body = serde_json::to_string(done).map_err(|e| format!("serialize progress: {e}"))?;
+    let body = serde_json::to_string(progress).map_err(|e| format!("serialize progress: {e}"))?;
     irlume_common::write_0600_atomic(&path, body.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
@@ -590,7 +624,7 @@ pub(crate) enum RollbackRefusal {
 /// The check rollback is gated on. Kept separate from the restore itself so it
 /// can be run on its own by `verify`, and so both answer from one rule.
 pub(crate) fn unchanged_since_apply(record: &SurfaceRecord) -> Result<(), RollbackRefusal> {
-    unchanged_since_apply_excluding(record, &[])
+    unchanged_since_apply_excluding(record, &RollbackProgress::default())
 }
 
 /// The same question, minus the halves a stopped rollback already put back.
@@ -601,9 +635,9 @@ pub(crate) fn unchanged_since_apply(record: &SurfaceRecord) -> Result<(), Rollba
 /// unfinishable.
 pub(crate) fn unchanged_since_apply_excluding(
     record: &SurfaceRecord,
-    done: &[String],
+    done: &RollbackProgress,
 ) -> Result<(), RollbackRefusal> {
-    if !done.iter().any(|id| id == &record.id) {
+    if !done.touched(&record.id) {
         let current = match file_sha256(Path::new(&record.path)) {
             Ok(value) => value,
             Err(error) => return Err(RollbackRefusal::Unreadable(error)),
@@ -613,7 +647,7 @@ pub(crate) fn unchanged_since_apply_excluding(
             return Err(RollbackRefusal::ChangedSinceApply);
         }
     }
-    if done.iter().any(|id| id == &sidecar_progress_id(&record.id)) {
+    if done.touched(&sidecar_progress_id(&record.id)) {
         return Ok(());
     }
     // The backup counts as part of the surface. Rollback restores it too, so
@@ -830,23 +864,41 @@ mod tests {
         std::fs::remove_file(&greeter).unwrap();
         assert!(snapshot_before_rollback(&tx).is_ok());
 
-        // Progress: nothing, then something, then cleared.
-        assert!(rollback_progress(&id).is_empty());
-        note_rollback_progress(&id, &["kde".to_string()]).expect("note");
-        assert_eq!(rollback_progress(&id), vec!["kde".to_string()]);
+        // Progress: nothing, then BEGUN, then done, then cleared.
+        assert_eq!(rollback_progress(&id), RollbackProgress::default());
+        let begun = RollbackProgress {
+            started: vec!["kde".to_string()],
+            done: Vec::new(),
+        };
+        note_rollback_progress(&id, &begun).expect("note");
+        // Begun is already enough to stop trusting the file: the write may have
+        // landed before the process died. That is the whole point — a restore
+        // writes the recorded content, so repeating it is safe, while checking
+        // its digest is not.
+        assert!(rollback_progress(&id).touched("kde"));
+        assert!(!rollback_progress(&id).finished("kde"));
+        let done = RollbackProgress {
+            started: vec!["kde".to_string()],
+            done: vec!["kde".to_string()],
+        };
+        note_rollback_progress(&id, &done).expect("note");
+        assert!(rollback_progress(&id).finished("kde"));
         clear_rollback_progress(&id).expect("clear");
-        assert!(rollback_progress(&id).is_empty());
+        assert_eq!(rollback_progress(&id), RollbackProgress::default());
 
         // An unreadable note means "no progress", never "all done": redoing a
         // restore writes the same recorded content, while skipping one that
         // never happened leaves a half-rolled-back stack.
-        note_rollback_progress(&id, &["kde".to_string()]).expect("note");
+        note_rollback_progress(&id, &done).expect("note");
         std::fs::write(store_dir().join(format!("{id}.progress")), "{ not a list").unwrap();
-        assert!(rollback_progress(&id).is_empty());
+        assert_eq!(rollback_progress(&id), RollbackProgress::default());
 
         // An id that is not plain hex never becomes a path.
-        assert!(note_rollback_progress("../../etc/passwd", &[]).is_err());
-        assert!(rollback_progress("../../etc/passwd").is_empty());
+        assert!(note_rollback_progress("../../etc/passwd", &RollbackProgress::default()).is_err());
+        assert_eq!(
+            rollback_progress("../../etc/passwd"),
+            RollbackProgress::default()
+        );
         clear_rollback_progress(&id).expect("clear");
 
         // A surface is TWO writes, so it is two entries. Noting it only once
@@ -854,14 +906,18 @@ mod tests {
         // granularity: the live file held its before-image and nothing said so,
         // and the re-run refused it as drift.
         let surface = &tx.surfaces[0];
+        let started = |ids: &[&str]| RollbackProgress {
+            started: ids.iter().map(|s| (*s).to_string()).collect(),
+            done: Vec::new(),
+        };
         assert!(
-            unchanged_since_apply_excluding(surface, &[]).is_err(),
+            unchanged_since_apply_excluding(surface, &RollbackProgress::default()).is_err(),
             "the live file is not what apply left, so unaided this refuses"
         );
         assert_eq!(
-            unchanged_since_apply_excluding(surface, std::slice::from_ref(&surface.id)),
+            unchanged_since_apply_excluding(surface, &started(&[&surface.id])),
             Ok(()),
-            "with the live half noted, the surface stops being a blocker"
+            "a restore merely BEGUN already exempts the file from the digest check"
         );
 
         // The halves are independent, and each excuses only itself. With a
@@ -878,14 +934,14 @@ mod tests {
             gid: None,
         });
         assert_eq!(
-            unchanged_since_apply_excluding(&with_backup, std::slice::from_ref(&with_backup.id)),
+            unchanged_since_apply_excluding(&with_backup, &started(&[&with_backup.id])),
             Err(RollbackRefusal::ChangedSinceApply),
             "noting the live half excused the backup as well"
         );
         assert_eq!(
             unchanged_since_apply_excluding(
                 &with_backup,
-                &[with_backup.id.clone(), sidecar_progress_id(&with_backup.id)]
+                &started(&[&with_backup.id, &sidecar_progress_id(&with_backup.id)])
             ),
             Ok(()),
             "with both halves noted there is nothing left to check"
@@ -893,7 +949,7 @@ mod tests {
         // And noting the backup does not excuse the live file.
         assert!(unchanged_since_apply_excluding(
             &with_backup,
-            &[sidecar_progress_id(&with_backup.id)]
+            &started(&[&sidecar_progress_id(&with_backup.id)])
         )
         .is_err());
     }

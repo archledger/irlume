@@ -900,14 +900,23 @@ fn rollback_restore(
     // skipped: they hold their before-content now, so re-restoring is pointless
     // and re-checking them against the after-digest would refuse the whole
     // record — which is what made a stopped rollback unfinishable.
-    let mut restored = crate::logintx::rollback_progress(&record.id);
-    let already: std::collections::HashSet<String> = restored.iter().cloned().collect();
+    let mut progress = crate::logintx::rollback_progress(&record.id);
+    // Marking a restore BEGUN before doing it, and finished after, is the same
+    // write-ahead ordering the transaction record itself uses. Noting only
+    // completions left the window between the write and the note: a kill there
+    // leaves a surface holding its before-image with nothing recording it, and
+    // the re-run refuses it as drift. Thirty killed rollbacks in a row were
+    // unfinishable that way on real hardware.
+    let begin = |progress: &mut crate::logintx::RollbackProgress, key: &str| {
+        if !progress.started.iter().any(|k| k == key) {
+            progress.started.push(key.to_string());
+        }
+        crate::logintx::note_rollback_progress(&record.id, progress)
+    };
     for surface in &record.surfaces {
         let sidecar_key = crate::logintx::sidecar_progress_id(&surface.id);
-        // A surface is two writes. Each is noted as it lands, so a stop between
-        // them resumes at the second rather than refusing the first as drift.
-        let live_done = already.contains(&surface.id);
-        let sidecar_done = already.contains(&sidecar_key);
+        let live_done = progress.finished(&surface.id);
+        let sidecar_done = progress.finished(&sidecar_key);
         if live_done && sidecar_done {
             continue;
         }
@@ -919,7 +928,7 @@ fn rollback_restore(
         // check-and-write. Skipped for an unconfirmed record, whose digests were
         // never confirmed and so cannot gate anything.
         if !unconfirmed {
-            if let Err(reason) = crate::logintx::unchanged_since_apply_excluding(surface, &restored)
+            if let Err(reason) = crate::logintx::unchanged_since_apply_excluding(surface, &progress)
             {
                 irlume_common::dlog!(
                     "{command}: {} moved while the rollback was running: {reason:?}",
@@ -929,7 +938,7 @@ fn rollback_restore(
                     &failure(command, "changed-since-apply", false, contract),
                     json!({
                         "transaction_id": record.id,
-                        "restored": restored,
+                        "restored": progress.done,
                         "stopped_at": surface.id,
                         // Where the pre-rollback copies are, so a caller that
                         // stopped partway can still find what was overwritten.
@@ -949,11 +958,16 @@ fn rollback_restore(
         let live = if live_done {
             Ok(())
         } else {
-            crate::pamwire::restore_surface(
-                std::path::Path::new(&surface.path),
-                surface.before.as_deref(),
-                metadata,
-            )
+            // Announced before it happens. Restoring writes the recorded
+            // before-content, so doing it twice is the same as doing it once,
+            // which is what makes an interrupted one safe to repeat.
+            begin(&mut progress, &surface.id).and_then(|()| {
+                crate::pamwire::restore_surface(
+                    std::path::Path::new(&surface.path),
+                    surface.before.as_deref(),
+                    metadata,
+                )
+            })
         };
         match live {
             Ok(()) => {
@@ -962,16 +976,16 @@ fn rollback_restore(
                 // held its before-image and nothing said so, so the re-run
                 // checked it against the after-digest and refused it as drift.
                 if !live_done {
-                    restored.push(surface.id.clone());
+                    progress.done.push(surface.id.clone());
                     if let Err(message) =
-                        crate::logintx::note_rollback_progress(&record.id, &restored)
+                        crate::logintx::note_rollback_progress(&record.id, &progress)
                     {
                         irlume_common::dlog!("{command}: cannot record progress: {message}");
                         return emit_with_extra(
                             &failure(command, "operation-failed", false, contract),
                             json!({
                                 "transaction_id": record.id,
-                                "restored": restored,
+                                "restored": progress.done,
                                 "stopped_at": surface.id,
                                 "snapshot": snapshot,
                             }),
@@ -1002,7 +1016,7 @@ fn rollback_restore(
                             &failure(command, "operation-failed", false, contract),
                             json!({
                                 "transaction_id": record.id,
-                                "restored": restored,
+                                "restored": progress.done,
                                 "stopped_at": surface.id,
                             }),
                             ExitCode::FAILURE,
@@ -1012,15 +1026,15 @@ fn rollback_restore(
                 // The sidecar half, noted on its own. Durably, before moving
                 // to the next surface: a note written after the whole loop would
                 // describe only the runs that did not need it.
-                restored.push(sidecar_key.clone());
-                if let Err(message) = crate::logintx::note_rollback_progress(&record.id, &restored)
+                progress.done.push(sidecar_key.clone());
+                if let Err(message) = crate::logintx::note_rollback_progress(&record.id, &progress)
                 {
                     irlume_common::dlog!("{command}: cannot record progress: {message}");
                     return emit_with_extra(
                         &failure(command, "operation-failed", false, contract),
                         json!({
                             "transaction_id": record.id,
-                            "restored": restored,
+                            "restored": progress.done,
                             "stopped_at": surface.id,
                             "snapshot": snapshot,
                         }),
@@ -1037,7 +1051,7 @@ fn rollback_restore(
                     &failure(command, "operation-failed", false, contract),
                     json!({
                         "transaction_id": record.id,
-                        "restored": restored,
+                        "restored": progress.done,
                         "stopped_at": surface.id,
                         // Where the pre-rollback copies are, so a caller that
                         // stopped partway can still find what was overwritten.
@@ -1062,7 +1076,7 @@ fn rollback_restore(
             &failure(command, "operation-failed", true, contract),
             json!({
                 "transaction_id": record.id,
-                "restored": restored,
+                "restored": progress.done,
                 "applied": true,
                 "snapshot": snapshot,
             }),
@@ -1076,7 +1090,7 @@ fn rollback_restore(
                 "transaction_id": record.id,
                 "action": record.action,
                 "unconfirmed": unconfirmed,
-                "restored": restored,
+                "restored": progress.done,
                 "applied": true,
                 "snapshot": snapshot,
             }),
@@ -1117,7 +1131,7 @@ fn rollback_blockers(record: &crate::logintx::Transaction) -> RollbackBlockers<'
 /// that irlume itself restored part of it.
 fn rollback_blockers_excluding<'a>(
     record: &'a crate::logintx::Transaction,
-    done: &[String],
+    done: &crate::logintx::RollbackProgress,
 ) -> RollbackBlockers<'a> {
     let mut blockers = RollbackBlockers::default();
     for surface in &record.surfaces {

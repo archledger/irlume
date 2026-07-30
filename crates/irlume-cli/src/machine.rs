@@ -856,6 +856,23 @@ fn rollback_restore(
             ExitCode::SUCCESS,
         );
     }
+    // Refuse the whole record if it names anything irlume does not manage,
+    // BEFORE restoring any of it. Checked here rather than at load so a record
+    // can still be read and reported by verify; it is writing that is gated.
+    if let Some(stray) = record
+        .surfaces
+        .iter()
+        .find(|s| !crate::pamwire::is_managed_path(&s.path))
+    {
+        irlume_common::dlog!(
+            "{command}: refusing, record names an unmanaged path: {}",
+            stray.path
+        );
+        return emit(
+            &failure(command, "unmanaged-path", false, contract),
+            ExitCode::FAILURE,
+        );
+    }
     let mut restored = Vec::new();
     for surface in &record.surfaces {
         // Re-check THIS surface immediately before restoring it. The blanket
@@ -898,7 +915,11 @@ fn rollback_restore(
                 // The backup is put back with its surface. Leaving a stale one
                 // behind is not inert: a later enable rebuilds from it as the
                 // origin, so it would silently discard an administrator's edits.
-                if let Some(sidecar) = &surface.sidecar {
+                if let Some(sidecar) = &surface
+                    .sidecar
+                    .as_ref()
+                    .filter(|s| crate::pamwire::is_managed_path(&s.path))
+                {
                     let sidecar_metadata = match (sidecar.mode, sidecar.uid, sidecar.gid) {
                         (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
                         _ => None,

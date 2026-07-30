@@ -1204,6 +1204,30 @@ pub(crate) fn apply(
     out
 }
 
+/// Whether irlume manages this path at all.
+///
+/// A transaction record names the paths a rollback will write, and nothing
+/// previously checked that those were paths irlume had any business touching. A
+/// record naming /etc/shadow with a correct digest rewrote it: verified, not
+/// theorised. Only root can plant a record, and root can already write that
+/// file, so it was not an escalation, but it made `login rollback` a
+/// general-purpose write-anywhere-as-root primitive whose only gate was a
+/// directory mode. Any future way to plant a record would then be total.
+///
+/// So the paths are checked against the surfaces irlume wires, plus their
+/// `.pre-irlume` sidecars, and nothing else is restorable.
+pub(crate) fn is_managed_path(path: &str) -> bool {
+    let bare = path.strip_suffix(BACKUP).unwrap_or(path);
+    // Built from the same lists the wiring uses, so a surface added there is
+    // restorable without anyone remembering to update a second list.
+    GREETERS
+        .iter()
+        .chain(FP_GREETERS.iter())
+        .map(|s| s.etc)
+        .chain([LOCKSCREEN.etc, POLKIT.etc, SUDO])
+        .any(|managed| managed == bare)
+}
+
 /// Put one surface back to the content recorded before a transaction.
 ///
 /// Reuses the same atomic write the wiring path uses, so a restore lands the
@@ -3041,6 +3065,37 @@ mod tests {
             "the original\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_paths_irlume_manages_are_restorable() {
+        // Found by attacking, not by review: a record naming /etc/shadow with a
+        // CORRECT digest rewrote it. Only root can plant a record and root can
+        // already write that file, so it was not an escalation, but it made
+        // rollback a write-anywhere-as-root primitive gated on a directory mode.
+        for managed in [
+            "/etc/pam.d/sudo",
+            "/etc/pam.d/kde",
+            "/etc/pam.d/plasmalogin",
+            "/etc/pam.d/polkit-1",
+            "/etc/pam.d/gdm-password",
+            // A sidecar is restorable because its surface is.
+            "/etc/pam.d/sudo.pre-irlume",
+        ] {
+            assert!(is_managed_path(managed), "{managed} must be restorable");
+        }
+        for stray in [
+            "/etc/shadow",
+            "/etc/passwd",
+            "/etc/sudoers",
+            "/root/.ssh/authorized_keys",
+            "/etc/pam.d/../shadow",
+            "/etc/pam.d/sshd",
+            "/etc/pam.d/system-auth",
+            "",
+        ] {
+            assert!(!is_managed_path(stray), "{stray} must NOT be restorable");
+        }
     }
 
     #[test]

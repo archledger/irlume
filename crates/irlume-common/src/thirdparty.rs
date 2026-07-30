@@ -112,17 +112,14 @@ pub fn model_path(m: &ThirdPartyModel) -> PathBuf {
     dir().join(m.file)
 }
 
-/// Lowercase hex SHA-256 of `bytes`. The one place the checksum is computed, so
-/// the CLI's enable/verify path and the daemon's load guard agree byte for byte.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    // sha2 0.11's digest output no longer implements LowerHex; hex-encode
-    // the bytes directly.
-    sha2::Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+/// Lowercase hex SHA-256 of `bytes`, re-exported at this path because the
+/// model catalog's callers have always reached it here.
+///
+/// The implementation moved to the crate root once a second and third caller
+/// appeared (login transactions, and the IR emitter's undo journal). Three
+/// copies of a checksum is three chances for one of them to disagree with the
+/// digests already written to disk.
+pub use crate::sha256_hex;
 
 /// Whether a fetched weight file is present and matches its pinned checksum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

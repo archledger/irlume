@@ -522,6 +522,20 @@ pub(crate) mod fake_camera {
         })
     }
 
+    /// Force what the control reports, without a write.
+    ///
+    /// Models a camera that accepted a `SET_CUR` and is nonetheless holding
+    /// something else: a clamp, a partial apply, or a mode it resolved
+    /// differently. The fake normally follows an accepted write, which is right
+    /// for every other test and useless for this one.
+    pub(crate) fn set_current(value: Vec<u8>) {
+        CAMERA.with(|c| {
+            if let Some(cam) = c.borrow_mut().as_mut() {
+                cam.current = value;
+            }
+        });
+    }
+
     /// What the control holds now.
     pub(crate) fn current() -> Vec<u8> {
         CAMERA.with(|c| {
@@ -1586,6 +1600,9 @@ struct ExploratoryWrite {
     unit: u8,
     selector: u8,
     original: Vec<u8>,
+    /// The value this run applies. Kept so `commit` can confirm the camera is
+    /// actually holding it before the undo data is thrown away.
+    attempted: Vec<u8>,
     /// The record exactly as it was written, so the removal cannot target a
     /// different file than the save did.
     record: crate::emitter_journal::PendingWrite,
@@ -1652,6 +1669,7 @@ impl ExploratoryWrite {
             unit,
             selector,
             original: original.to_vec(),
+            attempted: attempted.to_vec(),
             record,
             resolved: false,
             // Nothing has been written yet.
@@ -1704,14 +1722,32 @@ impl ExploratoryWrite {
     }
 
     /// The control is deliberately left at the applied value, and the
-    /// configuration naming it is durable. Drop the record.
+    /// configuration naming it is durable. Confirm it, then drop the record.
     ///
     /// Ordering matters: called only AFTER `save_conf`. A crash between a
     /// successful discovery and that write leaves the camera lit with nothing on
     /// disk saying which control did it, which is the same unrecorded change
     /// this module exists to prevent, so until the configuration lands the
     /// record stays open and the guard would put the control back.
+    ///
+    /// The read-back is not optional here either. This used to clear on the
+    /// strength of the final `SET_CUR` returning success, which is exactly the
+    /// assumption the rest of this module refuses to make: a camera that clamps
+    /// the value, applies it partly, or answers success while holding something
+    /// else would have had the only copy of its original bytes deleted, and
+    /// `ir_emitter.conf` stores coordinates and no payload, so nothing else
+    /// holds them. Returning an error leaves the guard armed, so `Discovered`
+    /// dropping puts the original back and confirms THAT.
     fn commit(&mut self) -> Result<(), String> {
+        let now = get_cur(self.fd, self.unit, self.selector, self.attempted.len())
+            .map_err(|e| format!("read the applied control back: {e}"))?;
+        crate::emitter_journal::trace(&format!("read back applied {now:02x?}"));
+        if now != self.attempted {
+            return Err(format!(
+                "the control reads {now:02x?} after being set to {:02x?}",
+                self.attempted
+            ));
+        }
         crate::emitter_journal::clear(&self.record)?;
         self.resolved = true;
         Ok(())
@@ -2967,6 +3003,61 @@ mod tests {
             matches!(outcome, Ok(Attempt::Lit(..))),
             "the fixture must reach a successful discovery: {outcome:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A camera that says "yes" to the final write but holds something else must
+    /// not have its undo data deleted.
+    ///
+    /// `commit` used to clear on the strength of the `SET_CUR` returning
+    /// success, which is precisely the assumption the rest of this module
+    /// refuses to make. `ir_emitter.conf` stores coordinates and no payload, so
+    /// once the record is gone nothing holds the original bytes at all.
+    #[test]
+    fn a_final_write_the_camera_did_not_take_keeps_the_undo_record() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-commit-readback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        let _fake = fake_camera::install(a_working_camera());
+        let mut pending =
+            ExploratoryWrite::open(-1, &id, ms.unit_id, selector, 3, &[1, 3, 1], &[1, 3, 2])
+                .expect("open the record");
+        pending
+            .apply_exploratory(&[1, 3, 2])
+            .expect("the fake accepts the write");
+
+        // The camera quietly holds something else. The fake's GET_CUR follows an
+        // accepted SET_CUR, so this is forced directly.
+        fake_camera::set_current(vec![1, 3, 3]);
+
+        let err = pending.commit().expect_err("commit must not accept this");
+        assert!(err.contains("[01, 03, 03]"), "{err}");
+        assert!(
+            !pending.resolved,
+            "an unconfirmed control leaves the guard armed so Drop restores it"
+        );
+
+        let store = dir.join("ir-emitter-journal");
+        assert_eq!(
+            std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0),
+            1,
+            "the undo record must survive: nothing else holds the original bytes"
+        );
+        drop(pending);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

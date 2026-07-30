@@ -474,6 +474,28 @@ pub(crate) fn restore_decision(record: &PendingWrite, now: &ControlNow) -> Resto
     if now.current == original {
         return Restore::AlreadyRestored;
     }
+    // The control must be holding THIS run's exploratory value, or there is no
+    // basis for writing anything.
+    //
+    // `attempted` was recorded from the start and, until review pointed it out,
+    // never read: any value other than the original was taken as proof that
+    // irlume's write was still live. The per-camera lock excludes other irlume
+    // processes and nothing else, so a vendor tool, a driver action or an
+    // operator could have set this control between the interruption and now, and
+    // recovery would have silently overwritten a state it did not create. A
+    // record cannot authorise undoing somebody else's change.
+    let attempted = match from_hex(&record.attempted) {
+        Ok(bytes) => bytes,
+        Err(why) => return Restore::Refuse(format!("attempted: {why}")),
+    };
+    if now.current != attempted {
+        return Restore::Refuse(format!(
+            "the control holds {:02x?}, which is neither the value this run wrote \
+             ({attempted:02x?}) nor the one it recorded ({original:02x?}), so something \
+             else has changed it since",
+            now.current
+        ));
+    }
     if !now.writable {
         return Restore::Refuse(
             "the camera reports it does not accept a write to this control right now".into(),
@@ -1160,6 +1182,47 @@ mod tests {
         };
         assert_eq!(
             restore_decision(&record, &now),
+            Restore::Write(vec![1, 3, 1])
+        );
+    }
+
+    /// A control something ELSE moved is left alone.
+    ///
+    /// The lock excludes other irlume processes and nothing else. A vendor tool
+    /// or an operator can change this control between the interruption and the
+    /// recovery, and "not the original" was being read as "still holding our
+    /// write". `attempted` was recorded from the first commit precisely to tell
+    /// those apart, and until review pointed it out nothing read it.
+    #[test]
+    fn a_control_a_third_party_moved_is_not_overwritten() {
+        let id = identity();
+        let record = record_for(&id); // original 010301, attempted 010302
+        let now = ControlNow {
+            len: 3,
+            writable: true,
+            current: vec![1, 3, 3], // neither
+        };
+        match restore_decision(&record, &now) {
+            Restore::Refuse(why) => {
+                // The operator needs all three values to work out what happened.
+                assert!(why.contains("[01, 03, 03]"), "{why}");
+                assert!(why.contains("[01, 03, 02]"), "{why}");
+                assert!(why.contains("[01, 03, 01]"), "{why}");
+            }
+            other => panic!("a third party's value must not be overwritten: {other:?}"),
+        }
+
+        // And the guard must not swallow the case it exists FOR: the control
+        // still holding this run's write is restored.
+        assert_eq!(
+            restore_decision(
+                &record,
+                &ControlNow {
+                    len: 3,
+                    writable: true,
+                    current: vec![1, 3, 2],
+                }
+            ),
             Restore::Write(vec![1, 3, 1])
         );
     }

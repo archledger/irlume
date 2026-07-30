@@ -903,7 +903,12 @@ fn rollback_restore(
     let mut restored = crate::logintx::rollback_progress(&record.id);
     let already: std::collections::HashSet<String> = restored.iter().cloned().collect();
     for surface in &record.surfaces {
-        if already.contains(&surface.id) {
+        let sidecar_key = crate::logintx::sidecar_progress_id(&surface.id);
+        // A surface is two writes. Each is noted as it lands, so a stop between
+        // them resumes at the second rather than refusing the first as drift.
+        let live_done = already.contains(&surface.id);
+        let sidecar_done = already.contains(&sidecar_key);
+        if live_done && sidecar_done {
             continue;
         }
         // Re-check THIS surface immediately before restoring it. The blanket
@@ -914,7 +919,8 @@ fn rollback_restore(
         // check-and-write. Skipped for an unconfirmed record, whose digests were
         // never confirmed and so cannot gate anything.
         if !unconfirmed {
-            if let Err(reason) = crate::logintx::unchanged_since_apply(surface) {
+            if let Err(reason) = crate::logintx::unchanged_since_apply_excluding(surface, &restored)
+            {
                 irlume_common::dlog!(
                     "{command}: {} moved while the rollback was running: {reason:?}",
                     surface.id
@@ -940,18 +946,46 @@ fn rollback_restore(
             (Some(mode), Some(uid), Some(gid)) => Some((mode, uid, gid)),
             _ => None,
         };
-        match crate::pamwire::restore_surface(
-            std::path::Path::new(&surface.path),
-            surface.before.as_deref(),
-            metadata,
-        ) {
+        let live = if live_done {
+            Ok(())
+        } else {
+            crate::pamwire::restore_surface(
+                std::path::Path::new(&surface.path),
+                surface.before.as_deref(),
+                metadata,
+            )
+        };
+        match live {
             Ok(()) => {
+                // Noted BEFORE the backup is touched. Recording the two together
+                // is what left a stop between them unresumable: the live file
+                // held its before-image and nothing said so, so the re-run
+                // checked it against the after-digest and refused it as drift.
+                if !live_done {
+                    restored.push(surface.id.clone());
+                    if let Err(message) =
+                        crate::logintx::note_rollback_progress(&record.id, &restored)
+                    {
+                        irlume_common::dlog!("{command}: cannot record progress: {message}");
+                        return emit_with_extra(
+                            &failure(command, "operation-failed", false, contract),
+                            json!({
+                                "transaction_id": record.id,
+                                "restored": restored,
+                                "stopped_at": surface.id,
+                                "snapshot": snapshot,
+                            }),
+                            ExitCode::FAILURE,
+                        );
+                    }
+                }
                 // The backup is put back with its surface. Leaving a stale one
                 // behind is not inert: a later enable rebuilds from it as the
                 // origin, so it would silently discard an administrator's edits.
                 if let Some(sidecar) = &surface
                     .sidecar
                     .as_ref()
+                    .filter(|_| !sidecar_done)
                     .filter(|s| crate::pamwire::is_managed_path(&s.path))
                 {
                     let sidecar_metadata = match (sidecar.mode, sidecar.uid, sidecar.gid) {
@@ -975,10 +1009,10 @@ fn rollback_restore(
                         );
                     }
                 }
-                restored.push(surface.id.clone());
-                // Durably, before moving to the next surface. A note written
-                // after the whole loop would describe only the runs that did not
-                // need it.
+                // The sidecar half, noted on its own. Durably, before moving
+                // to the next surface: a note written after the whole loop would
+                // describe only the runs that did not need it.
+                restored.push(sidecar_key.clone());
                 if let Err(message) = crate::logintx::note_rollback_progress(&record.id, &restored)
                 {
                     irlume_common::dlog!("{command}: cannot record progress: {message}");
@@ -1069,10 +1103,7 @@ fn rollback_blockers_excluding<'a>(
 ) -> RollbackBlockers<'a> {
     let mut blockers = RollbackBlockers::default();
     for surface in &record.surfaces {
-        if done.iter().any(|id| id == &surface.id) {
-            continue;
-        }
-        match crate::logintx::unchanged_since_apply(surface) {
+        match crate::logintx::unchanged_since_apply_excluding(surface, done) {
             Ok(()) => {}
             Err(crate::logintx::RollbackRefusal::ChangedSinceApply) => {
                 blockers.changed.push(surface.id.as_str());

@@ -405,6 +405,17 @@ pub(crate) fn clear_rollback_progress(id: &str) {
     }
 }
 
+/// How a surface's backup is named in the progress note.
+///
+/// A surface is two writes: the live file and its `.pre-irlume` backup. Noting
+/// the surface only once BOTH were done reproduced the very failure the note
+/// exists to fix, one level down: a crash between them left the live file
+/// holding its before-image and nothing recording that, so the re-run checked it
+/// against the after-digest and refused it as drift.
+pub(crate) fn sidecar_progress_id(surface_id: &str) -> String {
+    format!("{surface_id}\u{0}sidecar")
+}
+
 fn progress_path(id: &str) -> Option<PathBuf> {
     is_valid_id(id).then(|| store_dir().join(format!("{id}.progress")))
 }
@@ -452,8 +463,23 @@ pub(crate) fn snapshot_before_rollback(record: &Transaction) -> Result<PathBuf, 
             match std::fs::read(source) {
                 Ok(bytes) => {
                     let dest = dir.join(name);
-                    irlume_common::write_0600_atomic(&dest, &bytes)
-                        .map_err(|e| format!("write {}: {e}", dest.display()))?;
+                    // The FIRST capture is the one worth keeping. A resumed
+                    // rollback runs this again, and by then the surfaces it
+                    // already restored hold their before-image: re-capturing
+                    // would overwrite the only copy of the administrator's
+                    // change with irlume's own restore. Published by link, which
+                    // fails rather than replaces, so the decision is not a
+                    // separate check that could be raced.
+                    let tmp = dir.join(format!(".{name}.tmp"));
+                    irlume_common::write_0600_atomic(&tmp, &bytes)
+                        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+                    let linked = std::fs::hard_link(&tmp, &dest);
+                    let _ = std::fs::remove_file(&tmp);
+                    match linked {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(format!("write {}: {e}", dest.display())),
+                    }
                 }
                 // Absent is a state worth knowing about, but there is nothing to
                 // copy and a rollback that recreates the file destroys nothing.
@@ -547,13 +573,31 @@ pub(crate) enum RollbackRefusal {
 /// The check rollback is gated on. Kept separate from the restore itself so it
 /// can be run on its own by `verify`, and so both answer from one rule.
 pub(crate) fn unchanged_since_apply(record: &SurfaceRecord) -> Result<(), RollbackRefusal> {
-    let current = match file_sha256(Path::new(&record.path)) {
-        Ok(value) => value,
-        Err(error) => return Err(RollbackRefusal::Unreadable(error)),
-    };
-    let current = current.unwrap_or_else(|| ABSENT.to_string());
-    if current != record.after_sha256 {
-        return Err(RollbackRefusal::ChangedSinceApply);
+    unchanged_since_apply_excluding(record, &[])
+}
+
+/// The same question, minus the halves a stopped rollback already put back.
+///
+/// A surface is two writes, so it is two entries in the progress note. Either
+/// one already restored holds its BEFORE content and therefore no longer matches
+/// the after-digest; checking it would refuse the record and leave the other half
+/// unfinishable.
+pub(crate) fn unchanged_since_apply_excluding(
+    record: &SurfaceRecord,
+    done: &[String],
+) -> Result<(), RollbackRefusal> {
+    if !done.iter().any(|id| id == &record.id) {
+        let current = match file_sha256(Path::new(&record.path)) {
+            Ok(value) => value,
+            Err(error) => return Err(RollbackRefusal::Unreadable(error)),
+        };
+        let current = current.unwrap_or_else(|| ABSENT.to_string());
+        if current != record.after_sha256 {
+            return Err(RollbackRefusal::ChangedSinceApply);
+        }
+    }
+    if done.iter().any(|id| id == &sidecar_progress_id(&record.id)) {
+        return Ok(());
     }
     // The backup counts as part of the surface. Rollback restores it too, so
     // leaving it out of the check meant a backup an administrator or a package
@@ -786,6 +830,97 @@ mod tests {
         // An id that is not plain hex never becomes a path.
         assert!(note_rollback_progress("../../etc/passwd", &[]).is_err());
         assert!(rollback_progress("../../etc/passwd").is_empty());
+        clear_rollback_progress(&id);
+
+        // A surface is TWO writes, so it is two entries. Noting it only once
+        // both landed left a crash between them unresumable at a finer
+        // granularity: the live file held its before-image and nothing said so,
+        // and the re-run refused it as drift.
+        let surface = &tx.surfaces[0];
+        assert!(
+            unchanged_since_apply_excluding(surface, &[]).is_err(),
+            "the live file is not what apply left, so unaided this refuses"
+        );
+        assert_eq!(
+            unchanged_since_apply_excluding(surface, std::slice::from_ref(&surface.id)),
+            Ok(()),
+            "with the live half noted, the surface stops being a blocker"
+        );
+
+        // The halves are independent, and each excuses only itself. With a
+        // DRIFTED backup recorded, noting the live half must not also excuse the
+        // backup: one progress entry standing for both is how a stopped rollback
+        // skipped a write it never made.
+        let mut with_backup = surface.clone();
+        with_backup.sidecar = Some(SidecarRecord {
+            path: sidecar.display().to_string(),
+            after_sha256: Some("a digest the backup does not have".into()),
+            before: None,
+            mode: None,
+            uid: None,
+            gid: None,
+        });
+        assert_eq!(
+            unchanged_since_apply_excluding(&with_backup, std::slice::from_ref(&with_backup.id)),
+            Err(RollbackRefusal::ChangedSinceApply),
+            "noting the live half excused the backup as well"
+        );
+        assert_eq!(
+            unchanged_since_apply_excluding(
+                &with_backup,
+                &[with_backup.id.clone(), sidecar_progress_id(&with_backup.id)]
+            ),
+            Ok(()),
+            "with both halves noted there is nothing left to check"
+        );
+        // And noting the backup does not excuse the live file.
+        assert!(unchanged_since_apply_excluding(
+            &with_backup,
+            &[sidecar_progress_id(&with_backup.id)]
+        )
+        .is_err());
+    }
+
+    /// A resumed unconfirmed rollback must not overwrite its own rescue copies.
+    ///
+    /// Every unconfirmed run snapshots before it looks at the progress note, so
+    /// a second run re-captures surfaces the first already restored — which by
+    /// then hold irlume's own before-image. That would replace the only saved
+    /// copy of the administrator's change with the thing that overwrote it.
+    #[test]
+    fn a_resumed_snapshot_keeps_the_first_capture() {
+        let _env = StateDirGuard::new("resnap");
+        let live = store_dir().parent().unwrap().join("etc");
+        std::fs::create_dir_all(&live).unwrap();
+        let greeter = live.join("kde");
+        std::fs::write(&greeter, "the administrator's change\n").unwrap();
+
+        let tx = Transaction {
+            id: "cd".repeat(16),
+            schema_version: SCHEMA_VERSION,
+            status: TransactionStatus::Prepared,
+            action: "enable".into(),
+            plan_id: "1".repeat(32),
+            engine_version: "0.0.0".into(),
+            surfaces: vec![record(&greeter, Some("the original\n"), "deadbeef")],
+        };
+
+        let dir = snapshot_before_rollback(&tx).expect("first snapshot");
+        // The rollback restored it; a resumed run snapshots again.
+        std::fs::write(&greeter, "the original\n").unwrap();
+        snapshot_before_rollback(&tx).expect("second snapshot");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("kde")).unwrap(),
+            "the administrator's change\n",
+            "the resume overwrote the only copy of what the rollback replaced"
+        );
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left scratch: {strays:?}");
     }
 
     /// A record from a schema this build does not implement is refused, not

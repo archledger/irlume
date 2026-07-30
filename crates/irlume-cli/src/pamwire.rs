@@ -1297,11 +1297,24 @@ pub(crate) fn restore_surface(
             });
             write_atomic_inner(path, content, attrs)
         }
-        None => match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("remove {}: {error}", path.display())),
-        },
+        None => {
+            // The same refusal the replacing branch gets. Removing was a direct
+            // `remove_file`, so a path recorded as previously absent that is now
+            // a symlink was unlinked despite the claim that every write path
+            // refuses one, and a multiply-linked file lost a name irlume cannot
+            // put back.
+            inspect_target(path)?;
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("remove {}: {error}", path.display())),
+            }
+            // A deletion is a directory change like any other. Without this the
+            // unlink could be lost to a power cut while the durable progress
+            // note said the surface was done, so a resume would skip a file that
+            // is still there.
+            fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+        }
     }
 }
 
@@ -2722,6 +2735,25 @@ mod tests {
         );
         // Restore refuses on the same terms; it used to have no check at all.
         assert!(restore_surface(&a, Some("restored\n"), None).is_err());
+
+        // REMOVING a surface is a write path too. Rollback removes a file that
+        // was absent before the transaction, and that branch called remove_file
+        // directly: a path now holding a symlink was unlinked despite the claim
+        // that every path refuses one, and a multiply-linked file lost a name
+        // irlume cannot put back.
+        let gone_link = dir.join("was-absent");
+        std::os::unix::fs::symlink(&real, &gone_link).unwrap();
+        let refused = restore_surface(&gone_link, None, None)
+            .expect_err("removing a symlink must be refused too");
+        assert!(refused.contains("symlink"), "{refused}");
+        assert!(gone_link.is_symlink(), "the symlink was unlinked");
+        let peer = dir.join("linked-peer");
+        std::fs::hard_link(&a, &peer).unwrap();
+        assert!(
+            restore_surface(&a, None, None).is_err(),
+            "removing one name of a multiply-linked file must be refused"
+        );
+        std::fs::remove_file(&peer).unwrap();
 
         // Unlinking the peer makes it an ordinary file again, and writable.
         std::fs::remove_file(&b).unwrap();

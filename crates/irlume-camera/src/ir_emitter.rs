@@ -628,10 +628,33 @@ fn apply_override(
     ctrl: &EmitterControl,
 ) -> bool {
     let key = format!("{device} {} {}:{}", id.usb_id(), ctrl.unit, ctrl.selector);
-    if let Ok(memo) = override_memo().lock() {
-        if let Some(decided) = memo.get(&key) {
-            return *decided;
+
+    // ONE guard spans the lookup, the device access and the record. Taking the
+    // lock twice around an unlocked middle would have made "at most once" a
+    // description of the happy path: two callers can both miss, both write, and
+    // then both record the same answer. The window is the whole point of the
+    // limiter, so it is closed rather than commented.
+    //
+    // Holding a lock across ioctls is deliberate. It serialises the first
+    // override decision across cameras too, which costs one `GET_INFO`/`GET_LEN`/
+    // `GET_CUR` round trip of waiting, once per camera per process, and is not
+    // reachable from a capture loop after that.
+    let mut memo = match override_memo().lock() {
+        Ok(memo) => memo,
+        // A poisoned lock means a thread panicked mid-decision. Ignoring it
+        // would make every later call a miss, which turns the write limiter off
+        // exactly when the process has already shown it is not well.
+        Err(_) => {
+            eprintln!(
+                "irlume: refusing IRLUME_IR_EMITTER={}: the one-write record is unavailable \
+                 after a panic, so irlume cannot tell whether this was already applied",
+                ctrl.encode()
+            );
+            return false;
         }
+    };
+    if let Some(decided) = memo.get(&key) {
+        return *decided;
     }
     let applied = match check_and_apply_override(fd, id, ctrl) {
         Ok(applied) => applied,
@@ -646,10 +669,41 @@ fn apply_override(
             false
         }
     };
-    if let Ok(mut memo) = override_memo().lock() {
-        memo.insert(key, applied);
-    }
+    memo.insert(key, applied);
     applied
+}
+
+/// Test-only: hold a caller inside the gate so another thread can observe what
+/// is true while the device is being talked to.
+///
+/// The property under test is "the memo lock is held across the device access",
+/// and it cannot be observed from outside without stopping time in the middle.
+/// Two racing threads would not do: whether the second one gets in is a question
+/// of scheduling, so it could pass while the window was wide open.
+#[cfg(test)]
+fn park_inside_for_test() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !test_park().armed.load(SeqCst) {
+        return;
+    }
+    test_park().reached.store(true, SeqCst);
+    while !test_park().release.load(SeqCst) {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestPark {
+    armed: std::sync::atomic::AtomicBool,
+    reached: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+fn test_park() -> &'static TestPark {
+    static P: std::sync::OnceLock<TestPark> = std::sync::OnceLock::new();
+    P.get_or_init(Default::default)
 }
 
 /// The gate itself, separated from the memo and the message so a test can assert
@@ -659,6 +713,9 @@ fn check_and_apply_override(
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
 ) -> std::result::Result<bool, OverrideRefusal> {
+    #[cfg(test)]
+    park_inside_for_test();
+
     // First, and before the fd is touched at all: a unit this camera does not
     // publish is refused without a single ioctl reaching the device.
     override_is_published(id, ctrl)?;
@@ -2041,6 +2098,57 @@ mod tests {
         assert_eq!(
             sent, 0,
             "an override was sent to a device whose descriptors were never read"
+        );
+    }
+
+    /// "At most once per camera" has to survive two callers, or it describes
+    /// only the happy path.
+    ///
+    /// The first version of this fix took the memo lock, dropped it, talked to
+    /// the camera, then took it again to record the answer. Two threads could
+    /// both miss and both write. Found in review of this PR; it is defect
+    /// pattern 2, a check and its write being two moments.
+    ///
+    /// Asserted by stopping a caller INSIDE the gate and testing what is true
+    /// while it is there: if the lock is held across the device access, no other
+    /// thread can be in the same window. `try_lock` answers that with no
+    /// scheduling assumption at all. Racing two real threads would not prove it,
+    /// because the second thread losing the race is indistinguishable from the
+    /// second thread being blocked.
+    #[test]
+    fn the_write_record_is_locked_across_the_device_access() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let parked = std::thread::spawn(|| {
+            test_park().armed.store(true, SeqCst);
+            // Through `apply_override`, because the lock it takes is the thing
+            // under test. Unit 3 is not published, so the gate refuses before
+            // any ioctl; what matters is only that the caller got INSIDE.
+            apply_override(
+                -1,
+                "/dev/irlume-test-locking",
+                &identity(0x3277, 0x0059),
+                &ctrl(3, 1, vec![255]),
+            )
+        });
+
+        while !test_park().reached.load(SeqCst) {
+            std::thread::yield_now();
+        }
+        // The parked caller is between the lookup and the record. Anyone else
+        // reaching `apply_override` right now must NOT be able to take the memo.
+        let held = override_memo().try_lock().is_err();
+
+        test_park().release.store(true, SeqCst);
+        test_park().armed.store(false, SeqCst);
+        let _ = parked.join();
+        test_park().reached.store(false, SeqCst);
+        test_park().release.store(false, SeqCst);
+
+        assert!(
+            held,
+            "the memo was free while a caller was talking to the camera, \
+             so a second caller could reach the same write"
         );
     }
 

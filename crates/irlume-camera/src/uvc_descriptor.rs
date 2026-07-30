@@ -238,6 +238,12 @@ pub struct CameraIdentity {
     /// stable across reboots for a fixed port and changes when the device is
     /// moved to another one, which is the right way round for a record that has
     /// to survive a power loss.
+    ///
+    /// It is NOT a physical-device identity. The kernel calls it the device's
+    /// key "at that point in time": the same path is reused by whatever is
+    /// plugged into that port next. So a path match says "the same place", never
+    /// "the same camera", and anything authorising a write on a path match alone
+    /// is trusting a port.
     pub usb_devpath: String,
 }
 

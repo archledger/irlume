@@ -326,12 +326,26 @@ impl PendingWrite {
     }
 }
 
-/// Whether this record was written about the camera in front of us.
+/// Whether this record was written about the camera in front of us, to the
+/// standard required to WRITE to that camera.
 ///
-/// The serial is compared only when BOTH sides have one: a record from a build
-/// that did not store it must not be mistaken for a different unit. The devpath
-/// is required on both sides, because it is the only discriminator that holds
-/// when two identical units are attached at once.
+/// This answers the authorisation question, not the "can I find it" question.
+/// The two pull in opposite directions and both matter:
+///
+///   * A record must stay FINDABLE when the serial read fails, or a transient
+///     failure hides the only description of an outstanding change. `load`
+///     handles that by scanning, so the record is still reported and `doctor`
+///     still warns.
+///   * A record must not AUTHORISE a firmware write on evidence weaker than the
+///     evidence it was written with. A record carrying a serial, matched
+///     against a camera whose serial could not be read, is exactly that: the
+///     device path names a port, and the kernel is explicit that it is the
+///     device's key "at that point in time", not a persistent identity. An
+///     identical unit swapped into the same port between the record and the
+///     recovery would satisfy descriptor and path alike.
+///
+/// So a missing current serial fails CLOSED. The record is found, reported and
+/// left alone; when the serial reads again it is acted on.
 pub(crate) fn describes_this_camera(record: &PendingWrite, id: &CameraIdentity) -> bool {
     if record.descriptor_sha256 != fingerprint(id) {
         return false;
@@ -341,7 +355,14 @@ pub(crate) fn describes_this_camera(record: &PendingWrite, id: &CameraIdentity) 
     }
     match (record.serial.as_deref(), id.serial.as_deref()) {
         (Some(recorded), Some(attached)) => recorded == attached,
-        _ => true,
+        // The record was written with a discriminator this observation cannot
+        // reproduce. Throwing that away and writing anyway is the one direction
+        // that cannot be taken back.
+        (Some(_), None) => false,
+        // Nothing to compare: the record was written for a camera that
+        // published no serial, which is the ordinary case on the module this
+        // was developed against.
+        (None, _) => true,
     }
 }
 
@@ -1056,19 +1077,41 @@ mod tests {
     /// The serial narrows a match but never settles one, and it is only compared
     /// when both sides have it: a record from a build that did not store one
     /// must not read as a different unit.
+    /// All four serial combinations, because the asymmetric ones are where the
+    /// safe answer differs and where two review rounds pulled opposite ways.
     #[test]
-    fn a_serial_is_compared_only_when_both_sides_publish_one() {
-        let id = identity();
+    fn a_missing_serial_never_authorises_a_write() {
+        let id = identity(); // publishes 200901010001
+        let no_serial_camera = CameraIdentity {
+            serial: None,
+            ..identity()
+        };
 
-        let mut no_serial_recorded = record_for(&id);
-        no_serial_recorded.serial = None;
-        assert!(describes_this_camera(&no_serial_recorded, &id));
+        // both present and equal -> confirmed
+        assert!(describes_this_camera(&record_for(&id), &id));
 
-        let mut different_serial = record_for(&id);
-        different_serial.serial = Some("some-other-unit".into());
+        // both present and different -> two cameras
+        let mut different = record_for(&id);
+        different.serial = Some("some-other-unit".into());
         assert!(
-            !describes_this_camera(&different_serial, &id),
+            !describes_this_camera(&different, &id),
             "two serials that disagree are two cameras"
+        );
+
+        // record has none -> nothing to compare, and the module this was built
+        // against publishes none at all
+        let mut recorded_without = record_for(&id);
+        recorded_without.serial = None;
+        assert!(describes_this_camera(&recorded_without, &id));
+        assert!(describes_this_camera(&recorded_without, &no_serial_camera));
+
+        // record HAS one and this observation does not -> evidence the record
+        // was written with cannot be reproduced, so it authorises nothing. The
+        // device path names a port, not a unit: an identical camera swapped into
+        // that port satisfies descriptor and path alike.
+        assert!(
+            !describes_this_camera(&record_for(&id), &no_serial_camera),
+            "a missing current serial must fail closed"
         );
     }
 
@@ -1146,10 +1189,19 @@ mod tests {
             filing_key(&no_serial),
             "the premise: the key really does change"
         );
+        // FOUND, but not acted on. Round 7 established that a transient serial
+        // failure must not hide the record; round 12 established that it must
+        // not authorise a write either, because the device path names a port
+        // and an identical unit could have been swapped into it. Both hold:
+        // the record is reported, and left alone until the serial reads again.
         assert_eq!(
             load(&no_serial).expect("load"),
-            Situation::Mine(Box::new(record.clone())),
-            "the record describes this camera and must be found"
+            Situation::SameModelElsewhere(Box::new(record.clone())),
+            "the record must still be found, and must not authorise a write"
+        );
+        assert!(
+            !describes_this_camera(&record, &no_serial),
+            "a serial the record has and this observation lacks is missing evidence"
         );
 
         // And the reverse: written without one, read with one.

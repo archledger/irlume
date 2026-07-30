@@ -221,10 +221,17 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 /// [`write_0600_atomic`] at a caller-chosen mode.
 ///
 /// Exists because not everything that needs the atomic, fsynced write is secret.
-/// `ir_emitter.conf` names a camera and a control number, is read by the
-/// diagnostic script, and has always been world-readable; it needed durability,
-/// not privacy, and quietly narrowing its mode while fixing that would have been
-/// an unrelated change to something a user-run script depends on.
+/// `ir_emitter.conf` names a camera and a control number; it needed durability,
+/// not privacy.
+///
+/// `mode` is a CEILING, not a guarantee: the kernel applies the process umask to
+/// a newly created file, so the result is `mode & !umask`. `irlumed.service`
+/// sets `UMask=0027`, which turns a requested 0644 into 0640 — and that is
+/// deliberately left alone, because `std::fs::write` behaved identically
+/// (`0666 & !umask` is also 0640 there) and forcing the requested bits would
+/// WIDEN permissions on machines already running. The 0600 callers are
+/// unaffected: a umask can only remove bits, and every ordinary umask removes
+/// none of those.
 pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {

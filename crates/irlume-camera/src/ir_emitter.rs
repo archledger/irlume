@@ -229,8 +229,11 @@ pub fn save_conf(
     // `commit` says it is called once the configuration is durable, and that was
     // not true of what it was called after.
     //
-    // 0644, the mode this file has always had. It names a camera and a control
-    // number, nothing secret, and the diagnostic script reads it as the user.
+    // A requested 0644, which the process umask then narrows: under the shipped
+    // `UMask=0027` the file lands at 0640, exactly as `std::fs::write` left it
+    // before this became atomic. The mode is unchanged by this commit, and the
+    // earlier comment here claiming a plain 0644 was simply wrong about the
+    // machine it runs on.
     irlume_common::write_atomic_mode(
         &path,
         format!("{} {}:{}", id.usb_id(), ctrl.unit, ctrl.selector).as_bytes(),
@@ -482,6 +485,14 @@ pub(crate) mod fake_camera {
         /// send nothing further, while a value that merely disagrees means the
         /// control still needs putting back.
         pub(crate) fail_get_cur: Option<i32>,
+        /// After this many `GET_CUR`s, the control quietly becomes this value.
+        ///
+        /// Models something OTHER than irlume writing the control mid-sequence,
+        /// which is the only way to exercise the gap between an authorising read
+        /// and the write it authorises.
+        pub(crate) change_after_gets: Option<(usize, Vec<u8>)>,
+        /// `GET_CUR`s seen so far.
+        pub(crate) gets_seen: usize,
         /// `SET_CUR`s seen so far, so `fail_set_from` can count.
         pub(crate) sets_seen: usize,
         /// Run at the instant the first `SET_CUR` is intercepted, before it is
@@ -617,6 +628,7 @@ pub(crate) mod fake_camera {
                     Ok(())
                 }
                 UVC_GET_CUR => {
+                    cam.gets_seen += 1;
                     cam.log.push(Request::Get {
                         query,
                         size: data.len(),
@@ -624,8 +636,19 @@ pub(crate) mod fake_camera {
                     if let Some(errno) = cam.fail_get_cur {
                         return Some(Err(XuError::from_errno(errno)));
                     }
+                    // Answer THIS read first, then change, so the read that
+                    // triggers the change still sees the old value.
+                    let pending = cam
+                        .change_after_gets
+                        .as_ref()
+                        .filter(|(after, _)| cam.gets_seen >= *after)
+                        .map(|(_, v)| v.clone());
                     for (slot, byte) in data.iter_mut().zip(cam.current.iter()) {
                         *slot = *byte;
+                    }
+                    if let Some(v) = pending {
+                        cam.current = v;
+                        cam.change_after_gets = None;
                     }
                     Ok(())
                 }
@@ -1955,6 +1978,39 @@ fn recover_pending_write_locked(
                 // uncounted write: exactly the loop the counter exists to stop.
                 return RecoveryOutcome::Unresolved(format!("count the attempt: {why}"));
             }
+
+            // Read the control AGAIN, immediately before writing it.
+            //
+            // The authorisation above was made before `journal::save`, which is
+            // a whole durable transaction: create, write, fsync, rename, fsync
+            // the directory, fsync its ancestors. A check made on one side of
+            // that and acted on from the other is a check-then-act with a
+            // filesystem's worth of time in the middle, and the camera lock
+            // excludes other irlume processes, not a vendor tool or another UVC
+            // client. Without this, the refusal to undo somebody else's change
+            // only covered changes made before the first GET_CUR.
+            //
+            // A syscall-sized window remains and cannot be closed here: UVC
+            // offers no compare-and-set. What is claimed is narrowed to match.
+            let attempted = match journal::from_hex(&record.attempted) {
+                Ok(bytes) => bytes,
+                Err(why) => return RecoveryOutcome::Unresolved(format!("attempted: {why}")),
+            };
+            match get_cur(fd, record.unit, record.selector, original.len()) {
+                Ok(now) if now == attempted => {}
+                Ok(now) => {
+                    return RecoveryOutcome::Unresolved(format!(
+                        "the control changed while the attempt was being recorded: it holds \
+                         {now:02x?}, not this run's value {attempted:02x?}; nothing was written"
+                    ))
+                }
+                Err(e) => {
+                    return RecoveryOutcome::Unresolved(format!(
+                        "recheck the control before restoring it: {e}"
+                    ))
+                }
+            }
+
             if let Err(e) = set_cur(fd, record.unit, record.selector, &original) {
                 return RecoveryOutcome::Unresolved(format!("restore: {e}"));
             }
@@ -3676,12 +3732,117 @@ mod tests {
             std::fs::read_to_string(&conf).expect("read"),
             format!("{} 14:10", id.usb_id())
         );
-        // The mode this file has always had: the diagnostic script reads it as
-        // the user, so making it durable must not quietly make it private.
+        // The requested mode NARROWED BY THE PROCESS UMASK, which is what
+        // actually happens. A bare 0644 assertion passed only because the test
+        // binary's umask is 0022; the daemon ships `UMask=0027`, so the real
+        // file is 0640 and this was green here while false on the machine that
+        // matters.
         use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: umask is process-global, and the env lock held by this test
+        // serialises it against every other test that touches process state.
+        let previous = unsafe { libc::umask(0o027) };
+        let masked = dir.join("masked.conf");
+        irlume_common::write_atomic_mode(&masked, b"x", 0o644).expect("write");
+        let masked_mode = std::fs::metadata(&masked)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        unsafe { libc::umask(previous) };
+        assert_eq!(
+            masked_mode, 0o640,
+            "a requested 0644 under UMask=0027 is 0640, which is what the shipped \
+             daemon has always produced"
+        );
         assert_eq!(
             std::fs::metadata(&conf).expect("stat").permissions().mode() & 0o777,
-            0o644
+            0o644 & !previous,
+            "and the config written above follows the same rule"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A control changed AFTER recovery authorised the restore is not
+    /// overwritten.
+    ///
+    /// The authorisation read happens, then the attempt counter is written and
+    /// fsynced — a create, a write, a rename and several directory syncs — and
+    /// only then the restore. Acting on the earlier read across all of that is a
+    /// check-then-act with a filesystem's worth of time in it, and the camera
+    /// lock excludes other irlume processes, not a vendor tool. So the control
+    /// is read again immediately before the write.
+    #[test]
+    fn a_control_changed_while_the_attempt_was_recorded_is_not_overwritten() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-recheck-before-restore");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        crate::emitter_journal::save(&crate::emitter_journal::PendingWrite {
+            schema_version: crate::emitter_journal::SCHEMA_VERSION,
+            engine_version: "test".into(),
+            descriptor_sha256: crate::emitter_journal::fingerprint(&id),
+            usb_id: id.usb_id(),
+            interface_number: id.interface_number,
+            unit: ms.unit_id,
+            selector,
+            len: 3,
+            original: crate::emitter_journal::to_hex(&[1, 3, 1]),
+            attempted: crate::emitter_journal::to_hex(&[1, 3, 2]),
+            restore_attempts: 0,
+            boot_id: None,
+            pid: None,
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
+        })
+        .expect("plant the record");
+
+        // Holding this run's exploratory value at the authorising read, and
+        // something else's by the time the write would happen.
+        let camera = fake_camera::Camera {
+            current: vec![1, 3, 2],
+            change_after_gets: Some((1, vec![1, 3, 3])),
+            ..a_working_camera()
+        };
+        let _fake = fake_camera::install(camera);
+
+        let outcome = recover_pending_write(-1, &id);
+        let log = fake_camera::log();
+
+        assert!(
+            matches!(outcome, RecoveryOutcome::Unresolved(ref why) if why.contains("[01, 03, 03]")),
+            "the second read must be what decides: {outcome:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "nothing may be written over a value irlume did not put there: {log:?}"
+        );
+        // And the read really did happen twice, or the guard was never reached.
+        assert!(
+            log.iter()
+                .filter(|r| matches!(
+                    r,
+                    fake_camera::Request::Get {
+                        query: UVC_GET_CUR,
+                        ..
+                    }
+                ))
+                .count()
+                >= 2,
+            "the control must be re-read immediately before the write: {log:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

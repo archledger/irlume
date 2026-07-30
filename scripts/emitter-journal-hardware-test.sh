@@ -224,8 +224,15 @@ assert "no record is left after a completed run" "still present" \
 
 echo "=== 3. the emitter config ==="
 if [ -f "$CONF" ]; then
+    # The requested 0644 narrowed by the daemon's umask. The packaged unit sets
+    # UMask=0027, so the real file is 0640; this harness starts the daemon from a
+    # shell and inherits ITS umask, so a bare "644" assertion here would pass
+    # while the shipped service produced something else. Compare against what the
+    # umask in force actually implies.
     mode=$(stat -c %a "$CONF")
-    assert "ir_emitter.conf is 0644" "$mode" test "$mode" = "644"
+    expected=$(printf "%o" $((0644 & ~$(umask))))
+    assert "ir_emitter.conf is $expected, the requested 0644 under umask $(umask)" \
+        "got $mode" test "$mode" = "$expected"
     echo "    conf: $(cat "$CONF")"
     assert "it records the camera and coordinates, not a payload" "old-style entry" \
         grep -qE '^[0-9a-f]{4}:[0-9a-f]{4} [0-9]+:[0-9]+$' "$CONF"

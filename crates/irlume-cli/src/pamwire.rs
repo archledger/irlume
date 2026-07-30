@@ -2175,7 +2175,35 @@ pub(crate) fn lock_pam() -> Result<PamLock, String> {
             ));
         }
     }
+    sweep_abandoned_scratch();
     Ok(PamLock { _file: file })
+}
+
+/// Remove scratch files a killed irlume left in `/etc/pam.d`.
+///
+/// A `SIGKILL` between creating the scratch file and renaming it skips every
+/// cleanup path, so real hardware runs that interrupt an apply leave
+/// `.sudo.irlume-new.1234.0.tmp` behind. PAM selects a stack by exact filename,
+/// so a dotfile is never read as a service and this is litter rather than a
+/// hazard — but it is irlume's litter, and it accumulates.
+///
+/// Done while holding the lock, which is what makes it safe: the name is one
+/// only this module produces, and no other irlume can be mid-write. Nothing
+/// outside that pattern is ever considered, because a cleanup that reasons about
+/// what "looks unexpected" is how a harness in this project deleted a real
+/// conffile.
+fn sweep_abandoned_scratch() {
+    let dir = std::path::Path::new("/etc/pam.d");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') && name.contains(".irlume-") && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Test-only: replace a target during the window between the first look and the

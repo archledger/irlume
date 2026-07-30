@@ -316,17 +316,36 @@ pub(crate) fn is_valid_id(id: &str) -> bool {
 /// `irlume` itself, whose entry is in `/var/lib`. A record fsynced into a
 /// directory whose name did not survive is not a record.
 fn fsync_ancestors(dir: &Path) -> Result<(), String> {
-    let mut chain: Vec<&Path> = dir
-        .ancestors()
-        .skip(1) // `dir` itself is synced by the atomic write that fills it
-        // A relative path's last ancestor is "", which names nothing.
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect();
-    chain.reverse();
-    for parent in chain {
-        fsync_dir(parent)?;
+    for parent in ancestor_chain(dir) {
+        fsync_dir(&parent)?;
     }
     Ok(())
+}
+
+/// The directories to sync above `dir`, shallowest first.
+///
+/// Separated out because the interesting case cannot be observed from outside:
+/// whether an `fsync` happened is not visible in the filesystem afterwards, so
+/// the list is what a test can actually assert on.
+fn ancestor_chain(dir: &Path) -> Vec<PathBuf> {
+    let mut chain: Vec<PathBuf> = dir
+        .ancestors()
+        .skip(1) // `dir` itself is synced by the atomic write that fills it
+        .map(|p| {
+            // A relative path's last ancestor is "", which opens nothing. The
+            // directory a relative path is anchored in is the working
+            // directory, and that is where the entry actually lives. Filtering
+            // the empty one out instead left `IRLUME_STATE_DIR=state` syncing
+            // `state` while nothing synced the `state` entry itself.
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .collect();
+    chain.reverse();
+    chain
 }
 
 /// Make a directory's own contents durable, so entries created in it survive a
@@ -515,6 +534,49 @@ mod tests {
     /// inode and passes through a moment where the file is empty; replacing by
     /// rename gives a new inode and never does. A test that only checked the
     /// final contents would pass either way.
+    /// Every directory whose entry has to survive is in the chain, shallowest
+    /// first, including the one a RELATIVE state root is anchored in.
+    ///
+    /// A directory's name lives in its parent, so syncing `state` does nothing
+    /// for the `state` entry itself; for a relative path that entry is in the
+    /// working directory. An earlier version dropped the empty last ancestor
+    /// instead of reading it as ".", which left exactly that gap. Asserted on
+    /// the list because an `fsync` leaves no trace in the filesystem to check.
+    #[test]
+    fn the_sync_chain_covers_every_directory_whose_entry_must_survive() {
+        let abs = ancestor_chain(Path::new("/var/lib/irlume/login-transactions"));
+        assert_eq!(
+            abs,
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/var"),
+                PathBuf::from("/var/lib"),
+                PathBuf::from("/var/lib/irlume"),
+            ],
+            "shallowest first, and the store itself is left to the atomic write"
+        );
+
+        // The case the filter used to lose: nothing anchored `state`.
+        let rel = ancestor_chain(Path::new("state/login-transactions"));
+        assert_eq!(rel, vec![PathBuf::from("."), PathBuf::from("state")]);
+
+        // A store directly under a relative root still names the anchor.
+        assert_eq!(
+            ancestor_chain(Path::new("login-transactions")),
+            vec![PathBuf::from(".")]
+        );
+        // Nothing in a chain may be empty: an empty path opens nothing, so a
+        // sync of it is a sync that silently did not happen.
+        for dir in ["/a/b", "a/b", "b", "/"] {
+            assert!(
+                ancestor_chain(Path::new(dir))
+                    .iter()
+                    .all(|p| !p.as_os_str().is_empty()),
+                "{dir} produced an empty entry"
+            );
+        }
+    }
+
     #[test]
     fn confirming_a_transaction_replaces_its_record_instead_of_emptying_it() {
         use std::os::unix::fs::MetadataExt as _;

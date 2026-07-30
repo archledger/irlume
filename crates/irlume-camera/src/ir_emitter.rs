@@ -32,7 +32,7 @@
 //! environment repeated that write for the life of the process. Naming a control
 //! is consent to write it; it is not consent to write to a control the camera
 //! has never said it has, and it is not consent to keep writing it forever. See
-//! [`apply_override`].
+//! `apply_override`.
 //!
 //! Approach credit: EmixamPP/linux-enable-ir-emitter (MIT) for the idea of
 //! driving the emitter from userspace. The search it uses is exactly what is no
@@ -418,7 +418,7 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 /// - `IRLUME_IR_EMITTER` is a person typing a control they got from vendor
 ///   documentation. Naming a control is consent to write it, so the unit may be
 ///   a vendor's rather than Microsoft's; it is not consent to write to a control
-///   the camera has never said it has. It goes through [`apply_override`], which
+///   the camera has never said it has. It goes through `apply_override`, which
 ///   requires the same evidence from the descriptor and the device that every
 ///   other write here requires, and is attempted at most once per camera per
 ///   process.

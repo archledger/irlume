@@ -13,15 +13,17 @@ All notable changes to irlume are documented here. This project adheres to
   camera's descriptor at all, so an arbitrary payload went to an arbitrary unit
   and selector on whichever device was open. No GUID, no check that the unit
   exists, no check that the selector is advertised, no `GET_INFO`, no length
-  bound, no read-back. That is the mechanism which destroyed the camera in
-  [#159], still reachable in 0.7.1.
+  bound, no read-back. This is the same kind of unchecked write that preceded the
+  camera in [#159] no longer enumerating on the USB bus, and it remained reachable
+  in 0.7.1. Which payload or sequence caused that camera's permanent failure was
+  never established, and nobody should establish it experimentally.
 
   Two things made it worse than a documented escape hatch. irlume advertised it:
   the hint that printed when infrared looked dark told the user to set it, which
   is precisely when someone is guessing. And it was not one write. `enable` runs
   every eighth frame of every capture, so an override in `irlumed`'s environment
-  re-sent the payload for the life of the daemon, and #159's damage came from
-  writes that kept going after the device had stopped answering.
+  re-sent the payload for the life of the daemon; in #159 the writes continued
+  after the device had stopped answering.
 
   The override still exists and may still name a vendor's unit rather than
   Microsoft's, because cameras with no Microsoft unit are the case it exists for.

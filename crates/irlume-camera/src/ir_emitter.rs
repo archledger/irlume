@@ -438,7 +438,7 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 /// sent, its result is the answer: sending a second payload to a camera that just
 /// failed to accept the first is how the search in #159 kept going.
 pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
-    let _ = card;
+    let _ = (card, device);
     match std::env::var("IRLUME_IR_EMITTER")
         .ok()
         .as_deref()
@@ -460,7 +460,7 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
     };
 
     if let Some(ctrl) = env_control() {
-        return apply_override(fd, device, &id, &ctrl);
+        return apply_override(fd, &id, &ctrl);
     }
 
     if let Some((unit, selector)) = load_conf(&id) {
@@ -583,25 +583,104 @@ pub(crate) fn override_is_published(
     Ok(())
 }
 
-type OverrideMemo = std::sync::Mutex<std::collections::HashMap<String, bool>>;
+/// Which control on which open device a decision was about.
+///
+/// Every field comes from the descriptor that will receive the ioctl. An earlier
+/// version keyed partly on the caller's `device` string, which meant the check
+/// and the record identified different objects: `enable` takes the fd and the
+/// path separately, so two calls on ONE open camera with two spellings of its
+/// path were two records and two permitted writes, and one spelling shared
+/// between two matching cameras aliased them into one.
+///
+/// `st_rdev` is the kernel's identifier for the character device behind the fd,
+/// so it cannot be spelled two ways. The USB identity and interface number come
+/// with it because a node number is reused after a replug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OverrideKey {
+    rdev: libc::dev_t,
+    interface_number: u8,
+    vid: u16,
+    pid: u16,
+    unit: u8,
+    selector: u8,
+}
 
-/// Whether the override has already been decided for one camera in this process,
-/// and what was decided.
+/// What was decided, and for which bytes.
+///
+/// The payload is kept because the decision was about it. Without it, changing
+/// `IRLUME_IR_EMITTER` to a different payload at the same unit and selector
+/// returned the cached `true`: the caller was told the value it asked for was
+/// active when the camera held different bytes, and the new payload was never
+/// length-checked or written.
+struct OverrideDecision {
+    payload: Vec<u8>,
+    applied: bool,
+}
+
+type OverrideMemo = std::sync::Mutex<std::collections::HashMap<OverrideKey, OverrideDecision>>;
+
+/// Whether the override has already been decided for one control on one open
+/// camera in this process, and what was decided.
 ///
 /// The override used to be re-sent on every [`enable`], which is every eighth
 /// frame of every capture: one variable in `irlumed`'s environment became an
-/// unbounded stream of firmware writes lasting as long as the daemon. #159's
-/// damage came from writes that kept going after the device stopped answering,
-/// so the answer is computed once and reused, including when it was a refusal or
-/// a failed write. A control that self-clears will therefore go dark rather than
-/// be re-driven; for bytes irlume cannot check, not writing again is the safer
-/// of the two failures.
+/// unbounded stream of firmware writes lasting as long as the daemon. Repeated
+/// writes are what #159 ended in, so the answer is computed once and reused,
+/// including when it was a refusal or a failed write. A control that self-clears
+/// will therefore go dark rather than be re-driven; for bytes irlume cannot
+/// check, not writing again is the safer of the two failures.
 ///
-/// Keyed on the device node together with the camera's USB id, so a different
-/// model appearing at the same node is decided afresh, and two identical modules
-/// on different nodes are decided separately. What the key cannot distinguish is
-/// the same model replugged onto the same node mid-process: that keeps the
-/// earlier answer, which errs towards not writing.
+/// What the key cannot distinguish is the same model replugged onto the same
+/// node mid-process, since the kernel may hand back the same `st_rdev`. That
+/// keeps the earlier answer, which errs towards not writing.
+/// What an existing record means for the value now being asked for.
+#[derive(Debug, PartialEq)]
+enum Reuse {
+    /// The same bytes were already decided; that answer stands.
+    Answer(bool),
+    /// The same control, different bytes. Neither answering from the record nor
+    /// writing again is right, so refuse.
+    RefuseChanged,
+    /// Nothing decided yet.
+    Decide,
+}
+
+/// Separated from the plumbing because it is the policy, and because the
+/// alternative is untestable: with no camera attached every path through
+/// `apply_override` returns false, so a test there cannot tell a stale answer
+/// from a correct refusal. Here it can.
+fn reuse(existing: Option<&OverrideDecision>, wanted: &[u8]) -> Reuse {
+    match existing {
+        None => Reuse::Decide,
+        Some(d) if d.payload == wanted => Reuse::Answer(d.applied),
+        Some(_) => Reuse::RefuseChanged,
+    }
+}
+
+/// Identify the control and the open device a decision is about.
+///
+/// `fstat` on the fd rather than the path the caller passed, so the record names
+/// the same object the ioctl will reach.
+fn override_key(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+) -> std::io::Result<OverrideKey> {
+    // SAFETY: fstat writes into `st` and borrows `fd` for the call only.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(OverrideKey {
+        rdev: st.st_rdev,
+        interface_number: id.interface_number,
+        vid: id.vid,
+        pid: id.pid,
+        unit: ctrl.unit,
+        selector: ctrl.selector,
+    })
+}
+
 fn override_memo() -> &'static OverrideMemo {
     static MEMO: std::sync::OnceLock<OverrideMemo> = std::sync::OnceLock::new();
     MEMO.get_or_init(Default::default)
@@ -623,11 +702,20 @@ fn override_memo() -> &'static OverrideMemo {
 /// already holding the payload needs no write at all.
 fn apply_override(
     fd: c_int,
-    device: &str,
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
 ) -> bool {
-    let key = format!("{device} {} {}:{}", id.usb_id(), ctrl.unit, ctrl.selector);
+    let key = match override_key(fd, id, ctrl) {
+        Ok(key) => key,
+        Err(err) => {
+            eprintln!(
+                "irlume: refusing IRLUME_IR_EMITTER={}: cannot identify the open device ({err}), \
+                 so irlume cannot tell whether this was already applied",
+                ctrl.encode()
+            );
+            return false;
+        }
+    };
 
     // ONE guard spans the lookup, the device access and the record. Taking the
     // lock twice around an unlocked middle would have made "at most once" a
@@ -653,8 +741,20 @@ fn apply_override(
             return false;
         }
     };
-    if let Some(decided) = memo.get(&key) {
-        return *decided;
+    match reuse(memo.get(&key), &ctrl.payload) {
+        Reuse::Answer(decided) => return decided,
+        Reuse::RefuseChanged => {
+            eprintln!(
+                "irlume: refusing IRLUME_IR_EMITTER={}: unit {} selector {} was already decided \
+                 this run for different bytes, and a second value is not written to a control in \
+                 one run; restart to apply it",
+                ctrl.encode(),
+                ctrl.unit,
+                ctrl.selector
+            );
+            return false;
+        }
+        Reuse::Decide => {}
     }
     let applied = match check_and_apply_override(fd, id, ctrl) {
         Ok(applied) => applied,
@@ -669,7 +769,13 @@ fn apply_override(
             false
         }
     };
-    memo.insert(key, applied);
+    memo.insert(
+        key,
+        OverrideDecision {
+            payload: ctrl.payload.clone(),
+            applied,
+        },
+    );
     applied
 }
 
@@ -680,12 +786,18 @@ fn apply_override(
 /// and it cannot be observed from outside without stopping time in the middle.
 /// Two racing threads would not do: whether the second one gets in is a question
 /// of scheduling, so it could pass while the window was wide open.
+/// Parks ONLY the thread that armed it. `cargo test` runs tests in parallel in
+/// one process, so a flag saying merely "someone is armed" would park whichever
+/// unrelated test reached this line first; that thread holds no memo lock, so
+/// the observer would see the lock free and report a race that is not there.
 #[cfg(test)]
 fn park_inside_for_test() {
     use std::sync::atomic::Ordering::SeqCst;
-    if !test_park().armed.load(SeqCst) {
+    let armed = test_park().armed.lock().unwrap_or_else(|e| e.into_inner());
+    if *armed != Some(std::thread::current().id()) {
         return;
     }
+    drop(armed);
     test_park().reached.store(true, SeqCst);
     while !test_park().release.load(SeqCst) {
         std::thread::yield_now();
@@ -695,7 +807,7 @@ fn park_inside_for_test() {
 #[cfg(test)]
 #[derive(Default)]
 struct TestPark {
-    armed: std::sync::atomic::AtomicBool,
+    armed: std::sync::Mutex<Option<std::thread::ThreadId>>,
     reached: std::sync::atomic::AtomicBool,
     release: std::sync::atomic::AtomicBool,
 }
@@ -2026,6 +2138,7 @@ mod tests {
     /// happen with no descriptor read at all.
     #[test]
     fn an_unpublished_unit_is_refused_without_reaching_the_device() {
+        let _g = env_guard();
         let asus = identity(0x3277, 0x0059);
         assert_eq!(
             check_and_apply_override(-1, &asus, &ctrl(3, 1, vec![255])),
@@ -2051,6 +2164,7 @@ mod tests {
     /// verdict IS the proof that nothing was sent.
     #[test]
     fn a_camera_that_will_not_answer_is_not_written_to() {
+        let _g = env_guard();
         let asus = identity(0x3277, 0x0059);
         let f = non_uvc_fd();
         use std::os::fd::AsRawFd;
@@ -2101,6 +2215,84 @@ mod tests {
         );
     }
 
+    /// The record has to name the same object the check did, and the bytes it
+    /// was about.
+    ///
+    /// Both found in review of this PR. The key was built from the caller's
+    /// `device` string, so two spellings of one open camera were two records and
+    /// two permitted writes; and it omitted the payload, so changing
+    /// `IRLUME_IR_EMITTER` to different bytes at the same control returned the
+    /// cached `true` for a value that was never length-checked or written.
+    #[test]
+    fn the_record_identifies_the_open_device_and_the_bytes_it_decided() {
+        use std::os::fd::AsRawFd;
+        let id = identity(0x3277, 0x0059);
+        let a = non_uvc_fd();
+        let b = non_uvc_fd();
+
+        // Two OPENS of the same device node. The path string is not consulted at
+        // all now, and both fds carry the same st_rdev, so they are one record.
+        let ka = override_key(a.as_raw_fd(), &id, &ctrl(14, 6, vec![1; 9])).unwrap();
+        let kb = override_key(b.as_raw_fd(), &id, &ctrl(14, 6, vec![1; 9])).unwrap();
+        assert_eq!(ka, kb, "the same device reached twice must be one record");
+
+        // Two DIFFERENT devices must not share a record, or one camera's
+        // decision would suppress the check on another. This is the assertion
+        // that fails if the key stops coming from the fd: with the old
+        // caller-string key, one path spelling shared between two cameras
+        // aliased them, and a constant would alias every camera.
+        let other = std::fs::File::open("/dev/zero").expect("open /dev/zero");
+        let kz = override_key(other.as_raw_fd(), &id, &ctrl(14, 6, vec![1; 9])).unwrap();
+        assert_ne!(
+            ka, kz,
+            "two different devices were recorded as the same camera"
+        );
+
+        // A different control on the same camera is a different record.
+        let kc = override_key(a.as_raw_fd(), &id, &ctrl(14, 9, vec![1; 9])).unwrap();
+        assert_ne!(ka, kc);
+
+        // The payload is NOT part of the key: the same control decided for
+        // different bytes must find the earlier decision, so it can refuse
+        // rather than silently report the old answer for new bytes.
+        let kd = override_key(a.as_raw_fd(), &id, &ctrl(14, 6, vec![2; 9])).unwrap();
+        assert_eq!(ka, kd);
+
+        // A closed fd cannot be identified, and that refuses rather than
+        // guessing a key that would let a write through unrecorded.
+        assert!(override_key(-1, &id, &ctrl(14, 6, vec![1; 9])).is_err());
+    }
+
+    /// Asking for different bytes at a control already decided this run is
+    /// refused, not answered from the record.
+    ///
+    /// The case that matters is a recorded SUCCESS: reusing it would tell the
+    /// caller the bytes it just asked for are active on a camera holding
+    /// different ones, having never length-checked them. It is asserted here
+    /// rather than through `apply_override` because with no camera attached
+    /// every path through that function returns false, so the stale answer and
+    /// the correct refusal would be indistinguishable.
+    #[test]
+    fn changing_the_override_does_not_report_the_earlier_answer() {
+        let applied = OverrideDecision {
+            payload: vec![1, 3, 2],
+            applied: true,
+        };
+        assert_eq!(reuse(Some(&applied), &[1, 3, 2]), Reuse::Answer(true));
+        assert_eq!(reuse(Some(&applied), &[1, 3, 1]), Reuse::RefuseChanged);
+        // A shorter prefix is not the same bytes either.
+        assert_eq!(reuse(Some(&applied), &[1, 3]), Reuse::RefuseChanged);
+        assert_eq!(reuse(None, &[1, 3, 2]), Reuse::Decide);
+
+        // A recorded refusal is reused just as firmly: retrying it every capture
+        // is what the limiter exists to stop.
+        let refused = OverrideDecision {
+            payload: vec![1, 3, 2],
+            applied: false,
+        };
+        assert_eq!(reuse(Some(&refused), &[1, 3, 2]), Reuse::Answer(false));
+    }
+
     /// "At most once per camera" has to survive two callers, or it describes
     /// only the happy path.
     ///
@@ -2119,20 +2311,30 @@ mod tests {
     fn the_write_record_is_locked_across_the_device_access() {
         use std::sync::atomic::Ordering::SeqCst;
 
-        let parked = std::thread::spawn(|| {
-            test_park().armed.store(true, SeqCst);
+        let f = non_uvc_fd();
+        let fd = {
+            use std::os::fd::AsRawFd;
+            f.as_raw_fd()
+        };
+        let parked = std::thread::spawn(move || {
+            *test_park().armed.lock().unwrap() = Some(std::thread::current().id());
             // Through `apply_override`, because the lock it takes is the thing
-            // under test. Unit 3 is not published, so the gate refuses before
+            // under test. Unit 30 is not published, so the gate refuses before
             // any ioctl; what matters is only that the caller got INSIDE.
-            apply_override(
-                -1,
-                "/dev/irlume-test-locking",
-                &identity(0x3277, 0x0059),
-                &ctrl(3, 1, vec![255]),
-            )
+            // These coordinates are this test's alone: the memo is global, and a
+            // control another test already decided would return from the record
+            // without entering the gate at all.
+            apply_override(fd, &identity(0x3277, 0x0059), &ctrl(30, 31, vec![255]))
         });
 
+        // Bounded, because a caller that never arrives is a failure to report
+        // rather than a suite that hangs with no output.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !test_park().reached.load(SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked caller never entered the gate"
+            );
             std::thread::yield_now();
         }
         // The parked caller is between the lookup and the record. Anyone else
@@ -2140,8 +2342,8 @@ mod tests {
         let held = override_memo().try_lock().is_err();
 
         test_park().release.store(true, SeqCst);
-        test_park().armed.store(false, SeqCst);
         let _ = parked.join();
+        *test_park().armed.lock().unwrap() = None;
         test_park().reached.store(false, SeqCst);
         test_park().release.store(false, SeqCst);
 

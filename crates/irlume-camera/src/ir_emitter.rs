@@ -1173,6 +1173,92 @@ impl std::fmt::Display for DiscoveryError {
     }
 }
 
+/// Which signal asked the current run to stop, or 0.
+static ABORT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The whole signal handler. Storing to a lock-free atomic is one of the very
+/// few things a handler may do; putting the camera back is not, so that happens
+/// on the normal return path where syscalls, locks and allocation are allowed.
+extern "C" fn note_abort_signal(signum: c_int) {
+    ABORT_SIGNAL.store(signum, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a fatal signal arrived during this discovery run.
+///
+/// Polled by the measurement closure, which is the only part of discovery that
+/// blocks for any length of time. Returning `None` from it aborts the run
+/// through the ordinary restore path.
+pub fn abort_requested() -> bool {
+    ABORT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0
+}
+
+/// Turns a fatal signal arriving mid-discovery into an orderly abort, then lets
+/// it kill the process as it was going to.
+///
+/// Without this, a `systemd` stop or a watchdog SIGTERM during `ir-setup`
+/// terminates the daemon on the default disposition: no unwinding, so no `Drop`
+/// runs, so the control stays changed. The undo record still covers that case,
+/// but it covers it at the NEXT capture, which is minutes or a reboot away. This
+/// closes it now for every signal that can actually be caught.
+///
+/// Installed without `SA_RESTART` on purpose: the blocking `VIDIOC_DQBUF` in the
+/// measurement loop then fails with `EINTR` instead of resuming, so the abort is
+/// noticed in milliseconds rather than at the end of a frame burst.
+///
+/// `SIGKILL` and a power loss are exactly the cases a handler cannot reach. They
+/// are the record's job.
+pub struct AbortOnSignal {
+    saved: Vec<(c_int, libc::sigaction)>,
+}
+
+impl AbortOnSignal {
+    /// Catch the fatal signals for the caller's scope.
+    ///
+    /// Best-effort: a signal whose disposition cannot be changed is skipped
+    /// rather than failing the run, because the record covers it and refusing to
+    /// set up a camera over a `sigaction` failure helps nobody.
+    pub fn install() -> Self {
+        ABORT_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut saved = Vec::new();
+        for signum in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: `action` is fully initialised below before use, and
+            // `note_abort_signal` touches nothing but one lock-free atomic.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = note_abort_signal as *const () as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                action.sa_flags = 0; // no SA_RESTART: let the frame dequeue fail with EINTR
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(signum, &action, &mut previous) == 0 {
+                    saved.push((signum, previous));
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for AbortOnSignal {
+    fn drop(&mut self) {
+        for (signum, previous) in &self.saved {
+            // SAFETY: `previous` is what sigaction handed back for this signal.
+            unsafe {
+                libc::sigaction(*signum, previous, std::ptr::null_mut());
+            }
+        }
+        // The signal was caught to get the camera put back, not to ignore it.
+        // The original disposition is restored above, so re-raising now does
+        // whatever would have happened had this guard never existed.
+        let pending = ABORT_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if pending != 0 {
+            // SAFETY: raising a signal at its restored disposition.
+            unsafe {
+                libc::raise(pending);
+            }
+        }
+    }
+}
+
 /// Holds the undo data for an exploratory write for as long as the control is
 /// not known to be back where it was found.
 ///
@@ -1252,6 +1338,7 @@ impl ExploratoryWrite {
     fn confirm_restored(&mut self) -> Result<(), String> {
         let now = get_cur(self.fd, self.unit, self.selector, self.original.len())
             .map_err(|e| format!("read the control back: {e}"))?;
+        crate::emitter_journal::trace(&format!("read back {now:02x?}"));
         if now != self.original {
             return Err(format!(
                 "the control reads {:02x?} after being restored to {:02x?}",
@@ -2085,6 +2172,56 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caught signal must set the flag the measurement loop polls, and the
+    /// guard must hand the signal back to whatever disposition it displaced.
+    ///
+    /// SIGINT is set to SIG_IGN around the whole test, so the re-raise on drop
+    /// is a no-op instead of killing the test binary. That also makes the
+    /// restore assertion real: SIG_IGN is what must come back.
+    #[test]
+    fn a_caught_signal_is_noted_and_then_handed_back() {
+        // Signal dispositions are process-global, like the environment, so this
+        // contends on the same lock rather than racing the tests that flip env
+        // vars while this one is swapping handlers.
+        let _lock = crate::testenv::env_lock();
+
+        // SAFETY: every sigaction below is fully initialised before use.
+        unsafe {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignore.sa_mask);
+            let mut before: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGINT, &ignore, &mut before), 0);
+
+            {
+                let _guard = AbortOnSignal::install();
+                assert!(!abort_requested(), "nothing raised yet");
+                assert_eq!(libc::raise(libc::SIGINT), 0);
+                assert!(
+                    abort_requested(),
+                    "the handler must record the signal for the measurement loop to see"
+                );
+            } // drop restores SIG_IGN, then re-raises into it
+
+            let mut after: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGINT, std::ptr::null(), &mut after),
+                0
+            );
+            assert_eq!(
+                after.sa_sigaction,
+                libc::SIG_IGN,
+                "the guard must put the previous disposition back"
+            );
+            assert!(
+                !abort_requested(),
+                "the flag must not leak into the next run"
+            );
+
+            libc::sigaction(libc::SIGINT, &before, std::ptr::null_mut());
+        }
+    }
 
     #[test]
     fn encode_parse_roundtrip() {

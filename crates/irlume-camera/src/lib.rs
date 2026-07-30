@@ -2195,6 +2195,10 @@ pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Res
 /// anything changed can be undone.
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
+    // Declared first, so it is dropped LAST: the guard that puts the control
+    // back lives inside `discover` (or inside `found` on the success path) and
+    // has to finish before this re-raises the signal that stops the process.
+    let _abort_orderly = ir_emitter::AbortOnSignal::install();
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix);
@@ -2216,6 +2220,13 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // the daemon killed before the control it changed was restored. A fix for a
     // hang is not worth a race with systemd.
     let mut measure = || -> Option<f32> {
+        // A stop signal aborts through the same path a dead stream does, which
+        // is the path that puts the control back. The measurement loop is the
+        // only part of discovery that blocks for any length of time, so this is
+        // where the abort has to be noticed.
+        if ir_emitter::abort_requested() {
+            return None;
+        }
         // Frames already in flight were captured before the control changed, and
         // taking the brightest of the burst makes one stale frame decide the
         // answer. Discard a stream's worth before believing anything.

@@ -163,6 +163,24 @@ impl PendingWrite {
     }
 }
 
+/// Trace a journal event onto the same stream `set_cur` traces writes to.
+///
+/// The ordering claims this module makes — record before the first write,
+/// attempt counted before the restore, record dropped only after the read-back —
+/// are sequences of side effects, and a test that inspects the filesystem
+/// afterwards cannot see any of them: the record's whole job is to be gone by
+/// the end. Interleaving these lines with the `SET_CUR` lines makes the order an
+/// observation rather than a reading of the control flow.
+///
+/// `IRLUME_LOG_EMITTER_WRITES` is the same switch, deliberately: someone
+/// debugging what irlume sent their camera wants the undo record in the same
+/// transcript, in order.
+pub(crate) fn trace(event: &str) {
+    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+        eprintln!("irlume: journal {event}");
+    }
+}
+
 /// Where journal records live. One file per camera, under the state root.
 ///
 /// A directory rather than a single file because a machine can have more than
@@ -361,12 +379,20 @@ pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
     let body = serde_json::to_string(record).map_err(|e| format!("serialize record: {e}"))?;
     irlume_common::write_0600_atomic(&path, body.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))?;
+    // After the fsync, so a line here means the record is durable — which is the
+    // property the ordering depends on, not merely that a write was issued.
+    trace(&format!(
+        "saved unit{}/sel{} original={} attempts={}",
+        record.unit, record.selector, record.original, record.restore_attempts
+    ));
     Ok(path)
 }
 
 /// Remove a record whose control is confirmed back where it was found.
 pub(crate) fn clear(descriptor_sha256: &str) -> Result<(), String> {
-    irlume_common::remove_durable(&record_path(descriptor_sha256))
+    irlume_common::remove_durable(&record_path(descriptor_sha256))?;
+    trace("cleared");
+    Ok(())
 }
 
 /// Lowercase hex, the encoding the record stores control bytes in.

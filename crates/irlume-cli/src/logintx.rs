@@ -219,11 +219,30 @@ impl Transaction {
     /// returning, which the ordering needs and the old code never did: bytes
     /// still in the page cache when the machine loses power are not a record,
     /// and "written before the first PAM write" only means something if it is
-    /// durable before the first PAM write.
+    /// durable before the first PAM write. The store directory's own entry is
+    /// synced too, on the run that creates it, for the same reason.
     pub(crate) fn save(&self) -> Result<PathBuf, String> {
         let dir = store_dir();
+        let store_is_new = !dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         restrict(&dir, 0o700)?;
+        // Creating the store is itself a directory entry that has to survive a
+        // power loss, and `create_dir_all` does not make one durable.
+        // `write_0600_atomic` fsyncs the record and the directory holding it,
+        // but on the first run of a fresh install the entry for that directory
+        // is still only in its parent's page cache: the record could be fsynced
+        // into a directory that does not come back. PAM is rewritten
+        // immediately afterwards, so the machine would again be left changed
+        // with nothing describing how to undo it — the same defect as the
+        // truncate above, one level up.
+        //
+        // Only on creation: an fsync of the parent on every save would cost two
+        // per apply to re-prove something already durable.
+        if store_is_new {
+            if let Some(parent) = dir.parent() {
+                fsync_dir(parent)?;
+            }
+        }
         let path = dir.join(format!("{}.json", self.id));
         let body = serde_json::to_string(self).map_err(|e| format!("serialize record: {e}"))?;
         // The temp is created 0600 and renamed over the path, so the record is
@@ -282,6 +301,18 @@ pub(crate) enum LoadFailure {
 /// `..` or a `/` makes the id invalid, it does not get stripped out.
 pub(crate) fn is_valid_id(id: &str) -> bool {
     id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Make a directory's own contents durable, so entries created in it survive a
+/// power loss.
+///
+/// `fsync(2)` is explicit that syncing a file does not necessarily persist the
+/// directory entry naming it; the directory has to be synced too. Opening a
+/// directory read-only and syncing that descriptor is the way to do it.
+fn fsync_dir(dir: &Path) -> Result<(), String> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("fsync {}: {e}", dir.display()))
 }
 
 fn restrict(path: &Path, mode: u32) -> Result<(), String> {

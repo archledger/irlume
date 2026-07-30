@@ -363,7 +363,12 @@ Three properties a consumer may rely on:
 - `sequence` starts at zero and increments by one with no gaps, so a lost line
   is detected by arithmetic rather than by timeout;
 - exactly one event has `terminal` true, and it is the last, so a reader knows
-  when to stop without waiting;
+  when to stop without waiting. **A stream that ends without one means the
+  producer died**: it was killed, lost power, or hit a signal it could not
+  handle. Treat end-of-file as terminal as well, because a reader that waits for
+  the flag alone will wait forever. Verified: killing the command mid-stream
+  leaves the lines already emitted and no terminal event, which is the only
+  honest thing a dead process can do;
 - `operation_id` is identical on every line of one invocation.
 
 `reason` is one of `granted`, `not-live`, or `no-match`, derived from `granted`

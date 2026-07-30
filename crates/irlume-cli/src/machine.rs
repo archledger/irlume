@@ -1295,7 +1295,16 @@ pub fn login_apply(args: &[String]) -> ExitCode {
     // The scopes match what `apply` planned: this command wires the greeter and
     // lock screen, and never sudo or polkit, which are their own opt-in.
     if failed.is_empty() {
-        crate::pamwire::write_wired_marker(enable, false, false, enable);
+        // Only the scopes this command is responsible for. `login apply` wires
+        // the greeter and the lock screen and never touches sudo or polkit, so
+        // it must not overwrite their flags: a machine `enable` on a host where
+        // someone had opted into face-polkit would otherwise record
+        // with_polkit=false and reconcile would quietly stop maintaining it.
+        //
+        // On disable the marker goes entirely, because a disable unwires every
+        // surface including those two.
+        let (with_sudo, with_polkit, _) = crate::pamwire::read_wired_marker().unwrap_or_default();
+        crate::pamwire::write_wired_marker(enable, with_sudo, with_polkit, enable);
     }
     let changes: Vec<Value> = applied
         .iter()

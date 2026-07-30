@@ -237,7 +237,7 @@ pub(crate) fn write_wired_marker(
 
 /// Re-read the marker's recorded flags. Returns `None` when login was never
 /// enabled (no marker), so reconcile does nothing on machines that opted out.
-fn read_wired_marker() -> Option<(bool, bool, bool)> {
+pub(crate) fn read_wired_marker() -> Option<(bool, bool, bool)> {
     let path = wired_marker_path();
     // In production (default state dir) the marker must be root-owned: reconcile
     // acts on its with_sudo flag as root, so a marker a non-root user could plant

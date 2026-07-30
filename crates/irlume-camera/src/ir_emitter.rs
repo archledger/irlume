@@ -371,6 +371,33 @@ impl std::fmt::Display for XuError {
 type XuResult<T> = std::result::Result<T, XuError>;
 
 fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> XuResult<()> {
+    // Every read is traced HERE, not in `get_of`, because `get_len` and
+    // `get_info` have fixed widths and call this directly. The trace used to sit
+    // in `get_of` under a comment calling it "the single choke point for every
+    // READ", which was simply untrue: the two queries the ordering claim is
+    // ABOUT were the two it could not see. A hardware run produced a transcript
+    // with no GET_LEN in it at all, which is what caught it. The unit tests
+    // could not: the stand-in camera intercepts at this level and sees
+    // everything either way.
+    //
+    // `SET_CUR` is left to `set_cur`, which prints the payload bytes, so each
+    // ioctl appears exactly once and the order can be read straight off.
+    if query != UVC_SET_CUR && std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+        let name = match query {
+            UVC_GET_CUR => "GET_CUR",
+            UVC_GET_LEN => "GET_LEN",
+            UVC_GET_INFO => "GET_INFO",
+            UVC_GET_DEF => "GET_DEF",
+            UVC_GET_MIN => "GET_MIN",
+            UVC_GET_MAX => "GET_MAX",
+            UVC_GET_RES => "GET_RES",
+            other => &format!("GET_{other:#04x}"),
+        };
+        eprintln!(
+            "irlume: {name} unit{unit}/sel{selector} size={}",
+            data.len()
+        );
+    }
     // A test may stand in for the camera here. Every read and every write in
     // this module funnels through this one call, so a fake installed here can
     // drive the whole discovery sequence, record the exact order of requests,
@@ -613,29 +640,10 @@ fn get_info(fd: c_int, unit: u8, selector: u8) -> XuResult<u8> {
     Ok(buf[0])
 }
 
-/// The single choke point for every READ of a control.
-///
-/// Traced under the same switch as the writes, and with the transfer SIZE,
-/// because the size is the part that can be wrong. Recovery must size `GET_CUR`
-/// from the length the attached camera just reported and not from the record,
-/// and that is an ordering between two ioctls: it leaves nothing behind for a
-/// test to inspect, and this crate cannot reach any of it without a camera. A
-/// transcript that shows `GET_LEN` answering 3 and then `GET_CUR size=3` is the
-/// evidence. A mutant that removes the check survives the whole unit suite.
+/// Read `size` bytes from a control. Sized reads only; `get_len` and `get_info`
+/// have fixed widths and go straight to [`xu_query`], which is where the tracing
+/// lives precisely because of that.
 fn get_of(fd: c_int, unit: u8, selector: u8, query: u8, size: usize) -> XuResult<Vec<u8>> {
-    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
-        let name = match query {
-            UVC_GET_CUR => "GET_CUR",
-            UVC_GET_LEN => "GET_LEN",
-            UVC_GET_INFO => "GET_INFO",
-            UVC_GET_DEF => "GET_DEF",
-            UVC_GET_MIN => "GET_MIN",
-            UVC_GET_MAX => "GET_MAX",
-            UVC_GET_RES => "GET_RES",
-            _ => "GET_?",
-        };
-        eprintln!("irlume: {name} unit{unit}/sel{selector} size={size}");
-    }
     let mut buf = vec![0u8; size];
     xu_query(fd, unit, selector, query, &mut buf)?;
     Ok(buf)

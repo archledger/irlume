@@ -146,6 +146,19 @@ pub(crate) enum TransactionStatus {
     Prepared,
     /// Every surface was written and its after-state recorded.
     Applied,
+    /// A status this build does not know, written by a newer engine.
+    ///
+    /// Present for the same reason `OperationErrorCode::Unknown` is: without it
+    /// serde fails the whole document, and an older engine meeting a newer
+    /// record could not read it AT ALL. That matters more here than elsewhere,
+    /// because the record is the recovery path: refusing to parse it would take
+    /// away the one thing that says how to undo a change.
+    ///
+    /// Treated as conservatively as `Prepared`: this build cannot know what
+    /// guarantees the newer status carries, so a rollback needs the same
+    /// explicit acknowledgement.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Hex sha256 of a byte slice.

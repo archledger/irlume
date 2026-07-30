@@ -1072,6 +1072,32 @@ pub(crate) fn apply(
             // it per surface narrows that window to the gap between this check
             // and this write, which is as tight as it gets without holding a
             // lock nothing else in the system takes.
+            // A symlinked surface is refused rather than written. write_atomic
+            // renames over the path, which REPLACES the link with a regular
+            // file, and a rollback restores content rather than the link, so the
+            // conversion is silent and permanent. Writing through the link
+            // instead is no better: on Fedora these point into /etc/authselect
+            // and on Debian into /etc/alternatives, both shared targets that
+            // other tooling owns. Neither choice is irlume's to make quietly.
+            if path.is_symlink() {
+                out.push(AppliedSurface {
+                    id: service_name(svc.etc),
+                    role,
+                    path: svc.etc.to_string(),
+                    change: PlannedChange::NotInstalled,
+                    before: None,
+                    before_metadata: None,
+                    sidecar_before: None,
+                    sidecar_metadata: None,
+                    sidecar_existed: false,
+                    after_sha256: crate::logintx::ABSENT.to_string(),
+                    error: Some(format!(
+                        "{} is a symlink; irlume will not replace it or write through it",
+                        svc.etc
+                    )),
+                });
+                return;
+            }
             let planned_state = expected
                 .iter()
                 .find(|candidate| candidate.id == service_name(svc.etc))

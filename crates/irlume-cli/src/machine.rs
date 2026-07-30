@@ -1183,7 +1183,9 @@ pub fn login_verify(args: &[String]) -> ExitCode {
         Ok(record) => record,
         Err(reason) => return emit_load_failure(COMMAND, reason, contract),
     };
-    let unconfirmed = record.status == crate::logintx::TransactionStatus::Prepared;
+    // Unknown is a status a newer engine wrote. This build cannot know what it
+    // guarantees, so it is treated as cautiously as an unconfirmed one.
+    let unconfirmed = !matches!(record.status, crate::logintx::TransactionStatus::Applied);
     let (surfaces, drifted) = verify_surfaces(&record);
     emit(
         &success(
@@ -1196,7 +1198,14 @@ pub fn login_verify(args: &[String]) -> ExitCode {
                 // stopped between persisting the before-states and recording the
                 // result. The before-states are still usable, the after-digests
                 // are not, so drift is not meaningful for such a record.
-                "status": if unconfirmed { "prepared" } else { "applied" },
+                // Reported as it is, not folded into "prepared": a consumer
+                // meeting `unknown` is looking at a record from a newer engine,
+                // which is a different thing to diagnose than an interrupted one.
+                "status": match record.status {
+                    crate::logintx::TransactionStatus::Applied => "applied",
+                    crate::logintx::TransactionStatus::Prepared => "prepared",
+                    crate::logintx::TransactionStatus::Unknown => "unknown",
+                },
                 "surfaces": surfaces,
                 "drifted": drifted,
                 // Whether a rollback would be accepted right now. Stated by the
@@ -1267,7 +1276,7 @@ pub fn login_rollback(args: &[String]) -> ExitCode {
     // still the authority, so a restore IS possible, but it gives up the
     // protection against reverting somebody else's later edit. That trade is the
     // operator's to make, not something to do silently.
-    if record.status == crate::logintx::TransactionStatus::Prepared {
+    if !matches!(record.status, crate::logintx::TransactionStatus::Applied) {
         if !accept_unconfirmed {
             irlume_common::dlog!(
                 "login.rollback: {} is unconfirmed; needs --accept-unconfirmed",

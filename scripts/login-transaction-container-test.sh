@@ -124,6 +124,23 @@ echo "=== 9. a record is root-only ==="
 perms=$(stat -c %a "$IRLUME_STATE_DIR/login-transactions/$tx.json" 2>/dev/null)
 assert "record is 0600" "got $perms" test "$perms" = "600"
 
+echo "=== 10. confirming a record replaces it rather than emptying it ==="
+# A transaction is saved twice: Prepared before the first PAM write, Applied
+# after. `save` used to truncate the record in place, so the second save emptied
+# the only description of the previous PAM contents and then wrote into it; a
+# failure in that window left a rewritten machine with nothing to roll back
+# from. It now writes a temp beside the record and renames, so what survives on
+# the real store path is checked here: every record is complete, and no temp is
+# left behind for a later read to find.
+store="$IRLUME_STATE_DIR/login-transactions"
+strays=$(find "$store" -type f ! -name '*.json' 2>/dev/null | wc -l)
+assert "no temp files left in the store" "found $strays" test "$strays" -eq 0
+for r in "$store"/*.json; do
+    assert "record $(basename "$r") is not empty" "zero bytes" test -s "$r"
+    assert "record $(basename "$r") ends as complete JSON" "truncated" \
+        grep -q '}$' "$r"
+done
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -189,36 +189,50 @@ pub(crate) fn file_sha256(path: &Path) -> Result<Option<String>, String> {
 pub(crate) const ABSENT: &str = "absent";
 
 impl Transaction {
-    /// Persist the record, root-readable only.
+    /// Persist the record, root-readable only, replacing any earlier version of
+    /// it atomically and durably.
     ///
     /// Written before the caller reports success. A transaction that changed
     /// files but could not be recorded is worse than one that did not run: the
     /// change is on disk with nothing describing how to undo it, so the write
     /// failing is an error the caller must surface.
+    ///
+    /// # Why this cannot open the record and truncate it
+    ///
+    /// A transaction is saved twice: `Prepared` before the first PAM write, then
+    /// `Applied` after. The point of that ordering is that the before-states
+    /// reach disk while the files are still untouched, so a crash mid-apply
+    /// leaves something that says how to get back.
+    ///
+    /// This used to open the same path with `truncate(true)`. The second save
+    /// therefore destroyed the prepared record as its FIRST act, and wrote the
+    /// confirmed one into the emptied file. Between those two moments the files
+    /// had already changed and the only description of their previous contents
+    /// was gone; an ENOSPC, an EIO or a kill in that window left a machine whose
+    /// PAM stack had been rewritten with nothing at all to roll back from. The
+    /// write-ahead ordering was defeated by the write that was supposed to
+    /// confirm it.
+    ///
+    /// Writing a temp file in the same directory and renaming means the record
+    /// is only ever the prepared one or the confirmed one, never neither.
+    /// `write_0600_atomic` also `fsync`s the file and its directory before
+    /// returning, which the ordering needs and the old code never did: bytes
+    /// still in the page cache when the machine loses power are not a record,
+    /// and "written before the first PAM write" only means something if it is
+    /// durable before the first PAM write.
     pub(crate) fn save(&self) -> Result<PathBuf, String> {
         let dir = store_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         restrict(&dir, 0o700)?;
         let path = dir.join(format!("{}.json", self.id));
         let body = serde_json::to_string(self).map_err(|e| format!("serialize record: {e}"))?;
-        // Created 0600 rather than created-then-chmodded. Between a default-mode
-        // create and a later chmod there is a window, however brief, where the
-        // record is readable by anyone the umask allows, and it describes exactly
-        // how this machine authenticates.
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
-        file.write_all(body.as_bytes())
+        // The temp is created 0600 and renamed over the path, so the record is
+        // never briefly readable by anyone the umask allows, and it does not
+        // inherit the mode of a record an earlier run left behind: the inode is
+        // a fresh one every time. Same helper as `envelope.rs` and
+        // `template_key.rs`, which store material of the same sensitivity.
+        irlume_common::write_0600_atomic(&path, body.as_bytes())
             .map_err(|e| format!("write {}: {e}", path.display()))?;
-        // An existing record from an earlier run keeps its old mode through
-        // OpenOptions, so the mode is asserted either way.
-        restrict(&path, 0o600)?;
         Ok(path)
     }
 
@@ -376,6 +390,79 @@ mod tests {
         let path = tx.save().expect("save");
         assert!(path.exists());
         assert_eq!(Transaction::load(&tx.id).expect("load"), tx);
+        unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Confirming a transaction must never be able to destroy the record that
+    /// says how to undo it.
+    ///
+    /// A transaction is saved twice: `Prepared` before the first PAM write, then
+    /// `Applied` after. `save` used to open the same path with `truncate(true)`,
+    /// so the second save emptied the prepared record as its first act and then
+    /// wrote the confirmed one into it. In that window the PAM files had already
+    /// changed and nothing on disk described their previous contents, so an
+    /// ENOSPC, an EIO or a kill left a rewritten machine with nothing to roll
+    /// back from. The write that was meant to confirm the write-ahead ordering
+    /// was the write that defeated it.
+    ///
+    /// Asserted on the INODE, because that is what distinguishes the two
+    /// mechanisms rather than describing them. Truncating in place keeps the
+    /// inode and passes through a moment where the file is empty; replacing by
+    /// rename gives a new inode and never does. A test that only checked the
+    /// final contents would pass either way.
+    #[test]
+    fn confirming_a_transaction_replaces_its_record_instead_of_emptying_it() {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = env_lock();
+        let root = temp_state("atomic");
+        // SAFETY: single-threaded test, restored below.
+        unsafe { std::env::set_var("IRLUME_STATE_DIR", &root) };
+
+        let mut tx = Transaction {
+            id: "abcdef0123456789abcdef0123456789".into(),
+            status: TransactionStatus::Prepared,
+            action: "enable".into(),
+            plan_id: "1".repeat(32),
+            engine_version: "0.0.0".into(),
+            surfaces: vec![record(
+                Path::new("/etc/pam.d/plasmalogin"),
+                Some("the only copy of what was there before\n"),
+                "deadbeef",
+            )],
+        };
+        let path = tx.save().expect("save prepared");
+        let prepared_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        // The second save, the one that happens after PAM has been rewritten.
+        tx.status = TransactionStatus::Applied;
+        tx.save().expect("save applied");
+        let applied_inode = std::fs::metadata(&path).expect("stat").ino();
+
+        assert_ne!(
+            prepared_inode, applied_inode,
+            "the record was rewritten in place, so confirming it passes through a \
+             moment where the before-states are gone"
+        );
+        assert_eq!(
+            Transaction::load(&tx.id).expect("load").status,
+            TransactionStatus::Applied
+        );
+        // The replacement is a fresh inode, so it must carry the mode itself
+        // rather than inheriting the previous record's.
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the replacement must not widen the record");
+
+        // A temp left behind in the store would be a second, stale description
+        // of how the machine authenticates.
+        let strays: Vec<_> = std::fs::read_dir(store_dir())
+            .expect("read store")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n != "abcdef0123456789abcdef0123456789.json")
+            .collect();
+        assert!(strays.is_empty(), "stray files in the store: {strays:?}");
+
         unsafe { std::env::remove_var("IRLUME_STATE_DIR") };
         let _ = std::fs::remove_dir_all(&root);
     }

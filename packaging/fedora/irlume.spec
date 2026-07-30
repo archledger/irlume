@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.7.1
+Version:        0.7.2
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -210,6 +210,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Thu Jul 30 2026 archledger <archledger236@gmail.com> - 0.7.2-1
+- IRLUME_IR_EMITTER is checked against the camera's descriptor before any write
+- Login transactions in the machine API: plan, apply, verify, rollback
+- IR frames are classified by the camera's illumination flag, not by brightness
+
 * Wed Jul 29 2026 archledger <archledger236@gmail.com> - 0.7.1-1
 - Security: irlume no longer searches for an IR-emitter control by writing
   guessed values to UVC extension units. That search destroyed a reporter's

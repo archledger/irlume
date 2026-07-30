@@ -5,7 +5,34 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-30
+
+Fixes a camera-firmware hazard present in 0.7.1. Please upgrade.
+
+### Added
+
+- **A login transaction the desktop can carry out, confirm and undo.**
+  `irlume login plan|apply|verify|rollback --json` lets an integration make one
+  specific PAM change, check it landed, and put back exactly what was there
+  before. A record is written before the first PAM write and confirmed after, so
+  a crash mid-apply leaves something that says how to get back; rollback restores
+  only while every file is still exactly as apply left it, and refuses rather
+  than reverting an edit the transaction never made. Every irlume path that
+  changes PAM now holds one lock for the whole operation, writes durably, and
+  refuses a PAM path that is a symlink or has more than one hard link. Closes
+  [#108].
+
+- **`auth-test-events`**: `irlume auth test --events=jsonl` streams whether the
+  claimed account's live face matches its own enrolment, as newline-delimited
+  JSON. Verification against one account, never identification, and it releases
+  nothing.
+
+- **`login-plan-json`**: what `login enable` or `login disable` would change,
+  without changing anything.
+
 ### Fixed
+
+- **`IRLUME_IR_EMITTER` wrote to the camera with none of the checks 0.7.1 added.**
 
 - **`IRLUME_IR_EMITTER` wrote to the camera with none of the checks 0.7.1 added.**
   0.7.1 stopped irlume guessing its way around a camera's extension units, but
@@ -48,6 +75,37 @@ All notable changes to irlume are documented here. This project adheres to
   publishes.
 
 [#179]: https://github.com/archledger/irlume/issues/179
+
+- **Infrared frames were called lit by guessing from brightness.** irlume averaged
+  pixels against a fixed threshold of 40 out of 255. Measured on an ASUS Hello
+  module across 2160 stationary frames, exactly one configuration makes that
+  threshold correct: sitting close to the camera without glasses. At arm's length,
+  or simply wearing glasses without moving, every emitter-off frame was
+  misclassified. irlume now reads the camera's own illumination flag, the one
+  Microsoft's UVC extension publishes per frame, instead of inferring it. Closes
+  [#167].
+
+- **Six checks reported success having checked nothing.** One theme in six places:
+  a zero-match, zero-iteration or zero-sample case indistinguishable from a clean
+  pass — a conformance run that attempted nothing and exited 0, a set comparison
+  where no line carried the field, a `zip()` over an empty side. Each was proved
+  by reproducing the failure first. Closes [#161], [#162], [#163], [#164], [#165]
+  and [#166].
+
+- **A CI lane could select tests by name and run none of them.** `cargo test
+  <names>` exits 0 when the filter matches nothing, so a renamed test turned a
+  lane into a green no-op, and the coverage jobs were vulnerable the same way.
+  Closes [#158].
+
+[#108]: https://github.com/archledger/irlume/issues/108
+[#158]: https://github.com/archledger/irlume/issues/158
+[#161]: https://github.com/archledger/irlume/issues/161
+[#162]: https://github.com/archledger/irlume/issues/162
+[#163]: https://github.com/archledger/irlume/issues/163
+[#164]: https://github.com/archledger/irlume/issues/164
+[#165]: https://github.com/archledger/irlume/issues/165
+[#166]: https://github.com/archledger/irlume/issues/166
+[#167]: https://github.com/archledger/irlume/issues/167
 
 ## [0.7.1] - 2026-07-29
 
@@ -1475,7 +1533,8 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/archledger/irlume/releases/tag/v0.7.2
 [0.7.0]: https://github.com/archledger/irlume/releases/tag/v0.7.0
 [0.6.1]: https://github.com/archledger/irlume/releases/tag/v0.6.1
 [0.6.0]: https://github.com/archledger/irlume/releases/tag/v0.6.0

@@ -497,13 +497,32 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
 
     // Identity comes from the descriptor that will receive the write, not from a
     // path that could point somewhere else by the time the ioctl runs.
-    let Ok(id) = crate::uvc_descriptor::identity_from_fd(fd) else {
-        // The override used to be applied before this point, so a camera whose
-        // descriptors could not be read was still written to. It is now the
-        // first thing every path needs, including the override: without the
-        // descriptor there is no evidence about anything, and #159 is what
-        // writing without evidence costs.
-        return false;
+    //
+    // The override used to be applied before this point, so a camera whose
+    // descriptors could not be read was still written to. It is now the first
+    // thing every path needs, including the override: without the descriptor
+    // there is no evidence about anything, and #159 is what writing without
+    // evidence costs.
+    let id = match crate::uvc_descriptor::identity_from_fd(fd) {
+        Ok(id) => id,
+        Err(err) => {
+            // Someone who set the variable is owed the reason. Failing silently
+            // here reads as "applied, and the camera is dark", which is the
+            // reading every other refusal in this file exists to prevent. The
+            // automatic paths stay quiet: no one asked for them, and a camera
+            // with no readable descriptor is the ordinary case for a device
+            // irlume does not drive.
+            if let Some(ctrl) = &wanted {
+                eprintln!(
+                    "irlume: refusing IRLUME_IR_EMITTER={}: could not read the open camera's USB \
+                     descriptors ({err}), so unit {} selector {} cannot be checked against them",
+                    ctrl.encode(),
+                    ctrl.unit,
+                    ctrl.selector
+                );
+            }
+            return false;
+        }
     };
 
     if let Some(ctrl) = wanted {
@@ -733,8 +752,14 @@ fn override_memo() -> &'static OverrideMemo {
     MEMO.get_or_init(Default::default)
 }
 
-/// Apply an `IRLUME_IR_EMITTER` override, once per camera per process, and only
-/// with the evidence every other write here requires.
+/// Apply an `IRLUME_IR_EMITTER` override, writing at most once per control per
+/// camera per process, and only with the evidence every other write here
+/// requires.
+///
+/// The record bounds the WRITES. It is not used as an answer about the camera's
+/// present state: a remembered success re-reads `GET_CUR` and reports whether
+/// the control still holds the payload, because "we wrote this once" and "this
+/// is set now" stop being the same statement the moment a camera resets.
 ///
 /// The override is still an escape hatch: the unit may be a vendor's, and the
 /// bytes are the person's rather than the camera's own `GET_DEF`. What it no
@@ -789,7 +814,29 @@ fn apply_override(
         }
     };
     match reuse(memo.get(&key), &ctrl.payload) {
-        Reuse::Answer(decided) => return decided,
+        // A remembered refusal stands: re-running the checks every capture is
+        // the traffic the record exists to stop, and the answer is "no" either
+        // way.
+        Reuse::Answer(false) => return false,
+        // A remembered SUCCESS is not repeated back. It says a write happened,
+        // which is not the same as the control holding that value now, and the
+        // gap between them is real: a camera that resets or re-enumerates can
+        // land on the same device number with the same USB id and interface, and
+        // returning the old `true` would claim an emitter is lit on a control
+        // nothing has set. Callers use this answer to decide whether to tell the
+        // user their infrared is dark.
+        //
+        // So the record is used for what it is good for, which is not writing
+        // again, and the current state is read rather than assumed. If the
+        // control has drifted, the honest answer is that the emitter is not on;
+        // writing it back would be the second write this whole change exists to
+        // prevent.
+        Reuse::Answer(true) => {
+            return match get_cur(fd, ctrl.unit, ctrl.selector, ctrl.payload.len()) {
+                Ok(current) => current == ctrl.payload,
+                Err(_) => false,
+            }
+        }
         Reuse::RefuseChanged => {
             eprintln!(
                 "irlume: refusing IRLUME_IR_EMITTER={}: unit {} selector {} was already decided \
@@ -2261,6 +2308,50 @@ mod tests {
         assert_eq!(
             sent, 0,
             "an override was sent to a device whose descriptors were never read"
+        );
+    }
+
+    /// A remembered success is not repeated back as an answer about the camera.
+    ///
+    /// Found in review of this PR. "We wrote this once" and "the control holds
+    /// this now" stop being the same statement when a camera resets or
+    /// re-enumerates onto the same device number with the same USB id, and
+    /// callers use this answer to decide whether to tell the user their
+    /// infrared is dark. The record still bounds the writes; it is just not
+    /// consulted for present state.
+    ///
+    /// Asserted by seeding a success and then asking on a device that cannot
+    /// answer `GET_CUR`. Returning the cached `true` fails this.
+    #[test]
+    fn a_remembered_success_is_rechecked_against_the_camera() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let _g = env_guard();
+        let f = non_uvc_fd();
+        let id = identity(0x3277, 0x0059);
+        // Coordinates this test alone uses: the record is process-global.
+        let c = ctrl(20, 21, vec![1, 3, 2]);
+        let key = override_key(f.as_raw_fd(), &id, &c).unwrap();
+        override_memo().lock().unwrap().insert(
+            key,
+            OverrideDecision {
+                payload: c.payload.clone(),
+                applied: true,
+            },
+        );
+
+        let before = writes_attempted().load(SeqCst);
+        let answer = apply_override(f.as_raw_fd(), &id, &c);
+        assert_eq!(
+            writes_attempted().load(SeqCst),
+            before,
+            "re-checking must not write"
+        );
+        assert!(
+            !answer,
+            "a camera that cannot answer GET_CUR must not be reported as lit \
+             on the strength of an earlier write"
         );
     }
 

@@ -498,9 +498,6 @@ mod tests {
         assert!(extension_units_for_interface(&buf, 0).is_empty());
     }
 
-    /// Every descriptor in the real chain must be consumed exactly, with no
-    /// trailing slop, or the walk is mis-stepping through the buffer.
-    #[test]
     /// The recorded device path is the kernel's own `DEVPATH`, leading slash and
     /// all.
     ///
@@ -526,6 +523,8 @@ mod tests {
         );
     }
 
+    /// Every descriptor in the real chain must be consumed exactly, with no
+    /// trailing slop, or the walk is mis-stepping through the buffer.
     #[test]
     fn the_walk_consumes_the_whole_real_descriptor_chain() {
         let mut i = 0usize;

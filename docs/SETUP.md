@@ -251,13 +251,28 @@ reporter's camera ([#159]). It is now only ever run when you ask for it.
 To see exactly what irlume sends to the camera, set `IRLUME_LOG_EMITTER_WRITES=1`
 and it prints each emitter write before making it.
 
-If your camera documents a control that irlume cannot discover, set it yourself:
+If your camera's vendor documents a control that irlume cannot discover, set it
+yourself:
 
 ```sh
 IRLUME_IR_EMITTER=unit:selector:b,b,b
 ```
 
+These bytes go to your camera's firmware. Use a value the vendor documents; do
+not try numbers to see what happens, which is what destroyed the camera in
+[#159].
+
+The unit may be a vendor's rather than Microsoft's, since this exists for
+cameras with no Microsoft unit at all. Before writing anything, irlume checks
+the camera's USB descriptor publishes that unit and advertises that selector,
+that `GET_INFO` says the control accepts a write, that the payload is the length
+`GET_LEN` states, and that `GET_CUR` answers. If any of those fails it refuses
+and prints which one. The value is applied at most once per camera per run of
+the process: before 0.7.2 it was re-sent every eighth frame of every capture,
+with none of these checks ([#179]).
+
 [#159]: https://github.com/archledger/irlume/issues/159
+[#179]: https://github.com/archledger/irlume/issues/179
 
 ## Optional third-party liveness models
 
@@ -318,7 +333,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` |
 | `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |
 | `IRLUME_RGB_DEVICE` / `IRLUME_IR_DEVICE` | camera-pair override; both must be set | auto |
-| `IRLUME_IR_EMITTER` | emitter control override: `off`, or `unit:selector:b,b,..` (decimal or `0x` hex bytes); bypasses `ir_emitter.conf` | conf, else known-module table |
+| `IRLUME_IR_EMITTER` | emitter control override: `off`, or `unit:selector:b,b,..` (decimal or `0x` hex bytes); writes to camera firmware, checked against the descriptor first, applied once per camera per process; bypasses `ir_emitter.conf` | conf, else known-module table |
 | `IRLUME_IR_EMITTER_CONF` | alternate path for `ir_emitter.conf` | `/var/lib/irlume/ir_emitter.conf` |
 | `IRLUME_RGB_MOIRE_MAX` | per-camera ceiling for the screen-replay moiré cue | 28 |
 | `IRLUME_IR_AMBIENT_SUBTRACT` | `1` enables experimental lit-minus-ambient IR subtraction; changes the IR frames the matcher sees, so re-enroll after toggling (see [ARCHITECTURE.md](ARCHITECTURE.md)) | off |

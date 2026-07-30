@@ -1473,11 +1473,20 @@ impl IrSession<'_> {
         // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
         // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
         // don't have a table entry for. Guide the user to configure it.
+        //
+        // This used to say "run `linux-enable-ir-emitter configure`, then set
+        // IRLUME_IR_EMITTER=unit:sel:b,b,...". That tool finds a control by
+        // writing invented payloads across units and selectors until the picture
+        // brightens, which is precisely the search irlume removed from its own
+        // code after it destroyed a reporter's camera (#159). Deleting the search
+        // here and then telling the user to go and run it somewhere else is not a
+        // fix. `irlume ir-setup` does the same job from the camera's own
+        // descriptor and its own GET_DEF values.
         if !lit && (0.0..IR_DARK_HINT_MAX).contains(&best_mean) {
             eprintln!(
-                "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter; for an \
-             external Hello camera run `linux-enable-ir-emitter configure`, then set \
-             IRLUME_IR_EMITTER=unit:sel:b,b,... (or IRLUME_IR_EMITTER=off to silence)"
+                "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter; \
+             run `sudo irlume ir-setup` to find this camera's emitter control from what it \
+             publishes (IRLUME_IR_EMITTER=off silences this)"
             );
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;

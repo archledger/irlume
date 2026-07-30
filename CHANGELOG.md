@@ -5,6 +5,41 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **`IRLUME_IR_EMITTER` wrote to the camera with none of the checks 0.7.1 added.**
+  0.7.1 stopped irlume guessing its way around a camera's extension units, but
+  left one path exempt: the override applied its bytes before irlume had read the
+  camera's descriptor at all, so an arbitrary payload went to an arbitrary unit
+  and selector on whichever device was open. No GUID, no check that the unit
+  exists, no check that the selector is advertised, no `GET_INFO`, no length
+  bound, no read-back. That is the mechanism which destroyed the camera in
+  [#159], still reachable in 0.7.1.
+
+  Two things made it worse than a documented escape hatch. irlume advertised it:
+  the hint that printed when infrared looked dark told the user to set it, which
+  is precisely when someone is guessing. And it was not one write. `enable` runs
+  every eighth frame of every capture, so an override in `irlumed`'s environment
+  re-sent the payload for the life of the daemon, and #159's damage came from
+  writes that kept going after the device had stopped answering.
+
+  The override still exists and may still name a vendor's unit rather than
+  Microsoft's, because cameras with no Microsoft unit are the case it exists for.
+  It is no longer exempt. The camera's descriptor must publish that unit and
+  advertise that selector, `GET_INFO` must say the control accepts a write,
+  `GET_LEN` must agree with the payload's length, and `GET_CUR` must answer;
+  irlume refuses and says which check failed otherwise. It is applied at most once
+  per camera per process, and not at all if the control already holds the value.
+  Reported as [#179].
+
+  The dark-infrared hint told users to run `linux-enable-ir-emitter configure`.
+  That tool finds a control by writing invented payloads until the picture
+  brightens, which is the search irlume removed from its own code after [#159].
+  It now points at `sudo irlume ir-setup`, which works from what the camera
+  publishes.
+
+[#179]: https://github.com/archledger/irlume/issues/179
+
 ## [0.7.1] - 2026-07-29
 
 Security release. Please upgrade.

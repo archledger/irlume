@@ -20,9 +20,19 @@
 //!   value to write from the camera's own answers about that control.
 //!
 //! Precedence for [`enable`]: `IRLUME_IR_EMITTER=off` disables; an explicit
-//! `IRLUME_IR_EMITTER=unit:sel:b,b,...` is applied as given, because a person
-//! typing a vendor-documented control is consent; otherwise the persisted config
-//! or the built-in table, both of which must pass the descriptor check.
+//! `IRLUME_IR_EMITTER=unit:sel:b,b,...` supplies the bytes and may name a
+//! vendor's unit rather than Microsoft's, because a person reading vendor
+//! documentation is the case it exists for; otherwise the persisted config or
+//! the built-in table.
+//!
+//! **Every one of those passes the descriptor check.** The override used to
+//! skip it: it was written before identity was even read, so arbitrary bytes
+//! went to an arbitrary unit on whichever device was open, and because [`enable`]
+//! runs every eighth frame of every capture, one variable in the daemon's
+//! environment repeated that write for the life of the process. Naming a control
+//! is consent to write it; it is not consent to write to a control the camera
+//! has never said it has, and it is not consent to keep writing it forever. See
+//! [`apply_override`].
 //!
 //! Approach credit: EmixamPP/linux-enable-ir-emitter (MIT) for the idea of
 //! driving the emitter from userspace. The search it uses is exactly what is no
@@ -366,8 +376,24 @@ fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}");
     }
+    #[cfg(test)]
+    writes_attempted().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut data = payload.to_vec();
     xu_query(fd, unit, selector, UVC_SET_CUR, &mut data)
+}
+
+/// Counts every write this module attempts, so a test can assert that a path
+/// sent NOTHING to the camera.
+///
+/// A returned `false` cannot make that claim: a refused write and a write the
+/// device rejected are both `false`, and the whole of #179 was a path that
+/// looked like the second while being the first. Counting at the single choke
+/// point makes "no ioctl reached the device" an assertion rather than a reading
+/// of the control flow.
+#[cfg(test)]
+fn writes_attempted() -> &'static std::sync::atomic::AtomicUsize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &N
 }
 
 /// `GET_INFO` says the control accepts `SET_CUR` and is not currently disabled.
@@ -390,9 +416,12 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 /// Three kinds of control reach here and they are not trusted equally:
 ///
 /// - `IRLUME_IR_EMITTER` is a person typing a control they got from vendor
-///   documentation. That is consent, and it is applied as given, because
-///   requiring it to be a Microsoft control would defeat the point of an escape
-///   hatch for vendor-documented hardware.
+///   documentation. Naming a control is consent to write it, so the unit may be
+///   a vendor's rather than Microsoft's; it is not consent to write to a control
+///   the camera has never said it has. It goes through [`apply_override`], which
+///   requires the same evidence from the descriptor and the device that every
+///   other write here requires, and is attempted at most once per camera per
+///   process.
 /// - A control `ir-setup` recorded is applied by re-reading the camera's own
 ///   default for it. The file stores coordinates, never a payload, so the bytes
 ///   written are the device's and are checked the same way discovery checks
@@ -401,15 +430,15 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 ///   validated against that exact USB product rather than a value read from a
 ///   file that anything could have written.
 ///
-/// The last two must also name a control the attached camera's descriptor says
-/// it implements.
+/// All three must name a control the attached camera's descriptor says it
+/// implements.
 ///
 /// At most one write is attempted. Selection falls through only when a candidate
 /// fails validation, which happens before any ioctl. Once a `SET_CUR` has been
 /// sent, its result is the answer: sending a second payload to a camera that just
 /// failed to accept the first is how the search in #159 kept going.
 pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
-    let _ = (card, device);
+    let _ = card;
     match std::env::var("IRLUME_IR_EMITTER")
         .ok()
         .as_deref()
@@ -418,15 +447,21 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
         Some("off") | Some("none") => return false,
         _ => {}
     }
-    if let Some(ctrl) = env_control() {
-        return set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload).is_ok();
-    }
 
     // Identity comes from the descriptor that will receive the write, not from a
     // path that could point somewhere else by the time the ioctl runs.
     let Ok(id) = crate::uvc_descriptor::identity_from_fd(fd) else {
+        // The override used to be applied before this point, so a camera whose
+        // descriptors could not be read was still written to. It is now the
+        // first thing every path needs, including the override: without the
+        // descriptor there is no evidence about anything, and #159 is what
+        // writing without evidence costs.
         return false;
     };
+
+    if let Some(ctrl) = env_control() {
+        return apply_override(fd, device, &id, &ctrl);
+    }
 
     if let Some((unit, selector)) = load_conf(&id) {
         let recorded = EmitterControl {
@@ -443,6 +478,233 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> bool {
         Some(ctrl) => apply_known_payload(fd, &ctrl).is_ok(),
         None => false,
     }
+}
+
+/// Why an `IRLUME_IR_EMITTER` override was not written to the camera.
+///
+/// Each variant names something the camera itself failed to say, so the message
+/// can tell the person who set the variable which claim was not backed up rather
+/// than leaving them to conclude the value was wrong and try another one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverrideRefusal {
+    /// The USB descriptor has no extension unit with that id.
+    NoSuchUnit { unit: u8, seen: Vec<u8> },
+    /// The unit exists but its `bmControls` does not advertise that selector.
+    NotAdvertised { unit: u8, selector: u8 },
+    /// `GET_INFO` says the control does not accept a write right now.
+    WriteNotAccepted { unit: u8, selector: u8, info: u8 },
+    /// `GET_LEN` disagrees with how many bytes the override supplies.
+    WrongLength {
+        unit: u8,
+        selector: u8,
+        wants: usize,
+        given: usize,
+    },
+    /// A request the descriptor says the control answers went unanswered, so the
+    /// control is not demonstrably the one the documentation described.
+    Unreadable {
+        unit: u8,
+        selector: u8,
+        err: XuError,
+    },
+}
+
+impl std::fmt::Display for OverrideRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchUnit { unit, seen } => write!(
+                f,
+                "this camera publishes no extension unit {unit} (it has units {seen:?})"
+            ),
+            Self::NotAdvertised { unit, selector } => write!(
+                f,
+                "unit {unit} does not advertise selector {selector} in its descriptor"
+            ),
+            Self::WriteNotAccepted {
+                unit,
+                selector,
+                info,
+            } => write!(
+                f,
+                "unit {unit} selector {selector} reports capabilities {info:#04x}, \
+                 which does not accept a write right now"
+            ),
+            Self::WrongLength {
+                unit,
+                selector,
+                wants,
+                given,
+            } => write!(
+                f,
+                "unit {unit} selector {selector} takes {wants} bytes, not the {given} given"
+            ),
+            Self::Unreadable {
+                unit,
+                selector,
+                err,
+            } => write!(
+                f,
+                "unit {unit} selector {selector} did not answer a request its own descriptor \
+                 says it implements ({err})"
+            ),
+        }
+    }
+}
+
+/// The descriptor half of the override's gate: the named unit must exist on this
+/// camera and advertise the named selector.
+///
+/// This is what separates a control someone read out of vendor documentation
+/// from a coordinate they guessed. It deliberately does NOT require Microsoft's
+/// camera-control GUID, which [`control_is_documented`] does: the override
+/// exists for cameras that have no Microsoft unit, so requiring one would leave
+/// it reachable only where discovery already works. A vendor unit that publishes
+/// a selector has stated the control is there. What #159 destroyed a camera by
+/// doing was writing to units and selectors nothing had published at all.
+///
+/// Pure, given an identity, so every refusal is tested without a camera.
+pub(crate) fn override_is_published(
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+) -> std::result::Result<(), OverrideRefusal> {
+    let units = id.extension_units();
+    let Some(unit) = units.iter().find(|u| u.unit_id == ctrl.unit) else {
+        return Err(OverrideRefusal::NoSuchUnit {
+            unit: ctrl.unit,
+            seen: units.iter().map(|u| u.unit_id).collect(),
+        });
+    };
+    if !unit.advertises(ctrl.selector) {
+        return Err(OverrideRefusal::NotAdvertised {
+            unit: ctrl.unit,
+            selector: ctrl.selector,
+        });
+    }
+    Ok(())
+}
+
+type OverrideMemo = std::sync::Mutex<std::collections::HashMap<String, bool>>;
+
+/// Whether the override has already been decided for one camera in this process,
+/// and what was decided.
+///
+/// The override used to be re-sent on every [`enable`], which is every eighth
+/// frame of every capture: one variable in `irlumed`'s environment became an
+/// unbounded stream of firmware writes lasting as long as the daemon. #159's
+/// damage came from writes that kept going after the device stopped answering,
+/// so the answer is computed once and reused, including when it was a refusal or
+/// a failed write. A control that self-clears will therefore go dark rather than
+/// be re-driven; for bytes irlume cannot check, not writing again is the safer
+/// of the two failures.
+///
+/// Keyed on the device node together with the camera's USB id, so a different
+/// model appearing at the same node is decided afresh, and two identical modules
+/// on different nodes are decided separately. What the key cannot distinguish is
+/// the same model replugged onto the same node mid-process: that keeps the
+/// earlier answer, which errs towards not writing.
+fn override_memo() -> &'static OverrideMemo {
+    static MEMO: std::sync::OnceLock<OverrideMemo> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// Apply an `IRLUME_IR_EMITTER` override, once per camera per process, and only
+/// with the evidence every other write here requires.
+///
+/// The override is still an escape hatch: the unit may be a vendor's, and the
+/// bytes are the person's rather than the camera's own `GET_DEF`. What it no
+/// longer is, is exempt. Before anything is sent, the descriptor has to publish
+/// the unit and the selector, `GET_INFO` has to say a write is accepted now, the
+/// payload has to be the length `GET_LEN` states, and `GET_CUR` has to answer.
+///
+/// The current value is read for two reasons and neither is a restore: this
+/// function's purpose is to leave the emitter lit, so it deliberately does not
+/// put the control back. It is read because a control that cannot be read is not
+/// demonstrably the control the documentation described, and because a control
+/// already holding the payload needs no write at all.
+fn apply_override(
+    fd: c_int,
+    device: &str,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+) -> bool {
+    let key = format!("{device} {} {}:{}", id.usb_id(), ctrl.unit, ctrl.selector);
+    if let Ok(memo) = override_memo().lock() {
+        if let Some(decided) = memo.get(&key) {
+            return *decided;
+        }
+    }
+    let applied = match check_and_apply_override(fd, id, ctrl) {
+        Ok(applied) => applied,
+        Err(why) => {
+            // Silence here would read as "the value was applied and the camera
+            // is simply dark", which is the reading that sends someone back to
+            // try another unit and selector.
+            eprintln!(
+                "irlume: refusing IRLUME_IR_EMITTER={}: {why}",
+                ctrl.encode()
+            );
+            false
+        }
+    };
+    if let Ok(mut memo) = override_memo().lock() {
+        memo.insert(key, applied);
+    }
+    applied
+}
+
+/// The gate itself, separated from the memo and the message so a test can assert
+/// on the reason rather than on a bare `false`.
+fn check_and_apply_override(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+) -> std::result::Result<bool, OverrideRefusal> {
+    // First, and before the fd is touched at all: a unit this camera does not
+    // publish is refused without a single ioctl reaching the device.
+    override_is_published(id, ctrl)?;
+
+    let (unit, selector) = (ctrl.unit, ctrl.selector);
+    // Every query failure below is reported the same way for the reason
+    // `DiscoveryError::Unresponsive` collapses its two cases: the selector was
+    // just confirmed as advertised, so a failure is the camera contradicting its
+    // own descriptor, and uvcvideo's errnos cannot separate a healthy refusal
+    // from a device in trouble. Either way nothing further is sent.
+    let info = get_info(fd, unit, selector).map_err(|err| OverrideRefusal::Unreadable {
+        unit,
+        selector,
+        err,
+    })?;
+    if !info_allows_set(info) {
+        return Err(OverrideRefusal::WriteNotAccepted {
+            unit,
+            selector,
+            info,
+        });
+    }
+    let len = get_len(fd, unit, selector).map_err(|err| OverrideRefusal::Unreadable {
+        unit,
+        selector,
+        err,
+    })?;
+    if len != ctrl.payload.len() {
+        return Err(OverrideRefusal::WrongLength {
+            unit,
+            selector,
+            wants: len,
+            given: ctrl.payload.len(),
+        });
+    }
+    let current = get_cur(fd, unit, selector, len).map_err(|err| OverrideRefusal::Unreadable {
+        unit,
+        selector,
+        err,
+    })?;
+    if current == ctrl.payload {
+        // Already holding what the override asks for. Reporting success is
+        // accurate and costs the camera nothing.
+        return Ok(true);
+    }
+    Ok(set_cur(fd, unit, selector, &ctrl.payload).is_ok())
 }
 
 /// Apply a validated built-in payload, with the same gate every other automatic
@@ -550,11 +812,18 @@ impl std::fmt::Display for DiscoveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Descriptors(e) => write!(f, "could not read the camera's USB descriptors: {e}"),
+            // This names the escape hatch, so it also has to say what setting it
+            // does. "set IRLUME_IR_EMITTER=unit:selector:bytes" reads like a
+            // configuration key, and it prints when IR is dark, which is exactly
+            // when someone is willing to try numbers. The bytes go to firmware.
             Self::NoMicrosoftXu { seen } => write!(
                 f,
                 "this camera has no Microsoft camera-control extension unit (found units {seen:?}), \
                  so irlume has no documented way to drive its emitter. If the vendor documents a \
-                 control, set IRLUME_IR_EMITTER=unit:selector:bytes"
+                 control for it, IRLUME_IR_EMITTER=unit:selector:bytes sends those bytes to the \
+                 camera's firmware; irlume checks the camera publishes that control before writing, \
+                 but the bytes themselves are yours. Do not try numbers to see what happens: that is \
+                 what left one reporter's camera unable to enumerate at all (#159)"
             ),
             Self::NoUsableControl { unit, tried } => write!(
                 f,
@@ -1626,6 +1895,218 @@ mod tests {
         assert!(
             ir_torch_default_is_usable(&torch(2, 100), &torch(1, 10), &max, &torch(0, 1)).is_err()
         );
+    }
+
+    // --- the IRLUME_IR_EMITTER override's gate (#179) ------------------------
+
+    fn ctrl(unit: u8, selector: u8, payload: Vec<u8>) -> EmitterControl {
+        EmitterControl {
+            unit,
+            selector,
+            payload,
+        }
+    }
+
+    /// The override may address a VENDOR unit, which is the whole reason it
+    /// exists: the message that advertises it prints when a camera has no
+    /// Microsoft unit at all. What it may not address is a unit or selector the
+    /// camera never published.
+    #[test]
+    fn the_override_accepts_a_vendor_unit_but_only_one_the_camera_publishes() {
+        let asus = identity(0x3277, 0x0059);
+
+        // Unit 10 on this camera's VideoControl interface is a vendor unit, not
+        // Microsoft's, and its descriptor advertises selectors 10 and 11.
+        let vendor = ctrl(10, 11, vec![1]);
+        assert_eq!(override_is_published(&asus, &vendor), Ok(()));
+        // The automatic paths still refuse it, and that difference is the point:
+        // a vendor control is reachable only when a person names it.
+        assert!(
+            !control_is_documented(&asus, &vendor),
+            "a vendor unit must never be written without someone naming it"
+        );
+
+        // Microsoft's own unit is equally acceptable when named.
+        assert_eq!(
+            override_is_published(&asus, &ctrl(14, 6, vec![1; 9])),
+            Ok(())
+        );
+
+        // A selector that unit does not advertise. Unit 14 publishes 6 and 9;
+        // IR Torch (10) is not implemented on this module.
+        assert_eq!(
+            override_is_published(&asus, &ctrl(14, 10, vec![0; 4])),
+            Err(OverrideRefusal::NotAdvertised {
+                unit: 14,
+                selector: 10
+            })
+        );
+
+        // Unit 4 exists on the OTHER VideoControl function of the same physical
+        // camera and advertises selector 10 there. Unit numbers are not
+        // addresses, so from this interface it does not exist.
+        assert_eq!(
+            override_is_published(&asus, &ctrl(4, 10, vec![0; 4])),
+            Err(OverrideRefusal::NoSuchUnit {
+                unit: 4,
+                seen: vec![11, 10, 14]
+            })
+        );
+
+        // The shape someone types when they are guessing.
+        assert!(matches!(
+            override_is_published(&asus, &ctrl(3, 1, vec![255])),
+            Err(OverrideRefusal::NoSuchUnit { .. })
+        ));
+    }
+
+    /// The descriptor gate runs BEFORE the file descriptor is touched.
+    ///
+    /// Proved with an fd that cannot serve any ioctl: -1 is never a valid
+    /// descriptor, so if `get_info` ran first this would come back `Unreadable`.
+    /// Getting `NoSuchUnit` out of it is the ordering, not a restatement of the
+    /// previous test. This is the property #179 was about: the write used to
+    /// happen with no descriptor read at all.
+    #[test]
+    fn an_unpublished_unit_is_refused_without_reaching_the_device() {
+        let asus = identity(0x3277, 0x0059);
+        assert_eq!(
+            check_and_apply_override(-1, &asus, &ctrl(3, 1, vec![255])),
+            Err(OverrideRefusal::NoSuchUnit {
+                unit: 3,
+                seen: vec![11, 10, 14]
+            })
+        );
+        assert_eq!(
+            check_and_apply_override(-1, &asus, &ctrl(14, 10, vec![0; 4])),
+            Err(OverrideRefusal::NotAdvertised {
+                unit: 14,
+                selector: 10
+            })
+        );
+    }
+
+    /// A published control on a descriptor that answers nothing is refused at
+    /// the first query, so no `SET_CUR` is reached.
+    ///
+    /// `Unreadable` is only constructible before the write: the write is the
+    /// last expression in the function and its result is an `Ok`. So this
+    /// verdict IS the proof that nothing was sent.
+    #[test]
+    fn a_camera_that_will_not_answer_is_not_written_to() {
+        let asus = identity(0x3277, 0x0059);
+        let f = non_uvc_fd();
+        use std::os::fd::AsRawFd;
+        assert!(matches!(
+            check_and_apply_override(
+                f.as_raw_fd(),
+                &asus,
+                &ctrl(14, 6, vec![1, 3, 2, 0, 0, 0, 0, 0, 0])
+            ),
+            Err(OverrideRefusal::Unreadable {
+                unit: 14,
+                selector: 6,
+                ..
+            })
+        ));
+    }
+
+    /// **The regression test for #179 itself.**
+    ///
+    /// A set override on a device whose descriptors cannot be read must send
+    /// nothing. The old code applied the override at the top of `enable`, before
+    /// `identity_from_fd` was ever called, so this same call wrote nine bytes to
+    /// unit 14 selector 6 of whatever `/dev/null` happened to be.
+    ///
+    /// Asserted on the write COUNT, not on the return value: both versions
+    /// return false here, one because it refused and one because the device
+    /// rejected what it was sent. Reintroducing the early return makes this fail.
+    ///
+    /// The counter is process-global; `env_guard` serialises this against the
+    /// other tests that could reach a write, and the assertion is on the delta.
+    #[test]
+    fn a_set_override_writes_nothing_when_the_descriptor_cannot_be_read() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let _g = env_guard();
+        let f = non_uvc_fd();
+        std::env::set_var("IRLUME_IR_EMITTER", "14:6:1,3,2,0,0,0,0,0,0");
+        let before = writes_attempted().load(SeqCst);
+        let applied = enable(f.as_raw_fd(), "ASUS FHD webcam", "/dev/irlume-test-missing");
+        let sent = writes_attempted().load(SeqCst) - before;
+        std::env::remove_var("IRLUME_IR_EMITTER");
+
+        assert!(!applied);
+        assert_eq!(
+            sent, 0,
+            "an override was sent to a device whose descriptors were never read"
+        );
+    }
+
+    /// Every refusal has to name the control, or the person who set the variable
+    /// cannot tell which of their two numbers the camera disputed.
+    #[test]
+    fn every_refusal_says_which_control_and_why() {
+        for (refusal, must_contain) in [
+            (
+                OverrideRefusal::NoSuchUnit {
+                    unit: 3,
+                    seen: vec![11, 10, 14],
+                },
+                vec!["3", "11, 10, 14"],
+            ),
+            (
+                OverrideRefusal::NotAdvertised {
+                    unit: 14,
+                    selector: 10,
+                },
+                vec!["14", "10", "advertise"],
+            ),
+            (
+                OverrideRefusal::WriteNotAccepted {
+                    unit: 14,
+                    selector: 6,
+                    info: 0x01,
+                },
+                vec!["14", "6", "0x01"],
+            ),
+            (
+                OverrideRefusal::WrongLength {
+                    unit: 14,
+                    selector: 6,
+                    wants: 9,
+                    given: 3,
+                },
+                vec!["14", "6", "9 bytes", "3 given"],
+            ),
+            (
+                OverrideRefusal::Unreadable {
+                    unit: 14,
+                    selector: 6,
+                    err: XuError::Unresponsive(libc::ETIMEDOUT),
+                },
+                vec!["14", "6", "did not answer"],
+            ),
+        ] {
+            let msg = refusal.to_string();
+            for needle in must_contain {
+                assert!(
+                    msg.contains(needle),
+                    "{refusal:?} message missing {needle:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The onboarding hint prints when IR is dark, which is when someone is most
+    /// willing to try numbers, so it has to say the bytes reach firmware.
+    #[test]
+    fn the_hint_that_offers_the_override_says_what_it_writes_to() {
+        let msg = DiscoveryError::NoMicrosoftXu { seen: vec![1, 2] }.to_string();
+        assert!(msg.contains("IRLUME_IR_EMITTER"), "{msg}");
+        assert!(msg.contains("firmware"), "{msg}");
+        assert!(msg.contains("#159"), "{msg}");
     }
 
     // --- Face Authentication derivation ------------------------------------

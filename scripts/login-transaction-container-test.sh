@@ -196,7 +196,7 @@ assert "without the note, the re-run refuses the whole record" "$out" \
     test "$(echo "$out" | field code)" = "changed-since-apply"
 
 # WITH the note, that surface is skipped and the rollback completes.
-printf '["%s"]' "$sid" >"$prog"
+printf '{"started":["%s"],"done":["%s"]}' "$sid" "$sid" >"$prog"
 out=$($B login rollback --transaction-id "$tx4" --apply --json)
 assert "with the note, the rollback resumes and completes" "$out" \
     test "$(echo "$out" | field applied)" = "true"

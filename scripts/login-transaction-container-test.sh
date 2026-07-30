@@ -256,6 +256,23 @@ assert "the backup survived the refusal" "overwritten" \
     grep -q "somebody put a backup here afterwards" "$SUDO_PAM.pre-irlume"
 rm -f "$SUDO_PAM.pre-irlume"
 
+echo "=== 15. apply keeps the self-heal marker in step ==="
+# The machine API unwired the files and left the marker saying "wired", so
+# irlume-reconcile.path fired on the change apply had just made, re-wired every
+# greeter, and the transaction that asked for the disable was drifted and no
+# longer rollbackable — irlume fighting its own writes. Found on a machine where
+# login was genuinely wired; a container has no path unit, so only the marker
+# itself can be checked here.
+marker="$IRLUME_STATE_DIR/login.wired"
+mkdir -p "$IRLUME_STATE_DIR"
+printf 'with_sudo=false\nwith_polkit=false\nwith_lock=false\n' >"$marker"
+grep -q pam_irlume "$SUDO_PAM" || sed -i '1i auth       sufficient   pam_irlume.so' "$SUDO_PAM"
+pid7=$($B login plan --action disable --json | field plan_id)
+tx7=$($B login apply --action disable --plan-id "$pid7" --json | field transaction_id)
+assert "apply for the marker case: $tx7" "no id" test -n "$tx7"
+assert_not "a machine disable clears the self-heal marker" "reconcile would re-wire" \
+    test -e "$marker"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

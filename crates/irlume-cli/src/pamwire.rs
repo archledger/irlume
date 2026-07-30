@@ -203,7 +203,12 @@ fn wired_marker_path() -> std::path::PathBuf {
 /// Persist (on enable) or remove (on disable) the wiring marker. The body is a
 /// tiny stable key=value record of the extra scopes so reconcile re-applies the
 /// same `--with-sudo` / `--with-polkit` choice, not a bare login wiring.
-fn write_wired_marker(enable: bool, with_sudo: bool, with_polkit: bool, with_lock: bool) {
+pub(crate) fn write_wired_marker(
+    enable: bool,
+    with_sudo: bool,
+    with_polkit: bool,
+    with_lock: bool,
+) {
     let path = wired_marker_path();
     if !enable {
         let _ = std::fs::remove_file(&path);

@@ -1281,6 +1281,22 @@ pub fn login_apply(args: &[String]) -> ExitCode {
 
     let failed: Vec<&crate::pamwire::AppliedSurface> =
         applied.iter().filter(|s| s.error.is_some()).collect();
+    // Keep the self-heal marker in step with what was just written, exactly as
+    // the human path does. Without this the machine API unwires the files and
+    // leaves the marker saying "wired", so `irlume-reconcile.path` fires on the
+    // change it just made, re-wires every greeter, and the transaction that
+    // asked for the disable is drifted and no longer rollbackable — irlume
+    // fighting its own writes.
+    //
+    // Found on a machine where login was genuinely wired and the path unit
+    // active. Neither the container suite nor a bed with nothing wired can show
+    // it: there is no reconcile unit in one and nothing to re-wire in the other.
+    //
+    // The scopes match what `apply` planned: this command wires the greeter and
+    // lock screen, and never sudo or polkit, which are their own opt-in.
+    if failed.is_empty() {
+        crate::pamwire::write_wired_marker(enable, false, false, enable);
+    }
     let changes: Vec<Value> = applied
         .iter()
         .map(|surface| {

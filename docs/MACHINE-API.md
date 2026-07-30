@@ -513,7 +513,29 @@ rejected rather than sanitised, because the id becomes a filename.
 Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
 `not-authorized` (apply and `rollback --apply` need root, checked before
 anything is written rather than left to a write failing partway),
-`operation-failed`.
+`unconfirmed-transaction`, `unsupported-record`, `operation-failed`.
+
+`unsupported-record` means the record was written to a record schema this engine
+does not implement, and it is not retryable: run the newer irlume. A record
+carries a `schema_version`, which is a gate rather than a description. It is
+raised only when the MEANING of a record changes, so a purely descriptive
+addition does not raise it and an older engine keeps reading such records. What
+an engine will not do is act on the parts of a newer record it recognises: the
+fields would parse and look reasonable while meaning something else, and a
+record is the recovery path for a machine's login stack.
+
+Every irlume path that changes PAM — `login apply`, `login rollback --apply`,
+the human `login enable`/`disable`, and the self-heal reconcile — holds one
+exclusive lock for the whole operation, so a consumer's transaction cannot
+interleave with another irlume process. The lock does not cover package managers
+or an administrator with an editor, which is why each surface is re-checked
+immediately before it is written.
+
+irlume refuses to write a PAM path that is a symlink or that has more than one
+hard link, on every one of those paths. Renaming over a symlink would silently
+convert it to a regular file, and replacing a multiply-linked file would leave
+the other names on the old content; neither is recorded, so neither could be
+undone. Such a surface is reported as not installed with the reason.
 
 ## Security and privacy
 

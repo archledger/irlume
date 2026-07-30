@@ -125,6 +125,18 @@ pub(crate) struct Transaction {
     /// engine that predates the field.
     #[serde(default)]
     pub(crate) status: TransactionStatus,
+    /// Which record format this is. A GATE, unlike `engine_version`.
+    ///
+    /// Bumped only when the MEANING of a record changes: a new field a rollback
+    /// must act on, or a different interpretation of an existing one. Adding a
+    /// purely descriptive field does not need it. A build refuses anything above
+    /// what it implements rather than reading the parts it recognises.
+    ///
+    /// Defaulted for records written before the field existed. Those predate any
+    /// meaning change, so treating them as version 1 is accurate rather than
+    /// generous.
+    #[serde(default = "schema_version_1")]
+    pub(crate) schema_version: u32,
     /// `enable` or `disable`.
     pub(crate) action: String,
     /// The plan this was applied from, so a consumer can tie the two together.
@@ -159,6 +171,13 @@ pub(crate) enum TransactionStatus {
     /// explicit acknowledgement.
     #[serde(other)]
     Unknown,
+}
+
+/// The record format this build writes and is willing to act on.
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+
+fn schema_version_1() -> u32 {
+    1
 }
 
 /// Hex sha256 of a byte slice.
@@ -283,7 +302,20 @@ impl Transaction {
             }
             Err(error) => return Err(LoadFailure::Unreadable(format!("{error}"))),
         };
-        serde_json::from_str(&body).map_err(|e| LoadFailure::Unreadable(format!("{e}")))
+        let record: Self =
+            serde_json::from_str(&body).map_err(|e| LoadFailure::Unreadable(format!("{e}")))?;
+        // Before anything reads a field. Deserializing succeeded, which is
+        // exactly the trap: serde ignores unknown fields, so a newer record
+        // parses cleanly into this older shape and every field this build knows
+        // about looks reasonable. What it cannot know is whether they still mean
+        // the same thing.
+        if record.schema_version > SCHEMA_VERSION {
+            return Err(LoadFailure::TooNew {
+                found: record.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        Ok(record)
     }
 }
 
@@ -297,6 +329,18 @@ pub(crate) enum LoadFailure {
     NotFound,
     NotAuthorized,
     Unreadable(String),
+    /// Written to a schema this build does not implement.
+    ///
+    /// `engine_version` was recorded but never checked, and serde ignores
+    /// unknown fields, so an older engine happily read a newer record whenever
+    /// the fields it knew about happened to deserialize — then rolled it back
+    /// using its own, older meaning of them. A record is the recovery path for a
+    /// machine's login stack; acting on one whose semantics this build cannot
+    /// know is worse than refusing and naming the version that can.
+    TooNew {
+        found: u32,
+        supported: u32,
+    },
 }
 
 /// Whether a transaction id is safe to use as a filename.
@@ -502,6 +546,7 @@ mod tests {
         let _env = StateDirGuard::new("roundtrip");
         let tx = Transaction {
             id: "0123456789abcdef0123456789abcdef".into(),
+            schema_version: SCHEMA_VERSION,
             status: TransactionStatus::Applied,
             action: "enable".into(),
             plan_id: "aaaabbbbccccddddaaaabbbbccccdddd".into(),
@@ -534,6 +579,64 @@ mod tests {
     /// inode and passes through a moment where the file is empty; replacing by
     /// rename gives a new inode and never does. A test that only checked the
     /// final contents would pass either way.
+    /// A record from a schema this build does not implement is refused, not
+    /// half-read.
+    ///
+    /// `engine_version` was recorded and never checked, and serde ignores
+    /// unknown fields, so a newer record parsed cleanly into the older shape and
+    /// every field this build knew about looked reasonable. What it could not
+    /// know is whether they still MEAN the same thing, and a record is the
+    /// recovery path for a machine's login stack.
+    #[test]
+    fn a_record_from_a_newer_schema_is_refused_rather_than_partly_understood() {
+        let _env = StateDirGuard::new("schema");
+        let dir = store_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "0".repeat(32);
+        let write = |body: &str| std::fs::write(dir.join(format!("{id}.json")), body).unwrap();
+
+        // A newer engine's record: fields this build knows, plus one it does
+        // not, plus a schema it does not implement.
+        write(&format!(
+            r#"{{"id":"{id}","schema_version":{},"status":"applied","action":"enable",
+                "plan_id":"{}","engine_version":"9.9.9","surfaces":[],
+                "something_this_build_ignores":{{"restore_me_too":"/etc/pam.d/x"}}}}"#,
+            SCHEMA_VERSION + 1,
+            "1".repeat(32)
+        ));
+        assert_eq!(
+            Transaction::load(&id),
+            Err(LoadFailure::TooNew {
+                found: SCHEMA_VERSION + 1,
+                supported: SCHEMA_VERSION
+            }),
+            "a newer record must not be acted on by an older engine"
+        );
+
+        // The same record at a schema this build implements is fine, unknown
+        // field and all: ignoring a descriptive addition is the point of not
+        // bumping the version for one.
+        write(&format!(
+            r#"{{"id":"{id}","schema_version":{SCHEMA_VERSION},"status":"applied","action":"enable",
+                "plan_id":"{}","engine_version":"9.9.9","surfaces":[],
+                "something_this_build_ignores":true}}"#,
+            "1".repeat(32)
+        ));
+        assert_eq!(
+            Transaction::load(&id).map(|r| r.schema_version),
+            Ok(SCHEMA_VERSION)
+        );
+
+        // A record written before the field existed predates any meaning
+        // change, so it reads as version 1 rather than being refused.
+        write(&format!(
+            r#"{{"id":"{id}","status":"applied","action":"enable",
+                "plan_id":"{}","engine_version":"0.7.0","surfaces":[]}}"#,
+            "1".repeat(32)
+        ));
+        assert_eq!(Transaction::load(&id).map(|r| r.schema_version), Ok(1));
+    }
+
     /// Every directory whose entry has to survive is in the chain, shallowest
     /// first, including the one a RELATIVE state root is anchored in.
     ///
@@ -585,6 +688,7 @@ mod tests {
 
         let mut tx = Transaction {
             id: "abcdef0123456789abcdef0123456789".into(),
+            schema_version: SCHEMA_VERSION,
             status: TransactionStatus::Prepared,
             action: "enable".into(),
             plan_id: "1".repeat(32),
@@ -633,6 +737,7 @@ mod tests {
         let _env = StateDirGuard::new("perms");
         let tx = Transaction {
             id: "ffffffffffffffffffffffffffffffff".into(),
+            schema_version: SCHEMA_VERSION,
             status: TransactionStatus::Applied,
             action: "disable".into(),
             plan_id: "0".repeat(32),

@@ -798,6 +798,10 @@ fn emit_load_failure(
         crate::logintx::LoadFailure::NotFound => "not-found",
         crate::logintx::LoadFailure::NotAuthorized => "not-authorized",
         crate::logintx::LoadFailure::Unreadable(_) => "operation-failed",
+        // Distinct from operation-failed: retrying will never help, and the
+        // action a consumer should take is to run the newer irlume, not to
+        // report a storage problem.
+        crate::logintx::LoadFailure::TooNew { .. } => "unsupported-record",
     };
     emit(&failure(command, code, false, contract), ExitCode::FAILURE)
 }
@@ -1107,6 +1111,7 @@ pub fn login_apply(args: &[String]) -> ExitCode {
     };
     let mut record = crate::logintx::Transaction {
         id: transaction_id,
+        schema_version: crate::logintx::SCHEMA_VERSION,
         status: crate::logintx::TransactionStatus::Prepared,
         action: action.to_string(),
         plan_id: current_plan,
@@ -1970,6 +1975,7 @@ mod tests {
     fn record_over(files: &[(&str, &std::path::Path, &str)]) -> crate::logintx::Transaction {
         crate::logintx::Transaction {
             id: "0123456789abcdef0123456789abcdef".into(),
+            schema_version: crate::logintx::SCHEMA_VERSION,
             status: crate::logintx::TransactionStatus::Applied,
             action: "disable".into(),
             plan_id: "f".repeat(32),

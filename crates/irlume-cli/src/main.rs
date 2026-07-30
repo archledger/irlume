@@ -2911,6 +2911,31 @@ fn doctor_run(
         State::Info,
         secureboot::detect_boot_mode().as_str(),
     );
+    // A control an interrupted `ir-setup` left changed on a camera. The capture
+    // path puts it back on its own, but not when the operator has set
+    // IRLUME_IR_EMITTER=off, and not while the camera is detached — which are
+    // exactly the situations someone runs `doctor` in.
+    match irlume_camera::emitter_journal::pending_summary() {
+        irlume_camera::emitter_journal::PendingSummary::None => {
+            report.check("emitter-undo-pending", State::Pass);
+        }
+        irlume_camera::emitter_journal::PendingSummary::Pending(entries) => {
+            dout!(
+                report,
+                "[doctor] IR emitter: {} camera control(s) left changed by an interrupted \
+                 setup ⚠ — {}. Reconnect the camera and authenticate, or run \
+                 `sudo irlume ir-setup`, to put them back",
+                entries.len(),
+                entries.join("; ")
+            );
+            report.check_detail("emitter-undo-pending", State::Warn, entries.join("; "));
+        }
+        irlume_camera::emitter_journal::PendingSummary::Unreadable(why) => {
+            // Root-only by design, so an ordinary run lands here. Unknown, not
+            // Pass: nobody checked.
+            report.check_detail("emitter-undo-pending", State::Unknown, why);
+        }
+    }
     report.check(
         "signed-pcr-policy",
         if irlume_core::pcrsig::signed_policy_available() {

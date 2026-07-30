@@ -249,7 +249,15 @@ automatically at daemon start and during enrollment. That permanently destroyed 
 reporter's camera ([#159]). It is now only ever run when you ask for it.
 
 To see exactly what irlume sends to the camera, set `IRLUME_LOG_EMITTER_WRITES=1`
-and it prints each emitter write before making it.
+and it prints each emitter write before making it, interleaved with the undo
+record's own events so the order is visible.
+
+Setup writes that undo record before it touches the control and removes it only
+once the control reads back holding its original value again, so a crash, a kill
+or a power loss part-way through leaves the original bytes on disk. The next
+capture on that camera puts them back; `irlume doctor` reports anything still
+outstanding, which is how you find it on a machine running
+`IRLUME_IR_EMITTER=off`.
 
 If your camera's vendor documents a control that irlume cannot discover, set it
 yourself:
@@ -320,6 +328,7 @@ live in them; sealed envelopes are stored separately (see
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
+| `/var/lib/irlume/ir-emitter-journal/` | one record per camera, holding the bytes a control held before `ir-setup` changed it. Written before the change and removed once the control reads back as restored, so a crash, a kill or a power loss mid-setup leaves something that can undo it. Root-only | `irlume ir-setup`, cleared by it or by the next capture |
 
 Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env
 pair (both set), then `cameras.conf`, then auto-detection, then the compiled

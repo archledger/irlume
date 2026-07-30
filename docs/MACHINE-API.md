@@ -202,6 +202,7 @@ reused for a different meaning. The registry as of this contract:
 | `tpm` | a usable TPM 2.0 resource-manager device |
 | `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
 | `boot-mode` | the boot chain, which decides which PCR policy tier applies |
+| `emitter-undo-pending` | camera controls an interrupted `ir-setup` left changed and has not put back. `unknown` when the root-only record store cannot be read, which is any run that is not root |
 | `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
 | `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths |

@@ -163,6 +163,64 @@ impl PendingWrite {
     }
 }
 
+/// What the store holds right now, for a report that has no camera open.
+///
+/// Deliberately does not open a camera or write anything: `doctor` runs on a
+/// machine whose camera may be detached, may be in use, and whose operator may
+/// have set `IRLUME_IR_EMITTER=off` precisely because they do not want irlume
+/// touching it. It counts files and says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSummary {
+    /// The store has no records: nothing was left changed.
+    None,
+    /// This many cameras have an outstanding change, with the coordinates of
+    /// each so an operator can match them against `lsusb`.
+    Pending(Vec<String>),
+    /// The store could not be listed. Not the same as empty: it is root-only, so
+    /// an ordinary `doctor` run lands here, and reporting that as "nothing
+    /// pending" would be a clean bill of health nobody checked.
+    Unreadable(String),
+}
+
+/// Summarise the store without touching any camera.
+pub fn pending_summary() -> PendingSummary {
+    let dir = store_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PendingSummary::None,
+        Err(e) => return PendingSummary::Unreadable(format!("{}: {e}", dir.display())),
+    };
+    let mut pending = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return PendingSummary::Unreadable(format!("{}: {e}", dir.display())),
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        // A record that will not parse is still a record: something is pending
+        // and this build cannot read it, which an operator needs told.
+        pending.push(match std::fs::read_to_string(&path) {
+            Ok(body) => match serde_json::from_str::<PendingWrite>(&body) {
+                Ok(record) => format!(
+                    "{} unit {} selector {} (original {})",
+                    record.usb_id, record.unit, record.selector, record.original
+                ),
+                Err(e) => format!("{} (unparseable: {e})", path.display()),
+            },
+            Err(e) => format!("{} (unreadable: {e})", path.display()),
+        });
+    }
+    if pending.is_empty() {
+        PendingSummary::None
+    } else {
+        pending.sort();
+        PendingSummary::Pending(pending)
+    }
+}
+
 /// Trace a journal event onto the same stream `set_cur` traces writes to.
 ///
 /// The ordering claims this module makes — record before the first write,

@@ -2181,8 +2181,14 @@ fn swap_target_for_test(path: &Path) {
     *armed = None;
     // A different inode under the same name: what an administrator, a package
     // or another writer does in that window.
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::write(path, "SOMEONE ELSE'S FILE\n");
+    //
+    // Written elsewhere and renamed over, NOT removed and recreated. Removing
+    // frees the inode number, and a filesystem is free to hand the same one
+    // straight back: this test passed locally and failed in CI for exactly that
+    // reason. Both files exist at once here, so the numbers cannot coincide.
+    let replacement = path.with_extension("irlume-swap-source");
+    let _ = std::fs::write(&replacement, "SOMEONE ELSE'S FILE\n");
+    let _ = std::fs::rename(&replacement, path);
 }
 
 #[cfg(test)]
@@ -2213,7 +2219,12 @@ type TargetState = Option<(u64, u64)>;
 ///   breaking it silently the wrong default.
 ///
 /// The identity returned is the device and inode, which is what the caller
-/// compares to decide the name still refers to the same file.
+/// compares to decide the name still refers to the same file. That is the usual
+/// answer and not a perfect one: a filesystem may hand the same inode number
+/// back for a file created right after the old one was unlinked, so a
+/// replacement can in principle wear the identity of what it replaced. irlume's
+/// own paths cannot collide here because they hold the PAM lock; against an
+/// external writer this narrows the window rather than closing it.
 fn inspect_target(path: &Path) -> Result<TargetState, String> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = match std::fs::symlink_metadata(path) {

@@ -223,6 +223,22 @@ pub struct CameraIdentity {
     pub interface_number: u8,
     pub vid: u16,
     pub pid: u16,
+    /// The USB serial string, when the device publishes one.
+    ///
+    /// NOT a unique physical identity, and must not be trusted as one: the ASUS
+    /// module this project develops against reports `200901010001`, a batch
+    /// number of the kind webcam vendors repeat across every unit they ship.
+    /// It narrows a match; it does not settle one.
+    pub serial: Option<String>,
+    /// Resolved sysfs path of the USB DEVICE, `/devices/...` with no `/sys`
+    /// prefix and no interface suffix.
+    ///
+    /// The only identifier here that distinguishes two identical units attached
+    /// at the same time, because it names the port rather than the model. It is
+    /// stable across reboots for a fixed port and changes when the device is
+    /// moved to another one, which is the right way round for a record that has
+    /// to survive a power loss.
+    pub usb_devpath: String,
 }
 
 pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdentity> {
@@ -252,6 +268,19 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
             .ok_or_else(|| bad(format!("{} has no idVendor", dev_dir.display())))?,
         pid: read_hex_u16(&dev_dir.join("idProduct"))
             .ok_or_else(|| bad(format!("{} has no idProduct", dev_dir.display())))?,
+        // Absent on plenty of devices, so this is `None` rather than an error.
+        serial: std::fs::read_to_string(dev_dir.join("serial"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        // `dev_dir` came from `canonicalize`, so it is already the resolved
+        // physical path. Stripping `/sys` keeps the value comparable to the
+        // `DEVPATH` the kernel publishes for the same device.
+        usb_devpath: dev_dir
+            .strip_prefix("/sys")
+            .unwrap_or(&dev_dir)
+            .to_string_lossy()
+            .into_owned(),
     })
 }
 

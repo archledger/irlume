@@ -123,6 +123,24 @@ pub(crate) struct PendingWrite {
     pub(crate) boot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<u32>,
+    /// The USB serial the camera published, when it published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) serial: Option<String>,
+    /// The sysfs path of the USB device the change was made to.
+    ///
+    /// The only field that distinguishes two identical units attached at the
+    /// same time. Without it the key was the descriptor blob, which two units of
+    /// one model share byte for byte: a capture on the second camera would load
+    /// the first camera's record, write the first camera's bytes into the
+    /// second, and then delete the record on a successful read-back, leaving the
+    /// camera that was actually changed with no undo data at all. Reported by
+    /// review on #183.
+    ///
+    /// Empty on records written before this field existed. Those cannot be
+    /// confirmed to belong to the camera in front of us, so they are reported
+    /// rather than acted on.
+    #[serde(default)]
+    pub(crate) usb_devpath: String,
 }
 
 /// This boot's identifier, or `None` where the kernel does not publish one.
@@ -259,9 +277,72 @@ pub(crate) fn record_path(descriptor_sha256: &str) -> PathBuf {
     store_dir().join(format!("{descriptor_sha256}.json"))
 }
 
-/// The digest a record for this camera is filed under.
+/// The digest of the camera's PUBLISHED DESCRIPTION: model, not unit.
+///
+/// Two units of one model produce the same value, by construction. That is what
+/// makes it the right key for "is this record about a camera like the one in
+/// front of me" and the wrong key for "is this record about THIS camera", which
+/// is [`filing_key`].
 pub(crate) fn fingerprint(id: &CameraIdentity) -> String {
     irlume_common::sha256_hex(&id.descriptors)
+}
+
+/// The name a record for this exact camera is filed under.
+///
+/// Binds the model description to the port and, where the device publishes one,
+/// the serial. The descriptor blob alone collided across identical units, so one
+/// camera's setup silently replaced another's undo record.
+///
+/// The parts are length-prefixed rather than concatenated, so a serial ending in
+/// what looks like a path cannot produce the same key as a different pairing.
+pub(crate) fn filing_key(id: &CameraIdentity) -> String {
+    key_of(&fingerprint(id), id.serial.as_deref(), &id.usb_devpath)
+}
+
+/// The one place a filing key is built, so a record is always written where a
+/// lookup for the same camera will go looking. Two constructions of this would
+/// be two chances to file a record somewhere it is never found again, which is
+/// the same as not having written it.
+fn key_of(descriptor_sha256: &str, serial: Option<&str>, usb_devpath: &str) -> String {
+    let serial = serial.unwrap_or("");
+    irlume_common::sha256_hex(
+        format!(
+            "descriptors:{descriptor_sha256}|serial:{}:{serial}|devpath:{}:{usb_devpath}",
+            serial.len(),
+            usb_devpath.len(),
+        )
+        .as_bytes(),
+    )
+}
+
+impl PendingWrite {
+    /// Where this record belongs, derived from the record's own fields.
+    pub(crate) fn filing_key(&self) -> String {
+        key_of(
+            &self.descriptor_sha256,
+            self.serial.as_deref(),
+            &self.usb_devpath,
+        )
+    }
+}
+
+/// Whether this record was written about the camera in front of us.
+///
+/// The serial is compared only when BOTH sides have one: a record from a build
+/// that did not store it must not be mistaken for a different unit. The devpath
+/// is required on both sides, because it is the only discriminator that holds
+/// when two identical units are attached at once.
+pub(crate) fn describes_this_camera(record: &PendingWrite, id: &CameraIdentity) -> bool {
+    if record.descriptor_sha256 != fingerprint(id) {
+        return false;
+    }
+    if record.usb_devpath.is_empty() || record.usb_devpath != id.usb_devpath {
+        return false;
+    }
+    match (record.serial.as_deref(), id.serial.as_deref()) {
+        (Some(recorded), Some(attached)) => recorded == attached,
+        _ => true,
+    }
 }
 
 /// Why a record cannot be acted on against the camera in front of us.
@@ -401,21 +482,88 @@ pub(crate) fn restore_decision(record: &PendingWrite, now: &ControlNow) -> Resto
     Restore::Write(original)
 }
 
-/// Read this camera's record, if there is one.
+/// What the store has to say about the camera in front of us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Situation {
+    /// Nothing about this camera or anything like it.
+    Nothing,
+    /// A record written about THIS camera: same model, same port, and the same
+    /// serial where both sides publish one.
+    Mine(Box<PendingWrite>),
+    /// A record about a camera of the SAME MODEL at a different port, or one
+    /// written before records carried a port at all.
+    ///
+    /// Kept apart from `Mine` because the bytes in it were read from a control
+    /// on some other unit, or on this one at a time we cannot confirm. Writing
+    /// them here would be guessing, and clearing the record afterwards would
+    /// destroy the only description of a change that is still outstanding
+    /// somewhere. Reported, never acted on.
+    SameModelElsewhere(Box<PendingWrite>),
+}
+
+/// Classify the store against this camera.
+///
+/// The exact record is tried first, by name, so the ordinary case costs one
+/// failed open. Only when that misses is the directory scanned, which is what
+/// finds a same-model record filed under a different port.
 ///
 /// An unreadable record that exists is an error rather than "no record":
 /// treating a permission or IO failure as absence would silently drop the one
 /// description of how to undo a firmware write.
-pub(crate) fn load(id: &CameraIdentity) -> Result<Option<PendingWrite>, String> {
-    let path = record_path(&fingerprint(id));
-    let body = match std::fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
+    let path = record_path(&filing_key(id));
+    match std::fs::read_to_string(&path) {
+        Ok(body) => {
+            let record: PendingWrite = serde_json::from_str(&body)
+                .map_err(|e| format!("parse {}: {e}", path.display()))?;
+            // The filename is a convenience, never the authority. A record that
+            // landed under this name but does not describe this camera is
+            // treated as what it says it is, not as what it is called.
+            if describes_this_camera(&record, id) {
+                return Ok(Situation::Mine(Box::new(record)));
+            }
+            return Ok(Situation::SameModelElsewhere(Box::new(record)));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("read {}: {e}", path.display())),
+    }
+
+    let model = fingerprint(id);
+    for record in all_records()? {
+        if record.descriptor_sha256 == model {
+            return Ok(Situation::SameModelElsewhere(Box::new(record)));
+        }
+    }
+    Ok(Situation::Nothing)
+}
+
+/// Every parseable record in the store.
+///
+/// A record that will not parse is an error rather than a skip: something is
+/// pending, this build cannot read it, and continuing as though the store were
+/// empty is how an outstanding firmware change gets reported as clean.
+fn all_records() -> Result<Vec<PendingWrite>, String> {
+    let dir = store_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("list {}: {e}", dir.display())),
     };
-    serde_json::from_str(&body)
-        .map(Some)
-        .map_err(|e| format!("parse {}: {e}", path.display()))
+    let mut records = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("list {}: {e}", dir.display()))?
+            .path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let body =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        records.push(
+            serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?,
+        );
+    }
+    Ok(records)
 }
 
 /// Write a record and make it durable before the caller touches the camera.
@@ -433,7 +581,7 @@ pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     irlume_common::restrict(&dir, 0o700)?;
     irlume_common::fsync_ancestors(&dir)?;
-    let path = record_path(&record.descriptor_sha256);
+    let path = record_path(&record.filing_key());
     let body = serde_json::to_string(record).map_err(|e| format!("serialize record: {e}"))?;
     irlume_common::write_0600_atomic(&path, body.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -447,8 +595,11 @@ pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
 }
 
 /// Remove a record whose control is confirmed back where it was found.
-pub(crate) fn clear(descriptor_sha256: &str) -> Result<(), String> {
-    irlume_common::remove_durable(&record_path(descriptor_sha256))?;
+///
+/// Takes the record rather than a key so the removal cannot target a different
+/// file than the save did.
+pub(crate) fn clear(record: &PendingWrite) -> Result<(), String> {
+    irlume_common::remove_durable(&record_path(&record.filing_key()))?;
     trace("cleared");
     Ok(())
 }
@@ -501,6 +652,21 @@ mod tests {
             interface_number: 2,
             vid: 0x3277,
             pid: 0x0059,
+            // The real values this module was developed against. The serial is
+            // deliberately the batch-looking one the ASUS module actually
+            // reports, so nothing here can quietly assume a serial is unique.
+            serial: Some("200901010001".into()),
+            usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb3/3-5".into(),
+        }
+    }
+
+    /// The same MODEL at a different port: byte-identical descriptors, the same
+    /// serial, a different physical address. This is the pair the descriptor
+    /// digest could not tell apart.
+    fn identical_unit_elsewhere() -> CameraIdentity {
+        CameraIdentity {
+            usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb3/3-2".into(),
+            ..identity()
         }
     }
 
@@ -534,6 +700,8 @@ mod tests {
             restore_attempts: 0,
             boot_id: None,
             pid: None,
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
         }
     }
 
@@ -563,10 +731,10 @@ mod tests {
         let record = record_for(&id);
         let path = save(&record).expect("save");
         assert!(path.starts_with(&dir), "record lands under the state root");
-        assert_eq!(load(&id), Ok(Some(record)));
+        assert_eq!(load(&id), Ok(Situation::Mine(Box::new(record.clone()))));
 
-        clear(&fingerprint(&id)).expect("clear");
-        assert_eq!(load(&id), Ok(None));
+        clear(&record).expect("clear");
+        assert_eq!(load(&id), Ok(Situation::Nothing));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -605,13 +773,110 @@ mod tests {
         save(&record_for(&first)).expect("save first");
         save(&record_for(&second)).expect("save second");
 
-        assert!(load(&first).expect("load first").is_some());
-        assert!(load(&second).expect("load second").is_some());
+        assert!(matches!(
+            load(&first).expect("load first"),
+            Situation::Mine(_)
+        ));
+        assert!(matches!(
+            load(&second).expect("load second"),
+            Situation::Mine(_)
+        ));
         assert_ne!(
-            record_path(&fingerprint(&first)),
-            record_path(&fingerprint(&second))
+            record_path(&filing_key(&first)),
+            record_path(&filing_key(&second))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two units of one model publish byte-identical descriptors, so the model
+    /// digest cannot tell them apart. Filing by it meant a capture on the second
+    /// camera loaded the first camera's record, and a successful read-back then
+    /// DELETED it, leaving the camera that was actually changed with no undo
+    /// data. Setup on the second camera also replaced the first camera's record
+    /// outright, since the atomic write deliberately replaces its destination.
+    #[test]
+    fn two_identical_cameras_do_not_share_one_record() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-identical-units");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let first = identity();
+        let second = identical_unit_elsewhere();
+
+        // The premise: these really are indistinguishable by everything except
+        // the port. Without this the rest of the test proves nothing.
+        assert_eq!(
+            fingerprint(&first),
+            fingerprint(&second),
+            "the fixture must be two units of ONE model"
+        );
+        assert_eq!(first.serial, second.serial, "and the same serial");
+        assert_ne!(first.usb_devpath, second.usb_devpath);
+
+        assert_ne!(
+            filing_key(&first),
+            filing_key(&second),
+            "so they must not be filed under the same name"
+        );
+
+        let record = record_for(&first);
+        save(&record).expect("save the first camera's record");
+
+        // The capture on the second camera: it must not be handed the first
+        // camera's bytes, and it must not delete the record either.
+        match load(&second).expect("load for the second camera") {
+            Situation::SameModelElsewhere(found) => {
+                assert_eq!(found.usb_devpath, first.usb_devpath)
+            }
+            other => panic!("the second camera must not own this record: {other:?}"),
+        }
+        assert!(
+            !describes_this_camera(&record, &second),
+            "the record does not describe the second camera"
+        );
+        assert!(describes_this_camera(&record, &first));
+
+        // And setting up the second camera leaves the first camera's record
+        // where it was, rather than replacing it.
+        save(&record_for(&second)).expect("save the second camera's record");
+        assert_eq!(
+            load(&first).expect("the first record survived"),
+            Situation::Mine(Box::new(record))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record written before records carried a port cannot be confirmed to
+    /// belong to anything, so it is reported rather than acted on.
+    #[test]
+    fn a_record_with_no_recorded_port_is_never_acted_on() {
+        let id = identity();
+        let mut legacy = record_for(&id);
+        legacy.usb_devpath = String::new();
+        assert!(
+            !describes_this_camera(&legacy, &id),
+            "an empty port matches nothing, including a camera whose path is also unknown"
+        );
+    }
+
+    /// The serial narrows a match but never settles one, and it is only compared
+    /// when both sides have it: a record from a build that did not store one
+    /// must not read as a different unit.
+    #[test]
+    fn a_serial_is_compared_only_when_both_sides_publish_one() {
+        let id = identity();
+
+        let mut no_serial_recorded = record_for(&id);
+        no_serial_recorded.serial = None;
+        assert!(describes_this_camera(&no_serial_recorded, &id));
+
+        let mut different_serial = record_for(&id);
+        different_serial.serial = Some("some-other-unit".into());
+        assert!(
+            !describes_this_camera(&different_serial, &id),
+            "two serials that disagree are two cameras"
+        );
     }
 
     #[test]

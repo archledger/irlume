@@ -397,7 +397,29 @@ fn get_info(fd: c_int, unit: u8, selector: u8) -> XuResult<u8> {
     Ok(buf[0])
 }
 
+/// The single choke point for every READ of a control.
+///
+/// Traced under the same switch as the writes, and with the transfer SIZE,
+/// because the size is the part that can be wrong. Recovery must size `GET_CUR`
+/// from the length the attached camera just reported and not from the record,
+/// and that is an ordering between two ioctls: it leaves nothing behind for a
+/// test to inspect, and this crate cannot reach any of it without a camera. A
+/// transcript that shows `GET_LEN` answering 3 and then `GET_CUR size=3` is the
+/// evidence. A mutant that removes the check survives the whole unit suite.
 fn get_of(fd: c_int, unit: u8, selector: u8, query: u8, size: usize) -> XuResult<Vec<u8>> {
+    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+        let name = match query {
+            UVC_GET_CUR => "GET_CUR",
+            UVC_GET_LEN => "GET_LEN",
+            UVC_GET_INFO => "GET_INFO",
+            UVC_GET_DEF => "GET_DEF",
+            UVC_GET_MIN => "GET_MIN",
+            UVC_GET_MAX => "GET_MAX",
+            UVC_GET_RES => "GET_RES",
+            _ => "GET_?",
+        };
+        eprintln!("irlume: {name} unit{unit}/sel{selector} size={size}");
+    }
     let mut buf = vec![0u8; size];
     xu_query(fd, unit, selector, query, &mut buf)?;
     Ok(buf)
@@ -1325,7 +1347,9 @@ struct ExploratoryWrite {
     unit: u8,
     selector: u8,
     original: Vec<u8>,
-    descriptor_sha256: String,
+    /// The record exactly as it was written, so the removal cannot target a
+    /// different file than the save did.
+    record: crate::emitter_journal::PendingWrite,
     /// Set once the control is confirmed back at `original`, or once the applied
     /// value is durably recorded in the configuration. Until then the record
     /// stays on disk and `Drop` still tries.
@@ -1349,7 +1373,7 @@ impl ExploratoryWrite {
         attempted: &[u8],
     ) -> Result<Self, String> {
         let descriptor_sha256 = crate::emitter_journal::fingerprint(id);
-        crate::emitter_journal::save(&crate::emitter_journal::PendingWrite {
+        let record = crate::emitter_journal::PendingWrite {
             schema_version: crate::emitter_journal::SCHEMA_VERSION,
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             descriptor_sha256: descriptor_sha256.clone(),
@@ -1365,13 +1389,16 @@ impl ExploratoryWrite {
             // while the run that changed it is still going.
             boot_id: crate::emitter_journal::current_boot_id(),
             pid: Some(std::process::id()),
-        })?;
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
+        };
+        crate::emitter_journal::save(&record)?;
         Ok(Self {
             fd,
             unit,
             selector,
             original: original.to_vec(),
-            descriptor_sha256,
+            record,
             resolved: false,
         })
     }
@@ -1392,7 +1419,7 @@ impl ExploratoryWrite {
                 now, self.original
             ));
         }
-        crate::emitter_journal::clear(&self.descriptor_sha256)?;
+        crate::emitter_journal::clear(&self.record)?;
         self.resolved = true;
         Ok(())
     }
@@ -1406,7 +1433,7 @@ impl ExploratoryWrite {
     /// this module exists to prevent, so until the configuration lands the
     /// record stays open and the guard would put the control back.
     fn commit(&mut self) -> Result<(), String> {
-        crate::emitter_journal::clear(&self.descriptor_sha256)?;
+        crate::emitter_journal::clear(&self.record)?;
         self.resolved = true;
         Ok(())
     }
@@ -1446,8 +1473,29 @@ pub(crate) fn recover_pending_write(
     use crate::emitter_journal as journal;
 
     let record = match journal::load(id) {
-        Ok(None) => return RecoveryOutcome::NothingPending,
-        Ok(Some(record)) => record,
+        Ok(journal::Situation::Nothing) => return RecoveryOutcome::NothingPending,
+        Ok(journal::Situation::Mine(record)) => *record,
+        // A record about a camera of the same model at a different port, or one
+        // written before records carried a port at all. Its bytes were read from
+        // a control this run cannot confirm is the same one, so writing them
+        // here would be guessing, and clearing it afterwards would destroy the
+        // only description of a change still outstanding somewhere else.
+        //
+        // Loud rather than silent, and it stops this camera's emitter, because
+        // the alternative reading is that this IS the camera and it is still
+        // holding an exploratory value.
+        Ok(journal::Situation::SameModelElsewhere(record)) => {
+            return RecoveryOutcome::Unconfirmed {
+                unit: record.unit,
+                selector: record.selector,
+                original: record.original.clone(),
+                recorded_at: if record.usb_devpath.is_empty() {
+                    "a build that did not record which port it was on".into()
+                } else {
+                    record.usb_devpath.clone()
+                },
+            }
+        }
         // A store that cannot be read may be hiding a change to THIS camera, so
         // it is unresolved rather than "nothing pending".
         Err(why) => return RecoveryOutcome::Unresolved(why),
@@ -1473,26 +1521,42 @@ pub(crate) fn recover_pending_write(
 
     // Read the control before deciding anything. A restore that is not needed is
     // still a write to firmware.
-    let now = match (
-        get_len(fd, record.unit, record.selector),
-        get_info(fd, record.unit, record.selector),
-        // Length comes from the record here only to size the read; the decision
-        // below compares it against what the camera just reported and refuses if
-        // they differ.
-        get_cur(fd, record.unit, record.selector, record.len),
-    ) {
-        (Ok(len), Ok(info), Ok(current)) => journal::ControlNow {
-            len,
-            writable: info_allows_set(info),
-            current,
-        },
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            return RecoveryOutcome::Unresolved(format!("query the control: {e}"))
-        }
+    //
+    // Sequenced, not gathered into a tuple. A tuple evaluates every operand
+    // before the match runs, so an earlier version issued `GET_CUR` sized by the
+    // RECORD while `GET_LEN` was being fetched in the same expression: a record
+    // saying 64 against a camera reporting 3 sent a 64-byte control request to
+    // firmware, and only then was the mismatch noticed. The camera's own answer
+    // has to come first and gate the rest.
+    let len = match get_len(fd, record.unit, record.selector) {
+        Ok(len) => len,
+        Err(e) => return RecoveryOutcome::Unresolved(format!("query the control length: {e}")),
+    };
+    if len != record.len {
+        return RecoveryOutcome::Unresolved(format!(
+            "the control is {len} bytes and the record was written when it was {}, \
+             so the recorded bytes are not this control's value",
+            record.len
+        ));
+    }
+    let info = match get_info(fd, record.unit, record.selector) {
+        Ok(info) => info,
+        Err(e) => return RecoveryOutcome::Unresolved(format!("query the control: {e}")),
+    };
+    // Sized by what the camera just reported, which the check above has proved
+    // equal to the record's.
+    let current = match get_cur(fd, record.unit, record.selector, len) {
+        Ok(current) => current,
+        Err(e) => return RecoveryOutcome::Unresolved(format!("read the control: {e}")),
+    };
+    let now = journal::ControlNow {
+        len,
+        writable: info_allows_set(info),
+        current,
     };
 
     match journal::restore_decision(&record, &now) {
-        journal::Restore::AlreadyRestored => match journal::clear(&record.descriptor_sha256) {
+        journal::Restore::AlreadyRestored => match journal::clear(&record) {
             Ok(()) => RecoveryOutcome::AlreadyRestored,
             // The control holds its original. Only the store is unhappy, and the
             // store does not decide what the camera holds.
@@ -1523,7 +1587,7 @@ pub(crate) fn recover_pending_write(
                 return RecoveryOutcome::Unresolved(format!("restore: {e}"));
             }
             match get_cur(fd, record.unit, record.selector, original.len()) {
-                Ok(back) if back == original => match journal::clear(&record.descriptor_sha256) {
+                Ok(back) if back == original => match journal::clear(&record) {
                     Ok(()) => RecoveryOutcome::Restored {
                         unit: record.unit,
                         selector: record.selector,
@@ -1606,6 +1670,23 @@ pub(crate) enum RecoveryOutcome {
     /// An outstanding change on THIS camera that could not be resolved. Nothing
     /// further may be written to it by any path.
     Unresolved(String),
+    /// A record for a camera of the SAME MODEL that this run cannot confirm is
+    /// the camera in front of it: a different port, or a record from a build
+    /// that did not store one.
+    ///
+    /// Two units of one model publish byte-identical descriptors, so the model
+    /// digest alone cannot tell them apart. Acting on the record would write one
+    /// camera's bytes into another and then delete the record on a successful
+    /// read-back, leaving the camera that was actually changed with no undo data
+    /// at all. Reported, never acted on, and it stops writes here because the
+    /// other reading is that this IS that camera, still holding an exploratory
+    /// value.
+    Unconfirmed {
+        unit: u8,
+        selector: u8,
+        original: String,
+        recorded_at: String,
+    },
 }
 
 impl RecoveryOutcome {
@@ -1644,6 +1725,22 @@ impl RecoveryOutcome {
                  light. The recorded original is in {}",
                 store.display()
             )),
+            Self::Unconfirmed {
+                unit,
+                selector,
+                original,
+                recorded_at,
+            } => Some(format!(
+                "irlume: a camera of this model was left with unit {unit} selector {selector} \
+                 changed by an interrupted setup, recorded at {recorded_at}, and this camera is \
+                 not at that address. Two units of one model are indistinguishable from their \
+                 USB descriptors, so irlume will not write those bytes into this one and will \
+                 not write to its emitter at all until the record is resolved: IR face \
+                 authentication will not light. Reconnect the camera to the port it was set up \
+                 on and it will be put back automatically. The original value is {original}, \
+                 recorded in {}",
+                store.display()
+            )),
         }
     }
 
@@ -1657,6 +1754,7 @@ impl RecoveryOutcome {
             Self::RestoredRecordKept(_) => "restored-record-kept",
             Self::OwnerStillRunning { .. } => "owner-running",
             Self::Unresolved(_) => "unresolved",
+            Self::Unconfirmed { .. } => "unconfirmed",
         }
     }
 
@@ -1687,7 +1785,9 @@ impl RecoveryOutcome {
             // The control is confirmed back at its original. Only the store is
             // unhappy, and the store does not decide what the camera holds.
             | Self::RestoredRecordKept(_) => true,
-            Self::OwnerStillRunning { .. } | Self::Unresolved(_) => false,
+            Self::OwnerStillRunning { .. }
+            | Self::Unresolved(_)
+            | Self::Unconfirmed { .. } => false,
         }
     }
 
@@ -1708,9 +1808,10 @@ impl RecoveryOutcome {
             | Self::ForAnotherCamera
             | Self::AlreadyRestored
             | Self::Restored { .. } => false,
-            Self::RestoredRecordKept(_) | Self::OwnerStillRunning { .. } | Self::Unresolved(_) => {
-                true
-            }
+            Self::RestoredRecordKept(_)
+            | Self::OwnerStillRunning { .. }
+            | Self::Unresolved(_)
+            | Self::Unconfirmed { .. } => true,
         }
     }
 }
@@ -1836,6 +1937,13 @@ impl Discovered {
 }
 
 /// What one advertised control turned out to be.
+///
+/// `Lit` is the large variant because it carries the open undo record, which now
+/// holds the whole `PendingWrite` so the removal cannot target a different file
+/// than the save did. Boxing it would move an allocation onto the success path of
+/// an operation that already spends seconds on camera I/O, and discovery returns
+/// exactly one of these per run.
+#[allow(clippy::large_enum_variant)]
 enum Attempt {
     /// Lit, and still holding the applied value, with its undo record open.
     Lit(EmitterControl, ExploratoryWrite),
@@ -2542,6 +2650,8 @@ mod tests {
             interface_number: 2,
             vid,
             pid,
+            serial: Some("200901010001".into()),
+            usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb3/3-5".into(),
         }
     }
 
@@ -2863,6 +2973,8 @@ mod tests {
             interface_number: 0,
             vid: 0x3277,
             pid: 0x0059,
+            serial: Some("200901010001".into()),
+            usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb3/3-5".into(),
         };
         let err = discover(std::os::fd::AsRawFd::as_raw_fd(&f), &no_ms, &mut measure).unwrap_err();
         match err {

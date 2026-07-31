@@ -771,8 +771,39 @@ fn all_records() -> Result<Vec<(PathBuf, PendingWrite)>, String> {
 /// levels that were missing) is a check-then-act on shared state: a second
 /// process finds the directory present and inherits a guarantee nobody has made.
 /// `ir-setup` is a person running a command, not a hot path.
+/// DURABLE, or this is an error. The initial record's durability IS the
+/// authorization for the first firmware write, so "the rename landed but the
+/// directory fsync failed" must not open discovery: the entry can still be lost,
+/// and losing it after the camera has been written recreates the whole defect
+/// this module exists to prevent. Only the attempt COUNTER may treat a visible
+/// record as good enough, because there the question is whether a later reader
+/// sees the higher number, not whether the machine may be cut.
+///
+/// The visible record is deliberately left where it is. No camera write has
+/// happened, so a later run finds the control already holding `original` and
+/// drops the record without touching anything.
 pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
-    save_at(&record_path(&record.filing_key()), record).map(|(path, _)| path)
+    let (path, durability) = save_at(&record_path(&record.filing_key()), record)?;
+    require_durable(path, durability)
+}
+
+/// The decision itself, separated from the write that produces it.
+///
+/// Nothing available here can make a directory `fsync` fail, so a test that goes
+/// through `save` cannot reach the rejecting arm and a mutant deleting it
+/// survives. `AtomicWrite` is a value, so the decision made ABOUT that value can
+/// be exercised directly even when the condition producing it cannot be staged.
+fn require_durable(
+    path: PathBuf,
+    durability: irlume_common::AtomicWrite,
+) -> Result<PathBuf, String> {
+    match durability {
+        irlume_common::AtomicWrite::Durable => Ok(path),
+        irlume_common::AtomicWrite::VisibleNotDurable(e) => Err(format!(
+            "write {}: the undo record became visible but could not be made durable: {e}",
+            path.display()
+        )),
+    }
 }
 
 /// Write a record to a PARTICULAR path.
@@ -798,8 +829,10 @@ pub(crate) fn save_at(
     // never wrote — both have happened here.
     let durability = irlume_common::write_atomic_reporting(&path, body.as_bytes(), 0o600)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
-    // After the fsync, so a line here means the record is durable — which is the
-    // property the ordering depends on, not merely that a write was issued.
+    // After the fsyncs, and it says which outcome it got rather than asserting
+    // one: the ordering depends on the record being DURABLE before the firmware
+    // write, so a transcript that cannot distinguish "durable" from "published,
+    // might not survive a power cut" cannot establish the thing it is read for.
     trace(&format!(
         "saved unit{}/sel{} original={} attempts={} ({})",
         record.unit,
@@ -1805,6 +1838,39 @@ mod tests {
             ),
             Restore::AlreadyRestored,
             "nothing to write, so writability does not matter"
+        );
+    }
+
+    /// The initial undo record's DURABILITY is what authorizes the first
+    /// firmware write, so a record that is merely visible must be an error.
+    ///
+    /// This is the regression for a fix that went too far: the attempt counter
+    /// genuinely may treat a published-but-not-durable record as counted, and
+    /// relaxing that at the shared helper handed the same licence to `save`,
+    /// where it means "write the camera even though the record can still be
+    /// lost" — the exact defect this module exists to prevent.
+    #[test]
+    fn a_record_that_is_visible_but_not_durable_does_not_authorize_a_write() {
+        let path = std::path::PathBuf::from("/var/lib/irlume/ir-emitter-journal/x.json");
+        assert_eq!(
+            super::require_durable(path.clone(), irlume_common::AtomicWrite::Durable),
+            Ok(path.clone()),
+            "an ordinary durable write is the normal path and must still pass"
+        );
+        let why = super::require_durable(
+            path,
+            irlume_common::AtomicWrite::VisibleNotDurable(std::io::Error::other("disk went away")),
+        )
+        .expect_err("a record that may not survive a power cut must NOT open discovery");
+        // The operator has to be able to tell this apart from an ordinary write
+        // failure: the file IS there, and that is the surprising part.
+        assert!(
+            why.contains("visible") && why.contains("durable"),
+            "the refusal must say the record is visible but not durable, got: {why}"
+        );
+        assert!(
+            why.contains("disk went away"),
+            "the underlying error must survive into the message, got: {why}"
         );
     }
 }

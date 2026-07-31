@@ -1744,6 +1744,22 @@ impl ExploratoryWrite {
         Ok(())
     }
 
+    /// Drop the record without touching the camera.
+    ///
+    /// For the one case where the record turns out to describe a state irlume
+    /// never got to act on: nothing has been written, so there is nothing to
+    /// undo, and leaving the record behind would make the next run refuse this
+    /// camera over a change that never happened.
+    fn abandon_before_write(&mut self) -> Result<(), String> {
+        debug_assert!(
+            !self.exploratory_value_is_live,
+            "abandoning after the exploratory write would strand the control"
+        );
+        crate::emitter_journal::clear(&self.record_path)?;
+        self.resolved = true;
+        Ok(())
+    }
+
     /// Put the original back, once.
     ///
     /// Disarms first either way: if this succeeds there is nothing left for
@@ -2600,6 +2616,33 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
 
     let mut pending = ExploratoryWrite::open(fd, id, unit, selector, len, &original, &wanted)
         .map_err(TryFailure::Journal)?;
+
+    // Read the control AGAIN, immediately before changing it.
+    //
+    // `original` was read before `intended_value`, before a whole baseline frame
+    // measurement, and before the record's create/write/fsync/rename/fsync. The
+    // per-camera flock excludes other irlume processes and nothing else: a
+    // vendor tool or any other UVC client can move this control inside that
+    // window. Recording a value that is no longer there means the restore later
+    // writes bytes irlume never found, which is precisely the "we do not undo
+    // somebody else's change" promise the rest of this file keeps. Recovery
+    // already re-reads for the same reason; discovery did not.
+    //
+    // The residual race is one syscall wide and cannot be closed here: the UVC
+    // interface offers GET_CUR and SET_CUR and no compare-and-set.
+    let now = get_cur(fd, unit, selector, len)?;
+    if now != original {
+        // Nothing has been written, so the record describes a change that never
+        // happened; drop it rather than leave the camera refused by the next run.
+        pending
+            .abandon_before_write()
+            .map_err(TryFailure::Journal)?;
+        return Ok(Attempt::NotUsable(format!(
+            "the control changed while setup was measuring: it held {original:02x?} \
+             when discovery began and {now:02x?} immediately before the write, so \
+             something else is driving it; nothing was sent"
+        )));
+    }
 
     if abort_requested() {
         return Err(TryFailure::Measurement);
@@ -4054,6 +4097,81 @@ mod tests {
                 .count()
                 >= 2,
             "the control must be re-read immediately before the write: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Somebody else moves the control while setup is measuring, and setup
+    /// notices BEFORE it writes.
+    ///
+    /// `original` is read, then `intended_value` runs, then a whole baseline
+    /// frame measurement, then the record's create/write/fsync/rename/fsync. The
+    /// per-camera flock excludes other irlume processes and nothing else, so a
+    /// vendor tool can move the control anywhere inside that window. Recording a
+    /// value that is no longer there means the eventual restore writes bytes
+    /// irlume never found on this camera, which is the one thing the rest of
+    /// this file promises not to do. Recovery already re-read for exactly this
+    /// reason; discovery did not.
+    #[test]
+    fn discovery_refuses_when_the_control_moved_while_it_was_measuring() {
+        let _lock = crate::testenv::env_lock();
+        let camera = fake_camera::Camera {
+            // The first GET_CUR answers [1,3,1] and THEN the control moves, so
+            // the re-read immediately before the write is what sees it.
+            change_after_gets: Some((1, vec![1, 3, 3])),
+            ..a_working_camera()
+        };
+        let (outcome, log, current, dir) =
+            run_discovery(camera, "moved-while-measuring", || Some(50.0));
+
+        match outcome {
+            Ok(Attempt::NotUsable(why)) => {
+                assert!(
+                    why.contains("changed while setup was measuring"),
+                    "the refusal must name what happened, got: {why}"
+                );
+                assert!(
+                    why.contains("nothing was sent"),
+                    "and must say the camera was left alone, got: {why}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // The whole point: not one byte reached the camera.
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set { .. })),
+            "nothing may be written once the control is known to have moved: {log:?}"
+        );
+        assert_eq!(
+            current,
+            vec![1, 3, 3],
+            "the other writer's value must be left exactly as it was found"
+        );
+        // The re-read has to have actually happened, or this passed for the
+        // wrong reason.
+        assert!(
+            log.iter()
+                .filter(|r| matches!(
+                    r,
+                    fake_camera::Request::Get {
+                        query: UVC_GET_CUR,
+                        ..
+                    }
+                ))
+                .count()
+                >= 2,
+            "the control must be re-read immediately before the write: {log:?}"
+        );
+        // And the record is gone, because nothing was written: leaving it would
+        // make the next run refuse this camera over a change never made.
+        let store = dir.join("ir-emitter-journal");
+        let left: Vec<_> = std::fs::read_dir(&store)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            left.is_empty(),
+            "no camera write happened, so no undo record may survive: {left:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

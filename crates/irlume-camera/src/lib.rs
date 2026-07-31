@@ -1869,8 +1869,14 @@ pub fn capture_ir_streaming<B>(
                 // kept until a replacement genuinely holds one; replacing it
                 // unconditionally would drop it armed and write the default
                 // under the stream that just reopened.
+                // `owns_restore`, not `lit`. The control survives the close, so
+                // the fresh `enable` usually finds the value already there and
+                // comes back ACTIVE but owning nothing. Handing ownership over
+                // on `lit` disarmed the guard that actually held the change and
+                // installed one with nothing to put back, so the capture ended
+                // without restoring at all.
                 let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
-                if fresh.lit() {
+                if fresh.owns_restore() {
                     mode.disarm();
                     mode = fresh;
                 }
@@ -1988,8 +1994,14 @@ pub fn capture_ir_sequence(
                 // kept until a replacement genuinely holds one; replacing it
                 // unconditionally would drop it armed and write the default
                 // under the stream that just reopened.
+                // `owns_restore`, not `lit`. The control survives the close, so
+                // the fresh `enable` usually finds the value already there and
+                // comes back ACTIVE but owning nothing. Handing ownership over
+                // on `lit` disarmed the guard that actually held the change and
+                // installed one with nothing to put back, so the capture ended
+                // without restoring at all.
                 let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
-                if fresh.lit() {
+                if fresh.owns_restore() {
                     mode.disarm();
                     mode = fresh;
                 }

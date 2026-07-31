@@ -996,6 +996,19 @@ impl StreamMode {
         self.armed = false;
     }
 
+    /// Whether this guard owns an outstanding change that still has to be put
+    /// back.
+    ///
+    /// NOT `lit`. That reports whether the control is ACTIVE, whoever set it,
+    /// and the two diverge exactly where it matters: a control found already
+    /// holding the wanted value is active and owns nothing. A caller deciding
+    /// which of two guards keeps the restore has to ask this one, and the
+    /// restart sites asked `lit` instead, so a replacement that wrote nothing
+    /// took ownership from the guard that had.
+    pub fn owns_restore(&self) -> bool {
+        self.armed
+    }
+
     /// Put the control back now, rather than waiting for the drop.
     ///
     /// Separated so the ordinary path can restore while it can still report a
@@ -4474,7 +4487,53 @@ mod tests {
         );
     }
 
-    /// Restoring twice writes once.
+    /// Ownership of the restore does not pass to a guard that owns nothing.
+    ///
+    /// The frozen-stream restart replaces the guard after reopening. The control
+    /// survives a stream close on both cameras here, so the replacement usually
+    /// finds the value already in place and comes back ACTIVE while owning
+    /// nothing. Deciding on `lit` handed ownership to it and disarmed the guard
+    /// that actually held the change, and the capture then ended without putting
+    /// the control back at all: the exact leak the restart logic exists to stop.
+    #[test]
+    fn ownership_of_the_restore_does_not_pass_to_a_guard_that_owns_nothing() {
+        let held = StreamMode {
+            fd: -1,
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            armed: true,
+            active: true,
+        };
+        // What `enable` returns on a reopen when the control survived: active,
+        // because the mode IS applied, and owning nothing, because it wrote
+        // nothing.
+        let already = StreamMode {
+            fd: -1,
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            armed: false,
+            active: true,
+        };
+        assert!(already.lit(), "the mode is active on the reopened stream");
+        assert!(
+            !already.owns_restore(),
+            "but it wrote nothing, so it owes no restore"
+        );
+        assert!(
+            held.owns_restore(),
+            "the original guard is the one holding the change"
+        );
+        // Deciding on `lit` would swap them, which is the defect.
+        assert_ne!(
+            already.lit(),
+            already.owns_restore(),
+            "lit and owns_restore must not be read as the same question"
+        );
+    }
+
+    /// Restoring twice writes once.    /// Restoring twice writes once.
     ///
     /// The ordinary path calls `restore` explicitly, so it can report a failure
     /// that `Drop` would have to swallow, and then the guard drops as well. The

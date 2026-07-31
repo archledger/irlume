@@ -1332,14 +1332,13 @@ impl IrSession<'_> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
-        let fd = self.cam.dev.handle().fd();
         let lit = self.lit;
         let stream = &mut self.stream;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
-        // frame, the lit strobe phase (linhello lesson). Re-fire mid-burst in case
-        // the control self-clears. Keep every frame so the optional ambient
-        // subtraction below can pair the lit frame with an adjacent emitter-off one.
+        // frame, the lit strobe phase (linhello lesson). Keep every frame so the
+        // optional ambient subtraction below can pair the lit frame with an
+        // adjacent emitter-off one.
         // Every frame is decoded to 8-bit GREY at dequeue, so the means, the
         // subtraction, and everything downstream see one uniform layout.
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
@@ -1356,10 +1355,16 @@ impl IrSession<'_> {
         if let Some(log) = meta.as_mut() {
             log.begin_burst();
         }
-        for i in 0..IR_BURST {
-            if i == IR_BURST / 2 {
-                ir_emitter::enable(fd, card, device);
-            }
+        // No re-fire mid-burst. The mode is set once before the stream starts,
+        // which is the sequence Microsoft documents and tests: set the property,
+        // start streaming, stop streaming, unset. Rewriting the control under a
+        // running stream is not part of it, and nothing published says which
+        // frame such a write first affects.
+        //
+        // The re-fire existed to make sure a lit frame landed in the burst. The
+        // camera answers that directly now, per frame, through the illumination
+        // metadata added in #167, so the guess is not needed to know the answer.
+        for _ in 0..IR_BURST {
             let (buf, bmeta) = stream.next().map_err(|e| map_io(device, e))?;
             stamps.push(bmeta.timestamp.sec * 1_000_000 + bmeta.timestamp.usec);
             taken.push(std::time::Instant::now());
@@ -1770,11 +1775,16 @@ pub fn capture_ir_streaming<B>(
     // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
     let (mut dead_run, mut restarts) = (0usize, 0usize);
     let mut last_sig: Option<Vec<u8>> = None;
-    for attempt in 0..max_frames {
-        // Keep the emitter lit across the whole window (some controls self-clear).
-        if attempt % 8 == 0 {
-            ir_emitter::enable(dev.handle().fd(), &card, device);
-        }
+    // Set once above, before the stream started, and not again inside the loop.
+    //
+    // This used to re-apply the control every eighth frame on the theory that
+    // "some controls self-clear". At the default consent budget that is ten more
+    // writes to camera firmware per watch, and `enable` is not a bare ioctl: each
+    // call re-reads the USB descriptors from sysfs and takes a lock to scan the
+    // undo journal on disk. Ten of those sit in the authentication path for a
+    // hypothesis the hardware can now be asked about directly, per frame, through
+    // the illumination metadata from #167.
+    for _ in 0..max_frames {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
         let taken = std::time::Instant::now();
         let data = dec.decode(buf, w, h);

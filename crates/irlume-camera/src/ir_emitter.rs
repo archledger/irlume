@@ -1050,6 +1050,16 @@ impl StreamMode {
         // Disarmed first either way. If this succeeds there is nothing left for
         // `Drop` to do; if it fails, `Drop` repeating a write the camera has
         // just refused is how #159 territory is entered.
+        //
+        // The early return above is DEFENCE IN DEPTH and a mutant deleting it
+        // survives the suite. That is not a missing test: the read-back below
+        // subsumes it. On a second call the control already holds `restore`,
+        // which is not `applied`, so the "somebody else moved it" arm leaves it
+        // alone and no write goes out either way. Kept rather than removed
+        // because it states the intent at the top of the function, where the next
+        // reader looks, and because a later change to the read-back would
+        // otherwise silently take the only thing stopping a double write. The
+        // mutant is recorded as unkillable by construction rather than dropped.
         self.armed = false;
 
         // Read it back before putting anything back. This guard knows what it

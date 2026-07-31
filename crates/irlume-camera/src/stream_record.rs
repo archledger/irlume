@@ -417,6 +417,11 @@ pub(crate) fn claim(
     }
     // The lock arrived after the open; make sure the name still means this
     // inode. A record replaced in between belongs to whoever replaced it.
+    // NOT covered by a test, and a mutant deleting it survives the suite:
+    // staging the condition needs another process's rename to land inside the
+    // instructions between our open and our flock, which nothing available
+    // here can arrange deterministically. The decision has no extractable
+    // value either — it IS the comparison.
     let (Ok(ours), Ok(named)) = (file.metadata(), std::fs::metadata(&path)) else {
         return None;
     };

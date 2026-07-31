@@ -187,48 +187,56 @@ pub(crate) struct StreamLock {
     _file: std::fs::File,
 }
 
-/// Take this camera's stream lock, or report why not.
+/// Why the stream lock was not acquired. The two answers demand OPPOSITE
+/// responses, and collapsing them was review round 4's finding: a busy lock
+/// is a LIVE irlume writer whose restore bookkeeping a second, unrecorded
+/// write would silently invalidate, so the write must be refused; an
+/// unavailable store is machine trouble with nobody contesting the camera,
+/// where refusing would turn a full disk into dark IR at every login.
+#[derive(Debug)]
+pub(crate) enum AcquireError {
+    /// Another live irlume guard holds this camera's lock.
+    Busy,
+    /// The lock could not be created, opened or taken for a reason other
+    /// than contention.
+    Unavailable(String),
+}
+
+/// Take this camera's stream lock, or say why not.
 ///
-/// `None` means another live irlume guard owns this camera's record right now
-/// — another process mid-capture, or this process's own previous guard during
-/// a frozen-stream restart (`flock` excludes per open file description, so a
-/// second open in the same process is refused too). The caller proceeds
-/// without bookkeeping; an error creating or opening the lock is reported and
-/// answered the same way, since a write that cannot be recorded is still a
-/// write worth making (see `write_if_different`).
-pub(crate) fn acquire(id: &CameraIdentity) -> Option<StreamLock> {
+/// `Busy` means another live irlume guard owns this camera right now —
+/// another process mid-capture, or this process's own previous guard
+/// (`flock` excludes per open file description, so a second open in the same
+/// process is refused too).
+pub(crate) fn acquire(id: &CameraIdentity) -> Result<StreamLock, AcquireError> {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::AsRawFd as _;
 
     let dir = store_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("irlume: cannot create {}: {e}", dir.display());
-        return None;
-    }
-    if let Err(e) = irlume_common::restrict(&dir, 0o700) {
-        eprintln!("irlume: {e}");
-        return None;
-    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AcquireError::Unavailable(format!("create {}: {e}", dir.display())))?;
+    irlume_common::restrict(&dir, 0o700).map_err(AcquireError::Unavailable)?;
     let path = lock_path(id);
-    let file = match std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .open(&path)
-    {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("irlume: cannot open {}: {e}", path.display());
-            return None;
-        }
-    };
+        .map_err(|e| AcquireError::Unavailable(format!("open {}: {e}", path.display())))?;
     // SAFETY: the fd is owned by `file`, which the returned guard keeps open.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return None;
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Err(AcquireError::Busy),
+            _ => Err(AcquireError::Unavailable(format!(
+                "lock {}: {e}",
+                path.display()
+            ))),
+        };
     }
-    Some(StreamLock { _file: file })
+    Ok(StreamLock { _file: file })
 }
 
 /// A live record: the file on disk, its parsed contents, and the stream lock

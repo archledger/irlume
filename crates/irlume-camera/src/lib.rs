@@ -1879,34 +1879,22 @@ pub fn capture_ir_streaming<B>(
                 dead_run = 0;
                 last_sig = None;
                 drop(stream); // stop + release buffers before re-arming
-                stream = SafeStream::open(device, &dev)?;
-                // The reopened stream needs the mode set again, and the OLD
-                // guard is only given up if the new one actually took. The
-                // measured behaviour on both cameras here is that the control
-                // survives a stream close, so the fresh `enable` can find the
-                // value still in place, send nothing, and come back unarmed.
-                // The restore then still belongs to the old guard, which is
-                // kept until a replacement genuinely holds one; replacing it
-                // unconditionally would drop it armed and write the default
-                // under the stream that just reopened.
-                // `owns_restore`, not `lit`. The control survives the close, so
-                // the fresh `enable` usually finds the value already there and
-                // comes back ACTIVE but owning nothing. Handing ownership over
-                // on `lit` disarmed the guard that actually held the change and
-                // installed one with nothing to put back, so the capture ended
-                // without restoring at all. The stream record's lock now
-                // enforces the same answer: while the old guard lives, its
-                // leftover record cannot be claimed, so the fresh `enable`
-                // cannot arm off the record either.
-                let mut fresh = ir_emitter::enable(dev.handle(), &card, device);
-                if fresh.owns_restore() {
-                    mode.disarm();
-                    // The old guard held the per-camera stream lock, so the
-                    // fresh one wrote unrecorded; the outstanding change and
-                    // its on-disk record move over together (#188).
-                    fresh.adopt_record(mode.take_record());
-                    mode = fresh;
+                              // The OLD guard restores BEFORE the reopen. Its stream is
+                              // already gone, and while the guard lives it holds the
+                              // per-camera stream lock, which would make the fresh `enable`
+                              // refuse to drive the emitter at all — the lock refuses
+                              // contested writes rather than allowing an unrecorded one
+                              // (#188, review round 4). Restoring here cannot write under
+                              // the new stream either, because it happens before the fresh
+                              // apply. Earlier versions kept the old guard armed across the
+                              // reopen and negotiated ownership afterwards; the cost of
+                              // this simpler shape is one restore/apply pair per restart,
+                              // and restarts are the exception, not the path.
+                if let Err(e) = mode.restore() {
+                    eprintln!("irlume: restoring the emitter before a stream restart: {e}");
                 }
+                stream = SafeStream::open(device, &dev)?;
+                mode = ir_emitter::enable(dev.handle(), &card, device);
             }
             continue;
         }
@@ -2016,34 +2004,22 @@ pub fn capture_ir_sequence(
                 dead_run = 0;
                 last_sig = None;
                 drop(stream.take()); // stop + release buffers before re-arming
-                stream = Some(SafeStream::open(device, &dev)?);
-                // The reopened stream needs the mode set again, and the OLD
-                // guard is only given up if the new one actually took. The
-                // measured behaviour on both cameras here is that the control
-                // survives a stream close, so the fresh `enable` can find the
-                // value still in place, send nothing, and come back unarmed.
-                // The restore then still belongs to the old guard, which is
-                // kept until a replacement genuinely holds one; replacing it
-                // unconditionally would drop it armed and write the default
-                // under the stream that just reopened.
-                // `owns_restore`, not `lit`. The control survives the close, so
-                // the fresh `enable` usually finds the value already there and
-                // comes back ACTIVE but owning nothing. Handing ownership over
-                // on `lit` disarmed the guard that actually held the change and
-                // installed one with nothing to put back, so the capture ended
-                // without restoring at all. The stream record's lock now
-                // enforces the same answer: while the old guard lives, its
-                // leftover record cannot be claimed, so the fresh `enable`
-                // cannot arm off the record either.
-                let mut fresh = ir_emitter::enable(dev.handle(), &card, device);
-                if fresh.owns_restore() {
-                    mode.disarm();
-                    // The old guard held the per-camera stream lock, so the
-                    // fresh one wrote unrecorded; the outstanding change and
-                    // its on-disk record move over together (#188).
-                    fresh.adopt_record(mode.take_record());
-                    mode = fresh;
+                                     // The OLD guard restores BEFORE the reopen. Its stream is
+                                     // already gone, and while the guard lives it holds the
+                                     // per-camera stream lock, which would make the fresh `enable`
+                                     // refuse to drive the emitter at all — the lock refuses
+                                     // contested writes rather than allowing an unrecorded one
+                                     // (#188, review round 4). Restoring here cannot write under
+                                     // the new stream either, because it happens before the fresh
+                                     // apply. Earlier versions kept the old guard armed across the
+                                     // reopen and negotiated ownership afterwards; the cost of
+                                     // this simpler shape is one restore/apply pair per restart,
+                                     // and restarts are the exception, not the path.
+                if let Err(e) = mode.restore() {
+                    eprintln!("irlume: restoring the emitter before a stream restart: {e}");
                 }
+                stream = Some(SafeStream::open(device, &dev)?);
+                mode = ir_emitter::enable(dev.handle(), &card, device);
             }
             continue;
         }

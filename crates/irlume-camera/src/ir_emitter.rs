@@ -879,7 +879,31 @@ fn write_if_different(
     wanted: &[u8],
     id: &crate::uvc_descriptor::CameraIdentity,
 ) -> XuResult<CaptureWrite> {
-    let lock = crate::stream_record::acquire(id);
+    let lock = match crate::stream_record::acquire(id) {
+        Ok(lock) => Some(lock),
+        // A LIVE irlume guard owns this camera. Writing anyway — even
+        // unrecorded — is what review round 4 caught: the owner's restore
+        // would read the newcomer's bytes as "somebody else's", discard the
+        // only record, and the newcomer's own restore would then put the
+        // OWNER'S value back instead of the original. Nothing is sent at
+        // all; the control keeps whatever the live owner is doing with it.
+        Err(crate::stream_record::AcquireError::Busy) => {
+            eprintln!(
+                "irlume: not driving unit{unit}/sel{selector}: another live irlume stream \
+                 owns this camera's emitter"
+            );
+            return Ok(CaptureWrite::refused());
+        }
+        // Machine trouble, nobody contesting: proceed without bookkeeping,
+        // the same degradation as an unwritable record.
+        Err(crate::stream_record::AcquireError::Unavailable(why)) => {
+            eprintln!(
+                "irlume: cannot lock unit{unit}/sel{selector}'s emitter bookkeeping ({why}); \
+                 driving the emitter without crash recovery"
+            );
+            None
+        }
+    };
     let current = get_cur(fd, unit, selector, len)?;
     if current == *wanted {
         // Said distinctly from `Wrote` because the two diverge at stream end:
@@ -907,10 +931,8 @@ fn write_if_different(
                 }
             }
         }
-        // Another live irlume guard owns this camera's bookkeeping. Its lock
-        // is the exclusion that keeps two records from replacing each other;
-        // this write proceeds without one, degraded exactly as a save failure
-        // is. Quiet: the frozen-stream restart lands here at every reopen.
+        // The store is unusable (reported above); nobody contests the
+        // camera, so the write proceeds without bookkeeping.
         None => None,
     };
     if set_cur(fd, unit, selector, wanted).is_ok() {
@@ -1270,39 +1292,13 @@ impl StreamMode {
     /// the replacement is armed, and an unarmed replacement leaves the old guard
     /// to put the value back.
     ///
-    /// The leftover record is NOT resolved here: the change it describes is
-    /// still outstanding, now owned by the replacement. The caller moves the
-    /// record across with `take_record`, because the
-    /// replacement cannot have one of its own — this guard held the
-    /// per-camera stream lock the whole time (#188).
+    /// The leftover record is NOT resolved here: giving up the restore gives
+    /// up the bookkeeping with it, and dropping this guard then releases the
+    /// lock and leaves the file — which no longer matters, because since
+    /// review round 4 no second guard can have WRITTEN while this one lived,
+    /// so a disarmed guard's record describes a change nobody made twice.
     pub fn disarm(&mut self) {
         self.armed = false;
-    }
-
-    /// Take the leftover record (and the stream lock inside it) out of this
-    /// guard, for handing to the replacement that now owns the restore.
-    pub(crate) fn take_record(&mut self) -> Option<crate::stream_record::StreamRecord> {
-        self.record.take()
-    }
-
-    /// Install a record handed over from the guard this one replaces.
-    ///
-    /// Only for the frozen-stream restart: the old guard held the stream lock,
-    /// so this replacement wrote UNRECORDED and its `record` is `None`; the
-    /// old record still describes the outstanding change (same control, same
-    /// applied bytes — the replacement re-derives the same mode). The one
-    /// divergence is the displaced value: this guard restores its own
-    /// in-memory reading, while a claim after a crash restores the record's,
-    /// which is the ORIGINAL pre-irlume value from before the first apply.
-    /// Older truth, device-derived either way.
-    ///
-    /// A replacement that somehow has its own record keeps it: the handed-in
-    /// one is the stale of the two, and dropping it unresolved releases the
-    /// lock while leaving the newer bookkeeping in place.
-    pub(crate) fn adopt_record(&mut self, record: Option<crate::stream_record::StreamRecord>) {
-        if self.record.is_none() {
-            self.record = record;
-        }
     }
 
     /// Whether this guard owns an outstanding change that still has to be put
@@ -5438,8 +5434,11 @@ mod tests {
         // within one process too, which is what the frozen-stream restart
         // leans on.
         assert!(
-            crate::stream_record::acquire(&asus).is_none(),
-            "the stream lock must be refused while its owner lives"
+            matches!(
+                crate::stream_record::acquire(&asus),
+                Err(crate::stream_record::AcquireError::Busy)
+            ),
+            "the stream lock must be refused as BUSY while its owner lives"
         );
 
         // The crash: lock released, file kept, control still holding the mode.
@@ -5668,6 +5667,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A write contested by a LIVE irlume guard is refused outright, not made
+    /// unrecorded (#188, review round 4). An unrecorded second write would
+    /// make the owner's restore read the newcomer's bytes as another
+    /// program's, discard the only record, and the newcomer would then
+    /// restore the OWNER'S value instead of the original: the camera ends at
+    /// a value neither stream found, with nothing left to say so.
+    #[test]
+    fn a_contested_write_is_refused_not_made_unrecorded() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        // The live owner, holding the camera's stream lock.
+        let owner = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let _fake = fake_camera::install(a_working_camera());
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("a busy refusal is not an ioctl error");
+        assert_eq!(write.outcome, Applied::Nothing);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may reach a camera a live guard owns: {:?}",
+            fake_camera::log()
+        );
+        assert!(
+            !fake_camera::log().iter().any(|r| matches!(
+                r,
+                fake_camera::Request::Get {
+                    query: UVC_GET_CUR,
+                    ..
+                }
+            )),
+            "the control is not even read once the lock reports a live owner: {:?}",
+            fake_camera::log()
+        );
+        drop(owner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A value somebody else set is left alone: same bytes, no record, no
     /// claim, no write (#188).
     #[test]
@@ -5723,7 +5763,7 @@ mod tests {
             ;
         for attempt in 1..=crate::stream_record::MAX_RESTORE_ATTEMPTS {
             let lock = crate::stream_record::acquire(&asus)
-                .unwrap_or_else(|| panic!("the lock is free before claim {attempt}"));
+                .unwrap_or_else(|_| panic!("the lock is free before claim {attempt}"));
             let (_, record) = crate::stream_record::claim(lock, &asus, 14, 6, &[1, 3, 2])
                 .unwrap_or_else(|| panic!("claim {attempt} is within the limit"));
             // Every restore "fails": the record handle drops unresolved, as

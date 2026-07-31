@@ -14,9 +14,9 @@
 # prints unrecognised as that number.
 set -uo pipefail
 
-TREE=/tmp/irl-emitter-hw
-IR=/dev/video2
-RGB=/dev/video0
+TREE="${1:-/tmp/irl-emitter-hw}"
+IR="${2:-/dev/video2}"
+RGB="${3:-/dev/video0}"
 OUT=/tmp/emitter-strace
 SOCK=/run/irlume-strace.sock
 STATE=/var/lib/irlume-stracetest

@@ -946,12 +946,17 @@ impl StreamMode {
     /// Give up the restore without writing anything.
     ///
     /// For one case only: the stream this guard was set for has been torn down
-    /// and reopened. These modules reset the control per open, so there is
-    /// nothing left to put back for the old stream, and a fresh guard covers the
-    /// new one. Restoring here instead would be a write to a control the reopen
-    /// already reset, and reassigning without it would drop the OLD guard after
-    /// the new `enable` had run, writing the default straight over the value
-    /// just set.
+    /// and reopened, and a FRESH guard has taken over the same control.
+    ///
+    /// Without this, reassigning would drop the old guard after the new `enable`
+    /// had already run, writing the default straight over the value just set.
+    ///
+    /// An earlier version of this comment justified it with "these modules reset
+    /// the control per open". That is not what this project measured: the record
+    /// in `IrCamera::session` says the control survives stream close and process
+    /// exit on both cameras here. So the caller gives the old guard up only when
+    /// the replacement is armed, and an unarmed replacement leaves the old guard
+    /// to put the value back.
     pub fn disarm(&mut self) {
         self.armed = false;
     }
@@ -1274,10 +1279,15 @@ fn override_memo() -> &'static OverrideMemo {
 /// camera per process, and only with the evidence every other write here
 /// requires.
 ///
-/// The record bounds the WRITES. It is not used as an answer about the camera's
-/// present state: a remembered success re-reads `GET_CUR` and reports whether
-/// the control still holds the payload, because "we wrote this once" and "this
-/// is set now" stop being the same statement the moment a camera resets.
+/// The record bounds the CHECKS, not the writes. A remembered success means this
+/// payload was already validated against this camera's descriptors, so the
+/// checks and the refusal message do not run again; the value is still applied
+/// for each new stream, because the mode is restored when the previous one
+/// ended and the control is sitting at the camera's default.
+///
+/// It used to answer from a `GET_CUR` read-back instead, which was right while
+/// irlume left the mode set for the life of the process. Under a per-stream
+/// lifecycle that reported every stream after the first as dark.
 ///
 /// The override is still an escape hatch: the unit may be a vendor's, and the
 /// bytes are the person's rather than the camera's own `GET_DEF`. What it no
@@ -1336,23 +1346,31 @@ fn apply_override(
         // the traffic the record exists to stop, and the answer is "no" either
         // way.
         Reuse::Answer(false) => return false,
-        // A remembered SUCCESS is not repeated back. It says a write happened,
-        // which is not the same as the control holding that value now, and the
-        // gap between them is real: a camera that resets or re-enumerates can
-        // land on the same device number with the same USB id and interface, and
-        // returning the old `true` would claim an emitter is lit on a control
-        // nothing has set. Callers use this answer to decide whether to tell the
-        // user their infrared is dark.
+        // A remembered SUCCESS says this payload was checked against this
+        // camera's descriptors and accepted. It does NOT say the control still
+        // holds it, and since the mode is now restored when each stream ends it
+        // usually does not: the next stream finds the camera's default there.
         //
-        // So the record is used for what it is good for, which is not writing
-        // again, and the current state is read rather than assumed. If the
-        // control has drifted, the honest answer is that the emitter is not on;
-        // writing it back would be the second write this whole change exists to
-        // prevent.
+        // Reading it back and reporting the difference as "the emitter is not
+        // on" was right while irlume left the control set for the life of the
+        // process. With a per-stream lifecycle it means the first stream in a
+        // daemon lights and every later one runs dark, which on a machine that
+        // authenticates in the dark is a lockout.
+        //
+        // So the memo is used for what it is good for, which is not re-running
+        // the descriptor checks and the refusal message, and the value is
+        // applied again for this stream. That is one write per stream, which is
+        // the documented sequence, not the repeated writing this change removes.
         Reuse::Answer(true) => {
-            return match get_cur(fd, ctrl.unit, ctrl.selector, ctrl.payload.len()) {
-                Ok(current) => current == ctrl.payload,
-                Err(_) => false,
+            return match check_and_apply_override(fd, id, ctrl) {
+                Ok(applied) => applied,
+                Err(why) => {
+                    eprintln!(
+                        "irlume: refusing IRLUME_IR_EMITTER={}: {why}",
+                        ctrl.encode()
+                    );
+                    false
+                }
             }
         }
         Reuse::RefuseChanged => {
@@ -4430,7 +4448,7 @@ mod tests {
         assert_eq!(fake_camera::current(), vec![1, 3, 1]);
     }
 
-    /// `disarm` gives up the restore without writing, for the one case that    /// `disarm` gives up the restore without writing, for the one case that
+    /// `disarm` gives up the restore without writing, for the one case that
     /// needs it: the stream the guard was set for has been torn down and
     /// reopened, so a fresh guard covers the new one.
     #[test]
@@ -4458,7 +4476,6 @@ mod tests {
     }
 
     /// Somebody else moves the control while setup is measuring, and setup
-    /// notices BEFORE it writes.    /// Somebody else moves the control while setup is measuring, and setup
     /// notices BEFORE it writes.
     ///
     /// `original` is read, then `intended_value` runs, then a whole baseline

@@ -1017,9 +1017,11 @@ impl StreamMode {
 
     /// Put the control back now, rather than waiting for the drop.
     ///
-    /// Separated so the ordinary path can restore while it can still report a
-    /// failure. `Drop` cannot return anything, so a restore that only ever
-    /// happened there would fail silently.
+    /// Public so a caller that wants to put the control back while it can still
+    /// REPORT a failure has somewhere to do it. Nothing in production takes that
+    /// route today: every restore currently goes through `Drop`, which cannot
+    /// return anything and so can only print. Saying otherwise would describe an
+    /// error path that does not exist.
     pub fn restore(&mut self) -> XuResult<()> {
         if !self.armed {
             return Ok(());

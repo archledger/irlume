@@ -2009,22 +2009,46 @@ fn recover_pending_write_locked(
             //
             // A syscall-sized window remains and cannot be closed here: UVC
             // offers no compare-and-set. What is claimed is narrowed to match.
+            // A pass that decides NOT to write must not spend an attempt. The
+            // counter means "times the original was written back", and three
+            // refusals that touched nothing would otherwise exhaust the budget
+            // and leave the emitter off for good over writes that never
+            // happened. The count is put back before returning.
+            //
+            // Rolling back can itself fail, and then the count stays high. That
+            // direction is the safe one: too few retries leaves a reported,
+            // recoverable record, while too many is what the budget exists to
+            // prevent.
+            let give_back = |outcome: RecoveryOutcome| -> RecoveryOutcome {
+                match journal::save_at(&record_path, &record) {
+                    Ok(_) => outcome,
+                    Err(why) => RecoveryOutcome::Unresolved(format!(
+                        "{}; and the unused attempt could not be given back ({why})",
+                        match &outcome {
+                            RecoveryOutcome::Unresolved(w) => w.clone(),
+                            other => format!("{other:?}"),
+                        }
+                    )),
+                }
+            };
             let attempted = match journal::from_hex(&record.attempted) {
                 Ok(bytes) => bytes,
-                Err(why) => return RecoveryOutcome::Unresolved(format!("attempted: {why}")),
+                Err(why) => {
+                    return give_back(RecoveryOutcome::Unresolved(format!("attempted: {why}")))
+                }
             };
             match get_cur(fd, record.unit, record.selector, original.len()) {
                 Ok(now) if now == attempted => {}
                 Ok(now) => {
-                    return RecoveryOutcome::Unresolved(format!(
+                    return give_back(RecoveryOutcome::Unresolved(format!(
                         "the control changed while the attempt was being recorded: it holds \
                          {now:02x?}, not this run's value {attempted:02x?}; nothing was written"
-                    ))
+                    )))
                 }
                 Err(e) => {
-                    return RecoveryOutcome::Unresolved(format!(
+                    return give_back(RecoveryOutcome::Unresolved(format!(
                         "recheck the control before restoring it: {e}"
-                    ))
+                    )))
                 }
             }
 
@@ -4103,6 +4127,81 @@ mod tests {
         assert_eq!(
             left, 0,
             "one operation must not leave a second record behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal that writes nothing does not spend an attempt.
+    ///
+    /// The counter is incremented before the write so a kill during the write is
+    /// counted. But the re-read that follows can refuse, and then nothing was
+    /// written: three such passes would exhaust the budget and leave the emitter
+    /// off for good over writes that never happened. The count goes back.
+    #[test]
+    fn a_refusal_that_writes_nothing_gives_the_attempt_back() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-attempt-giveback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        let record = crate::emitter_journal::PendingWrite {
+            schema_version: crate::emitter_journal::SCHEMA_VERSION,
+            engine_version: "test".into(),
+            descriptor_sha256: crate::emitter_journal::fingerprint(&id),
+            usb_id: id.usb_id(),
+            interface_number: id.interface_number,
+            unit: ms.unit_id,
+            selector,
+            len: 3,
+            original: crate::emitter_journal::to_hex(&[1, 3, 1]),
+            attempted: crate::emitter_journal::to_hex(&[1, 3, 2]),
+            restore_attempts: 0,
+            boot_id: None,
+            pid: None,
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
+        };
+        let path = crate::emitter_journal::save(&record).expect("plant");
+
+        // Authorises on the first read, then something else moves the control
+        // before the re-read.
+        let camera = fake_camera::Camera {
+            current: vec![1, 3, 2],
+            change_after_gets: Some((1, vec![1, 3, 3])),
+            ..a_working_camera()
+        };
+        let _fake = fake_camera::install(camera);
+
+        let outcome = recover_pending_write(-1, &id);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Unresolved(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "nothing was written, so nothing should have been spent"
+        );
+
+        let after: crate::emitter_journal::PendingWrite =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("parse");
+        assert_eq!(
+            after.restore_attempts, 0,
+            "an attempt that wrote nothing must be given back"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

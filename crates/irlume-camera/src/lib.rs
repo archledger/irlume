@@ -1327,7 +1327,7 @@ impl IrCamera {
         // Held for the session rather than just applied: dropping `IrSession`
         // puts the control back to the camera's own default, which is the
         // documented sequence's last step and the half irlume never did.
-        mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
+        mode = ir_emitter::enable(self.dev.handle(), &self.card, &self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream)?;
@@ -1733,7 +1733,7 @@ pub mod ir_probe {
         // lands before streaming starts.
         let mode;
         let mut stream = super::SafeStream::open(device, &dev)?;
-        mode = ir_emitter::enable(dev.handle().fd(), &card, device);
+        mode = ir_emitter::enable(dev.handle(), &card, device);
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
@@ -1834,7 +1834,7 @@ pub fn capture_ir_streaming<B>(
     // lands before streaming starts.
     let mut mode;
     let mut stream = SafeStream::open(device, &dev)?;
-    mode = ir_emitter::enable(dev.handle().fd(), &card, device);
+    mode = ir_emitter::enable(dev.handle(), &card, device);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
     // constant mid-grey for the rest of the window); real sensor noise never
@@ -1894,7 +1894,7 @@ pub fn capture_ir_streaming<B>(
                 // on `lit` disarmed the guard that actually held the change and
                 // installed one with nothing to put back, so the capture ended
                 // without restoring at all.
-                let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
+                let fresh = ir_emitter::enable(dev.handle(), &card, device);
                 if fresh.owns_restore() {
                     mode.disarm();
                     mode = fresh;
@@ -1963,7 +1963,7 @@ pub fn capture_ir_sequence(
     // lands before streaming starts.
     let mut mode;
     let mut stream = Some(SafeStream::open(device, &dev)?);
-    mode = ir_emitter::enable(dev.handle().fd(), &card, device);
+    mode = ir_emitter::enable(dev.handle(), &card, device);
     // Set once above and not re-applied inside the loop. This path also carried
     // an every-eighth-frame re-fire; it went for the same reason, and with the
     // same caveat: the justification is the MEASURED record in
@@ -2024,7 +2024,7 @@ pub fn capture_ir_sequence(
                 // on `lit` disarmed the guard that actually held the change and
                 // installed one with nothing to put back, so the capture ended
                 // without restoring at all.
-                let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
+                let fresh = ir_emitter::enable(dev.handle(), &card, device);
                 if fresh.owns_restore() {
                     mode.disarm();
                     mode = fresh;

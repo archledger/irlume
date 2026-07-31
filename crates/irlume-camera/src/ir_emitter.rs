@@ -777,8 +777,17 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 /// fails validation, which happens before any ioctl. Once a `SET_CUR` has been
 /// sent, its result is the answer: sending a second payload to a camera that just
 /// failed to accept the first is how the search in #159 kept going.
-pub fn enable(fd: c_int, card: &str, device: &str) -> StreamMode {
+///
+/// Takes the `Arc<Handle>` from `v4l::Device::handle()` rather than the raw fd
+/// it wraps. The guard writes to this descriptor when the stream ends, and a
+/// bare integer permitted the device to be dropped first, the number recycled
+/// by the next `open`, and the restore delivered to whatever now holds it —
+/// hardware-target substitution through the API of the type that exists to
+/// prevent it (#189). Holding the `Arc` makes the descriptor outlive the guard
+/// by construction.
+pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &str) -> StreamMode {
     let _ = (card, device);
+    let fd = handle.fd();
     let setting = override_setting(std::env::var("IRLUME_IR_EMITTER"));
     let wanted = match setting {
         OverrideSetting::Disabled => return StreamMode::inert(),
@@ -920,7 +929,7 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> StreamMode {
         },
     };
     StreamMode {
-        fd,
+        handle: Some(handle),
         unit,
         selector,
         restore,
@@ -954,7 +963,12 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> StreamMode {
 /// cancelled request. Same reason the undo record in #183 restores from `Drop`.
 #[must_use = "dropping this immediately puts the control back and leaves the stream unlit"]
 pub struct StreamMode {
-    fd: c_int,
+    /// The open camera the mode was applied through, kept alive for as long as
+    /// this guard can write to it. `None` only for a guard over nothing, which
+    /// never writes. A raw `c_int` here let a caller drop the `v4l::Device`
+    /// first and have the restore land on whatever `open` handed the recycled
+    /// number to next (#189); the `Arc` removes that state from the API.
+    handle: Option<std::sync::Arc<v4l::device::Handle>>,
     unit: u8,
     selector: u8,
     /// What the control HELD before irlume touched it, captured before the first
@@ -985,7 +999,7 @@ impl StreamMode {
     /// write `let _ = ...` and silently discard a guard that DID hold a control.
     fn inert() -> Self {
         StreamMode {
-            fd: -1,
+            handle: None,
             unit: 0,
             selector: 0,
             restore: Vec::new(),
@@ -993,6 +1007,14 @@ impl StreamMode {
             armed: false,
             active: false,
         }
+    }
+
+    /// The descriptor the restore goes to, or -1 for a guard holding no camera.
+    ///
+    /// -1 is unreachable from an armed guard: `enable` is the only place that
+    /// arms one, and it always installs the handle it wrote through.
+    fn fd(&self) -> c_int {
+        self.handle.as_ref().map_or(-1, |h| h.fd())
     }
 
     /// Whether the emitter control is active for this stream, whoever set it.
@@ -1072,7 +1094,7 @@ impl StreamMode {
         //
         // A control that no longer holds this guard's value is left alone. The
         // change irlume made is already gone, so there is nothing of its to undo.
-        match get_cur(self.fd, self.unit, self.selector, self.applied.len()) {
+        match get_cur(self.fd(), self.unit, self.selector, self.applied.len()) {
             Ok(now) if now != self.applied => {
                 eprintln!(
                     "irlume: leaving unit{}/sel{} at {:02x?}: it no longer holds what irlume \
@@ -1084,7 +1106,7 @@ impl StreamMode {
             // Unreadable is not evidence that somebody else owns it, and leaving
             // a mode applied because one GET_CUR failed is the worse of the two
             // errors. Fall through and restore.
-            _ => set_cur(self.fd, self.unit, self.selector, &self.restore),
+            _ => set_cur(self.fd(), self.unit, self.selector, &self.restore),
         }
     }
 }
@@ -4508,7 +4530,7 @@ mod tests {
         });
         {
             let _mode = StreamMode {
-                fd: -1,
+                handle: None,
                 unit: 14,
                 selector: 6,
                 restore: vec![1, 3, 1],
@@ -4545,7 +4567,7 @@ mod tests {
         });
         drop(StreamMode::inert());
         drop(StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4578,7 +4600,7 @@ mod tests {
     #[test]
     fn ownership_of_the_restore_does_not_pass_to_a_guard_that_owns_nothing() {
         let held = StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4590,7 +4612,7 @@ mod tests {
         // because the mode IS applied, and owning nothing, because it wrote
         // nothing.
         let already = StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4640,7 +4662,7 @@ mod tests {
         // The guard as `enable` now builds it: restore is what the control HELD,
         // not what the camera calls its default.
         let mut mode = StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: theirs.clone(),
@@ -4678,7 +4700,7 @@ mod tests {
             ..a_working_camera()
         });
         let mut mode = StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4724,7 +4746,7 @@ mod tests {
             ..a_working_camera()
         });
         let mut mode = StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4764,7 +4786,7 @@ mod tests {
             ..a_working_camera()
         });
         let mut mode = StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4817,7 +4839,7 @@ mod tests {
         // The guard, armed the way `enable` arms it: only for `Wrote`. Its end
         // must leave the other writer's bytes exactly where they were.
         drop(StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4921,7 +4943,7 @@ mod tests {
         // The guard, armed the way `enable` arms it: the write went out, but
         // it carried the restore bytes, so nothing is outstanding.
         drop(StreamMode {
-            fd: -1,
+            handle: None,
             unit: 14,
             selector: crate::uvc_descriptor::MSXU_IR_TORCH,
             restore: def.clone(),
@@ -5330,6 +5352,18 @@ mod tests {
         std::fs::File::open("/dev/null").expect("open /dev/null")
     }
 
+    /// A real `Arc<Handle>` over a node that is not a UVC camera.
+    ///
+    /// `Device::with_path` is a plain `open(2)` with no ioctl, so `/dev/null`
+    /// serves. The point is the TYPE: `enable` no longer accepts a bare
+    /// integer, so a test reaches it the same way production does, through a
+    /// handle that keeps the descriptor alive.
+    fn non_uvc_handle() -> std::sync::Arc<v4l::device::Handle> {
+        v4l::Device::with_path("/dev/null")
+            .expect("open /dev/null")
+            .handle()
+    }
+
     #[test]
     fn parse_control_accepts_decimal_and_hex() {
         assert_eq!(
@@ -5541,25 +5575,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Point the conf away from any real /var/lib/irlume install.
         std::env::set_var("IRLUME_IR_EMITTER_CONF", dir.join("none.conf"));
-        let f = non_uvc_fd();
-        use std::os::fd::AsRawFd;
-        let fd = f.as_raw_fd();
+        let h = non_uvc_handle();
 
         // `off`/`none` disable before any control lookup or ioctl.
         std::env::set_var("IRLUME_IR_EMITTER", "off");
-        assert!(!enable(fd, "ASUS", DEV).lit());
+        assert!(!enable(h.clone(), "ASUS", DEV).lit());
         std::env::set_var("IRLUME_IR_EMITTER", "none");
-        assert!(!enable(fd, "ASUS", DEV).lit());
+        assert!(!enable(h.clone(), "ASUS", DEV).lit());
         // A valid env control is parsed, but SET_CUR on a non-UVC fd fails.
         std::env::set_var("IRLUME_IR_EMITTER", "14:6:1,3,2");
-        assert!(!enable(fd, "whatever", DEV).lit());
+        assert!(!enable(h.clone(), "whatever", DEV).lit());
         std::env::remove_var("IRLUME_IR_EMITTER");
         // The card string is no longer consulted at all; identity comes from
         // the USB IDs, and DEV does not exist, so nothing is applied.
-        assert!(!enable(fd, "Some Unknown Cam", DEV).lit());
+        assert!(!enable(h.clone(), "Some Unknown Cam", DEV).lit());
         // A table entry now requires the USB identity to match AND the
         // descriptor to confirm the unit, neither of which a fake path offers.
-        assert!(!enable(fd, "ASUS", DEV).lit());
+        assert!(!enable(h.clone(), "ASUS", DEV).lit());
         // A persisted control naming an undocumented unit is refused: this is
         // the migration path that stops pre-0.7.1 configs from writing.
         save_conf(
@@ -5571,7 +5603,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!enable(fd, "Some Unknown Cam", DEV).lit());
+        assert!(!enable(h.clone(), "Some Unknown Cam", DEV).lit());
 
         std::env::remove_var("IRLUME_IR_EMITTER_CONF");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5956,14 +5988,13 @@ mod tests {
     /// other tests that could reach a write, and the assertion is on the delta.
     #[test]
     fn a_set_override_writes_nothing_when_the_descriptor_cannot_be_read() {
-        use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering::SeqCst;
 
         let _g = env_guard();
-        let f = non_uvc_fd();
+        let h = non_uvc_handle();
         std::env::set_var("IRLUME_IR_EMITTER", "14:6:1,3,2,0,0,0,0,0,0");
         let before = writes_attempted().load(SeqCst);
-        let applied = enable(f.as_raw_fd(), "ASUS FHD webcam", "/dev/irlume-test-missing");
+        let applied = enable(h, "ASUS FHD webcam", "/dev/irlume-test-missing");
         let sent = writes_attempted().load(SeqCst) - before;
         std::env::remove_var("IRLUME_IR_EMITTER");
 

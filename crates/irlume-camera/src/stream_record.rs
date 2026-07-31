@@ -259,9 +259,17 @@ impl StreamRecord {
     /// leftover is real again, so the record must be claimable again. On
     /// failure the record stays `prepared` on disk: reported, unclaimable,
     /// and the safe direction.
-    pub(crate) fn mark_applied(mut self) -> Result<Self, String> {
+    pub(crate) fn mark_applied(mut self) -> Result<Self, Box<(Self, String)>> {
         self.record.state = WriteState::Applied;
-        publish(&self.path, &self.record)?;
+        if let Err(why) = publish(&self.path, &self.record) {
+            // The handle comes BACK on failure. Consuming it here dropped the
+            // stream lock while the hardware write it covered was still live,
+            // and a second irlume could then interleave exactly the way the
+            // busy-refusal exists to prevent (review round 5). Boxed for the
+            // cold path only.
+            self.record.state = WriteState::Prepared;
+            return Err(Box::new((self, why)));
+        }
         trace("confirmed applied");
         Ok(self)
     }
@@ -275,9 +283,12 @@ impl StreamRecord {
     /// resolution would later authorise a firmware write over whatever
     /// unrelated value happened to match it (review round 2). Demoting first
     /// means the worst a failed cleanup leaves is inert litter.
-    pub(crate) fn retire(mut self) -> Result<Self, String> {
+    pub(crate) fn retire(mut self) -> Result<Self, Box<(Self, String)>> {
         self.record.state = WriteState::Prepared;
-        publish(&self.path, &self.record)?;
+        if let Err(why) = publish(&self.path, &self.record) {
+            self.record.state = WriteState::Applied;
+            return Err(Box::new((self, why)));
+        }
         trace("retired");
         Ok(self)
     }
@@ -354,12 +365,37 @@ fn publish(path: &Path, record: &StreamWrite) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a record was not saved. Both failures return the caller's lock: the
+/// exclusion must outlive the bookkeeping trouble, or a second irlume takes
+/// the camera mid-stream (review round 5).
+#[derive(Debug)]
+pub(crate) enum SaveError {
+    /// An `applied` record for a change that may still be LIVE sits at this
+    /// camera's path, and publishing would rename over the only recovery
+    /// data it has (review round 5). Same control with the record's applied
+    /// bytes still in the control, or a DIFFERENT control whose state this
+    /// write cannot see: either way, nothing is written and nothing is
+    /// destroyed.
+    /// The lock is NOT returned here: the caller refuses the write, so there
+    /// is no change for the exclusion to outlive, and releasing it lets the
+    /// control's own next capture claim the outstanding record.
+    Outstanding { unit: u8, selector: u8 },
+    /// The store could not take the record for a reason other than an
+    /// outstanding one: unreadable existing file, unwritable directory, a
+    /// failed rename. The caller proceeds unrecorded, still holding the lock.
+    Unavailable { lock: StreamLock, why: String },
+}
+
 /// Put the `prepared` record for this stream's write on disk, BEFORE the
 /// write, under the lock the caller acquired.
 ///
-/// Best-effort at the caller: a store that cannot be written costs crash
-/// bookkeeping, not the authentication — see `write_if_different` for why
-/// that direction was chosen.
+/// `displaced` is what the target control holds right now, which doubles as
+/// the liveness probe for an existing SAME-control record: an applied record
+/// whose bytes are still in the control describes irlume's own live leftover,
+/// and renaming over it would destroy the only route back. A record for a
+/// DIFFERENT control cannot be probed from here at all, so it is never
+/// replaced while `applied`. Superseded records (bytes no longer present) and
+/// `prepared` ones authorise nothing and are replaced freely.
 pub(crate) fn save(
     lock: StreamLock,
     id: &CameraIdentity,
@@ -367,7 +403,53 @@ pub(crate) fn save(
     selector: u8,
     applied: &[u8],
     displaced: &[u8],
-) -> Result<StreamRecord, String> {
+) -> Result<StreamRecord, SaveError> {
+    let path = record_path(id);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => match serde_json::from_str::<StreamWrite>(&body) {
+            Ok(existing)
+                if existing.schema_version == SCHEMA_VERSION
+                    && existing.state == WriteState::Applied =>
+            {
+                let live = if (existing.unit, existing.selector) == (unit, selector) {
+                    // Same control: superseded exactly when its bytes are no
+                    // longer what the control holds. An unparseable applied
+                    // field cannot prove that, so it reads as live.
+                    from_hex(&existing.applied)
+                        .map(|bytes| bytes == displaced)
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+                if live {
+                    drop(lock);
+                    return Err(SaveError::Outstanding {
+                        unit: existing.unit,
+                        selector: existing.selector,
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // A file that will not parse could be hiding an applied
+                // record. Nothing is written over it; a human gets to look.
+                return Err(SaveError::Unavailable {
+                    lock,
+                    why: format!(
+                        "existing record {} does not parse ({e}); not writing over it",
+                        path.display()
+                    ),
+                });
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(SaveError::Unavailable {
+                lock,
+                why: format!("read {}: {e}", path.display()),
+            });
+        }
+    }
     let record = StreamWrite {
         schema_version: SCHEMA_VERSION,
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -383,8 +465,9 @@ pub(crate) fn save(
         serial: id.serial.clone(),
         usb_devpath: id.usb_devpath.clone(),
     };
-    let path = record_path(id);
-    publish(&path, &record)?;
+    if let Err(why) = publish(&path, &record) {
+        return Err(SaveError::Unavailable { lock, why });
+    }
     trace(&format!(
         "saved unit{unit}/sel{selector} applied={} displaced={} state=prepared",
         record.applied, record.displaced

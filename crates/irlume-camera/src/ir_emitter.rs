@@ -804,10 +804,11 @@ struct CaptureWrite {
     /// stream guard, which resolves it when the change is no longer
     /// outstanding.
     record: Option<crate::stream_record::StreamRecord>,
-    /// The per-camera stream lock, still held, when the outcome is
-    /// `AlreadyHeld`: the caller needs it to CLAIM a crash leftover, and
-    /// taking it again would deadlock against ourselves. `None` on every
-    /// other outcome — a write's lock lives inside its record.
+    /// The per-camera stream lock, still held, in two cases: `AlreadyHeld`,
+    /// where the caller needs it to CLAIM a crash leftover; and a `Wrote`
+    /// whose record could not be saved, where the lock must outlive the
+    /// bookkeeping trouble or a second irlume takes the camera mid-stream
+    /// (review round 5). A recorded write's lock lives inside its record.
     lock: Option<crate::stream_record::StreamLock>,
 }
 
@@ -917,51 +918,75 @@ fn write_if_different(
             lock,
         });
     }
-    let record = match lock {
+    let (record, bare_lock) = match lock {
         Some(lock) => {
             match crate::stream_record::save(lock, id, unit, selector, wanted, &current) {
-                Ok(record) => Some(record),
-                Err(why) => {
+                Ok(record) => (Some(record), None),
+                // An applied record for a change that may still be live sits
+                // at this camera's path. Writing would either destroy its
+                // only recovery data (rename over it) or make an unrecorded
+                // change on top of an unresolved one. Neither; nothing is
+                // sent (review round 5).
+                Err(crate::stream_record::SaveError::Outstanding {
+                    unit: old_unit,
+                    selector: old_selector,
+                }) => {
+                    eprintln!(
+                        "irlume: not driving unit{unit}/sel{selector}: an unresolved record \
+                         for unit{old_unit}/sel{old_selector} is outstanding on this camera \
+                         and would be destroyed; resolve it first (a later capture on that \
+                         control claims it automatically)"
+                    );
+                    return Ok(CaptureWrite::refused());
+                }
+                // Machine trouble, nobody contesting. Proceed unrecorded, and
+                // KEEP the lock: dropping it here handed the camera to a
+                // second irlume mid-stream (review round 5).
+                Err(crate::stream_record::SaveError::Unavailable { lock, why }) => {
                     eprintln!(
                         "irlume: cannot record this stream's write to unit{unit}/sel{selector} \
                          ({why}); driving the emitter anyway — a crash before the restore would \
                          leave the mode set with nothing marking it as irlume's"
                     );
-                    None
+                    (None, Some(lock))
                 }
             }
         }
-        // The store is unusable (reported above); nobody contests the
-        // camera, so the write proceeds without bookkeeping.
-        None => None,
+        // The lock itself is unavailable (reported at acquire); nobody
+        // demonstrably contests the camera, so the write proceeds without
+        // bookkeeping or exclusion — there is nothing left to hold.
+        None => (None, None),
     };
     if set_cur(fd, unit, selector, wanted).is_ok() {
         // Confirm only after the camera accepted. A failure here leaves the
-        // record PREPARED on disk: the write happened, but a crash from this
-        // state leaves a leftover no claim will touch, which is reported by
-        // mark_applied and is the safe direction.
-        let record = record.and_then(|r| match r.mark_applied() {
-            Ok(r) => Some(r),
-            Err(why) => {
+        // record PREPARED on disk — the write happened, but a crash from this
+        // state leaves a leftover no claim will touch, which is reported and
+        // is the safe direction — and the HANDLE is kept: it holds the stream
+        // lock, which must live as long as the change does.
+        let record = record.map(|r| match r.mark_applied() {
+            Ok(r) => r,
+            Err(e) => {
+                let (r, why) = *e;
                 eprintln!(
                     "irlume: the emitter write to unit{unit}/sel{selector} succeeded but its \
                      record could not be confirmed ({why}); a crash before the restore would \
                      leave a leftover no later session will claim"
                 );
-                None
+                r
             }
         });
         return Ok(CaptureWrite {
             outcome: Applied::Wrote,
             current,
             record,
-            lock: None,
+            lock: bare_lock,
         });
     }
     // The write never landed, so the record describes a change that does not
     // exist; a leftover of it would refuse to claim anyway (prepared records
     // never authorise), but there is no reason to leave it lying around. A
-    // failed removal is inert litter for the same reason.
+    // failed removal is inert litter for the same reason, and no hardware
+    // change exists for the lock to protect.
     if let Some(record) = record {
         if let Err(why) = record.resolve() {
             eprintln!("irlume: {why}");
@@ -1130,19 +1155,19 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
     // refuses while the record's writer is alive, which is also what keeps a
     // frozen-stream restart's fresh guard from taking the restore out from
     // under the old one in this same process.
-    let (restore, record) = match write {
+    let (restore, record, lock) = match write {
         Some(w) => match w.outcome {
-            Applied::Wrote => (Some(w.current), w.record),
+            Applied::Wrote => (Some(w.current), w.record, w.lock),
             Applied::AlreadyHeld => match w
                 .lock
                 .and_then(|lock| crate::stream_record::claim(lock, &id, unit, selector, &w.current))
             {
-                Some((displaced, record)) => (Some(displaced), Some(record)),
-                None => (None, None),
+                Some((displaced, record)) => (Some(displaced), Some(record), None),
+                None => (None, None, None),
             },
-            Applied::Nothing => (None, None),
+            Applied::Nothing => (None, None, None),
         },
-        None => (None, None),
+        None => (None, None, None),
     };
     StreamMode {
         handle: Some(handle),
@@ -1153,6 +1178,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         active,
         applied,
         record,
+        _lock: lock,
     }
 }
 
@@ -1211,6 +1237,11 @@ pub struct StreamMode {
     /// concludes there is nothing left to undo; left behind, unlocked, when
     /// the restore write fails, so the next session can claim it.
     record: Option<crate::stream_record::StreamRecord>,
+    /// The bare stream lock, held (never read) when this guard's write could
+    /// not be RECORDED: the exclusion must still outlive the change, or a
+    /// second irlume takes the camera mid-stream (review round 5). `None`
+    /// whenever a record exists — the lock lives inside it then.
+    _lock: Option<crate::stream_record::StreamLock>,
 }
 
 /// Why a restore did not put the control back.
@@ -1250,6 +1281,7 @@ impl StreamMode {
         StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 0,
             selector: 0,
             restore: Vec::new(),
@@ -1362,7 +1394,13 @@ impl StreamMode {
         let record = match self.record.take() {
             Some(record) => match record.retire() {
                 Ok(record) => Some(record),
-                Err(why) => {
+                Err(e) => {
+                    let (record, why) = *e;
+                    // The handle drops HERE, on purpose: this guard will never
+                    // write again, so releasing the lock is what lets the next
+                    // session claim the still-applied record and finish the
+                    // restore this one could not start.
+                    drop(record);
                     return Err(RestoreError::Bookkeeping(format!(
                         "not restoring unit{}/sel{}: its stream record cannot be retired \
                          ({why}); the mode stays applied and the record stays claimable \
@@ -1408,7 +1446,8 @@ impl StreamMode {
                 if let Some(record) = record {
                     match record.mark_applied() {
                         Ok(_kept) => {}
-                        Err(why) => {
+                        Err(e) => {
+                            let why = e.1;
                             eprintln!(
                                 "irlume: the failed restore's record could not be put back \
                                  into force ({why}); the leftover will not be claimed \
@@ -4829,6 +4868,7 @@ mod tests {
             let _mode = StreamMode {
                 handle: None,
                 record: None,
+                _lock: None,
                 unit: 14,
                 selector: 6,
                 restore: vec![1, 3, 1],
@@ -4867,6 +4907,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4901,6 +4942,7 @@ mod tests {
         let held = StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4914,6 +4956,7 @@ mod tests {
         let already = StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4965,6 +5008,7 @@ mod tests {
         let mut mode = StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: theirs.clone(),
@@ -5004,6 +5048,7 @@ mod tests {
         let mut mode = StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5051,6 +5096,7 @@ mod tests {
         let mut mode = StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5092,6 +5138,7 @@ mod tests {
         let mut mode = StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5157,6 +5204,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5390,6 +5438,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: write.record,
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: write.current,
@@ -5463,6 +5512,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: Some(claimed),
+            _lock: None,
             unit: 14,
             selector: 6,
             restore,
@@ -5548,6 +5598,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: Some(record),
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5596,6 +5647,7 @@ mod tests {
         let mut mode = StreamMode {
             handle: None,
             record: Some(record),
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5650,6 +5702,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: Some(record),
+            _lock: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -5705,6 +5758,141 @@ mod tests {
             fake_camera::log()
         );
         drop(owner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write must not destroy an applied record for a DIFFERENT control
+    /// (#188, review round 5): the record path is per camera, and renaming a
+    /// new record over a live one erases the only recovery data the old
+    /// change has. The write is refused instead.
+    #[test]
+    fn a_write_never_destroys_a_live_record_for_another_control() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        // A crash left an applied record for selector 6.
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        drop(
+            crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+                .expect("the record is on disk")
+                .mark_applied()
+                .expect("the write is confirmed"),
+        );
+        // Configuration has moved on: the next capture drives selector 9.
+        let _fake = fake_camera::install(a_working_camera());
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 9, vec![1, 3, 2]))
+            .expect("the refusal is not an ioctl error");
+        assert_eq!(write.outcome, Applied::Nothing);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may land while another control's record is outstanding: {:?}",
+            fake_camera::log()
+        );
+        let (names, records) = stream_store_state(&dir);
+        assert_eq!(names, 1, "the old record survives untouched");
+        assert_eq!(
+            (records[0].unit, records[0].selector, records[0].state),
+            (14, 6, crate::stream_record::WriteState::Applied),
+            "selector 6's recovery data is intact"
+        );
+
+        // The same protection for the SAME control while its leftover is
+        // live: the control still holds the old applied bytes, and a write
+        // of different bytes would orphan them.
+        fake_camera::set_current(vec![1, 3, 2]);
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 3]))
+            .expect("the refusal is not an ioctl error");
+        assert_eq!(write.outcome, Applied::Nothing);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "the live leftover's bytes are still in the control: {:?}",
+            fake_camera::log()
+        );
+
+        // But a SUPERSEDED record (its bytes no longer in the control) is
+        // replaced freely: the leftover it described is already gone.
+        fake_camera::set_current(vec![9, 9, 9]);
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 3]))
+            .expect("a superseded record does not block");
+        assert_eq!(write.outcome, Applied::Wrote);
+        let (_, records) = stream_store_state(&dir);
+        assert_eq!(
+            (records[0].selector, records[0].applied.as_str()),
+            (6, "010303"),
+            "the superseded record is replaced by the new write's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bookkeeping failure must not release the stream lock while the write
+    /// it covers is live (#188, review round 5): the lock comes back from a
+    /// failed save, rides the guard bare, and a failed confirmation keeps
+    /// the record handle rather than dropping it.
+    #[test]
+    fn a_failed_save_keeps_the_lock_held_for_the_streams_lifetime() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-keeplock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        // Make the store unusable for saving without touching the lock: an
+        // unparseable file sits where the record would go.
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        drop(lock); // the acquire created the store dir
+        let record_file = {
+            // The record path is private; find it by planting through save.
+            let lock = crate::stream_record::acquire(&asus).expect("free again");
+            let planted = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+                .expect("plant a record to learn the path");
+            let (_, records) = stream_store_state(&dir);
+            assert_eq!(records.len(), 1);
+            drop(planted); // releases the lock, keeps the file
+            let store = dir.join("ir-emitter-stream");
+            std::fs::read_dir(&store)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|e| e == "json"))
+                .expect("the planted record file")
+        };
+        std::fs::write(&record_file, b"not json").expect("corrupt the record");
+
+        let _fake = fake_camera::install(a_working_camera());
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("an unavailable store does not refuse the write");
+        assert_eq!(
+            write.outcome,
+            Applied::Wrote,
+            "machine trouble costs bookkeeping, not authentication"
+        );
+        assert!(write.record.is_none(), "nothing was recorded");
+        assert!(
+            write.lock.is_some(),
+            "the lock must ride the unrecorded write for the stream's lifetime"
+        );
+        assert!(
+            matches!(
+                crate::stream_record::acquire(&asus),
+                Err(crate::stream_record::AcquireError::Busy)
+            ),
+            "no second irlume may take the camera while the unrecorded change lives"
+        );
+        assert_eq!(
+            std::fs::read(&record_file).expect("still there"),
+            b"not json",
+            "the unreadable file was not written over"
+        );
+        drop(write);
+        assert!(
+            crate::stream_record::acquire(&asus).is_ok(),
+            "the lock releases when the guard's write handle drops"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5856,6 +6044,7 @@ mod tests {
         drop(StreamMode {
             handle: None,
             record: None,
+            _lock: None,
             unit: 14,
             selector: crate::uvc_descriptor::MSXU_IR_TORCH,
             restore: def.clone(),

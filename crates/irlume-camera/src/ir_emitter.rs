@@ -1191,6 +1191,33 @@ pub struct StreamMode {
     record: Option<crate::stream_record::StreamRecord>,
 }
 
+/// Why a restore did not put the control back.
+///
+/// Two causes, and a caller must be able to tell them apart: a camera that
+/// refused or vanished is hardware trouble, while bookkeeping that could not
+/// be written means the restore was deliberately NOT ATTEMPTED and the mode is
+/// still applied (review round 3 — returning `Ok` there made a skipped
+/// restore read as a completed one).
+#[derive(Debug)]
+pub enum RestoreError {
+    /// The camera did not take the read or the write.
+    Camera(XuError),
+    /// The record could not be retired first, so no camera request was made:
+    /// the mode stays applied and the record stays claimable.
+    Bookkeeping(String),
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Camera(e) => write!(f, "{e}"),
+            Self::Bookkeeping(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
 impl StreamMode {
     /// A guard over nothing: no control was applied, so `Drop` writes nothing.
     ///
@@ -1296,9 +1323,9 @@ impl StreamMode {
     /// Public so a caller that wants to put the control back while it can still
     /// REPORT a failure has somewhere to do it. Nothing in production takes that
     /// route today: every restore currently goes through `Drop`, which cannot
-    /// return anything and so can only print. Saying otherwise would describe an
-    /// error path that does not exist.
-    pub fn restore(&mut self) -> XuResult<()> {
+    /// return anything and so can only print. `Err(Bookkeeping)` means no
+    /// camera request was made at all — the mode is still applied, on purpose.
+    pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
         if !self.armed {
             return Ok(());
         }
@@ -1340,16 +1367,12 @@ impl StreamMode {
             Some(record) => match record.retire() {
                 Ok(record) => Some(record),
                 Err(why) => {
-                    eprintln!(
-                        "irlume: not restoring unit{}/sel{}: its stream record cannot be \
-                         retired ({why}); the mode stays applied and the record stays \
-                         claimable for the next session",
+                    return Err(RestoreError::Bookkeeping(format!(
+                        "not restoring unit{}/sel{}: its stream record cannot be retired \
+                         ({why}); the mode stays applied and the record stays claimable \
+                         for the next session",
                         self.unit, self.selector
-                    );
-                    // Fully reported just above, and returning an error here
-                    // would make `Drop` blame the camera for a filesystem
-                    // problem. The guard restored nothing, on purpose.
-                    return Ok(());
+                    )));
                 }
             },
             None => None,
@@ -1398,7 +1421,7 @@ impl StreamMode {
                         }
                     }
                 }
-                Err(e)
+                Err(RestoreError::Camera(e))
             }
         }
     }
@@ -5571,7 +5594,7 @@ mod tests {
             current: vec![1, 3, 2],
             ..a_working_camera()
         });
-        drop(StreamMode {
+        let mut mode = StreamMode {
             handle: None,
             record: Some(record),
             unit: 14,
@@ -5580,7 +5603,17 @@ mod tests {
             applied: vec![1, 3, 2],
             armed: true,
             active: true,
-        });
+        };
+        let result = mode.restore();
+        assert!(
+            matches!(result, Err(RestoreError::Bookkeeping(_))),
+            "a restore that sends no camera request must not report success: {result:?}"
+        );
+        assert!(
+            !mode.owns_restore(),
+            "the failed attempt must not be repeated by Drop"
+        );
+        drop(mode);
         assert!(
             !fake_camera::log()
                 .iter()

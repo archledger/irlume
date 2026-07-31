@@ -1242,7 +1242,7 @@ impl StreamMode {
     ///
     /// The leftover record is NOT resolved here: the change it describes is
     /// still outstanding, now owned by the replacement. The caller moves the
-    /// record across with [`take_record`](Self::take_record), because the
+    /// record across with `take_record`, because the
     /// replacement cannot have one of its own — this guard held the
     /// per-camera stream lock the whole time (#188).
     pub fn disarm(&mut self) {

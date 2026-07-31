@@ -358,13 +358,35 @@ impl PendingWrite {
 /// So a missing current serial fails CLOSED. The record is found, reported and
 /// left alone; when the serial reads again it is acted on.
 pub(crate) fn describes_this_camera(record: &PendingWrite, id: &CameraIdentity) -> bool {
-    if record.descriptor_sha256 != fingerprint(id) {
+    identity_authorizes(
+        &record.descriptor_sha256,
+        &record.usb_devpath,
+        record.serial.as_deref(),
+        id,
+    )
+}
+
+/// The authorisation rule itself, over a recorded identity's three parts.
+///
+/// One construction, shared with the per-stream leftover record (#188), so
+/// "which camera may a record act on" cannot drift between the two stores. The
+/// rule is [`describes_this_camera`]'s: descriptor digest and device path must
+/// match outright, and a recorded serial the attached camera cannot currently
+/// reproduce refuses — failing OPEN there would let an identical unit in the
+/// same port receive the first camera's bytes.
+pub(crate) fn identity_authorizes(
+    descriptor_sha256: &str,
+    usb_devpath: &str,
+    serial: Option<&str>,
+    id: &CameraIdentity,
+) -> bool {
+    if descriptor_sha256 != fingerprint(id) {
         return false;
     }
-    if record.usb_devpath.is_empty() || record.usb_devpath != id.usb_devpath {
+    if usb_devpath.is_empty() || usb_devpath != id.usb_devpath {
         return false;
     }
-    match (record.serial.as_deref(), id.serial.as_deref()) {
+    match (serial, id.serial.as_deref()) {
         (Some(recorded), Some(attached)) => recorded == attached,
         // The record was written with a discriminator this observation cannot
         // reproduce. Throwing that away and writing anyway is the one direction

@@ -25,6 +25,7 @@
 pub mod emitter_journal;
 pub mod ir_emitter;
 mod ir_metadata;
+mod stream_record;
 pub mod uvc_descriptor;
 
 /// Serializes unit tests that mutate process-global environment variables, and
@@ -1893,7 +1894,10 @@ pub fn capture_ir_streaming<B>(
                 // comes back ACTIVE but owning nothing. Handing ownership over
                 // on `lit` disarmed the guard that actually held the change and
                 // installed one with nothing to put back, so the capture ended
-                // without restoring at all.
+                // without restoring at all. The stream record's lock now
+                // enforces the same answer: while the old guard lives, its
+                // leftover record cannot be claimed, so the fresh `enable`
+                // cannot arm off the record either.
                 let fresh = ir_emitter::enable(dev.handle(), &card, device);
                 if fresh.owns_restore() {
                     mode.disarm();
@@ -2023,7 +2027,10 @@ pub fn capture_ir_sequence(
                 // comes back ACTIVE but owning nothing. Handing ownership over
                 // on `lit` disarmed the guard that actually held the change and
                 // installed one with nothing to put back, so the capture ended
-                // without restoring at all.
+                // without restoring at all. The stream record's lock now
+                // enforces the same answer: while the old guard lives, its
+                // leftover record cannot be claimed, so the fresh `enable`
+                // cannot arm off the record either.
                 let fresh = ir_emitter::enable(dev.handle(), &card, device);
                 if fresh.owns_restore() {
                     mode.disarm();

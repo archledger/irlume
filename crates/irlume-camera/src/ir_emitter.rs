@@ -755,11 +755,16 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 /// When `outcome` is `Wrote`, `current` is what the write DISPLACED, read on
 /// the same pass that decided to write, and it is the only value a stream
 /// guard may put back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct CaptureWrite {
     outcome: Applied,
     /// What `GET_CUR` answered immediately before the write decision.
     current: Vec<u8>,
+    /// The leftover record covering the write (#188), on disk and locked from
+    /// just before the `SET_CUR`. Present only when the outcome is `Wrote` and
+    /// the store took it; carried to the stream guard, which resolves it when
+    /// the change is no longer outstanding.
+    record: Option<crate::stream_record::StreamRecord>,
 }
 
 impl CaptureWrite {
@@ -769,6 +774,7 @@ impl CaptureWrite {
         CaptureWrite {
             outcome: Applied::Nothing,
             current: Vec::new(),
+            record: None,
         }
     }
 }
@@ -794,12 +800,26 @@ impl CaptureWrite {
 /// used to propagate it discarded the detail, and the override memo records it
 /// as a refusal either way. A `GET_CUR` that cannot be read IS an error — with
 /// no answer there is no restore value, so nothing may be written.
+///
+/// Between the read and the write, the leftover record goes on disk (#188): a
+/// crash after the `SET_CUR` must leave something saying whose value is in the
+/// control, and recording after the write would leave the same gap one level
+/// down — the ordering the #183 journal establishes for discovery writes,
+/// carried over. Recording is BEST-EFFORT, in the opposite direction from that
+/// journal, and deliberately: a discovery write is exploratory bytes nobody
+/// can re-derive, so an unwritable journal refuses the write; this record is
+/// crash bookkeeping for a documented mode derived from the camera itself,
+/// and refusing here would turn a full store or read-only state directory
+/// into IR authentication going dark. The cost of proceeding unrecorded is
+/// that a kill mid-stream leaves a leftover no later session can claim, which
+/// is exactly the pre-#188 status quo.
 fn write_if_different(
     fd: c_int,
     unit: u8,
     selector: u8,
     len: usize,
     wanted: &[u8],
+    id: &crate::uvc_descriptor::CameraIdentity,
 ) -> XuResult<CaptureWrite> {
     let current = get_cur(fd, unit, selector, len)?;
     if current == *wanted {
@@ -809,14 +829,39 @@ fn write_if_different(
         return Ok(CaptureWrite {
             outcome: Applied::AlreadyHeld,
             current,
+            record: None,
         });
     }
-    let outcome = if set_cur(fd, unit, selector, wanted).is_ok() {
-        Applied::Wrote
-    } else {
-        Applied::Nothing
+    let record = match crate::stream_record::save(id, unit, selector, wanted, &current) {
+        Ok(record) => Some(record),
+        Err(why) => {
+            eprintln!(
+                "irlume: cannot record this stream's write to unit{unit}/sel{selector} ({why}); \
+                 driving the emitter anyway — a crash before the restore would leave the mode \
+                 set with nothing marking it as irlume's"
+            );
+            None
+        }
     };
-    Ok(CaptureWrite { outcome, current })
+    if set_cur(fd, unit, selector, wanted).is_ok() {
+        return Ok(CaptureWrite {
+            outcome: Applied::Wrote,
+            current,
+            record,
+        });
+    }
+    // The write never landed, so the record describes a change that does not
+    // exist; a leftover of it would refuse to claim anyway (the control holds
+    // the displaced value, not the applied one), but there is no reason to
+    // leave it lying around.
+    if let Some(record) = record {
+        record.resolve();
+    }
+    Ok(CaptureWrite {
+        outcome: Applied::Nothing,
+        current,
+        record: None,
+    })
 }
 
 /// Light the emitter on the open `fd` for `device`, if a control is configured.
@@ -952,12 +997,12 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
             (Some(apply_override(fd, &id, &ctrl)), payload)
         }
         CaptureAction::DeviceDefault { unit, selector } => {
-            match apply_device_default(fd, unit, selector) {
+            match apply_device_default(fd, &id, unit, selector) {
                 Ok((w, sent)) => (Some(w), sent),
                 Err(_) => (None, Vec::new()),
             }
         }
-        CaptureAction::KnownPayload(ctrl) => match apply_known_payload(fd, &ctrl) {
+        CaptureAction::KnownPayload(ctrl) => match apply_known_payload(fd, &id, &ctrl) {
             Ok(w) => (Some(w), ctrl.payload),
             Err(_) => (None, Vec::new()),
         },
@@ -965,9 +1010,28 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
     let active = write
         .as_ref()
         .is_some_and(|w| w.outcome != Applied::Nothing);
-    let restore = write
-        .filter(|w| w.outcome == Applied::Wrote)
-        .map(|w| w.current);
+    // What the guard owns: a write of its own, with the value it displaced —
+    // or a crash leftover claimed through the stream record (#188). A control
+    // already holding the wanted bytes is another writer's state EXCEPT when a
+    // record for this camera, this control and these bytes marks it as
+    // irlume's own unrestored change; then the guard arms with the recorded
+    // displaced value and finishes what the killed stream could not. The claim
+    // refuses while the record's writer is alive, which is also what keeps a
+    // frozen-stream restart's fresh guard from taking the restore out from
+    // under the old one in this same process.
+    let (restore, record) = match write {
+        Some(w) => match w.outcome {
+            Applied::Wrote => (Some(w.current), w.record),
+            Applied::AlreadyHeld => {
+                match crate::stream_record::claim(&id, unit, selector, &w.current) {
+                    Some((displaced, record)) => (Some(displaced), Some(record)),
+                    None => (None, None),
+                }
+            }
+            Applied::Nothing => (None, None),
+        },
+        None => (None, None),
+    };
     StreamMode {
         handle: Some(handle),
         unit,
@@ -976,6 +1040,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         restore: restore.unwrap_or_default(),
         active,
         applied,
+        record,
     }
 }
 
@@ -1029,6 +1094,11 @@ pub struct StreamMode {
     /// and the caller prints "IR is dark with no active emitter" on that, which
     /// would have been a false statement about the camera.
     active: bool,
+    /// The on-disk leftover record for the outstanding change (#188), locked
+    /// for as long as this guard lives. Resolved (removed) when the guard
+    /// concludes there is nothing left to undo; left behind, unlocked, when
+    /// the restore write fails, so the next session can claim it.
+    record: Option<crate::stream_record::StreamRecord>,
 }
 
 impl StreamMode {
@@ -1040,6 +1110,7 @@ impl StreamMode {
     fn inert() -> Self {
         StreamMode {
             handle: None,
+            record: None,
             unit: 0,
             selector: 0,
             restore: Vec::new(),
@@ -1081,6 +1152,11 @@ impl StreamMode {
     /// exit on both cameras here. So the caller gives the old guard up only when
     /// the replacement is armed, and an unarmed replacement leaves the old guard
     /// to put the value back.
+    ///
+    /// The leftover record is NOT resolved here, and must not be: an armed
+    /// replacement has already renamed its own record over this one's name, so
+    /// this guard's inode is nameless and evaporates when the handle drops.
+    /// Resolving would race the replacement for the path (#188).
     pub fn disarm(&mut self) {
         self.armed = false;
     }
@@ -1134,7 +1210,7 @@ impl StreamMode {
         //
         // A control that no longer holds this guard's value is left alone. The
         // change irlume made is already gone, so there is nothing of its to undo.
-        match get_cur(self.fd(), self.unit, self.selector, self.applied.len()) {
+        let outcome = match get_cur(self.fd(), self.unit, self.selector, self.applied.len()) {
             Ok(now) if now != self.applied => {
                 eprintln!(
                     "irlume: leaving unit{}/sel{} at {:02x?}: it no longer holds what irlume \
@@ -1147,6 +1223,21 @@ impl StreamMode {
             // a mode applied because one GET_CUR failed is the worse of the two
             // errors. Fall through and restore.
             _ => set_cur(self.fd(), self.unit, self.selector, &self.restore),
+        };
+        match outcome {
+            // Nothing is outstanding any more: the control is back, or the
+            // change irlume made is already gone. Either way the record must
+            // not outlive the fact it records (#188).
+            Ok(()) => {
+                if let Some(record) = self.record.take() {
+                    record.resolve();
+                }
+                Ok(())
+            }
+            // The restore write failed, so the leftover is REAL. The record
+            // stays on disk for the next session to claim; its lock releases
+            // when this handle drops, and the guard is already disarmed.
+            Err(e) => Err(e),
         }
     }
 }
@@ -1689,7 +1780,7 @@ fn check_and_apply_override(
             given: ctrl.payload.len(),
         });
     }
-    write_if_different(fd, unit, selector, len, &ctrl.payload).map_err(|err| {
+    write_if_different(fd, unit, selector, len, &ctrl.payload, id).map_err(|err| {
         OverrideRefusal::Unreadable {
             unit,
             selector,
@@ -1706,7 +1797,11 @@ fn check_and_apply_override(
 /// that size right now. Writing a nine-byte payload to a control the camera has
 /// just reported as disabled, or as a different length, is not something a
 /// validated VID:PID should buy.
-fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<CaptureWrite> {
+fn apply_known_payload(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+) -> XuResult<CaptureWrite> {
     if !info_allows_set(get_info(fd, ctrl.unit, ctrl.selector)?) {
         return Err(XuError::Unsupported);
     }
@@ -1714,7 +1809,7 @@ fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<CaptureWrit
     if len != ctrl.payload.len() {
         return Err(XuError::Unsupported);
     }
-    write_if_different(fd, ctrl.unit, ctrl.selector, len, &ctrl.payload)
+    write_if_different(fd, ctrl.unit, ctrl.selector, len, &ctrl.payload, id)
 }
 
 /// The bytes to write for one documented control, or why the camera has not
@@ -1766,7 +1861,12 @@ fn intended_value(
 /// this function derives them and the caller needs them: `enable` records what
 /// the guard APPLIED, which for IR Torch is the camera's own default rather
 /// than anything the caller named.
-fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<(CaptureWrite, Vec<u8>)> {
+fn apply_device_default(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    unit: u8,
+    selector: u8,
+) -> XuResult<(CaptureWrite, Vec<u8>)> {
     if !info_allows_set(get_info(fd, unit, selector)?) {
         return Err(XuError::Unsupported);
     }
@@ -1774,7 +1874,7 @@ fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<(CaptureW
     let Ok(wanted) = intended_value(fd, unit, selector, len)? else {
         return Err(XuError::Unsupported);
     };
-    let write = write_if_different(fd, unit, selector, len, &wanted)?;
+    let write = write_if_different(fd, unit, selector, len, &wanted, id)?;
     Ok((write, wanted))
 }
 
@@ -4547,6 +4647,7 @@ mod tests {
         {
             let _mode = StreamMode {
                 handle: None,
+                record: None,
                 unit: 14,
                 selector: 6,
                 restore: vec![1, 3, 1],
@@ -4584,6 +4685,7 @@ mod tests {
         drop(StreamMode::inert());
         drop(StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4617,6 +4719,7 @@ mod tests {
     fn ownership_of_the_restore_does_not_pass_to_a_guard_that_owns_nothing() {
         let held = StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4629,6 +4732,7 @@ mod tests {
         // nothing.
         let already = StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4679,6 +4783,7 @@ mod tests {
         // not what the camera calls its default.
         let mut mode = StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: theirs.clone(),
@@ -4717,6 +4822,7 @@ mod tests {
         });
         let mut mode = StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4763,6 +4869,7 @@ mod tests {
         });
         let mut mode = StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4803,6 +4910,7 @@ mod tests {
         });
         let mut mode = StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4830,6 +4938,9 @@ mod tests {
     #[test]
     fn an_override_the_control_already_holds_is_not_written_or_undone() {
         let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-already-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         let _fake = fake_camera::install(fake_camera::Camera {
             // Some other tool already put the exact payload the override names
             // into the control.
@@ -4839,13 +4950,18 @@ mod tests {
         let asus = identity(0x3277, 0x0059);
 
         let outcome = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]));
+        let held = outcome
+            .as_ref()
+            .expect("a value found in place is a success");
         assert_eq!(
-            outcome,
-            Ok(CaptureWrite {
-                outcome: Applied::AlreadyHeld,
-                current: vec![1, 3, 2],
-            }),
+            held.outcome,
+            Applied::AlreadyHeld,
             "a value found in place is a success, but not irlume's write"
+        );
+        assert_eq!(held.current, vec![1, 3, 2]);
+        assert!(
+            held.record.is_none(),
+            "no write went out, so there is no leftover to record"
         );
         assert!(
             !fake_camera::log()
@@ -4859,6 +4975,7 @@ mod tests {
         // must leave the other writer's bytes exactly where they were.
         drop(StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: 6,
             restore: vec![1, 3, 1],
@@ -4876,14 +4993,19 @@ mod tests {
         // The distinction cuts the other way too: a control holding something
         // else IS written, and that write is irlume's to undo.
         fake_camera::set_current(vec![1, 3, 1]);
+        let written = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("a control holding something else is written");
+        assert_eq!(written.outcome, Applied::Wrote);
         assert_eq!(
-            check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2])),
-            Ok(CaptureWrite {
-                outcome: Applied::Wrote,
-                current: vec![1, 3, 1],
-            }),
+            written.current,
+            vec![1, 3, 1],
             "a write reports the value it displaced, read on the same pass"
         );
+        assert!(
+            written.record.is_some(),
+            "a write that went out is covered by a leftover record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A built-in payload the control already holds is not written or claimed.
@@ -4895,6 +5017,10 @@ mod tests {
     #[test]
     fn a_known_payload_the_control_already_holds_is_not_rewritten() {
         let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-known-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
         let payload = vec![1, 3, 2];
         let _fake = fake_camera::install(fake_camera::Camera {
             current: payload.clone(),
@@ -4908,7 +5034,7 @@ mod tests {
             payload: payload.clone(),
         };
         assert_eq!(
-            apply_known_payload(-1, &ctrl)
+            apply_known_payload(-1, &asus, &ctrl)
                 .expect("a control that already agrees is not an error")
                 .outcome,
             Applied::AlreadyHeld,
@@ -4924,15 +5050,16 @@ mod tests {
         // And a control holding something else is still written, or the guard
         // above would have turned the whole path off.
         fake_camera::set_current(vec![9, 9, 9]);
+        let written =
+            apply_known_payload(-1, &asus, &ctrl).expect("a control that disagrees is written");
+        assert_eq!(written.outcome, Applied::Wrote);
         assert_eq!(
-            apply_known_payload(-1, &ctrl).expect("a control that disagrees is written"),
-            CaptureWrite {
-                outcome: Applied::Wrote,
-                current: vec![9, 9, 9],
-            },
+            written.current,
+            vec![9, 9, 9],
             "the write reports the value it displaced"
         );
         assert_eq!(fake_camera::current(), payload);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The apply path reads the control ONCE, and the value it reports as
@@ -4947,6 +5074,9 @@ mod tests {
     #[test]
     fn one_read_decides_and_its_answer_is_what_the_write_displaced() {
         let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-one-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         let _fake = fake_camera::install(fake_camera::Camera {
             current: vec![7, 7, 7],
             len: 3,
@@ -4956,12 +5086,10 @@ mod tests {
         let asus = identity(0x3277, 0x0059);
         let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
             .expect("a published control with a valid payload is applied");
+        assert_eq!(write.outcome, Applied::Wrote);
         assert_eq!(
-            write,
-            CaptureWrite {
-                outcome: Applied::Wrote,
-                current: vec![7, 7, 7],
-            },
+            write.current,
+            vec![7, 7, 7],
             "the displaced value is the one read's answer"
         );
         assert_eq!(
@@ -4983,6 +5111,262 @@ mod tests {
             ],
             "exactly one GET_CUR, immediately before the write it authorises"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Records left in the stream store, as (filename count, parsed records).
+    fn stream_store_state(
+        dir: &std::path::Path,
+    ) -> (usize, Vec<crate::stream_record::StreamWrite>) {
+        let store = dir.join("ir-emitter-stream");
+        let Ok(entries) = std::fs::read_dir(&store) else {
+            return (0, Vec::new());
+        };
+        let mut names = 0;
+        let mut records = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            names += 1;
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                if let Ok(record) = serde_json::from_str(&body) {
+                    records.push(record);
+                }
+            }
+        }
+        (names, records)
+    }
+
+    /// The leftover record is on disk BEFORE the `SET_CUR` and gone once the
+    /// guard resolves (#188).
+    ///
+    /// The before half is observed at the instant of the write, the only place
+    /// that distinguishes record-then-write from write-then-record — checking
+    /// afterwards cannot tell them apart, and the gap between them is the
+    /// crash window the record exists to cover. Same construction as the #183
+    /// journal's ordering test, for the same reason.
+    #[test]
+    fn the_record_is_on_disk_before_the_write_and_gone_after_the_restore() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let probe = dir.clone();
+        let _fake = fake_camera::install(fake_camera::Camera {
+            at_first_write: Some(Box::new(move || {
+                let (names, records) = stream_store_state(&probe);
+                if names != 1 {
+                    return Err(format!(
+                        "{names} records on disk at the first SET_CUR, want 1"
+                    ));
+                }
+                let [record] = records.as_slice() else {
+                    return Err("the record on disk does not parse".to_string());
+                };
+                if record.applied != "010302" || record.displaced != "010301" {
+                    return Err(format!(
+                        "the record says applied={} displaced={}, want 010302/010301",
+                        record.applied, record.displaced
+                    ));
+                }
+                Ok(())
+            })),
+            ..a_working_camera()
+        });
+        let asus = identity(0x3277, 0x0059);
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("a published control with a valid payload is applied");
+        assert_eq!(write.outcome, Applied::Wrote);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::FailedPrecondition(_))),
+            "the record was not on disk when the write went out: {:?}",
+            fake_camera::log()
+        );
+        // The guard, wired the way `enable` wires it, resolves the record when
+        // it puts the control back.
+        drop(StreamMode {
+            handle: None,
+            record: write.record,
+            unit: 14,
+            selector: 6,
+            restore: write.current,
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        });
+        assert_eq!(fake_camera::current(), vec![1, 3, 1], "the control is back");
+        assert_eq!(
+            stream_store_state(&dir).0,
+            0,
+            "a record must not outlive a cleanly ended stream"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A killed stream's leftover is claimed by the next session and restored,
+    /// and a claim while the writer still lives is refused (#188).
+    ///
+    /// The crash is simulated by dropping the record handle without resolving
+    /// it, which is byte-for-byte what `SIGKILL` leaves: the file on disk, the
+    /// lock released. Before that drop, the claim must refuse — the lock is
+    /// the liveness signal, and this is the same-process shape the frozen
+    /// stream restart depends on.
+    #[test]
+    fn a_crash_leftover_is_claimed_and_the_next_session_restores_it() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _fake = fake_camera::install(a_working_camera());
+        let asus = identity(0x3277, 0x0059);
+
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("the mode is applied");
+        assert_eq!(write.outcome, Applied::Wrote);
+        let record = write.record.expect("the write is covered by a record");
+
+        // While the writer lives, the control's value is a RUNNING stream's
+        // business.
+        assert!(
+            crate::stream_record::claim(&asus, 14, 6, &[1, 3, 2]).is_none(),
+            "a record whose writer holds the lock must not be claimed"
+        );
+
+        // The crash: lock released, file kept, control still holding the mode.
+        drop(record);
+        assert_eq!(fake_camera::current(), vec![1, 3, 2]);
+
+        // The next session finds the value already in place and the record
+        // marks it as irlume's own.
+        let next = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("the next session reads the control");
+        assert_eq!(next.outcome, Applied::AlreadyHeld);
+        let (restore, claimed) = crate::stream_record::claim(&asus, 14, 6, &next.current)
+            .expect("the leftover is irlume's and must be claimed");
+        assert_eq!(
+            restore,
+            vec![1, 3, 1],
+            "the claim hands back what the killed stream displaced"
+        );
+        drop(StreamMode {
+            handle: None,
+            record: Some(claimed),
+            unit: 14,
+            selector: 6,
+            restore,
+            applied: next.current,
+            armed: true,
+            active: true,
+        });
+        assert_eq!(
+            fake_camera::current(),
+            vec![1, 3, 1],
+            "the next session finishes the restore the killed one could not"
+        );
+        assert_eq!(stream_store_state(&dir).0, 0, "the claim is resolved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A value somebody else set is left alone: same bytes, no record, no
+    /// claim, no write (#188).
+    #[test]
+    fn a_value_someone_else_set_is_not_claimed() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _fake = fake_camera::install(fake_camera::Camera {
+            // Another tool already established the exact wanted value.
+            current: vec![1, 3, 2],
+            ..a_working_camera()
+        });
+        let asus = identity(0x3277, 0x0059);
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("the control reads");
+        assert_eq!(write.outcome, Applied::AlreadyHeld);
+        assert!(
+            crate::stream_record::claim(&asus, 14, 6, &write.current).is_none(),
+            "no record exists, so these bytes are another writer's state"
+        );
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "nothing may be written to a control irlume never changed: {:?}",
+            fake_camera::log()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each claim spends one counted attempt, and the fourth is refused (#188).
+    ///
+    /// Simulates a control that keeps reading back as irlume's leftover no
+    /// matter how many restores land — the pathology the counter exists for:
+    /// without it, every stream open would send one more firmware write,
+    /// forever.
+    #[test]
+    fn a_leftover_that_never_resolves_stops_being_claimed_after_three_attempts() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        crate::stream_record::save(&asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+            .expect("seed the leftover")
+            // The seeding "stream" dies without resolving.
+            ;
+        for attempt in 1..=crate::stream_record::MAX_RESTORE_ATTEMPTS {
+            let (_, record) = crate::stream_record::claim(&asus, 14, 6, &[1, 3, 2])
+                .unwrap_or_else(|| panic!("claim {attempt} is within the limit"));
+            // Every restore "fails": the record handle drops unresolved, as
+            // the guard leaves it when its SET_CUR errors.
+            drop(record);
+            let (_, records) = stream_store_state(&dir);
+            assert_eq!(
+                records[0].restore_attempts, attempt,
+                "the attempt is counted on disk before the write it authorises"
+            );
+        }
+        assert!(
+            crate::stream_record::claim(&asus, 14, 6, &[1, 3, 2]).is_none(),
+            "the fourth claim is refused: the control never resolves and \
+             writing again is the loop the counter stops"
+        );
+        assert_eq!(
+            stream_store_state(&dir).0,
+            1,
+            "the spent record stays for a human, like the journal's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `SET_CUR` the camera rejects leaves no record behind (#188): the
+    /// record would describe a change that never happened.
+    #[test]
+    fn a_rejected_write_leaves_no_record() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-reject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _fake = fake_camera::install(fake_camera::Camera {
+            fail_set_from: Some((1, libc::EIO)),
+            ..a_working_camera()
+        });
+        let asus = identity(0x3277, 0x0059);
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("the checks pass; only the write is rejected");
+        assert_eq!(write.outcome, Applied::Nothing);
+        assert!(write.record.is_none());
+        assert_eq!(
+            stream_store_state(&dir).0,
+            0,
+            "a record must not describe a write the camera refused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// IR Torch's applied value IS the camera's default, so there is nothing
@@ -5009,8 +5393,10 @@ mod tests {
             ..Default::default()
         });
 
-        let (write, sent) = apply_device_default(-1, 14, crate::uvc_descriptor::MSXU_IR_TORCH)
-            .expect("a conformant torch takes its own default");
+        let asus = identity(0x3277, 0x0059);
+        let (write, sent) =
+            apply_device_default(-1, &asus, 14, crate::uvc_descriptor::MSXU_IR_TORCH)
+                .expect("a conformant torch takes its own default");
         assert_eq!(sent, def, "the applied bytes are the camera's own GET_DEF");
         // The fixture starts at the default, so there is nothing to write: the
         // torch's own value IS the default, which is the point of the case.
@@ -5024,6 +5410,7 @@ mod tests {
         // it carried the restore bytes, so nothing is outstanding.
         drop(StreamMode {
             handle: None,
+            record: None,
             unit: 14,
             selector: crate::uvc_descriptor::MSXU_IR_TORCH,
             restore: def.clone(),
@@ -6012,18 +6399,18 @@ mod tests {
         let _g = env_guard();
         let asus = identity(0x3277, 0x0059);
         assert_eq!(
-            check_and_apply_override(-1, &asus, &ctrl(3, 1, vec![255])),
-            Err(OverrideRefusal::NoSuchUnit {
+            check_and_apply_override(-1, &asus, &ctrl(3, 1, vec![255])).unwrap_err(),
+            OverrideRefusal::NoSuchUnit {
                 unit: 3,
                 seen: vec![11, 10, 14]
-            })
+            }
         );
         assert_eq!(
-            check_and_apply_override(-1, &asus, &ctrl(14, 10, vec![0; 4])),
-            Err(OverrideRefusal::NotAdvertised {
+            check_and_apply_override(-1, &asus, &ctrl(14, 10, vec![0; 4])).unwrap_err(),
+            OverrideRefusal::NotAdvertised {
                 unit: 14,
                 selector: 10
-            })
+            }
         );
     }
 
@@ -6123,8 +6510,8 @@ mod tests {
             "re-checking must not write"
         );
         assert_eq!(
-            answer,
-            CaptureWrite::refused(),
+            answer.outcome,
+            Applied::Nothing,
             "a camera that cannot answer GET_CUR must not be reported as lit \
              on the strength of an earlier write"
         );

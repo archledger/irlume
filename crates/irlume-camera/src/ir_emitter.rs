@@ -1317,29 +1317,13 @@ impl StreamMode {
         self.active
     }
 
-    /// Give up the restore without writing anything.
-    ///
-    /// For one case only: the stream this guard was set for has been torn down
-    /// and reopened, and a FRESH guard has taken over the same control.
-    ///
-    /// Without this, reassigning would drop the old guard after the new `enable`
-    /// had already run, writing the default straight over the value just set.
-    ///
-    /// An earlier version of this comment justified it with "these modules reset
-    /// the control per open". That is not what this project measured: the record
-    /// in `IrCamera::session` says the control survives stream close and process
-    /// exit on both cameras here. So the caller gives the old guard up only when
-    /// the replacement is armed, and an unarmed replacement leaves the old guard
-    /// to put the value back.
-    ///
-    /// The leftover record is NOT resolved here: giving up the restore gives
-    /// up the bookkeeping with it, and dropping this guard then releases the
-    /// lock and leaves the file — which no longer matters, because since
-    /// review round 4 no second guard can have WRITTEN while this one lived,
-    /// so a disarmed guard's record describes a change nobody made twice.
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
+    // There used to be a public `disarm()` here, for the frozen-stream
+    // restart's ownership handover. The restart restores before reopening
+    // since review round 4, which removed the method's one production caller
+    // — and a disarmed guard holding an APPLIED record would abandon it,
+    // unlocked and still authoritative, for a later stream to claim against
+    // a value whose owner meant to keep it (review round 8). Ownership moves
+    // by moving the whole guard, or not at all.
 
     /// Whether this guard owns an outstanding change that still has to be put
     /// back.
@@ -5131,37 +5115,6 @@ mod tests {
             "restoring again, and then dropping, must send nothing further"
         );
         assert_eq!(fake_camera::current(), vec![1, 3, 1]);
-    }
-
-    /// `disarm` gives up the restore without writing, for the one case that
-    /// needs it: the stream the guard was set for has been torn down and
-    /// reopened, so a fresh guard covers the new one.
-    #[test]
-    fn disarming_gives_up_the_restore_without_writing() {
-        let _lock = crate::testenv::env_lock();
-        let _fake = fake_camera::install(fake_camera::Camera {
-            current: vec![1, 3, 2],
-            len: 3,
-            ..a_working_camera()
-        });
-        let mut mode = StreamMode {
-            handle: None,
-            record: None,
-            _lock: None,
-            unit: 14,
-            selector: 6,
-            restore: vec![1, 3, 1],
-            applied: vec![1, 3, 2],
-            armed: true,
-            active: true,
-        };
-        mode.disarm();
-        drop(mode);
-        assert_eq!(
-            fake_camera::current(),
-            vec![1, 3, 2],
-            "a disarmed guard must leave the control exactly as it found it"
-        );
     }
 
     /// An override the control already holds is not written, and not undone.

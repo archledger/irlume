@@ -270,11 +270,14 @@ echo "=== 3. the same bytes planted from outside irlume are not claimed ==="
 if [ -z "${APPLIED:-}" ]; then
     skip "no applied value is known, so nothing can be planted"
 else
-    "$XU_SET" "$IR" "$UNIT" "$SEL" "$APPLIED" >"$OUT/plant.out" 2>&1 || {
+    planted=no
+    if "$XU_SET" "$IR" "$UNIT" "$SEL" "$APPLIED" >"$OUT/plant.out" 2>&1; then
+        planted=yes
+    else
         sed 's/^/    /' "$OUT/plant.out"
-        skip "the plant write was refused, so the outside-writer case was not staged"
-    }
-    if grep -aq "after:" "$OUT/plant.out"; then
+        skip "the plant write did not take, so the outside-writer case was not staged"
+    fi
+    if [ "$planted" = yes ]; then
         start_daemon outside || exit 2
         capture 1 >"$OUT/capture-outside.out" 2>&1
         stop_daemon

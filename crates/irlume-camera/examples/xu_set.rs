@@ -104,7 +104,13 @@ fn run() -> Result<(), String> {
     eprintln!("xu_set: unit{unit}/sel{selector} wrote:  {payload:02x?}");
     eprintln!("xu_set: unit{unit}/sel{selector} after:  {after:02x?}");
     if after != payload {
-        eprintln!("xu_set: note: the control did not read back what was written");
+        // An exit status the harnesses can key on: a camera that clamps,
+        // ignores or rewrites the payload has NOT been put into the state
+        // the caller asked for, and a park or plant that silently did not
+        // take makes every assertion built on it vacuous.
+        return Err(format!(
+            "the control did not take the value: wrote {payload:02x?}, reads {after:02x?}"
+        ));
     }
     Ok(())
 }

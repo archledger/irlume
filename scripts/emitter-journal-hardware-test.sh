@@ -258,11 +258,33 @@ if [ -n "$(find "$STORE" -name '*.json' 2>/dev/null)" ]; then
 fi
 
 echo "=== 1. park the control at the camera's own default ==="
+# Parked by applying the default in a capture and then KILLING the daemon before
+# the stream ends.
+#
+# Starting a daemon with the override and stopping it cleanly no longer parks
+# anything, and that is #168 working rather than a bug: the daemon does not
+# capture at startup, so nothing is written, and if a capture does run the guard
+# restores whatever was there before the park, undoing it. No capture-path route
+# can leave a control changed any more, which is the whole point of the change.
+#
+# A kill is the one thing that still can, because the guard never runs. That is
+# the same mechanism section 4 uses deliberately, and it leaves the control at
+# the default exactly as this section needs.
 start_daemon park "$UNIT:$SEL:$PARK" || {
     echo "  daemon would not start"
     exit 2
 }
-stop_daemon
+IRLUME_SOCKET="$SOCK" "$B/irlume" camera-tune --rounds 1 >"$OUT/park-tune.out" 2>&1 &
+tune=$!
+for _ in $(seq 1 600); do
+    grep -aq "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null && break
+    sleep 0.05
+done
+# Killed the instant the park value is on the camera, so the guard cannot undo it.
+pkill -KILL -f "$B/irlumed" 2>/dev/null
+wait "$tune" 2>/dev/null
+daemon_pid=""
+sleep 1
 parked=$(grep -ac "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null)
 if [ "${parked:-0}" -ge 1 ]; then
     ok "the control was parked at its default"

@@ -687,18 +687,37 @@ pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
     //   * A record could be sitting under this name without describing this
     //     camera at all.
     //
-    // So a hit is checked, a miss falls through, and the scan below decides.
+    // So a MISS falls through and the scan below decides. A hit is still checked,
+    // but a hit that fails the check is an error, not a fall-through: the name is
+    // built from the very fields being compared, so contents that disagree at
+    // this path mean the file was damaged, and continuing to the scan let it drop
+    // out as "nothing pending" while a firmware change was still outstanding.
     let path = record_path(&filing_key(id));
     match std::fs::read_to_string(&path) {
         Ok(body) => {
             let record: PendingWrite = serde_json::from_str(&body)
                 .map_err(|e| format!("parse {}: {e}", path.display()))?;
-            if describes_this_camera(&record, id) {
-                return Ok(Situation::Mine {
-                    path,
-                    record: Box::new(record),
-                });
+            if !describes_this_camera(&record, id) {
+                // Filed under THIS camera's key, yet its contents say otherwise.
+                // The key is built from the fingerprint, serial and device path,
+                // so a record that legitimately belongs to another camera lands
+                // under another name; arriving here means the file was damaged
+                // or edited. Falling through was fail-open: the scan drops it on
+                // the same mismatch, `load` answers `Nothing`, and the capture
+                // path takes that as licence to write to the camera while an
+                // unresolved change may still be outstanding. An existing record
+                // is never absence, which is the rule the unparseable and
+                // unreadable cases already follow.
+                return Err(format!(
+                    "{} is filed under this camera's exact journal key but its contents \
+                     describe a different camera; refusing to treat the store as empty",
+                    path.display()
+                ));
             }
+            return Ok(Situation::Mine {
+                path,
+                record: Box::new(record),
+            });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("read {}: {e}", path.display())),
@@ -1005,6 +1024,49 @@ mod tests {
 
         clear(&path).expect("clear");
         assert_eq!(load(&id), Ok(Situation::Nothing));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record sitting at THIS camera's exact key whose contents disagree is an
+    /// error, never "nothing pending".
+    ///
+    /// The key is built from the fingerprint, serial and device path, so a
+    /// record that genuinely belongs to another camera is filed under another
+    /// name. Contents that disagree HERE mean the file was damaged or edited.
+    /// The old code fell through to the scan, which drops it on the same
+    /// mismatch, so `load` answered `Nothing` and the capture path read that as
+    /// licence to write to the camera while an undo record was still outstanding
+    /// — fail-open, in the one module whose entire job is to fail closed.
+    #[test]
+    fn a_damaged_record_at_this_cameras_exact_key_is_not_treated_as_absent() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-damaged-exact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let id = identity();
+        let mut record = record_for(&id);
+        let path = save(&record).expect("save");
+
+        // Still valid JSON, still at the name this camera computes, but one
+        // identity field no longer matches the camera in front of us.
+        record.descriptor_sha256 = "0".repeat(64);
+        std::fs::write(&path, serde_json::to_string(&record).expect("serialize"))
+            .expect("damage the record");
+
+        let why = load(&id)
+            .expect_err("a record at the exact key that disagrees must not read as an empty store");
+        assert!(
+            why.contains("exact journal key"),
+            "the error must say where the record was found, got: {why}"
+        );
+        // And it is still there: refusing must not destroy the only description
+        // of a change that may still be outstanding.
+        assert!(
+            path.exists(),
+            "the record must be left for a person to look at"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

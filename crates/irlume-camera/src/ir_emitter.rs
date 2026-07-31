@@ -750,6 +750,75 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
         && info & DISABLED_BY_COMMIT_STATE == 0
 }
 
+/// What a capture write did, and what its one read answered.
+///
+/// When `outcome` is `Wrote`, `current` is what the write DISPLACED, read on
+/// the same pass that decided to write, and it is the only value a stream
+/// guard may put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureWrite {
+    outcome: Applied,
+    /// What `GET_CUR` answered immediately before the write decision.
+    current: Vec<u8>,
+}
+
+impl CaptureWrite {
+    /// Nothing was read and nothing was sent: a check refused before the
+    /// control was consulted at all.
+    fn refused() -> Self {
+        CaptureWrite {
+            outcome: Applied::Nothing,
+            current: Vec::new(),
+        }
+    }
+}
+
+/// The one tail every capture write goes through: read what the control holds,
+/// and write only when it differs.
+///
+/// The read and the write decision are ONE pass, which is the point. `enable`
+/// used to read `GET_CUR` itself, record that as the guard's restore value, and
+/// then let the apply path read `GET_CUR` a second time to decide whether to
+/// write. Another client landing between the two reads got the FIRST, stale
+/// value restored over its own when the stream ended (#190). Here the value the
+/// guard records is the value the write displaced, because they are the same
+/// read.
+///
+/// The restore value used to be `GET_DEF`, on the reading that Microsoft's
+/// sequence ends by "unsetting" the control. That destroys a non-default mode
+/// another program deliberately established; putting back what was displaced
+/// restores a control found at its default to its default, and a control found
+/// anywhere else to where its owner left it.
+///
+/// A `SET_CUR` the camera rejects is `Nothing`, not an error: the callers that
+/// used to propagate it discarded the detail, and the override memo records it
+/// as a refusal either way. A `GET_CUR` that cannot be read IS an error — with
+/// no answer there is no restore value, so nothing may be written.
+fn write_if_different(
+    fd: c_int,
+    unit: u8,
+    selector: u8,
+    len: usize,
+    wanted: &[u8],
+) -> XuResult<CaptureWrite> {
+    let current = get_cur(fd, unit, selector, len)?;
+    if current == *wanted {
+        // Said distinctly from `Wrote` because the two diverge at stream end:
+        // these bytes are another writer's state, and a guard armed here would
+        // end the stream by writing over them.
+        return Ok(CaptureWrite {
+            outcome: Applied::AlreadyHeld,
+            current,
+        });
+    }
+    let outcome = if set_cur(fd, unit, selector, wanted).is_ok() {
+        Applied::Wrote
+    } else {
+        Applied::Nothing
+    };
+    Ok(CaptureWrite { outcome, current })
+}
+
 /// Light the emitter on the open `fd` for `device`, if a control is configured.
 /// Returns whether a `SET_CUR` succeeded. Best-effort.
 ///
@@ -854,86 +923,57 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
     let action = planned_action(&recovery, wanted, &id);
     report_recovery(&id, recovery);
 
-    // Where the write is going, before it goes, so the camera's own default can
-    // be read while the control is still untouched.
+    // Which control the write is going to. Needed here only to give the guard
+    // its coordinates; every read of the control itself happens inside the
+    // apply path, on the same pass that decides whether to write.
     let Some((unit, selector)) = action.coordinates() else {
         return StreamMode::inert();
     };
-    // What the control HOLDS right now, read before anything disturbs it. This is
-    // what the guard puts back.
-    //
-    // It used to record `GET_DEF` instead, on the reading that Microsoft's
-    // sequence ends by "unsetting" the control. That is right whenever the
-    // control is sitting at its default, which is the ordinary case and where
-    // the two values are identical. It is wrong the moment they are not: a
-    // camera another program deliberately left in a non-default mode would be
-    // returned to the DEFAULT when irlume finished, destroying that program's
-    // state while this file repeatedly promises not to undo changes irlume did
-    // not make. Putting back what was displaced honours both, because a control
-    // found at its default is restored to its default.
-    // NOT covered by a unit test: nothing here reaches `enable`, which needs a
-    // real sysfs-backed camera for `identity_from_fd`, so a mutant swapping this
-    // back to GET_DEF survives the suite. What IS covered is the decision the
-    // guard makes about whatever value gets recorded.
-    let restore = match get_len(fd, unit, selector)
-        .and_then(|len| get_of(fd, unit, selector, UVC_GET_CUR, len))
-    {
-        Ok(current) => current,
-        Err(e) => {
-            // Unreadable means no recorded route home, so nothing is applied.
-            // Leaving a control changed with no way back is the state #168
-            // exists to remove.
-            eprintln!(
-                "irlume: not driving unit{unit}/sel{selector}: its current value is unreadable \
-                 ({e}), so there would be no way to put it back"
-            );
-            return StreamMode::inert();
-        }
-    };
 
-    // Armed only when irlume actually CHANGED the control: a write went out,
-    // and it carried bytes other than the ones the guard would put back. Same
-    // rule as the #183 undo journal: irlume does not undo a change it did not
-    // make. Three cases fail that test. A refused write is a change that never
-    // happened, and restoring after it would write to a camera that has just
-    // refused one. An override the control already held is another writer's
-    // state, and a restore would put the default over a value irlume never
-    // set. And IR Torch applies the camera's own default, so its restore would
-    // be a SET_CUR that changes nothing, sent to firmware at the end of every
-    // capture.
-    // Two answers, deliberately not one. `changed` decides whether the guard has
-    // a restore to make; `active` decides what the caller tells the user about
-    // their infrared. A control that already held the wanted value is active and
-    // not irlume's to undo, and collapsing the pair reported it dark.
-    let (changed, active, applied) = match action {
-        CaptureAction::Nothing => (false, false, Vec::new()),
+    // Armed only when irlume actually CHANGED the control, and the guard's
+    // restore value is what that change DISPLACED — the answer of the one
+    // `GET_CUR` in the apply path, not a separate earlier read. Recording an
+    // earlier read left a window: another client writing between the two reads
+    // got the stale value restored over its own (#190). Same rule as the #183
+    // undo journal either way: irlume does not undo a change it did not make.
+    // A refused write is a change that never happened, and an already-held
+    // value is another writer's state. `Wrote` needs no "did it differ" check:
+    // the tail only writes when the displaced value differs from the payload.
+    //
+    // Two answers, deliberately not one. The restore decides whether the guard
+    // has something to put back; `active` decides what the caller tells the
+    // user about their infrared. A control that already held the wanted value
+    // is active and not irlume's to undo, and collapsing the pair reported it
+    // dark.
+    let (write, applied) = match action {
+        CaptureAction::Nothing => (None, Vec::new()),
         CaptureAction::Override(ctrl) => {
-            let outcome = apply_override(fd, &id, &ctrl);
-            let holds = outcome != Applied::Nothing;
-            let changed = outcome == Applied::Wrote && ctrl.payload != restore;
-            (changed, holds, ctrl.payload)
+            let payload = ctrl.payload.clone();
+            (Some(apply_override(fd, &id, &ctrl)), payload)
         }
         CaptureAction::DeviceDefault { unit, selector } => {
             match apply_device_default(fd, unit, selector) {
-                Ok((outcome, sent)) => (outcome == Applied::Wrote && sent != restore, true, sent),
-                Err(_) => (false, false, Vec::new()),
+                Ok((w, sent)) => (Some(w), sent),
+                Err(_) => (None, Vec::new()),
             }
         }
         CaptureAction::KnownPayload(ctrl) => match apply_known_payload(fd, &ctrl) {
-            Ok(outcome) => (
-                outcome == Applied::Wrote && ctrl.payload != restore,
-                true,
-                ctrl.payload,
-            ),
-            Err(_) => (false, false, Vec::new()),
+            Ok(w) => (Some(w), ctrl.payload),
+            Err(_) => (None, Vec::new()),
         },
     };
+    let active = write
+        .as_ref()
+        .is_some_and(|w| w.outcome != Applied::Nothing);
+    let restore = write
+        .filter(|w| w.outcome == Applied::Wrote)
+        .map(|w| w.current);
     StreamMode {
         handle: Some(handle),
         unit,
         selector,
-        restore,
-        armed: changed,
+        armed: restore.is_some(),
+        restore: restore.unwrap_or_default(),
         active,
         applied,
     }
@@ -1458,7 +1498,7 @@ fn apply_override(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
-) -> Applied {
+) -> CaptureWrite {
     let key = match override_key(fd, id, ctrl) {
         Ok(key) => key,
         Err(err) => {
@@ -1467,7 +1507,7 @@ fn apply_override(
                  so irlume cannot tell whether this was already applied",
                 ctrl.encode()
             );
-            return Applied::Nothing;
+            return CaptureWrite::refused();
         }
     };
 
@@ -1492,14 +1532,14 @@ fn apply_override(
                  after a panic, so irlume cannot tell whether this was already applied",
                 ctrl.encode()
             );
-            return Applied::Nothing;
+            return CaptureWrite::refused();
         }
     };
     match reuse(memo.get(&key), &ctrl.payload) {
         // A remembered refusal stands: re-running the checks every capture is
         // the traffic the record exists to stop, and the answer is "no" either
         // way.
-        Reuse::Answer(false) => return Applied::Nothing,
+        Reuse::Answer(false) => return CaptureWrite::refused(),
         // A remembered SUCCESS says this payload was checked against this
         // camera's descriptors and accepted. It does NOT say the control still
         // holds it, and since the mode is now restored when each stream ends it
@@ -1517,13 +1557,13 @@ fn apply_override(
         // the documented sequence, not the repeated writing this change removes.
         Reuse::Answer(true) => {
             return match check_and_apply_override(fd, id, ctrl) {
-                Ok(applied) => applied,
+                Ok(write) => write,
                 Err(why) => {
                     eprintln!(
                         "irlume: refusing IRLUME_IR_EMITTER={}: {why}",
                         ctrl.encode()
                     );
-                    Applied::Nothing
+                    CaptureWrite::refused()
                 }
             }
         }
@@ -1536,12 +1576,12 @@ fn apply_override(
                 ctrl.unit,
                 ctrl.selector
             );
-            return Applied::Nothing;
+            return CaptureWrite::refused();
         }
         Reuse::Decide => {}
     }
-    let outcome = match check_and_apply_override(fd, id, ctrl) {
-        Ok(applied) => applied,
+    let write = match check_and_apply_override(fd, id, ctrl) {
+        Ok(write) => write,
         Err(why) => {
             // Silence here would read as "the value was applied and the camera
             // is simply dark", which is the reading that sends someone back to
@@ -1550,7 +1590,7 @@ fn apply_override(
                 "irlume: refusing IRLUME_IR_EMITTER={}: {why}",
                 ctrl.encode()
             );
-            Applied::Nothing
+            CaptureWrite::refused()
         }
     };
     memo.insert(
@@ -1559,10 +1599,10 @@ fn apply_override(
             payload: ctrl.payload.clone(),
             // The record answers "was this payload accepted", so a value found
             // already in place counts the same as a write the camera took.
-            applied: outcome != Applied::Nothing,
+            applied: write.outcome != Applied::Nothing,
         },
     );
-    outcome
+    write
 }
 
 /// Test-only: hold a caller inside the gate so another thread can observe what
@@ -1610,7 +1650,7 @@ fn check_and_apply_override(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
-) -> std::result::Result<Applied, OverrideRefusal> {
+) -> std::result::Result<CaptureWrite, OverrideRefusal> {
     #[cfg(test)]
     park_inside_for_test();
 
@@ -1649,22 +1689,12 @@ fn check_and_apply_override(
             given: ctrl.payload.len(),
         });
     }
-    let current = get_cur(fd, unit, selector, len).map_err(|err| OverrideRefusal::Unreadable {
-        unit,
-        selector,
-        err,
-    })?;
-    if current == ctrl.payload {
-        // Already holding what the override asks for, so nothing is sent. Said
-        // distinctly from `Wrote` because the two diverge at stream end: these
-        // bytes are another writer's state, and a guard armed here would end
-        // the stream by setting the default over them.
-        return Ok(Applied::AlreadyHeld);
-    }
-    Ok(if set_cur(fd, unit, selector, &ctrl.payload).is_ok() {
-        Applied::Wrote
-    } else {
-        Applied::Nothing
+    write_if_different(fd, unit, selector, len, &ctrl.payload).map_err(|err| {
+        OverrideRefusal::Unreadable {
+            unit,
+            selector,
+            err,
+        }
     })
 }
 
@@ -1676,7 +1706,7 @@ fn check_and_apply_override(
 /// that size right now. Writing a nine-byte payload to a control the camera has
 /// just reported as disabled, or as a different length, is not something a
 /// validated VID:PID should buy.
-fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<Applied> {
+fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<CaptureWrite> {
     if !info_allows_set(get_info(fd, ctrl.unit, ctrl.selector)?) {
         return Err(XuError::Unsupported);
     }
@@ -1684,16 +1714,7 @@ fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<Applied> {
     if len != ctrl.payload.len() {
         return Err(XuError::Unsupported);
     }
-    // The same rule the override path follows: a control already holding these
-    // bytes was not put there by this run, so writing them again would claim a
-    // change irlume did not make, and the end of the stream would clear somebody
-    // else's state. One GET_CUR on a path that has already sent GET_INFO and
-    // GET_LEN.
-    if get_cur(fd, ctrl.unit, ctrl.selector, len)? == ctrl.payload {
-        return Ok(Applied::AlreadyHeld);
-    }
-    set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload)?;
-    Ok(Applied::Wrote)
+    write_if_different(fd, ctrl.unit, ctrl.selector, len, &ctrl.payload)
 }
 
 /// The bytes to write for one documented control, or why the camera has not
@@ -1741,11 +1762,11 @@ fn intended_value(
 /// replayed from the file: the value is read out of the camera immediately
 /// before it is written back.
 ///
-/// Returns the bytes that went out, because only this function knows them and
-/// the caller needs them: `enable` arms the stream guard by comparing what was
-/// written against what the guard would write back, and for IR Torch the two
-/// are the same bytes.
-fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<(Applied, Vec<u8>)> {
+/// Returns the bytes that went out alongside the write's outcome, because only
+/// this function derives them and the caller needs them: `enable` records what
+/// the guard APPLIED, which for IR Torch is the camera's own default rather
+/// than anything the caller named.
+fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<(CaptureWrite, Vec<u8>)> {
     if !info_allows_set(get_info(fd, unit, selector)?) {
         return Err(XuError::Unsupported);
     }
@@ -1753,13 +1774,8 @@ fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<(Applied,
     let Ok(wanted) = intended_value(fd, unit, selector, len)? else {
         return Err(XuError::Unsupported);
     };
-    // As above: already there means irlume did not put it there, so it is not
-    // irlume's to undo when the stream ends.
-    if get_cur(fd, unit, selector, len)? == wanted {
-        return Ok((Applied::AlreadyHeld, wanted));
-    }
-    set_cur(fd, unit, selector, &wanted)?;
-    Ok((Applied::Wrote, wanted))
+    let write = write_if_different(fd, unit, selector, len, &wanted)?;
+    Ok((write, wanted))
 }
 
 /// Why discovery could not produce a control.
@@ -4825,7 +4841,10 @@ mod tests {
         let outcome = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]));
         assert_eq!(
             outcome,
-            Ok(Applied::AlreadyHeld),
+            Ok(CaptureWrite {
+                outcome: Applied::AlreadyHeld,
+                current: vec![1, 3, 2],
+            }),
             "a value found in place is a success, but not irlume's write"
         );
         assert!(
@@ -4844,9 +4863,9 @@ mod tests {
             selector: 6,
             restore: vec![1, 3, 1],
             applied: vec![1, 3, 2],
-            armed: outcome == Ok(Applied::Wrote),
+            armed: matches!(&outcome, Ok(w) if w.outcome == Applied::Wrote),
             // Active either way: the control holds the payload, whoever set it.
-            active: outcome.is_ok(),
+            active: matches!(&outcome, Ok(w) if w.outcome != Applied::Nothing),
         });
         assert_eq!(
             fake_camera::current(),
@@ -4859,7 +4878,11 @@ mod tests {
         fake_camera::set_current(vec![1, 3, 1]);
         assert_eq!(
             check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2])),
-            Ok(Applied::Wrote)
+            Ok(CaptureWrite {
+                outcome: Applied::Wrote,
+                current: vec![1, 3, 1],
+            }),
+            "a write reports the value it displaced, read on the same pass"
         );
     }
 
@@ -4885,7 +4908,9 @@ mod tests {
             payload: payload.clone(),
         };
         assert_eq!(
-            apply_known_payload(-1, &ctrl).expect("a control that already agrees is not an error"),
+            apply_known_payload(-1, &ctrl)
+                .expect("a control that already agrees is not an error")
+                .outcome,
             Applied::AlreadyHeld,
             "the value is there; irlume did not put it there"
         );
@@ -4901,10 +4926,65 @@ mod tests {
         fake_camera::set_current(vec![9, 9, 9]);
         assert_eq!(
             apply_known_payload(-1, &ctrl).expect("a control that disagrees is written"),
-            Applied::Wrote
+            CaptureWrite {
+                outcome: Applied::Wrote,
+                current: vec![9, 9, 9],
+            },
+            "the write reports the value it displaced"
         );
         assert_eq!(fake_camera::current(), payload);
     }
+
+    /// The apply path reads the control ONCE, and the value it reports as
+    /// displaced is that read's answer.
+    ///
+    /// Two reads was the defect (#190): `enable` recorded an early `GET_CUR` as
+    /// the guard's restore value while the apply path decided on a later one,
+    /// so a writer landing between them had its value overwritten by the stale
+    /// record when the stream ended. The FULL request order is asserted, so a
+    /// second `GET_CUR` reappearing anywhere in the path fails here rather than
+    /// reopening the window quietly.
+    #[test]
+    fn one_read_decides_and_its_answer_is_what_the_write_displaced() {
+        let _lock = crate::testenv::env_lock();
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![7, 7, 7],
+            len: 3,
+            info: 0b0000_0011,
+            ..a_working_camera()
+        });
+        let asus = identity(0x3277, 0x0059);
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("a published control with a valid payload is applied");
+        assert_eq!(
+            write,
+            CaptureWrite {
+                outcome: Applied::Wrote,
+                current: vec![7, 7, 7],
+            },
+            "the displaced value is the one read's answer"
+        );
+        assert_eq!(
+            fake_camera::log(),
+            vec![
+                fake_camera::Request::Get {
+                    query: UVC_GET_INFO,
+                    size: 1,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_LEN,
+                    size: 2,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_CUR,
+                    size: 3,
+                },
+                fake_camera::Request::Set(vec![1, 3, 2]),
+            ],
+            "exactly one GET_CUR, immediately before the write it authorises"
+        );
+    }
+
     /// IR Torch's applied value IS the camera's default, so there is nothing
     /// for the stream end to restore.
     ///
@@ -4929,13 +5009,13 @@ mod tests {
             ..Default::default()
         });
 
-        let (outcome, sent) = apply_device_default(-1, 14, crate::uvc_descriptor::MSXU_IR_TORCH)
+        let (write, sent) = apply_device_default(-1, 14, crate::uvc_descriptor::MSXU_IR_TORCH)
             .expect("a conformant torch takes its own default");
         assert_eq!(sent, def, "the applied bytes are the camera's own GET_DEF");
         // The fixture starts at the default, so there is nothing to write: the
         // torch's own value IS the default, which is the point of the case.
         assert_eq!(
-            outcome,
+            write.outcome,
             Applied::AlreadyHeld,
             "a control already at the value it wants is not written again"
         );
@@ -4948,7 +5028,7 @@ mod tests {
             selector: crate::uvc_descriptor::MSXU_IR_TORCH,
             restore: def.clone(),
             applied: vec![1, 3, 2],
-            armed: sent != def,
+            armed: write.outcome == Applied::Wrote,
             // The torch IS on: its default is an active mode. Active without
             // being armed is exactly the pair this field exists to separate.
             active: true,
@@ -6044,7 +6124,7 @@ mod tests {
         );
         assert_eq!(
             answer,
-            Applied::Nothing,
+            CaptureWrite::refused(),
             "a camera that cannot answer GET_CUR must not be reported as lit \
              on the strength of an earlier write"
         );

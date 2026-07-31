@@ -1987,7 +1987,10 @@ fn recover_pending_write_locked(
             // The attempt counter is what limits repeats.
             spent.boot_id = None;
             spent.pid = None;
-            if let Err(why) = journal::save(&spent) {
+            // To the path the record was FOUND at, not the one its contents
+            // derive: a scanned record need not be filed under its own name, and
+            // deriving here wrote the incremented record to a second file.
+            if let Err(why) = journal::save_at(&record_path, &spent) {
                 // The attempt could not be counted, so making it would be an
                 // uncounted write: exactly the loop the counter exists to stop.
                 return RecoveryOutcome::Unresolved(format!("count the attempt: {why}"));
@@ -4017,6 +4020,89 @@ mod tests {
                 .count()
                 >= 2,
             "the control must be re-read immediately before the write: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recovering a MISFILED record leaves exactly one file behind, and then
+    /// none.
+    ///
+    /// The attempt counter is written before the restoring write. Deriving that
+    /// path from the record's contents put the incremented copy in a SECOND
+    /// file, and the clear afterwards removed only the one that was read — two
+    /// records for one operation, the survivor pending forever. The earlier
+    /// misfiled test only reached the already-restored branch and never took
+    /// this one.
+    #[test]
+    fn recovering_a_misfiled_record_leaves_no_duplicate() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-misfiled-attempt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+
+        let record = crate::emitter_journal::PendingWrite {
+            schema_version: crate::emitter_journal::SCHEMA_VERSION,
+            engine_version: "test".into(),
+            descriptor_sha256: crate::emitter_journal::fingerprint(&id),
+            usb_id: id.usb_id(),
+            interface_number: id.interface_number,
+            unit: ms.unit_id,
+            selector,
+            len: 3,
+            original: crate::emitter_journal::to_hex(&[1, 3, 1]),
+            attempted: crate::emitter_journal::to_hex(&[1, 3, 2]),
+            restore_attempts: 0,
+            boot_id: None,
+            pid: None,
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
+        };
+        // Deliberately NOT under the name its own fields produce.
+        let store = dir.join("ir-emitter-journal");
+        std::fs::create_dir_all(&store).expect("store");
+        let misfiled =
+            store.join("1111111111111111111111111111111111111111111111111111111111111111.json");
+        std::fs::write(
+            &misfiled,
+            serde_json::to_string(&record).expect("serialize"),
+        )
+        .expect("plant");
+
+        // The control still holds this run's exploratory value, so recovery
+        // takes the counting-and-restoring branch rather than already-restored.
+        let camera = fake_camera::Camera {
+            current: vec![1, 3, 2],
+            ..a_working_camera()
+        };
+        let _fake = fake_camera::install(camera);
+
+        let outcome = recover_pending_write(-1, &id);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Restored { .. }),
+            "the restoring branch must be the one taken: {outcome:?}"
+        );
+        let left = std::fs::read_dir(&store)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            left, 0,
+            "one operation must not leave a second record behind"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

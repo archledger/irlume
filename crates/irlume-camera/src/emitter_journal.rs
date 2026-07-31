@@ -64,7 +64,14 @@ pub(crate) struct PendingWrite {
     /// newer schema rather than reading the fields it happens to recognise,
     /// because serde ignores unknown fields and every field here would still
     /// deserialize into a plausible-looking older shape.
-    #[serde(default = "schema_version_1")]
+    ///
+    /// REQUIRED, with no serde default. A default invented schema 1 whenever the
+    /// field was absent, which handed the gate its own answer: a record with no
+    /// version at all deserialized into a schema-1 record and could authorise a
+    /// firmware write. An absent version is precisely "this build cannot know
+    /// what this record means", so the parse fails, `load` reports it, and
+    /// nothing is acted on. The default existed for records written before the
+    /// field, and this feature has never shipped, so there are none.
     pub(crate) schema_version: u32,
     /// Which build wrote the record. Descriptive, not a gate.
     pub(crate) engine_version: String,
@@ -170,10 +177,6 @@ pub(crate) fn owner_still_running(record: &PendingWrite) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-fn schema_version_1() -> u32 {
-    1
-}
-
 impl PendingWrite {
     /// The original bytes, or an error naming what is wrong with the record.
     pub(crate) fn original_bytes(&self) -> Result<Vec<u8>, String> {
@@ -255,6 +258,14 @@ pub(crate) fn trace(event: &str) {
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: journal {event}");
     }
+}
+
+/// Only referenced by a mutation-test variant that reinstates the serde default
+/// this type deliberately does not have. Never used in production.
+#[cfg(test)]
+#[allow(dead_code)]
+fn schema_version_one() -> u32 {
+    1
 }
 
 /// Where journal records live. One file per camera, under the state root.
@@ -761,11 +772,22 @@ fn all_records() -> Result<Vec<(PathBuf, PendingWrite)>, String> {
 /// process finds the directory present and inherits a guarantee nobody has made.
 /// `ir-setup` is a person running a command, not a hot path.
 pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
+    save_at(&record_path(&record.filing_key()), record)
+}
+
+/// Write a record to a PARTICULAR path.
+///
+/// Recovery uses this to rewrite a record it found by scanning. `save` derives
+/// the name from the contents, and a scanned record need not be filed under the
+/// name its contents produce, so counting an attempt through `save` wrote the
+/// incremented record to a second file and left the first one behind — two
+/// records for one operation, and the clear afterwards removed only one.
+pub(crate) fn save_at(path: &std::path::Path, record: &PendingWrite) -> Result<PathBuf, String> {
     let dir = store_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     irlume_common::restrict(&dir, 0o700)?;
     irlume_common::fsync_ancestors(&dir)?;
-    let path = record_path(&record.filing_key());
+    let path = path.to_path_buf();
     let body = serde_json::to_string(record).map_err(|e| format!("serialize record: {e}"))?;
     irlume_common::write_0600_atomic(&path, body.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -1099,6 +1121,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A record with no schema version at all authorises nothing.
+    ///
+    /// A serde default invented schema 1 whenever the field was missing, which
+    /// handed the gate its own answer. An absent version means this build cannot
+    /// know what the record means, so the parse must fail and the record must be
+    /// reported rather than acted on.
+    #[test]
+    fn a_record_with_no_schema_version_is_refused_rather_than_assumed() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-no-schema");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let id = identity();
+        let mut fields: serde_json::Value =
+            serde_json::to_value(record_for(&id)).expect("serialize");
+        fields
+            .as_object_mut()
+            .expect("object")
+            .remove("schema_version");
+        std::fs::create_dir_all(store_dir()).expect("store");
+        std::fs::write(
+            record_path(&filing_key(&id)),
+            serde_json::to_string(&fields).expect("reserialize"),
+        )
+        .expect("plant");
+
+        // Not silently read as schema 1: the load fails, which the caller turns
+        // into an unresolved outcome rather than an authorisation.
+        assert!(
+            load(&id).is_err(),
+            "a record with no version must not deserialize into one"
+        );
+        // And it is still visible to an operator rather than vanishing.
+        match pending_summary() {
+            PendingSummary::Pending(entries) => assert_eq!(entries.len(), 1),
+            other => panic!("the record must still be reported: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE CONSEQUENCE OF TWO IDENTICAL CAMERAS: one camera's pending record
     /// darkens the other one too.
     ///
@@ -1305,27 +1368,69 @@ mod tests {
 
     /// With several same-model records in the store, this camera's own must be
     /// found wherever the directory listing happens to put it.
+    ///
+    /// MY record is deliberately MISFILED, so the exact-path fast path misses
+    /// and the SCAN is what has to find it. Without that this never reached the
+    /// loop at all: the fast path answered, and a mutant that stopped the scan
+    /// at the first same-model record survived under a test named for
+    /// directory order.
+    ///
+    /// The foreign record is given a name this directory really does hand back
+    /// first, discovered by asking rather than assumed, so the ordering the test
+    /// is named for is the ordering it runs against.
     #[test]
     fn this_cameras_record_is_found_whatever_the_directory_order() {
         let _lock = env_lock();
         let dir = std::env::temp_dir().join("irlume-journal-scan-order");
         let _ = std::fs::remove_dir_all(&dir);
         let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        std::fs::create_dir_all(store_dir()).expect("store");
 
         let mine = identity();
-        let other = identical_unit_elsewhere();
-        // A foreign same-model record and this camera's own, both present.
-        save(&record_for(&other)).expect("save the other unit's");
         let my_record = record_for(&mine);
-        save(&my_record).expect("save mine");
+        let misfiled = store_dir().join(format!("{}.json", "f".repeat(64)));
+        std::fs::write(
+            &misfiled,
+            serde_json::to_string(&my_record).expect("serialize"),
+        )
+        .expect("plant mine misfiled");
+
+        let other = record_for(&identical_unit_elsewhere());
+        let first_entry = || {
+            std::fs::read_dir(store_dir())
+                .expect("read store")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .next()
+                .expect("an entry")
+        };
+        let mut foreign = None;
+        for n in 0..64u32 {
+            let candidate = store_dir().join(format!("{n:064x}.json"));
+            std::fs::write(
+                &candidate,
+                serde_json::to_string(&other).expect("serialize"),
+            )
+            .expect("plant foreign");
+            if first_entry() == candidate {
+                foreign = Some(candidate);
+                break;
+            }
+            std::fs::remove_file(&candidate).expect("try another name");
+        }
+        assert!(
+            foreign.is_some(),
+            "no name came back before mine in 64 tries, so the ordering this \
+             test is named for was never established"
+        );
 
         assert_eq!(
             load(&mine).expect("load"),
             Situation::Mine {
-                path: record_path(&my_record.filing_key()),
+                path: misfiled,
                 record: Box::new(my_record)
             },
-            "stopping at the first same-model record found would report the wrong one"
+            "stopping at the first same-model record would report the wrong one"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -380,9 +380,17 @@ pub(crate) enum SaveError {
     /// is no change for the exclusion to outlive, and releasing it lets the
     /// control's own next capture claim the outstanding record.
     Outstanding { unit: u8, selector: u8 },
-    /// The store could not take the record for a reason other than an
-    /// outstanding one: unreadable existing file, unwritable directory, a
-    /// failed rename. The caller proceeds unrecorded, still holding the lock.
+    /// The existing record cannot be REASONED ABOUT — an unsupported schema,
+    /// an unparseable body — or is `prepared` for a change this write cannot
+    /// prove absent. Not authorising a claim does not license destroying it:
+    /// a `prepared` record's write may have SUCCEEDED (a crash between the
+    /// `SET_CUR` and the confirmation), and its displaced value is then the
+    /// only route back (review round 7). The caller refuses the write; the
+    /// lock is dropped, nothing is written, nothing is destroyed.
+    Protected { why: String },
+    /// The store could not take the record for a reason other than the two
+    /// above: an unreadable existing file, an unwritable directory, a failed
+    /// rename. The caller proceeds unrecorded, still holding the lock.
     Unavailable { lock: StreamLock, why: String },
 }
 
@@ -405,23 +413,33 @@ pub(crate) fn save(
     displaced: &[u8],
 ) -> Result<StreamRecord, SaveError> {
     let path = record_path(id);
+    // What already sits at this camera's path decides whether writing is
+    // allowed at all. The ONLY record that may be replaced is one that is
+    // demonstrably superseded: same schema, same control, and its applied
+    // bytes no longer in the control. Everything else is protected —
+    // including `prepared` records, whose write may have succeeded before a
+    // crash stopped the confirmation, and schemas this build cannot read
+    // (review round 7: "authorises nothing" never meant "may be destroyed").
     match std::fs::read_to_string(&path) {
         Ok(body) => match serde_json::from_str::<StreamWrite>(&body) {
-            Ok(existing)
-                if existing.schema_version == SCHEMA_VERSION
-                    && existing.state == WriteState::Applied =>
-            {
-                let live = if (existing.unit, existing.selector) == (unit, selector) {
-                    // Same control: superseded exactly when its bytes are no
-                    // longer what the control holds. An unparseable applied
-                    // field cannot prove that, so it reads as live.
-                    from_hex(&existing.applied)
-                        .map(|bytes| bytes == displaced)
-                        .unwrap_or(true)
-                } else {
-                    true
-                };
-                if live {
+            Ok(existing) => {
+                if existing.schema_version != SCHEMA_VERSION {
+                    drop(lock);
+                    return Err(SaveError::Protected {
+                        why: format!(
+                            "existing record {} uses schema {} and this build reads \
+                             {SCHEMA_VERSION}; not writing over recovery data this build \
+                             cannot interpret",
+                            path.display(),
+                            existing.schema_version
+                        ),
+                    });
+                }
+                let superseded = (existing.unit, existing.selector) == (unit, selector)
+                    && from_hex(&existing.applied)
+                        .map(|bytes| bytes != displaced)
+                        .unwrap_or(false);
+                if !superseded {
                     drop(lock);
                     return Err(SaveError::Outstanding {
                         unit: existing.unit,
@@ -429,12 +447,11 @@ pub(crate) fn save(
                     });
                 }
             }
-            Ok(_) => {}
             Err(e) => {
-                // A file that will not parse could be hiding an applied
-                // record. Nothing is written over it; a human gets to look.
-                return Err(SaveError::Unavailable {
-                    lock,
+                // A file that will not parse could be hiding anything,
+                // including an applied record. Nothing is written over it.
+                drop(lock);
+                return Err(SaveError::Protected {
                     why: format!(
                         "existing record {} does not parse ({e}); not writing over it",
                         path.display()

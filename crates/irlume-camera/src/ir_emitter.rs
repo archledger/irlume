@@ -934,9 +934,17 @@ fn write_if_different(
                     eprintln!(
                         "irlume: not driving unit{unit}/sel{selector}: an unresolved record \
                          for unit{old_unit}/sel{old_selector} is outstanding on this camera \
-                         and would be destroyed; resolve it first (a later capture on that \
-                         control claims it automatically)"
+                         and would be destroyed; a capture on that control resolves an \
+                         applied record automatically, an unconfirmed one needs a look at \
+                         the ir-emitter-stream store"
                     );
+                    return Ok(CaptureWrite::refused());
+                }
+                // A record this build must not reason its way past: refuse
+                // the write rather than either destroying it or stacking an
+                // unrecorded change on top of it (review round 7).
+                Err(crate::stream_record::SaveError::Protected { why }) => {
+                    eprintln!("irlume: not driving unit{unit}/sel{selector}: {why}");
                     return Ok(CaptureWrite::refused());
                 }
                 // Machine trouble, nobody contesting. Proceed unrecorded, and
@@ -5831,38 +5839,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Plant a record through `save` and hand back its file path.
+    fn plant_record(
+        dir: &std::path::Path,
+        id: &crate::uvc_descriptor::CameraIdentity,
+        unit: u8,
+        selector: u8,
+        applied: &[u8],
+        displaced: &[u8],
+        confirmed: bool,
+    ) -> std::path::PathBuf {
+        let lock = crate::stream_record::acquire(id).expect("the lock is free");
+        let record = crate::stream_record::save(lock, id, unit, selector, applied, displaced)
+            .expect("plant a record");
+        if confirmed {
+            drop(record.mark_applied().expect("confirm the planted record"));
+        } else {
+            drop(record);
+        }
+        std::fs::read_dir(dir.join("ir-emitter-stream"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .expect("the planted record file")
+    }
+
     /// Bookkeeping failure must not release the stream lock while the write
     /// it covers is live (#188, review round 5): the lock comes back from a
     /// failed save, rides the guard bare, and a failed confirmation keeps
     /// the record handle rather than dropping it.
     #[test]
     fn a_failed_save_keeps_the_lock_held_for_the_streams_lifetime() {
+        // Staged via an UNREADABLE record file (EACCES), which is machine
+        // trouble rather than a protected record. Meaningless as root, where
+        // mode 000 still reads.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, mode 000 does not refuse reads");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
         let _lock = crate::testenv::env_lock();
         let dir = std::env::temp_dir().join(format!("irlume-rec-keeplock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         let asus = identity(0x3277, 0x0059);
-        // Make the store unusable for saving without touching the lock: an
-        // unparseable file sits where the record would go.
-        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
-        drop(lock); // the acquire created the store dir
-        let record_file = {
-            // The record path is private; find it by planting through save.
-            let lock = crate::stream_record::acquire(&asus).expect("free again");
-            let planted = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
-                .expect("plant a record to learn the path");
-            let (_, records) = stream_store_state(&dir);
-            assert_eq!(records.len(), 1);
-            drop(planted); // releases the lock, keeps the file
-            let store = dir.join("ir-emitter-stream");
-            std::fs::read_dir(&store)
-                .unwrap()
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| p.extension().is_some_and(|e| e == "json"))
-                .expect("the planted record file")
-        };
-        std::fs::write(&record_file, b"not json").expect("corrupt the record");
+        let record_file = plant_record(&dir, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1], false);
+        std::fs::set_permissions(&record_file, std::fs::Permissions::from_mode(0o000))
+            .expect("make the record unreadable");
 
         let _fake = fake_camera::install(a_working_camera());
         let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
@@ -5884,15 +5908,84 @@ mod tests {
             ),
             "no second irlume may take the camera while the unrecorded change lives"
         );
-        assert_eq!(
-            std::fs::read(&record_file).expect("still there"),
-            b"not json",
-            "the unreadable file was not written over"
-        );
         drop(write);
         assert!(
             crate::stream_record::acquire(&asus).is_ok(),
             "the lock releases when the guard's write handle drops"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `prepared` record whose write may have SUCCEEDED is protected from
+    /// replacement (#188, review round 7): a crash between the `SET_CUR` and
+    /// the confirmation leaves `prepared` on disk with the applied bytes in
+    /// the control, and its displaced value is the only route back.
+    /// "Authorises nothing" never meant "may be destroyed".
+    #[test]
+    fn a_prepared_record_whose_bytes_are_live_is_not_written_over() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-gap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        // The crash-in-the-gap shape: prepared record, applied bytes ON the
+        // camera (the SET_CUR landed, the confirmation did not).
+        let record_file = plant_record(&dir, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1], false);
+        let before = std::fs::read(&record_file).expect("the planted record");
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 3, 2],
+            ..a_working_camera()
+        });
+        // A later configuration wants different bytes on the same control.
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 3]))
+            .expect("the refusal is not an ioctl error");
+        assert_eq!(write.outcome, Applied::Nothing);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may stack on an unresolved change: {:?}",
+            fake_camera::log()
+        );
+        assert_eq!(
+            std::fs::read(&record_file).expect("still there"),
+            before,
+            "the gap record survives byte-for-byte"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record from a build with another schema is never written over
+    /// (#188, review round 7): this build cannot know what it describes, and
+    /// the claim path already refuses to act on it for the same reason.
+    #[test]
+    fn a_foreign_schema_record_is_not_written_over() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let record_file = plant_record(&dir, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1], true);
+        // A newer build's record: same shape, schema 2.
+        let body = std::fs::read_to_string(&record_file).unwrap();
+        let newer = body.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+        assert_ne!(body, newer, "the schema field must have been rewritten");
+        std::fs::write(&record_file, &newer).unwrap();
+        let _fake = fake_camera::install(a_working_camera());
+        let write = check_and_apply_override(-1, &asus, &ctrl(14, 6, vec![1, 3, 2]))
+            .expect("the refusal is not an ioctl error");
+        assert_eq!(write.outcome, Applied::Nothing);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may destroy recovery data this build cannot read: {:?}",
+            fake_camera::log()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record_file).expect("still there"),
+            newer,
+            "the foreign record survives byte-for-byte"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

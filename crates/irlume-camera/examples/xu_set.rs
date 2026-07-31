@@ -23,10 +23,12 @@
 //! itself reported: `def` asks the device and writes its own `GET_DEF`.
 //!
 //! Usage:
+//!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> get
 //!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> def
 //!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> <b0,b1,...>
 //!
-//! Bytes are decimal or 0x-hex, comma-separated, and must match GET_LEN.
+//! `get` reads GET_CUR and writes nothing at all. Bytes are decimal or 0x-hex,
+//! comma-separated, and must match GET_LEN.
 
 use irlume_camera::ir_emitter::raw;
 use irlume_camera::uvc_descriptor;
@@ -43,7 +45,7 @@ fn parse_byte(s: &str) -> Result<u8, String> {
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [device, unit, selector, value] = args.as_slice() else {
-        return Err("usage: xu_set <video-dev> <unit> <selector> <def|b0,b1,...>".to_string());
+        return Err("usage: xu_set <video-dev> <unit> <selector> <get|def|b0,b1,...>".to_string());
     };
     let unit: u8 = unit.parse().map_err(|e| format!("unit {unit}: {e}"))?;
     let selector: u8 = selector
@@ -71,6 +73,11 @@ fn run() -> Result<(), String> {
 
     let len = raw::get_len(fd, unit, selector)?;
     let before = raw::get_cur(fd, unit, selector, len)?;
+    if value == "get" {
+        // Read-only: the one line a harness parses, and no ioctl but GETs.
+        println!("{}", before.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        return Ok(());
+    }
     let payload = if value == "def" {
         raw::get_def(fd, unit, selector, len)?
     } else {

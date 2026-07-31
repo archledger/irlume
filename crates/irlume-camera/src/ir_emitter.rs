@@ -1643,9 +1643,13 @@ struct ExploratoryWrite {
     /// The value this run applies. Kept so `commit` can confirm the camera is
     /// actually holding it before the undo data is thrown away.
     attempted: Vec<u8>,
-    /// The record exactly as it was written, so the removal cannot target a
-    /// different file than the save did.
-    record: crate::emitter_journal::PendingWrite,
+    /// The PATH `save` wrote the record to.
+    ///
+    /// The removal uses this rather than a path derived from the record's
+    /// contents, so it cannot target a different file than the save did. The
+    /// record itself was kept here for that purpose and is no longer needed:
+    /// deriving the name looked equivalent to remembering it and is not.
+    record_path: std::path::PathBuf,
     /// Set once the control is confirmed back at `original`, or once the applied
     /// value is durably recorded in the configuration. Until then the record
     /// stays on disk and `Drop` still tries.
@@ -1713,14 +1717,14 @@ impl ExploratoryWrite {
             serial: id.serial.clone(),
             usb_devpath: id.usb_devpath.clone(),
         };
-        crate::emitter_journal::save(&record)?;
+        let record_path = crate::emitter_journal::save(&record)?;
         Ok(Self {
             fd,
             unit,
             selector,
             original: original.to_vec(),
             attempted: attempted.to_vec(),
-            record,
+            record_path,
             resolved: false,
             // Nothing has been written yet.
             exploratory_value_is_live: false,
@@ -1766,7 +1770,7 @@ impl ExploratoryWrite {
                 now, self.original
             ));
         }
-        crate::emitter_journal::clear(&self.record)?;
+        crate::emitter_journal::clear(&self.record_path)?;
         self.resolved = true;
         Ok(())
     }
@@ -1781,7 +1785,7 @@ impl ExploratoryWrite {
     /// record stays open and the guard would put the control back.
     ///
     fn commit(&mut self) -> Result<(), String> {
-        crate::emitter_journal::clear(&self.record)?;
+        crate::emitter_journal::clear(&self.record_path)?;
         self.resolved = true;
         Ok(())
     }
@@ -1877,9 +1881,9 @@ fn recover_pending_write_locked(
 ) -> RecoveryOutcome {
     use crate::emitter_journal as journal;
 
-    let record = match journal::load(id) {
+    let (record_path, record) = match journal::load(id) {
         Ok(journal::Situation::Nothing) => return RecoveryOutcome::NothingPending,
-        Ok(journal::Situation::Mine(record)) => *record,
+        Ok(journal::Situation::Mine { path, record }) => (path, *record),
         // A record about a camera of the same model at a different port, or one
         // written before records carried a port at all. Its bytes were read from
         // a control this run cannot confirm is the same one, so writing them
@@ -1961,7 +1965,7 @@ fn recover_pending_write_locked(
     };
 
     match journal::restore_decision(&record, &now) {
-        journal::Restore::AlreadyRestored => match journal::clear(&record) {
+        journal::Restore::AlreadyRestored => match journal::clear(&record_path) {
             Ok(()) => RecoveryOutcome::AlreadyRestored,
             // The control holds its original. Only the store is unhappy, and the
             // store does not decide what the camera holds.
@@ -2025,7 +2029,7 @@ fn recover_pending_write_locked(
                 return RecoveryOutcome::Unresolved(format!("restore: {e}"));
             }
             match get_cur(fd, record.unit, record.selector, original.len()) {
-                Ok(back) if back == original => match journal::clear(&record) {
+                Ok(back) if back == original => match journal::clear(&record_path) {
                     Ok(()) => RecoveryOutcome::Restored {
                         unit: record.unit,
                         selector: record.selector,
@@ -3421,7 +3425,7 @@ mod tests {
 
         // Which also proves the disarmed drop left the record alone.
         let record = match crate::emitter_journal::load(&id).expect("load") {
-            crate::emitter_journal::Situation::Mine(r) => *r,
+            crate::emitter_journal::Situation::Mine { record, .. } => *record,
             other => panic!("expected this camera's own record: {other:?}"),
         };
         assert_eq!(record.pid, None, "a live pid would strand this record");

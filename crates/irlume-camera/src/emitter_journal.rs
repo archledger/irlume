@@ -635,7 +635,14 @@ pub(crate) enum Situation {
     Nothing,
     /// A record written about THIS camera: same model, same port, and the same
     /// serial where both sides publish one.
-    Mine(Box<PendingWrite>),
+    ///
+    /// Carries the path it was actually found at, because that is what has to be
+    /// removed when it is resolved. `SameModelElsewhere` needs no path: it is
+    /// reported and never cleared.
+    Mine {
+        path: PathBuf,
+        record: Box<PendingWrite>,
+    },
     /// A record about a camera of the SAME MODEL at a different port, or one
     /// written before records carried a port at all.
     ///
@@ -676,7 +683,10 @@ pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
             let record: PendingWrite = serde_json::from_str(&body)
                 .map_err(|e| format!("parse {}: {e}", path.display()))?;
             if describes_this_camera(&record, id) {
-                return Ok(Situation::Mine(Box::new(record)));
+                return Ok(Situation::Mine {
+                    path,
+                    record: Box::new(record),
+                });
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -689,12 +699,17 @@ pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
     // sat further down the list.
     let model = fingerprint(id);
     let mut elsewhere = None;
-    for record in all_records()? {
+    for (found_at, record) in all_records()? {
         if record.descriptor_sha256 != model {
             continue;
         }
         if describes_this_camera(&record, id) {
-            return Ok(Situation::Mine(Box::new(record)));
+            // The path it was FOUND at, not one derived from it: a record is not
+            // necessarily filed under the name its own fields produce.
+            return Ok(Situation::Mine {
+                path: found_at,
+                record: Box::new(record),
+            });
         }
         if elsewhere.is_none() {
             elsewhere = Some(record);
@@ -711,7 +726,7 @@ pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
 /// A record that will not parse is an error rather than a skip: something is
 /// pending, this build cannot read it, and continuing as though the store were
 /// empty is how an outstanding firmware change gets reported as clean.
-fn all_records() -> Result<Vec<PendingWrite>, String> {
+fn all_records() -> Result<Vec<(PathBuf, PendingWrite)>, String> {
     let dir = store_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -728,9 +743,9 @@ fn all_records() -> Result<Vec<PendingWrite>, String> {
         }
         let body =
             std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        records.push(
-            serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?,
-        );
+        let record =
+            serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        records.push((path, record));
     }
     Ok(records)
 }
@@ -765,10 +780,15 @@ pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
 
 /// Remove a record whose control is confirmed back where it was found.
 ///
-/// Takes the record rather than a key so the removal cannot target a different
-/// file than the save did.
-pub(crate) fn clear(record: &PendingWrite) -> Result<(), String> {
-    irlume_common::remove_durable(&record_path(&record.filing_key()))?;
+/// Takes the PATH the record was read from or written to, never a path derived
+/// from its contents. Deriving it looked equivalent and was not: a record found
+/// by scanning the store is not necessarily filed under the name its own fields
+/// produce — one written by a build with a different key derivation, or planted
+/// by hand, or left behind by a rename that failed after publication. Removing
+/// the derived name then deletes nothing, and the record warns forever while
+/// looking resolved to the code that "cleared" it.
+pub(crate) fn clear(path: &std::path::Path) -> Result<(), String> {
+    irlume_common::remove_durable(path)?;
     trace("cleared");
     Ok(())
 }
@@ -900,9 +920,21 @@ mod tests {
         let record = record_for(&id);
         let path = save(&record).expect("save");
         assert!(path.starts_with(&dir), "record lands under the state root");
-        assert_eq!(load(&id), Ok(Situation::Mine(Box::new(record.clone()))));
+        match load(&id).expect("load") {
+            Situation::Mine {
+                path: found,
+                record: got,
+            } => {
+                assert_eq!(*got, record);
+                assert_eq!(
+                    found, path,
+                    "the path it was found at is the path it was saved to"
+                );
+            }
+            other => panic!("expected this camera's own record: {other:?}"),
+        }
 
-        clear(&record).expect("clear");
+        clear(&path).expect("clear");
         assert_eq!(load(&id), Ok(Situation::Nothing));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -944,11 +976,11 @@ mod tests {
 
         assert!(matches!(
             load(&first).expect("load first"),
-            Situation::Mine(_)
+            Situation::Mine { .. }
         ));
         assert!(matches!(
             load(&second).expect("load second"),
-            Situation::Mine(_)
+            Situation::Mine { .. }
         ));
         assert_ne!(
             record_path(&filing_key(&first)),
@@ -1011,8 +1043,59 @@ mod tests {
         save(&record_for(&second)).expect("save the second camera's record");
         assert_eq!(
             load(&first).expect("the first record survived"),
-            Situation::Mine(Box::new(record))
+            Situation::Mine {
+                path: record_path(&record.filing_key()),
+                record: Box::new(record)
+            }
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record filed under a name its own contents do not produce is still
+    /// cleared, because the path it was FOUND at is what gets removed.
+    ///
+    /// Deriving the path from the record looked equivalent to remembering it and
+    /// was not. A record can sit under a name its fields do not reproduce: one
+    /// written by a build with a different key derivation, one placed by hand, or
+    /// one left by a rename that failed after publication. Removing the derived
+    /// name deletes nothing, and the record then warns forever while the code
+    /// that "cleared" it believes it is gone.
+    #[test]
+    fn a_misfiled_record_is_still_removed_when_it_is_resolved() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-misfiled");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let id = identity();
+        let record = record_for(&id);
+        // Deliberately NOT the name its own fields produce.
+        std::fs::create_dir_all(store_dir()).expect("store");
+        let wrong = store_dir()
+            .join("0000000000000000000000000000000000000000000000000000000000000000.json");
+        std::fs::write(&wrong, serde_json::to_string(&record).expect("serialize")).expect("plant");
+        assert_ne!(
+            wrong,
+            record_path(&record.filing_key()),
+            "the premise: it is filed under a name its contents do not produce"
+        );
+
+        // The scan finds it and reports where it really is.
+        let found_at = match load(&id).expect("load") {
+            Situation::Mine { path, .. } => path,
+            other => panic!("expected this camera's record: {other:?}"),
+        };
+        assert_eq!(
+            found_at, wrong,
+            "the path reported must be the path on disk"
+        );
+
+        clear(&found_at).expect("clear");
+        assert!(
+            !wrong.exists(),
+            "the file that was read must be the file removed"
+        );
+        assert_eq!(load(&id).expect("load"), Situation::Nothing);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1211,7 +1294,10 @@ mod tests {
         save(&no_serial_record).expect("save without a serial");
         assert_eq!(
             load(&with_serial).expect("load"),
-            Situation::Mine(Box::new(no_serial_record)),
+            Situation::Mine {
+                path: record_path(&no_serial_record.filing_key()),
+                record: Box::new(no_serial_record)
+            },
             "a record with no serial still describes a camera that has one"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1235,7 +1321,10 @@ mod tests {
 
         assert_eq!(
             load(&mine).expect("load"),
-            Situation::Mine(Box::new(my_record)),
+            Situation::Mine {
+                path: record_path(&my_record.filing_key()),
+                record: Box::new(my_record)
+            },
             "stopping at the first same-model record found would report the wrong one"
         );
         let _ = std::fs::remove_dir_all(&dir);

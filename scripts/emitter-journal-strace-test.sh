@@ -21,7 +21,11 @@ OUT=/tmp/emitter-strace
 SOCK=/run/irlume-strace.sock
 STATE=/var/lib/irlume-stracetest
 MODELS=/usr/share/irlume/models
-PARK=1,3,1,0,0,0,0,0,0
+# Guard-free SET_CUR tool; the park value is read from THIS camera's GET_DEF.
+# A daemon-based park no longer works: the stream guard restores what a capture
+# applies, and a kill cannot land inside the microseconds between apply and
+# restore (pt192).
+XU_SET="$TREE/target/release/examples/xu_set"
 # Taken from the packaged unit rather than assumed: the ONNX runtime ships beside
 # irlume on some installs and sits on the default search path on others, and a
 # daemon that cannot find it never reaches its socket, which reads as a hung build.
@@ -122,13 +126,15 @@ SEL=$((SEL))
 echo "    Microsoft XU: unit $UNIT, first advertised selector $SEL"
 
 echo "=== park the control so discovery has something to explore ==="
-start_daemon park "$UNIT:$SEL:$PARK" || {
-    echo "daemon would not start"
-    tail -20 "$OUT/daemon-park.log"
+if [ ! -x "$XU_SET" ]; then
+    echo "$XU_SET is missing; build it first:"
+    echo "  cargo build --release -p irlume-camera --example xu_set"
+    exit 2
+fi
+"$XU_SET" "$IR" "$UNIT" "$SEL" def 2>&1 | sed 's/^/    /' || {
+    echo "refusing: the control could not be parked"
     exit 2
 }
-pkill -TERM -f "target/release/irlumed" 2>/dev/null
-sleep 1
 
 echo "=== trace one ir-setup ==="
 start_daemon traced off strace || {

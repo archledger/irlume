@@ -59,6 +59,19 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// bounds with the same constant, on the same reasoning.
 pub(crate) const MAX_RESTORE_ATTEMPTS: u32 = 3;
 
+/// Trace a stream-record event onto the stream `set_cur` traces writes to.
+///
+/// Same switch as the journal's, for the same reason: the claims this module
+/// makes are ORDERINGS — record on disk before the `SET_CUR`, resolved only
+/// after the restore — and on hardware the only way to observe them is to put
+/// the events into the same transcript as the writes, in order. An strace of
+/// `write(2)` then shows both interleaved (pt190).
+fn trace(event: &str) {
+    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+        eprintln!("irlume: stream-record {event}");
+    }
+}
+
 /// One stream's applied emitter mode, on disk from just before the `SET_CUR`
 /// until the guard resolves.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,8 +162,9 @@ impl StreamRecord {
         match std::fs::metadata(&self.path) {
             Ok(m) if (m.dev(), m.ino()) == (ours.dev(), ours.ino()) => {
                 let _ = std::fs::remove_file(&self.path);
+                trace("resolved");
             }
-            _ => {}
+            _ => trace("resolved (already replaced, left in place)"),
         }
     }
 }
@@ -246,7 +260,12 @@ pub(crate) fn save(
         serial: id.serial.clone(),
         usb_devpath: id.usb_devpath.clone(),
     };
-    publish(&record_path(id), &record)
+    let handle = publish(&record_path(id), &record)?;
+    trace(&format!(
+        "saved unit{unit}/sel{selector} applied={} displaced={}",
+        record.applied, record.displaced
+    ));
+    Ok(handle)
 }
 
 /// Why a record does not hand this stream a restore.
@@ -463,7 +482,13 @@ pub(crate) fn claim(
         ..record
     };
     match publish(&path, &counted) {
-        Ok(handle) => Some((displaced, handle)),
+        Ok(handle) => {
+            trace(&format!(
+                "claimed unit{unit}/sel{selector} displaced={} attempt={}",
+                counted.displaced, counted.restore_attempts
+            ));
+            Some((displaced, handle))
+        }
         Err(why) => {
             eprintln!(
                 "irlume: cannot count a claim on {} ({why}); not restoring",

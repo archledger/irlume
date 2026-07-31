@@ -39,11 +39,41 @@ env IRLUME_SOCKET="$SOCK" IRLUME_STATE_DIR="$S" IRLUME_IR_EMITTER_CONF="$S/c.con
 for _ in $(seq 1 1800); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { echo "daemon never listened"; tail -3 "$S/d.log"; exit 2; }
 # N SEPARATE requests against the one daemon: N sessions, one memo.
+failed=0
 for i in $(seq 1 "$N"); do
-    IRLUME_SOCKET="$SOCK" "$B/irlume" camera-tune --rounds 1 >"$S/tune-$i.out" 2>&1
+    if ! IRLUME_SOCKET="$SOCK" "$B/irlume" camera-tune --rounds 1 >"$S/tune-$i.out" 2>&1; then
+        failed=$((failed + 1))
+        echo "  request $i failed:"
+        tail -2 "$S/tune-$i.out" | sed 's/^/    /'
+    fi
 done
 pkill -TERM -f "$B/irlumed" 2>/dev/null; sleep 1
 applied=$(grep -ac 'SET_CUR unit14/sel6: \[01, 03, 02' "$S/d.log" || true)
 restored=$(grep -ac 'SET_CUR unit14/sel6: \[01, 03, 01' "$S/d.log" || true)
-echo "requests=$N  applied=$applied  restored=$restored"
 systemctl is-enabled --quiet irlumed 2>/dev/null && systemctl start irlumed 2>/dev/null
+echo "requests=$N  applied=$applied  restored=$restored  failed_requests=$failed"
+
+# Asserted, not printed. The first version of this script reported the counts and
+# left a person to interpret them, which means it can never fail and would pass
+# in CI against the very defect it was written for.
+rc=0
+fail() {
+    echo "  FAILED  $1"
+    rc=1
+}
+# A request that errored produced no stream, so its absence from the counts is
+# not evidence about the memo.
+[ "$failed" -eq 0 ] || fail "$failed of $N requests failed; the counts below are not comparable"
+# The defect: only the FIRST stream in the process ever applies the override.
+if [ "$applied" -le 1 ]; then
+    fail "only $applied applied write across $N requests: later streams ran at the camera's default"
+else
+    echo "  ok      the override applied on more than the first stream ($applied writes)"
+fi
+# And every applied mode is still put back, which is the rest of #168.
+if [ "$applied" -eq "$restored" ]; then
+    echo "  ok      every applied mode was put back ($applied set, $restored restored)"
+else
+    fail "$applied applied against $restored restored: a stream ended without unsetting"
+fi
+exit "$rc"

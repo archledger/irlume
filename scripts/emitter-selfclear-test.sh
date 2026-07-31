@@ -49,6 +49,7 @@ ORT="${ORT_DYLIB_PATH:-$(systemctl cat irlumed 2>/dev/null |
 
 pass=0
 fail=0
+skipped=0
 ok() {
     pass=$((pass + 1))
     echo "  ok      $1"
@@ -197,27 +198,26 @@ else
         "$applied applied writes against $restored streams"
 fi
 
-echo "=== 3. does the control still hold what was set? ==="
-start_daemon readback || exit 2
-IRLUME_SOCKET="$SOCK" "$B/irlume" ir-setup --dry-run >"$S/readback.out" 2>&1
-pkill -TERM -f "$B/irlumed" 2>/dev/null
-sleep 1
-sed 's/^/  /' "$S/readback.out" | head -3
-
-# `ir-setup` on the second run reports "already set to the value setup would
-# apply" when the control survived. That is the self-clear question answered by
-# the camera rather than by a comment.
-start_daemon confirm || exit 2
-IRLUME_SOCKET="$SOCK" "$B/irlume" ir-setup >"$S/confirm.out" 2>&1
-pkill -TERM -f "$B/irlumed" 2>/dev/null
-sed 's/^/  /' "$S/confirm.out" | tail -2
-if grep -qE "already set|IR emitter enabled" "$S/confirm.out"; then
-    ok "the camera still answers on that control after a full capture window"
-else
-    bad "the control did not survive the window" "$(tail -1 "$S/confirm.out")"
-fi
+echo "=== 3. did the value survive WHILE the stream was running? ==="
+# NOT ANSWERED HERE, and the earlier version of this section pretended otherwise.
+#
+# It read the control back after the daemon had been killed. Killing the request
+# drops the guard, which restores the camera's default, so the readback examined
+# the post-restore state and said nothing about whether the applied value
+# survived during streaming. Its assertion then accepted BOTH "already set" and
+# "IR emitter enabled" as success, which are opposite outcomes, so it could not
+# fail for the thing it claimed to check. A camera that self-cleared right after
+# STREAMON would have passed it.
+#
+# Answering it needs a GET_CUR taken from INSIDE a live stream, before STREAMOFF
+# and before the guard runs. `crates/irlume-camera/examples/ir_refire_probe.rs`
+# already owns one uninterrupted stream and is where that readback belongs.
+skipped=$((skipped + 1))
+echo "  NOT EXERCISED  needs an in-stream GET_CUR; see ir_refire_probe.rs"
+echo "                 what sections 1 and 2 DO establish is the write count and"
+echo "                 that every applied mode is paired with a restore"
 
 echo
-echo "$pass passed, $fail failed"
+echo "$pass passed, $fail failed, $skipped not exercised"
 echo "(sandbox left in $S for inspection)"
 [ "$fail" -eq 0 ]

@@ -1326,8 +1326,10 @@ impl IrCamera {
         // exit on both cameras measured, so it is not stream-scoped.
         //
         // Held for the session rather than just applied: dropping `IrSession`
-        // puts the control back to the camera's own default, which is the
-        // documented sequence's last step and the half irlume never did.
+        // puts back the value the capture write displaced — the camera's
+        // default in the ordinary case, another program's value where one was
+        // deliberately set — which is the documented sequence's last step and
+        // the half irlume never did.
         mode = ir_emitter::enable(self.dev.handle(), &self.card, &self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).

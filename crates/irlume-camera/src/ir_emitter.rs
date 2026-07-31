@@ -1472,7 +1472,7 @@ impl Drop for StreamMode {
             // which is exactly the state this type exists to prevent, so it is
             // worth a line even though nothing here can react to it.
             eprintln!(
-                "irlume: could not put unit{}/sel{} back to the camera's default: {e}",
+                "irlume: could not put unit{}/sel{} back to the value irlume displaced: {e}",
                 self.unit, self.selector
             );
         }
@@ -4847,7 +4847,8 @@ mod tests {
         assert!(why.contains("disk full"), "got: {why}");
     }
 
-    /// The control goes back to the camera's own default when the stream ends.
+    /// The control goes back to the value irlume displaced when the stream
+    /// ends — its own default here, because the fixture starts there.
     ///
     /// Microsoft's sequence ends by unsetting the property, and the HLK suite
     /// tests that it happened. irlume set the mode and left it. The ASUS module

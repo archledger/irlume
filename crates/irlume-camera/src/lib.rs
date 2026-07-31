@@ -1892,9 +1892,19 @@ pub fn capture_ir_streaming<B>(
                               // reopen and negotiated ownership afterwards; the cost of
                               // this simpler shape is one restore/apply pair per restart,
                               // and restarts are the exception, not the path.
-                if let Err(e) = mode.restore() {
-                    eprintln!("irlume: restoring the emitter before a stream restart: {e}");
-                }
+                              // A restore failure PROPAGATES rather than being logged
+                              // over: the guard is spent after one attempt, and an
+                              // UNRECORDED write whose restore failed here would otherwise
+                              // become permanently unowned — the fresh enable finds the
+                              // wanted bytes with no record to claim and leaves them
+                              // forever (review round 12). Surfacing hardware trouble
+                              // beats continuing to authenticate through it.
+                mode.restore().map_err(|e| {
+                    Error::Hardware(format!(
+                        "{device}: could not restore the emitter before restarting \
+                         a frozen stream: {e}"
+                    ))
+                })?;
                 stream = SafeStream::open(device, &dev)?;
                 mode = ir_emitter::enable(dev.handle(), &card, device);
             }
@@ -2017,9 +2027,19 @@ pub fn capture_ir_sequence(
                                      // reopen and negotiated ownership afterwards; the cost of
                                      // this simpler shape is one restore/apply pair per restart,
                                      // and restarts are the exception, not the path.
-                if let Err(e) = mode.restore() {
-                    eprintln!("irlume: restoring the emitter before a stream restart: {e}");
-                }
+                                     // A restore failure PROPAGATES rather than being logged
+                                     // over: the guard is spent after one attempt, and an
+                                     // UNRECORDED write whose restore failed here would otherwise
+                                     // become permanently unowned — the fresh enable finds the
+                                     // wanted bytes with no record to claim and leaves them
+                                     // forever (review round 12). Surfacing hardware trouble
+                                     // beats continuing to authenticate through it.
+                mode.restore().map_err(|e| {
+                    Error::Hardware(format!(
+                        "{device}: could not restore the emitter before restarting \
+                         a frozen stream: {e}"
+                    ))
+                })?;
                 stream = Some(SafeStream::open(device, &dev)?);
                 mode = ir_emitter::enable(dev.handle(), &card, device);
             }

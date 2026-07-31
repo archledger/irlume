@@ -1340,11 +1340,11 @@ impl StreamMode {
 
     /// Put the control back now, rather than waiting for the drop.
     ///
-    /// Public so a caller that wants to put the control back while it can still
-    /// REPORT a failure has somewhere to do it. Nothing in production takes that
-    /// route today: every restore currently goes through `Drop`, which cannot
-    /// return anything and so can only print. `Err(Bookkeeping)` means no
-    /// camera request was made at all — the mode is still applied, on purpose.
+    /// Used by the frozen-stream restart paths, which must restore the old
+    /// stream's change (and surface a failure) before opening and arming the
+    /// replacement; `Drop` remains the ordinary end-of-session path, and can
+    /// only print. `Err(Bookkeeping)` means no camera request was made at
+    /// all — the mode is still applied, on purpose.
     pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
         if !self.armed {
             return Ok(());
@@ -5697,6 +5697,42 @@ mod tests {
             "the control is back despite the broken store"
         );
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// An UNRECORDED guard whose restore write fails surfaces the failure:
+    /// the caller (the frozen-stream restart) must know, because nothing on
+    /// disk marks the leftover and a swallowed error would strand it
+    /// (review round 12).
+    #[test]
+    fn an_unrecorded_guards_failed_restore_reports_the_camera_error() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-unrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 3, 2],
+            fail_set_from: Some((1, libc::EIO)),
+            ..a_working_camera()
+        });
+        let mut mode = StreamMode {
+            handle: None,
+            record: None,
+            _lock: Some(lock),
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        };
+        let result = mode.restore();
+        assert!(
+            matches!(result, Err(RestoreError::Camera(_))),
+            "a rejected unrecorded restore must surface, not vanish: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A restore the camera rejects puts the record back into force, so the

@@ -6074,15 +6074,38 @@ mod tests {
         for attempt in 1..=crate::stream_record::MAX_RESTORE_ATTEMPTS {
             let lock = crate::stream_record::acquire(&asus)
                 .unwrap_or_else(|_| panic!("the lock is free before claim {attempt}"));
-            let (_, record) = crate::stream_record::claim(lock, &asus, 14, 6, &[1, 3, 2])
+            let (restore, record) = crate::stream_record::claim(lock, &asus, 14, 6, &[1, 3, 2])
                 .unwrap_or_else(|| panic!("claim {attempt} is within the limit"));
-            // Every restore "fails": the record handle drops unresolved, as
-            // the guard leaves it when its SET_CUR errors.
-            drop(record);
+            // Every restore is ATTEMPTED and rejected by the camera: the
+            // attempt is spent in retire()'s pre-write publication, the
+            // SET_CUR fails, and the re-promotion puts the record back in
+            // force for the next round. A claim abandoned without a restore
+            // attempt spends nothing (review round 11).
+            let _fake = fake_camera::install(fake_camera::Camera {
+                current: vec![1, 3, 2],
+                fail_set_from: Some((1, libc::EIO)),
+                ..a_working_camera()
+            });
+            drop(StreamMode {
+                handle: None,
+                record: Some(record),
+                _lock: None,
+                unit: 14,
+                selector: 6,
+                restore,
+                applied: vec![1, 3, 2],
+                armed: true,
+                active: true,
+            });
             let (_, records) = stream_store_state(&dir);
             assert_eq!(
                 records[0].restore_attempts, attempt,
-                "the attempt is counted on disk before the write it authorises"
+                "the attempt is counted on disk in the step before the write"
+            );
+            assert_eq!(
+                records[0].state,
+                crate::stream_record::WriteState::Applied,
+                "the failed restore re-promotes the record for the next round"
             );
         }
         let lock = crate::stream_record::acquire(&asus).expect("the lock is free");

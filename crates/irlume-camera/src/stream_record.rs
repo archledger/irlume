@@ -249,6 +249,12 @@ pub(crate) fn acquire(id: &CameraIdentity) -> Result<StreamLock, AcquireError> {
 pub(crate) struct StreamRecord {
     path: PathBuf,
     record: StreamWrite,
+    /// Whether this handle came from [`claim`] rather than [`save`]. A
+    /// claimed restore spends one counted attempt — persisted inside
+    /// [`retire`](Self::retire)'s pre-write publication, not at claim time,
+    /// so a bookkeeping failure that prevents the restore from even being
+    /// attempted spends nothing (review round 11).
+    claimed: bool,
     _lock: StreamLock,
 }
 
@@ -293,9 +299,20 @@ impl StreamRecord {
             trace("retired");
             return Ok(self);
         }
+        let previous_attempts = self.record.restore_attempts;
         self.record.state = WriteState::Prepared;
+        if self.claimed {
+            // The claimed attempt is counted HERE, in the same durable step
+            // that precedes the restoring write, and not at claim time: a
+            // retirement that fails makes no camera request, and spending the
+            // budget on bookkeeping failures could exhaust it with zero
+            // restores ever attempted (review round 11). Plain add: a claim
+            // only arms below MAX_RESTORE_ATTEMPTS, far from overflow.
+            self.record.restore_attempts += 1;
+        }
         if let Err(why) = publish(&self.path, &self.record) {
             self.record.state = WriteState::Applied;
+            self.record.restore_attempts = previous_attempts;
             return Err(Box::new((self, why)));
         }
         trace("retired");
@@ -411,8 +428,10 @@ pub(crate) enum SaveError {
 /// whose bytes are still in the control describes irlume's own live leftover,
 /// and renaming over it would destroy the only route back. A record for a
 /// DIFFERENT control cannot be probed from here at all, so it is never
-/// replaced while `applied`. Superseded records (bytes no longer present) and
-/// `prepared` ones authorise nothing and are replaced freely.
+/// replaced. The ONLY record replaced is one demonstrably superseded on this
+/// same control: its applied bytes are no longer what the control holds. A
+/// `prepared` record authorises no claim, and is still protected wherever
+/// its write may have landed — see the gate below and review rounds 7 and 11.
 pub(crate) fn save(
     lock: StreamLock,
     id: &CameraIdentity,
@@ -501,6 +520,7 @@ pub(crate) fn save(
     Ok(StreamRecord {
         path,
         record,
+        claimed: false,
         _lock: lock,
     })
 }
@@ -626,9 +646,10 @@ pub(crate) fn record_claims(
 ///
 /// `None` is the ordinary answer and means "not irlume's to undo": no record,
 /// or a record the pure gate refuses. `Some` arms the caller's guard with the
-/// displaced value and hands over the record, with the attempt already
-/// counted on disk — counted BEFORE the write it authorises, so a crash
-/// between claim and restore cannot uncount it.
+/// displaced value and hands over the record. The attempt it spends is
+/// persisted by `retire`, in the durable step immediately before the write it
+/// authorises — not here, where a later bookkeeping failure could leave it
+/// spent with no restore ever attempted (review round 11).
 pub(crate) fn claim(
     lock: StreamLock,
     id: &CameraIdentity,
@@ -695,35 +716,20 @@ pub(crate) fn claim(
             return None;
         }
     };
-    // Count the attempt before the write it authorises. A claim whose count
-    // cannot be recorded does not arm.
-    let counted = StreamWrite {
-        restore_attempts: record.restore_attempts + 1,
-        ..record
-    };
-    match publish(&path, &counted) {
-        Ok(()) => {
-            trace(&format!(
-                "claimed unit{unit}/sel{selector} displaced={} attempt={}",
-                counted.displaced, counted.restore_attempts
-            ));
-            Some((
-                displaced,
-                StreamRecord {
-                    path,
-                    record: counted,
-                    _lock: lock,
-                },
-            ))
-        }
-        Err(why) => {
-            eprintln!(
-                "irlume: cannot count a claim on {} ({why}); not restoring",
-                path.display()
-            );
-            None
-        }
-    }
+    trace(&format!(
+        "claimed unit{unit}/sel{selector} displaced={} attempt={}",
+        record.displaced,
+        record.restore_attempts + 1
+    ));
+    Some((
+        displaced,
+        StreamRecord {
+            path,
+            record,
+            claimed: true,
+            _lock: lock,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -873,6 +879,61 @@ mod tests {
             Err(ClaimRefusal::Superseded),
             "the control is not holding what was applied, so the leftover is already gone"
         );
+    }
+
+    /// A retirement that fails spends nothing (review round 11): the
+    /// increment rolls back with the state, and only the successful
+    /// pre-write publication carries it to disk.
+    #[test]
+    fn a_failed_retirement_spends_no_attempt() {
+        let _guard = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-sr-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = crate::testenv::EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let id = identity();
+        let lock = acquire(&id).expect("the lock is free");
+        drop(
+            save(lock, &id, 4, 6, &[1, 3, 2], &[1, 3, 1])
+                .expect("seed")
+                .mark_applied()
+                .expect("confirm"),
+        );
+        let lock = acquire(&id).expect("free again");
+        let (_, record) = claim(lock, &id, 4, 6, &[1, 3, 2]).expect("claimable");
+        // Break the retirement: the record's own path becomes a directory,
+        // so the publishing rename fails while everything else works.
+        let store = dir.join("ir-emitter-stream");
+        let path = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .expect("the record file");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let record = match record.retire() {
+            Ok(_) => panic!("the broken store must fail the retirement"),
+            Err(e) => e.0,
+        };
+        // Repair, and retire for real: exactly ONE attempt lands, in the
+        // successful publication.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        record
+            .retire()
+            .expect("the repaired store retires")
+            .resolve()
+            .expect("resolve");
+        // Nothing left: resolve removed the record, and the one attempt it
+        // carried went with it — the failed try left no counter behind.
+        let survivors = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .count();
+        assert_eq!(survivors, 0, "the retired record resolved cleanly");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -274,14 +274,14 @@ start_daemon park "$UNIT:$SEL:$PARK" || {
     echo "  daemon would not start"
     exit 2
 }
-IRLUME_SOCKET="$SOCK" "$B/irlume" camera-tune --rounds 1 >"$OUT/park-tune.out" 2>&1 &
+IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds 1 >"$OUT/park-tune.out" 2>&1 &
 tune=$!
 for _ in $(seq 1 600); do
     grep -aq "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null && break
     sleep 0.05
 done
 # Killed the instant the park value is on the camera, so the guard cannot undo it.
-pkill -KILL -f "$B/irlumed" 2>/dev/null
+pkill -KILL -f "$D" 2>/dev/null
 wait "$tune" 2>/dev/null
 daemon_pid=""
 sleep 1

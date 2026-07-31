@@ -850,20 +850,33 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> StreamMode {
     let Some((unit, selector)) = action.coordinates() else {
         return StreamMode::inert();
     };
-    // `GET_DEF` is what "unset" restores to. Read first: after the write it would
-    // still answer the same on a conforming camera, but reading the resting state
-    // before disturbing it is the only order that does not assume conformance.
+    // What the control HOLDS right now, read before anything disturbs it. This is
+    // what the guard puts back.
+    //
+    // It used to record `GET_DEF` instead, on the reading that Microsoft's
+    // sequence ends by "unsetting" the control. That is right whenever the
+    // control is sitting at its default, which is the ordinary case and where
+    // the two values are identical. It is wrong the moment they are not: a
+    // camera another program deliberately left in a non-default mode would be
+    // returned to the DEFAULT when irlume finished, destroying that program's
+    // state while this file repeatedly promises not to undo changes irlume did
+    // not make. Putting back what was displaced honours both, because a control
+    // found at its default is restored to its default.
+    // NOT covered by a unit test: nothing here reaches `enable`, which needs a
+    // real sysfs-backed camera for `identity_from_fd`, so a mutant swapping this
+    // back to GET_DEF survives the suite. What IS covered is the decision the
+    // guard makes about whatever value gets recorded.
     let restore = match get_len(fd, unit, selector)
-        .and_then(|len| get_of(fd, unit, selector, UVC_GET_DEF, len))
+        .and_then(|len| get_of(fd, unit, selector, UVC_GET_CUR, len))
     {
-        Ok(def) => def,
+        Ok(current) => current,
         Err(e) => {
-            // No default means no way back, so nothing is applied. Leaving a
-            // control set with no recorded route home is the state #168 exists
-            // to remove.
+            // Unreadable means no recorded route home, so nothing is applied.
+            // Leaving a control changed with no way back is the state #168
+            // exists to remove.
             eprintln!(
-                "irlume: not driving unit{unit}/sel{selector}: its default is unreadable ({e}), \
-                 so there would be no way to put it back"
+                "irlume: not driving unit{unit}/sel{selector}: its current value is unreadable \
+                 ({e}), so there would be no way to put it back"
             );
             return StreamMode::inert();
         }
@@ -4588,6 +4601,52 @@ mod tests {
         );
     }
 
+    /// A non-default mode another program established is put back, not replaced
+    /// by the camera's default.
+    ///
+    /// The guard used to record `GET_DEF`, reading Microsoft's "unset the
+    /// control" as "write the default". That is identical to putting back what
+    /// was displaced whenever the control sits at its default, which is the
+    /// ordinary case, and wrong the moment it does not: a camera another program
+    /// deliberately left in a non-default mode came back at the DEFAULT once
+    /// irlume finished, destroying that program's state while this file promises
+    /// the opposite.
+    #[test]
+    fn a_non_default_mode_is_put_back_rather_than_defaulted() {
+        let _lock = crate::testenv::env_lock();
+        let default = vec![1, 3, 1];
+        let theirs = vec![1, 3, 4]; // somebody else's non-default mode
+        let ours = vec![1, 3, 2];
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: theirs.clone(),
+            len: 3,
+            def: default.clone(),
+            ..a_working_camera()
+        });
+        // The guard as `enable` now builds it: restore is what the control HELD,
+        // not what the camera calls its default.
+        let mut mode = StreamMode {
+            fd: -1,
+            unit: 14,
+            selector: 6,
+            restore: theirs.clone(),
+            applied: ours.clone(),
+            armed: true,
+            active: true,
+        };
+        fake_camera::set_current(ours.clone());
+        mode.restore().expect("restore");
+        assert_eq!(
+            fake_camera::current(),
+            theirs,
+            "the mode that was there must come back, not the camera's default"
+        );
+        assert_ne!(
+            fake_camera::current(),
+            default,
+            "restoring the default here would destroy another program's state"
+        );
+    }
     /// A control somebody else moved during the stream is left where they put
     /// it.
     ///

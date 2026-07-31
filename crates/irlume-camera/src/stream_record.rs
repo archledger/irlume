@@ -247,9 +247,10 @@ pub(crate) struct StreamRecord {
 impl StreamRecord {
     /// Rewrite the record as `applied`, after the camera accepted the write.
     ///
-    /// On failure the record stays `prepared` on disk: the write happened but
-    /// a crash from here would leave a leftover no claim will touch, which is
-    /// reported, and is the safe direction.
+    /// Also how a record whose RESTORE failed is put back into force: the
+    /// leftover is real again, so the record must be claimable again. On
+    /// failure the record stays `prepared` on disk: reported, unclaimable,
+    /// and the safe direction.
     pub(crate) fn mark_applied(mut self) -> Result<Self, String> {
         self.record.state = WriteState::Applied;
         publish(&self.path, &self.record)?;
@@ -257,16 +258,42 @@ impl StreamRecord {
         Ok(self)
     }
 
-    /// Remove the record: the change it describes is no longer outstanding,
-    /// either because the restore landed or because the control was found no
-    /// longer holding irlume's value.
+    /// Rewrite the record as `prepared`, BEFORE the effect it covers is
+    /// undone, so it can no longer authorise a restore.
+    ///
+    /// The unlink in [`resolve`](Self::resolve) can fail — a store gone
+    /// read-only is exactly the kind of machine trouble that arrives between
+    /// a write and its cleanup — and an `applied` record surviving its own
+    /// resolution would later authorise a firmware write over whatever
+    /// unrelated value happened to match it (review round 2). Demoting first
+    /// means the worst a failed cleanup leaves is inert litter.
+    pub(crate) fn retire(mut self) -> Result<Self, String> {
+        self.record.state = WriteState::Prepared;
+        publish(&self.path, &self.record)?;
+        trace("retired");
+        Ok(self)
+    }
+
+    /// Remove a record that [`retire`](Self::retire) has already made
+    /// non-authoritative.
     ///
     /// A plain unlink is enough: every writer of this path holds the stable
     /// lock, this handle holds it now, so the record at the name is this
-    /// handle's own.
-    pub(crate) fn resolve(self) {
-        let _ = std::fs::remove_file(&self.path);
-        trace("resolved");
+    /// handle's own. A failure is the caller's to report, and costs litter
+    /// rather than authority: the record on disk is `prepared`, and a later
+    /// write replaces it.
+    pub(crate) fn resolve(self) -> Result<(), String> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                trace("resolved");
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                trace("resolved");
+                Ok(())
+            }
+            Err(e) => Err(format!("remove {}: {e}", self.path.display())),
+        }
     }
 }
 

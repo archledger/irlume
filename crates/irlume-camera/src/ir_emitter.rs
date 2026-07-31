@@ -938,9 +938,12 @@ fn write_if_different(
     }
     // The write never landed, so the record describes a change that does not
     // exist; a leftover of it would refuse to claim anyway (prepared records
-    // never authorise), but there is no reason to leave it lying around.
+    // never authorise), but there is no reason to leave it lying around. A
+    // failed removal is inert litter for the same reason.
     if let Some(record) = record {
-        record.resolve();
+        if let Err(why) = record.resolve() {
+            eprintln!("irlume: {why}");
+        }
     }
     Ok(CaptureWrite {
         outcome: Applied::Nothing,
@@ -1324,6 +1327,33 @@ impl StreamMode {
         //
         // A control that no longer holds this guard's value is left alone. The
         // change irlume made is already gone, so there is nothing of its to undo.
+        // Before anything touches the camera: make the record incapable of
+        // authorising another restore. The unlink at the end can fail, and an
+        // `applied` record outliving its own resolution would later authorise
+        // a firmware write over whatever unrelated value happened to match it
+        // (review round 2). If even the demotion cannot be written, nothing is
+        // restored at all: the mode stays applied and the record stays
+        // claimable, and the next session finishes the job when the store
+        // recovers. Restoring anyway would recreate the exact hole, since a
+        // store that cannot take a rename is not going to take the unlink.
+        let record = match self.record.take() {
+            Some(record) => match record.retire() {
+                Ok(record) => Some(record),
+                Err(why) => {
+                    eprintln!(
+                        "irlume: not restoring unit{}/sel{}: its stream record cannot be \
+                         retired ({why}); the mode stays applied and the record stays \
+                         claimable for the next session",
+                        self.unit, self.selector
+                    );
+                    // Fully reported just above, and returning an error here
+                    // would make `Drop` blame the camera for a filesystem
+                    // problem. The guard restored nothing, on purpose.
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
         let outcome = match get_cur(self.fd(), self.unit, self.selector, self.applied.len()) {
             Ok(now) if now != self.applied => {
                 eprintln!(
@@ -1341,17 +1371,35 @@ impl StreamMode {
         match outcome {
             // Nothing is outstanding any more: the control is back, or the
             // change irlume made is already gone. Either way the record must
-            // not outlive the fact it records (#188).
+            // not outlive the fact it records (#188). A failed unlink costs
+            // litter, not authority: the record was retired above.
             Ok(()) => {
-                if let Some(record) = self.record.take() {
-                    record.resolve();
+                if let Some(record) = record {
+                    if let Err(why) = record.resolve() {
+                        eprintln!("irlume: {why}");
+                    }
                 }
                 Ok(())
             }
-            // The restore write failed, so the leftover is REAL. The record
-            // stays on disk for the next session to claim; its lock releases
-            // when this handle drops, and the guard is already disarmed.
-            Err(e) => Err(e),
+            // The restore write failed, so the leftover is REAL again and the
+            // record must go back into force for the next session to claim.
+            // If the re-promotion fails too, that is reported and the
+            // leftover goes unclaimed — the safe direction, twice over.
+            Err(e) => {
+                if let Some(record) = record {
+                    match record.mark_applied() {
+                        Ok(_kept) => {}
+                        Err(why) => {
+                            eprintln!(
+                                "irlume: the failed restore's record could not be put back \
+                                 into force ({why}); the leftover will not be claimed \
+                                 automatically"
+                            );
+                        }
+                    }
+                }
+                Err(e)
+            }
         }
     }
 }
@@ -5439,6 +5487,150 @@ mod tests {
         assert!(
             crate::stream_record::claim(lock, &asus, 14, 6, &write.current).is_none(),
             "a prepared record matches these bytes and must still authorise nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record is demoted BEFORE the restoring write, so a failed unlink
+    /// afterwards leaves litter, never authority (#188, review round 2).
+    #[test]
+    fn the_record_is_demoted_before_the_restoring_write() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-demote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let record = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+            .expect("the record is on disk")
+            .mark_applied()
+            .expect("the write is confirmed");
+        let probe = dir.clone();
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 3, 2],
+            // The restore is the only SET this test issues; at its instant
+            // the record must already be non-authoritative.
+            at_first_write: Some(Box::new(move || {
+                let (_, records) = stream_store_state(&probe);
+                match records.as_slice() {
+                    [r] if r.state == crate::stream_record::WriteState::Prepared => Ok(()),
+                    [r] => Err(format!(
+                        "the record is {:?} at the restoring write",
+                        r.state
+                    )),
+                    other => Err(format!("{} records on disk", other.len())),
+                }
+            })),
+            ..a_working_camera()
+        });
+        drop(StreamMode {
+            handle: None,
+            record: Some(record),
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        });
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::FailedPrecondition(_))),
+            "the record still authorised a restore at the instant of the write: {:?}",
+            fake_camera::log()
+        );
+        assert_eq!(fake_camera::current(), vec![1, 3, 1], "the control is back");
+        assert_eq!(
+            stream_store_state(&dir).0,
+            0,
+            "the record is gone afterwards"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record that cannot be demoted blocks the restore entirely: restoring
+    /// under an `applied` record reopens the round-2 hole, since a store that
+    /// cannot take a rename will not take the unlink either (#188).
+    #[test]
+    fn a_record_that_cannot_be_retired_blocks_the_restore() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-block-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let record = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+            .expect("the record is on disk")
+            .mark_applied()
+            .expect("the write is confirmed");
+        // Break the store: the retire's temp file has nowhere to go.
+        std::fs::remove_dir_all(&dir).expect("clear the store");
+        std::fs::write(&dir, b"not a directory").expect("plant a file at the store root");
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 3, 2],
+            ..a_working_camera()
+        });
+        drop(StreamMode {
+            handle: None,
+            record: Some(record),
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        });
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "nothing may be restored under a record that cannot be demoted: {:?}",
+            fake_camera::log()
+        );
+        assert_eq!(
+            fake_camera::current(),
+            vec![1, 3, 2],
+            "the mode stays applied, for the next session to claim"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// A restore the camera rejects puts the record back into force, so the
+    /// still-real leftover stays claimable (#188).
+    #[test]
+    fn a_failed_restore_repromotes_the_record() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-repromote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let record = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+            .expect("the record is on disk")
+            .mark_applied()
+            .expect("the write is confirmed");
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 3, 2],
+            fail_set_from: Some((1, libc::EIO)),
+            ..a_working_camera()
+        });
+        drop(StreamMode {
+            handle: None,
+            record: Some(record),
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        });
+        let (names, records) = stream_store_state(&dir);
+        assert_eq!(names, 1, "the record survives the failed restore");
+        assert_eq!(
+            records[0].state,
+            crate::stream_record::WriteState::Applied,
+            "the leftover is real again, so the record is back in force"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -750,6 +750,44 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
         && info & DISABLED_BY_COMMIT_STATE == 0
 }
 
+/// Raw, guard-free extension-unit access, for TEST TOOLING ONLY.
+///
+/// Hidden from the documented API on purpose. Everything else in this module
+/// wraps a write in evidence and an undo path; these wrappers exist so
+/// `examples/xu_set.rs` and the hardware harnesses can put a control INTO a
+/// state — parking it at its device default before a discovery run, or
+/// planting another writer's value for the #188 leftover tests. Killing a
+/// daemon mid-capture cannot do either: apply and restore are microseconds
+/// apart, and a shell cannot interpose (measured on the NexiGo, pt192).
+///
+/// The bytes are the caller's. Nothing here validates a payload, and #159 is
+/// what an invented one can cost; the only safe values are ones the device
+/// itself reported (`GET_DEF`, `GET_CUR`).
+#[doc(hidden)]
+pub mod raw {
+    use super::c_int;
+
+    /// `GET_LEN` for a control, as the device reports it.
+    pub fn get_len(fd: c_int, unit: u8, selector: u8) -> Result<usize, String> {
+        super::get_len(fd, unit, selector).map_err(|e| e.to_string())
+    }
+
+    /// One sized read of `GET_CUR`.
+    pub fn get_cur(fd: c_int, unit: u8, selector: u8, len: usize) -> Result<Vec<u8>, String> {
+        super::get_cur(fd, unit, selector, len).map_err(|e| e.to_string())
+    }
+
+    /// One sized read of `GET_DEF`: the device's own parking value.
+    pub fn get_def(fd: c_int, unit: u8, selector: u8, len: usize) -> Result<Vec<u8>, String> {
+        super::get_of(fd, unit, selector, super::UVC_GET_DEF, len).map_err(|e| e.to_string())
+    }
+
+    /// ONE `SET_CUR`, owned by no guard, recorded in no journal.
+    pub fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> Result<(), String> {
+        super::set_cur(fd, unit, selector, payload).map_err(|e| e.to_string())
+    }
+}
+
 /// What a capture write did, and what its one read answered.
 ///
 /// When `outcome` is `Wrote`, `current` is what the write DISPLACED, read on

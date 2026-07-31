@@ -36,9 +36,10 @@
 # `ir-setup` writes to the camera's Microsoft extension unit. That is a firmware
 # write; it is the operation under test. Section 4 SIGKILLs the daemon mid-run,
 # which is the state this change exists to recover from. Every value written is
-# one the camera itself reported: the parking value is its own GET_DEF, sent
-# through the documented override. The published descriptor is captured before
-# and after and compared, because a descriptor that changes is what #159 was.
+# one the camera itself reported: the parking value is its own GET_DEF, read
+# from the device and sent by examples/xu_set. The published descriptor is
+# captured before and after and compared, because a descriptor that changes is
+# what #159 was.
 set -uo pipefail
 
 TREE="${1:?usage: $0 <worktree> <ir-node> [rgb-node]}"
@@ -47,6 +48,11 @@ RGB="${3:-/dev/video0}"
 
 B="$TREE/target/release/irlume"
 D="$TREE/target/release/irlumed"
+# One guard-free SET_CUR (crates/irlume-camera/examples/xu_set.rs). Parking by
+# killing a daemon mid-capture does not work: apply and restore are microseconds
+# apart on the NexiGo and a shell poll loop cannot interpose. This writes the
+# camera's OWN GET_DEF, read from the device at run time.
+XU_SET="$TREE/target/release/examples/xu_set"
 OUT=/tmp/emitter-journal-hw
 SOCK=/run/irlume-hwtest.sock
 STATE=/var/lib/irlume-hwtest
@@ -60,10 +66,6 @@ MODELS="${IRLUME_MODEL_DIR:-/usr/share/irlume/models}"
 # a sandboxed state directory does not have.
 ORT="${ORT_DYLIB_PATH:-$(systemctl cat irlumed 2>/dev/null |
     sed -n 's/^Environment="\?ORT_DYLIB_PATH=\([^"]*\)"\?$/\1/p' | head -1)}"
-# The camera's own default for the Microsoft face-authentication control, as both
-# validated modules report it via GET_DEF. Section 1 refuses to draw conclusions
-# if parking to it changed nothing.
-PARK="${PARK_VALUE:-1,3,1,0,0,0,0,0,0}"
 # The Microsoft unit and selector are DERIVED from the camera in section 0, not
 # assumed. They were hardcoded to one module's unit 4, which meant every
 # unit-specific assertion here silently checked nothing on any other camera: the
@@ -236,15 +238,14 @@ if [ -n "$node_dev" ]; then
 fi
 echo "  camera behind $IR: ${VID_PID:-unknown}"
 case "$VID_PID" in
-    3277:0059 | 3443:c803) known_park=yes ;;
-    *) known_park=no ;;
+    3277:0059 | 3443:c803) known_camera=yes ;;
+    *) known_camera=no ;;
 esac
-if [ -z "${PARK_VALUE:-}" ] && [ "$known_park" = no ]; then
-    echo "refusing: the built-in park value describes the ASUS 3277:0059 and"
-    echo "          NexiGo 3443:c803 streaming interface 3, and this is neither."
-    echo "          Set PARK_VALUE to a payload derived from THIS camera's"
-    echo "          GET_DEF, or run the read-only sections only."
-    exit 2
+if [ "$known_camera" = no ]; then
+    echo "note: this camera is neither of the two this harness was validated"
+    echo "      against (ASUS 3277:0059, NexiGo 3443:c803). The park value is"
+    echo "      read from THIS camera's GET_DEF, so it is still the device's"
+    echo "      own; the assertions below may still be module-specific."
 fi
 if [ -z "$UNIT" ] || [ -z "$SEL" ]; then
     echo "refusing: no Microsoft camera-control unit on this camera; nothing here applies"
@@ -258,54 +259,25 @@ if [ -n "$(find "$STORE" -name '*.json' 2>/dev/null)" ]; then
 fi
 
 echo "=== 1. park the control at the camera's own default ==="
-# Parked by applying the default in a capture and then KILLING the daemon before
-# the stream ends.
+# One guard-free SET_CUR of this camera's own GET_DEF, via examples/xu_set.
 #
-# Starting a daemon with the override and stopping it cleanly no longer parks
-# anything, and that is #168 working rather than a bug: the daemon does not
-# capture at startup, so nothing is written, and if a capture does run the guard
-# restores whatever was there before the park, undoing it. No capture-path route
-# can leave a control changed any more, which is the whole point of the change.
-#
-# A kill is the one thing that still can, because the guard never runs. That is
-# the same mechanism section 4 uses deliberately, and it leaves the control at
-# the default exactly as this section needs.
-start_daemon park "$UNIT:$SEL:$PARK" || {
-    echo "  daemon would not start"
+# No daemon-based route can park any more, and that is #168 working rather than
+# a bug: a clean stop writes nothing, and a captured write is restored by the
+# stream guard. Killing the daemon between apply and restore was tried and does
+# not work — they are microseconds apart on the NexiGo and a shell poll loop
+# cannot interpose. The tool exists for exactly this job.
+if [ ! -x "$XU_SET" ]; then
+    echo "  $XU_SET is missing; build it first:"
+    echo "  cargo build --release -p irlume-camera --example xu_set"
     exit 2
-}
-# KNOWN NOT TO WORK RELIABLY, kept because the attempt documents the problem.
-# The kill has to land between the apply and the guard's restore, and measurement
-# on the NexiGo says those are microseconds apart: every run so far logs the park
-# value applied and then immediately restored, whatever the round count. A shell
-# poll loop cannot interpose there.
-#
-# Parking now needs a write that no guard owns, which means a small tool issuing
-# one XU SET_CUR directly rather than going through a capture. Until that exists
-# the sections below report themselves NOT EXERCISED, which is the honest
-# outcome: they are not being tested, and saying so beats a pass that means
-# nothing.
-IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds 3 >"$OUT/park-tune.out" 2>&1 &
-tune=$!
-for _ in $(seq 1 600); do
-    grep -aq "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null && break
-    sleep 0.05
-done
-# Killed the instant the park value is on the camera, so the guard cannot undo it.
-pkill -KILL -f "$D" 2>/dev/null
-wait "$tune" 2>/dev/null
-daemon_pid=""
-sleep 1
-parked=$(grep -ac "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null)
-if [ "${parked:-0}" -ge 1 ]; then
-    ok "the control was parked at its default"
+fi
+if "$XU_SET" "$IR" "$UNIT" "$SEL" def >"$OUT/park.out" 2>&1; then
+    sed 's/^/    /' "$OUT/park.out"
+    ok "the control is parked at its own GET_DEF"
 else
-    # No write does NOT mean the park failed: the override reads the control
-    # first and writes nothing when it already holds the value, which is the
-    # ordinary state on a camera nothing has driven. What actually matters is
-    # whether discovery then had a difference to measure, and section 2 asserts
-    # that independently by requiring a SET_CUR of its own.
-    skip "the control already held the default, so no parking write was needed"
+    sed 's/^/    /' "$OUT/park.out"
+    echo "refusing: the control could not be parked, so nothing below would be exercised"
+    exit 2
 fi
 
 echo "=== 2. discovery: record before the write, cleared after a read-back ==="
@@ -373,7 +345,11 @@ else
 fi
 
 echo "=== 4. a SIGKILL mid-run leaves the record ==="
-start_daemon park2 "$UNIT:$SEL:$PARK" >/dev/null 2>&1 && stop_daemon
+"$XU_SET" "$IR" "$UNIT" "$SEL" def >"$OUT/park2.out" 2>&1 || {
+    sed 's/^/    /' "$OUT/park2.out"
+    echo "refusing: could not re-park before the kill section"
+    exit 2
+}
 start_daemon killed off || {
     echo "  daemon would not start"
     exit 2

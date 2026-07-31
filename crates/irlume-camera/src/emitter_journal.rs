@@ -419,7 +419,9 @@ pub(crate) fn record_applies(record: &PendingWrite, id: &CameraIdentity) -> Resu
             supported: SCHEMA_VERSION,
         });
     }
-
+    if record.descriptor_sha256 != fingerprint(id) {
+        return Err(Mismatch::DifferentCamera);
+    }
     // The digest already pins the descriptors, and these fields come from the
     // same sysfs read, so a disagreement means the record was assembled from two
     // different cameras or edited by hand. Either way it is not a description of

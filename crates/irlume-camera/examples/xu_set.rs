@@ -75,7 +75,13 @@ fn run() -> Result<(), String> {
     let before = raw::get_cur(fd, unit, selector, len)?;
     if value == "get" {
         // Read-only: the one line a harness parses, and no ioctl but GETs.
-        println!("{}", before.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        println!(
+            "{}",
+            before
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
         return Ok(());
     }
     let payload = if value == "def" {

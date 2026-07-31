@@ -1295,6 +1295,12 @@ impl IrCamera {
     /// module nobody here has seen going dark for a window, which costs the user
     /// a password fallback rather than the hardware.
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
+        // DECLARED before the stream so it drops AFTER it. Locals drop in
+        // reverse declaration order, and `warm_up_stream` below can fail: with
+        // the guard declared second, that `?` dropped it first and sent the
+        // restore while the stream was still live, the very mid-stream write
+        // this change removes. Assigned further down, once the stream exists.
+        let mode;
         let mut stream = SafeStream::open(&self.device, &self.dev)?;
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
@@ -1321,7 +1327,7 @@ impl IrCamera {
         // Held for the session rather than just applied: dropping `IrSession`
         // puts the control back to the camera's own default, which is the
         // documented sequence's last step and the half irlume never did.
-        let mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
+        mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream)?;

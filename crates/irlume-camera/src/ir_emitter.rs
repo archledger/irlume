@@ -941,12 +941,13 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> StreamMode {
 /// unasked, but the NexiGo was observed still at the applied value outside a
 /// capture. Relying on a camera to undo something irlume did is not a design.
 ///
-/// What gets written back is the camera's OWN `GET_DEF`, read before anything is
-/// applied, rather than a constructed "off" value. For a dual-purpose interface
-/// the specification requires that default to carry D0, general purpose, which
-/// is the resting state "unset" means; for a face-auth-only interface it is
-/// whatever that camera says it starts in. Either way it is the camera's answer,
-/// not irlume's guess.
+/// What gets written back is the value the control HELD, read before anything is
+/// applied, rather than a constructed "off" value or the camera's default. A
+/// control sitting at its default is therefore restored to its default, which is
+/// what "unset" means and is every case measured here; a control another program
+/// deliberately left elsewhere is put back where they left it, rather than being
+/// defaulted out from under them. Either way it is the camera's answer, not
+/// irlume's guess.
 ///
 /// `Drop` does the restoring, because the paths that need it most are the ones
 /// no statement covers: an error taken by `?`, a panic in the decoder, a
@@ -956,7 +957,10 @@ pub struct StreamMode {
     fd: c_int,
     unit: u8,
     selector: u8,
-    /// The camera's own default, captured before the first write.
+    /// What the control HELD before irlume touched it, captured before the first
+    /// write. Not the camera's default: those coincide in the ordinary case and
+    /// differ exactly when another program has set something, which is when
+    /// putting the default back would destroy their state.
     restore: Vec<u8>,
     /// What this guard actually wrote, so the restore can check the control
     /// still holds it rather than trusting that nothing else moved.

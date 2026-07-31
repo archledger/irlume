@@ -1848,8 +1848,18 @@ pub fn capture_ir_streaming<B>(
     // writes to camera firmware per watch, and `enable` is not a bare ioctl: each
     // call re-reads the USB descriptors from sysfs and takes a lock to scan the
     // undo journal on disk. Ten of those sit in the authentication path for a
-    // hypothesis the hardware can now be asked about directly, per frame, through
-    // the illumination metadata from #167.
+    // hypothesis this project MEASURED and found false: the record in
+    // `IrCamera::session` says the control survives stream close and process
+    // exit on both cameras here, so there was nothing self-clearing to re-arm
+    // against.
+    //
+    // NOT justified by the illumination metadata from #167. `capture_with_stats`
+    // classifies its frames with that; this function never opens the metadata
+    // queue, and an earlier version of this comment claimed the evidence anyway.
+    // The residual risk is a module nobody here has seen whose control does
+    // self-clear mid stream: this path would go dark for the window and cost the
+    // user a password fallback. Reading the metadata queue here is how that gets
+    // closed, and it is not done.
     for _ in 0..max_frames {
         let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
         let taken = std::time::Instant::now();
@@ -1951,6 +1961,11 @@ pub fn capture_ir_sequence(
     let mut mode;
     let mut stream = Some(SafeStream::open(device, &dev)?);
     mode = ir_emitter::enable(dev.handle().fd(), &card, device);
+    // Set once above and not re-applied inside the loop. This path also carried
+    // an every-eighth-frame re-fire; it went for the same reason, and with the
+    // same caveat: the justification is the MEASURED record in
+    // `IrCamera::session` that the control survives streaming, not the
+    // illumination metadata, which this function does not read either.
     let mut frames = Vec::with_capacity(samples);
     let max_attempts = samples * 2 + 30;
     let (mut dead_run, mut restarts) = (0usize, 0usize);

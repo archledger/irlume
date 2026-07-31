@@ -893,14 +893,18 @@ pub fn enable(fd: c_int, card: &str, device: &str) -> StreamMode {
         }
         CaptureAction::DeviceDefault { unit, selector } => {
             match apply_device_default(fd, unit, selector) {
-                Ok(sent) => (sent != restore, true, sent),
+                Ok((outcome, sent)) => (outcome == Applied::Wrote && sent != restore, true, sent),
                 Err(_) => (false, false, Vec::new()),
             }
         }
-        CaptureAction::KnownPayload(ctrl) => {
-            let ok = apply_known_payload(fd, &ctrl).is_ok();
-            (ok && ctrl.payload != restore, ok, ctrl.payload)
-        }
+        CaptureAction::KnownPayload(ctrl) => match apply_known_payload(fd, &ctrl) {
+            Ok(outcome) => (
+                outcome == Applied::Wrote && ctrl.payload != restore,
+                true,
+                ctrl.payload,
+            ),
+            Err(_) => (false, false, Vec::new()),
+        },
     };
     StreamMode {
         fd,
@@ -1623,14 +1627,24 @@ fn check_and_apply_override(
 /// that size right now. Writing a nine-byte payload to a control the camera has
 /// just reported as disabled, or as a different length, is not something a
 /// validated VID:PID should buy.
-fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<()> {
+fn apply_known_payload(fd: c_int, ctrl: &EmitterControl) -> XuResult<Applied> {
     if !info_allows_set(get_info(fd, ctrl.unit, ctrl.selector)?) {
         return Err(XuError::Unsupported);
     }
-    if get_len(fd, ctrl.unit, ctrl.selector)? != ctrl.payload.len() {
+    let len = get_len(fd, ctrl.unit, ctrl.selector)?;
+    if len != ctrl.payload.len() {
         return Err(XuError::Unsupported);
     }
-    set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload)
+    // The same rule the override path follows: a control already holding these
+    // bytes was not put there by this run, so writing them again would claim a
+    // change irlume did not make, and the end of the stream would clear somebody
+    // else's state. One GET_CUR on a path that has already sent GET_INFO and
+    // GET_LEN.
+    if get_cur(fd, ctrl.unit, ctrl.selector, len)? == ctrl.payload {
+        return Ok(Applied::AlreadyHeld);
+    }
+    set_cur(fd, ctrl.unit, ctrl.selector, &ctrl.payload)?;
+    Ok(Applied::Wrote)
 }
 
 /// The bytes to write for one documented control, or why the camera has not
@@ -1682,7 +1696,7 @@ fn intended_value(
 /// the caller needs them: `enable` arms the stream guard by comparing what was
 /// written against what the guard would write back, and for IR Torch the two
 /// are the same bytes.
-fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<Vec<u8>> {
+fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<(Applied, Vec<u8>)> {
     if !info_allows_set(get_info(fd, unit, selector)?) {
         return Err(XuError::Unsupported);
     }
@@ -1690,8 +1704,13 @@ fn apply_device_default(fd: c_int, unit: u8, selector: u8) -> XuResult<Vec<u8>> 
     let Ok(wanted) = intended_value(fd, unit, selector, len)? else {
         return Err(XuError::Unsupported);
     };
+    // As above: already there means irlume did not put it there, so it is not
+    // irlume's to undo when the stream ends.
+    if get_cur(fd, unit, selector, len)? == wanted {
+        return Ok((Applied::AlreadyHeld, wanted));
+    }
     set_cur(fd, unit, selector, &wanted)?;
-    Ok(wanted)
+    Ok((Applied::Wrote, wanted))
 }
 
 /// Why discovery could not produce a control.
@@ -4596,7 +4615,8 @@ mod tests {
         };
         // Another writer moves it while the stream is running.
         fake_camera::set_current(vec![1, 3, 3]);
-        mode.restore().expect("a refusal to overwrite is not an error");
+        mode.restore()
+            .expect("a refusal to overwrite is not an error");
         drop(mode);
         assert_eq!(
             fake_camera::current(),
@@ -4748,6 +4768,48 @@ mod tests {
         );
     }
 
+    /// A built-in payload the control already holds is not written or claimed.
+    ///
+    /// The override path refuses to claim a value it did not set, and the
+    /// built-in table path did not: it wrote unconditionally and armed, so a
+    /// value another process left there was rewritten, claimed, and cleared at
+    /// the end of the stream. Same rule, applied in one place and not the other.
+    #[test]
+    fn a_known_payload_the_control_already_holds_is_not_rewritten() {
+        let _lock = crate::testenv::env_lock();
+        let payload = vec![1, 3, 2];
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: payload.clone(),
+            len: 3,
+            info: 0b0000_0011,
+            ..a_working_camera()
+        });
+        let ctrl = EmitterControl {
+            unit: 14,
+            selector: 6,
+            payload: payload.clone(),
+        };
+        assert_eq!(
+            apply_known_payload(-1, &ctrl).expect("a control that already agrees is not an error"),
+            Applied::AlreadyHeld,
+            "the value is there; irlume did not put it there"
+        );
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may be sent at all: {:?}",
+            fake_camera::log()
+        );
+        // And a control holding something else is still written, or the guard
+        // above would have turned the whole path off.
+        fake_camera::set_current(vec![9, 9, 9]);
+        assert_eq!(
+            apply_known_payload(-1, &ctrl).expect("a control that disagrees is written"),
+            Applied::Wrote
+        );
+        assert_eq!(fake_camera::current(), payload);
+    }
     /// IR Torch's applied value IS the camera's default, so there is nothing
     /// for the stream end to restore.
     ///
@@ -4772,9 +4834,16 @@ mod tests {
             ..Default::default()
         });
 
-        let sent = apply_device_default(-1, 14, crate::uvc_descriptor::MSXU_IR_TORCH)
+        let (outcome, sent) = apply_device_default(-1, 14, crate::uvc_descriptor::MSXU_IR_TORCH)
             .expect("a conformant torch takes its own default");
         assert_eq!(sent, def, "the applied bytes are the camera's own GET_DEF");
+        // The fixture starts at the default, so there is nothing to write: the
+        // torch's own value IS the default, which is the point of the case.
+        assert_eq!(
+            outcome,
+            Applied::AlreadyHeld,
+            "a control already at the value it wants is not written again"
+        );
 
         // The guard, armed the way `enable` arms it: the write went out, but
         // it carried the restore bytes, so nothing is outstanding.
@@ -4794,9 +4863,9 @@ mod tests {
             .filter(|r| matches!(r, fake_camera::Request::Set(_)))
             .count();
         assert_eq!(
-            sets, 1,
-            "one write applies the mode; a second at stream end changes nothing \
-             and must not be sent"
+            sets, 0,
+            "the torch's own default was already there, so applying it writes \
+             nothing and the stream's end has nothing to put back"
         );
     }
 

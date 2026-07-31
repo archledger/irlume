@@ -141,6 +141,14 @@ stop_daemon() {
 }
 capture() { IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds "${1:-1}"; }
 records() { find "$STORE" -name '*.json' 2>/dev/null | wc -l; }
+# A record whose write is CONFIRMED on disk. The kill trigger keys on this,
+# not on the file existing: the file appears before the SET_CUR, and a kill
+# landing in the microseconds between the save and the confirmation leaves a
+# prepared record — a real, deliberate outcome (unclaimable and protected,
+# unit-covered), but not the branch this section stages. Keying on applied
+# makes the staged branch deterministic; the applied state lasts the whole
+# capture, so the window is wide.
+applied_records() { grep -al '"state":"applied"' "$STORE"/*.json 2>/dev/null | wc -l; }
 control() { "$XU_SET" "$IR" "$UNIT" "$SEL" get 2>/dev/null; }
 
 echo "=== 0. which control does this camera publish ==="
@@ -207,14 +215,16 @@ else
     capture 3 >"$OUT/capture-killed.out" 2>&1 &
     client=$!
     killed=no
-    # The trigger is the record FILE, not the log line. The log stays true
-    # forever once round 1 has run, so a grep-based kill can land between
-    # rounds, after the guard has already resolved — which is exactly how the
-    # first version of this section reported a false failure. The file is
-    # momentary state: present exactly while a guard is armed, and a SIGKILL
-    # cannot unlink it.
+    # The trigger is the CONFIRMED record on disk, not the log line and not
+    # the file's existence. The log stays true forever once round 1 has run,
+    # so a grep-based kill landed between rounds; the bare file appears
+    # before the SET_CUR, so a file-based kill sometimes landed in the
+    # save-to-confirmation gap and staged the prepared-leftover outcome
+    # instead of the claim this section is about (measured: roughly one run
+    # in three on the NexiGo). Both are momentary state a SIGKILL cannot
+    # unlink; only the applied state means the claim branch is staged.
     for _ in $(seq 1 900); do
-        if [ "$(records)" -ge 1 ]; then
+        if [ "$(applied_records)" -ge 1 ]; then
             kill -KILL "$daemon_pid" 2>/dev/null && killed=yes
             break
         fi

@@ -284,6 +284,15 @@ impl StreamRecord {
     /// unrelated value happened to match it (review round 2). Demoting first
     /// means the worst a failed cleanup leaves is inert litter.
     pub(crate) fn retire(mut self) -> Result<Self, Box<(Self, String)>> {
+        // Already non-authoritative: a failed post-write confirmation left the
+        // record `prepared` in memory and on disk, and rewriting it buys
+        // nothing — while a store still broken from that failure would turn
+        // the rewrite into a refusal that blocks the RESTORE of a change
+        // whose record never authorised anything (review round 10).
+        if self.record.state == WriteState::Prepared {
+            trace("retired");
+            return Ok(self);
+        }
         self.record.state = WriteState::Prepared;
         if let Err(why) = publish(&self.path, &self.record) {
             self.record.state = WriteState::Applied;

@@ -5652,6 +5652,53 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// A record whose confirmation failed must not BLOCK the restore when the
+    /// store stays broken (#188, review round 10): it is already `prepared`
+    /// on disk and in memory, authorises nothing, and retiring it needs no
+    /// rewrite. The hardware cleanup proceeds.
+    #[test]
+    fn a_failed_confirmation_does_not_block_the_restore() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-noblock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let record = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+            .expect("the prepared record is on disk");
+        // The store breaks between the write and its confirmation, and STAYS
+        // broken through the stream's end.
+        std::fs::remove_dir_all(&dir).expect("clear the store");
+        std::fs::write(&dir, b"not a directory").expect("plant a file at the store root");
+        let record = match record.mark_applied() {
+            Ok(_) => panic!("the confirmation must fail on the broken store"),
+            Err(e) => e.0,
+        };
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 3, 2],
+            ..a_working_camera()
+        });
+        let mut mode = StreamMode {
+            handle: None,
+            record: Some(record),
+            _lock: None,
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        };
+        mode.restore()
+            .expect("an unconfirmed record must not block the hardware cleanup");
+        assert_eq!(
+            fake_camera::current(),
+            vec![1, 3, 1],
+            "the control is back despite the broken store"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// A restore the camera rejects puts the record back into force, so the
     /// still-real leftover stays claimable (#188).
     #[test]

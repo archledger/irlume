@@ -1353,6 +1353,16 @@ impl StreamMode {
         // `Drop` to do; if it fails, `Drop` repeating a write the camera has
         // just refused is how #159 territory is entered.
         //
+        // The bare lock (an unrecorded write's exclusion) is held THROUGH the
+        // restore below and released when this attempt finishes, success or
+        // not: an explicitly restored guard no longer owns a live change, and
+        // the frozen-stream restart calls restore() and then runs a fresh
+        // enable while this guard still exists — a retained lock made that
+        // enable refuse against its own predecessor and the reopened stream
+        // ran dark (review round 9). A RECORDED write's lock lives in the
+        // record and is released by resolve() on the same schedule.
+        let _bare_lock = self._lock.take();
+
         // The early return above is DEFENCE IN DEPTH and a mutant deleting it
         // survives the suite. That is not a missing test: the read-back below
         // subsumes it. On a second call the control already holds `restore`,
@@ -5861,11 +5871,29 @@ mod tests {
             ),
             "no second irlume may take the camera while the unrecorded change lives"
         );
-        drop(write);
+        // The lock must also release on an EXPLICIT restore, before the guard
+        // itself drops: the frozen-stream restart calls restore() and then
+        // runs a fresh enable while the old guard still exists, and a
+        // retained bare lock made that enable refuse against its own
+        // predecessor (review round 9).
+        let mut mode = StreamMode {
+            handle: None,
+            record: None,
+            _lock: write.lock,
+            unit: 14,
+            selector: 6,
+            restore: write.current,
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        };
+        mode.restore().expect("the unrecorded change restores");
         assert!(
             crate::stream_record::acquire(&asus).is_ok(),
-            "the lock releases when the guard's write handle drops"
+            "an explicitly restored guard must release its bare lock before \
+             the replacement enable runs"
         );
+        drop(mode);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

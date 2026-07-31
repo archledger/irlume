@@ -274,7 +274,9 @@ start_daemon park "$UNIT:$SEL:$PARK" || {
     echo "  daemon would not start"
     exit 2
 }
-IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds 1 >"$OUT/park-tune.out" 2>&1 &
+# Three rounds, not one: the kill has to land BETWEEN the apply and the
+# guard's restore, and a single round finishes before a poll loop can react.
+IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds 3 >"$OUT/park-tune.out" 2>&1 &
 tune=$!
 for _ in $(seq 1 600); do
     grep -aq "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$OUT/daemon-park.log" 2>/dev/null && break

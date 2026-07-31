@@ -1850,16 +1850,17 @@ pub fn capture_ir_streaming<B>(
                 // The reopened stream needs the mode set again, and the OLD
                 // guard is only given up if the new one actually took. The
                 // measured behaviour on both cameras here is that the control
-                // survives a stream close, so an unarmed replacement would
-                // leave the value applied with nothing left to put it back.
-                // Reassigning drops the old guard: disarmed it writes nothing
-                // and the fresh value stands, still armed it restores the value
-                // it was holding.
+                // survives a stream close, so the fresh `enable` can find the
+                // value still in place, send nothing, and come back unarmed.
+                // The restore then still belongs to the old guard, which is
+                // kept until a replacement genuinely holds one; replacing it
+                // unconditionally would drop it armed and write the default
+                // under the stream that just reopened.
                 let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
                 if fresh.lit() {
                     mode.disarm();
+                    mode = fresh;
                 }
-                mode = fresh;
             }
             continue;
         }
@@ -1968,16 +1969,17 @@ pub fn capture_ir_sequence(
                 // The reopened stream needs the mode set again, and the OLD
                 // guard is only given up if the new one actually took. The
                 // measured behaviour on both cameras here is that the control
-                // survives a stream close, so an unarmed replacement would
-                // leave the value applied with nothing left to put it back.
-                // Reassigning drops the old guard: disarmed it writes nothing
-                // and the fresh value stands, still armed it restores the value
-                // it was holding.
+                // survives a stream close, so the fresh `enable` can find the
+                // value still in place, send nothing, and come back unarmed.
+                // The restore then still belongs to the old guard, which is
+                // kept until a replacement genuinely holds one; replacing it
+                // unconditionally would drop it armed and write the default
+                // under the stream that just reopened.
                 let fresh = ir_emitter::enable(dev.handle().fd(), &card, device);
                 if fresh.lit() {
                     mode.disarm();
+                    mode = fresh;
                 }
-                mode = fresh;
             }
             continue;
         }

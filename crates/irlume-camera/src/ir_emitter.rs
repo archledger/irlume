@@ -1990,10 +1990,20 @@ fn recover_pending_write_locked(
             // To the path the record was FOUND at, not the one its contents
             // derive: a scanned record need not be filed under its own name, and
             // deriving here wrote the incremented record to a second file.
-            if let Err(why) = journal::save_at(&record_path, &spent) {
-                // The attempt could not be counted, so making it would be an
-                // uncounted write: exactly the loop the counter exists to stop.
-                return RecoveryOutcome::Unresolved(format!("count the attempt: {why}"));
+            match journal::save_at(&record_path, &spent) {
+                // Durable, or published-but-not-durable: either way the
+                // incremented count IS what a reader sees, so the write below is
+                // accounted for. An error after the rename does not un-publish
+                // it, and treating that as "nothing was counted" spent an
+                // attempt on a pass that then refused to write — three of those
+                // and the emitter is off for good.
+                Ok(_) => {}
+                Err(why) => {
+                    // Nothing became visible, so nothing was spent and nothing
+                    // may be written: an uncounted write is the loop the counter
+                    // exists to stop.
+                    return RecoveryOutcome::Unresolved(format!("count the attempt: {why}"));
+                }
             }
 
             // Read the control AGAIN, immediately before writing it.

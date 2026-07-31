@@ -22,6 +22,11 @@ SOCK=/run/irlume-strace.sock
 STATE=/var/lib/irlume-stracetest
 MODELS=/usr/share/irlume/models
 PARK=1,3,1,0,0,0,0,0,0
+# Taken from the packaged unit rather than assumed: the ONNX runtime ships beside
+# irlume on some installs and sits on the default search path on others, and a
+# daemon that cannot find it never reaches its socket, which reads as a hung build.
+ORT="${ORT_DYLIB_PATH:-$(systemctl cat irlumed 2>/dev/null |
+    sed -n 's/^Environment="\?ORT_DYLIB_PATH=\([^"]*\)"\?$/\1/p' | head -1)}"
 
 pass=0
 fail=0
@@ -38,6 +43,13 @@ bad() {
 }
 rm -rf "$OUT" "$STATE"
 mkdir -p "$OUT" "$STATE"
+# A sandboxed state directory has no opt-in third-party PAD weights, and on a
+# machine whose settings.conf enables one the daemon stops during startup instead
+# of reaching its socket. Point at the real ones; the subject here is the
+# emitter, not the models.
+if [ -d /var/lib/irlume/models-thirdparty ]; then
+    ln -sfn /var/lib/irlume/models-thirdparty "$STATE/models-thirdparty"
+fi
 
 was_enabled=no
 systemctl is-enabled --quiet irlumed 2>/dev/null && was_enabled=yes
@@ -74,6 +86,7 @@ start_daemon() { # $1 = tag, $2 = override, $3 = "strace" to trace it
         IRLUME_MODEL="$MODELS/glintr100.onnx" \
         IRLUME_MESH_MODEL="$MODELS/face_landmark.onnx" \
         IRLUME_BLAZE_MODEL="$MODELS/blaze_face_short_range.onnx" \
+        ${ORT:+ORT_DYLIB_PATH="$ORT"} \
         "${pre[@]}" "$TREE/target/release/irlumed" >"$OUT/daemon-$1.log" 2>&1 &
     for _ in $(seq 1 400); do
         [ -S "$SOCK" ] && return 0
@@ -82,9 +95,36 @@ start_daemon() { # $1 = tag, $2 = override, $3 = "strace" to trace it
     return 1
 }
 
+# The extension unit is DERIVED, not assumed. This script was written against a
+# NexiGo (unit 4) and hardcoded it; on a camera whose Microsoft XU is unit 14 the
+# override is refused outright and the run dies at the park step with nothing to
+# say why. The same hardcoding in the hardware script was worse, because there it
+# failed silently.
+echo "=== which extension unit does this camera publish ==="
+start_daemon probe off || {
+    echo "daemon would not start for the probe"
+    tail -20 "$OUT/daemon-probe.log"
+    exit 2
+}
+IRLUME_SOCKET="$SOCK" "$TREE/target/release/irlume" ir-setup --dry-run \
+    >"$OUT/units.txt" 2>&1
+pkill -TERM -f "target/release/irlumed" 2>/dev/null
+sleep 1
+sed 's/^/    /' "$OUT/units.txt"
+UNIT=$(sed -n 's/.*unit \([0-9]*\) (Microsoft camera control).*/\1/p' "$OUT/units.txt" | head -1)
+SEL=$(sed -n 's/.*unit '"${UNIT:-x}"' (Microsoft camera control): advertises \[\(0x[0-9a-f]*\).*/\1/p' \
+    "$OUT/units.txt" | head -1)
+if [ -z "$UNIT" ] || [ -z "$SEL" ]; then
+    echo "refusing: no Microsoft camera-control unit on this camera; nothing here applies"
+    exit 2
+fi
+SEL=$((SEL))
+echo "    Microsoft XU: unit $UNIT, first advertised selector $SEL"
+
 echo "=== park the control so discovery has something to explore ==="
-start_daemon park "4:6:$PARK" || {
+start_daemon park "$UNIT:$SEL:$PARK" || {
     echo "daemon would not start"
+    tail -20 "$OUT/daemon-park.log"
     exit 2
 }
 pkill -TERM -f "target/release/irlumed" 2>/dev/null

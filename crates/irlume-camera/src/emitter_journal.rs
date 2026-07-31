@@ -772,7 +772,7 @@ fn all_records() -> Result<Vec<(PathBuf, PendingWrite)>, String> {
 /// process finds the directory present and inherits a guarantee nobody has made.
 /// `ir-setup` is a person running a command, not a hot path.
 pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
-    save_at(&record_path(&record.filing_key()), record)
+    save_at(&record_path(&record.filing_key()), record).map(|(path, _)| path)
 }
 
 /// Write a record to a PARTICULAR path.
@@ -782,22 +782,36 @@ pub(crate) fn save(record: &PendingWrite) -> Result<PathBuf, String> {
 /// name its contents produce, so counting an attempt through `save` wrote the
 /// incremented record to a second file and left the first one behind — two
 /// records for one operation, and the clear afterwards removed only one.
-pub(crate) fn save_at(path: &std::path::Path, record: &PendingWrite) -> Result<PathBuf, String> {
+pub(crate) fn save_at(
+    path: &std::path::Path,
+    record: &PendingWrite,
+) -> Result<(PathBuf, irlume_common::AtomicWrite), String> {
     let dir = store_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     irlume_common::restrict(&dir, 0o700)?;
     irlume_common::fsync_ancestors(&dir)?;
     let path = path.to_path_buf();
     let body = serde_json::to_string(record).map_err(|e| format!("serialize record: {e}"))?;
-    irlume_common::write_0600_atomic(&path, body.as_bytes())
+    // The reporting variant, because an error after the rename does NOT mean the
+    // record is absent. A caller that treats "save failed" as "nothing is on
+    // disk" spends an attempt it never made, or leaves a record it thinks it
+    // never wrote — both have happened here.
+    let durability = irlume_common::write_atomic_reporting(&path, body.as_bytes(), 0o600)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     // After the fsync, so a line here means the record is durable — which is the
     // property the ordering depends on, not merely that a write was issued.
     trace(&format!(
-        "saved unit{}/sel{} original={} attempts={}",
-        record.unit, record.selector, record.original, record.restore_attempts
+        "saved unit{}/sel{} original={} attempts={} ({})",
+        record.unit,
+        record.selector,
+        record.original,
+        record.restore_attempts,
+        match &durability {
+            irlume_common::AtomicWrite::Durable => "durable",
+            irlume_common::AtomicWrite::VisibleNotDurable(_) => "visible, not durable",
+        }
     ));
-    Ok(path)
+    Ok((path, durability))
 }
 
 /// Remove a record whose control is confirmed back where it was found.

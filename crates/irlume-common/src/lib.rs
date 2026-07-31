@@ -233,6 +233,42 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 /// unaffected: a umask can only remove bits, and every ordinary umask removes
 /// none of those.
 pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    match write_atomic_reporting(path, bytes, mode)? {
+        AtomicWrite::Durable => Ok(()),
+        AtomicWrite::VisibleNotDurable(e) => Err(e),
+    }
+}
+
+/// How far an atomic write got.
+///
+/// "It returned an error" and "nothing became visible" are not the same thing,
+/// and three separate defects on #183 came from treating them as one. The rename
+/// publishes the new content immediately and atomically; the fsyncs that make it
+/// survive a power loss come afterwards, and a failure there leaves the new
+/// content exactly where it was put.
+#[derive(Debug)]
+pub enum AtomicWrite {
+    /// Written, published, and both the file and its directory made durable.
+    Durable,
+    /// The rename landed, so the new content IS what a reader sees, but a later
+    /// fsync failed and it may not survive a power loss. A caller that must know
+    /// what is visible now has to treat this as published.
+    ///
+    /// NOT COVERED BY A TEST. Nothing available here can make a directory fsync
+    /// fail; provoking it needs filesystem fault injection, and a mutant that
+    /// reverts this arm to `?` propagation survives the suite. The branch rests
+    /// on `rename(2)` being atomic and immediate and `fsync(2)` being a separate
+    /// step, not on anything observed.
+    VisibleNotDurable(std::io::Error),
+}
+
+/// [`write_atomic_mode`], reporting whether the content became visible when the
+/// durability step failed. `Err` means nothing was published.
+pub fn write_atomic_reporting(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mode: u32,
+) -> std::io::Result<AtomicWrite> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -275,16 +311,21 @@ pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std
         }
         // fsync the directory so the rename (the directory entry that makes the
         // new bytes visible under `path`) is itself durable across a power loss.
-        // A failure here means the update is NOT durably committed, so surface it
-        // as a write failure (the content is live but a crash could revert the
-        // entry); the caller retries the whole atomic write.
-        std::fs::File::open(dir)?.sync_all()?;
-        Ok(())
+        // The rename has ALREADY happened, so a failure here does not un-publish
+        // anything: the new content is what a reader sees, it simply might not
+        // survive a power loss. Reported as such rather than as a plain error,
+        // because a caller that then behaves as though nothing was written is
+        // exactly how a half-published file goes unnoticed.
+        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            Ok(()) => Ok(AtomicWrite::Durable),
+            Err(e) => Ok(AtomicWrite::VisibleNotDurable(e)),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = mode;
-        std::fs::write(path, bytes)
+        std::fs::write(path, bytes)?;
+        Ok(AtomicWrite::Durable)
     }
 }
 
@@ -791,12 +832,45 @@ mod tests {
         }
     }
 
+    /// A write reports whether it became VISIBLE, separately from whether it
+    /// became durable.
+    ///
+    /// Three defects on #183 came from callers reading "returned an error" as
+    /// "nothing is on disk". The rename publishes; the fsyncs come after. The
+    /// ordinary path must still report `Durable`, or the distinction is a
+    /// distinction nobody can act on.
+    #[test]
+    fn an_atomic_write_reports_that_it_became_durable() {
+        // Per-process, because the ASan lane and the ordinary lane run this same
+        // binary at once and a shared fixed name makes them delete each other's
+        // scratch directory mid-test.
+        let dir =
+            std::env::temp_dir().join(format!("irlume-atomic-reporting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("f");
+        match super::write_atomic_reporting(&path, b"hello", 0o600).expect("write") {
+            super::AtomicWrite::Durable => {}
+            super::AtomicWrite::VisibleNotDurable(e) => {
+                panic!("an ordinary write must be durable, got {e}")
+            }
+        }
+        assert_eq!(std::fs::read(&path).expect("read"), b"hello");
+        // And a write that cannot be published at all is an error, not a
+        // half-success: nothing is visible under the target name.
+        let missing = dir.join("no-such-dir").join("f");
+        assert!(super::write_atomic_reporting(&missing, b"x", 0o600).is_err());
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A removal that is not durable brings the record back after a power loss,
     /// and a record that comes back is acted on again. Absence is the whole
     /// meaning of a resolved journal, so it gets the same treatment as a write.
     #[test]
     fn removing_a_record_that_is_already_gone_is_success() {
-        let dir = std::env::temp_dir().join("irlume-remove-durable-test");
+        let dir =
+            std::env::temp_dir().join(format!("irlume-remove-durable-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("record");
         std::fs::write(&path, b"x").unwrap();

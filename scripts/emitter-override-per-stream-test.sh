@@ -28,6 +28,11 @@ M=/usr/share/irlume/models
 ORT=$(systemctl cat irlumed 2>/dev/null | sed -n 's/^Environment="\?ORT_DYLIB_PATH=\([^"]*\)"\?$/\1/p' | head -1)
 rm -rf "$S"; mkdir -p "$S"
 [ -d /var/lib/irlume/models-thirdparty ] && ln -sfn /var/lib/irlume/models-thirdparty "$S/models-thirdparty"
+# Restores the daemon to the state it was ACTUALLY in, not to whether it is
+# enabled. A machine where irlumed is enabled but deliberately stopped came back
+# running, which is this script changing the system it was only supposed to
+# measure.
+irlumed_was_active=$(systemctl is-active irlumed 2>/dev/null || true)
 systemctl stop irlumed 2>/dev/null; sleep 1
 rm -f "$SOCK"
 env IRLUME_SOCKET="$SOCK" IRLUME_STATE_DIR="$S" IRLUME_IR_EMITTER_CONF="$S/c.conf" \
@@ -39,18 +44,30 @@ env IRLUME_SOCKET="$SOCK" IRLUME_STATE_DIR="$S" IRLUME_IR_EMITTER_CONF="$S/c.con
 for _ in $(seq 1 1800); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { echo "daemon never listened"; tail -3 "$S/d.log"; exit 2; }
 # N SEPARATE requests against the one daemon: N sessions, one memo.
+# Counted PER REQUEST, not in aggregate. An aggregate "more than one applied
+# write" passes when an early request applies twice and a later one runs dark,
+# which is the exact defect this script exists to catch.
+count_applied() { grep -ac "SET_CUR unit14/sel6: \[01, 03, 02" "$S/d.log" 2>/dev/null || true; }
 failed=0
+dark=0
 for i in $(seq 1 "$N"); do
+    before=$(count_applied)
     if ! IRLUME_SOCKET="$SOCK" "$B/irlume" camera-tune --rounds 1 >"$S/tune-$i.out" 2>&1; then
         failed=$((failed + 1))
         echo "  request $i failed:"
         tail -2 "$S/tune-$i.out" | sed 's/^/    /'
+        continue
+    fi
+    after=$(count_applied)
+    if [ "$after" -le "$before" ]; then
+        dark=$((dark + 1))
+        echo "  request $i succeeded but applied NOTHING (still $after)"
     fi
 done
 pkill -TERM -f "$B/irlumed" 2>/dev/null; sleep 1
 applied=$(grep -ac 'SET_CUR unit14/sel6: \[01, 03, 02' "$S/d.log" || true)
 restored=$(grep -ac 'SET_CUR unit14/sel6: \[01, 03, 01' "$S/d.log" || true)
-systemctl is-enabled --quiet irlumed 2>/dev/null && systemctl start irlumed 2>/dev/null
+[ "$irlumed_was_active" = active ] && systemctl start irlumed 2>/dev/null
 echo "requests=$N  applied=$applied  restored=$restored  failed_requests=$failed"
 
 # Asserted, not printed. The first version of this script reported the counts and
@@ -64,11 +81,14 @@ fail() {
 # A request that errored produced no stream, so its absence from the counts is
 # not evidence about the memo.
 [ "$failed" -eq 0 ] || fail "$failed of $N requests failed; the counts below are not comparable"
-# The defect: only the FIRST stream in the process ever applies the override.
-if [ "$applied" -le 1 ]; then
-    fail "only $applied applied write across $N requests: later streams ran at the camera's default"
+# The defect: a stream in the process that never applies the override. Asserted
+# per request, because "more than one write in total" cannot tell a run where
+# every request applied from one where an early request applied twice and a later
+# one ran at the camera's default.
+if [ "$dark" -eq 0 ]; then
+    echo "  ok      every successful request applied the override ($applied writes over $N)"
 else
-    echo "  ok      the override applied on more than the first stream ($applied writes)"
+    fail "$dark of $N successful requests applied nothing: those streams ran at the camera's default"
 fi
 # And every applied mode is still put back, which is the rest of #168.
 if [ "$applied" -eq "$restored" ]; then

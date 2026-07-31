@@ -76,7 +76,7 @@ bad() {
 cleanup() {
     pkill -KILL -f "$B/irlumed" 2>/dev/null
     rm -f "$SOCK"
-    if systemctl is-enabled --quiet irlumed 2>/dev/null; then
+    if [ "$irlumed_was_active" = active ]; then
         systemctl start irlumed 2>/dev/null
         echo "  (packaged irlumed: $(systemctl is-active irlumed))"
     fi
@@ -91,6 +91,11 @@ mkdir -p "$S"
 if [ -d /var/lib/irlume/models-thirdparty ]; then
     ln -sfn /var/lib/irlume/models-thirdparty "$S/models-thirdparty"
 fi
+# Restores the daemon to the state it was ACTUALLY in, not to whether it is
+# enabled. A machine where irlumed is enabled but deliberately stopped came back
+# running, which is this script changing the system it was only supposed to
+# measure.
+irlumed_was_active=$(systemctl is-active irlumed 2>/dev/null || true)
 systemctl stop irlumed 2>/dev/null
 sleep 1
 

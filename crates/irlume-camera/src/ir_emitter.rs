@@ -1422,10 +1422,16 @@ impl StreamMode {
                 );
                 Ok(())
             }
-            // Unreadable is not evidence that somebody else owns it, and leaving
-            // a mode applied because one GET_CUR failed is the worse of the two
-            // errors. Fall through and restore.
-            _ => set_cur(self.fd(), self.unit, self.selector, &self.restore),
+            Ok(_) => set_cur(self.fd(), self.unit, self.selector, &self.restore),
+            // An unreadable control authorises NOTHING: writing blind here
+            // could put the restore value over bytes some other client set
+            // mid-stream, the exact class this file exists to prevent. #184
+            // chose to restore anyway, reasoning that a stranded mode was the
+            // worse error — a calculus the claim machinery has since
+            // inverted: this error path re-promotes the record below, so a
+            // recorded change stays claimable and nothing strands, while an
+            // unrecorded one surfaces through the caller (review round 13).
+            Err(e) => Err(e),
         };
         match outcome {
             // Nothing is outstanding any more: the control is back, or the
@@ -5731,6 +5737,67 @@ mod tests {
         assert!(
             matches!(result, Err(RestoreError::Camera(_))),
             "a rejected unrecorded restore must surface, not vanish: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable control at restore time authorises no write: the value
+    /// there might be a third party's, set mid-stream, and writing blind
+    /// would put the restore bytes over it (review round 13). The record is
+    /// re-promoted so the change stays claimable.
+    #[test]
+    fn an_unreadable_control_is_not_blindly_restored() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-rec-blind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let asus = identity(0x3277, 0x0059);
+        let lock = crate::stream_record::acquire(&asus).expect("the lock is free");
+        let record = crate::stream_record::save(lock, &asus, 14, 6, &[1, 3, 2], &[1, 3, 1])
+            .expect("the record is on disk")
+            .mark_applied()
+            .expect("the write is confirmed");
+        let _fake = fake_camera::install(fake_camera::Camera {
+            // A third party moved the control mid-stream...
+            current: vec![7, 7, 7],
+            ..a_working_camera()
+        });
+        // ...and the read-back fails transiently.
+        fake_camera::fail_reads(libc::EIO);
+        let mut mode = StreamMode {
+            handle: None,
+            record: Some(record),
+            _lock: None,
+            unit: 14,
+            selector: 6,
+            restore: vec![1, 3, 1],
+            applied: vec![1, 3, 2],
+            armed: true,
+            active: true,
+        };
+        let result = mode.restore();
+        assert!(
+            matches!(result, Err(RestoreError::Camera(_))),
+            "an unverifiable restore must surface, not succeed: {result:?}"
+        );
+        drop(mode);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "no write may go to a control that cannot be read: {:?}",
+            fake_camera::log()
+        );
+        assert_eq!(
+            fake_camera::current(),
+            vec![7, 7, 7],
+            "the third party's value survives"
+        );
+        let (_, records) = stream_store_state(&dir);
+        assert_eq!(
+            records[0].state,
+            crate::stream_record::WriteState::Applied,
+            "the change stays claimable for a session that CAN read the control"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

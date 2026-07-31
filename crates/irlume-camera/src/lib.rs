@@ -1898,9 +1898,13 @@ pub fn capture_ir_streaming<B>(
                 // enforces the same answer: while the old guard lives, its
                 // leftover record cannot be claimed, so the fresh `enable`
                 // cannot arm off the record either.
-                let fresh = ir_emitter::enable(dev.handle(), &card, device);
+                let mut fresh = ir_emitter::enable(dev.handle(), &card, device);
                 if fresh.owns_restore() {
                     mode.disarm();
+                    // The old guard held the per-camera stream lock, so the
+                    // fresh one wrote unrecorded; the outstanding change and
+                    // its on-disk record move over together (#188).
+                    fresh.adopt_record(mode.take_record());
                     mode = fresh;
                 }
             }
@@ -2031,9 +2035,13 @@ pub fn capture_ir_sequence(
                 // enforces the same answer: while the old guard lives, its
                 // leftover record cannot be claimed, so the fresh `enable`
                 // cannot arm off the record either.
-                let fresh = ir_emitter::enable(dev.handle(), &card, device);
+                let mut fresh = ir_emitter::enable(dev.handle(), &card, device);
                 if fresh.owns_restore() {
                     mode.disarm();
+                    // The old guard held the per-camera stream lock, so the
+                    // fresh one wrote unrecorded; the outstanding change and
+                    // its on-disk record move over together (#188).
+                    fresh.adopt_record(mode.take_record());
                     mode = fresh;
                 }
             }

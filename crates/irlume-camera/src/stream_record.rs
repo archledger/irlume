@@ -16,9 +16,39 @@
 //! Claiming it always undoes another program's change; never claiming it makes
 //! one `SIGKILL` leave the mode applied forever, because every later session
 //! reads the leftover as somebody else's. This record is the missing fact: it
-//! is written immediately before the `SET_CUR` and removed once the guard
+//! goes on disk immediately before the `SET_CUR` and is removed once the guard
 //! resolves, so a value found already in place is irlume's own leftover
-//! exactly when a record for this camera, this control and these bytes exists.
+//! exactly when a CONFIRMED record for this camera, this control and these
+//! bytes exists.
+//!
+//! # Two phases, because the record precedes the write
+//!
+//! A record written before the `SET_CUR` describes a write that may never
+//! happen: a kill in the gap leaves the file with no hardware effect behind
+//! it. If that file could authorise a claim, a value some other program set
+//! LATER, matching the bytes irlume once intended, would be "restored" over —
+//! a firmware write on the strength of nothing (review of this PR, round 1).
+//! So the record is published as `prepared`, and rewritten as `applied` only
+//! after the camera accepts the write. Claims require `applied`. A crash
+//! between the write and the confirmation leaves an unclaimable leftover,
+//! which is the pre-#188 status quo and the safe direction.
+//!
+//! # One writer at a time, on a lock that never moves
+//!
+//! Every mutation of the record happens holding a per-camera LOCK FILE that is
+//! created once and never renamed or removed. The lock cannot ride the record
+//! itself: `flock` binds to the open file description, and replacing the
+//! pathname by rename leaves the old lock attached to a nameless inode while
+//! a second writer locks a fresh one — two live "exclusive" locks, no
+//! exclusion (same review round). The stable inode gives the lock one
+//! identity for everyone. It is held for the guard's whole lifetime, released
+//! by any death, so it is also the liveness signal: a claim that cannot take
+//! it is looking at a live stream's record and refuses. No pid or boot id is
+//! stored; #183 removed those from the journal after one stranded a record.
+//!
+//! The lock serialises IRLUME's writers only. A non-cooperating process can
+//! still move the control between irlume's `GET_CUR` and `SET_CUR`; UVC has
+//! no compare-and-swap, so that window cannot be closed from here.
 //!
 //! # Durability, deliberately weaker than the discovery journal's
 //!
@@ -31,17 +61,6 @@
 //! control that a physical power cycle was measured to reset anyway (pt190:
 //! a replugged camera returns at its `GET_DEF`). Conflating the two
 //! requirements is what kept this record out of #184 for two review rounds.
-//!
-//! # Liveness
-//!
-//! The file doubles as its own liveness signal: the writer holds a
-//! non-blocking `flock` on it for as long as the guard is armed, and the lock
-//! dies with the process while the file does not. A claim that cannot take
-//! the lock is looking at a LIVE stream's record — a second process, or this
-//! process's own previous guard during a frozen-stream restart — and refuses.
-//! No pid or boot id is stored: #183 removed those from the journal because a
-//! recorded pid strands a record when its long-lived writer outlives the
-//! stream, and a kernel-released lock cannot go stale.
 
 use crate::emitter_journal::{filing_key, fingerprint, from_hex, identity_authorizes, to_hex};
 use crate::uvc_descriptor::CameraIdentity;
@@ -62,14 +81,27 @@ pub(crate) const MAX_RESTORE_ATTEMPTS: u32 = 3;
 /// Trace a stream-record event onto the stream `set_cur` traces writes to.
 ///
 /// Same switch as the journal's, for the same reason: the claims this module
-/// makes are ORDERINGS — record on disk before the `SET_CUR`, resolved only
-/// after the restore — and on hardware the only way to observe them is to put
-/// the events into the same transcript as the writes, in order. An strace of
-/// `write(2)` then shows both interleaved (pt190).
+/// makes are ORDERINGS — record on disk before the `SET_CUR`, confirmed after
+/// it, resolved only after the restore — and on hardware the only way to
+/// observe them is to put the events into the same transcript as the writes,
+/// in order. An strace of `write(2)` then shows both interleaved (pt190).
 fn trace(event: &str) {
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: stream-record {event}");
     }
+}
+
+/// How far the write this record covers actually got.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WriteState {
+    /// Published before the `SET_CUR`. The write may never have happened, so
+    /// this state authorises NOTHING; it exists so a crash after the write
+    /// cannot be unrecorded, not so a crash before it can forge ownership.
+    Prepared,
+    /// The camera accepted the `SET_CUR`. Only this state makes a leftover
+    /// irlume's to undo.
+    Applied,
 }
 
 /// One stream's applied emitter mode, on disk from just before the `SET_CUR`
@@ -90,6 +122,10 @@ pub(crate) struct StreamWrite {
     pub(crate) interface_number: u8,
     pub(crate) unit: u8,
     pub(crate) selector: u8,
+    /// Whether the write this record covers is known to have reached the
+    /// camera. REQUIRED, no default: a record that cannot say is a record
+    /// that must not authorise.
+    pub(crate) state: WriteState,
     /// Hex of the payload the stream applied. A claim requires the control to
     /// be holding exactly this, or the leftover it describes is already gone.
     pub(crate) applied: String,
@@ -129,8 +165,74 @@ fn record_path(id: &CameraIdentity) -> PathBuf {
     store_dir().join(format!("{}.json", filing_key(id)))
 }
 
-/// A live record: the file on disk plus the `flock` that marks its writer as
-/// alive. Held by the stream guard while armed.
+/// This camera's lock path: the stable inode every writer and claimer locks.
+///
+/// Beside the record, one per camera, created on first use and never renamed
+/// or removed — removing a lock file hands the next opener a different inode
+/// and two "exclusive" locks. The store directory is root-only, so the lock
+/// is too.
+fn lock_path(id: &CameraIdentity) -> PathBuf {
+    store_dir().join(format!("{}.lock", filing_key(id)))
+}
+
+/// The per-camera stream lock, held from before the control is read until the
+/// guard resolves.
+///
+/// Released by ANY process death, which makes it the liveness signal for the
+/// record beside it. Excludes irlume's own writers only; see the module doc.
+#[derive(Debug)]
+pub(crate) struct StreamLock {
+    /// Held, never read: the open file description IS the lock, released
+    /// when this drops however the process ends.
+    _file: std::fs::File,
+}
+
+/// Take this camera's stream lock, or report why not.
+///
+/// `None` means another live irlume guard owns this camera's record right now
+/// — another process mid-capture, or this process's own previous guard during
+/// a frozen-stream restart (`flock` excludes per open file description, so a
+/// second open in the same process is refused too). The caller proceeds
+/// without bookkeeping; an error creating or opening the lock is reported and
+/// answered the same way, since a write that cannot be recorded is still a
+/// write worth making (see `write_if_different`).
+pub(crate) fn acquire(id: &CameraIdentity) -> Option<StreamLock> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let dir = store_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("irlume: cannot create {}: {e}", dir.display());
+        return None;
+    }
+    if let Err(e) = irlume_common::restrict(&dir, 0o700) {
+        eprintln!("irlume: {e}");
+        return None;
+    }
+    let path = lock_path(id);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("irlume: cannot open {}: {e}", path.display());
+            return None;
+        }
+    };
+    // SAFETY: the fd is owned by `file`, which the returned guard keeps open.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(StreamLock { _file: file })
+}
+
+/// A live record: the file on disk, its parsed contents, and the stream lock
+/// that marks its writer as alive. Held by the stream guard while armed.
 ///
 /// Dropping this WITHOUT [`resolve`](StreamRecord::resolve) keeps the file and
 /// releases the lock, which is exactly the crash shape on purpose: a restore
@@ -138,50 +240,44 @@ fn record_path(id: &CameraIdentity) -> PathBuf {
 #[derive(Debug)]
 pub(crate) struct StreamRecord {
     path: PathBuf,
-    file: std::fs::File,
+    record: StreamWrite,
+    _lock: StreamLock,
 }
 
 impl StreamRecord {
+    /// Rewrite the record as `applied`, after the camera accepted the write.
+    ///
+    /// On failure the record stays `prepared` on disk: the write happened but
+    /// a crash from here would leave a leftover no claim will touch, which is
+    /// reported, and is the safe direction.
+    pub(crate) fn mark_applied(mut self) -> Result<Self, String> {
+        self.record.state = WriteState::Applied;
+        publish(&self.path, &self.record)?;
+        trace("confirmed applied");
+        Ok(self)
+    }
+
     /// Remove the record: the change it describes is no longer outstanding,
     /// either because the restore landed or because the control was found no
     /// longer holding irlume's value.
     ///
-    /// Only the inode this handle locked is removed. The path may already
-    /// hold a NEWER record — a replacement guard renames its own over this
-    /// one — and removing by name alone would delete bookkeeping that is not
-    /// ours. A writer renaming over between the check and the unlink loses
-    /// its file's name; the window is a few instructions wide, needs a second
-    /// irlume on the same camera in it, and costs that writer a claimable
-    /// leftover rather than a wrong write, so it is accepted rather than
-    /// closed.
+    /// A plain unlink is enough: every writer of this path holds the stable
+    /// lock, this handle holds it now, so the record at the name is this
+    /// handle's own.
     pub(crate) fn resolve(self) {
-        use std::os::unix::fs::MetadataExt as _;
-        let Ok(ours) = self.file.metadata() else {
-            return;
-        };
-        match std::fs::metadata(&self.path) {
-            Ok(m) if (m.dev(), m.ino()) == (ours.dev(), ours.ino()) => {
-                let _ = std::fs::remove_file(&self.path);
-                trace("resolved");
-            }
-            _ => trace("resolved (already replaced, left in place)"),
-        }
+        let _ = std::fs::remove_file(&self.path);
+        trace("resolved");
     }
 }
 
-/// Serialize, write to a fresh temp file, lock it, and rename it into place.
-///
-/// The lock is taken on the temp fd BEFORE the rename, so from the first
-/// instant the record is visible its writer already reads as alive; there is
-/// no window in which a concurrent claim could adopt a record whose owner is
-/// running. `flock` follows the open file description across the rename.
+/// Serialize and publish a record: temp file, write, rename. The caller holds
+/// the stream lock; nothing here locks.
 ///
 /// No fsync anywhere, see the module doc: process death is the requirement,
 /// and the page cache meets it.
-fn publish(path: &Path, record: &StreamWrite) -> Result<StreamRecord, String> {
+fn publish(path: &Path, record: &StreamWrite) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::io::AsRawFd as _;
 
     let dir = store_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -196,7 +292,6 @@ fn publish(path: &Path, record: &StreamWrite) -> Result<StreamRecord, String> {
     let tmp = dir.join(format!(".{name}.tmp.{}.{seq}", std::process::id()));
     let open_tmp = || {
         std::fs::OpenOptions::new()
-            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -216,30 +311,22 @@ fn publish(path: &Path, record: &StreamWrite) -> Result<StreamRecord, String> {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("write {}: {e}", tmp.display()));
     }
-    // SAFETY: the fd is owned by `file`, which the returned guard keeps open.
-    // A fresh 0600 temp file nobody else can have opened: the non-blocking
-    // lock cannot fail with WouldBlock, and any failure is reported.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let e = std::io::Error::last_os_error();
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("lock {}: {e}", tmp.display()));
-    }
+    drop(file);
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("publish {}: {e}", path.display()));
     }
-    Ok(StreamRecord {
-        path: path.to_path_buf(),
-        file,
-    })
+    Ok(())
 }
 
-/// Put the record for this stream's write on disk, locked, BEFORE the write.
+/// Put the `prepared` record for this stream's write on disk, BEFORE the
+/// write, under the lock the caller acquired.
 ///
 /// Best-effort at the caller: a store that cannot be written costs crash
 /// bookkeeping, not the authentication — see `write_if_different` for why
 /// that direction was chosen.
 pub(crate) fn save(
+    lock: StreamLock,
     id: &CameraIdentity,
     unit: u8,
     selector: u8,
@@ -254,18 +341,24 @@ pub(crate) fn save(
         interface_number: id.interface_number,
         unit,
         selector,
+        state: WriteState::Prepared,
         applied: to_hex(applied),
         displaced: to_hex(displaced),
         restore_attempts: 0,
         serial: id.serial.clone(),
         usb_devpath: id.usb_devpath.clone(),
     };
-    let handle = publish(&record_path(id), &record)?;
+    let path = record_path(id);
+    publish(&path, &record)?;
     trace(&format!(
-        "saved unit{unit}/sel{selector} applied={} displaced={}",
+        "saved unit{unit}/sel{selector} applied={} displaced={} state=prepared",
         record.applied, record.displaced
     ));
-    Ok(handle)
+    Ok(StreamRecord {
+        path,
+        record,
+        _lock: lock,
+    })
 }
 
 /// Why a record does not hand this stream a restore.
@@ -283,6 +376,11 @@ pub(crate) enum ClaimRefusal {
     UnsupportedSchema { found: u32 },
     /// The record's own fields disagree with each other or will not parse.
     Malformed(String),
+    /// The record was published before its write and never confirmed after
+    /// it, so the write may not have happened at all. A value matching it can
+    /// be another program's deliberate choice, and restoring over that would
+    /// be a firmware write on the strength of nothing.
+    NotConfirmed,
     /// The record names a different control than this stream is applying.
     /// The leftover may still be real, but it is not THIS write's business:
     /// claiming it here would arm a restore for a control nobody validated
@@ -317,6 +415,11 @@ pub(crate) fn record_claims(
         return Err(ClaimRefusal::UnsupportedSchema {
             found: record.schema_version,
         });
+    }
+    // Before anything else about the camera: a record whose write was never
+    // confirmed authorises nothing, whoever it matches.
+    if record.state != WriteState::Applied {
+        return Err(ClaimRefusal::NotConfirmed);
     }
     if !identity_authorizes(
         &record.descriptor_sha256,
@@ -374,26 +477,24 @@ pub(crate) fn record_claims(
 }
 
 /// Try to claim a control found already holding the wanted value as irlume's
-/// own crash leftover.
+/// own crash leftover. The caller holds the stream lock, which is consumed:
+/// into the returned record on success, dropped on refusal.
 ///
 /// `None` is the ordinary answer and means "not irlume's to undo": no record,
-/// a record whose writer is still alive (its lock is held), or a record the
-/// pure gate refuses. `Some` arms the caller's guard with the displaced value
-/// and hands over the still-locked record, with the attempt already counted
-/// on disk — counted BEFORE the write it authorises, so a crash between claim
-/// and restore cannot uncount it.
+/// or a record the pure gate refuses. `Some` arms the caller's guard with the
+/// displaced value and hands over the record, with the attempt already
+/// counted on disk — counted BEFORE the write it authorises, so a crash
+/// between claim and restore cannot uncount it.
 pub(crate) fn claim(
+    lock: StreamLock,
     id: &CameraIdentity,
     unit: u8,
     selector: u8,
     current: &[u8],
 ) -> Option<(Vec<u8>, StreamRecord)> {
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::io::AsRawFd as _;
-
     let path = record_path(id);
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             // Not absence: a store that cannot be read may be hiding a real
@@ -402,37 +503,6 @@ pub(crate) fn claim(
             eprintln!(
                 "irlume: cannot read the stream record {}: {e}; treating the control's value \
                  as another writer's",
-                path.display()
-            );
-            return None;
-        }
-    };
-    // A held lock is a live writer: this stream's own predecessor during a
-    // frozen-stream restart, or another process mid-capture. Either way the
-    // value in the control is a RUNNING stream's business. Silent, because
-    // the restart path lands here at every reopen on a camera whose control
-    // survives a stream close.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return None;
-    }
-    // The lock arrived after the open; make sure the name still means this
-    // inode. A record replaced in between belongs to whoever replaced it.
-    // NOT covered by a test, and a mutant deleting it survives the suite:
-    // staging the condition needs another process's rename to land inside the
-    // instructions between our open and our flock, which nothing available
-    // here can arrange deterministically. The decision has no extractable
-    // value either — it IS the comparison.
-    let (Ok(ours), Ok(named)) = (file.metadata(), std::fs::metadata(&path)) else {
-        return None;
-    };
-    if (ours.dev(), ours.ino()) != (named.dev(), named.ino()) {
-        return None;
-    }
-    let body = match std::io::read_to_string(&file) {
-        Ok(body) => body,
-        Err(e) => {
-            eprintln!(
-                "irlume: cannot read the stream record {}: {e}",
                 path.display()
             );
             return None;
@@ -452,9 +522,11 @@ pub(crate) fn claim(
     let displaced = match record_claims(&record, id, unit, selector, current) {
         Ok(displaced) => displaced,
         // Ordinary refusals, quiet: a machine where something else also sets
-        // the control lands here at every stream open.
+        // the control lands here at every stream open, and an unconfirmed
+        // record is precisely a value that may be somebody else's choice.
         Err(ClaimRefusal::DifferentCamera)
         | Err(ClaimRefusal::DifferentControl { .. })
+        | Err(ClaimRefusal::NotConfirmed)
         | Err(ClaimRefusal::Superseded) => return None,
         Err(ClaimRefusal::UnsupportedSchema { found }) => {
             eprintln!(
@@ -479,20 +551,26 @@ pub(crate) fn claim(
             return None;
         }
     };
-    // Count the attempt before the write it authorises. The rewrite replaces
-    // the inode, so the lock moves to the new file with the returned handle;
-    // a claim that cannot count durably-enough does not arm.
+    // Count the attempt before the write it authorises. A claim whose count
+    // cannot be recorded does not arm.
     let counted = StreamWrite {
         restore_attempts: record.restore_attempts + 1,
         ..record
     };
     match publish(&path, &counted) {
-        Ok(handle) => {
+        Ok(()) => {
             trace(&format!(
                 "claimed unit{unit}/sel{selector} displaced={} attempt={}",
                 counted.displaced, counted.restore_attempts
             ));
-            Some((displaced, handle))
+            Some((
+                displaced,
+                StreamRecord {
+                    path,
+                    record: counted,
+                    _lock: lock,
+                },
+            ))
         }
         Err(why) => {
             eprintln!(
@@ -532,6 +610,7 @@ mod tests {
             interface_number: id.interface_number,
             unit: 4,
             selector: 6,
+            state: WriteState::Applied,
             applied: "010302".into(),
             displaced: "010301".into(),
             restore_attempts: 0,
@@ -547,6 +626,21 @@ mod tests {
             record_claims(&record_for(&id), &id, 4, 6, &[1, 3, 2]),
             Ok(vec![1, 3, 1]),
             "camera, control and bytes all match: this is irlume's leftover"
+        );
+    }
+
+    /// The finding from review round 1: a record published before a write
+    /// that never happened must not authorise a restore, however well it
+    /// matches. The value it matches may be another program's later choice.
+    #[test]
+    fn a_prepared_record_never_authorizes_a_claim() {
+        let id = identity();
+        let mut unconfirmed = record_for(&id);
+        unconfirmed.state = WriteState::Prepared;
+        assert_eq!(
+            record_claims(&unconfirmed, &id, 4, 6, &[1, 3, 2]),
+            Err(ClaimRefusal::NotConfirmed),
+            "an unconfirmed write may never have reached the camera"
         );
     }
 

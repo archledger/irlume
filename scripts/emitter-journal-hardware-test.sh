@@ -194,13 +194,62 @@ stop_daemon
 
 # "unit 14 (Microsoft camera control): advertises [0x06, 0x09]"
 UNIT=$(sed -n 's/.*unit \([0-9]*\) (Microsoft camera control).*/\1/p' "$OUT/units-before.txt" | head -1)
-SEL=$(sed -n 's/.*unit '"${UNIT:-x}"' (Microsoft camera control): advertises \[\(0x[0-9a-f]*\).*/\1/p' \
-    "$OUT/units-before.txt" | head -1)
+
+# Selector 0x06 SPECIFICALLY, and refuse otherwise.
+#
+# Taking "the first advertised selector" was wrong: a Microsoft XU can advertise
+# 0x09 (metadata) ahead of 0x06 (face authentication), and the park value below
+# describes face authentication. Writing it to whatever came first is a payload
+# that does not describe the control it reaches, which is the #159 mistake in a
+# test harness.
+if ! grep -q "unit $UNIT (Microsoft camera control): advertises \[.*0x06" "$OUT/units-before.txt"; then
+    echo "refusing: unit $UNIT does not advertise 0x06 (face authentication);"
+    echo "          this harness only drives that control"
+    exit 2
+fi
+SEL=6
+
+# The park payload is NOT derived from this camera, so it is only used on cameras
+# it is known to describe.
+#
+# `1,3,1,...` is bNumEntries=1, streaming interface 3, mode D0. Interface 3 is
+# what the ASUS 3277:0059 and NexiGo 3443:c803 publish; another camera's
+# face-auth entry can name a different interface, and sending this to it writes a
+# structure describing hardware that is not there. The production gate checks the
+# selector is advertised and the length matches; it does not check the entry
+# contents, so it would not stop this.
+# Resolved from the node being driven, NOT from the bus. `lsusb | grep` matched a
+# known camera anywhere on the machine, so on a laptop whose built-in ASUS sits
+# beside an external camera the guard passed while the TARGET was the external
+# one. Measured: it let a Logitech BRIO through on this machine.
+node_dev=$(udevadm info -q path -n "$IR" 2>/dev/null | sed 's,/video4linux.*,,')
+VID_PID=""
+if [ -n "$node_dev" ]; then
+    d=/sys$node_dev
+    while [ -n "$d" ] && [ "$d" != "/sys" ] && [ "$d" != "/" ]; do
+        if [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ]; then
+            VID_PID="$(cat "$d/idVendor"):$(cat "$d/idProduct")"
+            break
+        fi
+        d=$(dirname "$d")
+    done
+fi
+echo "  camera behind $IR: ${VID_PID:-unknown}"
+case "$VID_PID" in
+    3277:0059 | 3443:c803) known_park=yes ;;
+    *) known_park=no ;;
+esac
+if [ -z "${PARK_VALUE:-}" ] && [ "$known_park" = no ]; then
+    echo "refusing: the built-in park value describes the ASUS 3277:0059 and"
+    echo "          NexiGo 3443:c803 streaming interface 3, and this is neither."
+    echo "          Set PARK_VALUE to a payload derived from THIS camera's"
+    echo "          GET_DEF, or run the read-only sections only."
+    exit 2
+fi
 if [ -z "$UNIT" ] || [ -z "$SEL" ]; then
     echo "refusing: no Microsoft camera-control unit on this camera; nothing here applies"
     exit 2
 fi
-SEL=$((SEL))
 echo "    Microsoft XU: unit $UNIT, first advertised selector $SEL"
 if [ -n "$(find "$STORE" -name '*.json' 2>/dev/null)" ]; then
     echo "refusing: $STORE already holds a record; resolve it first"

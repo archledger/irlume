@@ -274,8 +274,17 @@ start_daemon park "$UNIT:$SEL:$PARK" || {
     echo "  daemon would not start"
     exit 2
 }
-# Three rounds, not one: the kill has to land BETWEEN the apply and the
-# guard's restore, and a single round finishes before a poll loop can react.
+# KNOWN NOT TO WORK RELIABLY, kept because the attempt documents the problem.
+# The kill has to land between the apply and the guard's restore, and measurement
+# on the NexiGo says those are microseconds apart: every run so far logs the park
+# value applied and then immediately restored, whatever the round count. A shell
+# poll loop cannot interpose there.
+#
+# Parking now needs a write that no guard owns, which means a small tool issuing
+# one XU SET_CUR directly rather than going through a capture. Until that exists
+# the sections below report themselves NOT EXERCISED, which is the honest
+# outcome: they are not being tested, and saying so beats a pass that means
+# nothing.
 IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds 3 >"$OUT/park-tune.out" 2>&1 &
 tune=$!
 for _ in $(seq 1 600); do

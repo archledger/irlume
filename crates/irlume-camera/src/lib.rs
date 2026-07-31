@@ -1302,16 +1302,29 @@ impl IrCamera {
         // buffers; STREAMON happens on the first dequeue, which is inside
         // `warm_up_stream` below. This is the window, and it is the only one.
         let meta = ir_metadata::IlluminationLog::open(&self.device);
+        // BEFORE the warm-up, because the warm-up's first dequeue is STREAMON.
+        // Microsoft's sequence sets the property and THEN starts streaming, and
+        // this ran the other way round: every authentication set the mode under
+        // an already-running stream, the mid-stream write the rest of #168
+        // removes.
+        //
+        // Still after `SafeStream::open`, which allocates buffers and starts
+        // nothing, and after the metadata queue above, whose ordering against
+        // the image queue is load-bearing and measured.
+        //
+        // The comment this replaces said the write had to happen "while
+        // streaming" because Hello modules reset the control per open. The reset
+        // is on DEVICE open, which happened in `IrCamera::open`, not here; and
+        // the record above says the control survives stream close and process
+        // exit on both cameras measured, so it is not stream-scoped.
+        //
+        // Held for the session rather than just applied: dropping `IrSession`
+        // puts the control back to the camera's own default, which is the
+        // documented sequence's last step and the half irlume never did.
+        let mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream)?;
-        // Fire the active-IR emitter on the open fd (Hello modules reset it
-        // per-open, so we must do it here, while streaming, not via an external
-        // one-shot).
-        // Held for the session, not just applied. Dropping `IrSession` puts the
-        // control back to the camera's own default, which is the documented
-        // sequence's last step and the half irlume never did.
-        let mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         Ok(IrSession {
             cam: self,
             stream,

@@ -1891,6 +1891,34 @@ pub(crate) fn recover_pending_write(
 }
 
 /// The recovery pass proper. The caller holds this camera's lock.
+/// Whether a counted attempt may be followed by a firmware write.
+///
+/// Separated from the write that produces it so the decision can be exercised.
+/// Nothing here can make a directory `fsync` fail, so a test going through
+/// `save_at` cannot reach the middle arm and a mutant deleting it survives; the
+/// outcome is a value, and the decision made about that value is testable even
+/// when the condition producing it is not reachable.
+fn counted_attempt_authorizes_write(
+    saved: Result<(std::path::PathBuf, irlume_common::AtomicWrite), String>,
+) -> Result<(), String> {
+    match saved {
+        Ok((_, irlume_common::AtomicWrite::Durable)) => Ok(()),
+        // The attempt limit exists to bound firmware writes ACROSS CRASHES, so a
+        // count a power loss can revert bounds nothing: the old record comes
+        // back with the lower number and the same restore runs again, past the
+        // limit. The increment IS visible, so refusing may cost an attempt with
+        // no write ever made — at most MAX_RESTORE_ATTEMPTS refusals, against
+        // unbounded writes to somebody's camera.
+        Ok((_, irlume_common::AtomicWrite::VisibleNotDurable(e))) => Err(format!(
+            "count the attempt: the updated record is visible but not durable ({e}); \
+             refusing the write"
+        )),
+        // Nothing became visible, so nothing was spent and nothing may be
+        // written: an uncounted write is the loop the counter exists to stop.
+        Err(why) => Err(format!("count the attempt: {why}")),
+    }
+}
+
 fn recover_pending_write_locked(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
@@ -2006,20 +2034,10 @@ fn recover_pending_write_locked(
             // To the path the record was FOUND at, not the one its contents
             // derive: a scanned record need not be filed under its own name, and
             // deriving here wrote the incremented record to a second file.
-            match journal::save_at(&record_path, &spent) {
-                // Durable, or published-but-not-durable: either way the
-                // incremented count IS what a reader sees, so the write below is
-                // accounted for. An error after the rename does not un-publish
-                // it, and treating that as "nothing was counted" spent an
-                // attempt on a pass that then refused to write — three of those
-                // and the emitter is off for good.
-                Ok(_) => {}
-                Err(why) => {
-                    // Nothing became visible, so nothing was spent and nothing
-                    // may be written: an uncounted write is the loop the counter
-                    // exists to stop.
-                    return RecoveryOutcome::Unresolved(format!("count the attempt: {why}"));
-                }
+            if let Err(why) =
+                counted_attempt_authorizes_write(journal::save_at(&record_path, &spent))
+            {
+                return RecoveryOutcome::Unresolved(why);
             }
 
             // Read the control AGAIN, immediately before writing it.
@@ -4099,6 +4117,47 @@ mod tests {
             "the control must be re-read immediately before the write: {log:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restoring write needs an attempt counted DURABLY, not merely visibly.
+    ///
+    /// The limit exists to bound firmware writes across crashes. A count that a
+    /// power loss reverts bounds nothing: the old record returns with the lower
+    /// number and the same restore runs again, past the limit. This reverses an
+    /// earlier fix of mine that read "visible" as good enough here — it is good
+    /// enough to say an attempt was SPENT, and not good enough to authorize the
+    /// write that spends it.
+    #[test]
+    fn a_restore_needs_the_attempt_counted_durably_not_just_visibly() {
+        let path = std::path::PathBuf::from("/var/lib/irlume/ir-emitter-journal/x.json");
+        assert_eq!(
+            counted_attempt_authorizes_write(Ok((
+                path.clone(),
+                irlume_common::AtomicWrite::Durable
+            ))),
+            Ok(()),
+            "the ordinary durable path must still authorize the write"
+        );
+
+        let why = counted_attempt_authorizes_write(Ok((
+            path,
+            irlume_common::AtomicWrite::VisibleNotDurable(std::io::Error::other("no space")),
+        )))
+        .expect_err("a count a power loss can revert must NOT authorize a firmware write");
+        assert!(
+            why.contains("visible but not durable") && why.contains("refusing"),
+            "the refusal must say why, got: {why}"
+        );
+        assert!(
+            why.contains("no space"),
+            "the underlying error must survive into the message, got: {why}"
+        );
+
+        // And nothing published at all is also a refusal, but for the other
+        // reason: no attempt was spent, so a write here would be uncounted.
+        let why = counted_attempt_authorizes_write(Err("disk full".into()))
+            .expect_err("an unwritten record must not authorize a write either");
+        assert!(why.contains("disk full"), "got: {why}");
     }
 
     /// Somebody else moves the control while setup is measuring, and setup

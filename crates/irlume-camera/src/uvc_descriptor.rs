@@ -274,11 +274,7 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
             .ok_or_else(|| bad(format!("{} has no idVendor", dev_dir.display())))?,
         pid: read_hex_u16(&dev_dir.join("idProduct"))
             .ok_or_else(|| bad(format!("{} has no idProduct", dev_dir.display())))?,
-        // Absent on plenty of devices, so this is `None` rather than an error.
-        serial: std::fs::read_to_string(dev_dir.join("serial"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+        serial: read_optional_serial(&dev_dir)?,
         // `dev_dir` came from `canonicalize`, so it is already the resolved
         // physical path. Stripping `/sys` makes the value the kernel's own
         // `DEVPATH` for this device, which is what `udevadm info -q path` prints
@@ -332,6 +328,42 @@ fn device_numbers(fd: std::os::raw::c_int) -> std::io::Result<(u32, u32)> {
     Ok((libc::major(rdev), libc::minor(rdev)))
 }
 
+/// The device's USB serial, distinguishing "publishes none" from "could not read
+/// it".
+///
+/// `.ok()` on the read collapsed those two, and the difference decides whether
+/// one camera's recorded bytes may be written into another. A record created
+/// while the read failed stores `serial: None`, and `None` on the record side is
+/// deliberately permissive — it has to be, because a camera that genuinely
+/// publishes no serial must still be recoverable, and the NexiGo HelloCam this
+/// was validated against publishes none. So an identical unit swapped into the
+/// same USB port would satisfy `(None, Some(_))` and be authorized to receive
+/// the first camera's undo bytes, on matching descriptors and a reused port path
+/// alone. Failing the read closed keeps that authorization from ever being
+/// created.
+///
+/// An ABSENT attribute is `None`, because sysfs simply does not publish `serial`
+/// for a device with no iSerial descriptor, and that is the common case rather
+/// than a fault.
+///
+/// An EMPTY attribute is also `None`, which is where this deliberately diverges
+/// from the review that found the collapse: it proposed treating empty as an
+/// error. Empty carries the same information as absent — the device names no
+/// unit — and no camera here publishes one, so making it fatal would refuse
+/// hardware nobody has tested against on the strength of a guess. The hole being
+/// closed is the failed READ, not the empty value.
+fn read_optional_serial(dev_dir: &Path) -> std::io::Result<Option<String>> {
+    let path = dev_dir.join("serial");
+    match std::fs::read_to_string(&path) {
+        Ok(value) => {
+            let value = value.trim();
+            Ok((!value.is_empty()).then(|| value.to_owned()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(bad(format!("could not read {}: {e}", path.display()))),
+    }
+}
+
 fn ancestor_with(start: &Path, marker: &str) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
@@ -379,6 +411,61 @@ fn bad(msg: String) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    /// A serial that could not be READ is not the same as a camera that has
+    /// none, and the difference decides whether one camera's undo bytes may be
+    /// written into another.
+    ///
+    /// `.ok()` collapsed the two. A record created during a failed read stored
+    /// `serial: None`, and `None` on the record side is deliberately permissive
+    /// because a camera that publishes no serial must still be recoverable. So
+    /// an identical unit swapped into the same USB port matched on descriptors
+    /// and port alone. A test over `CameraIdentity { serial: None }` cannot see
+    /// this: it has to be exercised at the filesystem boundary.
+    #[test]
+    fn a_serial_that_cannot_be_read_is_an_error_not_an_absent_serial() {
+        let root = std::env::temp_dir().join(format!("irlume-serial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // No `serial` attribute at all: the ordinary case for a device with no
+        // iSerial descriptor, and the NexiGo this was validated against.
+        let absent = root.join("absent");
+        std::fs::create_dir_all(&absent).expect("scratch");
+        assert_eq!(
+            super::read_optional_serial(&absent).expect("an absent serial is not an error"),
+            None
+        );
+
+        // Present and readable.
+        let present = root.join("present");
+        std::fs::create_dir_all(&present).expect("scratch");
+        std::fs::write(present.join("serial"), " 200901010001\n").expect("write");
+        assert_eq!(
+            super::read_optional_serial(&present).expect("readable"),
+            Some("200901010001".to_string())
+        );
+
+        // Present and empty carries the same information as absent: the device
+        // names no unit.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).expect("scratch");
+        std::fs::write(empty.join("serial"), "  \n").expect("write");
+        assert_eq!(super::read_optional_serial(&empty).expect("readable"), None);
+
+        // Present and UNREADABLE. A directory where the attribute belongs makes
+        // the read fail with EISDIR, which is neither NotFound nor success, and
+        // is the shape of every transient sysfs failure this guards against.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(broken.join("serial")).expect("scratch");
+        let e = super::read_optional_serial(&broken)
+            .expect_err("a serial that cannot be read must NOT read as absent");
+        assert!(
+            e.to_string().contains("could not read"),
+            "the error must name what failed, got: {e}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use super::*;
 
     /// Captured from the ASUS Hello camera (USB 3277:0059) this was developed

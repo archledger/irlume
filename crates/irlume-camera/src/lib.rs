@@ -1303,12 +1303,16 @@ impl IrCamera {
         // Fire the active-IR emitter on the open fd (Hello modules reset it
         // per-open, so we must do it here, while streaming, not via an external
         // one-shot).
-        let lit = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
+        // Held for the session, not just applied. Dropping `IrSession` puts the
+        // control back to the camera's own default, which is the documented
+        // sequence's last step and the half irlume never did.
+        let mode = ir_emitter::enable(self.dev.handle().fd(), &self.card, &self.device);
         Ok(IrSession {
             cam: self,
             stream,
             dec: IrDecoder::new(self.pix),
-            lit,
+            lit: mode.lit(),
+            _mode: mode,
             meta,
         })
     }
@@ -1320,6 +1324,14 @@ pub struct IrSession<'a> {
     stream: SafeStream<'a>,
     dec: IrDecoder,
     lit: bool,
+    /// Restores the face-auth control when this session ends, on every path out
+    /// including an error or a panic. Declared AFTER `stream` so it drops after
+    /// it: the control is put back once the stream it was set for has stopped,
+    /// which is the order the documented sequence uses.
+    ///
+    /// Never read. It is held for its `Drop`, which is the whole point, and the
+    /// dead-code lint cannot see that.
+    _mode: ir_emitter::StreamMode,
     /// The camera's own per-frame illumination reporting, when it has any.
     /// `None` means this camera cannot say, and brightness decides as before.
     meta: Option<ir_metadata::IlluminationLog>,
@@ -1680,7 +1692,7 @@ pub mod ir_probe {
         let (w, h) = (fmt.width, fmt.height);
         let mut stream = super::SafeStream::open(device, &dev)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-        ir_emitter::enable(dev.handle().fd(), &card, device);
+        let _mode = ir_emitter::enable(dev.handle().fd(), &card, device);
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
@@ -1765,7 +1777,7 @@ pub fn capture_ir_streaming<B>(
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = SafeStream::open(device, &dev)?;
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    ir_emitter::enable(dev.handle().fd(), &card, device);
+    let mut mode = ir_emitter::enable(dev.handle().fd(), &card, device);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
     // constant mid-grey for the rest of the window); real sensor noise never
@@ -1800,7 +1812,9 @@ pub fn capture_ir_streaming<B>(
                 last_sig = None;
                 drop(stream); // stop + release buffers before re-arming
                 stream = SafeStream::open(device, &dev)?;
-                ir_emitter::enable(dev.handle().fd(), &card, device);
+                // The old guard belongs to a stream that no longer exists.
+                mode.disarm();
+                mode = ir_emitter::enable(dev.handle().fd(), &card, device);
             }
             continue;
         }
@@ -1851,17 +1865,14 @@ pub fn capture_ir_sequence(
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = Some(SafeStream::open(device, &dev)?);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-    ir_emitter::enable(dev.handle().fd(), &card, device);
+    let mut mode = ir_emitter::enable(dev.handle().fd(), &card, device);
     let mut frames = Vec::with_capacity(samples);
     let max_attempts = samples * 2 + 30;
     let (mut dead_run, mut restarts) = (0usize, 0usize);
     let mut last_sig: Option<Vec<u8>> = None;
-    for attempt in 0..max_attempts {
+    for _ in 0..max_attempts {
         if frames.len() >= samples {
             break;
-        }
-        if attempt % 8 == 0 {
-            ir_emitter::enable(dev.handle().fd(), &card, device);
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
@@ -1895,7 +1906,9 @@ pub fn capture_ir_sequence(
                 last_sig = None;
                 drop(stream.take()); // stop + release buffers before re-arming
                 stream = Some(SafeStream::open(device, &dev)?);
-                ir_emitter::enable(dev.handle().fd(), &card, device);
+                // The old guard belongs to a stream that no longer exists.
+                mode.disarm();
+                mode = ir_emitter::enable(dev.handle().fd(), &card, device);
             }
             continue;
         }

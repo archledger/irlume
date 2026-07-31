@@ -165,22 +165,37 @@ IRLUME_SOCKET="$SOCK" "$B/irlume" camera-tune --rounds 3 >"$S/watch.out" 2>&1
 pkill -TERM -f "$B/irlumed" 2>/dev/null
 sleep 1
 
-writes=$(grep -ac "SET_CUR unit$UNIT/sel$SEL" "$S/daemon-watch.log" 2>/dev/null || echo 0)
-echo "  SET_CUR writes to unit$UNIT/sel$SEL during the capture: $writes"
-grep -aE "SET_CUR|GET_CUR" "$S/daemon-watch.log" | head -6 | sed 's/^/    /'
+log="$S/daemon-watch.log"
+writes=$(grep -ac "SET_CUR unit$UNIT/sel$SEL" "$log" 2>/dev/null || true)
+# The applied value and the camera's default, counted separately. A flat total
+# cannot tell "twice per stream" from "once every eighth frame": the restore that
+# #168 adds is a second write BY DESIGN, so the total legitimately doubles while
+# the thing being removed disappears.
+applied=$(grep -ac "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 02" "$log" 2>/dev/null || true)
+restored=$(grep -ac "SET_CUR unit$UNIT/sel$SEL: \[01, 03, 01" "$log" 2>/dev/null || true)
+echo "  SET_CUR to unit$UNIT/sel$SEL: $writes total ($applied applied, $restored restored)"
+grep -aE "SET_CUR unit$UNIT/sel$SEL" "$log" | head -6 | sed 's/^/    /'
 
-# The point of the change: the control is written once per stream, not per frame.
-# camera-tune opens more than one stream, so the bound is per round rather than a
-# flat 1; what must NOT appear is a write every eighth frame.
-assert_lt() {
-    if [ "$writes" -le "$1" ]; then
-        ok "no per-frame re-firing (writes=$writes, at most $1 expected)"
-    else
-        bad "the control is still being rewritten during streaming" \
-            "$writes writes; the every-eighth-frame path should be gone"
-    fi
-}
-assert_lt 8
+# The property #168 asks for, and it does not depend on how many frames ran:
+# every mode set for a stream is put back when that stream ends.
+if [ "$applied" -gt 0 ] && [ "$applied" -eq "$restored" ]; then
+    ok "every applied mode was put back ($applied set, $restored restored)"
+elif [ "$applied" -eq 0 ]; then
+    bad "the mode was never applied" "nothing to observe; check the setup step"
+else
+    bad "sets and restores do not pair up" \
+        "$applied applied against $restored restored; a stream ended without unsetting"
+fi
+
+# And the removed behaviour: re-firing every eighth frame put many MORE applied
+# writes than there were streams. Each stream now contributes exactly one applied
+# write, so applied must not exceed the restores, which count the streams.
+if [ "$applied" -le "$restored" ]; then
+    ok "no per-frame re-firing (one applied write per stream, not one per 8 frames)"
+else
+    bad "the control is still being rewritten during streaming" \
+        "$applied applied writes against $restored streams"
+fi
 
 echo "=== 3. does the control still hold what was set? ==="
 start_daemon readback || exit 2

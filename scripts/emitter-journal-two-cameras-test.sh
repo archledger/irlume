@@ -144,7 +144,9 @@ stop_daemon() {
         sleep 0.1
     done
 }
-setup() { IRLUME_SOCKET=/run/irlume-twocam.sock "$B/irlume" ir-setup "$@"; }
+# No arguments: this script only ever runs a plain `ir-setup`. Forwarding "$@"
+# made shellcheck point out that the parameters could never arrive.
+setup() { IRLUME_SOCKET=/run/irlume-twocam.sock "$B/irlume" ir-setup; }
 
 echo "=== 0. two cameras, and they really are different ==="
 ident() { # ir node -> "vid:pid devpath"

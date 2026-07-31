@@ -26,6 +26,18 @@ TREE="${1:?tree}"; N="${2:-3}"
 B="$TREE/target/release"; S=/var/lib/irlume-memoprobe; SOCK=/run/irlume-memoprobe.sock
 M=/usr/share/irlume/models
 ORT=$(systemctl cat irlumed 2>/dev/null | sed -n 's/^Environment="\?ORT_DYLIB_PATH=\([^"]*\)"\?$/\1/p' | head -1)
+# A cleanup trap, so an interrupted run does not leave a sandboxed daemon holding
+# the camera and the packaged one stopped. Without it, Ctrl-C between the stop
+# and the restore left the machine with no working face login and a stray daemon
+# on the device.
+cleanup() {
+    pkill -KILL -f "$B/irlumed" 2>/dev/null
+    rm -f "$SOCK"
+    [ "${irlumed_was_active:-}" = active ] && systemctl start irlumed 2>/dev/null
+    return 0
+}
+trap cleanup EXIT INT TERM
+
 rm -rf "$S"; mkdir -p "$S"
 [ -d /var/lib/irlume/models-thirdparty ] && ln -sfn /var/lib/irlume/models-thirdparty "$S/models-thirdparty"
 # Restores the daemon to the state it was ACTUALLY in, not to whether it is

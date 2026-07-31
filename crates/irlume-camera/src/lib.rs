@@ -1348,17 +1348,20 @@ pub struct IrSession<'a> {
     stream: SafeStream<'a>,
     dec: IrDecoder,
     lit: bool,
+    /// The camera's own per-frame illumination reporting, when it has any.
+    /// `None` means this camera cannot say, and brightness decides as before.
+    meta: Option<ir_metadata::IlluminationLog>,
     /// Restores the face-auth control when this session ends, on every path out
-    /// including an error or a panic. Declared AFTER `stream` so it drops after
-    /// it: the control is put back once the stream it was set for has stopped,
-    /// which is the order the documented sequence uses.
+    /// including an error or a panic. Declared LAST of the streaming fields, so
+    /// it drops last: struct fields drop in declaration order, and both `stream`
+    /// and `meta` have to stop before the control is put back. `meta` is a
+    /// running V4L2 stream of its own that issues STREAMOFF from its `Drop`, so
+    /// with it declared after this one the restore went out while a stream tied
+    /// to the same capture was still live.
     ///
     /// Never read. It is held for its `Drop`, which is the whole point, and the
     /// dead-code lint cannot see that.
     _mode: ir_emitter::StreamMode,
-    /// The camera's own per-frame illumination reporting, when it has any.
-    /// `None` means this camera cannot say, and brightness decides as before.
-    meta: Option<ir_metadata::IlluminationLog>,
 }
 
 impl IrSession<'_> {

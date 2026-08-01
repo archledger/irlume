@@ -446,6 +446,20 @@ fn privacy_permits_setup(observed: std::io::Result<Option<bool>>) -> Result<(), 
     }
 }
 
+/// The kernel driver behind a video node and whether it sits on USB, read from
+/// sysfs. This answers the first question of every camera bug report: is this
+/// the `uvcvideo`-on-USB case irlume is built and tested for, or an IPU/MIPI
+/// or other pipeline that merely looks similar? #187's diagnosis had to ask
+/// for exactly this by shell script; `doctor` now reads it itself.
+pub fn node_backend(device: &str) -> Option<(String, bool)> {
+    let name = device.strip_prefix("/dev/")?;
+    let dev = std::fs::canonicalize(format!("/sys/class/video4linux/{name}/device")).ok()?;
+    let driver = std::fs::read_link(dev.join("driver")).ok()?;
+    let driver = driver.file_name()?.to_str()?.to_string();
+    let on_usb = dev.to_str().is_some_and(|p| p.contains("/usb"));
+    Some((driver, on_usb))
+}
+
 /// True iff a sysfs `device` path traces to a real hardware bus (USB/PCI) and
 /// not a virtual/loopback origin. Pure so it can be unit-tested without sysfs.
 fn is_physical_camera_path(p: &str) -> bool {
@@ -3332,6 +3346,15 @@ mod tests {
             select_pair(),
             ("/dev/irlume-test-rgb".into(), "/dev/irlume-test-ir".into())
         );
+    }
+
+    #[test]
+    fn node_backend_is_none_off_the_video_class() {
+        // Missing nodes, non-/dev paths and nodes with no sysfs entry all
+        // answer None rather than inventing a driver name.
+        assert!(node_backend("/dev/irlume-test-missing").is_none());
+        assert!(node_backend("/dev/null").is_none());
+        assert!(node_backend("not-even-a-dev-path").is_none());
     }
 
     #[test]

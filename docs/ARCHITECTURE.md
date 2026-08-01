@@ -27,7 +27,7 @@ flowchart LR
         cli("irlume CLI / TUI")
     end
     socket{{"/run/irlume.sock<br/>SO_PEERCRED · root-or-self"}}
-    subgraph trust["irlumed: privileged · single-threaded"]
+    subgraph trust["irlumed: privileged · one serialized camera worker"]
         daemon("owns: camera · IR emitter · ONNX models · templates · TPM<br/><i>raw frames never leave here</i>")
     end
     callers -->|invokes| pam
@@ -50,7 +50,12 @@ flowchart LR
   directly by design; they are diagnostics, not auth paths.)
 - **`irlumed`** is the sole owner of the camera/IR/models/templates/TPM. This is
   the Linux analogue of Windows Hello ESS's isolated camera→matcher pathway: the
-  login/display-manager process tree never sees raw image data.
+  login/display-manager process tree never sees raw image data. Connections are
+  handled concurrently, but exactly ONE worker owns and advances the biometric
+  engine and camera state; the arbiter refuses non-auth camera work while an
+  authentication is pending, and long operations yield only at complete capture
+  boundaries. The security invariant is the serialized owner, not the thread
+  count.
 - **Trust boundary:** `irlumed` reads `SO_PEERCRED` on every connection. Only
   root or the target user may enroll/delete that user's profiles, and the sealed
   login password is released only to a root peer. (We use a raw Unix socket +

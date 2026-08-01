@@ -184,14 +184,23 @@ pub fn render(card: &str, mean: f64, cause: &IrDarkCause) -> Option<String> {
             frames_classified,
         } => Some(format!(
             "[ir] {card:?}: the IR frame is saturated and nearly constant (mean \
-             {mean:.0}, stddev {stddev:.2}){}. On both tested cameras this matched an \
-             opaque cover directly in front of the lens, bouncing the emitter straight \
-             back (covered measured 252.8-255.0; real scenes carry spread 35+). Remove \
-             whatever is in front of the camera.",
+             {mean:.0}, stddev {stddev:.2}){}. On both tested cameras this pattern \
+             matched an opaque cover directly in front of the lens{}; strong IR \
+             flooding the lens could read the same (covered measured 252.8-255.0; \
+             real scenes carry spread 35+). Check for a cover or anything flush \
+             against the camera.",
             if *frames_lit > 0 {
                 format!(", with {frames_lit}/{frames_classified} frames marked illuminated")
             } else {
                 String::new()
+            },
+            // The reflection mechanism is asserted only when the camera says
+            // its illuminator was on; a saturated frame without that flag
+            // could as easily be ambient overexposure (review thread).
+            if *frames_lit > 0 {
+                ", bouncing the emitter straight back"
+            } else {
+                ""
             }
         )),
         IrDarkCause::LitButDark {
@@ -416,6 +425,27 @@ mod tests {
                 !msg.contains("ir-setup"),
                 "no firmware advice for a cover: {msg}"
             );
+            assert!(
+                msg.contains("bouncing the emitter"),
+                "lit flags support the mechanism: {msg}"
+            );
+        }
+        {
+            // Without lit flags the mechanism claim must vanish: saturation
+            // could be ambient overexposure, and the message may only name
+            // the pattern (review thread on this PR).
+            let msg = render(
+                "cam",
+                255.0,
+                &IrDarkCause::SaturatedFlat {
+                    stddev: 0.0,
+                    frames_lit: 0,
+                    frames_classified: 0,
+                },
+            )
+            .expect("still speaks");
+            assert!(!msg.contains("bouncing the emitter"), "{msg}");
+            assert!(!msg.contains("marked illuminated"), "{msg}");
         }
         assert_eq!(
             diagnose(&DarkEvidence {

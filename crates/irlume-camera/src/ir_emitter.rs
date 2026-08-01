@@ -1056,8 +1056,8 @@ fn write_if_different(
 /// PIDs (with `comm`) of OTHER processes holding `dev` open, read from
 /// `proc_root` (`/proc` in production; a constructed tree in tests).
 ///
-/// The check is definitionally racy — a consumer can arrive one instant after
-/// the scan — and that is acceptable for what it guards: honouring the
+/// The check is definitionally racy (a consumer can arrive one instant after
+/// the scan), and that is acceptable for what it guards: honouring the
 /// read-only-sharer contract for consumers that exist at decision time, not a
 /// mutual-exclusion primitive (the kernel lock does that for irlume's own
 /// processes). Unreadable entries are skipped silently: as root (the daemon)

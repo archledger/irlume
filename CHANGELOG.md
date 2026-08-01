@@ -13,7 +13,7 @@ All notable changes to irlume are documented here. This project adheres to
   settings. irlume wrote the extension-unit control whenever it captured,
   relying on its capture failing busy afterwards anyway. `ir_emitter::enable`
   now stands down from the write when another process already holds the camera
-  node, leaving that application's configuration untouched — the fail-safe
+  node, leaving that application's configuration untouched, the fail-safe
   direction, since an unlit emitter degrades one capture toward the password.
   The threat model gains a sourced section on the whole Windows camera
   contract: the exclusive-control model, the certification tie between IR

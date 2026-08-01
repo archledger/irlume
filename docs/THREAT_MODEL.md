@@ -78,7 +78,7 @@ primary source:
 **Exclusive control.** Windows permits many frame consumers but exactly one of
 them may modify device configuration; shared consumers are read-only and
 inherit the controlling application's settings, and explicitly "cannot change
-KSPROPERTYSETID_ExtendedCameraControl controls" — the class the Hello extension
+KSPROPERTYSETID_ExtendedCameraControl controls", the class the Hello extension
 unit belongs to ([MediaCaptureSharingMode][ms-share],
 [MF FrameServer share modes][ms-frameserver]). irlume honours this: when
 another process already holds the camera node, `ir_emitter::enable` stands
@@ -90,8 +90,8 @@ direction). irlume-vs-irlume exclusion is separate and kernel-enforced.
 **Privacy indication for IR-only capture.** irlume can illuminate a person
 with 850 nm light during authentication. Windows hardware certification ties
 visible indication to sensor capture, including for IR-only streams: a visible-
-wavelength (850 nm) illuminator may itself serve as the indicator — it glows
-faint red — while designs with an invisible (940 nm) illuminator must light a
+wavelength (850 nm) illuminator may itself serve as the indicator (it glows
+faint red), while designs with an invisible (940 nm) illuminator must light a
 separate visible LED whenever the IR sensor is on
 ([camera privacy controls][ms-privacy]). On certified modules that indication
 is wired to sensor power in hardware, which is why it follows irlume's captures
@@ -106,8 +106,8 @@ camera lines are where irlume already reasons about what the user can see.
 fully off in D3cold and preserves no control context; its optional
 [UVC control cache][ms-cache] restores a fixed list of ordinary
 `VIDEOPROCAMP` controls (brightness, contrast, …) across such transitions, and
-extension-unit state is not on that list. irlume's policy — re-apply the
-emitter control at every capture and restore on stream end — is therefore the
+extension-unit state is not on that list. irlume's policy, re-apply the
+emitter control at every capture and restore on stream end, is therefore the
 deliberate response to the same power behaviour, not an incidental habit:
 nothing below irlume undertakes to preserve this state, on either OS. (#168
 tracks narrowing WHEN within a capture the control is held.)

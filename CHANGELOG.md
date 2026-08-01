@@ -8,8 +8,8 @@ All notable changes to irlume are documented here. This project adheres to
 ### Added
 
 - **The consent watch records the #101 candidate discriminator on every run.**
-  `mean_step` — mean absolute pitch change per adjacent frame pair, with
-  face-lost gaps contributing nothing — now rides in the nod evidence, the
+  `mean_step` (mean absolute pitch change per adjacent frame pair, with
+  face-lost gaps contributing nothing) now rides in the nod evidence, the
   consent debug line, and `blinkcap replay`'s per-label summary. It gates
   nothing: #101 measured it separating a still head from a deliberate nod by
   2.3x where the gating pitch range manages 1.44x, then deliberately declined

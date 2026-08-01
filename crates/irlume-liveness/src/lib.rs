@@ -675,7 +675,7 @@ pub struct NodEvidence {
     /// RECORDED, NEVER GATING. This is the candidate discriminator #101 left
     /// on the table: measured there once, it separated a still head from a
     /// deliberate nod by 2.3x (still at most 0.0064, nods at least 0.0149)
-    /// where the gating `pitch_range` manages 1.44x — but those numbers come
+    /// where the gating `pitch_range` manages 1.44x. Those numbers come
     /// from one user in one session, and the same thread documents this class
     /// of signal drifting across sessions (genuine nods at 0.057 in one
     /// campaign, 0.082 weakest in another). The issue's recorded blocker is
@@ -1942,8 +1942,8 @@ mod nod_evidence_tests {
     }
 
     /// `mean_step` is the #101 shadow metric: recorded with the verdict,
-    /// never part of it. Pin the arithmetic — mean |Δpitch| over ADJACENT
-    /// pairs with both readings — and the gap rule that keeps it honest: a
+    /// never part of it. Pin the arithmetic (mean |Δpitch| over ADJACENT
+    /// pairs with both readings) and the gap rule that keeps it honest: a
     /// face-lost frame contributes no pair, rather than a fake jump across
     /// the gap. The measured populations that motivated it (still ≤0.0064,
     /// nods ≥0.0149) are provenance in the field's docs, deliberately NOT
@@ -1975,7 +1975,7 @@ mod nod_evidence_tests {
 
         // Directional sanity on the shapes the gate already models: the nod
         // series moves more per frame than the still series. Relative order
-        // only — no absolute floor, that is #101's threshold call to make.
+        // only; no absolute floor, that is #101's threshold call to make.
         let nod = [
             0.53, 0.55, 0.60, 0.63, 0.58, 0.52, 0.51, 0.55, 0.62, 0.64, 0.57, 0.52, 0.53, 0.56,
         ];

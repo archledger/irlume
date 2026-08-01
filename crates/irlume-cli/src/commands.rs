@@ -286,6 +286,17 @@ fn ubuntu_codename(os_release: &str) -> Option<String> {
 /// Does the PPA publish for this Ubuntu series? HTTP 200 on the series
 /// Release file means yes. None = couldn't check (offline / no curl).
 fn ppa_serves(codename: &str) -> Option<bool> {
+    ppa_serves_via(std::path::Path::new("curl"), codename)
+}
+
+/// [`ppa_serves`] with the curl binary injected. The seam exists for #194:
+/// tests used to point this code at a fake curl by prepending to PATH and
+/// steering it through FAKE_CURL_MODE, but `std::env::set_var` is unsafe with
+/// any concurrent env reader, and PATH is read by every `Command` any other
+/// test spawns in parallel — a race that produced one false CI failure on an
+/// unrelated PR per sighting. A parameter is a value: nothing global, nothing
+/// racing.
+fn ppa_serves_via(curl: &std::path::Path, codename: &str) -> Option<bool> {
     // Whether the PPA has an actually-INSTALLABLE irlume for this Ubuntu series,
     // checked against the binary Packages index, NOT just a `Release` file. A
     // Release file lingers for a series long after its packages are deleted
@@ -302,7 +313,7 @@ fn ppa_serves(codename: &str) -> Option<bool> {
     // Distinguish an HTTP error (404 = series genuinely not served) from a
     // network/tooling failure (offline), so we never tell a CURRENT-LTS user
     // "the PPA doesn't serve you" just because they happen to be offline.
-    let out = std::process::Command::new("curl")
+    let out = std::process::Command::new(curl)
         .args(["-fsS", "--max-time", "8", &url])
         .output()
         .ok()?;
@@ -375,16 +386,34 @@ fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
 /// carry distro suffixes (`…-1.fc44`, `…-0ppa1~resolute1`, `…-1`); `version_gt`
 /// compares the numeric upstream prefix, so they still compare against a tag.
 fn installed_version(origin: &InstallOrigin) -> String {
+    use std::path::Path;
+    installed_version_via(
+        origin,
+        Path::new("rpm"),
+        Path::new("dpkg-query"),
+        Path::new("pacman"),
+    )
+}
+
+/// [`installed_version`] with the package-manager binaries injected — the same
+/// #194 seam as [`ppa_serves_via`], so the test fakes are arguments instead of
+/// PATH mutations.
+fn installed_version_via(
+    origin: &InstallOrigin,
+    rpm: &std::path::Path,
+    dpkg_query: &std::path::Path,
+    pacman: &std::path::Path,
+) -> String {
     let pkg = match origin {
         InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
-            cmd_stdout("rpm", &["-q", "--qf", "%{VERSION}", "irlume"])
+            cmd_stdout(rpm, &["-q", "--qf", "%{VERSION}", "irlume"])
         }
         InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
-            cmd_stdout("dpkg-query", &["-W", "-f", "${Version}", "irlume"])
+            cmd_stdout(dpkg_query, &["-W", "-f", "${Version}", "irlume"])
         }
         InstallOrigin::ArchPkg => {
             // `pacman -Q irlume` → "irlume 0.1.3-1"; take the version field.
-            cmd_stdout("pacman", &["-Q", "irlume"])
+            cmd_stdout(pacman, &["-Q", "irlume"])
                 .and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
         }
         InstallOrigin::Source => None,
@@ -404,7 +433,7 @@ fn cmd_ok(prog: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn cmd_stdout(prog: &str, args: &[&str]) -> Option<String> {
+fn cmd_stdout(prog: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(prog)
         .args(args)
         .stderr(std::process::Stdio::null())
@@ -443,11 +472,16 @@ struct LatestRelease {
 /// Best-effort fetch of the releases/latest API via curl, parsed for both the
 /// tag and the asset names, so one call serves the whole `update` run.
 fn latest_release() -> LatestRelease {
+    latest_release_via(std::path::Path::new("curl"))
+}
+
+/// [`latest_release`] with curl injected — the #194 seam again.
+fn latest_release_via(curl: &std::path::Path) -> LatestRelease {
     let offline = LatestRelease {
         tag: None,
         assets: Vec::new(),
     };
-    let Ok(out) = std::process::Command::new("curl")
+    let Ok(out) = std::process::Command::new(curl)
         .args([
             "-fsSL",
             "--max-time",
@@ -1558,8 +1592,8 @@ MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
 #[cfg(test)]
 mod origin_tests {
     use super::{
-        arch_names, gz_lists_irlume, installed_version, is_copr_repo, latest_release, ppa_serves,
-        ubuntu_codename, version_gt, InstallOrigin,
+        arch_names, gz_lists_irlume, installed_version_via, is_copr_repo, latest_release_via,
+        ppa_serves_via, ubuntu_codename, version_gt, InstallOrigin,
     };
 
     #[test]
@@ -1622,12 +1656,33 @@ mod origin_tests {
         assert!(!gz_lists_irlume(b"definitely not gzip data"));
     }
 
-    /// Drop a fake executable `name` into `dir` (a `#!/bin/sh` script).
-    fn fake_tool(dir: &std::path::Path, name: &str, body: &str) {
+    /// Drop a fake executable `name` into `dir` (a `#!/bin/sh` script) and
+    /// wait until it can actually be exec'd.
+    ///
+    /// The wait is the load-bearing part, and it is what actually ends the
+    /// #194 flake. Writing a script and exec'ing it moments later races every
+    /// OTHER test's `Command`: a fork that happens during our write inherits
+    /// the write-open fd until that child's own exec closes it (CLOEXEC), and
+    /// exec of this script fails ETXTBSY while any such fd exists. Every
+    /// captured failure payload was the probe's spawn-Err fallback (`None` /
+    /// the binary's own version), never wrong content — including both CI
+    /// sightings, whose signatures match this and not the env theory (the env
+    /// writers were already serialized by ENV_LOCK when CI flaked). Once one
+    /// exec succeeds the file is permanently safe: the parent's fd is closed,
+    /// so no future fork can inherit it. The scripts are pure printf/exit, so
+    /// the warm-up run has no side effects.
+    fn fake_tool(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..2000 {
+            match std::process::Command::new(&p).output() {
+                Ok(_) => return p,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        panic!("fake tool {} never became executable", p.display());
     }
 
     // Regression: 0a7ab5c + e429106 + ee54b23. One test so the PATH override
@@ -1638,56 +1693,59 @@ mod origin_tests {
     // failure must be None (unknown), never "not served".
     #[test]
     fn update_probes_query_the_package_manager_and_the_ppa_index() {
-        let _guard = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // No PATH mutation, no FAKE_CURL_MODE, no ENV_LOCK: each probe takes
+        // the tool as a PARAMETER (#194). std::env::set_var is unsafe with any
+        // concurrent env reader, and PATH is read by every Command any other
+        // test spawns, so the old env indirection manufactured false failures
+        // on unrelated PRs. One fake per behaviour replaces the mode variable.
         let dir = std::env::temp_dir().join(format!("irlume-cli-faketools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         fake_tool(&dir, "rpm", "printf '9.9.9'");
-        fake_tool(
-            &dir,
-            "curl",
-            r#"case "$FAKE_CURL_MODE" in
-  serves) printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; exit 0 ;;
-  empty) printf '' | gzip -c; exit 0 ;;
-  http404) exit 22 ;;
-  *) exit 7 ;;
-esac"#,
-        );
-        let old_path = std::env::var("PATH").unwrap();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+        let rpm = dir.join("rpm");
+        let none = std::path::Path::new("/nonexistent-pkg-tool");
 
         // (a) 0a7ab5c: the rpm-owned origins ask rpm, and its answer wins over
         // the running binary's own version.
-        assert_eq!(installed_version(&InstallOrigin::Copr), "9.9.9");
+        assert_eq!(
+            installed_version_via(&InstallOrigin::Copr, &rpm, none, none),
+            "9.9.9"
+        );
         assert_ne!(env!("CARGO_PKG_VERSION"), "9.9.9");
         assert_eq!(
-            installed_version(&InstallOrigin::LocalRpm(String::new())),
+            installed_version_via(&InstallOrigin::LocalRpm(String::new()), &rpm, none, none),
             "9.9.9"
         );
         // Source installs have no owning package; the binary's version is the
         // documented fallback.
         assert_eq!(
-            installed_version(&InstallOrigin::Source),
+            installed_version_via(&InstallOrigin::Source, &rpm, none, none),
             env!("CARGO_PKG_VERSION")
         );
 
         // (b) e429106: an index that lists irlume is served; a 200 with an
         // empty index (the lingering-Release case) is NOT.
-        std::env::set_var("FAKE_CURL_MODE", "serves");
-        assert_eq!(ppa_serves("resolute"), Some(true));
-        std::env::set_var("FAKE_CURL_MODE", "empty");
-        assert_eq!(ppa_serves("noble"), Some(false));
+        fake_tool(
+            &dir,
+            "curl-serves",
+            "printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; exit 0",
+        );
+        assert_eq!(
+            ppa_serves_via(&dir.join("curl-serves"), "resolute"),
+            Some(true)
+        );
+        fake_tool(&dir, "curl-empty", "printf '' | gzip -c; exit 0");
+        assert_eq!(
+            ppa_serves_via(&dir.join("curl-empty"), "noble"),
+            Some(false)
+        );
         // (b) a genuine HTTP 404 (curl -f exit 22) is "not served".
-        std::env::set_var("FAKE_CURL_MODE", "http404");
-        assert_eq!(ppa_serves("trusty"), Some(false));
+        fake_tool(&dir, "curl-404", "exit 22");
+        assert_eq!(ppa_serves_via(&dir.join("curl-404"), "trusty"), Some(false));
         // (c) ee54b23: offline / connect failure is unknown, never false.
-        std::env::set_var("FAKE_CURL_MODE", "offline");
-        assert_eq!(ppa_serves("resolute"), None);
+        fake_tool(&dir, "curl-offline", "exit 7");
+        assert_eq!(ppa_serves_via(&dir.join("curl-offline"), "resolute"), None);
 
-        std::env::remove_var("FAKE_CURL_MODE");
-        std::env::set_var("PATH", old_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1730,18 +1788,15 @@ esac"#,
     // checksum files) plus the offline degradation to None/empty.
     #[test]
     fn release_feed_parsing_keeps_only_package_assets() {
-        let _guard = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Env-free like update_probes above (#194): the feed fetcher takes its
+        // curl as a parameter, so no PATH mutation and no lock.
         let dir = std::env::temp_dir().join(format!("irlume-cli-fakefeed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let body = r#"{"tag_name": "v9.9.9", "name": "irlume 9.9.9", "assets": [{"name": "irlume_9.9.9_amd64.deb"}, {"name": "irlume-9.9.9-1.fc44.x86_64.rpm"}, {"name": "irlume-9.9.9-1-x86_64.pkg.tar.zst"}, {"name": "SHA256SUMS"}]}"#;
-        fake_tool(&dir, "curl", &format!("printf '%s' '{body}'"));
-        let old_path = std::env::var("PATH").unwrap();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+        fake_tool(&dir, "curl-feed", &format!("printf '%s' '{body}'"));
 
-        let rel = latest_release();
+        let rel = latest_release_via(&dir.join("curl-feed"));
         assert_eq!(rel.tag.as_deref(), Some("v9.9.9"));
         assert_eq!(
             rel.assets,
@@ -1754,12 +1809,11 @@ esac"#,
         );
 
         // Offline (curl connect failure): unknown, never a false answer.
-        fake_tool(&dir, "curl", "exit 7");
-        let rel = latest_release();
+        fake_tool(&dir, "curl-offline", "exit 7");
+        let rel = latest_release_via(&dir.join("curl-offline"));
         assert_eq!(rel.tag, None);
         assert!(rel.assets.is_empty());
 
-        std::env::set_var("PATH", old_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

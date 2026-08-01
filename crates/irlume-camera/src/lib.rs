@@ -435,7 +435,8 @@ fn privacy_permits_setup(observed: std::io::Result<Option<bool>>) -> Result<(), 
     match observed {
         Ok(Some(true)) => Err("the hardware privacy shutter is engaged (the `privacy` \
              control reads 1), so the sensor returns a blank frame and discovery \
-             would measure nothing; release the shutter and re-run ir-setup"
+             would measure nothing; release the shutter and re-run \
+             `sudo irlume ir-setup`"
             .into()),
         Ok(Some(false)) | Ok(None) => Ok(()),
         Err(e) => Err(format!(

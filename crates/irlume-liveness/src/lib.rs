@@ -668,6 +668,23 @@ pub struct NodEvidence {
     pub yaw_range: f32,
     /// Median crossings of sufficient amplitude, against [`NOD_MIN_CROSSINGS`].
     pub crossings: usize,
+    /// Mean absolute pitch change per frame, over ADJACENT frame pairs where
+    /// both readings exist (a face-lost gap contributes nothing, rather than a
+    /// fake jump across it).
+    ///
+    /// RECORDED, NEVER GATING. This is the candidate discriminator #101 left
+    /// on the table: measured there once, it separated a still head from a
+    /// deliberate nod by 2.3x (still at most 0.0064, nods at least 0.0149)
+    /// where the gating `pitch_range` manages 1.44x — but those numbers come
+    /// from one user in one session, and the same thread documents this class
+    /// of signal drifting across sessions (genuine nods at 0.057 in one
+    /// campaign, 0.082 weakest in another). The issue's recorded blocker is
+    /// cross-session data; this field exists so every consent watch and every
+    /// replayed capture accumulates it with the rest of the evidence, instead
+    /// of only the runs where someone remembered IRLUME_DUMP_POSE_SERIES.
+    /// Turning it into a threshold is #101's call to make on that data, not
+    /// this field's.
+    pub mean_step: f32,
 }
 
 /// [`detect_nod`], plus the measurements behind the verdict.
@@ -695,6 +712,15 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
         }
     };
     let pitch_range = range(&pitch);
+    // Adjacent SAMPLES, not adjacent survivors of the filter above: pairing the
+    // filtered vector would read a step across a face-lost gap as one frame's
+    // motion and inflate the very statistic this exists to record faithfully.
+    let (step_sum, step_n) = samples.windows(2).fold((0.0f32, 0usize), |acc, w| {
+        match (w[0].pitch_frac, w[1].pitch_frac) {
+            (Some(a), Some(b)) => (acc.0 + (b - a).abs(), acc.1 + 1),
+            _ => acc,
+        }
+    });
     let evidence = NodEvidence {
         frames: pitch.len(),
         pitch_range,
@@ -704,6 +730,11 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
             0
         } else {
             nod_crossings(&pitch, pitch_range)
+        },
+        mean_step: if step_n == 0 {
+            0.0
+        } else {
+            step_sum / step_n as f32
         },
     };
     let verdict = if evidence.frames < NOD_MIN_FACE_FRAMES {
@@ -1908,6 +1939,49 @@ mod nod_evidence_tests {
         assert!(ev.pitch_range >= ev.pitch_min);
         assert!(ev.yaw_range <= NOD_YAW_MAX);
         assert!(ev.crossings >= NOD_MIN_CROSSINGS);
+    }
+
+    /// `mean_step` is the #101 shadow metric: recorded with the verdict,
+    /// never part of it. Pin the arithmetic — mean |Δpitch| over ADJACENT
+    /// pairs with both readings — and the gap rule that keeps it honest: a
+    /// face-lost frame contributes no pair, rather than a fake jump across
+    /// the gap. The measured populations that motivated it (still ≤0.0064,
+    /// nods ≥0.0149) are provenance in the field's docs, deliberately NOT
+    /// asserted here: one session's numbers are not a contract.
+    #[test]
+    fn mean_step_is_recorded_per_adjacent_pair_and_skips_gaps() {
+        // Known arithmetic: steps 0.02, 0.03, 0.01 → mean 0.02.
+        let (_, ev) = detect_nod_with_evidence(&samples(&[0.50, 0.52, 0.55, 0.54]));
+        assert!((ev.mean_step - 0.02).abs() < 1e-6, "got {}", ev.mean_step);
+
+        // A None gap breaks adjacency: the 0.50→0.60 jump spans the gap and
+        // must NOT count as one frame's motion. Pairs left: none.
+        let mut gappy = samples(&[0.50, 0.60]);
+        gappy.insert(
+            1,
+            PoseSample {
+                idx: 1,
+                pitch_frac: None,
+                yaw_signed: None,
+                bri: 0.0,
+            },
+        );
+        let (_, ev) = detect_nod_with_evidence(&gappy);
+        assert_eq!(ev.mean_step, 0.0, "a gap-spanning jump is not a step");
+
+        // Empty and single-frame windows have no pairs: 0.0, not NaN.
+        assert_eq!(detect_nod_with_evidence(&[]).1.mean_step, 0.0);
+        assert_eq!(detect_nod_with_evidence(&samples(&[0.5])).1.mean_step, 0.0);
+
+        // Directional sanity on the shapes the gate already models: the nod
+        // series moves more per frame than the still series. Relative order
+        // only — no absolute floor, that is #101's threshold call to make.
+        let nod = [
+            0.53, 0.55, 0.60, 0.63, 0.58, 0.52, 0.51, 0.55, 0.62, 0.64, 0.57, 0.52, 0.53, 0.56,
+        ];
+        let nod_step = detect_nod_with_evidence(&samples(&nod)).1.mean_step;
+        let still_step = detect_nod_with_evidence(&samples(&[0.5; 20])).1.mean_step;
+        assert!(nod_step > still_step);
     }
 
     /// The whole value of the evidence is that it describes the gate that

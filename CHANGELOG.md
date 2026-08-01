@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **The consent watch records the #101 candidate discriminator on every run.**
+  `mean_step` — mean absolute pitch change per adjacent frame pair, with
+  face-lost gaps contributing nothing — now rides in the nod evidence, the
+  consent debug line, and `blinkcap replay`'s per-label summary. It gates
+  nothing: #101 measured it separating a still head from a deliberate nod by
+  2.3x where the gating pitch range manages 1.44x, then deliberately declined
+  to set a threshold on one user's single session, because this class of
+  signal is known to drift between sessions. The blocker is cross-session
+  data; recording the metric with the rest of the evidence means every consent
+  watch and every replayed capture accumulates it, instead of only runs where
+  someone remembered the pose-series dump flag.
+
 - **A dark or blinded IR capture reports what its evidence supports.** A dark
   burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
   even though shutters, covers, range, exposure and emitter failures all

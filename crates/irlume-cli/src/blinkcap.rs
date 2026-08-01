@@ -258,7 +258,7 @@ fn load_recording(path: &Path) -> Option<Recording> {
 /// Run the head-nod detector over every pose (`--pose`) recording under `dir`
 /// and tally acceptance per label. Returns false if no pose recordings exist.
 fn replay_pose(dir: &Path) -> bool {
-    use irlume_liveness::{detect_nod, HeadGesture, PoseSample};
+    use irlume_liveness::{HeadGesture, PoseSample};
     use std::collections::BTreeMap;
     let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
@@ -267,7 +267,7 @@ fn replay_pose(dir: &Path) -> bool {
                 .collect()
         })
         .unwrap_or_default();
-    let mut tally: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut tally: BTreeMap<String, (usize, usize, f32, f32)> = BTreeMap::new();
     let mut any = false;
     for path in files {
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -298,16 +298,25 @@ fn replay_pose(dir: &Path) -> bool {
                 bri: r.bri,
             })
             .collect();
-        let e = tally.entry(label).or_default();
+        let e = tally
+            .entry(label)
+            .or_insert((0usize, 0usize, f32::INFINITY, f32::NEG_INFINITY));
         e.1 += 1;
-        if detect_nod(&samples) == HeadGesture::Nod {
+        // Verdict and evidence from the same call, so the replayed corpus
+        // accumulates the #101 shadow metric alongside the accept rate: the
+        // per-label mean_step spread is exactly the cross-session data that
+        // issue is blocked on, and old recordings are sessions too.
+        let (verdict, ev) = irlume_liveness::detect_nod_with_evidence(&samples);
+        if verdict == HeadGesture::Nod {
             e.0 += 1;
         }
+        e.2 = e.2.min(ev.mean_step);
+        e.3 = e.3.max(ev.mean_step);
     }
     if any {
         println!("== head-nod acceptance (detect_nod) by label ==");
-        for (label, (acc, total)) in &tally {
-            println!("  {label:<16} {acc}/{total}");
+        for (label, (acc, total, lo, hi)) in &tally {
+            println!("  {label:<16} {acc}/{total}   mean_step {lo:.4}..{hi:.4} (#101, not gating)");
         }
         println!("\n  A nod should be accepted; still / look-around / reclined-still should not.");
     }

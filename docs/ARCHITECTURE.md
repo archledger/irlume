@@ -50,7 +50,11 @@ flowchart LR
   directly by design; they are diagnostics, not auth paths.)
 - **`irlumed`** is the sole owner of the camera/IR/models/templates/TPM. This is
   the Linux analogue of Windows Hello ESS's isolated camera→matcher pathway: the
-  login/display-manager process tree never sees raw image data. Connections are
+  login/display-manager process tree never sees raw image data. It is an
+  analogue, not an equivalent: Windows adds a Device MFT, secure device
+  enumeration and a VBS-protected pathway that Linux does not expose, and
+  [#169](https://github.com/archledger/irlume/issues/169) tracks each
+  difference. Connections are
   handled concurrently, but exactly ONE worker owns and advances the biometric
   engine and camera state; the arbiter refuses non-auth camera work while an
   authentication is pending, and long operations yield only at complete capture

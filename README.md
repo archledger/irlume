@@ -12,11 +12,7 @@ Works with the camera you have: an **IR (Windows Hello) camera** unlocks the ful
 secure tier, a **regular webcam** gives convenient screen unlock, and a
 **fingerprint reader** slots in as a companion factor.
 
-Built in the Windows Hello mold (IR capture, liveness gates, TPM-sealed
-templates), on a fully open, commercially clean stack. Where the Windows camera
-contract goes further than Linux exposes, [#169] says exactly how.
-
-[#169]: https://github.com/archledger/irlume/issues/169
+Windows Hello-style security on a fully open, commercially clean stack.
 
 <br>
 

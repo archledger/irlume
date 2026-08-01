@@ -26,6 +26,18 @@ All notable changes to irlume are documented here. This project adheres to
   line to `system-local-login`, re-run — still enables, and now states that it
   covered console login and not sudo. When the line reaches none of the
   tracked surfaces, the report says that too. Closes #155.
+- **The wallet hand-off check was blind to the fingerprint path.** It anchored
+  on the face `unseal` line, but the post-auth `keyring` line releases the same
+  sealed password — and on a fingerprint-only box the greeter carries ONLY that
+  line, so a missing or mis-ordered wallet module after a fingerprint login was
+  never reported: the wallet stayed locked with nothing naming why. The check
+  now anchors on the first credential-releasing line of either mode, and its
+  warning names both methods. Verified against the KDE sources while at it:
+  Plasma's login greeter authenticates through the single `plasmalogin` stack
+  (its PAM backend has no fingerprint service; kscreenlocker's `kde-fingerprint`
+  triple is the lock screen only), so the greeter `keyring` line is exactly
+  where the KDE cold-boot fingerprint→KWallet chain runs — new tests pin that
+  the line lands above `pam_kwallet5.so` on every upstream plasmalogin layout.
 
 - **A stack using backslash line continuations is refused, not corrupted.**
   libpam's line assembler joins a directive ending in `\` with the next

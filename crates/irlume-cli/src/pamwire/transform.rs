@@ -52,9 +52,16 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
         return None;
     }
     let lines: Vec<&str> = content.lines().collect();
+    // Anchor on the first line that RELEASES the sealed password into
+    // PAM_AUTHTOK. Two modes do: `unseal` (face login) and `keyring` (the
+    // post-auth fingerprint unlock). Anchoring on `unseal` alone left the
+    // fingerprint path unchecked: a fingerprint-only box wires the greeter
+    // with ONLY the `keyring` line, and a missing or mis-ordered wallet
+    // module there went unreported — the wallet stayed locked after a
+    // fingerprint login with nothing naming why.
     let unseal_at = lines.iter().position(|l| {
         let d = directive(l);
-        d.contains(MODULE) && d.contains("unseal")
+        d.contains(MODULE) && (d.contains("unseal") || d.contains("keyring"))
     })?;
     let consumer_in = |l: &str| consumer_active_for(l, service);
     // A given module's session line may sit anywhere in the session phase, so

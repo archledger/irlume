@@ -24,7 +24,7 @@ use std::process::{Command, ExitCode};
 
 // Horizontal split by responsibility, innermost first: the bytes we write
 // (`stanzas`), reading a stack (`grammar`), rewriting one (`transform`). All
-// three are pure — no filesystem, no policy — which is what keeps this module's
+// three are pure (no filesystem, no policy), which is what keeps this module's
 // file handling and the wiring decisions testable apart from each other.
 //
 // Deliberately NOT split by modality: face and fingerprint lines share the same
@@ -45,7 +45,7 @@ use transform::*;
 
 // Re-exported for the rest of the CLI, which reaches these as `pamwire::…`.
 // A glob `use` binds names privately, so the public surface is listed here
-// rather than inherited — which also keeps that surface visible in one place.
+// rather than inherited, which also keeps that surface visible in one place.
 pub(crate) use files::{is_managed_path, lock_pam, restore_surface};
 // The one PAM-grammar item shared outside this module: `fingerprint.rs` must
 // read stack lines with the same comment semantics the wiring uses, or the
@@ -2580,8 +2580,8 @@ session    optional                    pam_gnome_keyring.so auto_start
 
     /// GDM `main`'s `data/pam-redhat/gdm-password.pam`, byte-for-byte: the shared
     /// stack is renamed to `gdm-password-auth-substack`, a file GDM does not itself
-    /// ship. No release carries this — 45.0 through 50.1 and 51.alpha all still say
-    /// `password-auth` — so it is latent, and would arrive with an upgrade.
+    /// ship. No release carries this: 45.0 through 50.1 and 51.alpha all still say
+    /// `password-auth`. It is latent, and would arrive with an upgrade.
     const UPSTREAM_GDM_RENAMED_SUBSTACK: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
 auth        substack      gdm-password-auth-substack
 auth        optional      pam_gnome_keyring.so
@@ -2725,7 +2725,7 @@ auth       optional      pam_gnome_keyring.so\n";
         // The named list cannot keep up with upstream renames, so an unrecognized
         // `substack` must still be preferred over the first-auth-line guess.
         // Otherwise the jump lands above pam_selinux_permit.so and the password
-        // substack runs anyway — the openSUSE bug, arriving via a GDM upgrade.
+        // substack runs anyway: the openSUSE bug, arriving via a GDM upgrade.
         assert!(!is_passwd_substack(
             "auth        substack      gdm-password-auth-substack",
             "auth"
@@ -2855,7 +2855,7 @@ auth       optional      pam_gnome_keyring.so\n";
     fn plasmalogin_fingerprint_keyring_line_lands_above_the_wallet_module() {
         // The KDE fingerprint→KWallet chain. Plasma's greeter runs ONE stack
         // for user auth (plasma-login-manager's PamBackend selects only
-        // `plasmalogin` / `plasmalogin-greeter` / `plasmalogin-autologin` — no
+        // `plasmalogin` / `plasmalogin-greeter` / `plasmalogin-autologin`, and no
         // fingerprint service, unlike kscreenlocker's kde/kde-fingerprint/
         // kde-smartcard triple). So a greeter fingerprint login happens when
         // the distro's shared stack carries pam_fprintd, provides no password,
@@ -2889,7 +2889,7 @@ auth       optional      pam_gnome_keyring.so\n";
     #[test]
     fn a_keyring_only_greeter_is_still_checked_for_the_wallet_handoff() {
         // A fingerprint-only box (no face login) wires the greeter with ONLY
-        // the `keyring` line — no `unseal`. The hand-off check used to anchor
+        // the `keyring` line and no `unseal` line. The hand-off check used to anchor
         // on `unseal` alone, so this stack was skipped entirely: a missing
         // wallet module after a fingerprint login had no warning at all.
         let (w, changed) = wire_greeter_impl(UPSTREAM_FEDORA, false, true, true);

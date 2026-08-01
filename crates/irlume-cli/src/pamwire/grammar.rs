@@ -19,7 +19,7 @@ pub(super) fn content_has_module(c: &str) -> bool {
 /// `auth include system-login`/`system-local-login`/`system-auth`, or a bare
 /// `auth include common-auth`. These need the `sufficient` (module IGNOREs on
 /// cold login) form, NOT the jump form. A `substack` is atomic for jump
-/// counting, so it deliberately does not match here and keeps the jump stanza —
+/// counting, so it deliberately does not match here and keeps the jump stanza;
 /// which is what openSUSE's `auth substack common-auth` relies on.
 pub(super) fn is_include_auth_layout(line: &str) -> bool {
     let t = directive(line);
@@ -47,7 +47,7 @@ pub(super) fn is_include_auth_layout(line: &str) -> bool {
 /// `auth substack common-auth`, which matched nothing here: wiring then fell
 /// back to the first auth line and inserted the jump above `pam_nologin.so`, so
 /// a face login skipped the nologin gate and *still* landed on the password
-/// stack underneath — face auth that neither honoured nologin nor logged you in.
+/// stack underneath: face auth that neither honoured nologin nor logged you in.
 pub(super) fn is_passwd_substack(line: &str, kind: &str) -> bool {
     let d = directive(line);
     let toks: Vec<&str> = d
@@ -76,7 +76,7 @@ pub(super) fn is_auth_directive(line: &str) -> bool {
 ///
 /// This exists because the named list cannot keep up with upstreams. GDM's main
 /// branch renamed its shared stack from `password-auth` to
-/// `gdm-password-auth-substack` (a file GDM does not ship — distros supply it),
+/// `gdm-password-auth-substack` (a file GDM does not ship; distros supply it),
 /// which no name in `is_passwd_substack` matches. Without this tier the anchor
 /// search falls through to "first auth line", which on GDM's stack is
 /// `pam_selinux_permit.so`: the jump would then skip THAT and land above the
@@ -95,7 +95,7 @@ pub(super) fn is_auth_substack_anchor(line: &str) -> bool {
 /// Where the face block anchors, in descending order of confidence: a shared
 /// stack we recognize by name, then any `substack` whatever its name, and only
 /// then the first `auth` line. The last tier is a guess and is kept last
-/// deliberately — it is what produces a jump over an unrelated module.
+/// deliberately: it is what produces a jump over an unrelated module.
 pub(super) fn find_auth_anchor(lines: &[&str]) -> Option<usize> {
     lines
         .iter()
@@ -133,12 +133,12 @@ pub(super) fn is_fingerprint_auth(line: &str) -> bool {
 ///
 /// `pam_gnome_keyring.so` accepts `only_if=<comma,separated,services>`, and for
 /// any service outside that list every one of its entry points returns
-/// `PAM_SUCCESS` immediately — it reads no token, stashes nothing, unlocks
+/// `PAM_SUCCESS` immediately: it reads no token, stashes nothing, unlocks
 /// nothing. Matching the module name alone would therefore count a line that is
 /// a guaranteed no-op here as a working consumer, and report a hand-off that
 /// cannot happen: the exact false reassurance this check exists to prevent.
 ///
-/// The list is matched the way gkr-pam's `evaluate_inlist` matches it — whole
+/// The list is matched the way gkr-pam's `evaluate_inlist` matches it: whole
 /// comma-separated items, not substrings, so `only_if=gdm` does not satisfy
 /// `gdm-fingerprint`. Any single excluding `only_if=` disables the module, since
 /// gkr ORs `ARG_IGNORE_SERVICE` in and never clears it. `pam_kwallet5.so` has no
@@ -160,7 +160,7 @@ pub(super) fn consumer_active_for(line: &str, service: &str) -> Option<&'static 
 /// Matching the raw line disagrees with libpam, which strips a trailing comment
 /// before tokenizing (verified against `pam_exec.so`: a real argument survives,
 /// a trailing comment does not). Without this, a module named only inside a
-/// comment counts as configured — and because `content_has_module` gates the
+/// comment counts as configured, and because `content_has_module` gates the
 /// whole wiring path, a stack whose comment happens to mention `pam_irlume.so`
 /// would be treated as already wired and silently left alone.
 ///
@@ -183,16 +183,16 @@ pub(crate) fn directive(line: &str) -> &str {
 /// evaluates, corrupting the stack on write.
 ///
 /// The semantics are pinned empirically against `pam_exec.so`:
-///   * a trailing `\` on a directive continues — the next physical line's
+///   * a trailing `\` on a directive continues; the next physical line's
 ///     text executed as this line's arguments;
 ///   * whitespace AFTER the backslash does not defuse it (still continues);
-///   * a `\` at the end of a COMMENT does not continue — both lines ran.
+///   * a `\` at the end of a COMMENT does not continue; both lines ran.
 ///
 /// Hence the check runs on `directive()` output with trailing space trimmed.
 ///
 /// No upstream stack irlume pins uses continuations, so the fail-safe answer
 /// is to notice and stand down: the wiring transforms refuse the file
-/// (staged, never written — the same contract as a missing anchor), and the
+/// (staged, never written, the same contract as a missing anchor), and the
 /// hand-off advisory stays silent rather than reporting from an analysis
 /// that cannot see the file the way PAM does.
 pub(crate) fn has_line_continuation(content: &str) -> bool {

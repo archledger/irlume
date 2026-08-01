@@ -17,7 +17,7 @@ use super::stanzas::*;
 /// irlume's job ends at setting `PAM_AUTHTOK`. Turning that token into an OPEN
 /// wallet is another module's work, and if that module is absent (or sits above
 /// our line, where it runs before the token exists) the login succeeds by face
-/// and the wallet stays locked — which surfaces to the user as KWallet
+/// and the wallet stays locked, which surfaces to the user as KWallet
 /// prompting for its password anyway. Nothing checked for this, so the failure
 /// was indistinguishable from "wired ✓".
 pub(super) struct KeyringHandoff {
@@ -41,7 +41,7 @@ pub(super) struct KeyringHandoff {
 
 /// Locate the keyring hand-off in a wired stack. `None` when this stack
 /// releases no credential at all (no `unseal` line), which is how the plain
-/// verify surfaces — sudo and polkit — opt out of being judged against a wallet
+/// verify surfaces, sudo and polkit, opt out of being judged against a wallet
 /// they were never meant to open. The lock screen opts out a level up instead:
 /// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
 /// runs against a wallet the login already opened.
@@ -57,7 +57,7 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
     // post-auth fingerprint unlock). Anchoring on `unseal` alone left the
     // fingerprint path unchecked: a fingerprint-only box wires the greeter
     // with ONLY the `keyring` line, and a missing or mis-ordered wallet
-    // module there went unreported — the wallet stayed locked after a
+    // module there went unreported: the wallet stayed locked after a
     // fingerprint login with nothing naming why.
     let unseal_at = lines.iter().position(|l| {
         let d = directive(l);
@@ -333,7 +333,7 @@ pub(super) fn unwire_lines(content: &str) -> (String, bool) {
         .filter(|l| {
             // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
             // module named only in a comment is never stripped. The tags are
-            // matched on the RAW line, because that is where they live — they
+            // matched on the RAW line, because that is where they live; they
             // are comments, invisible to PAM by design.
             let d = directive(l);
             let drop = d.contains(MODULE)

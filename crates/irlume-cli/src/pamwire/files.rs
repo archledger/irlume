@@ -203,7 +203,7 @@ pub(crate) fn lock_pam() -> Result<PamLock, String> {
 /// cleanup path, so real hardware runs that interrupt an apply leave
 /// `.sudo.irlume-new.1234.0.tmp` behind. PAM selects a stack by exact filename,
 /// so a dotfile is never read as a service and this is litter rather than a
-/// hazard — but it is irlume's litter, and it accumulates.
+/// hazard, but it is irlume's litter, and it accumulates.
 ///
 /// Done while holding the lock, which is what makes it safe: the name is one
 /// only this module produces, and no other irlume can be mid-write. Nothing
@@ -238,8 +238,8 @@ pub(super) fn service_present(s: &Svc) -> Option<PathBuf> {
 /// Test-only: replace a target during the window between the first look and the
 /// rename, so the recheck has something to catch.
 ///
-/// The window cannot be reached from outside — it is entirely inside one
-/// function call — so a test that only sets up a symlink beforehand proves the
+/// The window cannot be reached from outside (it is entirely inside one
+/// function call), so a test that only sets up a symlink beforehand proves the
 /// FIRST check, never the second. Without this, removing the pre-rename recheck
 /// left every test green.
 #[cfg(test)]

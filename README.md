@@ -12,7 +12,7 @@ Works with the camera you have: an **IR (Windows Hello) camera** unlocks the ful
 secure tier, a **regular webcam** gives convenient screen unlock, and a
 **fingerprint reader** slots in as a companion factor.
 
-Windows Hello-style security on a fully open, commercially clean stack.
+Windows Hello-style security for Linux, on a fully open, commercially clean stack.
 
 <br>
 

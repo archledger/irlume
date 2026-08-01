@@ -668,7 +668,7 @@ fn report_fprintd_coverage(pam_dir: &std::path::Path) {
     if cov.is_empty() {
         return;
     }
-    println!("[fingerprint] coverage, where a finger can answer the prompt:");
+    println!("[fingerprint] coverage: where a finger can answer the prompt:");
     for (svc, label, reaches) in &cov {
         println!("    {} {label}  ({svc})", if *reaches { "✓" } else { "✗" });
     }

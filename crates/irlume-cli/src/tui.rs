@@ -185,6 +185,12 @@ enum Suspend {
     SetCameras(String, String),
     /// Set up the IR emitter; root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
+    /// Measure whether the camera can stream RGB and IR at once and persist
+    /// the verdict (capture policy changes with it). The daemon root-gates the
+    /// write, and the measurement holds the camera and fires the emitter for
+    /// up to a minute, so like the other privileged one-shots it suspends to
+    /// `sudo irlume camera-tune`.
+    CameraTune,
     /// View the face-auth journal (`sudo irlume logs`); the daemon's lines live
     /// in the system journal, so it runs under sudo to guarantee they show.
     Logs,
@@ -1972,6 +1978,10 @@ impl App {
                 &["irlume", "set-cameras", &rgb, &ir],
             ),
             Suspend::IrSetup => self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
+            Suspend::CameraTune => self.sudo_step(
+                "measure simultaneous RGB+IR capture",
+                &["irlume", "camera-tune"],
+            ),
             Suspend::BitwardenSetup => self.sudo_step(
                 "install Bitwarden's polkit action",
                 &["irlume", "bitwarden", "setup", "--apply"],
@@ -2438,6 +2448,14 @@ impl App {
             (SC_CAMERAS, KeyCode::Char('s')) => {
                 self.log('→', "sudo irlume ir-setup: set up the 850nm emitter; this writes to the camera (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
+            }
+            // Capture-mode tuning: some Hello modules starve their own RGB
+            // interface when both stream, others keep the faster concurrent
+            // path; only a measurement can tell which camera this is. Said
+            // up front because it holds the camera for a while (#170).
+            (SC_CAMERAS, KeyCode::Char('t')) => {
+                self.log('→', "sudo irlume camera-tune: measure whether RGB and IR can stream at once; holds the camera and fires the IR emitter for up to a minute, then stores the verdict in /etc/irlume/cameras.conf (you'll be asked for your password)");
+                self.suspend = Some(Suspend::CameraTune);
             }
             (SC_CAMERAS, KeyCode::Char('p')) => self.start_async(
                 "IR emitter units",
@@ -3636,6 +3654,11 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled("  [s]", Style::new().fg(th().accent)),
             Span::styled(" set up emitter   ", Style::new().dim()),
+            Span::styled("[t]", Style::new().fg(th().accent)),
+            Span::styled(
+                " tune capture (holds the camera ~1 min)   ",
+                Style::new().dim(),
+            ),
             Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(" list units (writes nothing)", Style::new().dim()),
         ]));
@@ -6468,6 +6491,17 @@ mod tests {
         app.screen = SC_CAMERAS;
         app.on_key(KeyCode::Char('s'));
         assert!(matches!(app.suspend, Some(Suspend::IrSetup)));
+        app.suspend = None;
+        // [t] routes capture tuning to sudo (#170: previously no TUI route),
+        // and says what it will do before the suspend happens.
+        app.on_key(KeyCode::Char('t'));
+        assert!(matches!(app.suspend, Some(Suspend::CameraTune)));
+        assert!(
+            app.activity
+                .iter()
+                .any(|(_, m)| m.contains("camera-tune") && m.contains("up to a minute")),
+            "the route must say what it does before running"
+        );
         app.suspend = None;
         app.on_key(KeyCode::Char('p'));
         assert!(app.op.is_some(), "[p] starts the read-only emitter probe");

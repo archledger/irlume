@@ -50,21 +50,25 @@ pub struct DarkEvidence {
 pub enum IrDarkCause {
     /// The privacy control reads engaged: the sensor is blanked by the shutter.
     PrivacyEngaged,
-    /// The camera says the illuminator FIRED and the image stayed dark: light
-    /// left the emitter and did not reach the sensor (a cover, distance, or
-    /// exposure). `ir-setup` is the wrong advice here.
+    /// The camera marked frames as captured with illumination ON, yet the
+    /// image stayed dark. The Microsoft metadata reports the illumination
+    /// STATE; it does not measure optical output, so a failed LED and a
+    /// covered lens are both still in play (#196 review).
     LitButDark {
         frames_lit: usize,
         frames_classified: usize,
     },
-    /// The frame is a near-perfect constant: a covered or firmware-blanked
-    /// sensor, not a dark room (a dark room carries sensor noise; see
-    /// `FLAT_STDDEV_MAX` for the measured gap).
+    /// The decoded frame is nearly constant. Evidence of a FLAT OUTPUT, not
+    /// by itself evidence of why: the blank-vs-scene gap behind
+    /// `FLAT_STDDEV_MAX` was measured on one camera, and an ISP may clamp a
+    /// genuinely dark scene to a constant (#196 review).
     FlatFrame { stddev: f64 },
-    /// irlume applied the control and the camera accepted the write, but its
-    /// own metadata never flagged a lit frame: the camera did not act on the
-    /// mode.
-    AppliedNotTaken { frames_classified: usize },
+    /// The requested control value was ACTIVE for the stream (irlume wrote
+    /// it, or it was already held: `StreamMode::lit` does not distinguish),
+    /// but no classified frame was marked illuminated. Whether the camera
+    /// ignored the mode, the emitter failed, or the metadata did not reflect
+    /// the control cannot be told apart from here (#196 review).
+    ActiveButNotReported { frames_classified: usize },
     /// The user set `IRLUME_IR_EMITTER=off`; a dark frame is the configured
     /// outcome, and saying anything would be noise they opted out of.
     EmitterDisabled,
@@ -85,6 +89,12 @@ pub enum IrDarkCause {
 /// Name the cause of a dark burst. Pure; the caller decides whether the burst
 /// was dark at all (the `IR_DARK_HINT_MAX` gate, unchanged).
 pub fn diagnose(e: &DarkEvidence) -> IrDarkCause {
+    // An explicit output policy, not an inferred hardware cause: the user
+    // said "drive nothing", and every line below is chatter they opted out
+    // of, so it precedes every diagnosis that would speak (#196 review).
+    if e.emitter_disabled {
+        return IrDarkCause::EmitterDisabled;
+    }
     if e.privacy_engaged {
         return IrDarkCause::PrivacyEngaged;
     }
@@ -100,12 +110,9 @@ pub fn diagnose(e: &DarkEvidence) -> IrDarkCause {
         };
     }
     if e.emitter_active && e.frames_classified > 0 {
-        return IrDarkCause::AppliedNotTaken {
+        return IrDarkCause::ActiveButNotReported {
             frames_classified: e.frames_classified,
         };
-    }
-    if e.emitter_disabled {
-        return IrDarkCause::EmitterDisabled;
     }
     if !e.emitter_active {
         return IrDarkCause::NoEmitterDriven;
@@ -126,21 +133,26 @@ pub fn render(card: &str, mean: f64, cause: &IrDarkCause) -> Option<String> {
             frames_lit,
             frames_classified,
         } => Some(format!(
-            "[ir] {card:?}: the camera reports its illuminator fired ({frames_lit}/\
-             {frames_classified} frames) yet the image stayed dark (mean {mean:.0}); \
-             light is leaving the emitter and not reaching the sensor. Check for a \
-             lens cover, move closer, or check exposure; `ir-setup` will not help."
+            "[ir] {card:?}: the camera marked {frames_lit}/{frames_classified} frames \
+             as captured with illumination on, yet the image stayed dark (mean \
+             {mean:.0}). That metadata does not measure optical output, so irlume \
+             cannot distinguish a failed or ignored emitter from a lens cover, range, \
+             or exposure problem. Check the cover, distance and exposure; if those do \
+             not explain it, `sudo irlume ir-setup` re-measures the control."
         )),
         IrDarkCause::FlatFrame { stddev } => Some(format!(
-            "[ir] {card:?}: the IR frame is flat (mean {mean:.0}, stddev {stddev:.2}): \
-             a covered or blanked sensor, not a dark room (a dark scene still carries \
-             sensor noise). Check for a lens cover or privacy shade."
+            "[ir] {card:?}: the IR frame is nearly constant (mean {mean:.0}, stddev \
+             {stddev:.2}). On the tested ASUS camera this matched a privacy-blanked \
+             frame, but pixel variance alone cannot distinguish a blanked or covered \
+             sensor from camera processing of a dark scene. Check the privacy shutter \
+             and lens cover; if neither explains it, move closer and re-test."
         )),
-        IrDarkCause::AppliedNotTaken { frames_classified } => Some(format!(
-            "[ir] {card:?}: irlume applied the emitter control and the camera accepted \
-             the write, but none of {frames_classified} metadata-classified frames was \
-             flagged lit: the camera did not act on the mode. `sudo irlume ir-setup` \
-             re-measures what this control actually does."
+        IrDarkCause::ActiveButNotReported { frames_classified } => Some(format!(
+            "[ir] {card:?}: the emitter control held the requested value, but none of \
+             {frames_classified} metadata-classified frames was marked as captured \
+             with illumination on. The evidence cannot tell whether the camera \
+             ignored the mode, the emitter failed, or the metadata does not reflect \
+             the control. `sudo irlume ir-setup` re-measures the control."
         )),
         IrDarkCause::EmitterDisabled => None,
         IrDarkCause::NoEmitterDriven => Some(format!(
@@ -226,7 +238,7 @@ mod tests {
                 ..textured_dark()
             }),
             IrDarkCause::FlatFrame { stddev: 0.0 },
-            "a flat frame outranks applied-not-taken"
+            "a flat frame outranks active-but-not-reported"
         );
         assert_eq!(
             diagnose(&DarkEvidence {
@@ -234,7 +246,7 @@ mod tests {
                 frames_classified: 8,
                 ..textured_dark()
             }),
-            IrDarkCause::AppliedNotTaken {
+            IrDarkCause::ActiveButNotReported {
                 frames_classified: 8
             },
         );
@@ -246,6 +258,20 @@ mod tests {
             IrDarkCause::EmitterDisabled,
         );
         assert_eq!(diagnose(&textured_dark()), IrDarkCause::NoEmitterDriven);
+        // `off` is an output policy, not an inferred cause: it silences every
+        // other observation, through the production precedence, because the
+        // render-only check could not fail when diagnose never picked it
+        // (#196 review).
+        let off = diagnose(&DarkEvidence {
+            emitter_active: false,
+            emitter_disabled: true,
+            privacy_engaged: true,
+            frames_lit: 8,
+            frames_classified: 8,
+            frame_stddev: 0.0,
+        });
+        assert_eq!(off, IrDarkCause::EmitterDisabled);
+        assert!(render("cam", 20.0, &off).is_none());
         assert_eq!(
             diagnose(&DarkEvidence {
                 emitter_active: true,
@@ -285,10 +311,31 @@ mod tests {
         }
     }
 
-    /// The flat floor separates the two measured worlds: a firmware blank
-    /// (stddev exactly 0.00 on the ASUS, #186) and any real scene (34+).
+    /// The metadata flag reports illumination STATE; the message must not
+    /// claim measured optical output, and must not rule the emitter out
+    /// (#196 review: a failed LED sets the flag and emits nothing).
     #[test]
-    fn frame_stddev_separates_blank_from_scene() {
+    fn lit_metadata_does_not_claim_measured_optical_output() {
+        let msg = render(
+            "cam",
+            20.0,
+            &IrDarkCause::LitButDark {
+                frames_lit: 3,
+                frames_classified: 8,
+            },
+        )
+        .unwrap();
+        assert!(msg.contains("captured with illumination on"), "{msg}");
+        assert!(msg.contains("does not measure optical output"), "{msg}");
+        assert!(!msg.contains("light is leaving"), "{msg}");
+        assert!(!msg.contains("will not help"), "{msg}");
+    }
+
+    /// The arithmetic separates a constant sample from a non-constant one.
+    /// That is ALL it establishes: the hardware meaning of a constant frame
+    /// is measured on one camera and worded accordingly in the renderer.
+    #[test]
+    fn frame_stddev_classifies_constant_and_nonconstant_samples() {
         assert_eq!(frame_stddev(&[144; 1000]), 0.0);
         assert!(frame_stddev(&[144; 1000]) < FLAT_STDDEV_MAX);
         // Alternating values two apart: stddev 1.0, above the floor.

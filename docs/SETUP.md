@@ -152,6 +152,33 @@ password is never stored in plaintext. Re-run it after you change your login
 password. On a fingerprint machine a fingerprint login unseals the wallet the
 same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
+#### KDE Plasma: what has to be in place for KWallet
+
+On Plasma the chain is: `plasmalogin` runs irlume's `unseal` line, which sets the
+released password as `PAM_AUTHTOK`; `pam_kwallet5.so` reads that token and derives
+the wallet key; its `session` line starts the wallet daemon (`ksecretd` on Plasma
+6, `kwalletd6`/`kwalletd5` before it) and hands the key over. irlume owns only the
+first step, so two things must be true of the rest:
+
+- **kwallet-pam is installed** — the module is `pam_kwallet5.so`, still that name
+  under Plasma 6.
+- **Its auth line sits BELOW irlume's**, with a matching `session … auto_start`
+  line. Above ours it runs before the token exists, and the wallet stays locked.
+
+`irlume login status` (and `login enable --apply`) checks both and warns, so a
+wallet that still prompts after a face login names its own cause instead of
+looking like a face-login failure:
+
+```
+  ⚠ /etc/pam.d/plasmalogin: face login releases your login password, but no keyring module
+     reads it afterwards, so KWallet/the login keyring will still prompt.
+```
+
+One more requirement is outside PAM: your **wallet password must equal your login
+password**, since that is the password `keyring arm` seals. A wallet created with
+a different password cannot be opened on this path — change it under *System
+Settings → KDE Wallet*, or remove and recreate the wallet.
+
 ### 5. Recovery passphrase: recommended
 
 Set this. It's your backstop: without it, a TPM clear or a routine

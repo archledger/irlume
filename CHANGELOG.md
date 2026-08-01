@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`login status` says when face login releases a password nothing will use.**
+  Wiring the greeter and arming the keyring is only half the KWallet path: the
+  released password still has to be read by `pam_kwallet5.so` (KDE) or
+  `pam_gnome_keyring.so` (GNOME), from an auth line BELOW irlume's, with a
+  matching session line to start the wallet daemon. When that module is absent,
+  or sits above ours where it runs before the token exists, the face login
+  succeeds and the wallet prompts anyway — and every command still reported the
+  greeter as `● wired`, so the one symptom the user could see pointed away from
+  the cause. `login status` and `login enable --apply` now inspect each wired
+  greeter and name which half is missing. Advisory only: it changes no stack and
+  fails no command, because an absent wallet module is a packaging choice rather
+  than a broken wiring.
+
 - **A dark or blinded IR capture reports what its evidence supports.** A dark
   burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
   even though shutters, covers, range, exposure and emitter failures all

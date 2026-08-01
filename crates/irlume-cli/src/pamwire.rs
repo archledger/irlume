@@ -1398,6 +1398,11 @@ fn status() -> ExitCode {
     if any_ondemand {
         println!("  on-demand: {ONDEMAND_HINT}");
     }
+    // A greeter can be correctly wired and still leave the wallet locked, so
+    // this is reported next to the wiring rather than left to `doctor`: it is
+    // the difference between "face logs me in" and "face logs me in AND my
+    // wallet is open", which is what the keyring path exists for.
+    report_keyring_handoff();
     println!(
         "[login] SELinux module: {}",
         match selinux_loaded() {
@@ -1588,6 +1593,12 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         // (authselect, pam-auth-update, or a package upgrade shipping a fresh
         // vendor copy). On disable we clear the marker so reconcile stays quiet.
         write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+        // Say it at the moment the user wired it, not only when they next run
+        // `login status`: a wallet that still prompts after `enable --apply`
+        // otherwise reads as irlume having failed.
+        if enable {
+            report_keyring_handoff();
+        }
         println!("[login] done. Password remains the fallback everywhere.");
     }
     if errs == 0 {
@@ -1874,6 +1885,102 @@ fn is_auth_directive(line: &str) -> bool {
         return false;
     }
     t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
+}
+
+/// Login-keyring modules that CONSUME the password an `unseal` line releases.
+/// KDE's kwallet-pam still installs `pam_kwallet5.so` under Plasma 6 (the
+/// running provider process is `ksecretd`, but the PAM module kept the 5 in its
+/// name); older Plasma and a few distros ship `pam_kwallet.so`. GNOME ships
+/// `pam_gnome_keyring.so`.
+const KEYRING_CONSUMERS: &[&str] = &["pam_kwallet5.so", "pam_kwallet.so", "pam_gnome_keyring.so"];
+
+/// What a wired greeter stack does with the password irlume releases.
+///
+/// irlume's job ends at setting `PAM_AUTHTOK`. Turning that token into an OPEN
+/// wallet is another module's work, and if that module is absent (or sits above
+/// our line, where it runs before the token exists) the login succeeds by face
+/// and the wallet stays locked — which surfaces to the user as KWallet
+/// prompting for its password anyway. Nothing checked for this, so the failure
+/// was indistinguishable from "wired ✓".
+struct KeyringHandoff {
+    /// Consumer module on an `auth` line positioned AFTER irlume's `unseal`
+    /// line, i.e. one that will actually observe the token. `None` means the
+    /// released password is read by nobody.
+    auth: Option<&'static str>,
+    /// Whether a consumer also has a `session` line. That is the half that
+    /// starts the wallet daemon and hands it the key; an auth line alone
+    /// derives the key and then drops it.
+    session: bool,
+}
+
+/// Locate the keyring hand-off in a wired stack. `None` when this stack
+/// releases no credential at all (no `unseal` line), which is how the plain
+/// verify surfaces — sudo and polkit — opt out of being judged against a wallet
+/// they were never meant to open. The lock screen opts out a level up instead:
+/// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
+/// runs against a wallet the login already opened.
+fn keyring_handoff(content: &str) -> Option<KeyringHandoff> {
+    let lines: Vec<&str> = content.lines().collect();
+    let unseal_at = lines.iter().position(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.contains(MODULE) && t.contains("unseal")
+    })?;
+    let consumer_in = |l: &str| -> Option<&'static str> {
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            return None;
+        }
+        KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))
+    };
+    // Only lines BELOW ours can see the token we set, so the search starts past
+    // the unseal line rather than scanning the whole file.
+    let auth = lines
+        .iter()
+        .skip(unseal_at + 1)
+        .filter(|l| is_auth_directive(l))
+        .find_map(|l| consumer_in(l));
+    let session = lines.iter().any(|l| {
+        let t = l.trim_start();
+        let t = t.strip_prefix('-').unwrap_or(t);
+        t.split_whitespace().next() == Some("session") && consumer_in(l).is_some()
+    });
+    Some(KeyringHandoff { auth, session })
+}
+
+/// Print a warning for every wired greeter that releases the login password
+/// with nothing downstream to open the wallet. Advisory only: it never changes
+/// a stack and never fails a command, because a missing wallet module is the
+/// user's package/desktop choice, not a broken irlume wiring.
+fn report_keyring_handoff() {
+    for s in GREETERS {
+        let Some(path) = service_present(s) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content_has_module(&content) {
+            continue;
+        }
+        let Some(handoff) = keyring_handoff(&content) else {
+            continue;
+        };
+        match (handoff.auth, handoff.session) {
+            (Some(_), true) => {}
+            (Some(m), false) => println!(
+                "  ⚠ {}: {m} has an auth line but no session line, so the wallet\n     \
+                 daemon is never started with the key. Your wallet will still prompt.",
+                s.etc
+            ),
+            (None, _) => println!(
+                "  ⚠ {}: face login releases your login password, but no keyring module\n     \
+                 reads it afterwards, so KWallet/the login keyring will still prompt.\n     \
+                 Install kwallet-pam (KDE) or gnome-keyring (GNOME); if it is already\n     \
+                 installed, its auth line must sit BELOW the pam_irlume unseal line.",
+                s.etc
+            ),
+        }
+    }
 }
 
 /// Insert irlume's greeter block: `unseal` before the password substack, a
@@ -3350,6 +3457,160 @@ mod tests {
         assert!(msg.message.contains("restored from backup"), "{msg}");
         assert_eq!(std::fs::read_to_string(&etc).unwrap(), SUDO_STOCK);
         assert!(!dir.0.join(format!("sudo{BACKUP}")).exists());
+    }
+
+    // ---- keyring hand-off (KWallet / gnome-keyring) --------------------------
+    // A greeter can be wired perfectly and still leave the wallet locked, which
+    // reaches the user as "KWallet asks for its password even though face login
+    // worked". These pin the detection of that state.
+
+    /// Fedora KDE `plasmalogin` (substack layout) AFTER irlume wires it, with
+    /// the vendor kwallet lines in their shipped positions.
+    const PLASMA_WIRED: &str = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional                     pam_irlume.so reseal\n\
+-auth      optional      pam_kwallet5.so\n\
+auth       include       postlogin\n\
+account    include       password-auth\n\
+session    include       password-auth\n\
+-session   optional      pam_kwallet5.so auto_start\n\
+session    optional                     pam_irlume.so reseal\n";
+
+    #[test]
+    fn plasmalogin_with_kwallet_has_a_complete_handoff() {
+        let h = keyring_handoff(PLASMA_WIRED).expect("stack releases a credential");
+        // The jump skips exactly the substack and lands on the permit, so the
+        // vendor kwallet auth line below it does observe our PAM_AUTHTOK.
+        assert_eq!(h.auth, Some("pam_kwallet5.so"));
+        assert!(h.session, "session auto_start line must be seen");
+    }
+
+    /// The Fedora KDE vendor `plasmalogin` as shipped: kwallet lines in place,
+    /// irlume not yet wired.
+    const PLASMA_VENDOR: &str = "#%PAM-1.0\n\
+auth       substack      password-auth\n\
+-auth      optional      pam_kwallet5.so\n\
+auth       include       postlogin\n\
+account    include       password-auth\n\
+session    include       password-auth\n\
+-session   optional      pam_kwallet5.so auto_start\n";
+
+    #[test]
+    fn what_we_wire_is_what_the_handoff_check_approves() {
+        // Closes the loop between the two halves: the wiring must insert the
+        // unseal line ABOVE the vendor's kwallet auth line, which is exactly the
+        // order the check demands. If either side moves, this fails rather than
+        // shipping a stack we wire and then warn about.
+        let (wired, changed) = wire_greeter_impl(PLASMA_VENDOR, true, false, true);
+        assert!(changed);
+        let h = keyring_handoff(&wired).expect("a wired greeter releases a credential");
+        assert_eq!(h.auth, Some("pam_kwallet5.so"));
+        assert!(h.session);
+        let face = wired.find("pam_irlume.so unseal").unwrap();
+        let kwallet = wired.find("pam_kwallet5.so").unwrap();
+        assert!(face < kwallet, "our line must precede the wallet's");
+    }
+
+    #[test]
+    fn arch_include_greeter_we_wire_also_passes_the_handoff_check() {
+        const ARCH_VENDOR: &str = "#%PAM-1.0\n\
+auth        include     system-login\n\
+-auth       optional    pam_kwallet5.so\n\
+account     include     system-login\n\
+session     include     system-login\n\
+-session    optional    pam_kwallet5.so auto_start\n";
+        let (wired, changed) = wire_greeter_impl(ARCH_VENDOR, true, false, true);
+        assert!(changed);
+        let h = keyring_handoff(&wired).expect("a wired greeter releases a credential");
+        assert_eq!(h.auth, Some("pam_kwallet5.so"));
+        assert!(h.session);
+    }
+
+    #[test]
+    fn plasmalogin_without_any_keyring_module_is_flagged() {
+        let stripped: String = PLASMA_WIRED
+            .lines()
+            .filter(|l| !l.contains("pam_kwallet5.so"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let h = keyring_handoff(&stripped).expect("stack releases a credential");
+        // Nothing reads the released password: this is the silent case that used
+        // to report as "wired ✓" while the wallet kept prompting.
+        assert_eq!(h.auth, None);
+        assert!(!h.session);
+    }
+
+    #[test]
+    fn kwallet_above_the_irlume_line_does_not_count_as_a_consumer() {
+        // Ordering, not mere presence, is what matters: an auth line ABOVE ours
+        // runs before the token exists, so the wallet stays locked.
+        let above = "#%PAM-1.0\n\
+-auth      optional      pam_kwallet5.so\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+-session   optional      pam_kwallet5.so auto_start\n";
+        let h = keyring_handoff(above).expect("stack releases a credential");
+        assert_eq!(
+            h.auth, None,
+            "a consumer above our line cannot see the token"
+        );
+        assert!(h.session);
+    }
+
+    #[test]
+    fn arch_include_layout_handoff_is_detected() {
+        let arch = "#%PAM-1.0\n\
+auth       sufficient   pam_irlume.so unseal ondemand kr\n\
+auth       include     system-login\n\
+auth       optional                     pam_irlume.so reseal\n\
+-auth      optional    pam_kwallet5.so\n\
+-session   optional    pam_kwallet5.so auto_start\n";
+        let h = keyring_handoff(arch).expect("stack releases a credential");
+        assert_eq!(h.auth, Some("pam_kwallet5.so"));
+        assert!(h.session);
+    }
+
+    #[test]
+    fn auth_line_without_a_session_line_is_reported_separately() {
+        // pam_kwallet5 derives the key at auth time but it is the SESSION line
+        // that starts the daemon and hands it over; auth alone opens nothing.
+        let no_session: String = PLASMA_WIRED
+            .lines()
+            .filter(|l| !(l.contains("pam_kwallet5.so") && l.contains("session")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let h = keyring_handoff(&no_session).expect("stack releases a credential");
+        assert_eq!(h.auth, Some("pam_kwallet5.so"));
+        assert!(!h.session);
+    }
+
+    #[test]
+    fn gnome_keyring_counts_as_a_consumer_too() {
+        let gnome = PLASMA_WIRED.replace("pam_kwallet5.so", "pam_gnome_keyring.so");
+        let h = keyring_handoff(&gnome).expect("stack releases a credential");
+        assert_eq!(h.auth, Some("pam_gnome_keyring.so"));
+        assert!(h.session);
+    }
+
+    #[test]
+    fn a_verify_only_stack_is_not_judged_for_a_wallet() {
+        // sudo / polkit carry the plain verify stanza: no `unseal`, so no
+        // credential is released and there is nothing for a wallet to consume.
+        let sudo = "#%PAM-1.0\nauth       sufficient                   pam_irlume.so\n\
+@include common-auth\n";
+        assert!(keyring_handoff(sudo).is_none());
+    }
+
+    #[test]
+    fn a_commented_out_keyring_line_is_not_a_consumer() {
+        let commented = PLASMA_WIRED.replace(
+            "-auth      optional      pam_kwallet5.so",
+            "#-auth      optional      pam_kwallet5.so",
+        );
+        let h = keyring_handoff(&commented).expect("stack releases a credential");
+        assert_eq!(h.auth, None);
     }
 
     #[test]

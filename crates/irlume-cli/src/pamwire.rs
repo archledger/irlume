@@ -2572,14 +2572,29 @@ session    include                     system-local-login
 session    optional                    pam_gnome_keyring.so auto_start
 "#;
 
-    /// GDM's unreleased `main` renamed the shared stack; no release ships this
-    /// yet, but an upgrade would arrive silently.
+    /// GDM `main`'s `data/pam-redhat/gdm-password.pam`, byte-for-byte: the shared
+    /// stack is renamed to `gdm-password-auth-substack`, a file GDM does not itself
+    /// ship. No release carries this — 45.0 through 50.1 and 51.alpha all still say
+    /// `password-auth` — so it is latent, and would arrive with an upgrade.
     const UPSTREAM_GDM_RENAMED_SUBSTACK: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
 auth        substack      gdm-password-auth-substack
 auth        optional      pam_gnome_keyring.so
 auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       password-auth
+
+password    substack       gdm-password-auth-substack
+-password   optional       pam_gnome_keyring.so use_authtok
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
 session     include       password-auth
 session     optional      pam_gnome_keyring.so auto_start
+session     include       postlogin
 "#;
 
     /// GDM's shipped `gdm-fingerprint.pam` (upstream `data/pam-redhat`, released

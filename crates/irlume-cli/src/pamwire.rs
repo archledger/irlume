@@ -65,6 +65,23 @@ const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so
 /// the TPM-sealed password and sets PAM_AUTHTOK so pam_gnome_keyring opens the
 /// wallet. No-op when the keyring isn't armed or a password is already set.
 const KEYRING_UNSEAL: &str = "auth       optional                     pam_irlume.so keyring";
+/// Tag on the gnome-keyring lines irlume ADDS to a fingerprint stack, so unwiring
+/// removes exactly ours and never a keyring line the distro shipped. Linux-PAM
+/// strips a trailing `#` comment before tokenizing (verified against
+/// `pam_exec.so`: an argument survives, a trailing comment does not), so this is
+/// invisible to the module — which matters here because gnome-keyring's
+/// `parse_args` syslogs a warning for every option it does not recognize.
+const KEYRING_TAG: &str = "# irlume-keyring";
+/// GDM's `gdm-fingerprint` stack carries NO keyring module at all (verified on
+/// upstream `data/pam-redhat/gdm-fingerprint.pam` through GDM 50.0), so the
+/// `KEYRING_UNSEAL` line above would set a token nothing reads. These are the
+/// two halves gnome-keyring needs, added only when the stack has no consumer of
+/// its own. The leading `-` is PAM's "do not complain if the module is missing",
+/// so a machine without gnome-keyring installed is unaffected.
+const FP_GKR_AUTH: &str =
+    "-auth      optional                     pam_gnome_keyring.so   # irlume-keyring";
+const FP_GKR_SESSION: &str =
+    "-session   optional                     pam_gnome_keyring.so auto_start   # irlume-keyring";
 const RESEAL_SESSION: &str = "session    optional                     pam_irlume.so reseal";
 /// The plain verify stanza, shared by `sudo` and polkit prompts (Bitwarden vault
 /// unlock, pkexec, systemd unit control): no `unseal` (the daemon refuses
@@ -2211,21 +2228,60 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
         return (content.to_string(), false); // already wired
     }
     let lines: Vec<&str> = content.lines().collect();
-    let fp_at = lines.iter().position(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.starts_with("auth") && t.contains("pam_fprintd.so")
-    });
-    let Some(fp_at) = fp_at else {
+    let Some(fp_at) = lines.iter().position(|l| is_fingerprint_auth(l)) else {
         return (content.to_string(), false);
     };
-    let mut out = Vec::with_capacity(lines.len() + 1);
+    // Does anything in this stack already read the token we are about to set?
+    // GDM's own `gdm-fingerprint` does not, so the unseal line alone would
+    // release a password into a stack with no consumer.
+    let has_consumer = lines.iter().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && KEYRING_CONSUMERS.iter().any(|m| t.contains(m))
+    });
+    let mut out = Vec::with_capacity(lines.len() + 3);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());
         if i == fp_at {
             out.push(KEYRING_UNSEAL.to_string());
+            if !has_consumer {
+                out.push(FP_GKR_AUTH.to_string());
+            }
         }
     }
+    if !has_consumer {
+        // Appended last: gnome-keyring's session half wants to run once the
+        // session is otherwise set up, and it is the half that actually starts
+        // the daemon and unlocks with the stashed key.
+        out.push(FP_GKR_SESSION.to_string());
+    }
     (format!("{}\n", out.join("\n")), true)
+}
+
+/// The auth line that performs the fingerprint check, and therefore the line the
+/// keyring unseal must follow.
+///
+/// Matching a literal `pam_fprintd.so` was not enough: GDM's shipped
+/// `gdm-fingerprint.pam` never names the module, delegating instead to
+/// `auth substack fingerprint-auth` (renamed `gdm-fingerprint-auth-substack` on
+/// GDM's development branch). With only the literal match this returned no
+/// anchor, `wire_fp_keyring` became a silent no-op, and the fingerprint keyring
+/// unlock never wired on Fedora at all.
+fn is_fingerprint_auth(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    let toks: Vec<&str> = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .split_whitespace()
+        .collect();
+    if toks.first() != Some(&"auth") {
+        return false;
+    }
+    toks.iter().any(|w| w.contains("pam_fprintd.so"))
+        || (toks.iter().any(|w| *w == "substack" || *w == "include")
+            && toks.iter().any(|w| w.contains("fingerprint")))
 }
 /// Wire a single-stanza verify service (`sudo`, `polkit-1`): the stanza goes
 /// ABOVE the first auth-phase line, whether that is Fedora's `auth include
@@ -2272,7 +2328,10 @@ fn unwire_lines(content: &str) -> (String, bool) {
                 return true;
             }
             let drop = t.contains(MODULE)
-                || (t.contains("pam_permit.so") && l.contains("# irlume-landing"));
+                || (t.contains("pam_permit.so") && l.contains("# irlume-landing"))
+                // Only the gnome-keyring lines WE tagged; a distro-shipped
+                // keyring line carries no tag and must survive unwiring.
+                || (t.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
             if drop {
                 changed = true;
             }
@@ -3703,6 +3762,104 @@ auth        include       postlogin
 session     include       password-auth
 session     optional      pam_gnome_keyring.so auto_start
 "#;
+
+    /// GDM's shipped `gdm-fingerprint.pam` (upstream `data/pam-redhat`, released
+    /// 50.0). It names neither `pam_fprintd.so` nor any keyring module.
+    const UPSTREAM_GDM_FINGERPRINT: &str = r#"auth        substack      fingerprint-auth
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       fingerprint-auth
+
+password    include       fingerprint-auth
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       fingerprint-auth
+session     include       postlogin
+"#;
+
+    #[test]
+    fn gdm_fingerprint_wires_the_unseal_and_supplies_the_missing_consumer() {
+        // Two defects in one stack: no literal pam_fprintd.so to anchor on (so
+        // this used to be a silent no-op), and no keyring module at all (so the
+        // unseal line alone would release a token nothing reads).
+        assert!(!UPSTREAM_GDM_FINGERPRINT.contains("pam_fprintd.so"));
+        assert!(!UPSTREAM_GDM_FINGERPRINT.contains("pam_gnome_keyring.so"));
+
+        let (w, changed) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT);
+        assert!(changed, "the substack must serve as the anchor");
+        let lines: Vec<&str> = w.lines().collect();
+        let pos = |n: &str| lines.iter().position(|l| l.contains(n));
+
+        let fp = pos("substack      fingerprint-auth").expect("fingerprint substack");
+        let unseal = pos("pam_irlume.so keyring").expect("keyring unseal");
+        let gkr_auth = lines
+            .iter()
+            .position(|l| l.contains("pam_gnome_keyring.so") && is_auth_directive(l))
+            .expect("gnome-keyring auth line");
+        assert_eq!(
+            fp + 1,
+            unseal,
+            "unseal rides directly after the fingerprint auth"
+        );
+        assert_eq!(
+            unseal + 1,
+            gkr_auth,
+            "the consumer reads it immediately after"
+        );
+
+        // Both halves present and paired, so the hand-off actually completes.
+        let session_gkr = lines
+            .iter()
+            .any(|l| l.contains("pam_gnome_keyring.so") && l.contains("auto_start"));
+        assert!(
+            session_gkr,
+            "gnome-keyring needs its session half to unlock"
+        );
+        // The lines we added are tagged, and use PAM's `-` so a machine without
+        // gnome-keyring installed does not get an error logged.
+        assert!(w.contains(KEYRING_TAG));
+        assert!(w.contains("-auth") && w.contains("-session"));
+    }
+
+    #[test]
+    fn wire_fp_keyring_does_not_duplicate_an_existing_keyring_module() {
+        // gdm-fingerprint stacks that DO ship a keyring module must get the
+        // unseal line only; adding a second consumer would be noise.
+        let with_gkr = "#%PAM-1.0\nauth       required      pam_fprintd.so\n\
+auth       optional      pam_gnome_keyring.so\n\
+session    optional      pam_gnome_keyring.so auto_start\n";
+        let (w, changed) = wire_fp_keyring(with_gkr);
+        assert!(changed);
+        assert_eq!(
+            w.matches("pam_gnome_keyring.so").count(),
+            2,
+            "must not add a third keyring line"
+        );
+        assert!(!w.contains(KEYRING_TAG), "nothing of ours to tag here");
+    }
+
+    #[test]
+    fn unwiring_removes_our_keyring_lines_but_keeps_the_distros() {
+        // Ours are tagged; a distro-shipped keyring line is not, and must survive.
+        let (wired, _) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT);
+        let (bare, changed) = unwire_lines(&wired);
+        assert!(changed);
+        assert!(!bare.contains("pam_gnome_keyring.so"), "ours must go");
+        assert!(!bare.contains("pam_irlume.so"));
+        // Round-trips back to the upstream content.
+        assert_eq!(bare.trim_end(), UPSTREAM_GDM_FINGERPRINT.trim_end());
+
+        // A foreign keyring line is untagged and survives.
+        let foreign = "auth       required      pam_fprintd.so\n\
+auth       optional      pam_gnome_keyring.so\n";
+        let (kept, _) = unwire_lines(foreign);
+        assert!(kept.contains("pam_gnome_keyring.so"));
+    }
 
     #[test]
     fn upstream_gdm_stacks_wire_into_a_complete_gnome_keyring_handoff() {

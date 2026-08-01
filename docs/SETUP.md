@@ -231,12 +231,25 @@ GDM's upstream `gdm-password.pam` ships both halves on every OS variant it
 provides (Red Hat, Arch, LFS, Exherbo), so the check stays quiet on a stock
 GNOME system.
 
-**Known gap — fingerprint on GNOME.** Fedora's `gdm-fingerprint.pam` contains no
-`pam_gnome_keyring.so` line at all (and no literal `pam_fprintd.so` line to
-anchor on — it is `auth substack fingerprint-auth`). The fingerprint keyring
-unlock in [ADR-0003](adr/0003-fingerprint-keyring-unlock.md) therefore does not
-wire itself there. Face login is unaffected; this concerns fingerprint logins
-only.
+**Fingerprint on GNOME.** GDM's `gdm-fingerprint.pam` names neither
+`pam_fprintd.so` (it delegates to `auth substack fingerprint-auth`) nor any
+keyring module. So the [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)
+fingerprint keyring unlock needs both an anchor that recognizes the substack and
+a consumer to read the released password. `login enable` supplies both:
+
+```
+auth        substack      fingerprint-auth
+auth       optional       pam_irlume.so keyring          ← releases the sealed password
+-auth      optional       pam_gnome_keyring.so           ← reads and stashes it
+...
+-session   optional       pam_gnome_keyring.so auto_start  ← unlocks, starts the daemon
+```
+
+The two `pam_gnome_keyring.so` lines are added **only** when the stack has no
+keyring module of its own, and are tagged so `login disable` removes exactly
+those and never a line your distro shipped. The leading `-` is PAM's "do not
+complain if the module is missing", so a machine without gnome-keyring installed
+is unaffected.
 
 ### 5. Recovery passphrase: recommended
 

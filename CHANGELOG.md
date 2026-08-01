@@ -7,6 +7,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **Fingerprint keyring unlock never wired on GNOME, and could not have worked
+  if it had.** Two defects in one stack. The wiring anchored on a literal
+  `pam_fprintd.so` auth line, but GDM's `gdm-fingerprint.pam` never names the
+  module — it delegates to `auth substack fingerprint-auth` — so the anchor
+  search found nothing and the whole step became a silent no-op: `login enable`
+  reported success and wrote nothing. And had it wired, the stack carries no
+  keyring module at all, so the released password would have gone to a stack
+  with no consumer. The anchor now recognizes a fingerprint substack or include
+  as well as the literal module, and when the stack has no keyring consumer of
+  its own the two `pam_gnome_keyring.so` halves it needs are added alongside.
+  Those added lines are tagged so unwiring removes exactly ours and never a
+  distro-shipped keyring line, and carry PAM's leading `-` so a machine without
+  gnome-keyring installed is unaffected. Face login was never involved.
+
 - **A renamed shared PAM stack no longer drops the face block onto the wrong
   line.** The greeter block anchored on a fixed list of stack names
   (`password-auth`, `system-auth`, …) and, failing that, on the first `auth`

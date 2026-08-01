@@ -31,9 +31,9 @@ pub const SATURATED_MIN_MEAN: f64 = 250.0;
 /// A saturated frame at or below this spread is a constant, not a scene.
 /// Measured covered chosen frames: stddev 0.00 (ASUS, fully clipped), 0.76
 /// (NexiGo at its 252.8 clip), up to 3.63 mid auto-exposure walk-down; real
-/// scenes measure 35 and up. Deliberately wider than `FLAT_STDDEV_MAX`:
-/// saturation clips UNEVENLY on the NexiGo, so "exactly constant" would miss
-/// a fully covered camera there.
+/// scenes measure 35 and up. Deliberately wider than "exactly constant":
+/// saturation clips UNEVENLY on the NexiGo (0.76 at its 252.8 clip point),
+/// so a zero floor would miss a fully covered camera there.
 const SATURATED_FLAT_MAX: f64 = 8.0;
 
 /// What the capture path observed about a dark burst. Every field is a plain

@@ -75,17 +75,21 @@ contract is the closest thing to a specification for the hardware. Where irlume
 diverges, the divergence should be deliberate. Positions, each against the
 primary source:
 
-**Exclusive control.** Windows permits many frame consumers but exactly one of
-them may modify device configuration; shared consumers are read-only and
-inherit the controlling application's settings, and explicitly "cannot change
-KSPROPERTYSETID_ExtendedCameraControl controls", the class the Hello extension
-unit belongs to ([MediaCaptureSharingMode][ms-share],
-[MF FrameServer share modes][ms-frameserver]). irlume honours this: when
-another process already holds the camera node, `ir_emitter::enable` stands
-down from the control write and leaves the controlling application's
-configuration untouched (the capture then proceeds or fails on its own terms;
-an unlit emitter degrades toward the password, which is the fail-safe
-direction). irlume-vs-irlume exclusion is separate and kernel-enforced.
+**Exclusive control.** Windows permits many frame consumers but exactly one
+controlling instance. Sharing-mode consumers must use the controlling
+application's media type and explicitly "cannot change
+KSPROPERTYSETID_ExtendedCameraControl controls", the class Windows routes
+Hello's camera control through; the same page does let them change legacy
+`VIDEOPROCAMP`-style and vendor-specific controls
+([MediaCaptureSharingMode][ms-share],
+[MF FrameServer share modes][ms-frameserver]). irlume takes the strict end of
+that contract: when another process already holds the camera node,
+`ir_emitter::enable` stands down from the control write entirely, even though
+a Windows sharing consumer could touch a vendor extension unit, and leaves the
+controlling application's configuration untouched (the capture then proceeds
+or fails on its own terms; an unlit emitter degrades toward the password,
+which is the fail-safe direction). irlume-vs-irlume exclusion is separate and
+kernel-enforced.
 
 **Privacy indication for IR-only capture.** irlume can illuminate a person
 with 850 nm light during authentication. Windows hardware certification ties
@@ -93,9 +97,10 @@ visible indication to sensor capture, including for IR-only streams: a visible-
 wavelength (850 nm) illuminator may itself serve as the indicator (it glows
 faint red), while designs with an invisible (940 nm) illuminator must light a
 separate visible LED whenever the IR sensor is on
-([camera privacy controls][ms-privacy]). On certified modules that indication
-is wired to sensor power in hardware, which is why it follows irlume's captures
-without irlume's involvement. irlume's position: it never suppresses or
+([camera privacy controls][ms-privacy]). The certification phrases that
+obligation against the module's ISP capturing sensor data, not against any
+host application, which is why on certified modules indication follows
+irlume's captures without irlume's involvement. irlume's position: it never suppresses or
 controls indication, adds no software indicator (software indication is
 exactly what that certification distrusts), and inherits whatever the hardware
 provides. A user of an uncertified or external camera should know its IR

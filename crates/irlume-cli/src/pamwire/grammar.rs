@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
+//! Reading PAM stack lines: which line is an auth directive, which one is the
+//! shared password stack, where the face block should anchor.
+//!
+//! Pure predicates over a single line (or a slice of them). No I/O and no
+//! rewriting, so every distro layout irlume supports can be pinned by a unit
+//! test without touching a filesystem.
+
+use super::stanzas::MODULE;
+
+pub(super) fn content_has_module(c: &str) -> bool {
+    c.lines().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with('#') && t.contains(MODULE)
+    })
+}
+
+/// An `auth`-phase line whose password path is an `include` a `success=N` jump
+/// can't skip: Debian's `@include common-auth`/`login`, Arch's
+/// `auth include system-login`/`system-local-login`/`system-auth`, or a bare
+/// `auth include common-auth`. These need the `sufficient` (module IGNOREs on
+/// cold login) form, NOT the jump form. A `substack` is atomic for jump
+/// counting, so it deliberately does not match here and keeps the jump stanza —
+/// which is what openSUSE's `auth substack common-auth` relies on.
+pub(super) fn is_include_auth_layout(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("@include common-auth") || t.starts_with("@include login") {
+        return true;
+    }
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    toks.first() == Some(&"auth")
+        && toks.get(1) == Some(&"include")
+        && matches!(
+            toks.get(2),
+            Some(&"system-login")
+                | Some(&"system-local-login")
+                | Some(&"system-auth")
+                | Some(&"common-auth")
+        )
+}
+
+/// `<kind>` is `auth`/`session`; matches the shared password stack that the
+/// `success=1` jump skips: Fedora's `password-auth`/`system-auth`, and
+/// openSUSE's `common-auth`/`common-session`.
+///
+/// The stack names are kind-aware so an `auth` line is only tested against
+/// auth-phase names. openSUSE's `plasmalogin` routes the password through
+/// `auth substack common-auth`, which matched nothing here: wiring then fell
+/// back to the first auth line and inserted the jump above `pam_nologin.so`, so
+/// a face login skipped the nologin gate and *still* landed on the password
+/// stack underneath — face auth that neither honoured nologin nor logged you in.
+pub(super) fn is_passwd_substack(line: &str, kind: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    let toks: Vec<&str> = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .split_whitespace()
+        .collect();
+    let stacks: &[&str] = match kind {
+        "auth" => &["password-auth", "system-auth", "common-auth"],
+        "session" => &["password-auth", "system-auth", "common-session"],
+        _ => &["password-auth", "system-auth"],
+    };
+    toks.first() == Some(&kind)
+        && toks.iter().any(|w| *w == "substack" || *w == "include")
+        && toks.iter().any(|w| stacks.contains(w))
+}
+
+pub(super) fn is_auth_directive(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
+}
+
+/// An `auth` line whose control keyword is `substack`, whatever the shared stack
+/// happens to be NAMED. A substack is atomic for jump counting, so this is a
+/// safe jump anchor even when we do not recognize the target.
+///
+/// This exists because the named list cannot keep up with upstreams. GDM's main
+/// branch renamed its shared stack from `password-auth` to
+/// `gdm-password-auth-substack` (a file GDM does not ship — distros supply it),
+/// which no name in `is_passwd_substack` matches. Without this tier the anchor
+/// search falls through to "first auth line", which on GDM's stack is
+/// `pam_selinux_permit.so`: the jump would then skip THAT and land above the
+/// password substack, which still runs. That is the openSUSE failure exactly,
+/// and it would arrive silently with a GDM upgrade.
+pub(super) fn is_auth_substack_anchor(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    let toks: Vec<&str> = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .split_whitespace()
+        .collect();
+    toks.first() == Some(&"auth") && toks.get(1) == Some(&"substack")
+}
+
+/// Where the face block anchors, in descending order of confidence: a shared
+/// stack we recognize by name, then any `substack` whatever its name, and only
+/// then the first `auth` line. The last tier is a guess and is kept last
+/// deliberately — it is what produces a jump over an unrelated module.
+pub(super) fn find_auth_anchor(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| is_passwd_substack(l, "auth"))
+        .or_else(|| lines.iter().position(|l| is_auth_substack_anchor(l)))
+        .or_else(|| lines.iter().position(|l| is_auth_directive(l)))
+}
+
+/// The auth line that performs the fingerprint check, and therefore the line the
+/// keyring unseal must follow.
+///
+/// Matching a literal `pam_fprintd.so` was not enough: GDM's shipped
+/// `gdm-fingerprint.pam` never names the module, delegating instead to
+/// `auth substack fingerprint-auth` (renamed `gdm-fingerprint-auth-substack` on
+/// GDM's development branch). With only the literal match this returned no
+/// anchor, `wire_fp_keyring` became a silent no-op, and the fingerprint keyring
+/// unlock never wired on Fedora at all.
+pub(super) fn is_fingerprint_auth(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    let toks: Vec<&str> = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .split_whitespace()
+        .collect();
+    if toks.first() != Some(&"auth") {
+        return false;
+    }
+    toks.iter().any(|w| w.contains("pam_fprintd.so"))
+        || (toks.iter().any(|w| *w == "substack" || *w == "include")
+            && toks.iter().any(|w| w.contains("fingerprint")))
+}

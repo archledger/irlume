@@ -165,7 +165,7 @@ pub(super) fn consumer_active_for(line: &str, service: &str) -> Option<&'static 
 /// would be treated as already wired and silently left alone.
 ///
 /// A full-line comment yields `""`, so callers need no separate `#` check.
-pub(super) fn directive(line: &str) -> &str {
+pub(crate) fn directive(line: &str) -> &str {
     let t = line.trim_start();
     match t.find('#') {
         Some(i) => &t[..i],

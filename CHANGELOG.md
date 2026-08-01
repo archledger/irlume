@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **`fingerprint enable` says which prompts a finger actually answers, instead
+  of implying all of them.** The gate before recording the method asked only
+  "does an active `pam_fprintd.so` line exist in some live stack" — the right
+  gate (face must not stand down while nothing drives a prompt) but the wrong
+  report: on the issue-#155 Ubuntu box the only carrier was `gdm-fingerprint`,
+  so the success message promised finger unlock on a machine whose sudo and
+  console login had no fingerprint path at all. `enable` (and
+  `fingerprint status`) now print per-surface coverage — login screens, lock
+  screens, console login, sudo — resolved the way libpam actually evaluates a
+  stack: `auth include`/`substack` chains followed transitively, the Debian
+  `@include` form included, non-auth includes contributing nothing, and
+  include targets opened by name even when dotted (each behaviour pinned by
+  experiment against `pam_exec.so`; the authselect templates confirm Fedora's
+  `with-fingerprint` lands in `system-auth`, which is why one line covers
+  nearly everything there and one line covers almost nothing on the Ubuntu
+  layout). The gate itself is unchanged, so the documented Arch flow — add the
+  line to `system-local-login`, re-run — still enables, and now states that it
+  covered console login and not sudo. When the line reaches none of the
+  tracked surfaces, the report says that too. Closes #155.
+
 - **A stack using backslash line continuations is refused, not corrupted.**
   libpam's line assembler joins a directive ending in `\` with the next
   physical line before tokenizing (whitespace after the backslash does not

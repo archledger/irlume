@@ -47,6 +47,10 @@ use transform::*;
 // A glob `use` binds names privately, so the public surface is listed here
 // rather than inherited — which also keeps that surface visible in one place.
 pub(crate) use files::{is_managed_path, lock_pam, restore_surface};
+// The one PAM-grammar item shared outside this module: `fingerprint.rs` must
+// read stack lines with the same comment semantics the wiring uses, or the
+// two would disagree about what a file configures.
+pub(crate) use grammar::directive;
 pub(crate) use report::{login_manager_fact, status_report, surface_facts};
 pub(crate) use stanzas::BACKUP;
 

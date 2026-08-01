@@ -48,8 +48,8 @@ pub(super) struct KeyringHandoff {
 pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
     let lines: Vec<&str> = content.lines().collect();
     let unseal_at = lines.iter().position(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains(MODULE) && t.contains("unseal")
+        let d = directive(l);
+        d.contains(MODULE) && d.contains("unseal")
     })?;
     let consumer_in = |l: &str| consumer_active_for(l, service);
     // A given module's session line may sit anywhere in the session phase, so
@@ -57,13 +57,10 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
     // order-sensitive.
     let has_session_line = |module: &str| {
         lines.iter().any(|l| {
-            let t = l.trim_start();
-            if t.starts_with('#') {
-                return false;
-            }
-            let phase = t.strip_prefix('-').unwrap_or(t);
+            let d = directive(l);
+            let phase = d.strip_prefix('-').unwrap_or(d);
             phase.split_whitespace().next() == Some("session")
-                && t.contains(module)
+                && d.contains(module)
                 // The session half is gated by `only_if=` exactly as the auth
                 // half is: gkr-pam checks it in `pam_sm_open_session` too.
                 && consumer_active_for(l, service).is_some()
@@ -234,8 +231,8 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
 pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     if content.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
+        let d = directive(l);
+        d.contains(MODULE) && d.contains("keyring")
     }) {
         return (content.to_string(), false); // already wired
     }
@@ -310,15 +307,16 @@ pub(super) fn unwire_lines(content: &str) -> (String, bool) {
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| {
-            let t = l.trim_start();
-            if t.starts_with('#') {
-                return true;
-            }
-            let drop = t.contains(MODULE)
-                || (t.contains("pam_permit.so") && l.contains("# irlume-landing"))
+            // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
+            // module named only in a comment is never stripped. The tags are
+            // matched on the RAW line, because that is where they live — they
+            // are comments, invisible to PAM by design.
+            let d = directive(l);
+            let drop = d.contains(MODULE)
+                || (d.contains("pam_permit.so") && l.contains("# irlume-landing"))
                 // Only the gnome-keyring lines WE tagged; a distro-shipped
                 // keyring line carries no tag and must survive unwiring.
-                || (t.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
+                || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
             if drop {
                 changed = true;
             }

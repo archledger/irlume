@@ -11,10 +11,7 @@
 use super::stanzas::{KEYRING_CONSUMERS, MODULE};
 
 pub(super) fn content_has_module(c: &str) -> bool {
-    c.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains(MODULE)
-    })
+    c.lines().any(|l| directive(l).contains(MODULE))
 }
 
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
@@ -25,7 +22,7 @@ pub(super) fn content_has_module(c: &str) -> bool {
 /// counting, so it deliberately does not match here and keeps the jump stanza —
 /// which is what openSUSE's `auth substack common-auth` relies on.
 pub(super) fn is_include_auth_layout(line: &str) -> bool {
-    let t = line.trim_start();
+    let t = directive(line);
     if t.starts_with("@include common-auth") || t.starts_with("@include login") {
         return true;
     }
@@ -52,13 +49,10 @@ pub(super) fn is_include_auth_layout(line: &str) -> bool {
 /// a face login skipped the nologin gate and *still* landed on the password
 /// stack underneath — face auth that neither honoured nologin nor logged you in.
 pub(super) fn is_passwd_substack(line: &str, kind: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
     let stacks: &[&str] = match kind {
@@ -72,10 +66,7 @@ pub(super) fn is_passwd_substack(line: &str, kind: &str) -> bool {
 }
 
 pub(super) fn is_auth_directive(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
+    let t = directive(line);
     t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
 }
 
@@ -92,13 +83,10 @@ pub(super) fn is_auth_directive(line: &str) -> bool {
 /// password substack, which still runs. That is the openSUSE failure exactly,
 /// and it would arrive silently with a GDM upgrade.
 pub(super) fn is_auth_substack_anchor(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
     toks.first() == Some(&"auth") && toks.get(1) == Some(&"substack")
@@ -126,13 +114,10 @@ pub(super) fn find_auth_anchor(lines: &[&str]) -> Option<usize> {
 /// anchor, `wire_fp_keyring` became a silent no-op, and the fingerprint keyring
 /// unlock never wired on Fedora at all.
 pub(super) fn is_fingerprint_auth(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
     if toks.first() != Some(&"auth") {
@@ -160,14 +145,30 @@ pub(super) fn is_fingerprint_auth(line: &str) -> bool {
 /// equivalent option (`only_if` appears nowhere in kwallet-pam), so this only
 /// ever narrows the gnome-keyring case.
 pub(super) fn consumer_active_for(line: &str, service: &str) -> Option<&'static str> {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return None;
-    }
+    let t = directive(line);
     let module = KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))?;
     let gated_out = t
         .split_whitespace()
         .filter_map(|w| w.strip_prefix("only_if="))
         .any(|list| !list.split(',').any(|item| item == service));
     (!gated_out).then_some(module)
+}
+
+/// The part of a stack line PAM actually tokenizes: everything before the first
+/// `#`, leading whitespace trimmed.
+///
+/// Matching the raw line disagrees with libpam, which strips a trailing comment
+/// before tokenizing (verified against `pam_exec.so`: a real argument survives,
+/// a trailing comment does not). Without this, a module named only inside a
+/// comment counts as configured — and because `content_has_module` gates the
+/// whole wiring path, a stack whose comment happens to mention `pam_irlume.so`
+/// would be treated as already wired and silently left alone.
+///
+/// A full-line comment yields `""`, so callers need no separate `#` check.
+pub(super) fn directive(line: &str) -> &str {
+    let t = line.trim_start();
+    match t.find('#') {
+        Some(i) => &t[..i],
+        None => t,
+    }
 }

@@ -2862,6 +2862,97 @@ auth       optional      pam_gnome_keyring.so\n";
     }
 
     #[test]
+    fn directive_cuts_at_the_comment_exactly_as_pam_does() {
+        assert_eq!(
+            directive("auth optional pam_unix.so"),
+            "auth optional pam_unix.so"
+        );
+        assert_eq!(
+            directive("  auth optional pam_unix.so  # note"),
+            "auth optional pam_unix.so  "
+        );
+        assert_eq!(directive("# whole line comment"), "");
+        assert_eq!(directive(""), "");
+    }
+
+    #[test]
+    fn a_module_named_only_in_a_comment_is_never_treated_as_configured() {
+        // libpam strips a trailing comment before tokenizing, so none of these
+        // lines load the module they mention. Matching the raw line would make
+        // irlume disagree with the thing it is configuring.
+        //
+        // content_has_module is the dangerous one: it gates the whole wiring
+        // path, so a false positive means `login enable` silently writes
+        // nothing and reports the stack as already wired.
+        assert!(!content_has_module(
+            "auth required pam_unix.so  # was pam_irlume.so\n"
+        ));
+        assert!(content_has_module("auth sufficient pam_irlume.so\n"));
+
+        // Anchors must not be invented out of comment text either.
+        assert!(!is_passwd_substack(
+            "auth required pam_unix.so # substack password-auth",
+            "auth"
+        ));
+        assert!(!is_include_auth_layout(
+            "auth required pam_unix.so # @include common-auth"
+        ));
+        assert!(!is_auth_substack_anchor(
+            "auth required pam_unix.so # substack whatever"
+        ));
+        assert!(!is_fingerprint_auth(
+            "auth required pam_unix.so # substack fingerprint-auth"
+        ));
+        assert!(!is_auth_directive("# auth required pam_unix.so"));
+
+        // Nor a keyring consumer.
+        assert_eq!(
+            consumer_active_for(
+                "auth required pam_unix.so # see pam_gnome_keyring.so",
+                "gdm-password"
+            ),
+            None
+        );
+
+        // A stack whose only mention of a keyring module is a comment has no
+        // hand-off, however complete it looks to a grep.
+        let commented = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional      pam_deny.so    # pam_gnome_keyring.so would go here\n\
+session    optional      pam_deny.so    # pam_gnome_keyring.so auto_start\n";
+        let h = keyring_handoff(commented, "gdm-password").expect("releases a credential");
+        assert_eq!(h.complete, None);
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn unwiring_matches_modules_on_the_directive_but_tags_on_the_raw_line() {
+        // Our tags ARE comments, so they must still be found there; a foreign
+        // line that merely names one of our modules in a comment must survive.
+        let stack = "auth required pam_unix.so  # not pam_irlume.so, just a note\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+-auth      optional      pam_gnome_keyring.so   # irlume-keyring\n\
+-auth      optional      pam_gnome_keyring.so\n";
+        let (out, changed) = unwire_lines(stack);
+        assert!(changed);
+        assert!(
+            out.contains("not pam_irlume.so, just a note"),
+            "comment-only mention survives"
+        );
+        assert!(!out.contains("irlume-landing"), "our tagged landing goes");
+        assert!(
+            !out.contains("irlume-keyring"),
+            "our tagged keyring line goes"
+        );
+        assert!(
+            out.contains("-auth      optional      pam_gnome_keyring.so\n"),
+            "the distro's untagged keyring line survives"
+        );
+    }
+
+    #[test]
     fn only_if_gating_is_matched_the_way_gkr_pam_matches_it() {
         // gkr-pam's `evaluate_inlist` matches whole comma-separated items, so a
         // prefix must NOT satisfy it: `only_if=gdm` leaves gdm-fingerprint out.

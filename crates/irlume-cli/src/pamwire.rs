@@ -2848,6 +2848,61 @@ auth       optional      pam_gnome_keyring.so\n";
     }
 
     #[test]
+    fn plasmalogin_fingerprint_keyring_line_lands_above_the_wallet_module() {
+        // The KDE fingerprint→KWallet chain. Plasma's greeter runs ONE stack
+        // for user auth (plasma-login-manager's PamBackend selects only
+        // `plasmalogin` / `plasmalogin-greeter` / `plasmalogin-autologin` — no
+        // fingerprint service, unlike kscreenlocker's kde/kde-fingerprint/
+        // kde-smartcard triple). So a greeter fingerprint login happens when
+        // the distro's shared stack carries pam_fprintd, provides no password,
+        // and the `keyring` line must then release the sealed one ABOVE the
+        // vendor's pam_kwallet5 auth line for the wallet to open.
+        for (os, vendor, od) in [
+            ("fedora", UPSTREAM_FEDORA, true),
+            ("arch", UPSTREAM_ARCH, true),
+            ("debian", UPSTREAM_DEBIAN, true),
+        ] {
+            let (w, changed) = wire_greeter_impl(vendor, true, true, od);
+            assert!(changed, "{os}");
+            let lines: Vec<&str> = w.lines().collect();
+            let keyring = lines
+                .iter()
+                .position(|l| l.contains("pam_irlume.so keyring"))
+                .unwrap_or_else(|| panic!("{os}: keyring line missing"));
+            let kwallet = lines
+                .iter()
+                .position(|l| is_auth_directive(l) && l.contains("pam_kwallet5.so"))
+                .unwrap_or_else(|| panic!("{os}: kwallet auth line missing"));
+            assert!(
+                keyring < kwallet,
+                "{os}: the released password must be set before pam_kwallet5 reads it"
+            );
+            let h = keyring_handoff(&w, "plasmalogin").expect("releases a credential");
+            assert!(h.complete.is_some(), "{os}");
+        }
+    }
+
+    #[test]
+    fn a_keyring_only_greeter_is_still_checked_for_the_wallet_handoff() {
+        // A fingerprint-only box (no face login) wires the greeter with ONLY
+        // the `keyring` line — no `unseal`. The hand-off check used to anchor
+        // on `unseal` alone, so this stack was skipped entirely: a missing
+        // wallet module after a fingerprint login had no warning at all.
+        let (w, changed) = wire_greeter_impl(UPSTREAM_FEDORA, false, true, true);
+        assert!(changed);
+        assert!(!w.contains("unseal"), "no face line on this box");
+        let h = keyring_handoff(&w, "plasmalogin")
+            .expect("the keyring line releases a credential and must anchor the check");
+        assert!(h.complete.is_some(), "fedora ships the wallet modules");
+        // And on the stack that genuinely lacks a wallet module, the warning
+        // now fires for the fingerprint path too.
+        let (suse, changed) = wire_greeter_impl(UPSTREAM_SUSE, false, true, true);
+        assert!(changed);
+        let h = keyring_handoff(&suse, "plasmalogin").expect("releases a credential");
+        assert_eq!(h.complete, None);
+    }
+
+    #[test]
     fn upstream_suse_plasmalogin_ships_no_keyring_module_and_is_flagged() {
         // openSUSE's upstream file has neither pam_kwallet5 nor pam_gnome_keyring,
         // so a face login there releases a password nothing reads. This is the

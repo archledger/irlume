@@ -1150,7 +1150,10 @@ impl App {
         }
         // Method ↔ PAM-wiring coherence: competing biometric stacks intercept
         // each other's prompts; a chosen method that isn't wired does nothing.
-        // Active (non-comment) PAM lines only; a commented-out module is not wired.
+        // Matched on the DIRECTIVE part (everything before the first '#', all
+        // libpam tokenizes), via the same shared semantics as the wiring — a
+        // module named only in a trailing comment is not wired, and reading it
+        // as wired would suppress this exact Fail diagnostic.
         let pam_has = |needle: &str| {
             ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
                 .iter()
@@ -1158,7 +1161,7 @@ impl App {
                     std::fs::read_to_string(p)
                         .map(|s| {
                             s.lines()
-                                .any(|l| !l.trim_start().starts_with('#') && l.contains(needle))
+                                .any(|l| crate::pamwire::directive(l).contains(needle))
                         })
                         .unwrap_or(false)
                 })

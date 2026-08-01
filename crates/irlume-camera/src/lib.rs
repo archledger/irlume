@@ -417,7 +417,7 @@ fn privacy_state(dev: &Device) -> std::io::Result<Option<bool>> {
 /// stays `false`, because the cost of failing open here is a capture of dark
 /// frames and a refused authentication, which the pipeline already handles.
 /// `setup_ir_emitter` deliberately does NOT use this: it writes to firmware,
-/// where an unknown shutter state must refuse — see [`privacy_permits_setup`].
+/// where an unknown shutter state must refuse — see `privacy_permits_setup`.
 pub fn privacy_engaged(device: &str) -> bool {
     let Ok(dev) = Device::with_path(device) else {
         return false;

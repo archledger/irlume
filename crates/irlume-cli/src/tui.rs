@@ -2454,8 +2454,20 @@ impl App {
             // path; only a measurement can tell which camera this is. Said
             // up front because it holds the camera for a while (#170).
             (SC_CAMERAS, KeyCode::Char('t')) => {
-                self.log('→', "sudo irlume camera-tune: measure whether RGB and IR can stream at once; holds the camera and fires the IR emitter for up to a minute, then stores the verdict in /etc/irlume/cameras.conf (you'll be asked for your password)");
-                self.suspend = Some(Suspend::CameraTune);
+                // A modal, not an Activity line: the log-then-suspend shape
+                // never RENDERS before the terminal leaves the alt screen (the
+                // frame was drawn before the key was read, and the suspend
+                // runs in the same loop iteration), so the explanation the
+                // route promises would appear only after the run (#204
+                // review). The confirm modal is drawn before any key can
+                // schedule the suspend, which is the existing shape of every
+                // other consequential route here.
+                self.confirm = Some((
+                    "Tune capture mode? This holds the camera and fires the IR                      emitter for up to a minute, then stores the verdict in                      /etc/irlume/cameras.conf. Your password will be requested."
+                        .into(),
+                    "Tune",
+                    ConfirmAct::Sus(Suspend::CameraTune),
+                ));
             }
             (SC_CAMERAS, KeyCode::Char('p')) => self.start_async(
                 "IR emitter units",
@@ -6493,16 +6505,38 @@ mod tests {
         assert!(matches!(app.suspend, Some(Suspend::IrSetup)));
         app.suspend = None;
         // [t] routes capture tuning to sudo (#170: previously no TUI route),
-        // and says what it will do before the suspend happens.
+        // through a confirm modal so the effects are RENDERED before anything
+        // can run: the first version logged an Activity line in the same loop
+        // iteration as the suspend, which never reached the screen (#204
+        // review), and its test read the in-memory vector, which could not
+        // notice.
         app.on_key(KeyCode::Char('t'));
-        assert!(matches!(app.suspend, Some(Suspend::CameraTune)));
         assert!(
-            app.activity
-                .iter()
-                .any(|(_, m)| m.contains("camera-tune") && m.contains("up to a minute")),
-            "the route must say what it does before running"
+            app.suspend.is_none(),
+            "[t] must show the effects before scheduling camera-tune"
         );
+        // The popup wraps its message at the box edge, so reflow the rendered
+        // text before asserting: borders become spaces, runs of whitespace
+        // collapse, and the phrases read as written regardless of wrap point.
+        let text = draw_text(&app);
+        let flat = text
+            .replace(['│', '╭', '╮', '╰', '╯', '─'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("fires the IR emitter for up to a minute")
+                && flat.contains("/etc/irlume/cameras.conf")
+                && flat.contains("password will be requested"),
+            "the pre-run confirmation must render every material effect:\n{text}"
+        );
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::CameraTune)));
         app.suspend = None;
+        // And [n] declines without scheduling anything.
+        app.on_key(KeyCode::Char('t'));
+        app.on_key(KeyCode::Char('n'));
+        assert!(app.suspend.is_none() && app.confirm.is_none());
         app.on_key(KeyCode::Char('p'));
         assert!(app.op.is_some(), "[p] starts the read-only emitter probe");
         wait_op_done(&mut app);

@@ -140,6 +140,23 @@ stop_daemon() {
     daemon_pid=""
 }
 capture() { IRLUME_SOCKET="$SOCK" "$B" camera-tune --rounds "${1:-1}"; }
+# A synchronous capture that fails (missing model, dead socket, daemon error)
+# must fail the RUN, not soften into a skip: sections 2 and 3 assert that
+# things did NOT happen, which is trivially true of a capture that never ran,
+# so an ignored capture status turns four absence checks into vacuous passes
+# (review round 14). The killed capture stays on bare capture(): its daemon
+# dies under it by design, so its client MAY fail, and its success condition
+# is the confirmed record plus a successful kill.
+capture_checked() {
+    local tag="$1" rounds="${2:-1}"
+    if capture "$rounds" >"$OUT/capture-$tag.out" 2>&1; then
+        return 0
+    fi
+    echo "  FAILED  capture '$tag' did not complete"
+    sed 's/^/    /' "$OUT/capture-$tag.out"
+    stop_daemon
+    exit 1
+}
 records() { find "$STORE" -name '*.json' 2>/dev/null | wc -l; }
 # A record whose write is CONFIRMED on disk. The kill trigger keys on this,
 # not on the file existing: the file appears before the SET_CUR, and a kill
@@ -178,7 +195,7 @@ echo "=== 1. a clean capture: record before the write, resolved after ==="
 PARKED=$(control)
 echo "    parked at: $PARKED"
 start_daemon clean || exit 2
-capture 1 >"$OUT/capture-clean.out" 2>&1
+capture_checked clean 1
 stop_daemon
 grep -aE "stream-record|SET_CUR|leaving unit" "$OUT/daemon-clean.log" >"$OUT/clean.seq"
 sed 's/^/    /' "$OUT/clean.seq"
@@ -247,7 +264,7 @@ else
             # leftover the record describes is already gone. The next run must
             # supersede the record rather than claim it.
             start_daemon after || exit 2
-            capture 1 >"$OUT/capture-after.out" 2>&1
+            capture_checked after 1
             stop_daemon
             assert "the stale record is superseded, not claimed" \
                 "a claim appeared in the log" \
@@ -258,7 +275,7 @@ else
 close, so a leftover cannot survive here (use the NexiGo 3443:c803)"
         else
             start_daemon claim || exit 2
-            capture 1 >"$OUT/capture-claim.out" 2>&1
+            capture_checked claim 1
             stop_daemon
             grep -aE "stream-record|SET_CUR|leaving unit" "$OUT/daemon-claim.log" \
                 >"$OUT/claim.seq"
@@ -289,7 +306,7 @@ else
     fi
     if [ "$planted" = yes ]; then
         start_daemon outside || exit 2
-        capture 1 >"$OUT/capture-outside.out" 2>&1
+        capture_checked outside 1
         stop_daemon
         assert "irlume writes nothing over a value it did not set" \
             "a SET_CUR appeared" \

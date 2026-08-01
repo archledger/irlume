@@ -5,6 +5,60 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **A dark or blinded IR capture says why, from evidence.** A dark burst used
+  to get one hint ("no active emitter; run `sudo irlume ir-setup`") that fits
+  one of a dark frame's six causes and sent people toward camera firmware for
+  shutters, covers and range problems. The capture path now names the cause it
+  can support: the camera's own per-frame illumination metadata, the privacy
+  control and the frame's mean and spread decide between an engaged shutter,
+  an illuminator that fired into nothing, a control the camera did not act on,
+  and the one case where `ir-setup` is the right advice. The most common cover
+  case turned out not to be dark at all: an opaque cover under an active
+  emitter reflects it straight back and saturates the sensor (measured 252.8
+  to 255.0 covered on both test cameras, against spread 35 and up for every
+  real scene), so that saturated-flat signature is named too. And
+  `IRLUME_IR_EMITTER=off` now silences this output, which the old hint's own
+  text promised while printing anyway. Closes [#185] and [#197].
+
+- **A crash can no longer strand the emitter mode on.** Every capture's
+  emitter write is covered by a per-camera stream record, written before the
+  write, confirmed after the camera accepts it, and resolved when the guard
+  restores; the next daemon claims a confirmed leftover and finishes the
+  interrupted restore, with claims counted and capped. The guard arms with the
+  value the write actually displaced (one read, no window for another client's
+  value to be lost in), and it holds the camera handle itself, so a restore
+  cannot land on a descriptor number the kernel has recycled. Closes [#188],
+  [#189] and [#190].
+
+- **`doctor` names each camera node's backend.** `(uvcvideo, USB)` for the
+  case irlume is built and tested for; the driver, the bus and a warning for
+  anything else; and a visible "backend unknown" when the observation fails.
+  Read from `VIDIOC_QUERYCAP`, the interface's own answer. This is the first
+  question of every camera bug report ([#187] had to collect it by shell
+  script), answered by the tool that should have known.
+
+### Fixed
+
+- **`ir-setup` refuses to write camera firmware while the privacy shutter is
+  engaged.** With the shutter shut the sensor substitutes a blank frame, so
+  discovery measured a constant, learned nothing from every exploratory write,
+  and told the user their camera "advertises no usable emitter control". Setup
+  now refuses up front when the shutter is engaged, and also when the privacy
+  control cannot be read at all ("could not read the switch" is not "the
+  switch is released"); it re-checks immediately before each exploratory
+  write, because the operator can engage the shutter mid-run; and restores are
+  never blocked. Closes [#186].
+
+[#185]: https://github.com/archledger/irlume/issues/185
+[#186]: https://github.com/archledger/irlume/issues/186
+[#187]: https://github.com/archledger/irlume/issues/187
+[#188]: https://github.com/archledger/irlume/issues/188
+[#189]: https://github.com/archledger/irlume/issues/189
+[#190]: https://github.com/archledger/irlume/issues/190
+[#197]: https://github.com/archledger/irlume/issues/197
+
 ## [0.7.2] - 2026-07-30
 
 Fixes a camera-firmware hazard present in 0.7.1. Please upgrade.

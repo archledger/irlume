@@ -7,30 +7,36 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- **A dark or blinded IR capture says why, from evidence.** A dark burst used
-  to get one hint ("no active emitter; run `sudo irlume ir-setup`") that fits
-  one of a dark frame's six causes and sent people toward camera firmware for
-  shutters, covers and range problems. The capture path now names the cause it
-  can support: the camera's own per-frame illumination metadata, the privacy
-  control and the frame's mean and spread decide between an engaged shutter,
-  an illuminator that fired into nothing, a control the camera did not act on,
-  and the one case where `ir-setup` is the right advice. The most common cover
-  case turned out not to be dark at all: an opaque cover under an active
-  emitter reflects it straight back and saturates the sensor (measured 252.8
-  to 255.0 covered on both test cameras, against spread 35 and up for every
-  real scene), so that saturated-flat signature is named too. And
-  `IRLUME_IR_EMITTER=off` now silences this output, which the old hint's own
-  text promised while printing anyway. Closes [#185] and [#197].
+- **A dark or blinded IR capture reports what its evidence supports.** A dark
+  burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
+  even though shutters, covers, range, exposure and emitter failures all
+  produce similar frames. The capture path now reports from the camera's
+  per-frame illumination metadata, the privacy control, the emitter-control
+  state and the frame's mean and spread: it names an engaged shutter,
+  separates frames the camera marked illuminated from a requested mode it
+  never reported as illuminated, and reserves `ir-setup` advice for the one
+  case with no active emitter. Illumination metadata is never treated as
+  proof of optical output: a failed LED and a subject out of range read the
+  same, and the diagnosis says so. The most common measured cover case was
+  not dark at all: an opaque cover under an active emitter produced a
+  saturated, nearly constant frame (measured 252.8 to 255.0 on the two test
+  cameras, against spread 35 and up for every recorded real scene), so that
+  signature is named too. And `IRLUME_IR_EMITTER=off` now silences this
+  output, which the old hint's own text promised while printing anyway.
+  Closes [#185] and [#197].
 
-- **A crash can no longer strand the emitter mode on.** Every capture's
-  emitter write is covered by a per-camera stream record, written before the
-  write, confirmed after the camera accepts it, and resolved when the guard
-  restores; the next daemon claims a confirmed leftover and finishes the
-  interrupted restore, with claims counted and capped. The guard arms with the
-  value the write actually displaced (one read, no window for another client's
-  value to be lost in), and it holds the camera handle itself, so a restore
-  cannot land on a descriptor number the kernel has recycled. Closes [#188],
-  [#189] and [#190].
+- **Emitter-mode crash recovery for recorded capture writes.** Before
+  changing the camera's control, the capture path writes a per-camera stream
+  record and confirms it once the camera accepts the write; a later daemon
+  claims a confirmed leftover and finishes the interrupted restore, with
+  claims counted and capped. The guard arms with the value the write actually
+  displaced (one read, no window for another client's value to be lost in),
+  and it holds the camera handle itself, so a restore cannot land on a
+  descriptor number the kernel has recycled. The bookkeeping is deliberately
+  best-effort: when its lock, record write or confirmation is unavailable,
+  irlume warns and drives the emitter without crash recovery rather than
+  turning a full disk into a failed login, so a kill in that degraded path
+  can still strand the mode. Closes [#188], [#189] and [#190].
 
 - **`doctor` names each camera node's backend.** `(uvcvideo, USB)` for the
   case irlume is built and tested for; the driver, the bus and a warning for

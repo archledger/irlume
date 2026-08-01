@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A renamed shared PAM stack no longer drops the face block onto the wrong
+  line.** The greeter block anchored on a fixed list of stack names
+  (`password-auth`, `system-auth`, …) and, failing that, on the first `auth`
+  line — a guess that puts the `success=1` jump above whatever module happens to
+  come first. GDM's development branch renames its shared stack to
+  `gdm-password-auth-substack`, which no name matches; the guess would then have
+  anchored above `pam_selinux_permit.so` and landed the jump *before* the
+  password substack, which still runs. No released GDM ships that rename, so
+  this was latent rather than live, but it would have arrived silently with an
+  upgrade. Any `auth … substack …` line is now preferred over the guess,
+  whatever the stack is called — a substack is atomic for jump counting, so the
+  jump form stays correct — and the first-auth-line guess is kept strictly last.
+
 - **openSUSE greeters anchored face auth on the wrong line, skipping the
   nologin gate.** openSUSE's `plasmalogin` routes the password through
   `auth substack common-auth`, a stack name the wiring did not recognize, so it

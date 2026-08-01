@@ -206,6 +206,38 @@ password**, since that is the password `keyring arm` seals. A wallet created wit
 a different password cannot be opened on this path — change it under *System
 Settings → KDE Wallet*, or remove and recreate the wallet.
 
+#### GNOME: what has to be in place for the login keyring
+
+Same shape, different module. `gdm-password` runs irlume's `unseal` line, which
+sets `PAM_AUTHTOK`; `pam_gnome_keyring.so`'s **auth** line reads it and stashes it
+under `gkr_system_authtok`; its **session** line unlocks the keyring and starts
+the daemon. Both halves are required, for the same reason as KWallet:
+`pam_sm_authenticate` only stashes, and `pam_sm_open_session` is what acts.
+
+Two differences from KDE are worth knowing:
+
+- **`auto_start` is real here.** gnome-keyring parses it (`ARG_AUTO_START`) and
+  needs it on the session line to start the daemon — the opposite of kwallet,
+  which ignores the option entirely. Upstream GDM already ships
+  `session optional pam_gnome_keyring.so auto_start`.
+- **Failure is silent.** With no `PAM_AUTHTOK`, gnome-keyring's auth phase logs
+  "no password is available for user" and returns success without prompting.
+  kwallet prompts; gnome-keyring does not. So a mis-ordered line costs you
+  nothing visible at the login screen — the keyring simply stays locked, and you
+  only find out when an application asks for a secret. That is exactly the case
+  `irlume login status` now names.
+
+GDM's upstream `gdm-password.pam` ships both halves on every OS variant it
+provides (Red Hat, Arch, LFS, Exherbo), so the check stays quiet on a stock
+GNOME system.
+
+**Known gap — fingerprint on GNOME.** Fedora's `gdm-fingerprint.pam` contains no
+`pam_gnome_keyring.so` line at all (and no literal `pam_fprintd.so` line to
+anchor on — it is `auth substack fingerprint-auth`). The fingerprint keyring
+unlock in [ADR-0003](adr/0003-fingerprint-keyring-unlock.md) therefore does not
+wire itself there. Face login is unaffected; this concerns fingerprint logins
+only.
+
 ### 5. Recovery passphrase: recommended
 
 Set this. It's your backstop: without it, a TPM clear or a routine

@@ -1902,6 +1902,43 @@ fn is_auth_directive(line: &str) -> bool {
     t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
 }
 
+/// An `auth` line whose control keyword is `substack`, whatever the shared stack
+/// happens to be NAMED. A substack is atomic for jump counting, so this is a
+/// safe jump anchor even when we do not recognize the target.
+///
+/// This exists because the named list cannot keep up with upstreams. GDM's main
+/// branch renamed its shared stack from `password-auth` to
+/// `gdm-password-auth-substack` (a file GDM does not ship — distros supply it),
+/// which no name in `is_passwd_substack` matches. Without this tier the anchor
+/// search falls through to "first auth line", which on GDM's stack is
+/// `pam_selinux_permit.so`: the jump would then skip THAT and land above the
+/// password substack, which still runs. That is the openSUSE failure exactly,
+/// and it would arrive silently with a GDM upgrade.
+fn is_auth_substack_anchor(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return false;
+    }
+    let toks: Vec<&str> = t
+        .strip_prefix('-')
+        .unwrap_or(t)
+        .split_whitespace()
+        .collect();
+    toks.first() == Some(&"auth") && toks.get(1) == Some(&"substack")
+}
+
+/// Where the face block anchors, in descending order of confidence: a shared
+/// stack we recognize by name, then any `substack` whatever its name, and only
+/// then the first `auth` line. The last tier is a guess and is kept last
+/// deliberately — it is what produces a jump over an unrelated module.
+fn find_auth_anchor(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| is_passwd_substack(l, "auth"))
+        .or_else(|| lines.iter().position(|l| is_auth_substack_anchor(l)))
+        .or_else(|| lines.iter().position(|l| is_auth_directive(l)))
+}
+
 /// Login-keyring modules that CONSUME the password an `unseal` line releases.
 /// KDE's kwallet-pam still installs `pam_kwallet5.so` under Plasma 6 (the
 /// running provider process is `ksecretd`, but the PAM module kept the 5 in its
@@ -2081,10 +2118,7 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
         }
         return (format!("{}\n", out.join("\n")), true);
     }
-    let auth_at = lines
-        .iter()
-        .position(|l| is_passwd_substack(l, "auth"))
-        .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
+    let auth_at = find_auth_anchor(&lines);
     let sess_at = lines.iter().position(|l| is_passwd_substack(l, "session"));
     let Some(auth_at) = auth_at else {
         return (content.to_string(), false);
@@ -2149,10 +2183,7 @@ fn wire_lock(content: &str) -> (String, bool) {
         return (format!("{}\n", out.join("\n")), true);
     }
     // Fedora `substack password-auth` layout → jump stanza + permit landing.
-    let auth_at = lines
-        .iter()
-        .position(|l| is_passwd_substack(l, "auth"))
-        .or_else(|| lines.iter().position(|l| is_auth_directive(l)));
+    let auth_at = find_auth_anchor(&lines);
     let Some(auth_at) = auth_at else {
         return (content.to_string(), false);
     };
@@ -3620,6 +3651,133 @@ session  include        postlogin-session
                 .expect("a keyring module");
             assert!(face < consumer, "{os}: our line must precede the wallet's");
         }
+    }
+
+    // GDM's shipped stacks, verbatim from upstream `data/pam-<os>/gdm-password.pam`
+    // (GNOME/gdm). Redhat is the released 50.0 form; Arch is the include layout.
+    // gnome-keyring's module needs the same two halves kwallet does: its
+    // `pam_sm_authenticate` reads PAM_AUTHTOK and stashes it under
+    // "gkr_system_authtok", and `pam_sm_open_session` is what acts on it.
+
+    const UPSTREAM_GDM_REDHAT: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
+auth        substack      password-auth
+auth        optional      pam_gnome_keyring.so
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       password-auth
+
+password    substack       password-auth
+-password   optional       pam_gnome_keyring.so use_authtok
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       password-auth
+session     optional      pam_gnome_keyring.so auto_start
+session     include       postlogin
+"#;
+
+    const UPSTREAM_GDM_ARCH: &str = r#"#%PAM-1.0
+
+auth       include                     system-local-login
+auth       optional                    pam_gnome_keyring.so
+
+account    include                     system-local-login
+
+password   include                     system-local-login
+password   optional                    pam_gnome_keyring.so use_authtok
+
+session    include                     system-local-login
+session    optional                    pam_gnome_keyring.so auto_start
+"#;
+
+    /// GDM's unreleased `main` renamed the shared stack; no release ships this
+    /// yet, but an upgrade would arrive silently.
+    const UPSTREAM_GDM_RENAMED_SUBSTACK: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
+auth        substack      gdm-password-auth-substack
+auth        optional      pam_gnome_keyring.so
+auth        include       postlogin
+session     include       password-auth
+session     optional      pam_gnome_keyring.so auto_start
+"#;
+
+    #[test]
+    fn upstream_gdm_stacks_wire_into_a_complete_gnome_keyring_handoff() {
+        for (os, vendor) in [("redhat", UPSTREAM_GDM_REDHAT), ("arch", UPSTREAM_GDM_ARCH)] {
+            let (wired, changed) = wire_greeter_impl(vendor, true, false, false);
+            assert!(changed, "{os}: upstream GDM stack must be wirable");
+            let h =
+                keyring_handoff(&wired).unwrap_or_else(|| panic!("{os}: releases a credential"));
+            assert_eq!(
+                h.complete,
+                Some("pam_gnome_keyring.so"),
+                "{os}: expected a complete hand-off, auth_only={:?}",
+                h.auth_only
+            );
+            let face = wired.find("pam_irlume.so unseal").expect("face line");
+            let gkr = wired.find("pam_gnome_keyring.so").expect("keyring module");
+            assert!(face < gkr, "{os}: our line must precede gnome-keyring's");
+        }
+    }
+
+    #[test]
+    fn a_renamed_gdm_substack_still_anchors_on_the_substack() {
+        // The named list cannot keep up with upstream renames, so an unrecognized
+        // `substack` must still be preferred over the first-auth-line guess.
+        // Otherwise the jump lands above pam_selinux_permit.so and the password
+        // substack runs anyway — the openSUSE bug, arriving via a GDM upgrade.
+        assert!(!is_passwd_substack(
+            "auth        substack      gdm-password-auth-substack",
+            "auth"
+        ));
+        let (w, changed) = wire_greeter_impl(UPSTREAM_GDM_RENAMED_SUBSTACK, true, false, false);
+        assert!(changed);
+        let lines: Vec<&str> = w.lines().collect();
+        let pos = |n: &str| lines.iter().position(|l| l.contains(n));
+        let selinux = pos("pam_selinux_permit.so").expect("selinux line");
+        let face = pos("pam_irlume.so unseal").expect("face line");
+        let substack = pos("gdm-password-auth-substack").expect("substack");
+        let landing = pos("irlume-landing").expect("landing");
+        assert!(
+            selinux < face,
+            "pam_selinux_permit must stay above our line"
+        );
+        assert!(
+            face < substack,
+            "our line must precede the password substack"
+        );
+        assert_eq!(
+            substack + 1,
+            landing,
+            "the jump must land past the substack"
+        );
+        // The hand-off still resolves, so a rename costs nothing else.
+        let h = keyring_handoff(&w).expect("releases a credential");
+        assert_eq!(h.complete, Some("pam_gnome_keyring.so"));
+    }
+
+    #[test]
+    fn the_first_auth_line_guess_stays_the_last_resort() {
+        // Anchor precedence: named stack, then any substack, then the guess.
+        let named = ["auth substack password-auth", "auth substack whatever"];
+        assert_eq!(find_auth_anchor(&named), Some(0));
+        let unnamed = ["auth required pam_env.so", "auth substack whatever"];
+        assert_eq!(
+            find_auth_anchor(&unnamed),
+            Some(1),
+            "substack beats a guess"
+        );
+        let neither = ["auth required pam_env.so", "auth required pam_unix.so"];
+        assert_eq!(
+            find_auth_anchor(&neither),
+            Some(0),
+            "guess is still the floor"
+        );
+        let none: [&str; 0] = [];
+        assert_eq!(find_auth_anchor(&none), None);
     }
 
     #[test]

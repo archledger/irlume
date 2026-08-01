@@ -45,19 +45,13 @@ pub(super) struct KeyringHandoff {
 /// they were never meant to open. The lock screen opts out a level up instead:
 /// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
 /// runs against a wallet the login already opened.
-pub(super) fn keyring_handoff(content: &str) -> Option<KeyringHandoff> {
+pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
     let lines: Vec<&str> = content.lines().collect();
     let unseal_at = lines.iter().position(|l| {
         let t = l.trim_start();
         !t.starts_with('#') && t.contains(MODULE) && t.contains("unseal")
     })?;
-    let consumer_in = |l: &str| -> Option<&'static str> {
-        let t = l.trim_start();
-        if t.starts_with('#') {
-            return None;
-        }
-        KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))
-    };
+    let consumer_in = |l: &str| consumer_active_for(l, service);
     // A given module's session line may sit anywhere in the session phase, so
     // that half is searched across the whole file; only the AUTH half is
     // order-sensitive.
@@ -68,7 +62,11 @@ pub(super) fn keyring_handoff(content: &str) -> Option<KeyringHandoff> {
                 return false;
             }
             let phase = t.strip_prefix('-').unwrap_or(t);
-            phase.split_whitespace().next() == Some("session") && t.contains(module)
+            phase.split_whitespace().next() == Some("session")
+                && t.contains(module)
+                // The session half is gated by `only_if=` exactly as the auth
+                // half is: gkr-pam checks it in `pam_sm_open_session` too.
+                && consumer_active_for(l, service).is_some()
         })
     };
     // Only lines BELOW ours can see the token we set, so the search starts past
@@ -234,7 +232,7 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
 /// Wire the `keyring` unseal line into a fingerprint login service
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
-pub(super) fn wire_fp_keyring(content: &str) -> (String, bool) {
+pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     if content.lines().any(|l| {
         let t = l.trim_start();
         !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
@@ -248,10 +246,11 @@ pub(super) fn wire_fp_keyring(content: &str) -> (String, bool) {
     // Does anything in this stack already read the token we are about to set?
     // GDM's own `gdm-fingerprint` does not, so the unseal line alone would
     // release a password into a stack with no consumer.
-    let has_consumer = lines.iter().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && KEYRING_CONSUMERS.iter().any(|m| t.contains(m))
-    });
+    // `only_if=` aware: a keyring line that stands down for THIS service is not
+    // a consumer here, however plainly it names the module.
+    let has_consumer = lines
+        .iter()
+        .any(|l| consumer_active_for(l, service).is_some());
     let mut out = Vec::with_capacity(lines.len() + 3);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());

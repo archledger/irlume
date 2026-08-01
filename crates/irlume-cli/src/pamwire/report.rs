@@ -107,7 +107,7 @@ pub(super) fn report_keyring_handoff() {
         if !content_has_module(&content) {
             continue;
         }
-        let Some(handoff) = keyring_handoff(&content) else {
+        let Some(handoff) = keyring_handoff(&content, service_name(s.etc)) else {
             continue;
         };
         // A single complete module is enough: the wallet opens. Only when none

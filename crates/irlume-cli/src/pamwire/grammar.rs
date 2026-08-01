@@ -8,7 +8,7 @@
 //! rewriting, so every distro layout irlume supports can be pinned by a unit
 //! test without touching a filesystem.
 
-use super::stanzas::MODULE;
+use super::stanzas::{KEYRING_CONSUMERS, MODULE};
 
 pub(super) fn content_has_module(c: &str) -> bool {
     c.lines().any(|l| {
@@ -141,4 +141,33 @@ pub(super) fn is_fingerprint_auth(line: &str) -> bool {
     toks.iter().any(|w| w.contains("pam_fprintd.so"))
         || (toks.iter().any(|w| *w == "substack" || *w == "include")
             && toks.iter().any(|w| w.contains("fingerprint")))
+}
+
+/// The keyring module on this line, if it is one AND it will actually do
+/// something for `service`.
+///
+/// `pam_gnome_keyring.so` accepts `only_if=<comma,separated,services>`, and for
+/// any service outside that list every one of its entry points returns
+/// `PAM_SUCCESS` immediately — it reads no token, stashes nothing, unlocks
+/// nothing. Matching the module name alone would therefore count a line that is
+/// a guaranteed no-op here as a working consumer, and report a hand-off that
+/// cannot happen: the exact false reassurance this check exists to prevent.
+///
+/// The list is matched the way gkr-pam's `evaluate_inlist` matches it — whole
+/// comma-separated items, not substrings, so `only_if=gdm` does not satisfy
+/// `gdm-fingerprint`. Any single excluding `only_if=` disables the module, since
+/// gkr ORs `ARG_IGNORE_SERVICE` in and never clears it. `pam_kwallet5.so` has no
+/// equivalent option (`only_if` appears nowhere in kwallet-pam), so this only
+/// ever narrows the gnome-keyring case.
+pub(super) fn consumer_active_for(line: &str, service: &str) -> Option<&'static str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let module = KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))?;
+    let gated_out = t
+        .split_whitespace()
+        .filter_map(|w| w.strip_prefix("only_if="))
+        .any(|list| !list.split(',').any(|item| item == service));
+    (!gated_out).then_some(module)
 }

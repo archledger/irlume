@@ -520,11 +520,10 @@ pub(crate) fn fprintd_in_sudo(pam_dir: &std::path::Path) -> bool {
         return true;
     }
     for l in sudo.lines() {
-        let t = l.trim_start();
-        if t.starts_with('#') {
-            continue;
-        }
-        let mut parts = t.split_whitespace();
+        // Directive part only, like every other PAM read in this file: a
+        // full-line comment yields "" (no tokens), and a trailing comment can
+        // never contribute an include target.
+        let mut parts = crate::pamwire::directive(l).split_whitespace();
         // `auth include system-auth` / `auth substack system-auth`, and the
         // one-word `@include common-auth` Debian form.
         let target = match (parts.next(), parts.next(), parts.next()) {

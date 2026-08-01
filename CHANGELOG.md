@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **The emitter write honours the Windows exclusive-control model.** Windows
+  permits many camera consumers but only one may modify device configuration;
+  shared consumers are read-only and inherit the controlling application's
+  settings. irlume wrote the extension-unit control whenever it captured,
+  relying on its capture failing busy afterwards anyway. `ir_emitter::enable`
+  now stands down from the write when another process already holds the camera
+  node, leaving that application's configuration untouched — the fail-safe
+  direction, since an unlit emitter degrades one capture toward the password.
+  The threat model gains a sourced section on the whole Windows camera
+  contract: the exclusive-control model, the certification tie between IR
+  capture and visible indication (and irlume's position on it), why
+  re-applying the control every capture is the deliberate answer to D3cold,
+  and what Linux does not reproduce (DeviceMFT, Enhanced Sign-in Security) and
+  irlume does not claim to. Closes #169.
+
 - **A dark or blinded IR capture reports what its evidence supports.** A dark
   burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
   even though shutters, covers, range, exposure and emitter failures all

@@ -1053,8 +1053,51 @@ fn write_if_different(
 /// hardware-target substitution through the API of the type that exists to
 /// prevent it (#189). Holding the `Arc` makes the descriptor outlive the guard
 /// by construction.
+/// PIDs (with `comm`) of OTHER processes holding `dev` open, read from
+/// `proc_root` (`/proc` in production; a constructed tree in tests).
+///
+/// The check is definitionally racy — a consumer can arrive one instant after
+/// the scan — and that is acceptable for what it guards: honouring the
+/// read-only-sharer contract for consumers that exist at decision time, not a
+/// mutual-exclusion primitive (the kernel lock does that for irlume's own
+/// processes). Unreadable entries are skipped silently: as root (the daemon)
+/// everything is readable; as an unprivileged caller the scan degrades toward
+/// empty, which fails OPEN into today's behaviour rather than inventing a
+/// phantom consumer that stands the emitter down.
+fn foreign_consumers(proc_root: &std::path::Path, dev: &str, self_pid: u32) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    if dev.is_empty() {
+        return out;
+    }
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path()).is_ok_and(|t| t.as_os_str() == std::ffi::OsStr::new(dev))
+        });
+        if holds {
+            let comm = std::fs::read_to_string(entry.path().join("comm"))
+                .map(|c| c.trim().to_string())
+                .unwrap_or_else(|_| "?".into());
+            out.push((pid, comm));
+        }
+    }
+    out
+}
+
 pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &str) -> StreamMode {
-    let _ = (card, device);
+    let _ = card;
     let fd = handle.fd();
     let setting = override_setting(std::env::var("IRLUME_IR_EMITTER"));
     let wanted = match setting {
@@ -1071,6 +1114,34 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         OverrideSetting::Absent => None,
         OverrideSetting::Control(ctrl) => Some(ctrl),
     };
+
+    // The Windows contract these modules are certified against permits many
+    // frame consumers but exactly ONE of them to modify device configuration;
+    // shared consumers are read-only and inherit the controlling application's
+    // settings (MediaCaptureSharingMode / MF FrameServer share modes: sharing
+    // instances "cannot change KSPROPERTYSETID_ExtendedCameraControl", the
+    // class the Hello extension unit belongs to). irlume used to write the
+    // control regardless, relying on its capture failing EBUSY later anyway.
+    // Honour the model instead of relying on that (#169): when another PROCESS
+    // already holds this node, stand down from the write and stream-or-fail
+    // with whatever state the controlling application chose. Inert is the
+    // fail-safe direction: an unlit emitter degrades this one capture toward
+    // the password, while a write under a foreign owner mutates a stream that
+    // application is mid-way through using. irlume-vs-irlume exclusion is
+    // handled separately by the kernel lock; this covers everyone else.
+    let foreign = foreign_consumers(std::path::Path::new("/proc"), device, std::process::id());
+    if !foreign.is_empty() {
+        let who: Vec<String> = foreign
+            .iter()
+            .take(3)
+            .map(|(pid, comm)| format!("{comm}({pid})"))
+            .collect();
+        eprintln!(
+            "irlume: not driving the IR emitter on {device}: another application holds              this camera ({}); its configuration is left untouched",
+            who.join(", ")
+        );
+        return StreamMode::inert();
+    }
 
     // Identity comes from the descriptor that will receive the write, not from a
     // path that could point somewhere else by the time the ioctl runs.
@@ -3776,6 +3847,58 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a fake /proc tree: `pids` maps a pid to (comm, fd-targets).
+    fn fake_proc(tag: &str, pids: &[(u32, &str, &[&str])]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("irlume-fproc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (pid, comm, targets) in pids {
+            let fd = root.join(pid.to_string()).join("fd");
+            std::fs::create_dir_all(&fd).unwrap();
+            std::fs::write(root.join(pid.to_string()).join("comm"), format!("{comm}\n")).unwrap();
+            for (i, t) in targets.iter().enumerate() {
+                std::os::unix::fs::symlink(t, fd.join(i.to_string())).unwrap();
+            }
+        }
+        // Non-pid entries the scanner must skip, as the real /proc has.
+        std::fs::create_dir_all(root.join("sys")).unwrap();
+        root
+    }
+
+    #[test]
+    fn foreign_consumers_finds_other_processes_holding_the_node() {
+        let root = fake_proc(
+            "basic",
+            &[
+                (1234, "chrome", &["/dev/video2", "/home/user/x.log"]),
+                (5678, "bash", &["/dev/pts/0"]),
+                (9999, "irlumed", &["/dev/video2"]), // self: must be excluded
+            ],
+        );
+        let got = foreign_consumers(&root, "/dev/video2", 9999);
+        assert_eq!(got, vec![(1234, "chrome".to_string())]);
+        // A different node has no foreign consumers here.
+        assert!(foreign_consumers(&root, "/dev/video0", 9999).is_empty());
+        // The self pid holding it is not "foreign".
+        assert!(foreign_consumers(&root, "/dev/video2", 1234).len() == 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn foreign_consumers_fails_open_on_unreadable_or_odd_trees() {
+        // A missing proc root, an empty dev, and a pid dir without fd/ must all
+        // degrade to "no foreign consumers": the guard stands the emitter down
+        // only on positive evidence, never on scan failure.
+        assert!(
+            foreign_consumers(std::path::Path::new("/nonexistent-proc"), "/dev/video2", 1)
+                .is_empty()
+        );
+        let root = fake_proc("odd", &[(4321, "sleep", &[])]);
+        std::fs::remove_dir_all(root.join("4321").join("fd")).unwrap();
+        assert!(foreign_consumers(&root, "/dev/video2", 1).is_empty());
+        assert!(foreign_consumers(&root, "", 1).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// A caught signal must set the flag the measurement loop polls, and the
     /// guard must hand the signal back to whatever disposition it displaced.

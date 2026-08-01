@@ -63,7 +63,7 @@ pub(super) const KEYRING_UNSEAL: &str =
 /// removes exactly ours and never a keyring line the distro shipped. Linux-PAM
 /// strips a trailing `#` comment before tokenizing (verified against
 /// `pam_exec.so`: an argument survives, a trailing comment does not), so this is
-/// invisible to the module — which matters here because gnome-keyring's
+/// invisible to the module, which matters here because gnome-keyring's
 /// `parse_args` syslogs a warning for every option it does not recognize.
 pub(super) const KEYRING_TAG: &str = "# irlume-keyring";
 

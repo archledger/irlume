@@ -158,15 +158,15 @@ On Plasma the chain is: `plasmalogin` runs irlume's `unseal` line, which sets th
 released password as `PAM_AUTHTOK`; `pam_kwallet5.so`'s **auth** line reads that
 token and stashes the derived key; its **session** line starts the wallet daemon
 (`ksecretd` on Plasma 6, `kwalletd6`/`kwalletd5` before it) and hands the key
-over. Both halves are required — kwallet-pam stashes with `pam_set_data` during
+over. Both halves are required: kwallet-pam stashes with `pam_set_data` during
 auth and only acts on it in `pam_sm_open_session`. irlume owns only the first
 step, so two things must be true of the rest:
 
-- **kwallet-pam is installed** — the module is `pam_kwallet5.so`, still that name
+- **kwallet-pam is installed**: the module is `pam_kwallet5.so`, still that name
   under Plasma 6 (upstream's CMake sets `library_name "pam_kwallet5"` on the KF6
   branch). Fedora additionally lists a legacy `pam_kwallet.so`.
 - **Its auth line sits BELOW irlume's**, with a session line for the *same*
-  module. Above ours it runs before the token exists — and kwallet-pam then
+  module. Above ours it runs before the token exists, and kwallet-pam then
   prompts for the password itself, which is exactly the "it asked me anyway"
   symptom.
 
@@ -177,7 +177,7 @@ given, which is why the greeter is the right place for this and a TTY login is
 not.
 
 `irlume login status` (and `login enable --apply`) checks both halves, paired per
-module, and warns — so a wallet that still prompts after a face login names its
+module, and warns, so a wallet that still prompts after a face login names its
 own cause instead of looking like a face-login failure:
 
 ```
@@ -189,7 +189,7 @@ Fedora, Arch and Debian all ship a `plasmalogin` with both halves present, so th
 check stays quiet there. **openSUSE's upstream file carries no keyring module at
 all**, so face login on stock openSUSE releases a password nothing reads; the
 warning above is the expected output until `pam_kwallet5.so` is added to that
-stack. Adding it needs both lines — for example:
+stack. Adding it needs both lines, for example:
 
 ```
 -auth    optional    pam_kwallet5.so
@@ -203,22 +203,22 @@ it.)
 
 One more requirement is outside PAM: your **wallet password must equal your login
 password**, since that is the password `keyring arm` seals. A wallet created with
-a different password cannot be opened on this path — change it under *System
+a different password cannot be opened on this path; change it under *System
 Settings → KDE Wallet*, or remove and recreate the wallet.
 
 **Fingerprint on KDE.** Plasma's login greeter runs ONE PAM stack for user
 authentication: plasma-login-manager's PAM backend selects only `plasmalogin`
-(plus `plasmalogin-greeter` for the greeter user and `plasmalogin-autologin`) —
+(plus `plasmalogin-greeter` for the greeter user and `plasmalogin-autologin`);
 it has no separate fingerprint service, unlike kscreenlocker, which drives the
 *lock screen* through the `kde` / `kde-fingerprint` / `kde-smartcard` triple.
 So a fingerprint login at the KDE greeter happens when your distro's shared
 stack carries `pam_fprintd.so` (that is what `irlume fingerprint enable` wires,
 via authselect on Fedora or pam-auth-update on Debian), inside the same
 `plasmalogin` transaction. A fingerprint provides no password, so irlume's
-`keyring` line — wired into the greeter whenever a reader is present — releases
+`keyring` line, wired into the greeter whenever a reader is present, releases
 the TPM-sealed login password at the post-auth landing, and `pam_kwallet5.so`
 below it opens the wallet: a cold-boot fingerprint login unlocks KWallet with
-no prompt, same as face. The lock screen needs none of this — a warm unlock
+no prompt, same as face. The lock screen needs none of this: a warm unlock
 meets a wallet the login already opened.
 
 #### GNOME: what has to be in place for the login keyring
@@ -232,18 +232,18 @@ the daemon. Both halves are required, for the same reason as KWallet:
 Two differences from KDE are worth knowing:
 
 - **`auto_start` is real here.** gnome-keyring parses it (`ARG_AUTO_START`) and
-  needs it on the session line to start the daemon — the opposite of kwallet,
+  needs it on the session line to start the daemon, the opposite of kwallet,
   which ignores the option entirely. Upstream GDM already ships
   `session optional pam_gnome_keyring.so auto_start`.
 - **Failure is silent.** With no `PAM_AUTHTOK`, gnome-keyring's auth phase logs
   "no password is available for user" and returns success without prompting.
   kwallet prompts; gnome-keyring does not. So a mis-ordered line costs you
-  nothing visible at the login screen — the keyring simply stays locked, and you
+  nothing visible at the login screen; the keyring simply stays locked, and you
   only find out when an application asks for a secret. That is exactly the case
   `irlume login status` now names.
 - **`only_if=` can switch it off per service.** A line such as
   `-auth optional pam_gnome_keyring.so only_if=gdm,gdm-password` does nothing at
-  all on any other service — on `gdm-fingerprint`, for instance, it returns
+  all on any other service; on `gdm-fingerprint`, for instance, it returns
   success without reading the token. irlume evaluates that list per service, so
   a line gated off for the stack being checked is not counted as unlocking
   anything. `pam_kwallet5.so` has no such option.

@@ -1875,6 +1875,34 @@ fn content_has_module(c: &str) -> bool {
     c.lines().any(|l| directive(l).contains(MODULE))
 }
 
+/// True when any line's DIRECTIVE part ends in a `\` continuation.
+///
+/// libpam's line assembler joins such a line with the next one before
+/// tokenizing, so a two-physical-line entry is ONE line to PAM. Everything
+/// here is line-oriented, and on a continued file the two views disagree.
+/// Worse than mis-reading: inserting a stanza directly after a continued
+/// anchor would splice our text into the MIDDLE of the logical line PAM
+/// evaluates, corrupting the stack on write.
+///
+/// The semantics are pinned empirically against `pam_exec.so`:
+///   * a trailing `\` on a directive continues — the next physical line's
+///     text executed as this line's arguments;
+///   * whitespace AFTER the backslash does not defuse it (still continues);
+///   * a `\` at the end of a COMMENT does not continue — both lines ran.
+///
+/// Hence the check runs on `directive()` output with trailing space trimmed.
+///
+/// No upstream stack irlume pins uses continuations, so the fail-safe answer
+/// is to notice and stand down: the wiring transforms refuse the file
+/// (staged, never written — the same contract as a missing anchor), and the
+/// hand-off advisory stays silent rather than reporting from an analysis
+/// that cannot see the file the way PAM does.
+fn has_line_continuation(content: &str) -> bool {
+    content
+        .lines()
+        .any(|l| directive(l).trim_end().ends_with('\\'))
+}
+
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
 /// can't skip: Debian's `@include common-auth`/`login`, Arch's
 /// `auth include system-login`/`system-local-login`/`system-auth`, or a bare
@@ -2032,6 +2060,11 @@ struct KeyringHandoff {
 /// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
 /// runs against a wallet the login already opened.
 fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
+    // A continued file cannot be judged line-by-line; silence beats a verdict
+    // reached on lines PAM does not evaluate as written.
+    if has_line_continuation(content) {
+        return None;
+    }
     let lines: Vec<&str> = content.lines().collect();
     let unseal_at = lines.iter().position(|l| {
         let d = directive(l);
@@ -2127,6 +2160,9 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
     if !face && !keyring {
         return (content.to_string(), false);
     }
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -2211,6 +2247,9 @@ fn wire_greeter_impl(content: &str, face: bool, keyring: bool, ondemand: bool) -
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
 fn wire_lock(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -2251,6 +2290,9 @@ fn wire_lock(content: &str) -> (String, bool) {
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
 fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content.lines().any(|l| {
         let d = directive(l);
         d.contains(MODULE) && d.contains("keyring")
@@ -2322,6 +2364,9 @@ fn is_fingerprint_auth(line: &str) -> bool {
 /// on a failed face would then fail the whole prompt instead of falling back to
 /// the password.
 fn wire_verify_service(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -4122,6 +4167,13 @@ auth       optional      pam_gnome_keyring.so\n";
         );
         assert_eq!(directive("# whole line comment"), "");
         assert_eq!(directive(""), "");
+        // libpam truncates at '#' even mid-token (pam_exec received `arg` from
+        // a literal `arg#embedded`), so cutting at the FIRST '#' anywhere is
+        // the faithful reading, not an approximation.
+        assert_eq!(
+            directive("auth optional pam_unix.so arg#embedded"),
+            "auth optional pam_unix.so arg"
+        );
     }
 
     #[test]
@@ -4199,6 +4251,80 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             out.contains("-auth      optional      pam_gnome_keyring.so\n"),
             "the distro's untagged keyring line survives"
         );
+    }
+
+    #[test]
+    fn line_continuation_semantics_match_the_pam_assembler() {
+        // Each row was executed against libpam via pam_exec.so:
+        // a trailing backslash on a directive joins the NEXT physical line into
+        // this one (the module received the next line's text as its argument);
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh \\\n  CONT\n"
+        ));
+        // whitespace after the backslash does not defuse it (the follow-up
+        // line was still swallowed);
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh A \\   \n"
+        ));
+        // a backslash at the end of a COMMENT does not continue (both modules
+        // ran as separate lines);
+        assert!(!has_line_continuation(
+            "auth optional pam_exec.so run.sh FIRST # note \\\nauth optional pam_exec.so run.sh SECOND\n"
+        ));
+        // and a whole-line comment ending in a backslash is still just a comment.
+        assert!(!has_line_continuation("# just a comment \\\n"));
+        // A backslash mid-line is an ordinary character, not a continuation.
+        assert!(!has_line_continuation(
+            "auth optional pam_unix.so arg\\more\n"
+        ));
+    }
+
+    #[test]
+    fn a_stack_using_line_continuations_is_never_rewritten() {
+        // PAM evaluates a continued pair as ONE logical line, so a line-based
+        // insertion after the anchor would splice our stanza into the middle of
+        // it. Every transform must refuse the whole file: staged-never-written,
+        // the same contract as a missing anchor.
+        let cont =
+            "#%PAM-1.0\nauth substack \\\n    password-auth\nsession include password-auth\n";
+        assert!(has_line_continuation(cont));
+        let (g, changed) = wire_greeter_impl(cont, true, true, true);
+        assert!(!changed);
+        assert_eq!(g, cont);
+        let (l, changed) = wire_lock(cont);
+        assert!(!changed);
+        assert_eq!(l, cont);
+        let (v, changed) = wire_verify_service(cont);
+        assert!(!changed);
+        assert_eq!(v, cont);
+        let fp = "auth required pam_fprintd.so \\\n    likeauth\n";
+        let (f, changed) = wire_fp_keyring(fp, "gdm-fingerprint");
+        assert!(!changed);
+        assert_eq!(f, fp);
+        // The advisory stays silent too: a verdict from lines PAM does not
+        // evaluate as written would be worse than no verdict.
+        let wired = "auth sufficient pam_irlume.so unseal ondemand\n\
+-auth optional pam_kwallet5.so \\\n    someopt\n";
+        assert!(keyring_handoff(wired, "plasmalogin").is_none());
+    }
+
+    #[test]
+    fn no_upstream_fixture_uses_line_continuations() {
+        // What makes the refusal gate behaviour-neutral on real stacks. If a
+        // distro starts shipping continuations, this fails and the gate needs
+        // real assembly support instead of refusal.
+        for (name, body) in [
+            ("plasmalogin fedora", UPSTREAM_FEDORA),
+            ("plasmalogin arch", UPSTREAM_ARCH),
+            ("plasmalogin debian", UPSTREAM_DEBIAN),
+            ("plasmalogin suse", UPSTREAM_SUSE),
+            ("gdm redhat", UPSTREAM_GDM_REDHAT),
+            ("gdm arch", UPSTREAM_GDM_ARCH),
+            ("gdm renamed", UPSTREAM_GDM_RENAMED_SUBSTACK),
+            ("gdm fingerprint", UPSTREAM_GDM_FINGERPRINT),
+        ] {
+            assert!(!has_line_continuation(body), "{name}");
+        }
     }
 
     #[test]

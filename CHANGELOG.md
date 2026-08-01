@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A stack using backslash line continuations is refused, not corrupted.**
+  libpam's line assembler joins a directive ending in `\` with the next
+  physical line before tokenizing (whitespace after the backslash does not
+  defuse it; a backslash ending a comment does not continue — all three pinned
+  by experiment against `pam_exec.so`). irlume edits stacks line-by-line, so
+  on such a file every matcher reads a different unit than PAM evaluates, and
+  inserting a stanza directly after a continued anchor would splice irlume's
+  text into the middle of the neighbouring logical line — corrupting the auth
+  stack on write. Continuations are now detected up front: the wiring
+  transforms decline the whole file (staged, never written — the same contract
+  as a missing anchor) and the keyring hand-off advisory stays silent rather
+  than judging lines PAM does not see as written. No upstream `plasmalogin` or
+  `gdm-password` stack uses continuations, so behaviour on real systems is
+  unchanged; a test now pins that assumption too.
+
 - **A module named only in a comment counted as configured.** libpam strips a
   trailing `#` comment before tokenizing a stack line, so `auth required
   pam_unix.so  # was pam_irlume.so` loads no irlume module at all. Every

@@ -9,7 +9,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 - **The fingerprint-enable gate could pass on a comment.** `pam_fprintd_wired`
   matched raw lines, so a stack whose only `pam_fprintd.so` sat in a trailing
-  comment counted as wired — libpam tokenizes nothing after the first `#`, so
+  comment counted as wired; libpam tokenizes nothing after the first `#`, so
   no fingerprint prompt exists there. Recording a method on that gate, with
   `--fingerprint-only`, stands face down on a box where no biometric answers
   any prompt: the precise outcome the gate exists to prevent. The scan (and
@@ -18,24 +18,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 - **`fingerprint enable` says which prompts a finger actually answers, instead
   of implying all of them.** The gate before recording the method asked only
-  "does an active `pam_fprintd.so` line exist in some live stack" — the right
+  "does an active `pam_fprintd.so` line exist in some live stack". That is the right
   gate (face must not stand down while nothing drives a prompt) but the wrong
   report: on the issue-#155 Ubuntu box the only carrier was `gdm-fingerprint`,
   so the success message promised finger unlock on a machine whose sudo and
   console login had no fingerprint path at all. `enable` (and
-  `fingerprint status`) now print per-surface coverage — login screens, lock
-  screens, console login, sudo — resolved the way libpam actually evaluates a
+  `fingerprint status`) now print per-surface coverage (login screens, lock
+  screens, console login, sudo), resolved the way libpam actually evaluates a
   stack: `auth include`/`substack` chains followed transitively, the Debian
   `@include` form included, non-auth includes contributing nothing, and
   include targets opened by name even when dotted (each behaviour pinned by
   experiment against `pam_exec.so`; the authselect templates confirm Fedora's
   `with-fingerprint` lands in `system-auth`, which is why one line covers
   nearly everything there and one line covers almost nothing on the Ubuntu
-  layout). The gate itself is unchanged, so the documented Arch flow — add the
-  line to `system-local-login`, re-run — still enables, and now states that it
+  layout). The gate itself is unchanged, so the documented Arch flow (add the
+  line to `system-local-login`, re-run) still enables, and now states that it
   covered console login and not sudo. When the line reaches none of the
   tracked surfaces, the report says that too. A file using backslash line
-  continuations contributes nothing to coverage — libpam joins those lines
+  continuations contributes nothing to coverage: libpam joins those lines
   before tokenizing, so a physical line that looks like an auth fingerprint
   line can be the tail of another directive's arguments (verified: the spliced
   line never ran), and under-reporting is the safe direction where

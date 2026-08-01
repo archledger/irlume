@@ -94,7 +94,7 @@ fn status(user: &str) -> ExitCode {
         policy::method().as_str()
     );
     // Coverage rides on status too (read-only), so "which prompts does my
-    // finger answer" is checkable any time — not only in enable's output the
+    // finger answer" is checkable any time, not only in enable's output the
     // one time it scrolled past. Shown only when a line is wired at all: on a
     // face-only box the table would be twelve ✗ rows of noise.
     if pam_fprintd_wired(std::path::Path::new(PAM_DIR)) {
@@ -444,13 +444,13 @@ const PAM_DIR: &str = "/etc/pam.d";
 /// Does `text` contain an ACTIVE line whose DIRECTIVE part references
 /// `needle`?
 ///
-/// The directive part — everything before the first `#`, which is all libpam
-/// tokenizes — matters here more than anywhere: this feeds
+/// The directive part, everything before the first `#` (all libpam
+/// tokenizes), matters here more than anywhere: this feeds
 /// [`pam_fprintd_wired`], the gate that keeps `fingerprint enable` from
 /// recording a method nothing drives. Matching the raw line let a stack whose
 /// only `pam_fprintd.so` lived in a trailing comment pass that gate; with
 /// `--fingerprint-only` that stood face down on a box where no biometric
-/// answers any prompt — the precise outcome the gate exists to prevent.
+/// answers any prompt, the precise outcome the gate exists to prevent.
 /// `faillock_cohabits` (a doctor warning) and `fprintd_in_sudo` (the SSH
 /// stall warning) inherit the same comment semantics through this function.
 fn has_active_line(text: &str, needle: &str) -> bool {
@@ -548,7 +548,7 @@ pub(crate) fn fprintd_in_sudo(pam_dir: &std::path::Path) -> bool {
 ///
 /// These are the same surfaces `login enable` knows how to wire for face, plus
 /// the fingerprint-specific services (`gdm-fingerprint`, `kde-fingerprint`)
-/// and `login`, the console — the issue-#155 box had a covered greeter and an
+/// and `login`, the console; the issue-#155 box had a covered greeter and an
 /// uncovered console, and only a list that names both can say so.
 const FP_SURFACES: &[(&str, &str)] = &[
     (
@@ -576,11 +576,11 @@ const FP_SURFACES: &[(&str, &str)] = &[
 /// `pam_exec.so` tracing which modules execute):
 ///
 ///   * `auth include X` / `auth substack X` pull in X's auth lines, and X's
-///     own includes resolve too — a module two levels down executed;
+///     own includes resolve too (a module two levels down executed);
 ///   * `@include X` (the Debian form) reaches X's auth lines the same way;
-///   * a `session include X` contributes NOTHING to authentication — a
-///     session line in an included file did not run during `pam_authenticate`
-///     — so only auth-phase includes are followed;
+///   * a `session include X` contributes NOTHING to authentication (a
+///     session line in an included file did not run during `pam_authenticate`),
+///     so only auth-phase includes are followed;
 ///   * PAM opens include targets by NAME, dotted or not: `auth include
 ///     system-auth.custom` executed its module. This is why the walk reads
 ///     files by name instead of reusing [`live_pam_stacks`], whose dot filter
@@ -602,7 +602,7 @@ pub(crate) fn stack_reaches_fprintd(pam_dir: &std::path::Path, service: &str) ->
         // A `\`-continued file defeats line-oriented reading: libpam joins
         // those lines before tokenizing, so a physical line that LOOKS like
         // `auth ... pam_fprintd.so` can really be the tail of a session
-        // directive's arguments — executed never, in any phase (verified: the
+        // directive's arguments, executed never, in any phase (verified: the
         // spliced line did not run under pam_authenticate). Claiming coverage
         // from such a line would rebuild the exact over-promise this walker
         // exists to end, so a continued file contributes nothing: false is the
@@ -645,7 +645,7 @@ pub(crate) fn stack_reaches_fprintd(pam_dir: &std::path::Path, service: &str) ->
 }
 
 /// Per-surface fingerprint coverage: which of the stacks present on this
-/// machine reach a pam_fprintd prompt. This is the answer #155 asked for —
+/// machine reach a pam_fprintd prompt. This is the answer #155 asked for;
 /// `pam_fprintd_wired` says "an active line exists somewhere", which is the
 /// right GATE (face must not stand down while nothing drives a prompt), but
 /// the wrong REPORT: on the observed Ubuntu box the only carrier was
@@ -668,7 +668,7 @@ fn report_fprintd_coverage(pam_dir: &std::path::Path) {
     if cov.is_empty() {
         return;
     }
-    println!("[fingerprint] coverage — where a finger can answer the prompt:");
+    println!("[fingerprint] coverage, where a finger can answer the prompt:");
     for (svc, label, reaches) in &cov {
         println!("    {} {label}  ({svc})", if *reaches { "✓" } else { "✗" });
     }
@@ -754,7 +754,7 @@ mod tests {
         assert!(!pam_fprintd_wired(&dir));
         // Nor a TRAILING comment: libpam tokenizes only up to the first '#',
         // so this stack drives no fingerprint prompt. Passing the gate here
-        // records a method nothing serves — with --fingerprint-only, face
+        // records a method nothing serves; with --fingerprint-only, face
         // stands down on a box where no biometric answers any prompt.
         std::fs::write(
             dir.join("sudo"),
@@ -876,7 +876,7 @@ auth        include       postlogin\n",
     fn arch_documented_flow_reports_what_the_admin_line_reaches() {
         // The Arch/Other instructions tell the admin to add the line to
         // system-local-login (and/or sudo) and re-run. Coverage must credit
-        // exactly what that line reaches — console login via its include —
+        // exactly what that line reaches, console login via its include,
         // without pretending sudo gained a path it did not.
         let dir = pam_dir(
             "arch",
@@ -927,8 +927,8 @@ auth        include       postlogin\n",
         std::fs::remove_dir_all(&dir).unwrap();
         // 3. PAM opens include targets by NAME, dotted included (the module in
         //    system-auth.custom ran). The old any-live-file bool misses this
-        //    file entirely — its dot filter is right for enumeration and wrong
-        //    for include targets — so coverage can be true where wired() is
+        //    file entirely (its dot filter is right for enumeration and wrong
+        //    for include targets), so coverage can be true where wired() is
         //    false.
         let dir = pam_dir(
             "dotted",
@@ -967,7 +967,7 @@ auth        include       postlogin\n",
     fn a_continued_file_never_claims_coverage() {
         // libpam joins a `\`-continued line with the next one before
         // tokenizing, so the physical line `auth optional pam_fprintd.so`
-        // below is really the tail of the SESSION directive's arguments —
+        // below is really the tail of the SESSION directive's arguments,
         // verified: it does not run during pam_authenticate. Reading it as an
         // auth line would report a finger answering a prompt it cannot,
         // the exact over-promise this walker exists to end.

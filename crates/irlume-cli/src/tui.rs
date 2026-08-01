@@ -1151,7 +1151,7 @@ impl App {
         // Method ↔ PAM-wiring coherence: competing biometric stacks intercept
         // each other's prompts; a chosen method that isn't wired does nothing.
         // Matched on the DIRECTIVE part (everything before the first '#', all
-        // libpam tokenizes), via the same shared semantics as the wiring — a
+        // libpam tokenizes), via the same shared semantics as the wiring: a
         // module named only in a trailing comment is not wired, and reading it
         // as wired would suppress this exact Fail diagnostic.
         let pam_has = |needle: &str| {

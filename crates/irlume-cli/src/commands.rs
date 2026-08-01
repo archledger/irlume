@@ -293,7 +293,7 @@ fn ppa_serves(codename: &str) -> Option<bool> {
 /// tests used to point this code at a fake curl by prepending to PATH and
 /// steering it through FAKE_CURL_MODE, but `std::env::set_var` is unsafe with
 /// any concurrent env reader, and PATH is read by every `Command` any other
-/// test spawns in parallel — a race that produced one false CI failure on an
+/// test spawns in parallel, a race that produced one false CI failure on an
 /// unrelated PR per sighting. A parameter is a value: nothing global, nothing
 /// racing.
 fn ppa_serves_via(curl: &std::path::Path, codename: &str) -> Option<bool> {
@@ -395,7 +395,7 @@ fn installed_version(origin: &InstallOrigin) -> String {
     )
 }
 
-/// [`installed_version`] with the package-manager binaries injected — the same
+/// [`installed_version`] with the package-manager binaries injected, the same
 /// #194 seam as [`ppa_serves_via`], so the test fakes are arguments instead of
 /// PATH mutations.
 fn installed_version_via(
@@ -475,7 +475,7 @@ fn latest_release() -> LatestRelease {
     latest_release_via(std::path::Path::new("curl"))
 }
 
-/// [`latest_release`] with curl injected — the #194 seam again.
+/// [`latest_release`] with curl injected, the #194 seam again.
 fn latest_release_via(curl: &std::path::Path) -> LatestRelease {
     let offline = LatestRelease {
         tag: None,
@@ -1665,7 +1665,7 @@ mod origin_tests {
     /// the write-open fd until that child's own exec closes it (CLOEXEC), and
     /// exec of this script fails ETXTBSY while any such fd exists. Every
     /// captured failure payload was the probe's spawn-Err fallback (`None` /
-    /// the binary's own version), never wrong content — including both CI
+    /// the binary's own version), never wrong content, including both CI
     /// sightings, whose signatures match this and not the env theory (the env
     /// writers were already serialized by ENV_LOCK when CI flaked). Once one
     /// exec succeeds the file is permanently safe: the parent's fd is closed,

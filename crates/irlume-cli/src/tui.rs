@@ -2463,7 +2463,12 @@ impl App {
                 // schedule the suspend, which is the existing shape of every
                 // other consequential route here.
                 self.confirm = Some((
-                    "Tune capture mode? This holds the camera and fires the IR                      emitter for up to a minute, then stores the verdict in                      /etc/irlume/cameras.conf. Your password will be requested."
+                    concat!(
+                        "Tune capture mode? This holds the camera and fires the ",
+                        "IR emitter for up to a minute, then stores the verdict ",
+                        "in /etc/irlume/cameras.conf. Your password will be ",
+                        "requested."
+                    )
                         .into(),
                     "Tune",
                     ConfirmAct::Sus(Suspend::CameraTune),

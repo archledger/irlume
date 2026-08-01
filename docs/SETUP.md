@@ -206,6 +206,21 @@ password**, since that is the password `keyring arm` seals. A wallet created wit
 a different password cannot be opened on this path — change it under *System
 Settings → KDE Wallet*, or remove and recreate the wallet.
 
+**Fingerprint on KDE.** Plasma's login greeter runs ONE PAM stack for user
+authentication: plasma-login-manager's PAM backend selects only `plasmalogin`
+(plus `plasmalogin-greeter` for the greeter user and `plasmalogin-autologin`) —
+it has no separate fingerprint service, unlike kscreenlocker, which drives the
+*lock screen* through the `kde` / `kde-fingerprint` / `kde-smartcard` triple.
+So a fingerprint login at the KDE greeter happens when your distro's shared
+stack carries `pam_fprintd.so` (that is what `irlume fingerprint enable` wires,
+via authselect on Fedora or pam-auth-update on Debian), inside the same
+`plasmalogin` transaction. A fingerprint provides no password, so irlume's
+`keyring` line — wired into the greeter whenever a reader is present — releases
+the TPM-sealed login password at the post-auth landing, and `pam_kwallet5.so`
+below it opens the wallet: a cold-boot fingerprint login unlocks KWallet with
+no prompt, same as face. The lock screen needs none of this — a warm unlock
+meets a wallet the login already opened.
+
 #### GNOME: what has to be in place for the login keyring
 
 Same shape, different module. `gdm-password` runs irlume's `unseal` line, which

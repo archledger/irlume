@@ -2351,6 +2351,31 @@ pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Res
 /// anything changed can be undone.
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
+    // Refuse before anything touches the camera. An engaged shutter blanks the
+    // sensor to a flat frame (ASUS 3277:0059, eight frames per state: released
+    // mean 37.0 stddev 62.68, engaged a constant 144.0 stddev 0.00 with
+    // `privacy` reading 1 throughout), so every exploratory write would be
+    // spent measuring a constant, and discovery would then report "no usable
+    // emitter control" about a camera whose shutter is merely shut (#186).
+    // Every capture entry point already refuses this way; the one path that
+    // WRITES firmware must too. An undo record pending on this camera loses
+    // nothing: it is durable, `doctor` reports it, and recovery re-runs on the
+    // next capture or setup once the shutter is released — the same stance as
+    // `IRLUME_IR_EMITTER=off`.
+    //
+    // No test can stage this branch: `privacy` is a real V4L2 control, no fake
+    // provides it, and `verify_pinned` above rejects loopback devices before
+    // this line is reached. It is exercised on hardware only, with the
+    // machine's own E-shutter key (the capture-path guards above share this
+    // limit).
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!(
+            "{device}: the hardware privacy shutter is engaged (the `privacy` \
+             control reads 1), so the sensor returns a blank frame and \
+             discovery would measure nothing; release the shutter and re-run \
+             ir-setup"
+        )));
+    }
     // Declared first, so it is dropped LAST: the guard that puts the control
     // back lives inside `discover` (or inside `found` on the success path) and
     // has to finish before this re-raises the signal that stops the process.

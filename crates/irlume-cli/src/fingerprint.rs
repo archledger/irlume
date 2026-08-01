@@ -591,6 +591,18 @@ pub(crate) fn stack_reaches_fprintd(pam_dir: &std::path::Path, service: &str) ->
         let Ok(text) = std::fs::read_to_string(pam_dir.join(name)) else {
             return false;
         };
+        // A `\`-continued file defeats line-oriented reading: libpam joins
+        // those lines before tokenizing, so a physical line that LOOKS like
+        // `auth ... pam_fprintd.so` can really be the tail of a session
+        // directive's arguments — executed never, in any phase (verified: the
+        // spliced line did not run under pam_authenticate). Claiming coverage
+        // from such a line would rebuild the exact over-promise this walker
+        // exists to end, so a continued file contributes nothing: false is the
+        // safe direction (an uncovered surface asks the user to check; a
+        // covered one tells them to rely on it).
+        if crate::pamwire::has_line_continuation(&text) {
+            return false;
+        }
         for line in text.lines() {
             let d = crate::pamwire::directive(line);
             let mut toks = d.split_whitespace();
@@ -931,6 +943,51 @@ auth        include       postlogin\n",
         assert!(!stack_reaches_fprintd(&dir2, "login"));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn a_continued_file_never_claims_coverage() {
+        // libpam joins a `\`-continued line with the next one before
+        // tokenizing, so the physical line `auth optional pam_fprintd.so`
+        // below is really the tail of the SESSION directive's arguments —
+        // verified: it does not run during pam_authenticate. Reading it as an
+        // auth line would report a finger answering a prompt it cannot,
+        // the exact over-promise this walker exists to end.
+        let dir = pam_dir(
+            "splice",
+            &[(
+                "login",
+                "session optional pam_exec.so /bin/true \\\nauth optional pam_fprintd.so\n",
+            )],
+        );
+        assert!(!stack_reaches_fprintd(&dir, "login"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The refusal is per FILE, reached through includes too: a clean
+        // service including a continued file gains nothing from it.
+        let dir = pam_dir(
+            "splice-included",
+            &[
+                ("login", "auth include tangled\n"),
+                (
+                    "tangled",
+                    "auth optional pam_unix.so \\\n   nullok\nauth sufficient pam_fprintd.so\n",
+                ),
+            ],
+        );
+        assert!(!stack_reaches_fprintd(&dir, "login"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        // And a clean sibling path still resolves: only the continued file is
+        // opaque, not the whole walk.
+        let dir = pam_dir(
+            "splice-sibling",
+            &[
+                ("login", "auth include tangled\nauth include clean\n"),
+                ("tangled", "auth optional pam_unix.so \\\n   nullok\n"),
+                ("clean", "auth sufficient pam_fprintd.so\n"),
+            ],
+        );
+        assert!(stack_reaches_fprintd(&dir, "login"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -195,7 +195,7 @@ pub(crate) fn directive(line: &str) -> &str {
 /// (staged, never written — the same contract as a missing anchor), and the
 /// hand-off advisory stays silent rather than reporting from an analysis
 /// that cannot see the file the way PAM does.
-pub(super) fn has_line_continuation(content: &str) -> bool {
+pub(crate) fn has_line_continuation(content: &str) -> bool {
     content
         .lines()
         .any(|l| directive(l).trim_end().ends_with('\\'))

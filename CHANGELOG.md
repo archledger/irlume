@@ -25,7 +25,12 @@ All notable changes to irlume are documented here. This project adheres to
   layout). The gate itself is unchanged, so the documented Arch flow — add the
   line to `system-local-login`, re-run — still enables, and now states that it
   covered console login and not sudo. When the line reaches none of the
-  tracked surfaces, the report says that too. Closes #155.
+  tracked surfaces, the report says that too. A file using backslash line
+  continuations contributes nothing to coverage — libpam joins those lines
+  before tokenizing, so a physical line that looks like an auth fingerprint
+  line can be the tail of another directive's arguments (verified: the spliced
+  line never ran), and under-reporting is the safe direction where
+  over-reporting is the defect this exists to fix. Closes #155.
 - **The wallet hand-off check was blind to the fingerprint path.** It anchored
   on the face `unseal` line, but the post-auth `keyring` line releases the same
   sealed password — and on a fingerprint-only box the greeter carries ONLY that

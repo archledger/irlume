@@ -3601,11 +3601,19 @@ mod tests {
     // reaches the user as "KWallet asks for its password even though face login
     // worked". These pin the detection of that state.
 
-    // The four `plasmalogin` stacks Plasma Login Manager actually ships, copied
-    // verbatim from upstream `data/pam/<os>/plasmalogin` (KDE/plasma-login-manager).
-    // Its CMake installs them to ${prefix}/lib/pam.d, which is the vendor path
-    // irlume materializes its /etc override from. Held verbatim so a distro
-    // rewrite shows up here as a failing test rather than as a silent wallet.
+    // The four `plasmalogin` stacks Plasma Login Manager actually ships.
+    //
+    // Source: KDE/plasma-login-manager @ master, `data/pam/<os>/plasmalogin`.
+    // Its CMake installs them to `${prefix}/lib/pam.d`, which is the vendor path
+    // irlume materializes its /etc override from.
+    //
+    // BYTE-FOR-BYTE, comments and blank lines included. That is load-bearing, not
+    // tidiness: these pin what irlume's wiring is checked against, so a fixture
+    // that has been "cleaned up" is a fixture that no longer describes any real
+    // machine. An earlier revision of these constants had the comments stripped
+    // and, in the Debian file, had silently lost a `session required pam_env.so`
+    // directive along with them. Re-check with a diff against upstream rather
+    // than by eye.
 
     const UPSTREAM_FEDORA: &str = r#"auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so
 auth        substack      password-auth
@@ -3634,6 +3642,9 @@ session     include       postlogin
 
     const UPSTREAM_ARCH: &str = r#"#%PAM-1.0
 
+# SPDX-License-Identifier: CC0-1.0
+# SPDX-FileCopyrightText: none
+
 auth        include     system-login
 -auth       optional    pam_gnome_keyring.so
 -auth       optional    pam_kwallet5.so
@@ -3650,22 +3661,49 @@ session     include     system-login
 "#;
 
     const UPSTREAM_DEBIAN: &str = r#"#%PAM-1.0
+
+# Block login if they are globally disabled
 auth    requisite       pam_nologin.so
 auth    required        pam_succeed_if.so user != root quiet_success
+
+# auth    sufficient      pam_succeed_if.so user ingroup nopasswdlogin
 @include common-auth
+
+# gnome_keyring breaks QProcess
 -auth   optional        pam_gnome_keyring.so
 -auth   optional        pam_kwallet5.so
+
 @include common-account
+
+# SELinux needs to be the first session rule.  This ensures that any
+# lingering context has been cleared.  Without this it is possible that a
+# module could execute code in the wrong domain.
 session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so close
+
+# Create a new session keyring.
 session optional        pam_keyinit.so force revoke
 session required        pam_limits.so
 session required        pam_loginuid.so
+
 @include common-session
+
+# SELinux needs to intervene at login time to ensure that the process starts
+# in the proper default security context.  Only sessions which are intended
+# to run in the user's context should be run after this.
 session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so open
 -session optional       pam_gnome_keyring.so auto_start
 -session optional       pam_kwallet5.so auto_start
+
 @include common-password
+
+# From the pam_env man page
+# Since setting of PAM environment variables can have side effects to other modules, this module should be the last one on the stack.
+
+# Load environment from /etc/environment
 session required        pam_env.so
+
+# Load environment from /etc/default/locale and ~/.pam_environment
+session required        pam_env.so envfile=/etc/default/locale user_readenv=1
 "#;
 
     /// openSUSE's upstream `plasmalogin` carries NO keyring module at all.
@@ -3680,6 +3718,7 @@ session  required       pam_loginuid.so
 session  optional       pam_keyinit.so revoke force
 session  substack       common-session
 session  include        postlogin-session
+
 "#;
 
     #[test]
@@ -3712,8 +3751,10 @@ session  include        postlogin-session
         }
     }
 
-    // GDM's shipped stacks, verbatim from upstream `data/pam-<os>/gdm-password.pam`
-    // (GNOME/gdm). Redhat is the released 50.0 form; Arch is the include layout.
+    // GDM's shipped stacks, byte-for-byte from GNOME/gdm @ tag 50.0 (the latest
+    // release), `data/pam-<os>/gdm-password.pam`. Red Hat is the substack layout,
+    // Arch the include layout.
+    //
     // gnome-keyring's module needs the same two halves kwallet does: its
     // `pam_sm_authenticate` reads PAM_AUTHTOK and stashes it under
     // "gkr_system_authtok", and `pam_sm_open_session` is what acts on it.

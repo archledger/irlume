@@ -2143,6 +2143,10 @@ pub enum DiscoveryError {
     UnresolvedChange,
     /// The undo record could not be written, so nothing was sent to the camera.
     JournalUnwritable(String),
+    /// The caller's pre-write guard refused the next exploratory write, e.g.
+    /// the privacy shutter engaged after setup began. Anything already changed
+    /// was restored before this was returned.
+    WriteRefused(String),
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -2217,6 +2221,11 @@ impl std::fmt::Display for DiscoveryError {
                  be written ({why}). Setup writes that record first on purpose, so that a crash \
                  or a power loss part-way through still leaves something that can put the \
                  control back"
+            ),
+            Self::WriteRefused(why) => write!(
+                f,
+                "{why}; setup stopped without sending anything further, and anything it had \
+                 already changed was put back"
             ),
         }
     }
@@ -3055,10 +3064,15 @@ impl RecoveryOutcome {
 /// Preference order is IR Torch first (its whole purpose is the lamp), then Face
 /// Authentication (which drives the illuminator as a side effect of putting a
 /// streaming interface into face-auth mode).
-pub fn discover<F: FnMut() -> Option<f32>>(
+pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     measure: &mut F,
+    // Consulted immediately before each FORWARD write (never before a
+    // restore); an `Err` refuses the write and ends the run with its reason.
+    // The caller supplies the privacy-shutter re-check through this, so the
+    // check-to-write window is one syscall, not the whole discovery pipeline.
+    before_forward_write: &mut G,
 ) -> std::result::Result<Discovered, DiscoveryError> {
     let ms = id
         .microsoft_xu()
@@ -3099,7 +3113,7 @@ pub fn discover<F: FnMut() -> Option<f32>>(
             tried.push(format!("selector {selector:#04x} not advertised"));
             continue;
         }
-        match try_documented_control(fd, id, ms.unit_id, selector, measure) {
+        match try_documented_control(fd, id, ms.unit_id, selector, measure, before_forward_write) {
             // The lock travels with the open record: the camera stays held until
             // the configuration naming the applied control is durable, so nothing
             // else can file a record over this one in between.
@@ -3123,6 +3137,7 @@ pub fn discover<F: FnMut() -> Option<f32>>(
                 })
             }
             Err(TryFailure::Journal(why)) => return Err(DiscoveryError::JournalUnwritable(why)),
+            Err(TryFailure::Guard(why)) => return Err(DiscoveryError::WriteRefused(why)),
             // Any error at all stops everything. Only selectors the descriptor
             // advertises are reached, so a failure here is the camera
             // contradicting its own descriptor, and the errno cannot be relied
@@ -3254,6 +3269,9 @@ enum TryFailure {
     /// as much a sign of trouble as a control request going unanswered, and the
     /// old code turned it into "the picture is dark" and carried on.
     Measurement,
+    /// The caller's pre-write guard (the privacy-shutter re-check) refused the
+    /// next forward write. Nothing was sent; carries the guard's own reason.
+    Guard(String),
 }
 
 impl From<XuError> for TryFailure {
@@ -3264,12 +3282,13 @@ impl From<XuError> for TryFailure {
 
 /// Try one advertised, documented control, leaving it as it was found unless it
 /// worked.
-fn try_documented_control<F: FnMut() -> Option<f32>>(
+fn try_documented_control<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     unit: u8,
     selector: u8,
     measure: &mut F,
+    before_forward_write: &mut G,
 ) -> std::result::Result<Attempt, TryFailure> {
     if !info_allows_set(get_info(fd, unit, selector)?) {
         return Ok(Attempt::NotUsable(
@@ -3360,6 +3379,21 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     if abort_requested() {
         return Err(TryFailure::Measurement);
     }
+    // The guard runs immediately before EACH forward write, not only at the
+    // top of setup: the early sample there left format negotiation, the
+    // settling frames, the journal fsyncs and the baseline burst as a window
+    // in which the operator can engage the shutter, and this write would then
+    // be spent measuring a blanked frame (#193 review). Restores are
+    // deliberately not guarded: refusing to put a control back would leave it
+    // changed, which is the worse outcome by this file's own rules.
+    if let Err(why) = before_forward_write() {
+        // Nothing has been written, so the record describes a change that
+        // never happened; drop it, as the moved-control refusal above does.
+        pending
+            .abandon_before_write()
+            .map_err(TryFailure::Journal)?;
+        return Err(TryFailure::Guard(why));
+    }
     pending.apply_exploratory(&wanted)?;
     let Some(lit) = measure() else {
         // The stream died after the control was changed. Aborting without
@@ -3411,6 +3445,13 @@ fn try_documented_control<F: FnMut() -> Option<f32>>(
     // on disk that could put it back. `Discovered::committed` closes it.
     if abort_requested() {
         return Err(TryFailure::Measurement);
+    }
+    if let Err(why) = before_forward_write() {
+        // The restore above already put the control back and this branch
+        // writes nothing further, so the record resolves the same way the
+        // stayed-bright refusal does.
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Err(TryFailure::Guard(why));
     }
     pending.apply_exploratory(&wanted)?;
     Ok(Attempt::Lit(
@@ -3891,7 +3932,21 @@ mod tests {
     fn run_discovery(
         camera: fake_camera::Camera,
         tag: &str,
+        measure: impl FnMut() -> Option<f32>,
+    ) -> (
+        std::result::Result<Attempt, TryFailure>,
+        Vec<fake_camera::Request>,
+        Vec<u8>,
+        std::path::PathBuf,
+    ) {
+        run_discovery_guarded(camera, tag, measure, || Ok(()))
+    }
+
+    fn run_discovery_guarded(
+        camera: fake_camera::Camera,
+        tag: &str,
         mut measure: impl FnMut() -> Option<f32>,
+        mut guard: impl FnMut() -> Result<(), String>,
     ) -> (
         std::result::Result<Attempt, TryFailure>,
         Vec<fake_camera::Request>,
@@ -3912,7 +3967,8 @@ mod tests {
         .find(|s| ms.advertises(*s))
         .expect("fixture advertises an emitter selector");
         // fd is never reached: the fake intercepts before the ioctl.
-        let outcome = try_documented_control(-1, &id, ms.unit_id, selector, &mut measure);
+        let outcome =
+            try_documented_control(-1, &id, ms.unit_id, selector, &mut measure, &mut guard);
         (outcome, fake_camera::log(), fake_camera::current(), dir)
     }
 
@@ -6388,6 +6444,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The pre-write guard refusing before the FIRST exploratory write ends the
+    /// run with the guard's reason and zero bytes sent (#193 review: the early
+    /// privacy sample alone left the whole pipeline as a check-to-write window).
+    #[test]
+    fn a_guard_refusal_before_the_first_write_sends_nothing() {
+        let _lock = crate::testenv::env_lock();
+        let (outcome, log, current, dir) = run_discovery_guarded(
+            a_working_camera(),
+            "guard-first",
+            || Some(50.0),
+            || Err("the hardware privacy shutter is engaged".to_string()),
+        );
+        assert!(
+            matches!(&outcome, Err(TryFailure::Guard(why)) if why.contains("engaged")),
+            "the refusal must carry the guard's reason: {outcome:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set { .. })),
+            "a refused run may not write: {log:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the control is untouched");
+        let left: Vec<_> = std::fs::read_dir(dir.join("ir-emitter-journal"))
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            left.is_empty(),
+            "nothing was written, so no undo record may survive: {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard is consulted before EACH forward write, not once: a refusal
+    /// arriving between the restore and the final re-apply leaves the control
+    /// at its original value, with the record resolved and exactly the two
+    /// writes of the measurement (apply, restore) on the wire.
+    #[test]
+    fn a_guard_refusal_before_the_final_write_leaves_the_control_restored() {
+        let _lock = crate::testenv::env_lock();
+        let mut readings = [10.0, 40.0, 10.0].into_iter();
+        let mut calls = 0;
+        let (outcome, log, current, dir) = run_discovery_guarded(
+            a_working_camera(),
+            "guard-final",
+            || readings.next(),
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(())
+                } else {
+                    Err("the hardware privacy shutter is engaged".to_string())
+                }
+            },
+        );
+        assert!(
+            matches!(&outcome, Err(TryFailure::Guard(why)) if why.contains("engaged")),
+            "the second consultation must be able to refuse: {outcome:?}"
+        );
+        let sets: Vec<_> = log
+            .iter()
+            .filter(|r| matches!(r, fake_camera::Request::Set { .. }))
+            .collect();
+        assert_eq!(
+            sets.len(),
+            2,
+            "exactly the measurement's apply and restore, nothing after the refusal: {log:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the control ends where it began");
+        let left: Vec<_> = std::fs::read_dir(dir.join("ir-emitter-journal"))
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            left.is_empty(),
+            "the restore was confirmed, so the record must be resolved: {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Recovering a MISFILED record leaves exactly one file behind, and then
     /// none.
     ///
@@ -7028,7 +7162,14 @@ mod tests {
             serial: Some("200901010001".into()),
             usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb3/3-5".into(),
         };
-        let err = discover(std::os::fd::AsRawFd::as_raw_fd(&f), &no_ms, &mut measure).unwrap_err();
+        let mut permit = || Ok(());
+        let err = discover(
+            std::os::fd::AsRawFd::as_raw_fd(&f),
+            &no_ms,
+            &mut measure,
+            &mut permit,
+        )
+        .unwrap_err();
         match err {
             DiscoveryError::NoMicrosoftXu { seen } => assert_eq!(seen, vec![4, 7]),
             other => panic!("expected NoMicrosoftXu, got {other:?}"),

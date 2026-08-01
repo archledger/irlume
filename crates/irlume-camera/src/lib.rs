@@ -384,19 +384,64 @@ pub fn discover_nodes() -> Vec<(String, Role)> {
         .collect()
 }
 
-/// Best-effort privacy-shutter check. Returns `Ok(true)` if the hardware privacy
-/// switch is engaged. Never panics: reads only the specific CID, not the whole
-/// control set.
+/// Whether a failed privacy-control read means the camera does not HAVE the
+/// control, as opposed to having one that could not be read. The V4L2
+/// specification assigns EINVAL to an unsupported control id, and ENOTTY means
+/// the device does not implement the control ioctls at all; both are absence
+/// of the feature, stable across retries. Everything else (EIO, ENODEV, ...)
+/// is a failure to observe a control that may exist, which must never be
+/// reported as "not engaged" (#193 review). Pure so the classification is
+/// testable without hardware.
+fn control_read_failure_means_absent(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTTY))
+}
+
+/// Read the privacy control, keeping three outcomes apart: `Ok(Some(engaged))`
+/// when the control answered, `Ok(None)` when the camera does not have one,
+/// and `Err` when the observation itself failed. The old bool-returning check
+/// collapsed the third into the second, which let a transient read failure on
+/// a shuttered camera license a firmware write.
+fn privacy_state(dev: &Device) -> std::io::Result<Option<bool>> {
+    match dev.control(V4L2_CID_PRIVACY) {
+        Ok(ctrl) => Ok(Some(
+            matches!(ctrl.value, v4l::control::Value::Boolean(true))
+                || matches!(ctrl.value, v4l::control::Value::Integer(n) if n != 0),
+        )),
+        Err(e) if control_read_failure_means_absent(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Best-effort privacy-shutter check for the CAPTURE paths. Returns `true` only
+/// when the control answered "engaged"; an unopenable device or a failed read
+/// stays `false`, because the cost of failing open here is a capture of dark
+/// frames and a refused authentication, which the pipeline already handles.
+/// `setup_ir_emitter` deliberately does NOT use this: it writes to firmware,
+/// where an unknown shutter state must refuse — see [`privacy_permits_setup`].
 pub fn privacy_engaged(device: &str) -> bool {
     let Ok(dev) = Device::with_path(device) else {
         return false;
     };
-    match dev.control(V4L2_CID_PRIVACY) {
-        Ok(ctrl) => {
-            matches!(ctrl.value, v4l::control::Value::Boolean(true))
-                || matches!(ctrl.value, v4l::control::Value::Integer(n) if n != 0)
-        }
-        Err(_) => false, // control absent on this camera
+    matches!(privacy_state(&dev), Ok(Some(true)))
+}
+
+/// The decision `setup_ir_emitter` makes about one privacy observation, as a
+/// value: an engaged shutter refuses, and a FAILED observation refuses too,
+/// because "could not read the switch" is not "the switch is released". Only a
+/// control that answered "released", or a camera that has no such control, may
+/// proceed to a firmware write. Pure and used by the production path, so the
+/// fail-closed rule is testable without hardware.
+fn privacy_permits_setup(observed: std::io::Result<Option<bool>>) -> Result<(), String> {
+    match observed {
+        Ok(Some(true)) => Err("the hardware privacy shutter is engaged (the `privacy` \
+             control reads 1), so the sensor returns a blank frame and discovery \
+             would measure nothing; release the shutter and re-run ir-setup"
+            .into()),
+        Ok(Some(false)) | Ok(None) => Ok(()),
+        Err(e) => Err(format!(
+            "could not read the hardware privacy control ({e}); refusing to write \
+             to camera firmware while the shutter state is unknown"
+        )),
     }
 }
 
@@ -2351,36 +2396,29 @@ pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Res
 /// anything changed can be undone.
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
-    // Refuse before anything touches the camera. An engaged shutter blanks the
-    // sensor to a flat frame (ASUS 3277:0059, eight frames per state: released
-    // mean 37.0 stddev 62.68, engaged a constant 144.0 stddev 0.00 with
-    // `privacy` reading 1 throughout), so every exploratory write would be
-    // spent measuring a constant, and discovery would then report "no usable
-    // emitter control" about a camera whose shutter is merely shut (#186).
-    // Every capture entry point already refuses this way; the one path that
-    // WRITES firmware must too. An undo record pending on this camera loses
-    // nothing: it is durable, `doctor` reports it, and recovery re-runs on the
-    // next capture or setup once the shutter is released — the same stance as
+    // Open only long enough to read the standard V4L2 privacy control, and
+    // refuse before format negotiation, streaming, or any extension-unit
+    // write. An engaged shutter blanks the sensor to a flat frame (ASUS
+    // 3277:0059, eight frames per state: released mean 37.0 stddev 62.68,
+    // engaged a constant 144.0 stddev 0.00 with `privacy` reading 1
+    // throughout), so every exploratory write would be spent measuring a
+    // constant, and discovery would then report "no usable emitter control"
+    // about a camera whose shutter is merely shut (#186). Every capture entry
+    // point already refuses an engaged shutter; the one path that WRITES
+    // firmware refuses an UNREADABLE one too, and re-checks before each
+    // exploratory write below, because this early sample covers only this
+    // moment. An undo record pending on this camera loses nothing: it is
+    // durable, `doctor` reports it, and recovery re-runs on the next capture
+    // or setup once the shutter is released — the same stance as
     // `IRLUME_IR_EMITTER=off`.
-    //
-    // No test can stage this branch: `privacy` is a real V4L2 control, no fake
-    // provides it, and `verify_pinned` above rejects loopback devices before
-    // this line is reached. It is exercised on hardware only, with the
-    // machine's own E-shutter key (the capture-path guards above share this
-    // limit).
-    if privacy_engaged(device) {
-        return Err(Error::Hardware(format!(
-            "{device}: the hardware privacy shutter is engaged (the `privacy` \
-             control reads 1), so the sensor returns a blank frame and \
-             discovery would measure nothing; release the shutter and re-run \
-             ir-setup"
-        )));
-    }
-    // Declared first, so it is dropped LAST: the guard that puts the control
-    // back lives inside `discover` (or inside `found` on the success path) and
-    // has to finish before this re-raises the signal that stops the process.
-    let _abort_orderly = ir_emitter::AbortOnSignal::install();
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    privacy_permits_setup(privacy_state(&dev))
+        .map_err(|why| Error::Hardware(format!("{device}: {why}")))?;
+    // Declared before the stream and the guards below, so it is dropped LAST:
+    // the guard that puts the control back lives inside `discover` (or inside
+    // `found` on the success path) and has to finish before this re-raises the
+    // signal that stops the process.
+    let _abort_orderly = ir_emitter::AbortOnSignal::install();
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix);
     let (w, h) = (fmt.width, fmt.height);
@@ -2439,7 +2477,14 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
 
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| Error::Hardware(format!("could not identify the camera: {e}")))?;
-    match ir_emitter::discover(fd, &id, &mut measure) {
+    // Re-read the shutter immediately before each forward write. The early
+    // sample above is one moment; format negotiation, the settling frames, the
+    // journal fsyncs and the baseline burst all sit between it and the first
+    // SET_CUR, and the operator can engage the E-shutter anywhere in that
+    // window (#193 review). The residual race is one syscall wide: V4L2 offers
+    // no transaction spanning the privacy read and the extension-unit write.
+    let mut privacy_allows_write = || privacy_permits_setup(privacy_state(&dev));
+    match ir_emitter::discover(fd, &id, &mut measure, &mut privacy_allows_write) {
         Ok(found) => {
             let encoded = found.control().encode();
             // Confirm, publish, release, in that order. The sequence lives in
@@ -3294,6 +3339,44 @@ mod tests {
         // (the capture path then surfaces the real error).
         assert!(!privacy_engaged("/dev/irlume-test-missing"));
         assert!(!privacy_engaged("/dev/null"));
+    }
+
+    /// The setup decision fails CLOSED: an engaged shutter refuses, and a
+    /// FAILED observation refuses too, because "could not read the switch" is
+    /// not "the switch is released" (#193 review). Only an answered "released"
+    /// or a camera without the control proceeds to a firmware write.
+    #[test]
+    fn privacy_setup_decision_fails_closed() {
+        let engaged =
+            privacy_permits_setup(Ok(Some(true))).expect_err("an engaged shutter must refuse");
+        assert!(engaged.contains("shutter is engaged"), "{engaged}");
+        let unreadable = privacy_permits_setup(Err(std::io::Error::from_raw_os_error(libc::EIO)))
+            .expect_err("an unreadable shutter must refuse, not read as released");
+        assert!(unreadable.contains("could not read"), "{unreadable}");
+        assert!(privacy_permits_setup(Ok(Some(false))).is_ok());
+        assert!(privacy_permits_setup(Ok(None)).is_ok());
+    }
+
+    /// Only the errnos the V4L2 specification assigns to "this control does
+    /// not exist" (EINVAL for an unsupported id, ENOTTY for a device without
+    /// the ioctl) read as absence; an IO failure or a vanished device must not.
+    #[test]
+    fn only_specified_errnos_mean_the_control_is_absent() {
+        assert!(control_read_failure_means_absent(
+            &std::io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+        assert!(control_read_failure_means_absent(
+            &std::io::Error::from_raw_os_error(libc::ENOTTY)
+        ));
+        assert!(!control_read_failure_means_absent(
+            &std::io::Error::from_raw_os_error(libc::EIO)
+        ));
+        assert!(!control_read_failure_means_absent(
+            &std::io::Error::from_raw_os_error(libc::ENODEV)
+        ));
+        assert!(!control_read_failure_means_absent(&std::io::Error::other(
+            "no errno at all"
+        )));
     }
 
     #[test]

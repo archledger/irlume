@@ -12,7 +12,8 @@ All notable changes to irlume are documented here. This project adheres to
   even though shutters, covers, range, exposure and emitter failures all
   produce similar frames. The capture path now reports from the camera's
   per-frame illumination metadata, the privacy control, the emitter-control
-  state and the frame's mean and spread: it names an engaged shutter,
+  state and the frame's mean and spread (its pixel standard deviation): it
+  names an engaged shutter,
   separates frames the camera marked illuminated from a requested mode it
   never reported as illuminated, and reserves `ir-setup` advice for the one
   case with no active emitter. Illumination metadata is never treated as
@@ -20,7 +21,8 @@ All notable changes to irlume are documented here. This project adheres to
   same, and the diagnosis says so. The most common measured cover case was
   not dark at all: an opaque cover under an active emitter produced a
   saturated, nearly constant frame (measured 252.8 to 255.0 on the two test
-  cameras, against spread 35 and up for every recorded real scene), so that
+  cameras, against a standard deviation of 35 and up for every recorded real
+  scene), so that
   signature is named too. And `IRLUME_IR_EMITTER=off` now silences this
   output, which the old hint's own text promised while printing anyway.
   Closes [#185] and [#197].

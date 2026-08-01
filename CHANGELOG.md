@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A module named only in a comment counted as configured.** libpam strips a
+  trailing `#` comment before tokenizing a stack line, so `auth required
+  pam_unix.so  # was pam_irlume.so` loads no irlume module at all. Every
+  matcher compared against the raw line instead, and disagreed with the thing
+  it configures. The consequences ran from cosmetic to silent: an invented
+  anchor, a keyring consumer that does not exist, and — because
+  `content_has_module` gates the whole wiring path — a stack whose comment
+  merely mentioned `pam_irlume.so` reported as already wired, so `login
+  enable` wrote nothing and said it succeeded. All ten matchers now compare
+  against the directive, exactly what PAM tokenizes. The `# irlume-landing`
+  and `# irlume-keyring` tags are still matched on the raw line, since being
+  comments is the whole point of them.
+
 - **A keyring module that stands down for the service was counted as if it
   worked.** `pam_gnome_keyring.so` takes `only_if=<comma,separated,services>`,
   and for any service outside that list every one of its entry points returns

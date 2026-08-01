@@ -1852,11 +1852,27 @@ fn wire_service(
 
 // ---- pure PAM-text mechanics (unit-tested) -----------------------------------
 
+/// The part of a stack line PAM actually tokenizes: everything before the first
+/// `#`, leading whitespace trimmed.
+///
+/// Matching the raw line disagrees with libpam, which strips a trailing comment
+/// before tokenizing (verified against `pam_exec.so`: a real argument survives,
+/// a trailing comment does not). Without this, a module named only inside a
+/// comment counts as configured — and because `content_has_module` gates the
+/// whole wiring path, a stack whose comment happens to mention `pam_irlume.so`
+/// would be treated as already wired and silently left alone.
+///
+/// A full-line comment yields `""`, so callers need no separate `#` check.
+fn directive(line: &str) -> &str {
+    let t = line.trim_start();
+    match t.find('#') {
+        Some(i) => &t[..i],
+        None => t,
+    }
+}
+
 fn content_has_module(c: &str) -> bool {
-    c.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains(MODULE)
-    })
+    c.lines().any(|l| directive(l).contains(MODULE))
 }
 
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
@@ -1867,7 +1883,7 @@ fn content_has_module(c: &str) -> bool {
 /// counting, so it deliberately does not match here and keeps the jump stanza —
 /// which is what openSUSE's `auth substack common-auth` relies on.
 fn is_include_auth_layout(line: &str) -> bool {
-    let t = line.trim_start();
+    let t = directive(line);
     if t.starts_with("@include common-auth") || t.starts_with("@include login") {
         return true;
     }
@@ -1894,13 +1910,10 @@ fn is_include_auth_layout(line: &str) -> bool {
 /// a face login skipped the nologin gate and *still* landed on the password
 /// stack underneath — face auth that neither honoured nologin nor logged you in.
 fn is_passwd_substack(line: &str, kind: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
     let stacks: &[&str] = match kind {
@@ -1914,10 +1927,7 @@ fn is_passwd_substack(line: &str, kind: &str) -> bool {
 }
 
 fn is_auth_directive(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
+    let t = directive(line);
     t.strip_prefix('-').unwrap_or(t).split_whitespace().next() == Some("auth")
 }
 
@@ -1934,13 +1944,10 @@ fn is_auth_directive(line: &str) -> bool {
 /// password substack, which still runs. That is the openSUSE failure exactly,
 /// and it would arrive silently with a GDM upgrade.
 fn is_auth_substack_anchor(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
     toks.first() == Some(&"auth") && toks.get(1) == Some(&"substack")
@@ -1982,10 +1989,7 @@ const KEYRING_CONSUMERS: &[&str] = &["pam_kwallet5.so", "pam_kwallet.so", "pam_g
 /// equivalent option (`only_if` appears nowhere in kwallet-pam), so this only
 /// ever narrows the gnome-keyring case.
 fn consumer_active_for(line: &str, service: &str) -> Option<&'static str> {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return None;
-    }
+    let t = directive(line);
     let module = KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))?;
     let gated_out = t
         .split_whitespace()
@@ -2030,8 +2034,8 @@ struct KeyringHandoff {
 fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
     let lines: Vec<&str> = content.lines().collect();
     let unseal_at = lines.iter().position(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains(MODULE) && t.contains("unseal")
+        let d = directive(l);
+        d.contains(MODULE) && d.contains("unseal")
     })?;
     let consumer_in = |l: &str| consumer_active_for(l, service);
     // A given module's session line may sit anywhere in the session phase, so
@@ -2039,13 +2043,10 @@ fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
     // order-sensitive.
     let has_session_line = |module: &str| {
         lines.iter().any(|l| {
-            let t = l.trim_start();
-            if t.starts_with('#') {
-                return false;
-            }
-            let phase = t.strip_prefix('-').unwrap_or(t);
+            let d = directive(l);
+            let phase = d.strip_prefix('-').unwrap_or(d);
             phase.split_whitespace().next() == Some("session")
-                && t.contains(module)
+                && d.contains(module)
                 // The session half is gated by `only_if=` exactly as the auth
                 // half is: gkr-pam checks it in `pam_sm_open_session` too.
                 && consumer_active_for(l, service).is_some()
@@ -2251,8 +2252,8 @@ fn wire_lock(content: &str) -> (String, bool) {
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
 fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     if content.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
+        let d = directive(l);
+        d.contains(MODULE) && d.contains("keyring")
     }) {
         return (content.to_string(), false); // already wired
     }
@@ -2297,13 +2298,10 @@ fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
 /// anchor, `wire_fp_keyring` became a silent no-op, and the fingerprint keyring
 /// unlock never wired on Fedora at all.
 fn is_fingerprint_auth(line: &str) -> bool {
-    let t = line.trim_start();
-    if t.starts_with('#') {
-        return false;
-    }
-    let toks: Vec<&str> = t
+    let d = directive(line);
+    let toks: Vec<&str> = d
         .strip_prefix('-')
-        .unwrap_or(t)
+        .unwrap_or(d)
         .split_whitespace()
         .collect();
     if toks.first() != Some(&"auth") {
@@ -2353,15 +2351,16 @@ fn unwire_lines(content: &str) -> (String, bool) {
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| {
-            let t = l.trim_start();
-            if t.starts_with('#') {
-                return true;
-            }
-            let drop = t.contains(MODULE)
-                || (t.contains("pam_permit.so") && l.contains("# irlume-landing"))
+            // The module is matched on the DIRECTIVE (what PAM tokenizes), so a
+            // module named only in a comment is never stripped. The tags are
+            // matched on the RAW line, because that is where they live — they
+            // are comments, invisible to PAM by design.
+            let d = directive(l);
+            let drop = d.contains(MODULE)
+                || (d.contains("pam_permit.so") && l.contains("# irlume-landing"))
                 // Only the gnome-keyring lines WE tagged; a distro-shipped
                 // keyring line carries no tag and must survive unwiring.
-                || (t.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
+                || (d.contains("pam_gnome_keyring.so") && l.contains(KEYRING_TAG));
             if drop {
                 changed = true;
             }
@@ -4109,6 +4108,97 @@ auth       optional      pam_gnome_keyring.so\n";
         let h = keyring_handoff(&wired, "plasmalogin").expect("releases a credential");
         assert_eq!(h.complete, None);
         assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn directive_cuts_at_the_comment_exactly_as_pam_does() {
+        assert_eq!(
+            directive("auth optional pam_unix.so"),
+            "auth optional pam_unix.so"
+        );
+        assert_eq!(
+            directive("  auth optional pam_unix.so  # note"),
+            "auth optional pam_unix.so  "
+        );
+        assert_eq!(directive("# whole line comment"), "");
+        assert_eq!(directive(""), "");
+    }
+
+    #[test]
+    fn a_module_named_only_in_a_comment_is_never_treated_as_configured() {
+        // libpam strips a trailing comment before tokenizing, so none of these
+        // lines load the module they mention. Matching the raw line would make
+        // irlume disagree with the thing it is configuring.
+        //
+        // content_has_module is the dangerous one: it gates the whole wiring
+        // path, so a false positive means `login enable` silently writes
+        // nothing and reports the stack as already wired.
+        assert!(!content_has_module(
+            "auth required pam_unix.so  # was pam_irlume.so\n"
+        ));
+        assert!(content_has_module("auth sufficient pam_irlume.so\n"));
+
+        // Anchors must not be invented out of comment text either.
+        assert!(!is_passwd_substack(
+            "auth required pam_unix.so # substack password-auth",
+            "auth"
+        ));
+        assert!(!is_include_auth_layout(
+            "auth required pam_unix.so # @include common-auth"
+        ));
+        assert!(!is_auth_substack_anchor(
+            "auth required pam_unix.so # substack whatever"
+        ));
+        assert!(!is_fingerprint_auth(
+            "auth required pam_unix.so # substack fingerprint-auth"
+        ));
+        assert!(!is_auth_directive("# auth required pam_unix.so"));
+
+        // Nor a keyring consumer.
+        assert_eq!(
+            consumer_active_for(
+                "auth required pam_unix.so # see pam_gnome_keyring.so",
+                "gdm-password"
+            ),
+            None
+        );
+
+        // A stack whose only mention of a keyring module is a comment has no
+        // hand-off, however complete it looks to a grep.
+        let commented = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+auth       optional      pam_deny.so    # pam_gnome_keyring.so would go here\n\
+session    optional      pam_deny.so    # pam_gnome_keyring.so auto_start\n";
+        let h = keyring_handoff(commented, "gdm-password").expect("releases a credential");
+        assert_eq!(h.complete, None);
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn unwiring_matches_modules_on_the_directive_but_tags_on_the_raw_line() {
+        // Our tags ARE comments, so they must still be found there; a foreign
+        // line that merely names one of our modules in a comment must survive.
+        let stack = "auth required pam_unix.so  # not pam_irlume.so, just a note\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+-auth      optional      pam_gnome_keyring.so   # irlume-keyring\n\
+-auth      optional      pam_gnome_keyring.so\n";
+        let (out, changed) = unwire_lines(stack);
+        assert!(changed);
+        assert!(
+            out.contains("not pam_irlume.so, just a note"),
+            "comment-only mention survives"
+        );
+        assert!(!out.contains("irlume-landing"), "our tagged landing goes");
+        assert!(
+            !out.contains("irlume-keyring"),
+            "our tagged keyring line goes"
+        );
+        assert!(
+            out.contains("-auth      optional      pam_gnome_keyring.so\n"),
+            "the distro's untagged keyring line survives"
+        );
     }
 
     #[test]

@@ -172,3 +172,31 @@ pub(super) fn directive(line: &str) -> &str {
         None => t,
     }
 }
+
+/// True when any line's DIRECTIVE part ends in a `\` continuation.
+///
+/// libpam's line assembler joins such a line with the next one before
+/// tokenizing, so a two-physical-line entry is ONE line to PAM. Everything
+/// here is line-oriented, and on a continued file the two views disagree.
+/// Worse than mis-reading: inserting a stanza directly after a continued
+/// anchor would splice our text into the MIDDLE of the logical line PAM
+/// evaluates, corrupting the stack on write.
+///
+/// The semantics are pinned empirically against `pam_exec.so`:
+///   * a trailing `\` on a directive continues — the next physical line's
+///     text executed as this line's arguments;
+///   * whitespace AFTER the backslash does not defuse it (still continues);
+///   * a `\` at the end of a COMMENT does not continue — both lines ran.
+///
+/// Hence the check runs on `directive()` output with trailing space trimmed.
+///
+/// No upstream stack irlume pins uses continuations, so the fail-safe answer
+/// is to notice and stand down: the wiring transforms refuse the file
+/// (staged, never written — the same contract as a missing anchor), and the
+/// hand-off advisory stays silent rather than reporting from an analysis
+/// that cannot see the file the way PAM does.
+pub(super) fn has_line_continuation(content: &str) -> bool {
+    content
+        .lines()
+        .any(|l| directive(l).trim_end().ends_with('\\'))
+}

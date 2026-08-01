@@ -46,6 +46,11 @@ pub(super) struct KeyringHandoff {
 /// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
 /// runs against a wallet the login already opened.
 pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
+    // A continued file cannot be judged line-by-line; silence beats a verdict
+    // reached on lines PAM does not evaluate as written.
+    if has_line_continuation(content) {
+        return None;
+    }
     let lines: Vec<&str> = content.lines().collect();
     let unseal_at = lines.iter().position(|l| {
         let d = directive(l);
@@ -104,6 +109,9 @@ pub(super) fn wire_greeter_impl(
     ondemand: bool,
 ) -> (String, bool) {
     if !face && !keyring {
+        return (content.to_string(), false);
+    }
+    if has_line_continuation(content) {
         return (content.to_string(), false);
     }
     if content_has_module(content) {
@@ -190,6 +198,9 @@ pub(super) fn wire_greeter_impl(
 /// screen unlock releases no credential). Handles both the Debian `@include`
 /// and the Fedora `substack` layouts.
 pub(super) fn wire_lock(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }
@@ -230,6 +241,9 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
 pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content.lines().any(|l| {
         let d = directive(l);
         d.contains(MODULE) && d.contains("keyring")
@@ -278,6 +292,9 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
 /// on a failed face would then fail the whole prompt instead of falling back to
 /// the password.
 pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
     if content_has_module(content) {
         return (content.to_string(), false);
     }

@@ -2873,6 +2873,13 @@ auth       optional      pam_gnome_keyring.so\n";
         );
         assert_eq!(directive("# whole line comment"), "");
         assert_eq!(directive(""), "");
+        // libpam truncates at '#' even mid-token (pam_exec received `arg` from
+        // a literal `arg#embedded`), so cutting at the FIRST '#' anywhere is
+        // the faithful reading, not an approximation.
+        assert_eq!(
+            directive("auth optional pam_unix.so arg#embedded"),
+            "auth optional pam_unix.so arg"
+        );
     }
 
     #[test]
@@ -2950,6 +2957,80 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
             out.contains("-auth      optional      pam_gnome_keyring.so\n"),
             "the distro's untagged keyring line survives"
         );
+    }
+
+    #[test]
+    fn line_continuation_semantics_match_the_pam_assembler() {
+        // Each row was executed against libpam via pam_exec.so:
+        // a trailing backslash on a directive joins the NEXT physical line into
+        // this one (the module received the next line's text as its argument);
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh \\\n  CONT\n"
+        ));
+        // whitespace after the backslash does not defuse it (the follow-up
+        // line was still swallowed);
+        assert!(has_line_continuation(
+            "auth optional pam_exec.so run.sh A \\   \n"
+        ));
+        // a backslash at the end of a COMMENT does not continue (both modules
+        // ran as separate lines);
+        assert!(!has_line_continuation(
+            "auth optional pam_exec.so run.sh FIRST # note \\\nauth optional pam_exec.so run.sh SECOND\n"
+        ));
+        // and a whole-line comment ending in a backslash is still just a comment.
+        assert!(!has_line_continuation("# just a comment \\\n"));
+        // A backslash mid-line is an ordinary character, not a continuation.
+        assert!(!has_line_continuation(
+            "auth optional pam_unix.so arg\\more\n"
+        ));
+    }
+
+    #[test]
+    fn a_stack_using_line_continuations_is_never_rewritten() {
+        // PAM evaluates a continued pair as ONE logical line, so a line-based
+        // insertion after the anchor would splice our stanza into the middle of
+        // it. Every transform must refuse the whole file: staged-never-written,
+        // the same contract as a missing anchor.
+        let cont =
+            "#%PAM-1.0\nauth substack \\\n    password-auth\nsession include password-auth\n";
+        assert!(has_line_continuation(cont));
+        let (g, changed) = wire_greeter_impl(cont, true, true, true);
+        assert!(!changed);
+        assert_eq!(g, cont);
+        let (l, changed) = wire_lock(cont);
+        assert!(!changed);
+        assert_eq!(l, cont);
+        let (v, changed) = wire_verify_service(cont);
+        assert!(!changed);
+        assert_eq!(v, cont);
+        let fp = "auth required pam_fprintd.so \\\n    likeauth\n";
+        let (f, changed) = wire_fp_keyring(fp, "gdm-fingerprint");
+        assert!(!changed);
+        assert_eq!(f, fp);
+        // The advisory stays silent too: a verdict from lines PAM does not
+        // evaluate as written would be worse than no verdict.
+        let wired = "auth sufficient pam_irlume.so unseal ondemand\n\
+-auth optional pam_kwallet5.so \\\n    someopt\n";
+        assert!(keyring_handoff(wired, "plasmalogin").is_none());
+    }
+
+    #[test]
+    fn no_upstream_fixture_uses_line_continuations() {
+        // What makes the refusal gate behaviour-neutral on real stacks. If a
+        // distro starts shipping continuations, this fails and the gate needs
+        // real assembly support instead of refusal.
+        for (name, body) in [
+            ("plasmalogin fedora", UPSTREAM_FEDORA),
+            ("plasmalogin arch", UPSTREAM_ARCH),
+            ("plasmalogin debian", UPSTREAM_DEBIAN),
+            ("plasmalogin suse", UPSTREAM_SUSE),
+            ("gdm redhat", UPSTREAM_GDM_REDHAT),
+            ("gdm arch", UPSTREAM_GDM_ARCH),
+            ("gdm renamed", UPSTREAM_GDM_RENAMED_SUBSTACK),
+            ("gdm fingerprint", UPSTREAM_GDM_FINGERPRINT),
+        ] {
+            assert!(!has_line_continuation(body), "{name}");
+        }
     }
 
     #[test]

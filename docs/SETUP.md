@@ -155,24 +155,41 @@ same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 #### KDE Plasma: what has to be in place for KWallet
 
 On Plasma the chain is: `plasmalogin` runs irlume's `unseal` line, which sets the
-released password as `PAM_AUTHTOK`; `pam_kwallet5.so` reads that token and derives
-the wallet key; its `session` line starts the wallet daemon (`ksecretd` on Plasma
-6, `kwalletd6`/`kwalletd5` before it) and hands the key over. irlume owns only the
-first step, so two things must be true of the rest:
+released password as `PAM_AUTHTOK`; `pam_kwallet5.so`'s **auth** line reads that
+token and stashes the derived key; its **session** line starts the wallet daemon
+(`ksecretd` on Plasma 6, `kwalletd6`/`kwalletd5` before it) and hands the key
+over. Both halves are required — kwallet-pam stashes with `pam_set_data` during
+auth and only acts on it in `pam_sm_open_session`. irlume owns only the first
+step, so two things must be true of the rest:
 
 - **kwallet-pam is installed** — the module is `pam_kwallet5.so`, still that name
-  under Plasma 6.
-- **Its auth line sits BELOW irlume's**, with a matching `session … auto_start`
-  line. Above ours it runs before the token exists, and the wallet stays locked.
+  under Plasma 6 (upstream's CMake sets `library_name "pam_kwallet5"` on the KF6
+  branch). Fedora additionally lists a legacy `pam_kwallet.so`.
+- **Its auth line sits BELOW irlume's**, with a session line for the *same*
+  module. Above ours it runs before the token exists — and kwallet-pam then
+  prompts for the password itself, which is exactly the "it asked me anyway"
+  symptom.
 
-`irlume login status` (and `login enable --apply`) checks both and warns, so a
-wallet that still prompts after a face login names its own cause instead of
-looking like a face-login failure:
+`auto_start` on those lines is a *gnome-keyring* option; kwallet-pam parses only
+`kdehome=`, `kwalletd=`, `socketPath=` and `force_run`, and ignores the rest. Its
+session half also stands down outside a graphical session unless `force_run` is
+given, which is why the greeter is the right place for this and a TTY login is
+not.
+
+`irlume login status` (and `login enable --apply`) checks both halves, paired per
+module, and warns — so a wallet that still prompts after a face login names its
+own cause instead of looking like a face-login failure:
 
 ```
   ⚠ /etc/pam.d/plasmalogin: face login releases your login password, but no keyring module
      reads it afterwards, so KWallet/the login keyring will still prompt.
 ```
+
+Fedora, Arch and Debian all ship a `plasmalogin` with both halves present, so the
+check stays quiet there. **openSUSE's upstream file carries no keyring module at
+all**, so face login on stock openSUSE releases a password nothing reads; the
+warning above is the expected output until `pam_kwallet5.so` is added to that
+stack.
 
 One more requirement is outside PAM: your **wallet password must equal your login
 password**, since that is the password `keyring arm` seals. A wallet created with

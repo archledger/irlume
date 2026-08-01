@@ -5,6 +5,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **openSUSE greeters anchored face auth on the wrong line, skipping the
+  nologin gate.** openSUSE's `plasmalogin` routes the password through
+  `auth substack common-auth`, a stack name the wiring did not recognize, so it
+  fell back to the first `auth` line and inserted the `success=1` jump above
+  `pam_nologin.so`. A face match then jumped over the nologin gate and landed
+  *before* `substack common-auth`, which ran anyway: face auth that neither
+  honoured nologin nor spared the user the password. The auth and session stack
+  names are now kind-aware and include openSUSE's `common-auth` and
+  `common-session`, so the jump anchors on the password substack (atomic for
+  jump counting, so the jump form stays correct) and `pam_nologin.so` keeps
+  running first. A bare `auth include common-auth` is treated as an include
+  instead, taking the `sufficient` form a jump cannot skip.
+
 ### Added
 
 - **`login status` says when face login releases a password nothing will use.**

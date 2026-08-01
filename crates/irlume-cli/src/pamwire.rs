@@ -1840,14 +1840,13 @@ fn content_has_module(c: &str) -> bool {
     })
 }
 
-/// `<kind>` is `auth`/`session`; matches a `(substack|include) (password-auth|
-/// system-auth)` line, the shared substack the success=1 jump skips.
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
-/// can't skip: Debian's `@include common-auth`/`login`, or Arch's
-/// `auth include system-login`/`system-local-login`/`system-auth`. These need
-/// the `sufficient` (module IGNOREs on cold login) form, NOT the jump form. A
-/// Fedora `substack` is atomic for jump counting, so it deliberately does not
-/// match here and keeps the jump stanza.
+/// can't skip: Debian's `@include common-auth`/`login`, Arch's
+/// `auth include system-login`/`system-local-login`/`system-auth`, or a bare
+/// `auth include common-auth`. These need the `sufficient` (module IGNOREs on
+/// cold login) form, NOT the jump form. A `substack` is atomic for jump
+/// counting, so it deliberately does not match here and keeps the jump stanza —
+/// which is what openSUSE's `auth substack common-auth` relies on.
 fn is_include_auth_layout(line: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with("@include common-auth") || t.starts_with("@include login") {
@@ -1858,10 +1857,23 @@ fn is_include_auth_layout(line: &str) -> bool {
         && toks.get(1) == Some(&"include")
         && matches!(
             toks.get(2),
-            Some(&"system-login") | Some(&"system-local-login") | Some(&"system-auth")
+            Some(&"system-login")
+                | Some(&"system-local-login")
+                | Some(&"system-auth")
+                | Some(&"common-auth")
         )
 }
 
+/// `<kind>` is `auth`/`session`; matches the shared password stack that the
+/// `success=1` jump skips: Fedora's `password-auth`/`system-auth`, and
+/// openSUSE's `common-auth`/`common-session`.
+///
+/// The stack names are kind-aware so an `auth` line is only tested against
+/// auth-phase names. openSUSE's `plasmalogin` routes the password through
+/// `auth substack common-auth`, which matched nothing here: wiring then fell
+/// back to the first auth line and inserted the jump above `pam_nologin.so`, so
+/// a face login skipped the nologin gate and *still* landed on the password
+/// stack underneath — face auth that neither honoured nologin nor logged you in.
 fn is_passwd_substack(line: &str, kind: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with('#') {
@@ -1872,11 +1884,14 @@ fn is_passwd_substack(line: &str, kind: &str) -> bool {
         .unwrap_or(t)
         .split_whitespace()
         .collect();
+    let stacks: &[&str] = match kind {
+        "auth" => &["password-auth", "system-auth", "common-auth"],
+        "session" => &["password-auth", "system-auth", "common-session"],
+        _ => &["password-auth", "system-auth"],
+    };
     toks.first() == Some(&kind)
         && toks.iter().any(|w| *w == "substack" || *w == "include")
-        && toks
-            .iter()
-            .any(|w| *w == "password-auth" || *w == "system-auth")
+        && toks.iter().any(|w| stacks.contains(w))
 }
 
 fn is_auth_directive(line: &str) -> bool {
@@ -3605,6 +3620,80 @@ session  include        postlogin-session
                 .expect("a keyring module");
             assert!(face < consumer, "{os}: our line must precede the wallet's");
         }
+    }
+
+    #[test]
+    fn suse_common_auth_substack_is_the_jump_anchor_and_nologin_survives() {
+        let (w, changed) = wire_greeter_impl(UPSTREAM_SUSE, true, false, true);
+        assert!(changed);
+        let lines: Vec<&str> = w.lines().collect();
+        let pos = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        let nologin = pos("pam_nologin.so").expect("nologin line");
+        let face = pos("pam_irlume.so unseal").expect("face line");
+        let substack = pos("substack       common-auth").expect("common-auth substack");
+        let landing = pos("irlume-landing").expect("permit landing");
+
+        // The anchor is the password substack, NOT the first auth line. Before
+        // this, the jump went above pam_nologin.so: a face match skipped the
+        // nologin gate and then met `substack common-auth` anyway, so the user
+        // typed a password regardless.
+        assert!(
+            nologin < face,
+            "pam_nologin must still run before face auth"
+        );
+        assert!(
+            face < substack,
+            "face line must precede the password substack"
+        );
+        assert!(
+            substack + 1 == landing,
+            "success=1 must land on the permit directly after the substack"
+        );
+        // A substack is atomic for jump counting, so the jump form is right here
+        // (an include would need the `sufficient` form instead).
+        assert!(w.contains("[success=1 default=ignore]   pam_irlume.so unseal ondemand"));
+        assert!(!w.contains("sufficient   pam_irlume.so unseal"));
+        // The session reseal now anchors on `substack common-session` rather
+        // than being appended at EOF.
+        let sess = pos("substack       common-session").expect("common-session");
+        let reseal = pos("session    optional                     pam_irlume.so reseal")
+            .expect("session reseal");
+        assert_eq!(
+            sess + 1,
+            reseal,
+            "session reseal follows the session substack"
+        );
+    }
+
+    #[test]
+    fn common_auth_matching_is_kind_aware_and_leaves_other_phases_alone() {
+        assert!(is_passwd_substack(
+            "auth     substack   common-auth",
+            "auth"
+        ));
+        assert!(is_passwd_substack(
+            "session  substack   common-session",
+            "session"
+        ));
+        // An auth line is not matched against a session-phase stack name, and
+        // the account/password phases are never anchors at all.
+        assert!(!is_passwd_substack(
+            "auth     substack   common-session",
+            "auth"
+        ));
+        assert!(!is_passwd_substack(
+            "account  substack   common-account",
+            "auth"
+        ));
+        assert!(!is_passwd_substack(
+            "password substack   common-password",
+            "session"
+        ));
+        // A bare `auth include common-auth` is an include a jump can't skip, so
+        // it takes the `sufficient` path instead of becoming a jump anchor.
+        assert!(is_include_auth_layout("auth include common-auth"));
+        // Debian's @include form is still caught by the include layout first.
+        assert!(is_include_auth_layout("@include common-auth"));
     }
 
     #[test]

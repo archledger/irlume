@@ -189,7 +189,17 @@ Fedora, Arch and Debian all ship a `plasmalogin` with both halves present, so th
 check stays quiet there. **openSUSE's upstream file carries no keyring module at
 all**, so face login on stock openSUSE releases a password nothing reads; the
 warning above is the expected output until `pam_kwallet5.so` is added to that
-stack.
+stack. Adding it needs both lines — for example:
+
+```
+-auth    optional    pam_kwallet5.so
+-session optional    pam_kwallet5.so
+```
+
+placed after the `auth substack common-auth` line and in the session phase
+respectively. (openSUSE's greeter is otherwise wired correctly: irlume anchors
+its face line on that `common-auth` substack, leaving `pam_nologin.so` ahead of
+it.)
 
 One more requirement is outside PAM: your **wallet password must equal your login
 password**, since that is the password `keyring arm` seals. A wallet created with

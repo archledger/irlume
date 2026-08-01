@@ -226,6 +226,12 @@ Two differences from KDE are worth knowing:
   nothing visible at the login screen — the keyring simply stays locked, and you
   only find out when an application asks for a secret. That is exactly the case
   `irlume login status` now names.
+- **`only_if=` can switch it off per service.** A line such as
+  `-auth optional pam_gnome_keyring.so only_if=gdm,gdm-password` does nothing at
+  all on any other service — on `gdm-fingerprint`, for instance, it returns
+  success without reading the token. irlume evaluates that list per service, so
+  a line gated off for the stack being checked is not counted as unlocking
+  anything. `pam_kwallet5.so` has no such option.
 
 GDM's upstream `gdm-password.pam` ships both halves on every OS variant it
 provides (Red Hat, Arch, LFS, Exherbo), so the check stays quiet on a stock

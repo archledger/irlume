@@ -961,7 +961,8 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         visit(s, ROLE_LOGIN, &greeter_wire, face || fp_keyring);
     }
     for s in FP_GREETERS {
-        visit(s, ROLE_LOGIN_FP, &wire_fp_keyring, fp_keyring);
+        let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
+        visit(s, ROLE_LOGIN_FP, &fp_wire, fp_keyring);
     }
     visit(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
     if sudo_in_scope(enable, with_sudo) {
@@ -1552,7 +1553,8 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
         do_svc(s, &greeter_wire, face || want_fp_keyring);
     }
     for s in FP_GREETERS {
-        do_svc(s, &wire_fp_keyring, want_fp_keyring);
+        let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
+        do_svc(s, &fp_wire, want_fp_keyring);
     }
     // A separate lock service (KDE `kde`) is a WARM screen unlock: the module
     // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
@@ -1963,6 +1965,35 @@ fn find_auth_anchor(lines: &[&str]) -> Option<usize> {
 /// `pam_gnome_keyring.so`.
 const KEYRING_CONSUMERS: &[&str] = &["pam_kwallet5.so", "pam_kwallet.so", "pam_gnome_keyring.so"];
 
+/// The keyring module on this line, if it is one AND it will actually do
+/// something for `service`.
+///
+/// `pam_gnome_keyring.so` accepts `only_if=<comma,separated,services>`, and for
+/// any service outside that list every one of its entry points returns
+/// `PAM_SUCCESS` immediately — it reads no token, stashes nothing, unlocks
+/// nothing. Matching the module name alone would therefore count a line that is
+/// a guaranteed no-op here as a working consumer, and report a hand-off that
+/// cannot happen: the exact false reassurance this check exists to prevent.
+///
+/// The list is matched the way gkr-pam's `evaluate_inlist` matches it — whole
+/// comma-separated items, not substrings, so `only_if=gdm` does not satisfy
+/// `gdm-fingerprint`. Any single excluding `only_if=` disables the module, since
+/// gkr ORs `ARG_IGNORE_SERVICE` in and never clears it. `pam_kwallet5.so` has no
+/// equivalent option (`only_if` appears nowhere in kwallet-pam), so this only
+/// ever narrows the gnome-keyring case.
+fn consumer_active_for(line: &str, service: &str) -> Option<&'static str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let module = KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))?;
+    let gated_out = t
+        .split_whitespace()
+        .filter_map(|w| w.strip_prefix("only_if="))
+        .any(|list| !list.split(',').any(|item| item == service));
+    (!gated_out).then_some(module)
+}
+
 /// What a wired greeter stack does with the password irlume releases.
 ///
 /// irlume's job ends at setting `PAM_AUTHTOK`. Turning that token into an OPEN
@@ -1996,19 +2027,13 @@ struct KeyringHandoff {
 /// they were never meant to open. The lock screen opts out a level up instead:
 /// `report_keyring_handoff` walks only `GREETERS`, because a warm screen unlock
 /// runs against a wallet the login already opened.
-fn keyring_handoff(content: &str) -> Option<KeyringHandoff> {
+fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHandoff> {
     let lines: Vec<&str> = content.lines().collect();
     let unseal_at = lines.iter().position(|l| {
         let t = l.trim_start();
         !t.starts_with('#') && t.contains(MODULE) && t.contains("unseal")
     })?;
-    let consumer_in = |l: &str| -> Option<&'static str> {
-        let t = l.trim_start();
-        if t.starts_with('#') {
-            return None;
-        }
-        KEYRING_CONSUMERS.iter().copied().find(|m| t.contains(m))
-    };
+    let consumer_in = |l: &str| consumer_active_for(l, service);
     // A given module's session line may sit anywhere in the session phase, so
     // that half is searched across the whole file; only the AUTH half is
     // order-sensitive.
@@ -2019,7 +2044,11 @@ fn keyring_handoff(content: &str) -> Option<KeyringHandoff> {
                 return false;
             }
             let phase = t.strip_prefix('-').unwrap_or(t);
-            phase.split_whitespace().next() == Some("session") && t.contains(module)
+            phase.split_whitespace().next() == Some("session")
+                && t.contains(module)
+                // The session half is gated by `only_if=` exactly as the auth
+                // half is: gkr-pam checks it in `pam_sm_open_session` too.
+                && consumer_active_for(l, service).is_some()
         })
     };
     // Only lines BELOW ours can see the token we set, so the search starts past
@@ -2059,7 +2088,7 @@ fn report_keyring_handoff() {
         if !content_has_module(&content) {
             continue;
         }
-        let Some(handoff) = keyring_handoff(&content) else {
+        let Some(handoff) = keyring_handoff(&content, service_name(s.etc)) else {
             continue;
         };
         // A single complete module is enough: the wallet opens. Only when none
@@ -2220,7 +2249,7 @@ fn wire_lock(content: &str) -> (String, bool) {
 /// Wire the `keyring` unseal line into a fingerprint login service
 /// (`gdm-fingerprint`): insert it right after the `pam_fprintd.so` auth line so
 /// the sealed password is set before pam_gnome_keyring's auth line runs.
-fn wire_fp_keyring(content: &str) -> (String, bool) {
+fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     if content.lines().any(|l| {
         let t = l.trim_start();
         !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
@@ -2234,10 +2263,11 @@ fn wire_fp_keyring(content: &str) -> (String, bool) {
     // Does anything in this stack already read the token we are about to set?
     // GDM's own `gdm-fingerprint` does not, so the unseal line alone would
     // release a password into a stack with no consumer.
-    let has_consumer = lines.iter().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && KEYRING_CONSUMERS.iter().any(|m| t.contains(m))
-    });
+    // `only_if=` aware: a keyring line that stands down for THIS service is not
+    // a consumer here, however plainly it names the module.
+    let has_consumer = lines
+        .iter()
+        .any(|l| consumer_active_for(l, service).is_some());
     let mut out = Vec::with_capacity(lines.len() + 3);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());
@@ -3734,8 +3764,8 @@ session  include        postlogin-session
         ] {
             let (wired, changed) = wire_greeter_impl(vendor, true, false, true);
             assert!(changed, "{os}: upstream stack must be wirable");
-            let h =
-                keyring_handoff(&wired).unwrap_or_else(|| panic!("{os}: releases a credential"));
+            let h = keyring_handoff(&wired, "plasmalogin")
+                .unwrap_or_else(|| panic!("{os}: releases a credential"));
             assert!(
                 h.complete.is_some(),
                 "{os}: expected a complete hand-off, got auth_only={:?}",
@@ -3846,7 +3876,7 @@ session     include       postlogin
         assert!(!UPSTREAM_GDM_FINGERPRINT.contains("pam_fprintd.so"));
         assert!(!UPSTREAM_GDM_FINGERPRINT.contains("pam_gnome_keyring.so"));
 
-        let (w, changed) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT);
+        let (w, changed) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT, "gdm-fingerprint");
         assert!(changed, "the substack must serve as the anchor");
         let lines: Vec<&str> = w.lines().collect();
         let pos = |n: &str| lines.iter().position(|l| l.contains(n));
@@ -3889,7 +3919,7 @@ session     include       postlogin
         let with_gkr = "#%PAM-1.0\nauth       required      pam_fprintd.so\n\
 auth       optional      pam_gnome_keyring.so\n\
 session    optional      pam_gnome_keyring.so auto_start\n";
-        let (w, changed) = wire_fp_keyring(with_gkr);
+        let (w, changed) = wire_fp_keyring(with_gkr, "gdm-fingerprint");
         assert!(changed);
         assert_eq!(
             w.matches("pam_gnome_keyring.so").count(),
@@ -3902,7 +3932,7 @@ session    optional      pam_gnome_keyring.so auto_start\n";
     #[test]
     fn unwiring_removes_our_keyring_lines_but_keeps_the_distros() {
         // Ours are tagged; a distro-shipped keyring line is not, and must survive.
-        let (wired, _) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT);
+        let (wired, _) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT, "gdm-fingerprint");
         let (bare, changed) = unwire_lines(&wired);
         assert!(changed);
         assert!(!bare.contains("pam_gnome_keyring.so"), "ours must go");
@@ -3922,8 +3952,8 @@ auth       optional      pam_gnome_keyring.so\n";
         for (os, vendor) in [("redhat", UPSTREAM_GDM_REDHAT), ("arch", UPSTREAM_GDM_ARCH)] {
             let (wired, changed) = wire_greeter_impl(vendor, true, false, false);
             assert!(changed, "{os}: upstream GDM stack must be wirable");
-            let h =
-                keyring_handoff(&wired).unwrap_or_else(|| panic!("{os}: releases a credential"));
+            let h = keyring_handoff(&wired, "plasmalogin")
+                .unwrap_or_else(|| panic!("{os}: releases a credential"));
             assert_eq!(
                 h.complete,
                 Some("pam_gnome_keyring.so"),
@@ -3968,7 +3998,7 @@ auth       optional      pam_gnome_keyring.so\n";
             "the jump must land past the substack"
         );
         // The hand-off still resolves, so a rename costs nothing else.
-        let h = keyring_handoff(&w).expect("releases a credential");
+        let h = keyring_handoff(&w, "gdm-password").expect("releases a credential");
         assert_eq!(h.complete, Some("pam_gnome_keyring.so"));
     }
 
@@ -4076,9 +4106,87 @@ auth       optional      pam_gnome_keyring.so\n";
         assert!(!UPSTREAM_SUSE.contains("pam_gnome_keyring"));
         let (wired, changed) = wire_greeter_impl(UPSTREAM_SUSE, true, false, true);
         assert!(changed);
-        let h = keyring_handoff(&wired).expect("releases a credential");
+        let h = keyring_handoff(&wired, "plasmalogin").expect("releases a credential");
         assert_eq!(h.complete, None);
         assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn only_if_gating_is_matched_the_way_gkr_pam_matches_it() {
+        // gkr-pam's `evaluate_inlist` matches whole comma-separated items, so a
+        // prefix must NOT satisfy it: `only_if=gdm` leaves gdm-fingerprint out.
+        let line = "-auth optional pam_gnome_keyring.so only_if=gdm,gdm-password";
+        assert_eq!(
+            consumer_active_for(line, "gdm-password"),
+            Some("pam_gnome_keyring.so")
+        );
+        assert_eq!(consumer_active_for(line, "gdm-fingerprint"), None);
+        assert_eq!(
+            consumer_active_for(
+                "-auth optional pam_gnome_keyring.so only_if=gdm",
+                "gdm-fingerprint"
+            ),
+            None,
+            "a prefix must not satisfy a whole-item list"
+        );
+        // No only_if= at all → active everywhere. kwallet has no such option.
+        assert_eq!(
+            consumer_active_for("-auth optional pam_gnome_keyring.so", "anything"),
+            Some("pam_gnome_keyring.so")
+        );
+        assert_eq!(
+            consumer_active_for("-auth optional pam_kwallet5.so", "plasmalogin"),
+            Some("pam_kwallet5.so")
+        );
+        // A commented line is never a consumer.
+        assert_eq!(
+            consumer_active_for("# -auth optional pam_gnome_keyring.so", "plasmalogin"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_keyring_line_gated_off_for_this_service_is_not_a_hand_off() {
+        // The stack names pam_gnome_keyring on both halves, but `only_if=` means
+        // every entry point returns PAM_SUCCESS without reading the token. A
+        // module-name grep would call this complete and reassure the user that a
+        // wallet will open when nothing will.
+        let gated = "#%PAM-1.0\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       substack      password-auth\n\
+auth       optional                     pam_permit.so   # irlume-landing\n\
+-auth      optional      pam_gnome_keyring.so only_if=gdm-password\n\
+session    include       password-auth\n\
+-session   optional      pam_gnome_keyring.so auto_start only_if=gdm-password\n";
+        assert_eq!(
+            keyring_handoff(gated, "gdm-password").unwrap().complete,
+            Some("pam_gnome_keyring.so"),
+            "on the listed service it really is a hand-off"
+        );
+        let h = keyring_handoff(gated, "gdm-fingerprint").expect("releases a credential");
+        assert_eq!(
+            h.complete, None,
+            "gated off here, so nothing opens the wallet"
+        );
+        assert!(h.auth_only.is_empty());
+    }
+
+    #[test]
+    fn wire_fp_keyring_supplies_a_consumer_when_the_existing_one_is_gated_off() {
+        // Same trap on the fingerprint path: a gated line must not suppress the
+        // consumer we would otherwise add, or the unlock silently does nothing.
+        let gated = "#%PAM-1.0\nauth       required      pam_fprintd.so\n\
+-auth      optional      pam_gnome_keyring.so only_if=gdm-password\n\
+-session   optional      pam_gnome_keyring.so auto_start only_if=gdm-password\n";
+        let (w, changed) = wire_fp_keyring(gated, "gdm-fingerprint");
+        assert!(changed);
+        assert!(
+            w.contains(KEYRING_TAG),
+            "must add our own consumer, the existing one stands down here"
+        );
+        // And on the service the existing line DOES cover, we add nothing.
+        let (w2, _) = wire_fp_keyring(gated, "gdm-password");
+        assert!(!w2.contains(KEYRING_TAG));
     }
 
     #[test]
@@ -4093,7 +4201,7 @@ auth       optional                     pam_permit.so   # irlume-landing\n\
 -auth      optional      pam_kwallet5.so\n\
 session    include       password-auth\n\
 -session   optional      pam_gnome_keyring.so auto_start\n";
-        let h = keyring_handoff(split).expect("releases a credential");
+        let h = keyring_handoff(split, "plasmalogin").expect("releases a credential");
         assert_eq!(h.complete, None);
         assert_eq!(h.auth_only, vec!["pam_kwallet5.so"]);
     }
@@ -4114,7 +4222,7 @@ session    optional                     pam_irlume.so reseal\n";
 
     #[test]
     fn plasmalogin_with_kwallet_has_a_complete_handoff() {
-        let h = keyring_handoff(PLASMA_WIRED).expect("stack releases a credential");
+        let h = keyring_handoff(PLASMA_WIRED, "plasmalogin").expect("stack releases a credential");
         // The jump skips exactly the substack and lands on the permit, so the
         // vendor kwallet auth line below it does observe our PAM_AUTHTOK.
         assert_eq!(h.complete, Some("pam_kwallet5.so"));
@@ -4139,7 +4247,8 @@ session    include       password-auth\n\
         // shipping a stack we wire and then warn about.
         let (wired, changed) = wire_greeter_impl(PLASMA_VENDOR, true, false, true);
         assert!(changed);
-        let h = keyring_handoff(&wired).expect("a wired greeter releases a credential");
+        let h =
+            keyring_handoff(&wired, "plasmalogin").expect("a wired greeter releases a credential");
         assert_eq!(h.complete, Some("pam_kwallet5.so"));
         assert!(h.auth_only.is_empty());
         let face = wired.find("pam_irlume.so unseal").unwrap();
@@ -4157,7 +4266,8 @@ session     include     system-login\n\
 -session    optional    pam_kwallet5.so auto_start\n";
         let (wired, changed) = wire_greeter_impl(ARCH_VENDOR, true, false, true);
         assert!(changed);
-        let h = keyring_handoff(&wired).expect("a wired greeter releases a credential");
+        let h =
+            keyring_handoff(&wired, "plasmalogin").expect("a wired greeter releases a credential");
         assert_eq!(h.complete, Some("pam_kwallet5.so"));
         assert!(h.auth_only.is_empty());
     }
@@ -4169,7 +4279,7 @@ session     include     system-login\n\
             .filter(|l| !l.contains("pam_kwallet5.so"))
             .collect::<Vec<_>>()
             .join("\n");
-        let h = keyring_handoff(&stripped).expect("stack releases a credential");
+        let h = keyring_handoff(&stripped, "plasmalogin").expect("stack releases a credential");
         // Nothing reads the released password: this is the silent case that used
         // to report as "wired ✓" while the wallet kept prompting.
         assert_eq!(h.complete, None);
@@ -4185,7 +4295,7 @@ session     include     system-login\n\
 auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
 auth       substack      password-auth\n\
 -session   optional      pam_kwallet5.so auto_start\n";
-        let h = keyring_handoff(above).expect("stack releases a credential");
+        let h = keyring_handoff(above, "plasmalogin").expect("stack releases a credential");
         assert_eq!(
             h.complete, None,
             "a consumer above our line cannot see the token"
@@ -4201,7 +4311,7 @@ auth       include     system-login\n\
 auth       optional                     pam_irlume.so reseal\n\
 -auth      optional    pam_kwallet5.so\n\
 -session   optional    pam_kwallet5.so auto_start\n";
-        let h = keyring_handoff(arch).expect("stack releases a credential");
+        let h = keyring_handoff(arch, "plasmalogin").expect("stack releases a credential");
         assert_eq!(h.complete, Some("pam_kwallet5.so"));
         assert!(h.auth_only.is_empty());
     }
@@ -4215,7 +4325,7 @@ auth       optional                     pam_irlume.so reseal\n\
             .filter(|l| !(l.contains("pam_kwallet5.so") && l.contains("session")))
             .collect::<Vec<_>>()
             .join("\n");
-        let h = keyring_handoff(&no_session).expect("stack releases a credential");
+        let h = keyring_handoff(&no_session, "plasmalogin").expect("stack releases a credential");
         assert_eq!(h.complete, None);
         assert_eq!(h.auth_only, vec!["pam_kwallet5.so"]);
     }
@@ -4223,7 +4333,7 @@ auth       optional                     pam_irlume.so reseal\n\
     #[test]
     fn gnome_keyring_counts_as_a_consumer_too() {
         let gnome = PLASMA_WIRED.replace("pam_kwallet5.so", "pam_gnome_keyring.so");
-        let h = keyring_handoff(&gnome).expect("stack releases a credential");
+        let h = keyring_handoff(&gnome, "plasmalogin").expect("stack releases a credential");
         assert_eq!(h.complete, Some("pam_gnome_keyring.so"));
         assert!(h.auth_only.is_empty());
     }
@@ -4234,7 +4344,7 @@ auth       optional                     pam_irlume.so reseal\n\
         // credential is released and there is nothing for a wallet to consume.
         let sudo = "#%PAM-1.0\nauth       sufficient                   pam_irlume.so\n\
 @include common-auth\n";
-        assert!(keyring_handoff(sudo).is_none());
+        assert!(keyring_handoff(sudo, "plasmalogin").is_none());
     }
 
     #[test]
@@ -4243,7 +4353,7 @@ auth       optional                     pam_irlume.so reseal\n\
             "-auth      optional      pam_kwallet5.so",
             "#-auth      optional      pam_kwallet5.so",
         );
-        let h = keyring_handoff(&commented).expect("stack releases a credential");
+        let h = keyring_handoff(&commented, "plasmalogin").expect("stack releases a credential");
         assert_eq!(h.complete, None);
         assert!(h.auth_only.is_empty());
     }
@@ -4447,7 +4557,7 @@ auth       optional                     pam_irlume.so reseal\n\
 
     #[test]
     fn wire_fp_keyring_inserts_between_fprintd_and_the_keyring_auth_line() {
-        let (w, changed) = wire_fp_keyring(GDM_FP);
+        let (w, changed) = wire_fp_keyring(GDM_FP, "gdm-fingerprint");
         assert!(changed);
         let lines: Vec<&str> = w.lines().collect();
         let fp = lines
@@ -4467,18 +4577,22 @@ auth       optional                     pam_irlume.so reseal\n\
             "keyring unseal must sit fprintd→keyring"
         );
         // Idempotent: a second pass is a no-op.
-        let (w2, c2) = wire_fp_keyring(&w);
+        let (w2, c2) = wire_fp_keyring(&w, "gdm-fingerprint");
         assert!(!c2 && w2 == w);
     }
 
     #[test]
     fn wire_fp_keyring_needs_an_fprintd_anchor() {
         // No pam_fprintd line → nothing to anchor to → unchanged.
-        let (w, changed) = wire_fp_keyring("#%PAM-1.0\nauth required pam_unix.so\n");
+        let (w, changed) =
+            wire_fp_keyring("#%PAM-1.0\nauth required pam_unix.so\n", "gdm-fingerprint");
         assert!(!changed);
         assert_eq!(w, "#%PAM-1.0\nauth required pam_unix.so\n");
         // A commented fprintd line is not an anchor either.
-        let (_, c) = wire_fp_keyring("#%PAM-1.0\n# auth required pam_fprintd.so\n");
+        let (_, c) = wire_fp_keyring(
+            "#%PAM-1.0\n# auth required pam_fprintd.so\n",
+            "gdm-fingerprint",
+        );
         assert!(!c);
     }
 

@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A keyring module that stands down for the service was counted as if it
+  worked.** `pam_gnome_keyring.so` takes `only_if=<comma,separated,services>`,
+  and for any service outside that list every one of its entry points returns
+  `PAM_SUCCESS` immediately: it reads no token, stashes nothing, unlocks
+  nothing. The hand-off check matched the module name alone, so such a line
+  counted as a working consumer — reporting a wallet that would open when
+  nothing would, which is the one thing this check exists to prevent. It also
+  suppressed the consumer irlume adds to a fingerprint stack, silently undoing
+  that unlock. The list is now evaluated per service, matching whole
+  comma-separated items the way gkr-pam's own `evaluate_inlist` does, so
+  `only_if=gdm` no longer satisfies `gdm-fingerprint`. `pam_kwallet5.so` has no
+  equivalent option, so only the GNOME case narrows.
+
 - **Fingerprint keyring unlock never wired on GNOME, and could not have worked
   if it had.** Two defects in one stack. The wiring anchored on a literal
   `pam_fprintd.so` auth line, but GDM's `gdm-fingerprint.pam` never names the

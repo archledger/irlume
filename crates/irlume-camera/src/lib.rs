@@ -186,11 +186,6 @@ pub const V4L2_CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
 const FROZEN_RUN_BEFORE_RESTART: usize = 2;
 const FROZEN_RESTART_BUDGET: usize = 4;
 
-/// Below this 8-bit greyscale mean with no emitter fired, the IR sensor is
-/// dark and the onboarding hint (configure your emitter) is printed; see
-/// `ir_emitter::IR_LIT_MEAN` for the lit threshold on the other side.
-const IR_DARK_HINT_MAX: f64 = 35.0;
-
 /// mmap ring size for every V4L2 capture stream. Four buffers is the classic
 /// quad-buffer: enough that the driver never stalls waiting for a dequeue at
 /// 30fps, small enough to be granted by every UVC camera we have seen.
@@ -1522,8 +1517,12 @@ impl IrSession<'_> {
                     Some(_) => "agree",
                     None => "-",
                 };
+                // stddev too: whether a frame is a SCENE or a substituted
+                // constant is spread, not level (#197 wants the saturated
+                // cover's spread measured, and this line is the instrument).
                 eprintln!(
-                    "[ir_frame] {i:2} mean {m:6.1}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    "[ir_frame] {i:2} mean {m:6.1}  stddev {:6.2}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    ir_dark::frame_stddev(&frames[i]),
                     ir_emitter::IR_LIT_MEAN
                 );
             }
@@ -1640,21 +1639,26 @@ impl IrSession<'_> {
                 means.len()
             );
         }
-        // A dark burst gets a DIAGNOSIS, not the old one-size hint. The single
-        // "run ir-setup" line fit one of a dark frame's six causes and sent
-        // users to write camera firmware for shutters, covers and range
+        // An unusable burst gets a DIAGNOSIS, not the old one-size hint. The
+        // single "run ir-setup" line fit one of a dark frame's six causes and
+        // sent users to write camera firmware for shutters, covers and range
         // problems (#185); the evidence to do better is already in hand:
         // whether irlume drove the control, the camera's own per-frame
         // illumination metadata (#167), the privacy control, and the frame's
-        // variance (a firmware blank is a near-perfect constant, #186). The
-        // gate no longer requires `!lit`: an ACTIVE control with a dark frame
-        // is the broken case most worth explaining, and the causes that only
-        // exist when the control is active (lit-but-dark, applied-not-taken)
-        // were exactly the ones the old silence hid. `ir-setup` discovery
-        // advice survives only on the one cause it fits; the historical note
-        // about why irlume never recommends linux-enable-ir-emitter's blind
-        // search lives with that message's cause in `ir_dark` (#159).
-        if (0.0..IR_DARK_HINT_MAX).contains(&best_mean) {
+        // mean and spread. Two bands carry a diagnosis: dark, and
+        // saturated-flat, because the most common cover case is not dark at
+        // all: an opaque cover under the active emitter reflects it straight
+        // back and saturates the sensor (#197, measured 252.8-255.0 covered on
+        // both test cameras). This range check is only a shortcut past the
+        // stddev pass on ordinary scenes; `ir_dark::diagnose` re-applies the
+        // real gates and answers None for anything that is a scene after all.
+        // `ir-setup` discovery advice survives only on the one cause it fits;
+        // the historical note about why irlume never recommends
+        // linux-enable-ir-emitter's blind search lives with that message's
+        // cause in `ir_dark` (#159).
+        if (0.0..ir_dark::DARK_MEAN_MAX).contains(&best_mean)
+            || best_mean >= ir_dark::SATURATED_MIN_MEAN
+        {
             let frames_lit = flags
                 .iter()
                 .filter(|f| matches!(f, Some(ir_metadata::Illumination::Lit)))
@@ -1665,9 +1669,12 @@ impl IrSession<'_> {
                 privacy_engaged: privacy_engaged(device),
                 frames_lit,
                 frames_classified: from_camera,
+                frame_mean: best_mean,
                 frame_stddev: ir_dark::frame_stddev(&frames[best_i]),
             };
-            if let Some(line) = ir_dark::render(card, best_mean, &ir_dark::diagnose(&evidence)) {
+            if let Some(line) = ir_dark::diagnose(&evidence)
+                .and_then(|cause| ir_dark::render(card, best_mean, &cause))
+            {
                 eprintln!("{line}");
             }
         }

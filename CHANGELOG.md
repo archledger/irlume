@@ -9,7 +9,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 - **`camera-tune` is reachable from the TUI.** The Cameras screen gains `[t]`,
   which routes to `sudo irlume camera-tune` like the other privileged
-  one-shots — after saying up front that it holds the camera and fires the IR
+  one-shots, after saying up front that it holds the camera and fires the IR
   emitter for up to a minute and then persists the capture-mode verdict, since
   that materially changes how authentication captures frames afterwards. It
   was the one user-facing operation with no TUI route. Closes #170.

@@ -23,6 +23,7 @@
 //! panic on some drivers. Probe, don't assume.
 
 pub mod emitter_journal;
+pub mod ir_dark;
 pub mod ir_emitter;
 mod ir_metadata;
 mod stream_record;
@@ -1639,24 +1640,36 @@ impl IrSession<'_> {
                 means.len()
             );
         }
-        // Onboarding hint for a new (e.g. external) Hello camera: dark IR with no
-        // emitter fired usually means its 850nm illuminator needs a UVC-XU write we
-        // don't have a table entry for. Guide the user to configure it.
-        //
-        // This used to say "run `linux-enable-ir-emitter configure`, then set
-        // IRLUME_IR_EMITTER=unit:sel:b,b,...". That tool finds a control by
-        // writing invented payloads across units and selectors until the picture
-        // brightens, which is precisely the search irlume removed from its own
-        // code after it destroyed a reporter's camera (#159). Deleting the search
-        // here and then telling the user to go and run it somewhere else is not a
-        // fix. `irlume ir-setup` does the same job from the camera's own
-        // descriptor and its own GET_DEF values.
-        if !lit && (0.0..IR_DARK_HINT_MAX).contains(&best_mean) {
-            eprintln!(
-                "[ir] {card:?}: IR is dark (mean {best_mean:.0}) with no active emitter; \
-             run `sudo irlume ir-setup` to find this camera's emitter control from what it \
-             publishes (IRLUME_IR_EMITTER=off silences this)"
-            );
+        // A dark burst gets a DIAGNOSIS, not the old one-size hint. The single
+        // "run ir-setup" line fit one of a dark frame's six causes and sent
+        // users to write camera firmware for shutters, covers and range
+        // problems (#185); the evidence to do better is already in hand:
+        // whether irlume drove the control, the camera's own per-frame
+        // illumination metadata (#167), the privacy control, and the frame's
+        // variance (a firmware blank is a near-perfect constant, #186). The
+        // gate no longer requires `!lit`: an ACTIVE control with a dark frame
+        // is the broken case most worth explaining, and the causes that only
+        // exist when the control is active (lit-but-dark, applied-not-taken)
+        // were exactly the ones the old silence hid. `ir-setup` discovery
+        // advice survives only on the one cause it fits; the historical note
+        // about why irlume never recommends linux-enable-ir-emitter's blind
+        // search lives with that message's cause in `ir_dark` (#159).
+        if (0.0..IR_DARK_HINT_MAX).contains(&best_mean) {
+            let frames_lit = flags
+                .iter()
+                .filter(|f| matches!(f, Some(ir_metadata::Illumination::Lit)))
+                .count();
+            let evidence = ir_dark::DarkEvidence {
+                emitter_active: lit,
+                emitter_disabled: ir_emitter::emitter_explicitly_disabled(),
+                privacy_engaged: privacy_engaged(device),
+                frames_lit,
+                frames_classified: from_camera,
+                frame_stddev: ir_dark::frame_stddev(&frames[best_i]),
+            };
+            if let Some(line) = ir_dark::render(card, best_mean, &ir_dark::diagnose(&evidence)) {
+                eprintln!("{line}");
+            }
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
         Ok((

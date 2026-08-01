@@ -290,6 +290,16 @@ enum OverrideSetting {
     Malformed(String),
 }
 
+/// Whether `IRLUME_IR_EMITTER` is set to `off`/`none`: the user's explicit
+/// "drive nothing". The dark-frame diagnosis silences itself on this (#185);
+/// the old hint printed anyway, naming the very variable that was already set.
+pub(crate) fn emitter_explicitly_disabled() -> bool {
+    matches!(
+        override_setting(std::env::var("IRLUME_IR_EMITTER")),
+        OverrideSetting::Disabled
+    )
+}
+
 fn override_setting(raw: std::result::Result<String, std::env::VarError>) -> OverrideSetting {
     let raw = match raw {
         Err(std::env::VarError::NotPresent) => return OverrideSetting::Absent,

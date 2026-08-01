@@ -441,12 +441,21 @@ fn disable() -> ExitCode {
 /// directory they control.
 const PAM_DIR: &str = "/etc/pam.d";
 
-/// Does `text` contain an ACTIVE (non-comment) line referencing `needle`?
+/// Does `text` contain an ACTIVE line whose DIRECTIVE part references
+/// `needle`?
+///
+/// The directive part — everything before the first `#`, which is all libpam
+/// tokenizes — matters here more than anywhere: this feeds
+/// [`pam_fprintd_wired`], the gate that keeps `fingerprint enable` from
+/// recording a method nothing drives. Matching the raw line let a stack whose
+/// only `pam_fprintd.so` lived in a trailing comment pass that gate; with
+/// `--fingerprint-only` that stood face down on a box where no biometric
+/// answers any prompt — the precise outcome the gate exists to prevent.
+/// `faillock_cohabits` (a doctor warning) and `fprintd_in_sudo` (the SSH
+/// stall warning) inherit the same comment semantics through this function.
 fn has_active_line(text: &str, needle: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#') && t.contains(needle)
-    })
+    text.lines()
+        .any(|l| crate::pamwire::directive(l).contains(needle))
 }
 
 /// The contents of every file in `pam_dir` that PAM will actually load.
@@ -743,6 +752,16 @@ mod tests {
         assert!(!pam_fprintd_wired(&dir));
         // A commented-out line does not count.
         std::fs::write(dir.join("sudo"), "#auth sufficient pam_fprintd.so\n").unwrap();
+        assert!(!pam_fprintd_wired(&dir));
+        // Nor a TRAILING comment: libpam tokenizes only up to the first '#',
+        // so this stack drives no fingerprint prompt. Passing the gate here
+        // records a method nothing serves — with --fingerprint-only, face
+        // stands down on a box where no biometric answers any prompt.
+        std::fs::write(
+            dir.join("sudo"),
+            "auth required pam_unix.so   # was pam_fprintd.so\n",
+        )
+        .unwrap();
         assert!(!pam_fprintd_wired(&dir));
         // Unrelated modules do not count.
         std::fs::write(dir.join("login"), "auth required pam_unix.so\n").unwrap();

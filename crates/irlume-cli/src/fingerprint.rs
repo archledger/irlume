@@ -442,13 +442,26 @@ fn disable() -> ExitCode {
 const PAM_DIR: &str = "/etc/pam.d";
 
 /// The vendor service directory libpam falls back to when the machine
-/// directory has no file for a service. Measured on the three families irlume
-/// packages for, by reading the path compiled into the installed library:
-/// Fedora 44, Arch, and Ubuntu 26.04 (libpam 1.7.0-5ubuntu3) all carry
-/// `/usr/lib/pam.d`. Fedora and Arch ship files in it; on Ubuntu the directory
-/// does not exist by default, which `PamSearchPath::rooted` handles by
-/// carrying no vendor directory at all rather than probing a path that is not
-/// there.
+/// directory has no file for a service.
+///
+/// This is a build-time option, so it is established by measurement, not by
+/// assuming an upstream default. On the two lanes that ship the directory it
+/// was confirmed by BEHAVIOUR rather than by the path appearing in the
+/// library: a `pam_start` + `pam_authenticate` probe against a service placed
+/// only in `/usr/lib/pam.d` returned success, while a service that exists
+/// nowhere fell through to `other` and denied.
+///
+/// - Fedora 44, pam-1.7.2-2.fc44: vendor-only service 0, absent service 7.
+/// - Arch, pam 1.7.2-2: vendor-only service 0, absent service 7.
+/// - Ubuntu 26.04, libpam 1.7.0-5ubuntu3: the path is compiled in, but the
+///   directory does not exist, so `rooted` carries no vendor directory and
+///   nothing is read or claimed.
+///
+/// The Arch measurement matters because that package's changelog records
+/// `-Dvendordir=''`, which reads as removing the search directory; the
+/// installed library disagrees, and KDE ships `kde-fingerprint` there and
+/// nowhere else. Re-run the probe rather than trusting either source if this
+/// ever needs revisiting.
 const PAM_VENDOR_DIR: &str = "/usr/lib/pam.d";
 
 /// The directories libpam consults for a service, in its order. The machine
@@ -511,13 +524,29 @@ impl PamSearchPath {
     /// has one.
     pub(crate) fn service_path(&self, service: &str) -> Option<std::path::PathBuf> {
         let machine = self.machine.join(service);
-        if machine.is_file() {
+        if Self::shadows(&machine) {
             return Some(machine);
         }
         self.vendor
             .as_ref()
             .map(|dir| dir.join(service))
-            .filter(|p| p.is_file())
+            .filter(|p| Self::shadows(p))
+    }
+
+    /// Whether a path is a service file libpam would open, which is not the
+    /// same as `is_file()`. Disabling a service by symlinking it to
+    /// `/dev/null` is standard practice, and libpam opens that happily: the
+    /// stack is empty and it shadows the vendor copy rather than deferring to
+    /// it. `is_file()` follows the symlink to a character device, answers
+    /// false, and would send the scan to a vendor file libpam never reads,
+    /// reporting a fingerprint prompt as wired where PAM in fact denies.
+    /// Verified on archhost (pam 1.7.2-2) with a pam_start probe: a machine
+    /// service symlinked to /dev/null over a vendor copy stacking pam_permit
+    /// authenticated as 7 (failure), not 0.
+    fn shadows(p: &std::path::Path) -> bool {
+        // Follows symlinks, so a dangling link is absent (libpam cannot open
+        // it either) and a directory is not a stack.
+        p.metadata().map(|m| !m.is_dir()).unwrap_or(false)
     }
 
     /// The service file's contents, following the same precedence.
@@ -1045,6 +1074,34 @@ mod tests {
         );
 
         for d in [m, v, m2, v2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Symlinking a service to `/dev/null` is how an admin disables it, and
+    /// libpam opens that as an empty stack that shadows the vendor copy. A
+    /// scan that reads it as absent falls through to a vendor file libpam
+    /// never loads and calls a prompt wired that PAM denies, which is the
+    /// fail-open direction in the gate that stands face down. Confirmed on
+    /// archhost (pam 1.7.2-2): the probe returned 7, not 0.
+    #[test]
+    fn a_service_disabled_with_dev_null_still_shadows_the_vendor_copy() {
+        let wired = "auth sufficient pam_fprintd.so\n";
+        let (m, v) = pam_pair("devnull-shadow", &[], &[("sudo", wired)]);
+        std::os::unix::fs::symlink("/dev/null", m.join("sudo")).unwrap();
+        let path = PamSearchPath::rooted(&m, Some(&v));
+
+        assert_eq!(
+            path.service_path("sudo"),
+            Some(m.join("sudo")),
+            "the /dev/null stack is what PAM opens"
+        );
+        assert!(
+            !pam_fprintd_wired(&path),
+            "an emptied stack must not report the shadowed vendor line as wired"
+        );
+
+        for d in [m, v] {
             let _ = std::fs::remove_dir_all(d);
         }
     }

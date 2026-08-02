@@ -4085,13 +4085,14 @@ impl App {
                 Style::new().dim(),
             )));
             // Per-surface coverage (#155), the same table `fingerprint status`
-            // prints: which prompts a finger actually answers, per /etc/pam.d.
+            // prints: which prompts a finger actually answers, over the same
+            // search path libpam uses (machine then vendor, #208).
             // Shown only when at least one surface reaches the module; a
             // face-only box would render a column of ✗ noise.
             if self.fp_coverage.iter().any(|(_, _, reaches)| *reaches) {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled(
-                    "  Where a finger can answer the prompt (per /etc/pam.d):",
+                    "  Where a finger can answer the prompt (per the PAM service path):",
                     Style::new().dim(),
                 )));
                 for (_, label, reaches) in &self.fp_coverage {

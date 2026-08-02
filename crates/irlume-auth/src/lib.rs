@@ -3025,10 +3025,10 @@ pub fn saturated_frac_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4], whit
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return 0.0;
     }
-    // Clamp BOTH corners to the frame, unlike `mean_in_bbox`, whose x1/y1
-    // clamp to w-1/h-1: a box wholly past the right or bottom edge collapses
-    // there to a one-pixel strip of an unrelated edge rather than to an empty
-    // region. Here an off-frame box measures nothing, which is what it saw.
+    // Both corners clamp to the frame, so a box wholly past the right or
+    // bottom edge collapses to an empty region and measures nothing, which is
+    // what it saw. `mean_in_bbox` and its siblings clamp the same way since
+    // #225; before that they left a one-pixel strip of an unrelated edge.
     let x1 = (bbox[0].max(0.0) as u32).min(w);
     let y1 = (bbox[1].max(0.0) as u32).min(h);
     let x2 = (bbox[2].max(0.0) as u32).min(w);
@@ -3904,9 +3904,8 @@ mod tests {
         // Out-of-frame boxes clamp; a degenerate box reports nothing.
         assert_eq!(f(&[-9.0, -9.0, 99.0, 99.0], 255), 0.5);
         assert_eq!(f(&[3.0, 1.0, 3.0, 1.0], 255), 0.0);
-        // A box wholly past the right or bottom edge measures NOTHING. The
-        // sibling mean_in_bbox clamps its near corner to w-1/h-1 and so
-        // samples a one-pixel strip of an unrelated edge instead.
+        // A box wholly past the right or bottom edge measures NOTHING, which
+        // every bbox-sampling helper has agreed on since #225.
         assert_eq!(f(&[10.0, 0.0, 20.0, 2.0], 255), 0.0);
         assert_eq!(f(&[0.0, 9.0, 4.0, 12.0], 255), 0.0);
         // A truncated frame degrades like mean_in_bbox, never panics.

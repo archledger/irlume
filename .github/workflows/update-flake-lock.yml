@@ -2,10 +2,15 @@
 # has no nix support), so without this the pinned nixpkgs ages silently.
 #
 # The update runs `nix flake check` plus the fixed-output-derivation build
-# BEFORE opening the PR, so the PR arrives pre-validated in this workflow's
-# log. Note: PRs opened with the workflow token do not trigger the CI
-# workflow; close and reopen the PR (one click) to run the required checks
-# before merging.
+# before pushing, so the branch arrives pre-validated in this run's log.
+#
+# This workflow pushes `deps/update-flake-lock` and stops there; it does not
+# open the pull request. Doing so needs "Allow GitHub Actions to create and
+# approve pull requests", a repository-wide permission that would apply to
+# every workflow here, and this monthly refresh is not worth carrying it for
+# (#228). A maintainer opens the PR from the pushed branch, which also means
+# the required checks run: a PR opened with the workflow token does not
+# trigger them.
 name: Update flake.lock
 
 on:
@@ -13,8 +18,9 @@ on:
     - cron: "15 6 1 * *"
   workflow_dispatch:
 
-# Least privilege at the top; the one job that commits and opens a PR
-# escalates below (Scorecard Token-Permissions best practice).
+# Least privilege at the top; the one job that pushes a branch escalates
+# below (Scorecard Token-Permissions best practice). `pull-requests: write`
+# is deliberately absent: nothing here opens a PR.
 permissions:
   contents: read
 
@@ -24,7 +30,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -43,14 +48,33 @@ jobs:
           nix flake check --no-build --show-trace
           nix build --no-link .#default.cargoDeps .#onnxruntime-bin
 
-      - name: Open the update PR
-        uses: DeterminateSystems/update-flake-lock@834c491b2ece4de0bbd00d85214bb5e83b4da5c6 # v28
-        with:
-          pr-title: "deps: update flake.lock"
-          pr-body: |
-            Monthly nix input refresh. `nix flake check` and the
-            fixed-output-derivation builds passed in the generating
-            workflow run before this PR was opened. Close and reopen
-            this PR to trigger the required CI checks.
-          branch: deps/update-flake-lock
-          commit-msg: "deps: update flake.lock"
+      - name: Push the validated update branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: deps/update-flake-lock
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- flake.lock; then
+            echo "flake.lock is already current; nothing to push."
+            echo "flake.lock is already current; nothing to push." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "deps: update flake.lock"
+          # --force, not --force-with-lease: this branch is recreated from
+          # main by each run, and the checkout has no remote-tracking ref for
+          # it to lease against. Nothing but this workflow writes it.
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$BRANCH"
+          {
+            echo "### flake.lock update ready"
+            echo
+            echo "Pushed \`$BRANCH\`. \`nix flake check\` and the"
+            echo "fixed-output-derivation builds passed above."
+            echo
+            echo "Open a PR from it to run the required checks:"
+            echo "<https://github.com/${GITHUB_REPOSITORY}/compare/$BRANCH?expand=1>"
+          } >> "$GITHUB_STEP_SUMMARY"

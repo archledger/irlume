@@ -47,12 +47,17 @@ pub enum Class {
     /// stay on the worker so every mutation of shared state stays serialized
     /// against captures and against each other.
     Plain,
-    /// Read-only status that touches neither the camera nor the engine:
-    /// answered on the CONNECTION THREAD, never queued. This class exists
-    /// because one of its members (`ListProfiles`) is a TPM unseal that
-    /// measured 10.8 seconds on a slow TPM, and queued behind the worker it
-    /// made a concurrently arriving authentication wait that long (#212). A
-    /// status read has no business making a login wait.
+    /// Status that can be answered on the CONNECTION THREAD without touching
+    /// the camera, the engine, the TPM, or any shared mutable state: pure
+    /// path checks, the published engine bits, and the worker-published
+    /// enrollment summary. This class exists because `ListProfiles` is a TPM
+    /// unseal that measured 10.8 seconds on a slow TPM, and queued behind
+    /// the worker it made a concurrently arriving authentication wait that
+    /// long (#212). Membership is strict on purpose: the physical TPM
+    /// executes one command at a time (tpmrm queues, it does not
+    /// parallelize), so ANY TPM-touching request serves from the worker,
+    /// and a status answer that would need the TPM (an unpublished summary)
+    /// falls through to the worker queue instead.
     Status,
 }
 
@@ -66,15 +71,16 @@ pub fn classify(req: &Request) -> Class {
     use Request::*;
     match req {
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => Class::Auth,
-        // Read-only, engine-free, and possibly SLOW (ListProfiles pays a TPM
-        // unseal): answered where they arrive so they cannot delay a login
-        // and a login cannot delay them.
-        Ping
-        | Health
-        | HasSealedPassword { .. }
-        | KeyringInfo { .. }
-        | RecoveryStatus { .. }
-        | ListProfiles { .. } => Class::Status,
+        // Answerable from memory and path checks alone. ListProfiles is
+        // here because its ANSWER comes from the worker-published summary
+        // cache; a cache miss falls through to the worker queue, where the
+        // real load (a TPM unseal that may also re-seal the template key)
+        // stays serialized. KeyringInfo is NOT here: its PCR diagnosis is a
+        // TPM command, and the TPM executes one command at a time, so it
+        // serves from the worker with the other TPM users.
+        Ping | Health | HasSealedPassword { .. } | RecoveryStatus { .. } | ListProfiles { .. } => {
+            Class::Status
+        }
         PositionSample { .. }
         | Identify
         | Enroll { .. }

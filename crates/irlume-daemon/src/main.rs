@@ -1246,6 +1246,119 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
     });
 }
 
+/// One user's enrollment as the status path may report it, published by the
+/// WORKER after it loads or mutates that enrollment and read (cloned) by the
+/// connection threads. The real `storage::load` both unseals under the TPM
+/// (one command at a time on the physical chip, so it contends with a
+/// login's own TPM work) and can WRITE: `load_key`'s best-effort tier
+/// upgrade re-seals the template-key envelope. Neither belongs on a
+/// connection thread, so the status path serves only this snapshot and a
+/// miss falls through to the worker queue.
+#[derive(Clone)]
+struct EnrollmentSummary {
+    profiles: Vec<irlume_common::ProfileSummary>,
+    require_eyes_open: bool,
+    require_challenge: bool,
+    closure_calibrated: bool,
+    ir_ratio_calibrated: bool,
+}
+
+#[allow(clippy::type_complexity)]
+fn enrollment_summaries(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, EnrollmentSummary>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, EnrollmentSummary>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn summarize_enrollment(enr: Option<&irlume_core::storage::Enrollment>) -> EnrollmentSummary {
+    match enr {
+        Some(enr) => EnrollmentSummary {
+            profiles: enr
+                .profiles
+                .iter()
+                .map(|p| irlume_common::ProfileSummary {
+                    name: p.name.clone(),
+                    scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                })
+                .collect(),
+            require_eyes_open: enr.require_eyes_open,
+            require_challenge: enr.require_challenge,
+            closure_calibrated: enr
+                .closure_calibration
+                .map(|(o, c)| {
+                    irlume_liveness::ClosureCalibration {
+                        ear_open: o,
+                        ear_closed: c,
+                    }
+                    .is_usable()
+                })
+                .unwrap_or(false),
+            ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
+        },
+        // A successful load that found nothing IS an observation: publishing
+        // the empty summary keeps an unenrolled machine's status pollers off
+        // the worker instead of missing on every tick.
+        None => EnrollmentSummary {
+            profiles: Vec::new(),
+            require_eyes_open: false,
+            require_challenge: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
+        },
+    }
+}
+
+fn publish_enrollment_summary(user: &str, summary: EnrollmentSummary) {
+    enrollment_summaries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(user.to_string(), summary);
+}
+
+/// Dropped BEFORE the mutation runs, so the window where the cache could
+/// disagree with disk is "empty", never "stale": a concurrent status read
+/// misses and queues behind the mutation it would otherwise have raced.
+fn invalidate_enrollment_summary(user: &str) {
+    enrollment_summaries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(user);
+}
+
+fn cached_enrollment_summary(user: &str) -> Option<EnrollmentSummary> {
+    enrollment_summaries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(user)
+        .cloned()
+}
+
+/// The requests after which the published summary for `user` may no longer
+/// describe the enrollment on disk. The worker invalidates before running
+/// them. Recovery operations are included because they change the key
+/// material the enrollment is sealed under; re-publishing happens on the
+/// next worker-side listing.
+fn enrollment_mutating_user(req: &Request) -> Option<&str> {
+    use Request::*;
+    match req {
+        Enroll { user, .. }
+        | AddScan { user, .. }
+        | DeleteProfile { user, .. }
+        | DeleteScan { user, .. }
+        | RenameProfile { user, .. }
+        | RenameScan { user, .. }
+        | SetRequireEyesOpen { user, .. }
+        | SetRequireChallenge { user, .. }
+        | SetClosureCalibration { user, .. }
+        | RecoverySetup { user, .. }
+        | RecoveryRestore { user, .. }
+        | RecoveryForget { user, .. } => Some(user),
+        _ => None,
+    }
+}
+
 /// The username-validity pregate every request passes before any arm runs,
 /// shared by the worker dispatch and the connection-thread status dispatch.
 fn precheck(req: &Request) -> Option<Response> {
@@ -1310,12 +1423,89 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
             }
             Response::HasPassword(irlume_core::keyring::has_sealed_password(user))
         }
-        Request::KeyringInfo { user } => {
+        Request::RecoveryStatus { user } => {
             if !authorized_for(peer, user) {
                 return Some(Response::Error(format!("not authorized to query '{user}'")));
             }
-            let armed = irlume_core::keyring::has_sealed_password(user);
-            let path = irlume_core::keyring::envelope_path(user);
+            Response::RecoveryStatus {
+                encrypted: irlume_core::template_key::has_key(user),
+                recovery_set: irlume_core::template_key::has_recovery(user),
+                tpm_present: irlume_core::template_key::tpm_available(),
+            }
+        }
+        Request::ListProfiles {
+            user,
+            structured_errors,
+        } => {
+            let fail = |code: irlume_common::OperationErrorCode, prose: String| {
+                if *structured_errors {
+                    Response::OperationError {
+                        code,
+                        retryable: false,
+                    }
+                } else {
+                    Response::Error(prose)
+                }
+            };
+            if !authorized_for(peer, user) {
+                return Some(fail(
+                    irlume_common::OperationErrorCode::NotAuthorized,
+                    format!("not authorized to list '{user}'"),
+                ));
+            }
+            // Cache HIT only: the summary the worker published after its
+            // last load or mutation of this enrollment. A miss returns None
+            // and the request queues to the worker, whose ListProfiles arm
+            // does the real load (TPM unseal, possible key re-seal) and
+            // publishes. Serving the real load here would put a TPM command
+            // and a potential template-key WRITE on a connection thread.
+            match cached_enrollment_summary(user) {
+                Some(sum) => Response::Enrollment {
+                    profiles: sum.profiles,
+                    require_eyes_open: sum.require_eyes_open,
+                    require_challenge: sum.require_challenge,
+                    closure_calibrated: sum.closure_calibrated,
+                    ir_ratio_calibrated: sum.ir_ratio_calibrated,
+                },
+                None => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
+    // BEFORE the mutation runs, not after: a summary dropped early leaves
+    // the cache empty (a concurrent status read queues here behind us),
+    // never stale. Repopulated by the next worker-side listing.
+    if let Some(u) = enrollment_mutating_user(&req) {
+        invalidate_enrollment_summary(u);
+    }
+    // Status requests are normally answered on the connection thread and
+    // never reach here; delegating keeps this dispatch total (and identical
+    // in behavior) if one is ever submitted anyway. precheck rides inside.
+    if let Some(resp) = dispatch_status(&req, peer) {
+        return resp;
+    }
+    if let Some(resp) = precheck(&req) {
+        return resp;
+    }
+    match req {
+        // These four are answered by dispatch_status above; the arm is
+        // unreachable and exists so the match stays exhaustive without a
+        // second implementation to drift.
+        Request::Ping
+        | Request::Health
+        | Request::HasSealedPassword { .. }
+        | Request::RecoveryStatus { .. } => {
+            Response::Error("status request routed past its handler".into())
+        }
+        Request::KeyringInfo { user } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to query '{user}'"));
+            }
+            let armed = irlume_core::keyring::has_sealed_password(&user);
+            let path = irlume_core::keyring::envelope_path(&user);
             match irlume_core::envelope::SealedEnvelope::load(&path) {
                 Ok(env) => Response::KeyringInfo {
                     armed,
@@ -1338,16 +1528,6 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 },
             }
         }
-        Request::RecoveryStatus { user } => {
-            if !authorized_for(peer, user) {
-                return Some(Response::Error(format!("not authorized to query '{user}'")));
-            }
-            Response::RecoveryStatus {
-                encrypted: irlume_core::template_key::has_key(user),
-                recovery_set: irlume_core::template_key::has_recovery(user),
-                tpm_present: irlume_core::template_key::tpm_available(),
-            }
-        }
         Request::ListProfiles {
             user,
             structured_errors,
@@ -1357,7 +1537,7 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
             // variant, so sending one unasked would break it across the upgrade
             // window, which is the failure class of issue #93.
             let fail = |code: irlume_common::OperationErrorCode, prose: String| {
-                if *structured_errors {
+                if structured_errors {
                     Response::OperationError {
                         code,
                         retryable: false,
@@ -1366,74 +1546,34 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                     Response::Error(prose)
                 }
             };
-            if !authorized_for(peer, user) {
-                return Some(fail(
+            if !authorized_for(peer, &user) {
+                return fail(
                     irlume_common::OperationErrorCode::NotAuthorized,
                     format!("not authorized to list '{user}'"),
-                ));
+                );
             }
-            match irlume_core::storage::load(user) {
-                Ok(Some(enr)) => Response::Enrollment {
-                    profiles: enr
-                        .profiles
-                        .iter()
-                        .map(|p| irlume_common::ProfileSummary {
-                            name: p.name.clone(),
-                            scans: p.scans.iter().map(|s| s.name.clone()).collect(),
-                        })
-                        .collect(),
-                    require_eyes_open: enr.require_eyes_open,
-                    require_challenge: enr.require_challenge,
-                    closure_calibrated: enr
-                        .closure_calibration
-                        .map(|(o, c)| {
-                            irlume_liveness::ClosureCalibration {
-                                ear_open: o,
-                                ear_closed: c,
-                            }
-                            .is_usable()
-                        })
-                        .unwrap_or(false),
-                    ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
-                },
-                Ok(None) => Response::Enrollment {
-                    profiles: vec![],
-                    require_eyes_open: false,
-                    require_challenge: false,
-                    closure_calibrated: false,
-                    ir_ratio_calibrated: false,
-                },
+            match irlume_core::storage::load(&user) {
+                Ok(enr) => {
+                    // The status path serves this snapshot from now on; the
+                    // load above is also the moment `load_key` may have
+                    // re-sealed the template key, which is exactly why the
+                    // load lives HERE on the worker and not on a connection
+                    // thread.
+                    let sum = summarize_enrollment(enr.as_ref());
+                    publish_enrollment_summary(&user, sum.clone());
+                    Response::Enrollment {
+                        profiles: sum.profiles,
+                        require_eyes_open: sum.require_eyes_open,
+                        require_challenge: sum.require_challenge,
+                        closure_calibrated: sum.closure_calibrated,
+                        ir_ratio_calibrated: sum.ir_ratio_calibrated,
+                    }
+                }
                 Err(e) => fail(
                     irlume_common::OperationErrorCode::OperationFailed,
                     e.to_string(),
                 ),
             }
-        }
-        _ => return None,
-    })
-}
-
-fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
-    // Status requests are normally answered on the connection thread and
-    // never reach here; delegating keeps this dispatch total (and identical
-    // in behavior) if one is ever submitted anyway. precheck rides inside.
-    if let Some(resp) = dispatch_status(&req, peer) {
-        return resp;
-    }
-    if let Some(resp) = precheck(&req) {
-        return resp;
-    }
-    match req {
-        // Status variants are answered by dispatch_status above; this arm is
-        // unreachable and exists so the match stays exhaustive without a
-        // second implementation to drift.
-        Request::Ping
-        | Request::Health
-        | Request::HasSealedPassword { .. }
-        | Request::KeyringInfo { .. }
-        | Request::RecoveryStatus { .. }
-        | Request::ListProfiles { .. } => {
-            Response::Error("status request routed past its handler".into())
         }
         Request::PositionSample { user } => {
             match engine.position_sample(user.as_deref().filter(|u| authorized_for(peer, u))) {
@@ -2997,7 +3137,6 @@ mod tests {
             Request::Ping,
             Request::Health,
             Request::HasSealedPassword { user: u() },
-            Request::KeyringInfo { user: u() },
             Request::RecoveryStatus { user: u() },
             Request::ListProfiles {
                 user: u(),
@@ -3006,6 +3145,10 @@ mod tests {
         ] {
             assert_eq!(classify(&req), Class::Status, "{req:?}");
         }
+        // KeyringInfo diagnoses PCRs, a TPM command; the physical TPM runs
+        // one command at a time, so it serves from the worker with the
+        // other TPM users, not from a connection thread.
+        assert_eq!(classify(&Request::KeyringInfo { user: u() }), Class::Plain);
         // Mutating requests stay serialized on the worker: reclassifying one
         // as Status would let it race captures and other writers.
         for req in [
@@ -3021,6 +3164,125 @@ mod tests {
         ] {
             assert_eq!(classify(&req), Class::Plain, "{req:?}");
         }
+    }
+
+    #[test]
+    fn a_listing_serves_the_published_summary_and_misses_queue_to_the_worker() {
+        let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
+        let peer = Peer {
+            uid: unsafe { libc::getuid() },
+            gid: 0,
+            pid: 1,
+        };
+        let req = Request::ListProfiles {
+            user: me.clone(),
+            structured_errors: false,
+        };
+        invalidate_enrollment_summary(&me);
+        // MISS: the status path must NOT answer (None queues it to the
+        // worker, where the real load with its TPM unseal and possible
+        // template-key re-seal stays serialized).
+        assert!(
+            dispatch_status(&req, &peer).is_none(),
+            "an unpublished summary must route to the worker"
+        );
+        // HIT: the worker-published snapshot answers without the worker.
+        publish_enrollment_summary(
+            &me,
+            EnrollmentSummary {
+                profiles: vec![irlume_common::ProfileSummary {
+                    name: "Alice".into(),
+                    scans: vec!["s1".into()],
+                }],
+                require_eyes_open: true,
+                require_challenge: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: true,
+            },
+        );
+        match dispatch_status(&req, &peer) {
+            Some(Response::Enrollment {
+                profiles,
+                require_eyes_open,
+                ir_ratio_calibrated,
+                ..
+            }) => {
+                assert_eq!(profiles.len(), 1);
+                assert!(require_eyes_open);
+                assert!(ir_ratio_calibrated);
+            }
+            other => panic!("expected the cached enrollment, got {other:?}"),
+        }
+        // A mutation invalidates BEFORE it runs: the next status read
+        // misses and queues behind it instead of racing it.
+        assert!(enrollment_mutating_user(&Request::DeleteProfile {
+            user: me.clone(),
+            profile: "Alice".into(),
+        })
+        .is_some());
+        invalidate_enrollment_summary(&me);
+        assert!(dispatch_status(&req, &peer).is_none());
+    }
+
+    #[test]
+    fn every_enrollment_mutation_is_on_the_invalidation_list() {
+        let u = || "carol".to_string();
+        let mutating: Vec<Request> = vec![
+            Request::Enroll {
+                user: u(),
+                profile: None,
+                scans: None,
+                reset: false,
+            },
+            Request::AddScan {
+                user: u(),
+                profile: "p".into(),
+            },
+            Request::DeleteProfile {
+                user: u(),
+                profile: "p".into(),
+            },
+            Request::DeleteScan {
+                user: u(),
+                profile: "p".into(),
+                scan: "s".into(),
+            },
+            Request::RenameProfile {
+                user: u(),
+                profile: "a".into(),
+                new_name: "b".into(),
+            },
+            Request::RenameScan {
+                user: u(),
+                profile: "p".into(),
+                scan: "a".into(),
+                new_name: "b".into(),
+            },
+            Request::SetRequireEyesOpen {
+                user: u(),
+                on: true,
+            },
+            Request::SetRequireChallenge {
+                user: u(),
+                on: true,
+            },
+        ];
+        for req in &mutating {
+            assert_eq!(
+                enrollment_mutating_user(req),
+                Some("carol"),
+                "a mutation missing from the invalidation list serves stale \
+                 summaries forever: {req:?}"
+            );
+        }
+        // Reads must NOT invalidate: an Authenticate loads the enrollment
+        // but changes nothing the summary reports.
+        assert!(enrollment_mutating_user(&Request::Authenticate {
+            user: u(),
+            service: None,
+        })
+        .is_none());
+        assert!(enrollment_mutating_user(&Request::Ping).is_none());
     }
 
     #[test]

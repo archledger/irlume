@@ -679,7 +679,11 @@ fn report_fprintd_coverage(pam_dir: &std::path::Path) {
     if cov.is_empty() {
         return;
     }
-    println!("[fingerprint] coverage: where a finger can answer the prompt:");
+    // The scan reads /etc/pam.d only. Linux-PAM can also load a vendor
+    // service (/usr/lib/pam.d) when no /etc override exists, so a surface
+    // served purely by a vendor stack is absent from this table rather than
+    // shown wrong; saying so beats implying completeness (#208).
+    println!("[fingerprint] coverage: where a finger can answer the prompt (per /etc/pam.d):");
     for (svc, label, reaches) in &cov {
         println!("    {} {label}  ({svc})", if *reaches { "✓" } else { "✗" });
     }

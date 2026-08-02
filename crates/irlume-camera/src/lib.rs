@@ -341,22 +341,103 @@ fn camera_holder(device: &str) -> Option<String> {
 pub enum Role {
     Rgb,
     Ir,
-    /// A capture node advertising neither (metadata node) or unreadable.
+    /// A capture node that answered and advertises neither colour nor grey,
+    /// which is what a UVC metadata node looks like. A node that could not be
+    /// read is NOT this: see `Unreadable`.
     Other,
 }
 
-/// Classify a single `/dev/videoN` node by enumerating its pixel formats.
-/// Defensive: enumerate FORMATS (safe), never `query_controls` (panics on some
-/// UVC drivers; a hard-won linhello lesson).
-pub fn classify(device: &str) -> Role {
-    let Ok(dev) = Device::with_path(device) else {
-        return Role::Other;
+/// Where reading a node failed. A node that could not be read is kept apart
+/// from `Role::Other` all the way to the report, because the two call for
+/// opposite actions: `Other` is a node correctly ignored, while this is a
+/// camera whose kind is still unknown. Collapsing them told a user with a busy
+/// or unreadable camera that the hardware was absent, which is the same
+/// mistake `control_read_failure_means_absent` exists to prevent one function
+/// below (#227).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedAt {
+    /// `open(2)` on the node itself.
+    Open,
+    /// The node opened, then would not enumerate its formats.
+    EnumFormats,
+}
+
+/// A `/dev/video*` node that exists but could not be classified.
+#[derive(Debug, Clone)]
+pub struct Unreadable {
+    pub path: String,
+    pub at: FailedAt,
+    /// `None` when the failure carried no OS error, which the v4l crate can
+    /// produce for a malformed response rather than a syscall failure.
+    pub errno: Option<i32>,
+    /// The process holding the node, captured at scan time because a holder
+    /// named a minute later may not be the one that caused the failure. Only
+    /// looked up for EBUSY, and best-effort even then: `camera_holder` reads
+    /// /proc and cannot see a holder owned by another uid (#207).
+    pub holder: Option<String>,
+}
+
+impl Unreadable {
+    /// The cause in a person's terms, and what resolves it. Pure over the
+    /// struct, so the wording is testable without an unreadable camera to
+    /// hand. Deliberately says what `map_io` says for the same errnos: a user
+    /// who hits this in doctor and then again mid-capture should not get two
+    /// different explanations of one condition.
+    pub fn explain(&self) -> String {
+        let what = match self.at {
+            FailedAt::Open => "could not be opened",
+            FailedAt::EnumFormats => "opened but would not list its formats",
+        };
+        let why = match self.errno {
+            Some(libc::EACCES) | Some(libc::EPERM) => {
+                "permission denied; add your user to the 'video' group (camera) and re-login"
+                    .to_string()
+            }
+            Some(libc::EBUSY) => match &self.holder {
+                Some(h) => format!("camera busy, in use by {h}. Close that app and retry"),
+                None => {
+                    "camera busy, another app is using it. Close that app and retry".to_string()
+                }
+            },
+            Some(libc::ENODEV) | Some(libc::ENXIO) => {
+                "the node is present but the device behind it is gone, which is what an \
+                 unplugged or reset USB camera leaves behind"
+                    .to_string()
+            }
+            _ => "cause unknown; the errno above is reported as the driver gave it".to_string(),
+        };
+        let code = match self.errno {
+            Some(e) => format!("errno {e}: {}", std::io::Error::from_raw_os_error(e)),
+            None => "no OS error reported".to_string(),
+        };
+        format!("{} {what} ({code}). {why}", self.path)
+    }
+}
+
+/// Classify a single `/dev/videoN` node by enumerating its pixel formats,
+/// keeping a failure to read the node apart from a node that read as neither
+/// kind. Defensive: enumerate FORMATS (safe), never `query_controls` (panics on
+/// some UVC drivers; a hard-won linhello lesson).
+pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
+    let unreadable = |at, e: std::io::Error| Unreadable {
+        path: device.to_string(),
+        at,
+        errno: e.raw_os_error(),
+        // Filled in by `scan_nodes` for a busy node; classifying one node in
+        // isolation does not walk /proc.
+        holder: None,
     };
-    let Ok(formats) = Capture::enum_formats(&dev) else {
-        return Role::Other;
-    };
+    let dev = Device::with_path(device).map_err(|e| unreadable(FailedAt::Open, e))?;
+    let formats = Capture::enum_formats(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let fourccs: Vec<[u8; 4]> = formats.iter().map(|f| f.fourcc.repr).collect();
-    role_from_formats(&fourccs)
+    Ok(role_from_formats(&fourccs))
+}
+
+/// `classify_node` for callers that only act on a node they can use. An
+/// unreadable node answers `Other` here, so anything reporting to a human
+/// wants `classify_node` or `scan_nodes` instead.
+pub fn classify(device: &str) -> Role {
+    classify_node(device).unwrap_or(Role::Other)
 }
 
 /// Pure classification over a node's advertised fourccs (unit-testable without
@@ -381,17 +462,66 @@ pub(crate) fn role_from_formats(fourccs: &[[u8; 4]]) -> Role {
     }
 }
 
-/// Scan `/dev/video0..9`, returning (path, role) for each readable capture node.
-pub fn discover_nodes() -> Vec<(String, Role)> {
-    (0..10)
-        .map(|n| format!("/dev/video{n}"))
-        .filter(|p| std::path::Path::new(p).exists())
-        .map(|p| {
-            let role = classify(&p);
-            (p, role)
+/// Every `/dev/video*` node on the machine, in numeric order. Read from the
+/// directory rather than probing a fixed range: the old `0..10` scan never
+/// looked at `/dev/video10`, which a machine with two cameras and a couple of
+/// v4l2loopback nodes reaches without being unusual (#227).
+pub(crate) fn video_node_paths() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/dev") else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<(u32, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let n: u32 = name.strip_prefix("video")?.parse().ok()?;
+            Some((n, format!("/dev/{name}")))
         })
-        .filter(|(_, r)| *r != Role::Other)
-        .collect()
+        .collect();
+    nodes.sort_unstable();
+    nodes.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Every video node split into the ones that answered and the ones that could
+/// not be read. `discover_nodes` throws the second group away, which is right
+/// for callers picking a camera to open and wrong for anything reporting to a
+/// person.
+#[derive(Debug, Clone, Default)]
+pub struct NodeScan {
+    /// Nodes that answered, excluding `Role::Other`.
+    pub classified: Vec<(String, Role)>,
+    pub unreadable: Vec<Unreadable>,
+}
+
+/// `with_holders` walks /proc for each busy node to name what holds it. That
+/// is worth a report a person reads and not worth it for the camera-picking
+/// callers, which run on the TUI's refresh path.
+fn scan(with_holders: bool) -> NodeScan {
+    let mut scan = NodeScan::default();
+    for path in video_node_paths() {
+        match classify_node(&path) {
+            Ok(Role::Other) => {}
+            Ok(role) => scan.classified.push((path, role)),
+            Err(mut u) => {
+                if with_holders && u.errno == Some(libc::EBUSY) {
+                    u.holder = camera_holder(&u.path);
+                }
+                scan.unreadable.push(u);
+            }
+        }
+    }
+    scan
+}
+
+/// Classify every video node, keeping the failures and naming what holds a
+/// busy one. For reports; use `discover_nodes` to pick a camera.
+pub fn scan_nodes() -> NodeScan {
+    scan(true)
+}
+
+/// Scan for each readable capture node, returning (path, role).
+pub fn discover_nodes() -> Vec<(String, Role)> {
+    scan(false).classified
 }
 
 /// Whether a failed privacy-control read means the camera does not HAVE the
@@ -2707,6 +2837,71 @@ fn warm_up_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unreadable(at: FailedAt, errno: Option<i32>, holder: Option<&str>) -> Unreadable {
+        Unreadable {
+            path: "/dev/video4".into(),
+            at,
+            errno,
+            holder: holder.map(str::to_string),
+        }
+    }
+
+    /// The whole point of #227: the three conditions a camera node fails under
+    /// must reach the reader as three different sentences, each naming the act
+    /// that clears it. A permission problem that reads as absent hardware sends
+    /// someone after a driver bug they do not have.
+    #[test]
+    fn an_unreadable_node_explains_the_cause_it_actually_hit() {
+        let denied = unreadable(FailedAt::Open, Some(libc::EACCES), None).explain();
+        assert!(denied.contains("/dev/video4"), "{denied}");
+        assert!(denied.contains("could not be opened"), "{denied}");
+        assert!(denied.contains("'video' group"), "{denied}");
+
+        // A named holder is the difference between "something has your camera"
+        // and knowing which app to close.
+        let busy =
+            unreadable(FailedAt::Open, Some(libc::EBUSY), Some("firefox (pid 42)")).explain();
+        assert!(busy.contains("in use by firefox (pid 42)"), "{busy}");
+        assert!(!busy.contains("'video' group"), "{busy}");
+
+        // /proc could not name it (another uid, #207): still busy, no invention.
+        let anon = unreadable(FailedAt::Open, Some(libc::EBUSY), None).explain();
+        assert!(anon.contains("another app is using it"), "{anon}");
+
+        let gone = unreadable(FailedAt::EnumFormats, Some(libc::ENODEV), None).explain();
+        assert!(gone.contains("would not list its formats"), "{gone}");
+        assert!(gone.contains("device behind it is gone"), "{gone}");
+
+        // An errno with no mapping still reports the number rather than
+        // rounding down to silence.
+        let odd = unreadable(FailedAt::Open, Some(libc::EIO), None).explain();
+        assert!(odd.contains("errno 5"), "{odd}");
+        let none = unreadable(FailedAt::Open, None, None).explain();
+        assert!(none.contains("no OS error reported"), "{none}");
+    }
+
+    /// The old scan probed /dev/video0..9 by construction, so a tenth node was
+    /// invisible. archhost has one.
+    #[test]
+    fn the_node_scan_is_not_capped_at_ten() {
+        let paths = video_node_paths();
+        // Ordering is numeric, not lexical: video10 sorts after video9, which
+        // a string sort gets backwards.
+        let numbers: Vec<u32> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix("/dev/video")?.parse().ok())
+            .collect();
+        assert!(
+            numbers.windows(2).all(|w| w[0] < w[1]),
+            "nodes must be numerically ordered, got {paths:?}"
+        );
+        // Every path this yields is a real entry under /dev, whatever this
+        // machine happens to have.
+        for p in &paths {
+            assert!(std::path::Path::new(p).exists(), "{p} does not exist");
+        }
+    }
 
     fn frame(data: &[u8]) -> Frame {
         Frame {

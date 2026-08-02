@@ -3021,10 +3021,14 @@ fn doctor_run(
         report,
         "[doctor] camera nodes (classified by pixel format):"
     );
-    let nodes = irlume_camera::discover_nodes();
+    let scan = irlume_camera::scan_nodes();
+    let nodes = scan.classified.clone();
     // Capability, not identity: a consumer is told an IR node was classified,
     // never which device it is. The human report below still names them, since
     // a person debugging their own machine needs the path.
+    // The verdict is unchanged by #227: a node irlume cannot read is still a
+    // node it cannot use, so "nodes present, none readable" fails exactly as
+    // "no nodes" does. What changed is that the lines below now say which.
     report.check(
         "camera-nodes",
         if nodes.iter().any(|(_, r)| *r == irlume_camera::Role::Ir) {
@@ -3035,8 +3039,10 @@ fn doctor_run(
             State::Warn
         },
     );
+    if nodes.is_empty() && scan.unreadable.is_empty() {
+        dout!(report, "  (no /dev/video* nodes on this machine)");
+    }
     if nodes.is_empty() {
-        dout!(report, "  (none found under /dev/video0..9)");
         if let Some(gen) = irlume_camera::intel_ipu_present() {
             dout!(report,
                 "  ⚠ this laptop has an Intel {gen} MIPI camera, which irlume cannot use:\n     \
@@ -3096,6 +3102,12 @@ fn doctor_run(
                 );
             }
         }
+    }
+    // A node irlume could not read is named with its errno, never omitted.
+    // Dropping these is what let a permission problem read as absent hardware
+    // and sent the reader after a driver bug they did not have (#227).
+    for u in &scan.unreadable {
+        dout!(report, "  ⚠ {}", u.explain());
     }
 
     // --- models / runtime --------------------------------------------------

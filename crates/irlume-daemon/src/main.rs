@@ -3043,6 +3043,19 @@ mod tests {
         assert_eq!(peer.pid, std::process::id() as i32);
     }
 
+    /// Serialize the tests that mutate the process-global enrollment-summary
+    /// cache for the same username. libtest runs tests in parallel, so
+    /// without this one test's `publish` lands inside another's miss window
+    /// and turns a real pass into an intermittent failure (or worse, a false
+    /// pass in a mutation run, which is how a flake becomes a lie about
+    /// coverage).
+    fn enrollment_summary_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A Status request the connection thread CANNOT answer from memory must
     /// reach the worker, not be answered with an error.
     ///
@@ -3054,6 +3067,7 @@ mod tests {
     /// asserting their type: both were the same error.
     #[test]
     fn an_unpublished_listing_reaches_the_worker_instead_of_erroring() {
+        let _summary_guard = enrollment_summary_test_lock();
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         invalidate_enrollment_summary(&me);
 
@@ -3247,6 +3261,7 @@ mod tests {
 
     #[test]
     fn a_listing_serves_the_published_summary_and_misses_queue_to_the_worker() {
+        let _summary_guard = enrollment_summary_test_lock();
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         let peer = Peer {
             uid: unsafe { libc::getuid() },

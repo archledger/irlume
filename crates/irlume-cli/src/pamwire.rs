@@ -50,7 +50,7 @@ pub(crate) use files::{is_managed_path, lock_pam, restore_surface};
 // The one PAM-grammar item shared outside this module: `fingerprint.rs` must
 // read stack lines with the same comment semantics the wiring uses, or the
 // two would disagree about what a file configures.
-pub(crate) use grammar::{directive, has_line_continuation};
+pub(crate) use grammar::{directive, directive_has_auth_module, has_line_continuation};
 pub(crate) use report::{login_manager_fact, status_report, surface_facts};
 pub(crate) use stanzas::BACKUP;
 

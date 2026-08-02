@@ -441,21 +441,22 @@ fn disable() -> ExitCode {
 /// directory they control.
 const PAM_DIR: &str = "/etc/pam.d";
 
-/// Does `text` contain an ACTIVE line whose DIRECTIVE part references
-/// `needle`?
+/// Does `text` contain an auth RULE whose module-path names `module`?
 ///
-/// The directive part, everything before the first `#` (all libpam
-/// tokenizes), matters here more than anywhere: this feeds
-/// [`pam_fprintd_wired`], the gate that keeps `fingerprint enable` from
-/// recording a method nothing drives. Matching the raw line let a stack whose
-/// only `pam_fprintd.so` lived in a trailing comment pass that gate; with
-/// `--fingerprint-only` that stood face down on a box where no biometric
-/// answers any prompt, the precise outcome the gate exists to prevent.
+/// This feeds [`pam_fprintd_wired`], the gate that keeps `fingerprint enable`
+/// from recording a method nothing drives, so it must recognize what libpam
+/// recognizes and nothing more. Matching the raw line let a trailing comment
+/// pass the gate; matching the directive as a SUBSTRING still let a `session`
+/// line (never run by `pam_authenticate`), a module argument naming the file,
+/// or `pam_fprintd.so.disabled` pass it. With `--fingerprint-only` each of
+/// those stood face down on a box where no fingerprint rule answers any
+/// prompt, the precise outcome the gate exists to prevent. Parsing the rule
+/// fields ([`crate::pamwire::directive_has_auth_module`]) closes the class.
 /// `faillock_cohabits` (a doctor warning) and `fprintd_in_sudo` (the SSH
-/// stall warning) inherit the same comment semantics through this function.
-fn has_active_line(text: &str, needle: &str) -> bool {
+/// stall warning) inherit the same semantics through this function.
+fn has_auth_module(text: &str, module: &str) -> bool {
     text.lines()
-        .any(|l| crate::pamwire::directive(l).contains(needle))
+        .any(|l| crate::pamwire::directive_has_auth_module(l, module))
 }
 
 /// The contents of every file in `pam_dir` that PAM will actually load.
@@ -487,13 +488,18 @@ fn live_pam_stacks(pam_dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// True when a PAM stack PAM actually loads carries an ACTIVE (non-comment)
-/// line referencing `pam_fprintd.so`, i.e. something will really drive the
-/// fingerprint prompt. Unreadable dirs/files count as not wired.
+/// True when a PAM stack PAM actually loads carries an auth rule whose module
+/// is `pam_fprintd.so`, i.e. something will really drive the fingerprint
+/// prompt. Unreadable dirs/files count as not wired, and so does a
+/// `\`-continued file: libpam joins those lines before tokenizing, so a
+/// physical line reading `auth ... pam_fprintd.so` can really be the tail of
+/// a session directive's arguments, executed never. This is the gate before
+/// `--fingerprint-only` disables face; standing down on a file it cannot read
+/// the way PAM does is the safe direction.
 fn pam_fprintd_wired(pam_dir: &std::path::Path) -> bool {
     live_pam_stacks(pam_dir)
         .iter()
-        .any(|s| has_active_line(s, "pam_fprintd.so"))
+        .any(|s| !crate::pamwire::has_line_continuation(s) && has_auth_module(s, "pam_fprintd.so"))
 }
 
 /// True when one PAM service file stacks BOTH pam_faillock and pam_fprintd.
@@ -504,7 +510,7 @@ fn pam_fprintd_wired(pam_dir: &std::path::Path) -> bool {
 pub(crate) fn faillock_cohabits(pam_dir: &std::path::Path) -> bool {
     live_pam_stacks(pam_dir)
         .iter()
-        .any(|s| has_active_line(s, "pam_faillock.so") && has_active_line(s, "pam_fprintd.so"))
+        .any(|s| has_auth_module(s, "pam_faillock.so") && has_auth_module(s, "pam_fprintd.so"))
 }
 
 /// True when the sudo PAM service reaches pam_fprintd, either directly or via
@@ -516,7 +522,7 @@ pub(crate) fn fprintd_in_sudo(pam_dir: &std::path::Path) -> bool {
     let Ok(sudo) = std::fs::read_to_string(pam_dir.join("sudo")) else {
         return false;
     };
-    if has_active_line(&sudo, "pam_fprintd.so") {
+    if has_auth_module(&sudo, "pam_fprintd.so") {
         return true;
     }
     for l in sudo.lines() {
@@ -533,7 +539,7 @@ pub(crate) fn fprintd_in_sudo(pam_dir: &std::path::Path) -> bool {
         };
         if let Some(name) = target {
             if std::fs::read_to_string(pam_dir.join(name))
-                .is_ok_and(|s| has_active_line(&s, "pam_fprintd.so"))
+                .is_ok_and(|s| has_auth_module(&s, "pam_fprintd.so"))
             {
                 return true;
             }
@@ -635,7 +641,12 @@ pub(crate) fn stack_reaches_fprintd(pam_dir: &std::path::Path, service: &str) ->
                         return true;
                     }
                 }
-                _ if d.contains("pam_fprintd.so") => return true,
+                // The module-path FIELD, not a substring of the directive: an
+                // argument naming the file (`pam_exec.so log=/x/pam_fprintd.so`)
+                // is not a fingerprint rule.
+                _ if crate::pamwire::directive_has_auth_module(line, "pam_fprintd.so") => {
+                    return true
+                }
                 _ => {}
             }
         }
@@ -773,6 +784,51 @@ mod tests {
         .unwrap();
         assert!(pam_fprintd_wired(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn continued_physical_auth_line_does_not_pass_enable_gate() {
+        // libpam joins the two physical lines before tokenizing: PAM sees ONE
+        // session directive whose arguments happen to contain the text of an
+        // auth rule. The gate reading lines independently saw an auth line
+        // and licensed --fingerprint-only to disable face with no fingerprint
+        // rule anywhere.
+        let dir = pam_dir(
+            "continued-gate",
+            &[(
+                "login",
+                "session optional pam_exec.so /bin/true \\\nauth optional pam_fprintd.so\n",
+            )],
+        );
+        assert!(!pam_fprintd_wired(&dir));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_gate_requires_auth_module_path() {
+        // A session rule never runs under pam_authenticate; an argument
+        // naming the file is not the module-path field; a different filename
+        // is a different module. Each of these passed the substring gate.
+        for body in [
+            "session optional pam_fprintd.so\n",
+            "auth optional pam_exec.so /tmp/pam_fprintd.so\n",
+            "auth optional pam_fprintd.so.disabled\n",
+        ] {
+            let dir = pam_dir("module-field", &[("login", body)]);
+            assert!(!pam_fprintd_wired(&dir), "{body:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        // And the parser recognizes what libpam recognizes: a case-insensitive
+        // type, a bracketed multi-token control, and a full module path.
+        let dir = pam_dir(
+            "module-field-positive",
+            &[(
+                "login",
+                "AUTH [success=done default=ignore] /usr/lib64/security/pam_fprintd.so\n",
+            )],
+        );
+        assert!(pam_fprintd_wired(&dir));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A scratch pam.d directory populated from `(name, content)` pairs.

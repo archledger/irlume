@@ -481,8 +481,9 @@ impl PamSearchPath {
         }
     }
 
-    /// A machine directory with no vendor fallback, for callers and tests that
-    /// mean exactly one directory.
+    /// A machine directory with no vendor fallback, for tests that mean
+    /// exactly one directory. Production always resolves through `live()`.
+    #[cfg(test)]
     pub(crate) fn machine_only(machine: &std::path::Path) -> Self {
         Self {
             machine: machine.to_path_buf(),
@@ -527,11 +528,6 @@ impl PamSearchPath {
             }
         }
         names.into_iter().collect()
-    }
-
-    /// The directories to sweep, machine first.
-    fn dirs(&self) -> impl Iterator<Item = &std::path::Path> {
-        std::iter::once(self.machine.as_path()).chain(self.vendor.as_deref())
     }
 }
 
@@ -780,11 +776,18 @@ fn report_fprintd_coverage(path: &PamSearchPath) {
     if cov.is_empty() {
         return;
     }
-    // The scan reads /etc/pam.d only. Linux-PAM can also load a vendor
-    // service (/usr/lib/pam.d) when no /etc override exists, so a surface
-    // served purely by a vendor stack is absent from this table rather than
-    // shown wrong; saying so beats implying completeness (#208).
-    println!("[fingerprint] coverage: where a finger can answer the prompt (per /etc/pam.d):");
+    // The scan follows libpam's own search path since #208, so name the
+    // directories it actually read. A surface served purely by a vendor stack
+    // now appears; before, it was missing from the table entirely.
+    let where_from = match &path.vendor {
+        Some(v) => format!(
+            "per {} with {} as fallback",
+            path.machine.display(),
+            v.display()
+        ),
+        None => format!("per {}", path.machine.display()),
+    };
+    println!("[fingerprint] coverage: where a finger can answer the prompt ({where_from}):");
     for (svc, label, reaches) in &cov {
         println!("    {} {label}  ({svc})", if *reaches { "✓" } else { "✗" });
     }
@@ -948,6 +951,105 @@ mod tests {
             std::fs::write(dir.join(name), body).unwrap();
         }
         dir
+    }
+
+    /// A machine and a vendor directory, for the precedence tests.
+    fn pam_pair(
+        tag: &str,
+        machine: &[(&str, &str)],
+        vendor: &[(&str, &str)],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let m = pam_dir(&format!("{tag}-etc"), machine);
+        let v = pam_dir(&format!("{tag}-vendor"), vendor);
+        (m, v)
+    }
+
+    /// libpam reads a service from the vendor directory when the machine has
+    /// no file for it, and a machine file overrides its vendor namesake
+    /// outright rather than merging (pam.conf(5)). Scanning `/etc/pam.d` alone
+    /// omitted a service whose entire stack is a vendor file, so the coverage
+    /// table understated what a finger answers (#208).
+    #[test]
+    fn a_vendor_service_counts_and_a_machine_file_overrides_it() {
+        let wired = "auth sufficient pam_fprintd.so\n";
+        let bare = "auth required pam_unix.so\n";
+        let (m, v) = pam_pair(
+            "vendor-precedence",
+            // sudo exists in both, and the machine copy has NO fingerprint
+            // line: PAM runs this one, so coverage must follow it.
+            &[("sudo", bare)],
+            // login exists only in the vendor directory, wired.
+            &[("sudo", wired), ("login", wired)],
+        );
+        let path = PamSearchPath::rooted(&m, Some(&v));
+
+        assert_eq!(path.service_path("sudo"), Some(m.join("sudo")));
+        assert_eq!(path.service_path("login"), Some(v.join("login")));
+        assert_eq!(path.service_path("nothing-here"), None);
+
+        let cov = fprintd_coverage(&path);
+        let by = |svc: &str| cov.iter().find(|(s, _, _)| *s == svc).map(|(_, _, r)| *r);
+        // Vendor-only service appears at all, which is the omission #208 names.
+        assert_eq!(by("login"), Some(true), "vendor-only stack must count");
+        // The machine file shadows the wired vendor one, so sudo is NOT covered.
+        assert_eq!(
+            by("sudo"),
+            Some(false),
+            "a machine file overrides its vendor namesake"
+        );
+
+        // Machine-only reading sees neither the vendor service nor the truth
+        // about sudo being the only surface: this is the old behaviour.
+        let old = PamSearchPath::machine_only(&m);
+        assert_eq!(fprintd_coverage(&old).len(), 1);
+
+        for d in [m, v] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// `pam_fprintd_wired` is the GATE that lets `--fingerprint-only` stand
+    /// face down, so it must not be fooled in either direction: a vendor stack
+    /// really does drive a prompt, and a machine file that shadows a wired
+    /// vendor file really does mean nothing drives one.
+    #[test]
+    fn the_wiring_gate_follows_the_same_precedence() {
+        let wired = "auth sufficient pam_fprintd.so\n";
+        let bare = "auth required pam_unix.so\n";
+
+        let (m, v) = pam_pair("gate-vendor-only", &[], &[("login", wired)]);
+        assert!(
+            pam_fprintd_wired(&PamSearchPath::rooted(&m, Some(&v))),
+            "a vendor stack drives a real prompt"
+        );
+        assert!(
+            !pam_fprintd_wired(&PamSearchPath::machine_only(&m)),
+            "and the machine directory alone cannot see it"
+        );
+
+        let (m2, v2) = pam_pair("gate-shadowed", &[("login", bare)], &[("login", wired)]);
+        assert!(
+            !pam_fprintd_wired(&PamSearchPath::rooted(&m2, Some(&v2))),
+            "the shadowed vendor file is never loaded, so nothing is wired"
+        );
+
+        for d in [m, v, m2, v2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// A vendor directory that is not there is not an empty one: nothing is
+    /// read and nothing is claimed. Ubuntu 26.04 ships no /usr/lib/pam.d even
+    /// though its libpam has the path compiled in.
+    #[test]
+    fn an_absent_vendor_directory_is_carried_as_none() {
+        let m = pam_dir("vendor-absent", &[("login", "auth required pam_unix.so\n")]);
+        let absent = std::env::temp_dir().join(format!("irlume-no-vendor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&absent);
+        let path = PamSearchPath::rooted(&m, Some(&absent));
+        assert_eq!(path.service_path("login"), Some(m.join("login")));
+        assert_eq!(path.service_path("sudo"), None);
+        let _ = std::fs::remove_dir_all(m);
     }
 
     // The Ubuntu 26.04 box from issue #155, files verbatim from the report:

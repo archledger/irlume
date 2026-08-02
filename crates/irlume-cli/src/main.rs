@@ -3214,8 +3214,10 @@ fn doctor_run(
                  appear; common after suspend/resume); fix: sudo systemctl restart fprintd"
             );
         }
-        let pam_dir = std::path::Path::new("/etc/pam.d");
-        if fingerprint::faillock_cohabits(pam_dir) {
+        // The same search path libpam uses, so a vendor-only stack is not
+        // missed by a warning whose whole job is noticing one (#208).
+        let pam_path = fingerprint::PamSearchPath::live();
+        if fingerprint::faillock_cohabits(&pam_path) {
             dout!(
                 report,
                 "  ⚠ pam_faillock and pam_fprintd share a PAM stack: a touch-sensor misread \
@@ -3223,7 +3225,7 @@ fn doctor_run(
                  account lockout. If you get locked out: faillock --user <you> --reset"
             );
         }
-        if fingerprint::fprintd_in_sudo(pam_dir) && fingerprint::sshd_present() {
+        if fingerprint::fprintd_in_sudo(&pam_path) && fingerprint::sshd_present() {
             dout!(
                 report,
                 "  ⚠ pam_fprintd is reachable from the sudo stack and an SSH server is \

@@ -504,11 +504,21 @@ struct App {
     /// then read the still-working daemon as down; on its own thread it gets
     /// a real budget and the UI keeps drawing.
     profiles_load: Option<std::sync::mpsc::Receiver<ProfilesOutcome>>,
+    /// True after at least one successful ListProfiles response has landed.
+    /// An empty list is VALID OBSERVED STATE, not "never loaded": deriving
+    /// "unloaded" from emptiness made every light poll on an unenrolled
+    /// machine start another TPM-backed listing, and each one occupies the
+    /// daemon worker, which a login then waits behind.
+    profiles_loaded: bool,
     /// The last landed machine snapshot; see [`Probes`]. Draw and run_checks
     /// only ever READ it, so both stay off every external interface.
     probes: Probes,
     /// An in-flight background probe sweep, drained by `poll()`.
     probes_load: Option<std::sync::mpsc::Receiver<Probes>>,
+    /// At least one sweep has landed. Until then `probes` holds defaults,
+    /// and copying defaults over the capabilities `App::new` observed hides
+    /// real hardware; recompute_checks gates its copies on this.
+    probes_landed: bool,
     /// An in-flight background light poll (daemon reads), drained by `poll()`.
     light_load: Option<std::sync::mpsc::Receiver<LightState>>,
     /// PAM-screen state, computed with the diagnostics (10s tier + screen
@@ -856,8 +866,10 @@ impl App {
             fp_present,
             advanced: false,
             profiles_load: None,
+            profiles_loaded: false,
             probes: Probes::default(),
             probes_load: None,
+            probes_landed: false,
             light_load: None,
             pam_cache: PamCache::default(),
             fp_coverage: Vec::new(),
@@ -1006,7 +1018,7 @@ impl App {
         // The daemon just became reachable and no list was ever loaded (the
         // startup attempt may have raced a still-booting daemon): fetch it
         // now instead of waiting for a tab visit.
-        if self.daemon_up && self.profiles.is_empty() && self.enroll_error.is_none() {
+        if self.daemon_up && !self.profiles_loaded && self.enroll_error.is_none() {
             self.refresh_profiles();
         }
         self.nodes = l.nodes;
@@ -1101,12 +1113,17 @@ impl App {
         // so a hot-plugged camera or reader reveals its tabs, the fingerprint
         // trio, the PAM screen's cache, the coverage table), then rebuild the
         // checklist. Everything here is in-memory: the machine was observed
-        // by `Probes::gather` on the worker.
-        self.caps = self.probes.caps;
-        self.fp_present = self.probes.fp_present;
-        self.fp = self.probes.fp.clone();
-        self.pam_cache = self.probes.pam_cache.clone();
-        self.fp_coverage = self.probes.fp_coverage.clone();
+        // by `Probes::gather` on the worker. Before the FIRST sweep lands the
+        // snapshot holds defaults, and defaults are not observations: copying
+        // them would erase the capabilities `App::new` detected and hide the
+        // camera screens until the sweep arrives.
+        if self.probes_landed {
+            self.caps = self.probes.caps;
+            self.fp_present = self.probes.fp_present;
+            self.fp = self.probes.fp.clone();
+            self.pam_cache = self.probes.pam_cache.clone();
+            self.fp_coverage = self.probes.fp_coverage.clone();
+        }
         self.run_checks();
         // Visibility is state-driven (Repair appears when something fails);
         // re-derive it from the fresh diagnostics.
@@ -1126,10 +1143,16 @@ impl App {
     /// suspend-return. Order matters: refresh_light sets `daemon_up` (which
     /// refresh_profiles needs), profiles load, THEN recompute_checks runs so
     /// run_checks sees the fresh profile list (not the stale/empty one).
+    /// Full refresh: request daemon state, enrollment state, and the complete
+    /// machine snapshot. Existing landed state stays visible until the
+    /// replacements arrive through `poll()`; recomputing here would copy a
+    /// default (unlanded) snapshot over real observations, which at startup
+    /// erased the capabilities `App::new` had just detected and hid whole
+    /// screens for the first ten seconds.
     fn refresh(&mut self) {
         self.refresh_light();
         self.refresh_profiles();
-        self.recompute_checks();
+        self.request_probes();
     }
 
     /// Build the Repair-tab diagnostics from current state + quick local probes.
@@ -1947,6 +1970,7 @@ impl App {
             if let Ok(p) = rx.try_recv() {
                 self.probes_load = None;
                 self.probes = p;
+                self.probes_landed = true;
                 self.recompute_checks();
             }
         }
@@ -1963,6 +1987,7 @@ impl App {
                         self.eyes_open = eyes_open;
                         self.challenge = challenge;
                         self.enroll_error = None;
+                        self.profiles_loaded = true;
                     }
                     ProfilesOutcome::DaemonError(e) => self.enroll_error = Some(e),
                     // Transport failures are not state: the previous list
@@ -5545,8 +5570,10 @@ mod tests {
             caps,
             fp_present: false,
             profiles_load: None,
+            profiles_loaded: false,
             probes: Probes::default(),
             probes_load: None,
+            probes_landed: false,
             light_load: None,
             pam_cache: PamCache::default(),
             fp_coverage: Vec::new(),
@@ -6065,19 +6092,24 @@ mod tests {
     // a re-derived one cannot.
     #[test]
     fn refresh_rederives_hardware_capabilities() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("IRLUME_SOCKET", "/nonexistent/irlume-test.sock");
+        // The async flavor of the old property: a LANDED sweep replaces a
+        // stale capability snapshot. refresh() itself only requests
+        // (full_refresh_requests_the_machine_snapshot pins that), and an
+        // unlanded snapshot must replace nothing
+        // (full_refresh_does_not_replace_known_caps_with_unobserved_defaults).
+        let _guard = dead_socket();
         let impossible = irlume_camera::Caps {
             ir_pair: true,
             rgb: false,
         };
         let mut app = test_app();
         app.caps = impossible;
-        app.refresh();
-        std::env::remove_var("IRLUME_SOCKET");
+        app.probes = Probes::default(); // an observed no-camera machine
+        app.probes_landed = true;
+        app.recompute_checks();
         assert_ne!(
             app.caps, impossible,
-            "refresh() left the startup capability snapshot in place"
+            "a landed sweep must replace the stale capability snapshot"
         );
         assert!(
             app.caps.rgb || !app.caps.ir_pair,
@@ -7592,6 +7624,70 @@ mod tests {
             1,
             "a failed refresh must not clear the list"
         );
+    }
+
+    #[test]
+    fn an_observed_empty_profile_list_is_not_reloaded_by_every_light_poll() {
+        // An empty list is valid observed state (a new machine). Deriving
+        // "never loaded" from emptiness made every light poll start another
+        // TPM-backed listing, each occupying the daemon worker a login then
+        // waits behind.
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: Vec::new(),
+            eyes_open: false,
+            challenge: false,
+        })
+        .unwrap();
+        app.poll();
+        assert!(app.profiles_loaded);
+        assert!(app.profiles_load.is_none());
+        app.apply_light(LightState {
+            daemon_up: true,
+            health: None,
+            keyring_armed: None,
+            keyring_policy: None,
+            keyring_drift: None,
+            recovery: None,
+            nodes: Vec::new(),
+            pairs: Vec::new(),
+        });
+        assert!(
+            app.profiles_load.is_none(),
+            "a valid observed empty enrollment must not trigger another listing"
+        );
+    }
+
+    #[test]
+    fn full_refresh_requests_the_machine_snapshot() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        assert!(app.probes_load.is_none());
+        app.refresh();
+        assert!(
+            app.probes_load.is_some(),
+            "startup/manual full refresh must launch the heavy snapshot"
+        );
+    }
+
+    #[test]
+    fn full_refresh_does_not_replace_known_caps_with_unobserved_defaults() {
+        // App::new observed real hardware; a refresh before the first sweep
+        // lands must not overwrite that with Probes::default() and hide the
+        // camera screens.
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.refresh();
+        app.recompute_checks();
+        assert!(app.caps.ir_pair);
+        assert!(app.caps.rgb);
     }
 
     #[test]

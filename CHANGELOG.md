@@ -5,6 +5,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Seating distance is recorded with the liveness cues.** `face_frac` (face
+  width as a fraction of frame width, the same quantity the framing guide
+  judges distance by) now rides in `Signals` and both liveness debug lines.
+  It gates nothing. Several existing cues are absolute thresholds on
+  quantities that may move across the guide's accepted 0.12 to 0.55 band, and
+  #174 asks which ones actually do before any of them is retuned; recording
+  the distance signal alongside them makes that answerable from ordinary
+  `IRLUME_LOG=debug` output rather than a special capture campaign.
+
 ### Fixed
 
 - **A status read can no longer make a login wait.** Every request used to

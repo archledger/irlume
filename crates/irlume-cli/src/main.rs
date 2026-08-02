@@ -1854,12 +1854,15 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // dev gate probe: single frame, no burst stats
+            face_frac: ir_top_face
+                .map(|f| irlume_auth::bbox_width_frac(&f.bbox, ir.width))
+                .unwrap_or(0.0),
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");
+        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}  face_frac {:.3}", signals.face_frac);
         println!(
             "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
             cues.face_in_rgb,

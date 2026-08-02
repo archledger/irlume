@@ -63,6 +63,23 @@ pub struct Signals {
     /// not measured (RGB-only path, older callers); the flood rewording below
     /// then never triggers. See [`IR_AMBIENT_FLOOD`].
     pub ir_ambient: f32,
+    /// Face width as a fraction of frame width, from the frame the IR cues
+    /// were measured in (the RGB frame on the RGB-only path). 0.0 when no
+    /// face was found.
+    ///
+    /// RECORDED, NEVER GATED. The framing guide accepts 0.12 to 0.55, a 4.6x
+    /// span, and several cues above are absolute thresholds on quantities
+    /// that may move across it: emitter irradiance falls with distance, and
+    /// the center-to-edge contrast a near-coaxial emitter produces depends on
+    /// how large the face's own depth is relative to its distance. The
+    /// geometry of [`ir_center_edge_ratio`] is bbox-relative and so scale
+    /// invariant by construction, but neither the physics nor the pixel count
+    /// behind it is, and nobody has measured which way that cuts (#174). This
+    /// field exists so the correlation is answerable from ordinary debug
+    /// output instead of a special capture campaign.
+    ///
+    /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
+    pub face_frac: f32,
 }
 
 impl Default for Signals {
@@ -75,6 +92,7 @@ impl Default for Signals {
             ir_eye_glint: 0.0,
             head_yaw_asym: 0.0,   // frontal
             head_pitch_frac: 0.5, // frontal
+            face_frac: 0.0,
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
@@ -1431,6 +1449,41 @@ mod tests {
             ir_eye_glint: 220.0,
             ..Default::default() // frontal pose
         }
+    }
+
+    /// `face_frac` is RECORDED with the cues and read by nothing: the whole
+    /// point of #174 is to find out whether the existing thresholds move with
+    /// seating distance BEFORE anything is normalised by it. A verdict that
+    /// changed with this field would be exactly the retune-against-
+    /// contaminated-samples the issue warns off.
+    #[test]
+    fn face_frac_is_recorded_and_changes_no_verdict() {
+        let gate = LivenessGate::new();
+        // Across the framing guide's whole accepted band and past both ends.
+        for frac in [0.0, 0.05, 0.12, 0.3, 0.55, 0.9] {
+            let mut live = live_signals();
+            live.face_frac = frac;
+            assert_eq!(
+                gate.evaluate(&live).0,
+                Verdict::Live,
+                "a live face must stay Live at face_frac {frac}"
+            );
+            // And the same on the spoof side: a flat target does not become
+            // live by sitting closer, nor a live face a spoof by sitting back.
+            let mut flat = live_signals();
+            flat.face_frac = frac;
+            flat.ir_center_edge_ratio = 1.0; // flat
+            assert_ne!(
+                gate.evaluate(&flat).0,
+                Verdict::Live,
+                "a flat target must not pass at face_frac {frac}"
+            );
+        }
+        // It survives the round trip it exists for: whatever the caller
+        // measured is what the evidence carries.
+        let mut s = live_signals();
+        s.face_frac = 0.3125;
+        assert!((s.face_frac - 0.3125).abs() < 1e-6);
     }
 
     #[test]

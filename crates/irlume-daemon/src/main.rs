@@ -1334,6 +1334,21 @@ fn invalidate_enrollment_summary(user: &str) {
         .remove(user);
 }
 
+/// Drops every published summary. The cache is keyed by user alone, but a
+/// test sandbox swaps `IRLUME_STATE_DIR` underneath it, so a summary another
+/// test published describes an enrollment that no longer exists on disk.
+/// `dispatch` answers a listing from that cache before it ever reads storage
+/// (see `dispatch_status`), so without this a listing can report a profile
+/// from a dead sandbox. Production never moves its state dir, so this has no
+/// caller outside tests.
+#[cfg(test)]
+fn clear_enrollment_summaries() {
+    enrollment_summaries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 fn cached_enrollment_summary(user: &str) -> Option<EnrollmentSummary> {
     enrollment_summaries()
         .lock()
@@ -4075,6 +4090,9 @@ mod tests {
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", dir.join("template-keys"));
         std::env::set_var("IRLUME_RECOVERY_DIR", dir.join("recovery"));
         std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+        // The new state dir makes every published summary stale, and a
+        // listing is served from that cache before storage is read.
+        clear_enrollment_summaries();
         Sandbox { dir }
     }
 
@@ -4444,6 +4462,51 @@ mod tests {
         ) {
             Response::Error(msg) => assert_eq!(msg, "not authorized to list 'carol'"),
             other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+    }
+
+    /// `dispatch` answers a listing from the published summary before it
+    /// reads storage, and that cache is keyed by user with no notion of which
+    /// state dir the summary came from. Entering a sandbox must therefore
+    /// drop it: otherwise a test inherits whatever an earlier test's
+    /// enrollment happened to be called. This ran as a 15%-of-runs failure in
+    /// `list_profiles_reports_the_enrollment_and_gates_on_authorization`,
+    /// which reported the renamed profile from the mutation test's sandbox.
+    #[test]
+    fn a_sandbox_drops_the_summaries_an_earlier_one_published() {
+        let _g = env_lock();
+        let mut e = engine();
+        publish_enrollment_summary(
+            "carol",
+            EnrollmentSummary {
+                profiles: vec![irlume_common::ProfileSummary {
+                    name: "Profile From A Dead Sandbox".into(),
+                    scans: vec!["Face Scan 9".into()],
+                }],
+                require_eyes_open: false,
+                require_challenge: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: false,
+            },
+        );
+        let sb = sandbox("summary-carryover");
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        match dispatch(
+            Request::ListProfiles {
+                user: "carol".into(),
+                structured_errors: false,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Enrollment { profiles, .. } => {
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(
+                    profiles[0].name, "Face Profile 1",
+                    "the listing must come from this sandbox, not the cache"
+                );
+            }
+            other => panic!("expected Response::Enrollment, got {other:?}"),
         }
     }
 

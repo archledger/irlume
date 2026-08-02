@@ -3106,8 +3106,14 @@ fn doctor_run(
     // A node irlume could not read is named with its errno, never omitted.
     // Dropping these is what let a permission problem read as absent hardware
     // and sent the reader after a driver bug they did not have (#227).
+    // Nodes are grouped by cause: one missing 'video' group membership denies
+    // every node on the machine, and that is one fact, not eleven.
+    let mut by_cause: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
     for u in &scan.unreadable {
-        dout!(report, "  ⚠ {}", u.explain());
+        by_cause.entry(u.cause()).or_default().push(&u.path);
+    }
+    for (cause, paths) in &by_cause {
+        dout!(report, "  ⚠ {}: {cause}", paths.join(", "));
     }
 
     // --- models / runtime --------------------------------------------------

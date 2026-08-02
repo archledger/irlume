@@ -378,12 +378,13 @@ pub struct Unreadable {
 }
 
 impl Unreadable {
-    /// The cause in a person's terms, and what resolves it. Pure over the
-    /// struct, so the wording is testable without an unreadable camera to
-    /// hand. Deliberately says what `map_io` says for the same errnos: a user
-    /// who hits this in doctor and then again mid-capture should not get two
+    /// The cause and its remedy, without the path, so a caller can state one
+    /// cause once over the several nodes that share it. Pure over the struct,
+    /// so the wording is testable without an unreadable camera to hand.
+    /// Deliberately says what `map_io` says for the same errnos: a user who
+    /// hits this in doctor and then again mid-capture should not get two
     /// different explanations of one condition.
-    pub fn explain(&self) -> String {
+    pub fn cause(&self) -> String {
         let what = match self.at {
             FailedAt::Open => "could not be opened",
             FailedAt::EnumFormats => "opened but would not list its formats",
@@ -410,7 +411,12 @@ impl Unreadable {
             Some(e) => format!("errno {e}: {}", std::io::Error::from_raw_os_error(e)),
             None => "no OS error reported".to_string(),
         };
-        format!("{} {what} ({code}). {why}", self.path)
+        format!("{what} ({code}). {why}")
+    }
+
+    /// The cause with this node's path in front, for reporting one node alone.
+    pub fn explain(&self) -> String {
+        format!("{} {}", self.path, self.cause())
     }
 }
 

@@ -467,13 +467,23 @@ fn capture_formats_answered(dev: &Device) -> std::io::Result<()> {
         return Ok(());
     }
     let e = std::io::Error::last_os_error();
-    match e.raw_os_error() {
-        // The node answered: it has no capture format at index 0. A metadata
-        // node reaches here on every machine with a UVC camera, so treating
-        // this as a failure would warn about correctly-ignored nodes.
-        Some(libc::EINVAL) => Ok(()),
-        _ => Err(e),
+    if enum_fmt_failure_means_no_formats(&e) {
+        return Ok(());
     }
+    Err(e)
+}
+
+/// Whether a failed `VIDIOC_ENUM_FMT` at index 0 means the node HAS no capture
+/// format, as opposed to having formats it would not report. The kernel
+/// specifies EINVAL as "no format at this index", which is both the normal end
+/// of enumeration and what a non-capture node answers at index 0; every UVC
+/// camera puts a metadata node on the machine that lands here, and warning
+/// about those would bury the report this fix exists to produce. Every other
+/// errno is a failure to observe. Same shape and the same rule as
+/// `control_read_failure_means_absent`, and pure for the same reason: the
+/// decision is testable without a camera that misbehaves.
+fn enum_fmt_failure_means_no_formats(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EINVAL)
 }
 
 /// `classify_node` for callers that only act on a node they can use. An
@@ -3023,6 +3033,29 @@ mod tests {
             "{}",
             u.explain()
         );
+    }
+
+    /// EINVAL at index 0 is the kernel's "no format here", which every UVC
+    /// metadata node answers. Treating it as a failure would put a warning
+    /// against four correctly-ignored nodes on any machine with two cameras,
+    /// which is how a report that finally says something useful gets ignored.
+    /// Every other errno is a node that would not answer.
+    #[test]
+    fn only_einval_means_a_node_has_no_capture_formats() {
+        let err = |n| std::io::Error::from_raw_os_error(n);
+        assert!(enum_fmt_failure_means_no_formats(&err(libc::EINVAL)));
+        for other in [
+            libc::EBUSY,
+            libc::ENOTTY,
+            libc::EIO,
+            libc::ENODEV,
+            libc::EACCES,
+        ] {
+            assert!(
+                !enum_fmt_failure_means_no_formats(&err(other)),
+                "errno {other} is a failed observation, not an absence"
+            );
+        }
     }
 
     /// A directory that will not list must not read as a machine with no

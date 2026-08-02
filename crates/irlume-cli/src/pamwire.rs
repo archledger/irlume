@@ -1740,7 +1740,18 @@ fn wire_service(
                 );
             }
             let (base, _) = unwire_lines(&read(vendor)?);
-            let (wired, _) = wire(&base);
+            let (wired, changed) = wire(&base);
+            // The transform saying "unchanged" means it REFUSED (no anchor, a
+            // continued file): materializing anyway would shadow the vendor
+            // file with a copy carrying no irlume line and report ✓ while face
+            // login stayed off. The in-place branch below already refuses on
+            // this; the override branch must too.
+            if !changed {
+                return out(
+                    PlannedChange::NoAnchor,
+                    format!("· {}: no anchor to wire (skipped)", s.etc),
+                );
+            }
             let body = format!(
                 "{CREATED_PREFIX}{vendor}; delete this file to restore the vendor copy\n{wired}"
             );
@@ -2310,28 +2321,47 @@ fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     let Some(fp_at) = lines.iter().position(|l| is_fingerprint_auth(l)) else {
         return (content.to_string(), false);
     };
-    // Does anything in this stack already read the token we are about to set?
-    // GDM's own `gdm-fingerprint` does not, so the unseal line alone would
-    // release a password into a stack with no consumer.
-    // `only_if=` aware: a keyring line that stands down for THIS service is not
-    // a consumer here, however plainly it names the module.
-    let has_consumer = lines
-        .iter()
-        .any(|l| consumer_active_for(l, service).is_some());
+    // Does this stack already turn the token we are about to set into an open
+    // keyring? That takes ONE module holding BOTH halves in working positions:
+    // an auth line BELOW the fprintd anchor (above it, the module runs before
+    // PAM_AUTHTOK exists) and a session line of its own (the half that starts
+    // the daemon and unlocks with the stashed key), the same per-module rule
+    // `keyring_handoff` reports by. Any weaker test suppressed our lines on
+    // stacks where a lone session line, a lone auth line, a misplaced auth
+    // line, or even a password-phase line named the module, and the
+    // fingerprint login then succeeded with the wallet still locked.
+    // `only_if=` aware in both halves: a keyring line that stands down for
+    // THIS service is not a consumer here, however plainly it names the
+    // module. Supplying our tagged pair beside an incomplete foreign pair is
+    // the safe direction: unwiring removes exactly ours, and an extra pair
+    // risks redundant work where a suppressed pair leaves the wallet locked,
+    // the exact failure this function exists to close.
+    let has_complete_consumer = KEYRING_CONSUMERS.iter().copied().any(|module| {
+        let auth_below_anchor = lines
+            .iter()
+            .skip(fp_at + 1)
+            .any(|l| is_auth_directive(l) && consumer_active_for(l, service) == Some(module));
+        let session_present = lines.iter().any(|l| {
+            let d = directive(l);
+            let phase = d.strip_prefix('-').unwrap_or(d);
+            phase.split_whitespace().next() == Some("session")
+                && consumer_active_for(l, service) == Some(module)
+        });
+        auth_below_anchor && session_present
+    });
     let mut out = Vec::with_capacity(lines.len() + 3);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());
         if i == fp_at {
             out.push(KEYRING_UNSEAL.to_string());
-            if !has_consumer {
+            if !has_complete_consumer {
                 out.push(FP_GKR_AUTH.to_string());
             }
         }
     }
-    if !has_consumer {
+    if !has_complete_consumer {
         // Appended last: gnome-keyring's session half wants to run once the
-        // session is otherwise set up, and it is the half that actually starts
-        // the daemon and unlocks with the stashed key.
+        // session is otherwise set up.
         out.push(FP_GKR_SESSION.to_string());
     }
     (format!("{}\n", out.join("\n")), true)
@@ -4872,6 +4902,97 @@ auth       optional                     pam_irlume.so reseal\n\
             "gdm-fingerprint",
         );
         assert!(!c);
+    }
+
+    // A consumer only counts when ONE module holds BOTH halves in working
+    // positions, the same per-module rule `keyring_handoff` reports by. Any
+    // single keyring line used to suppress our pair, and the fingerprint
+    // login then succeeded with the wallet still locked.
+
+    #[test]
+    fn fp_session_only_does_not_suppress_the_auth_consumer() {
+        // Session half alone: nothing reads the token irlume releases.
+        let stack = "auth required pam_fprintd.so\n\
+-session optional pam_gnome_keyring.so auto_start\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        assert!(wired.contains(FP_GKR_AUTH), "{wired}");
+        assert!(
+            keyring_handoff(&wired, "gdm-fingerprint")
+                .expect("wired stack releases a credential")
+                .complete
+                .is_some(),
+            "the wired stack must form a complete hand-off:\n{wired}"
+        );
+    }
+
+    #[test]
+    fn fp_auth_only_does_not_suppress_the_session_consumer() {
+        // Auth half alone: the key is stashed and dropped, no daemon starts.
+        let stack = "auth required pam_fprintd.so\n\
+-auth optional pam_gnome_keyring.so\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        assert!(wired.contains(FP_GKR_SESSION), "{wired}");
+        assert!(
+            keyring_handoff(&wired, "gdm-fingerprint")
+                .expect("wired stack releases a credential")
+                .complete
+                .is_some(),
+            "the wired stack must form a complete hand-off:\n{wired}"
+        );
+    }
+
+    #[test]
+    fn fp_consumer_above_the_anchor_does_not_count() {
+        // Both halves present, but the auth half sits ABOVE pam_fprintd.so:
+        // it runs before PAM_AUTHTOK exists, so it consumes nothing, and it
+        // must not suppress a pair that would actually work.
+        let stack = "-auth optional pam_gnome_keyring.so\n\
+auth required pam_fprintd.so\n\
+-session optional pam_gnome_keyring.so auto_start\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        let release = wired
+            .find("pam_irlume.so keyring")
+            .expect("unseal line present");
+        let tagged_auth = wired.find(FP_GKR_AUTH).expect("tagged auth supplied");
+        assert!(
+            release < tagged_auth,
+            "the supplied consumer must sit below the release:\n{wired}"
+        );
+    }
+
+    // Regression for the vendor-override path: the transform refusing (a
+    // continued vendor file has no judgeable lines) must refuse the
+    // materialization too. This branch used to discard `changed`, write an
+    // override with NO irlume line over the vendor file, and report ✓.
+    #[test]
+    fn wire_service_override_does_not_materialize_a_refused_vendor_stack() {
+        let dir = TestDir::new("override-refused");
+        let vendor = dir.0.join("plasmalogin.vendor");
+        std::fs::write(
+            &vendor,
+            "auth substack \\\n    password-auth\nsession include password-auth\n",
+        )
+        .unwrap();
+        let etc = dir.0.join("plasmalogin");
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: Some(leak(&vendor)),
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+        let outcome = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(outcome.change, PlannedChange::NoAnchor);
+        assert!(
+            !etc.exists(),
+            "a refused transform must not create an override"
+        );
+        assert!(
+            !outcome.message.starts_with('✓'),
+            "refusal must not read as successful wiring: {}",
+            outcome.message
+        );
     }
 
     #[test]

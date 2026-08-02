@@ -51,7 +51,9 @@ pub(crate) use files::{is_managed_path, lock_pam, restore_surface};
 // TUI must read stack lines with the same comment and rule-field semantics
 // the wiring uses, or the two would disagree about what a file configures.
 pub(crate) use grammar::{directive, directive_has_auth_module, has_line_continuation};
-pub(crate) use report::{login_manager_fact, status_report, surface_facts};
+pub(crate) use report::{
+    keyring_handoff_warnings, login_manager_fact, status_report, surface_facts, HandoffWarning,
+};
 pub(crate) use stanzas::BACKUP;
 
 /// A PAM service to wire. `vendor=Some` → materialize an /etc override from the
@@ -688,8 +690,12 @@ pub(crate) fn fp_keyring_wired() -> bool {
     let has_keyring = |path: &str| -> Option<bool> {
         std::fs::read_to_string(path).ok().map(|s| {
             s.lines().any(|l| {
-                let t = l.trim_start();
-                !t.starts_with('#') && t.contains("pam_irlume.so") && t.contains("keyring")
+                // The DIRECTIVE part, like every other PAM read here: a
+                // trailing comment mentioning the module is not wiring, and
+                // this check matching what libpam ignores is how the Repair
+                // tab reports "fully wired" about a stack that is not.
+                let d = directive(l);
+                d.contains("pam_irlume.so") && d.contains("keyring")
             })
         })
     };

@@ -496,8 +496,56 @@ struct App {
     caps: irlume_camera::Caps,
     /// A fingerprint reader is present.
     fp_present: bool,
+    /// An in-flight background ListProfiles, drained by `poll()`. The listing
+    /// decrypts every profile under the TPM template key: ~350ms on the
+    /// reference Zenbook, MEASURED 10.8s on a ThinkPad X13 Yoga Gen 4 whose
+    /// TPM workqueue was hogging. Run synchronously it froze the UI for that
+    /// long at startup and on every Profiles entry, and the short poll budget
+    /// then read the still-working daemon as down; on its own thread it gets
+    /// a real budget and the UI keeps drawing.
+    profiles_load: Option<std::sync::mpsc::Receiver<ProfilesOutcome>>,
+    /// PAM-screen state, computed with the diagnostics (10s tier + screen
+    /// entry), never in draw: rendering used to re-read every PAM service
+    /// file and probe the LSM per FRAME.
+    pam_cache: PamCache,
+    /// Per-surface fingerprint coverage (#155), the same table `fingerprint
+    /// status` prints; refreshed with the diagnostics when a reader exists.
+    fp_coverage: Vec<(&'static str, &'static str, bool)>,
     spin: usize,
     quit: bool,
+}
+
+/// What one background `ListProfiles` produced (see `App::profiles_load`).
+enum ProfilesOutcome {
+    Loaded {
+        profiles: Vec<ProfileSummary>,
+        eyes_open: bool,
+        challenge: bool,
+    },
+    /// The daemon answered with an error (corrupt enrollment, missing
+    /// template key): real state, shown on Repair like the sync path did.
+    DaemonError(String),
+    /// The request itself failed (daemon down mid-load, timeout). Not state:
+    /// the previous list stays and the next refresh retries.
+    Transport(String),
+}
+
+/// Everything the PAM screen renders, gathered off the draw path.
+#[derive(Default)]
+struct PamCache {
+    /// `(label, present, wired)` per service, as `login status` reports.
+    rows: Vec<(String, bool, bool)>,
+    /// `/sys/fs/selinux` existed at refresh time (Fedora-family).
+    selinux_present: bool,
+    /// SELinux module state when present (`None` = needs root to tell).
+    selinux: Option<bool>,
+    /// AppArmor enabled this boot (Debian/Ubuntu-family).
+    apparmor_enabled: bool,
+    /// An irlume AppArmor profile is installed on disk.
+    apparmor_profiled: bool,
+    /// Wired greeters whose released password nothing turns into an open
+    /// wallet (#200's advisory, the same walk `login status` prints).
+    handoffs: Vec<crate::pamwire::HandoffWarning>,
 }
 
 pub fn run(args: &[String]) -> std::io::Result<()> {
@@ -590,6 +638,9 @@ impl App {
             caps,
             fp_present,
             advanced: false,
+            profiles_load: None,
+            pam_cache: PamCache::default(),
+            fp_coverage: Vec::new(),
             spin: 0,
             quit: false,
         }
@@ -786,47 +837,59 @@ impl App {
         }
     }
 
-    /// FULL refresh = cheap poll + the heavier probes (fingerprint via fprintd,
-    /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
-    /// on demand (`[r]`), after an op, and when opening Repair/Fingerprint, but
-    /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
-    /// Poll the enrollment list. This is the ONE slow read (a ListProfiles
-    /// triggers a TPM unseal of the template key to decrypt the profiles,
-    /// ~350ms measured), so it is kept OUT of the frequent refresh paths and
-    /// out of tab switches. Called only where a change can have happened: at
-    /// startup, after a TUI mutation, when entering the Profiles tab, and on
-    /// the slow heavy timer (for external `irlume enroll` changes).
+    /// Start a BACKGROUND enrollment-list load; `poll()` lands the result.
+    /// This is the ONE slow read: ListProfiles triggers a TPM unseal of the
+    /// template key to decrypt the profiles, ~350ms on the reference Zenbook
+    /// and a MEASURED 10.8s on a ThinkPad X13 Yoga Gen 4 (its TPM workqueue
+    /// hogging; dmesg said so). Run inline it froze the UI for the whole
+    /// unseal, and the 1.5s poll budget then abandoned the reply entirely, so
+    /// that machine never saw its profiles at all. The worker gets a budget
+    /// sized to the slowest TPM observed, and the UI keeps drawing. Called
+    /// only where a change can have happened: at startup, after a TUI
+    /// mutation, and when entering the Profiles tab.
     fn refresh_profiles(&mut self) {
-        if !self.daemon_up {
+        if !self.daemon_up || self.profiles_load.is_some() {
             return;
         }
-        match crate::daemon_poll(&Request::ListProfiles {
-            user: self.user.clone(),
-            structured_errors: false,
-        }) {
-            Ok(Response::Enrollment {
-                profiles,
-                require_eyes_open,
-                require_challenge,
-                ..
-            }) => {
-                self.profiles = profiles;
-                self.eyes_open = require_eyes_open;
-                self.challenge = require_challenge;
-                self.enroll_error = None;
-            }
-            // A corrupt/unreadable enrollment (or a missing template key for an
-            // encrypted file) surfaces as an Error, not empty; don't silently
-            // show "no face enrolled"; capture it so Repair can flag+fix it.
-            Ok(Response::Error(e)) => self.enroll_error = Some(e),
-            _ => {}
-        }
+        let (tx, rx) = mpsc::channel();
+        let user = self.user.clone();
+        std::thread::spawn(move || {
+            let outcome = match irlume_common::client::request_with_timeout(
+                &Request::ListProfiles {
+                    user,
+                    structured_errors: false,
+                },
+                std::time::Duration::from_secs(60),
+            ) {
+                Ok(Response::Enrollment {
+                    profiles,
+                    require_eyes_open,
+                    require_challenge,
+                    ..
+                }) => ProfilesOutcome::Loaded {
+                    profiles,
+                    eyes_open: require_eyes_open,
+                    challenge: require_challenge,
+                },
+                // A corrupt/unreadable enrollment (or a missing template key
+                // for an encrypted file) surfaces as an Error, not empty;
+                // don't silently show "no face enrolled"; capture it so
+                // Repair can flag+fix it.
+                Ok(Response::Error(e)) => ProfilesOutcome::DaemonError(e),
+                Ok(_) => ProfilesOutcome::Transport("unexpected daemon reply".into()),
+                Err(e) => ProfilesOutcome::Transport(e.to_string()),
+            };
+            let _ = tx.send(outcome);
+        });
+        self.profiles_load = Some(rx);
     }
 
-    /// Re-derive hardware caps + fingerprint + the Repair checklist from the
-    /// CURRENT state (daemon reads + self.profiles). Split out so both refresh
-    /// paths run it AFTER their state reads, and run_checks never sees stale
-    /// profiles (a startup ordering bug showed a spurious "no enrollment" warn).
+    /// Re-derive hardware caps + fingerprint + the PAM/coverage caches + the
+    /// Repair checklist from the CURRENT state (daemon reads + self.profiles).
+    /// Split out so both refresh paths run it AFTER their state reads, and
+    /// run_checks never sees stale profiles (a startup ordering bug showed a
+    /// spurious "no enrollment" warn; the async profile load closes the same
+    /// hole by reporting "loading" instead of "none" while in flight).
     fn recompute_checks(&mut self) {
         // Re-derive hardware capabilities so a camera or reader hot-plugged
         // after launch reveals its tabs (caps/fp_present drive `visible` and the
@@ -838,6 +901,26 @@ impl App {
             device: irlume_fingerprint::device_name(),
             enrolled: irlume_fingerprint::enrolled_fingers(&self.user),
             method: irlume_core::policy::method().as_str().to_string(),
+        };
+        // Everything the PAM screen renders, gathered HERE so draw stays pure:
+        // rendering used to re-read every PAM service file and probe the LSM
+        // per frame, and the hand-off/coverage advisories (#200/#155) had no
+        // TUI surface at all.
+        self.pam_cache = PamCache {
+            rows: crate::pamwire::status_report(),
+            selinux_present: std::path::Path::new("/sys/fs/selinux").exists(),
+            selinux: crate::pamwire::selinux_state(),
+            apparmor_enabled: std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+                .map(|s| s.trim() == "Y")
+                .unwrap_or(false),
+            apparmor_profiled: std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
+                || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists(),
+            handoffs: crate::pamwire::keyring_handoff_warnings(),
+        };
+        self.fp_coverage = if self.fp_present {
+            crate::fingerprint::fprintd_coverage_live()
+        } else {
+            Vec::new()
         };
         self.run_checks();
         // Visibility is state-driven (Repair appears when something fails);
@@ -874,7 +957,12 @@ impl App {
             fix,
         };
 
-        let up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
+        // refresh_light already pinged with the SHORT poll budget and both
+        // refresh paths run it first; asking again here with daemon_request's
+        // 120s budget meant every heavy tick blocked the UI for the whole
+        // arbiter queue whenever the daemon was busy (measured: ~9s per tab
+        // press on a ThinkPad while a TPM-bound ListProfiles was in flight).
+        let up = self.daemon_up;
         v.push(mk(
             "Daemon (irlumed)",
             if up { Sev::Ok } else { Sev::Fail },
@@ -1085,6 +1173,16 @@ impl App {
             v.push(mk("Enrollment", Sev::Fail,
                 format!("enrollment unreadable: {err}"),
                 Fix::Manual("restore the backup, or re-enroll (Profiles → [e]); if encrypted, the template key may be missing".into())));
+        } else if self.profiles_load.is_some() && self.profiles.is_empty() {
+            // The list is still loading in the background (a slow TPM makes
+            // this take seconds): "no face enrolled" would be a claim about
+            // state nobody has observed yet.
+            v.push(mk(
+                "Enrollment",
+                Sev::Ok,
+                "loading profiles…".into(),
+                Fix::None,
+            ));
         } else {
             v.push(mk(
                 "Enrollment",
@@ -1663,6 +1761,33 @@ impl App {
     }
 
     fn poll(&mut self) {
+        if let Some(rx) = &self.profiles_load {
+            if let Ok(outcome) = rx.try_recv() {
+                self.profiles_load = None;
+                match outcome {
+                    ProfilesOutcome::Loaded {
+                        profiles,
+                        eyes_open,
+                        challenge,
+                    } => {
+                        self.profiles = profiles;
+                        self.eyes_open = eyes_open;
+                        self.challenge = challenge;
+                        self.enroll_error = None;
+                    }
+                    ProfilesOutcome::DaemonError(e) => self.enroll_error = Some(e),
+                    // Transport failures are not state: the previous list
+                    // stays, the next refresh retries, and the Activity log
+                    // says why the list may be stale.
+                    ProfilesOutcome::Transport(e) => {
+                        self.log('·', format!("profile list not refreshed: {e}"));
+                    }
+                }
+                // The checks read the profile list (the no-enrollment warn);
+                // recompute now that it is current.
+                self.recompute_checks();
+            }
+        }
         if let Some(op) = &self.op {
             if let Ok((ok, msg)) = op.rx.try_recv() {
                 let tag = op.tag;
@@ -3309,8 +3434,16 @@ impl App {
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
         if self.profiles.is_empty() {
-            f.render_widget(Paragraph::new("\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically.")
-                .wrap(Wrap { trim: false }).dim(), area);
+            // The list loads in the background (a TPM unseal, seconds on slow
+            // TPMs). Until it lands, an empty list is "not loaded yet", and
+            // saying "no profiles" would tell an enrolled user their face is
+            // gone every time they open this tab.
+            let msg = if self.profiles_load.is_some() {
+                "\nLoading profiles… (decrypting the enrollment under the TPM key)"
+            } else {
+                "\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically."
+            };
+            f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }).dim(), area);
             return;
         }
         let rows = self.rows();
@@ -3734,6 +3867,29 @@ impl App {
                 "  Stock fprintd + pam_fprintd; unlocks alongside face, never instead.",
                 Style::new().dim(),
             )));
+            // Per-surface coverage (#155), the same table `fingerprint status`
+            // prints: which prompts a finger actually answers, per /etc/pam.d.
+            // Shown only when at least one surface reaches the module; a
+            // face-only box would render a column of ✗ noise.
+            if self.fp_coverage.iter().any(|(_, _, reaches)| *reaches) {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "  Where a finger can answer the prompt (per /etc/pam.d):",
+                    Style::new().dim(),
+                )));
+                for (_, label, reaches) in &self.fp_coverage {
+                    let mark = if *reaches {
+                        Span::styled("✓ ", Style::new().fg(th().ok))
+                    } else {
+                        Span::styled("✗ ", Style::new().dim())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        mark,
+                        Span::styled((*label).to_string(), Style::new().dim()),
+                    ]));
+                }
+            }
             lines.push(Line::raw(""));
             lines.push(action_line(&[
                 ("a", "enroll a finger"),
@@ -4274,11 +4430,13 @@ impl App {
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![section("PAM services (face auth wiring)")];
-        // Inline per-service status, same data as `irlume login status`.
-        for (label, present, wired) in crate::pamwire::status_report() {
+        // Everything below renders `self.pam_cache`, computed with the
+        // diagnostics: draw used to re-read every PAM service file and probe
+        // the LSM on EVERY FRAME, which is I/O in a render loop.
+        for (label, present, wired) in &self.pam_cache.rows {
             let val = if !present {
                 Span::styled("(not present)", Style::new().dim())
-            } else if wired {
+            } else if *wired {
                 Span::styled(
                     "● wired",
                     Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
@@ -4288,11 +4446,28 @@ impl App {
             };
             lines.push(Line::from(vec![Span::raw(format!("  {label:<16}")), val]));
         }
+        // The #200 advisory, same walk as `login status`: a wired greeter
+        // whose released password nothing turns into an open wallet is the
+        // one failure the user sees as "KWallet prompts anyway", and every
+        // other row here says wired ✓ while it happens.
+        for w in &self.pam_cache.handoffs {
+            let detail = match w.auth_only {
+                Some(m) => format!(
+                    "  ⚠ {}: {m} reads the password but has no session line; the wallet will still prompt",
+                    w.service
+                ),
+                None => format!(
+                    "  ⚠ {}: nothing reads the released password; the wallet will still prompt",
+                    w.service
+                ),
+            };
+            lines.push(Line::from(Span::styled(detail, Style::new().fg(th().err))));
+        }
         // LSM row is distro-aware: SELinux (Fedora-family), AppArmor
         // (Debian/Ubuntu-family), or nothing (e.g. Arch default); showing a
         // SELinux row on a non-SELinux system reads as a fault that isn't one.
-        if std::path::Path::new("/sys/fs/selinux").exists() {
-            let sel = match crate::pamwire::selinux_state() {
+        if self.pam_cache.selinux_present {
+            let sel = match self.pam_cache.selinux {
                 Some(true) => Span::styled("● loaded", Style::new().fg(th().ok)),
                 Some(false) => Span::styled("✗ not loaded", Style::new().fg(th().err)),
                 None => Span::styled("unknown (needs root)", Style::new().dim()),
@@ -4308,9 +4483,6 @@ impl App {
             // install). Fall back to the on-disk-profile heuristic only for an
             // older daemon that doesn't report the field.
             let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
-            let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
-                .map(|s| s.trim() == "Y")
-                .unwrap_or(false);
             let val = match aa {
                 Some(l) if l.contains("unconfined") => Some(Span::styled(
                     "✗ daemon UNCONFINED (profile installed but not loaded)",
@@ -4324,10 +4496,8 @@ impl App {
                     "● daemon confined (enforce)",
                     Style::new().fg(th().ok),
                 )),
-                None if enabled => {
-                    let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
-                        || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
-                    Some(if profiled {
+                None if self.pam_cache.apparmor_enabled => {
+                    Some(if self.pam_cache.apparmor_profiled {
                         Span::styled("● irlume profile installed", Style::new().fg(th().ok))
                     } else {
                         Span::styled(
@@ -5185,6 +5355,9 @@ mod tests {
             advanced: false,
             caps,
             fp_present: false,
+            profiles_load: None,
+            pam_cache: PamCache::default(),
+            fp_coverage: Vec::new(),
             spin: 0,
             quit: false,
         }
@@ -7150,6 +7323,131 @@ mod tests {
             text.contains("Improve Recognition"),
             "the add-scan guidance is missing"
         );
+    }
+
+    #[test]
+    fn a_loading_profile_list_never_reads_as_no_profiles() {
+        // The list loads in the background (a TPM unseal, 10.8s measured on
+        // one machine). Until it lands, an empty list is "not loaded yet";
+        // claiming "no profiles" told an enrolled user their face was gone.
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        let text = draw_text(&app);
+        assert!(text.contains("Loading profiles"), "{text}");
+        assert!(
+            !text.contains("No face profiles yet"),
+            "an unloaded list must not claim absence"
+        );
+    }
+
+    #[test]
+    fn poll_lands_the_background_profile_list() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["s1"])],
+            eyes_open: true,
+            challenge: false,
+        })
+        .unwrap();
+        app.poll();
+        assert!(app.profiles_load.is_none(), "the landed load must clear");
+        assert_eq!(app.profiles.len(), 1);
+        assert!(app.eyes_open);
+
+        // A daemon-side error is STATE (corrupt enrollment): it lands on
+        // enroll_error so Repair can flag it, exactly as the sync path did.
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::DaemonError("corrupt".into()))
+            .unwrap();
+        app.poll();
+        assert_eq!(app.enroll_error.as_deref(), Some("corrupt"));
+
+        // A transport failure is NOT state: the loaded list stays, and the
+        // next refresh retries.
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Transport("timeout".into()))
+            .unwrap();
+        app.poll();
+        assert_eq!(
+            app.profiles.len(),
+            1,
+            "a failed refresh must not clear the list"
+        );
+    }
+
+    #[test]
+    fn the_repair_enrollment_row_says_loading_while_the_list_is_in_flight() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (_tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        app.run_checks();
+        let row = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Enrollment")
+            .expect("an Enrollment row");
+        assert!(row.detail.contains("loading"), "{}", row.detail);
+        assert!(
+            !row.detail.contains("no face enrolled"),
+            "an in-flight load must not read as absence: {}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn the_pam_screen_renders_cached_state_and_the_handoff_warning() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        app.pam_cache = PamCache {
+            rows: vec![("plasmalogin".into(), true, true)],
+            selinux_present: false,
+            selinux: None,
+            apparmor_enabled: false,
+            apparmor_profiled: false,
+            handoffs: vec![crate::pamwire::HandoffWarning {
+                service: "/etc/pam.d/plasmalogin",
+                auth_only: None,
+            }],
+        };
+        let text = draw_text(&app);
+        assert!(text.contains("● wired"), "{text}");
+        // The #200 advisory: wired ✓ rows alone would hide the one failure
+        // the user actually sees (the wallet prompting after a face login).
+        assert!(
+            text.contains("nothing reads the released password"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_screen_shows_coverage_only_when_something_reaches() {
+        let mut app = test_app();
+        app.screen = SC_FINGERPRINT;
+        app.fp.available = true;
+        app.fp_coverage = vec![
+            (
+                "gdm-fingerprint",
+                "login screen (GNOME, fingerprint service)",
+                true,
+            ),
+            ("sudo", "sudo", false),
+        ];
+        let text = draw_text(&app);
+        assert!(text.contains("Where a finger can answer"), "{text}");
+        assert!(text.contains("login screen (GNOME"), "{text}");
+        // All-✗ coverage is noise, not information: the block stays hidden,
+        // matching `fingerprint status` gating the table on a wired line.
+        app.fp_coverage = vec![("sudo", "sudo", false)];
+        let text = draw_text(&app);
+        assert!(!text.contains("Where a finger can answer"), "{text}");
     }
 
     #[test]

@@ -441,6 +441,13 @@ fn disable() -> ExitCode {
 /// directory they control.
 const PAM_DIR: &str = "/etc/pam.d";
 
+/// [`fprintd_coverage`] over the live `/etc/pam.d`, for surfaces outside this
+/// module (the TUI's Fingerprint screen shows the same table `fingerprint
+/// status` prints, from the same walk).
+pub(crate) fn fprintd_coverage_live() -> Vec<(&'static str, &'static str, bool)> {
+    fprintd_coverage(std::path::Path::new(PAM_DIR))
+}
+
 /// Does `text` contain an auth RULE whose module-path names `module`?
 ///
 /// This feeds [`pam_fprintd_wired`], the gate that keeps `fingerprint enable`

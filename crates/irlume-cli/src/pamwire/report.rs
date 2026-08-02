@@ -96,7 +96,21 @@ pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
 /// with nothing downstream to open the wallet. Advisory only: it never changes
 /// a stack and never fails a command, because a missing wallet module is the
 /// user's package/desktop choice, not a broken irlume wiring.
-pub(super) fn report_keyring_handoff() {
+/// One wired greeter whose released password nothing turns into an open
+/// wallet: either a module read it with no session half (`auth_only`), or no
+/// keyring module reads it at all (`auth_only: None`).
+pub(crate) struct HandoffWarning {
+    /// The `/etc/pam.d` path of the affected greeter.
+    pub(crate) service: &'static str,
+    /// The module holding only the auth half, when one does.
+    pub(crate) auth_only: Option<&'static str>,
+}
+
+/// The keyring hand-off findings as DATA, shared by the printed report below
+/// and the TUI's PAM screen. One walk feeding both surfaces: two copies of
+/// this logic disagreeing is how an advisory lies in exactly one place.
+pub(crate) fn keyring_handoff_warnings() -> Vec<HandoffWarning> {
+    let mut out = Vec::new();
     for s in GREETERS {
         let Some(path) = service_present(s) else {
             continue;
@@ -115,18 +129,28 @@ pub(super) fn report_keyring_handoff() {
         if handoff.complete.is_some() {
             continue;
         }
-        match handoff.auth_only.first() {
+        out.push(HandoffWarning {
+            service: s.etc,
+            auth_only: handoff.auth_only.first().copied(),
+        });
+    }
+    out
+}
+
+pub(super) fn report_keyring_handoff() {
+    for w in keyring_handoff_warnings() {
+        match w.auth_only {
             Some(m) => println!(
                 "  ⚠ {}: {m} reads the released password but has no session line, so the\n     \
                  wallet daemon is never started with the key. Your wallet will still prompt.",
-                s.etc
+                w.service
             ),
             None => println!(
                 "  ⚠ {}: a face or fingerprint login releases your login password, but no\n     \
                  keyring module reads it afterwards, so KWallet/the login keyring will\n     \
                  still prompt. Install kwallet-pam (KDE) or gnome-keyring (GNOME); if it\n     \
                  is already installed, its auth line must sit BELOW the pam_irlume line.",
-                s.etc
+                w.service
             ),
         }
     }

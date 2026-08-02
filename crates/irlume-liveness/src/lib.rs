@@ -1457,7 +1457,7 @@ mod tests {
     /// changed with this field would be exactly the retune-against-
     /// contaminated-samples the issue warns off.
     #[test]
-    fn face_frac_is_recorded_and_changes_no_verdict() {
+    fn face_frac_changes_no_verdict() {
         let gate = LivenessGate::new();
         // Across the framing guide's whole accepted band and past both ends.
         for frac in [0.0, 0.05, 0.12, 0.3, 0.55, 0.9] {
@@ -1479,11 +1479,6 @@ mod tests {
                 "a flat target must not pass at face_frac {frac}"
             );
         }
-        // It survives the round trip it exists for: whatever the caller
-        // measured is what the evidence carries.
-        let mut s = live_signals();
-        s.face_frac = 0.3125;
-        assert!((s.face_frac - 0.3125).abs() < 1e-6);
     }
 
     #[test]

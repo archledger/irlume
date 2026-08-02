@@ -781,10 +781,7 @@ impl Engine {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // RGB-only path: no IR burst to measure
-            face_frac: rgb_top
-                .as_ref()
-                .map(|f| bbox_width_frac(&f.bbox, rgb.width))
-                .unwrap_or(0.0),
+            face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
@@ -1137,10 +1134,7 @@ impl Engine {
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: ir_stats.ambient_mean,
             // From the IR frame, because the IR cues are measured there.
-            face_frac: ir_top
-                .as_ref()
-                .map(|f| bbox_width_frac(&f.bbox, ir.width))
-                .unwrap_or(0.0),
+            face_frac: face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
             rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -2992,14 +2986,6 @@ pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
-/// The IR center/edge cue: ratio of the center-box mean to the edge-ring mean
-/// of the IR face crop (grey 0-255). A real 3D face lit by the near-coaxial
-/// emitter is brighter at the center/nose and falls off at the rim (ratio
-/// above 1); a flat matte screen/photo reads ~1. This is a brightness ratio,
-/// not a range measurement: a glossy print with a hot specular center clears
-/// it (docs/pad-results/2026-06-30-ir-liveness-selftest.md), which is why it is
-/// one cue and not a liveness proof. Returns 0.0 on a degenerate bbox or a
-/// near-black edge (no signal, never inf).
 /// Face width as a fraction of frame width: the framing guide's `face_frac`,
 /// computed from a detection box so the liveness path can record the same
 /// quantity the guide judges seating distance by (#174).
@@ -3010,6 +2996,25 @@ pub fn bbox_width_frac(bbox: &[f32; 4], frame_width: u32) -> f32 {
     (bbox[2] - bbox[0]).max(0.0) / frame_width as f32
 }
 
+/// `Signals::face_frac` for a capture: the top detection's width fraction, or
+/// 0.0 when nothing was detected.
+///
+/// Separated from the two call sites so the DECISION (no face means no
+/// distance signal, not a fabricated one) is a value a test can construct.
+/// What remains untestable off hardware is only which frame each caller
+/// hands in, one expression per path.
+pub fn face_frac_of(bbox: Option<&[f32; 4]>, frame_width: u32) -> f32 {
+    bbox.map(|b| bbox_width_frac(b, frame_width)).unwrap_or(0.0)
+}
+
+/// The IR center/edge cue: ratio of the center-box mean to the edge-ring mean
+/// of the IR face crop (grey 0-255). A real 3D face lit by the near-coaxial
+/// emitter is brighter at the center/nose and falls off at the rim (ratio
+/// above 1); a flat matte screen/photo reads ~1. This is a brightness ratio,
+/// not a range measurement: a glossy print with a hot specular center clears
+/// it (docs/pad-results/2026-06-30-ir-liveness-selftest.md), which is why it is
+/// one cue and not a liveness proof. Returns 0.0 on a degenerate bbox or a
+/// near-black edge (no signal, never inf).
 pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
     if bw <= 4.0 || bh <= 4.0 {
@@ -3762,6 +3767,16 @@ mod tests {
         // Degenerate inputs report no face rather than a negative or a NaN.
         assert_eq!(bbox_width_frac(&[300.0, 0.0, 100.0, 50.0], 640), 0.0);
         assert_eq!(bbox_width_frac(&[0.0, 0.0, 100.0, 50.0], 0), 0.0);
+    }
+
+    /// No detection means NO distance signal, and 0.0 is how that is spelled:
+    /// a reader correlating cues against face size must be able to drop those
+    /// rows rather than treat them as "a face filling nothing".
+    #[test]
+    fn face_frac_of_reports_zero_when_nothing_was_detected() {
+        assert_eq!(face_frac_of(None, 640), 0.0);
+        let bbox = [100.0f32, 0.0, 292.0, 200.0];
+        assert!((face_frac_of(Some(&bbox), 640) - 0.3).abs() < 1e-6);
     }
 
     /// The center/edge ratio's GEOMETRY is bbox-relative (the inner box is

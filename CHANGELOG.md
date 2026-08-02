@@ -5,7 +5,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-02
+
 ### Fixed
+
+- **The TUI never blocks on the machine.** Every observation (the fprintd and
+  busctl chain, PAM file walks, LSM and TPM probes, V4L2 opens, the daemon
+  polls, and the profile listing, which is a TPM unseal that measured 10.8
+  seconds on one laptop's TPM) now lands as a background snapshot; drawing
+  and the Repair checklist read memory only. On the machine that exposed it,
+  screen entries went from about eight seconds to under twenty milliseconds,
+  first frame in half a second, and the enrolled profile list actually
+  appears, which the old 1.5-second poll budget never allowed there. The
+  daemon-side costs are tracked separately (#211, #212). The TUI's PAM screen
+  now shows the keyring hand-off advisory `login status` prints, and its
+  Fingerprint screen shows the per-surface coverage table from `fingerprint
+  status`.
 
 - **The fingerprint-enable gate could pass on a comment.** `pam_fprintd_wired`
   matched raw lines, so a stack whose only `pam_fprintd.so` sat in a trailing

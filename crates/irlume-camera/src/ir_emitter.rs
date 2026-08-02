@@ -2737,7 +2737,7 @@ pub(crate) fn recover_pending_write(
             outcome
         }
         Ok(None) => RecoveryOutcome::Busy,
-        Err(why) => RecoveryOutcome::Unresolved(format!("lock the camera: {why}")),
+        Err(why) => RecoveryOutcome::Unchecked(format!("lock the camera: {why}")),
     }
 }
 
@@ -3010,6 +3010,13 @@ fn report_recovery(id: &crate::uvc_descriptor::CameraIdentity, outcome: Recovery
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecoveryOutcome {
     NothingPending,
+    /// The journal STATE COULD NOT BE EXAMINED (the per-camera lock was
+    /// unavailable, e.g. an unprivileged process cannot create it under
+    /// /run/lock). Not the same fact as [`Self::Unresolved`]: nothing was
+    /// observed about any record, so the message must not claim one exists.
+    /// The write refusal is identical, because a process that cannot check
+    /// cannot know the camera is safe to write to (#210).
+    Unchecked(String),
     /// A record exists for a DIFFERENT camera. Ordinary on a machine with two of
     /// them, and none of this camera's business: it must not stop the emitter
     /// here, which is the whole reason this is not folded in with the refusals.
@@ -3087,6 +3094,13 @@ impl RecoveryOutcome {
                  `irlume ir-setup` will refuse until the record can be written",
                 store.display()
             )),
+            Self::Unchecked(why) => Some(format!(
+                "irlume: could not check whether an interrupted emitter setup left this \
+                 camera changed ({why}). irlume will not write to this camera's emitter \
+                 from this process until it can check, so IR face authentication will \
+                 not light here. The daemon (root) checks and recovers on its own; an \
+                 unprivileged tool hitting this is expected and harmless."
+            )),
             Self::Unresolved(why) => Some(format!(
                 "irlume: an emitter control on this camera was left changed by an interrupted \
                  setup and has not been put back ({why}). irlume will not write to this \
@@ -3123,6 +3137,7 @@ impl RecoveryOutcome {
             Self::RestoredRecordKept(_) => "restored-record-kept",
             Self::OwnerStillRunning { .. } => "owner-running",
             Self::Busy => "busy",
+            Self::Unchecked(_) => "unchecked",
             Self::Unresolved(_) => "unresolved",
             Self::Unconfirmed { .. } => "unconfirmed",
         }
@@ -3157,6 +3172,7 @@ impl RecoveryOutcome {
             | Self::RestoredRecordKept(_) => true,
             Self::OwnerStillRunning { .. }
             | Self::Busy
+            | Self::Unchecked(_)
             | Self::Unresolved(_)
             | Self::Unconfirmed { .. } => false,
         }
@@ -3182,6 +3198,7 @@ impl RecoveryOutcome {
             Self::RestoredRecordKept(_)
             | Self::OwnerStillRunning { .. }
             | Self::Busy
+            | Self::Unchecked(_)
             | Self::Unresolved(_)
             | Self::Unconfirmed { .. } => true,
         }
@@ -4142,6 +4159,16 @@ mod tests {
                 true,
                 true,
             ),
+            // The journal state was never examined (lock unavailable). Loud,
+            // and it stops both writers: a process that cannot check cannot
+            // know the camera is safe to write to. Distinct from Unresolved
+            // because its message asserts nothing about records (#210).
+            (
+                RecoveryOutcome::Unchecked("lock the camera: permission denied".into()),
+                false,
+                true,
+                true,
+            ),
             // Another irlume process holds this camera. Silent, and it stops
             // both writers: it is being looked after already.
             (RecoveryOutcome::Busy, false, true, false),
@@ -4173,6 +4200,7 @@ mod tests {
                 RecoveryOutcome::RestoredRecordKept(_) => (true, true),
                 RecoveryOutcome::OwnerStillRunning { .. } => (false, true),
                 RecoveryOutcome::Busy => (false, true),
+                RecoveryOutcome::Unchecked(_) => (false, true),
                 RecoveryOutcome::Unresolved(_) => (false, true),
                 RecoveryOutcome::Unconfirmed { .. } => (false, true),
             }
@@ -4330,6 +4358,56 @@ mod tests {
     ///
     /// `commit` used to clear on the strength of the `SET_CUR` returning
     /// success, which is precisely the assumption the rest of this module
+    /// A lock the process cannot take means the journal state was never
+    /// examined; the outcome must SAY that, not fabricate a pending record.
+    /// Every unprivileged dev-tool capture used to print "an emitter control
+    /// ... was left changed by an interrupted setup" on machines whose
+    /// journal directory did not even exist (#210).
+    #[test]
+    fn an_untakeable_lock_reports_unchecked_never_a_phantom_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-unchecked-lockdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only lock dir");
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let id = identity(0x3277, 0x0059);
+        let probe = dir.join("probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            // A privileged run bypasses the permission this test constructs;
+            // say so instead of passing vacuously.
+            let _ = std::fs::remove_file(&probe);
+            eprintln!("not exercised: this uid bypasses directory permissions");
+        } else {
+            let fd = non_uvc_fd();
+            use std::os::unix::io::AsRawFd as _;
+            let outcome = recover_pending_write(fd.as_raw_fd(), &id);
+            assert!(
+                matches!(outcome, RecoveryOutcome::Unchecked(_)),
+                "an untakeable lock is a failure to OBSERVE, got {outcome:?}"
+            );
+            let msg = outcome.message().expect("unchecked is loud");
+            assert!(msg.contains("could not check"), "{msg}");
+            assert!(
+                !msg.contains("was left changed"),
+                "the message must not claim a record was observed: {msg}"
+            );
+            assert!(
+                !msg.contains("recorded original"),
+                "the message must not claim a record exists: {msg}"
+            );
+            assert!(
+                !outcome.permits_capture_write(),
+                "refusing is the safe half"
+            );
+            assert!(outcome.blocks_discovery());
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// refuses to make. `ir_emitter.conf` stores coordinates and no payload, so
     /// once the record is gone nothing holds the original bytes at all.
     #[test]

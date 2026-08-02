@@ -1003,6 +1003,12 @@ impl App {
                 self.recovery = l.recovery;
             }
         }
+        // The daemon just became reachable and no list was ever loaded (the
+        // startup attempt may have raced a still-booting daemon): fetch it
+        // now instead of waiting for a tab visit.
+        if self.daemon_up && self.profiles.is_empty() && self.enroll_error.is_none() {
+            self.refresh_profiles();
+        }
         self.nodes = l.nodes;
         self.pairs = l.pairs;
         let max = self.rows().len().max(1);
@@ -1042,7 +1048,13 @@ impl App {
     /// only where a change can have happened: at startup, after a TUI
     /// mutation, and when entering the Profiles tab.
     fn refresh_profiles(&mut self) {
-        if !self.daemon_up || self.profiles_load.is_some() {
+        // No daemon_up gate: at startup the async light poll has not landed
+        // yet, so the flag still reads false and gating on it meant the
+        // profile list never loaded until the user visited the Profiles tab
+        // (seen live: an enrolled machine's Repair row claiming "no face
+        // enrolled"). A down daemon just costs the worker a fast connect
+        // error, reported as a Transport outcome.
+        if self.profiles_load.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();

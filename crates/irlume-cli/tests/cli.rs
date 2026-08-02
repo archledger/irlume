@@ -1646,3 +1646,91 @@ esac"#,
         _ => {} // unknown family resolves to Source, covered elsewhere
     }
 }
+
+/// A pose recording exactly as `write_pose_jsonl` lays it out: a posecap
+/// header declaring `frames`, then one record per line with consecutive idx.
+fn write_pose_recording(path: &std::path::Path, label: &str, pitches: &[f32]) {
+    let mut s = format!(
+        "{{\"posecap\":true,\"label\":\"{label}\",\"frames\":{}}}\n",
+        pitches.len()
+    );
+    for (i, p) in pitches.iter().enumerate() {
+        s.push_str(&format!(
+            "{{\"idx\":{i},\"pitch_frac\":{p},\"yaw_signed\":0.0,\"bri\":100.0}}\n"
+        ));
+    }
+    std::fs::write(path, s).unwrap();
+}
+
+#[test]
+fn blinkcap_replay_accepts_a_single_pose_file_and_a_pose_only_dir() {
+    let sb = Sandbox::new("bc-pose-ok");
+    let file = sb.path("work").join("nod-01.jsonl");
+    // Steps 0.02, 0.03, 0.01 over consecutive idx: mean_step 0.0200. The
+    // exact figure in stdout pins the whole path (parse, idx pairing, tally).
+    write_pose_recording(&file, "nod", &[0.50, 0.52, 0.55, 0.54]);
+
+    // One pose FILE: the usage line advertises <file.jsonl | dir>, and a
+    // file used to bypass the pose replay entirely and then exit 1.
+    let (code, out, err) = run(sb
+        .cmd(&["blinkcap", "replay", file.to_str().unwrap()])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(
+        code, 0,
+        "single pose file must replay and exit 0; stderr: {err}"
+    );
+    assert!(out.contains("mean_step 0.0200..0.0200"), "{out}");
+
+    // A pose-only directory: the summary used to print and the exit code
+    // still said FAILURE, so a script could not trust a successful replay.
+    let dir = sb.path("work");
+    let (code, out, err) = run(sb
+        .cmd(&["blinkcap", "replay", dir.to_str().unwrap()])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 0, "pose-only dir must exit 0; stderr: {err}");
+    assert!(out.contains("head-nod acceptance"), "{out}");
+}
+
+#[test]
+fn blinkcap_replay_refuses_damaged_pose_recordings_loudly() {
+    let sb = Sandbox::new("bc-pose-bad");
+    let dir = sb.path("work");
+    write_pose_recording(&dir.join("nod-01.jsonl"), "nod", &[0.50, 0.52, 0.55]);
+
+    // A crash-truncated capture: valid header, no body. Replaying it would
+    // score an unread observation as a perfectly still head (mean_step 0.0)
+    // in the same summary as real sessions, so the whole replay must refuse,
+    // even though a healthy recording sits in the same directory.
+    std::fs::write(
+        dir.join("trunc.jsonl"),
+        "{\"posecap\":true,\"label\":\"nod\",\"frames\":3}\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(sb
+        .cmd(&["blinkcap", "replay", dir.to_str().unwrap()])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1, "a truncated pose recording must fail the replay");
+    assert!(err.contains("declares 3 frames"), "stderr: {err}");
+    assert!(
+        !out.contains("head-nod acceptance"),
+        "no summary may print over a damaged corpus: {out}"
+    );
+
+    // A malformed record inside a file that declares the right count.
+    std::fs::write(
+        dir.join("trunc.jsonl"),
+        "{\"posecap\":true,\"label\":\"nod\",\"frames\":2}\n\
+         {\"idx\":0,\"pitch_frac\":0.5,\"yaw_signed\":0.0,\"bri\":100.0}\n\
+         {\"idx\":1,\"pitch_frac\":BROKEN\n",
+    )
+    .unwrap();
+    let (code, _out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "replay",
+            dir.join("trunc.jsonl").to_str().unwrap(),
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1, "a malformed pose record must fail the replay");
+    assert!(err.contains("invalid pose record"), "stderr: {err}");
+}

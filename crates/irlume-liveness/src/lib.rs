@@ -668,9 +668,11 @@ pub struct NodEvidence {
     pub yaw_range: f32,
     /// Median crossings of sufficient amplitude, against [`NOD_MIN_CROSSINGS`].
     pub crossings: usize,
-    /// Mean absolute pitch change per frame, over ADJACENT frame pairs where
-    /// both readings exist (a face-lost gap contributes nothing, rather than a
-    /// fake jump across it).
+    /// Mean absolute pitch change per frame, over CONSECUTIVE frame pairs
+    /// (`idx` differing by exactly one) where both readings exist. A face-lost
+    /// gap contributes nothing, and so does a missing frame index: a sample
+    /// dropped before this function sees it must not turn a two-frame move
+    /// into one frame's motion.
     ///
     /// RECORDED, NEVER GATING. This is the candidate discriminator #101 left
     /// on the table: measured there once, it separated a still head from a
@@ -679,11 +681,14 @@ pub struct NodEvidence {
     /// from one user in one session, and the same thread documents this class
     /// of signal drifting across sessions (genuine nods at 0.057 in one
     /// campaign, 0.082 weakest in another). The issue's recorded blocker is
-    /// cross-session data; this field exists so every consent watch and every
-    /// replayed capture accumulates it with the rest of the evidence, instead
-    /// of only the runs where someone remembered IRLUME_DUMP_POSE_SERIES.
-    /// Turning it into a threshold is #101's call to make on that data, not
-    /// this field's.
+    /// cross-session data; this field rides in the evidence so debug-enabled
+    /// consent watches (`IRLUME_LOG=debug`, the same opt-in as every other
+    /// diagnostic line) and validated replay captures report it without
+    /// anyone remembering IRLUME_DUMP_POSE_SERIES. An ordinary authentication
+    /// run computes it and discards it with the rest of the evidence; making
+    /// it durable everywhere would need the storage and access-control design
+    /// the anti-oracle logging policy exists to force. Turning it into a
+    /// threshold is #101's call to make on that data, not this field's.
     pub mean_step: f32,
 }
 
@@ -712,12 +717,19 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
         }
     };
     let pitch_range = range(&pitch);
-    // Adjacent SAMPLES, not adjacent survivors of the filter above: pairing the
-    // filtered vector would read a step across a face-lost gap as one frame's
-    // motion and inflate the very statistic this exists to record faithfully.
+    // Adjacent FRAMES, not adjacent elements of the vector: `windows(2)` pairs
+    // whatever sits next to each other, and a sample dropped upstream (a
+    // record replay could not parse, a frame a caller filtered out) leaves
+    // `idx` 10 beside `idx` 12. Pairing those would read a two-frame move as
+    // one frame's motion and inflate the very statistic this exists to record
+    // faithfully, so a pair only counts when the indices are consecutive AND
+    // both readings exist and are finite.
     let (step_sum, step_n) = samples.windows(2).fold((0.0f32, 0usize), |acc, w| {
-        match (w[0].pitch_frac, w[1].pitch_frac) {
-            (Some(a), Some(b)) => (acc.0 + (b - a).abs(), acc.1 + 1),
+        let consecutive = w[0].idx.checked_add(1) == Some(w[1].idx);
+        match (consecutive, w[0].pitch_frac, w[1].pitch_frac) {
+            (true, Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
+                (acc.0 + (b - a).abs(), acc.1 + 1)
+            }
             _ => acc,
         }
     });
@@ -1956,18 +1968,68 @@ mod nod_evidence_tests {
 
         // A None gap breaks adjacency: the 0.50→0.60 jump spans the gap and
         // must NOT count as one frame's motion. Pairs left: none.
-        let mut gappy = samples(&[0.50, 0.60]);
-        gappy.insert(
-            1,
+        let gappy = vec![
+            PoseSample {
+                idx: 0,
+                pitch_frac: Some(0.50),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
             PoseSample {
                 idx: 1,
                 pitch_frac: None,
                 yaw_signed: None,
                 bri: 0.0,
             },
-        );
+            PoseSample {
+                idx: 2,
+                pitch_frac: Some(0.60),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+        ];
         let (_, ev) = detect_nod_with_evidence(&gappy);
         assert_eq!(ev.mean_step, 0.0, "a gap-spanning jump is not a step");
+
+        // A missing frame INDEX breaks adjacency the same way: these samples
+        // sit next to each other in the vector but two frames apart in time,
+        // the shape left behind when something upstream drops one frame.
+        let sparse = vec![
+            PoseSample {
+                idx: 10,
+                pitch_frac: Some(0.50),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+            PoseSample {
+                idx: 12,
+                pitch_frac: Some(0.60),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+        ];
+        assert_eq!(
+            detect_nod_with_evidence(&sparse).1.mean_step,
+            0.0,
+            "nonconsecutive frame indices must not form a step"
+        );
+
+        // And the adjacency check itself must not overflow on a hostile idx.
+        let wrap = vec![
+            PoseSample {
+                idx: usize::MAX,
+                pitch_frac: Some(0.50),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+            PoseSample {
+                idx: 0,
+                pitch_frac: Some(0.60),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+        ];
+        assert_eq!(detect_nod_with_evidence(&wrap).1.mean_step, 0.0);
 
         // Empty and single-frame windows have no pairs: 0.0, not NaN.
         assert_eq!(detect_nod_with_evidence(&[]).1.mean_step, 0.0);

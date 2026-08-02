@@ -7,17 +7,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- **The consent watch records the #101 candidate discriminator on every run.**
-  `mean_step` (mean absolute pitch change per adjacent frame pair, with
-  face-lost gaps contributing nothing) now rides in the nod evidence, the
-  consent debug line, and `blinkcap replay`'s per-label summary. It gates
-  nothing: #101 measured it separating a still head from a deliberate nod by
-  2.3x where the gating pitch range manages 1.44x, then deliberately declined
-  to set a threshold on one user's single session, because this class of
-  signal is known to drift between sessions. The blocker is cross-session
-  data; recording the metric with the rest of the evidence means every consent
-  watch and every replayed capture accumulates it, instead of only runs where
-  someone remembered the pose-series dump flag.
+- **Debug-enabled consent watches report the #101 candidate discriminator.**
+  `mean_step` (mean absolute pitch change per consecutive usable frame pair;
+  a face-lost frame or a missing frame index contributes nothing) now rides
+  in the nod evidence, the opt-in consent debug line (`IRLUME_LOG=debug`, off
+  by default; ordinary authentication runs still emit no diagnostic
+  evidence), and `blinkcap replay`'s per-label summary. It gates nothing:
+  #101 measured it separating a still head from a deliberate nod by 2.3x
+  where the gating pitch range manages 1.44x, then deliberately declined to
+  set a threshold on one user's single session, because this class of signal
+  is known to drift between sessions. The blocker is cross-session data, and
+  replay over recorded corpora is where that accumulates: replay now refuses
+  a damaged or truncated pose recording loudly instead of measuring its
+  fragments as a still head, accepts a single `.jsonl` file as documented
+  rather than only a directory, exits successfully on a pose-only corpus,
+  and captures are staged and renamed into place so a crash cannot leave a
+  valid header over a partial body.
 
 - **A dark or blinded IR capture reports what its evidence supports.** A dark
   burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")

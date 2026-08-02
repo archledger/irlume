@@ -262,28 +262,47 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     let Some(fp_at) = lines.iter().position(|l| is_fingerprint_auth(l)) else {
         return (content.to_string(), false);
     };
-    // Does anything in this stack already read the token we are about to set?
-    // GDM's own `gdm-fingerprint` does not, so the unseal line alone would
-    // release a password into a stack with no consumer.
-    // `only_if=` aware: a keyring line that stands down for THIS service is not
-    // a consumer here, however plainly it names the module.
-    let has_consumer = lines
-        .iter()
-        .any(|l| consumer_active_for(l, service).is_some());
+    // Does this stack already turn the token we are about to set into an open
+    // keyring? That takes ONE module holding BOTH halves in working positions:
+    // an auth line BELOW the fprintd anchor (above it, the module runs before
+    // PAM_AUTHTOK exists) and a session line of its own (the half that starts
+    // the daemon and unlocks with the stashed key), the same per-module rule
+    // `keyring_handoff` reports by. Any weaker test suppressed our lines on
+    // stacks where a lone session line, a lone auth line, a misplaced auth
+    // line, or even a password-phase line named the module, and the
+    // fingerprint login then succeeded with the wallet still locked.
+    // `only_if=` aware in both halves: a keyring line that stands down for
+    // THIS service is not a consumer here, however plainly it names the
+    // module. Supplying our tagged pair beside an incomplete foreign pair is
+    // the safe direction: unwiring removes exactly ours, and an extra pair
+    // risks redundant work where a suppressed pair leaves the wallet locked,
+    // the exact failure this function exists to close.
+    let has_complete_consumer = KEYRING_CONSUMERS.iter().copied().any(|module| {
+        let auth_below_anchor = lines
+            .iter()
+            .skip(fp_at + 1)
+            .any(|l| is_auth_directive(l) && consumer_active_for(l, service) == Some(module));
+        let session_present = lines.iter().any(|l| {
+            let d = directive(l);
+            let phase = d.strip_prefix('-').unwrap_or(d);
+            phase.split_whitespace().next() == Some("session")
+                && consumer_active_for(l, service) == Some(module)
+        });
+        auth_below_anchor && session_present
+    });
     let mut out = Vec::with_capacity(lines.len() + 3);
     for (i, l) in lines.iter().enumerate() {
         out.push((*l).to_string());
         if i == fp_at {
             out.push(KEYRING_UNSEAL.to_string());
-            if !has_consumer {
+            if !has_complete_consumer {
                 out.push(FP_GKR_AUTH.to_string());
             }
         }
     }
-    if !has_consumer {
+    if !has_complete_consumer {
         // Appended last: gnome-keyring's session half wants to run once the
-        // session is otherwise set up, and it is the half that actually starts
-        // the daemon and unlocks with the stashed key.
+        // session is otherwise set up.
         out.push(FP_GKR_SESSION.to_string());
     }
     (format!("{}\n", out.join("\n")), true)

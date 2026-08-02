@@ -491,6 +491,22 @@ impl PamSearchPath {
         }
     }
 
+    /// The directories this path actually read, for the report to name. A
+    /// vendor directory that is not on this machine is not mentioned: telling
+    /// a user the scan consulted `/usr/lib/pam.d` where no such directory
+    /// exists claims a completeness the scan does not have. Ubuntu 26.04 is
+    /// that case, with the path compiled into libpam and no directory shipped.
+    fn summary(&self) -> String {
+        match &self.vendor {
+            Some(v) => format!(
+                "per {} with {} as fallback",
+                self.machine.display(),
+                v.display()
+            ),
+            None => format!("per {}", self.machine.display()),
+        }
+    }
+
     /// The file PAM would open for `service`, or `None` when neither directory
     /// has one.
     pub(crate) fn service_path(&self, service: &str) -> Option<std::path::PathBuf> {
@@ -779,15 +795,10 @@ fn report_fprintd_coverage(path: &PamSearchPath) {
     // The scan follows libpam's own search path since #208, so name the
     // directories it actually read. A surface served purely by a vendor stack
     // now appears; before, it was missing from the table entirely.
-    let where_from = match &path.vendor {
-        Some(v) => format!(
-            "per {} with {} as fallback",
-            path.machine.display(),
-            v.display()
-        ),
-        None => format!("per {}", path.machine.display()),
-    };
-    println!("[fingerprint] coverage: where a finger can answer the prompt ({where_from}):");
+    println!(
+        "[fingerprint] coverage: where a finger can answer the prompt ({}):",
+        path.summary()
+    );
     for (svc, label, reaches) in &cov {
         println!("    {} {label}  ({svc})", if *reaches { "✓" } else { "✗" });
     }
@@ -1049,7 +1060,22 @@ mod tests {
         let path = PamSearchPath::rooted(&m, Some(&absent));
         assert_eq!(path.service_path("login"), Some(m.join("login")));
         assert_eq!(path.service_path("sudo"), None);
-        let _ = std::fs::remove_dir_all(m);
+        // And the report must not claim it consulted a directory that is not
+        // there, which is the only place the distinction is observable.
+        let summary = path.summary();
+        assert!(!summary.contains("fallback"), "{summary}");
+        assert!(summary.contains(&m.display().to_string()), "{summary}");
+
+        let present = pam_dir("vendor-present", &[("sudo", "auth required pam_unix.so\n")]);
+        let with_vendor = PamSearchPath::rooted(&m, Some(&present));
+        assert!(with_vendor.summary().contains("fallback"));
+        assert!(with_vendor
+            .summary()
+            .contains(&present.display().to_string()));
+
+        for d in [m, present] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     // The Ubuntu 26.04 box from issue #155, files verbatim from the report:

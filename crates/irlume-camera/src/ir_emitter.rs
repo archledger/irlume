@@ -1018,6 +1018,100 @@ fn write_if_different(
     })
 }
 
+/// What one pass over a proc tree could establish about other holders of a
+/// device node. `consumers` is only what the scan positively SAW; a blind spot
+/// is a separate fact, never an empty list.
+#[derive(Debug, Default, PartialEq)]
+struct ConsumerScan {
+    /// PIDs, with `comm`, of OTHER processes seen holding the node.
+    consumers: Vec<(u32, String)>,
+    /// At least one process refused inspection. Reading another process's
+    /// `/proc/<pid>/fd` is gated by PTRACE_MODE_READ_FSCREDS, not by file
+    /// permissions (proc_pid_fd(5), ptrace(2)); the packaged daemon keeps only
+    /// CAP_DAC_OVERRIDE and CAP_FOWNER, and root without CAP_SYS_PTRACE does
+    /// not pass that gate. Every cross-uid consumer in a desktop session
+    /// therefore lands HERE, not in `consumers`. Collapsing this bit into "no
+    /// consumer" is exactly how the scan failed open in production; closing
+    /// the blind spot itself is #207.
+    permission_denied: bool,
+}
+
+impl ConsumerScan {
+    /// Only a consumer the scan actually saw stands the emitter down. A blind
+    /// spot must not: under the packaged capability set the scan is blind to
+    /// every cross-uid process, so treating `permission_denied` as a consumer
+    /// would make every packaged capture inert and the emitter permanently
+    /// dark. The caller reports the blind spot instead (#207 owns removing it).
+    fn stands_down(&self) -> bool {
+        !self.consumers.is_empty()
+    }
+}
+
+/// Scan `proc_root` (`/proc` in production; a constructed tree in tests) for
+/// other processes holding `dev` open.
+///
+/// The check is definitionally racy (a consumer can arrive one instant after
+/// the scan), and that is acceptable for what it guards: honouring the sharing
+/// contract for consumers that exist at decision time, not a mutual-exclusion
+/// primitive (the kernel lock does that for irlume's own processes). Only a
+/// PERMISSION denial marks the scan incomplete: a pid dir that vanished
+/// mid-scan, an fd-less kernel thread, or a missing root are the ordinary
+/// churn of /proc, and counting them as blind spots would put the degradation
+/// warning on every scan on every machine.
+fn foreign_consumers(proc_root: &std::path::Path, dev: &str, self_pid: u32) -> ConsumerScan {
+    let mut scan = ConsumerScan::default();
+    if dev.is_empty() {
+        return scan;
+    }
+    let entries = match std::fs::read_dir(proc_root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            scan.permission_denied = err.kind() == std::io::ErrorKind::PermissionDenied;
+            return scan;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let fds = match std::fs::read_dir(entry.path().join("fd")) {
+            Ok(fds) => fds,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    scan.permission_denied = true;
+                }
+                continue;
+            }
+        };
+        let mut holds = false;
+        for fd in fds {
+            let Ok(fd) = fd else { continue };
+            match std::fs::read_link(fd.path()) {
+                Ok(target) if target.as_os_str() == std::ffi::OsStr::new(dev) => {
+                    holds = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    scan.permission_denied = true;
+                }
+                Err(_) => {}
+            }
+        }
+        if holds {
+            let comm = std::fs::read_to_string(entry.path().join("comm"))
+                .map(|c| c.trim().to_string())
+                .unwrap_or_else(|_| "?".into());
+            scan.consumers.push((pid, comm));
+        }
+    }
+    scan
+}
+
 /// Light the emitter on the open `fd` for `device`, if a control is configured.
 /// Returns whether a `SET_CUR` succeeded. Best-effort.
 ///
@@ -1053,49 +1147,6 @@ fn write_if_different(
 /// hardware-target substitution through the API of the type that exists to
 /// prevent it (#189). Holding the `Arc` makes the descriptor outlive the guard
 /// by construction.
-/// PIDs (with `comm`) of OTHER processes holding `dev` open, read from
-/// `proc_root` (`/proc` in production; a constructed tree in tests).
-///
-/// The check is definitionally racy (a consumer can arrive one instant after
-/// the scan), and that is acceptable for what it guards: honouring the
-/// read-only-sharer contract for consumers that exist at decision time, not a
-/// mutual-exclusion primitive (the kernel lock does that for irlume's own
-/// processes). Unreadable entries are skipped silently: as root (the daemon)
-/// everything is readable; as an unprivileged caller the scan degrades toward
-/// empty, which fails OPEN into today's behaviour rather than inventing a
-/// phantom consumer that stands the emitter down.
-fn foreign_consumers(proc_root: &std::path::Path, dev: &str, self_pid: u32) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
-    if dev.is_empty() {
-        return out;
-    }
-    let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if pid == self_pid {
-            continue;
-        }
-        let fd_dir = entry.path().join("fd");
-        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
-            continue;
-        };
-        let holds = fds.flatten().any(|fd| {
-            std::fs::read_link(fd.path()).is_ok_and(|t| t.as_os_str() == std::ffi::OsStr::new(dev))
-        });
-        if holds {
-            let comm = std::fs::read_to_string(entry.path().join("comm"))
-                .map(|c| c.trim().to_string())
-                .unwrap_or_else(|_| "?".into());
-            out.push((pid, comm));
-        }
-    }
-    out
-}
-
 pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &str) -> StreamMode {
     let _ = card;
     let fd = handle.fd();
@@ -1116,31 +1167,46 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
     };
 
     // The Windows contract these modules are certified against permits many
-    // frame consumers but exactly ONE of them to modify device configuration;
-    // shared consumers are read-only and inherit the controlling application's
-    // settings (MediaCaptureSharingMode / MF FrameServer share modes: sharing
-    // instances "cannot change KSPROPERTYSETID_ExtendedCameraControl", the
-    // class the Hello extension unit belongs to). irlume used to write the
-    // control regardless, relying on its capture failing EBUSY later anyway.
-    // Honour the model instead of relying on that (#169): when another PROCESS
-    // already holds this node, stand down from the write and stream-or-fail
-    // with whatever state the controlling application chose. Inert is the
-    // fail-safe direction: an unlit emitter degrades this one capture toward
-    // the password, while a write under a foreign owner mutates a stream that
-    // application is mid-way through using. irlume-vs-irlume exclusion is
-    // handled separately by the kernel lock; this covers everyone else.
-    let foreign = foreign_consumers(std::path::Path::new("/proc"), device, std::process::id());
-    if !foreign.is_empty() {
-        let who: Vec<String> = foreign
+    // frame consumers but exactly ONE controlling instance; sharing consumers
+    // "cannot change KSPROPERTYSETID_ExtendedCameraControl controls", the
+    // class the Hello extension unit belongs to, and inherit the controlling
+    // application's media type (MediaCaptureSharingMode / MF FrameServer share
+    // modes). irlume used to write the control regardless, relying on its
+    // capture failing EBUSY later anyway. Honour the model instead of relying
+    // on that (#169): when another PROCESS is seen holding this node, stand
+    // down from the write and stream-or-fail with whatever state the
+    // controlling application chose. Inert is the fail-safe direction: an
+    // unlit emitter degrades this one capture toward the password, while a
+    // write under a foreign owner mutates a stream that application is
+    // mid-way through using. irlume-vs-irlume exclusion is handled separately
+    // by the kernel lock; this covers everyone else.
+    let scan = foreign_consumers(std::path::Path::new("/proc"), device, std::process::id());
+    if scan.stands_down() {
+        let who: Vec<String> = scan
+            .consumers
             .iter()
             .take(3)
             .map(|(pid, comm)| format!("{comm}({pid})"))
             .collect();
         eprintln!(
-            "irlume: not driving the IR emitter on {device}: another application holds              this camera ({}); its configuration is left untouched",
+            "irlume: not driving the IR emitter on {device}: another application holds this \
+             camera ({}); its configuration is left untouched",
             who.join(", ")
         );
         return StreamMode::inert();
+    }
+    if scan.permission_denied {
+        // Once per process, not per capture: under the packaged capability
+        // set this is true on essentially every scan, and repeating it would
+        // bury the journal while saying nothing new.
+        static SCAN_DEGRADED: std::sync::Once = std::sync::Once::new();
+        SCAN_DEGRADED.call_once(|| {
+            eprintln!(
+                "irlume: the camera-consumer scan could not inspect every process \
+                 (permission denied), so a holder of {device} it cannot see goes \
+                 undetected and the emitter write proceeds; see issue #207"
+            );
+        });
     }
 
     // Identity comes from the descriptor that will receive the write, not from a
@@ -3876,28 +3942,108 @@ mod tests {
             ],
         );
         let got = foreign_consumers(&root, "/dev/video2", 9999);
-        assert_eq!(got, vec![(1234, "chrome".to_string())]);
+        assert_eq!(got.consumers, vec![(1234, "chrome".to_string())]);
+        // Everything in this tree was readable, so nothing was a blind spot.
+        assert!(!got.permission_denied);
         // A different node has no foreign consumers here.
-        assert!(foreign_consumers(&root, "/dev/video0", 9999).is_empty());
+        assert!(foreign_consumers(&root, "/dev/video0", 9999)
+            .consumers
+            .is_empty());
         // The self pid holding it is not "foreign".
-        assert!(foreign_consumers(&root, "/dev/video2", 1234).len() == 1);
+        assert!(
+            foreign_consumers(&root, "/dev/video2", 1234)
+                .consumers
+                .len()
+                == 1
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn foreign_consumers_fails_open_on_unreadable_or_odd_trees() {
+    fn foreign_consumers_fails_open_on_missing_or_odd_trees() {
         // A missing proc root, an empty dev, and a pid dir without fd/ must all
         // degrade to "no foreign consumers": the guard stands the emitter down
-        // only on positive evidence, never on scan failure.
-        assert!(
-            foreign_consumers(std::path::Path::new("/nonexistent-proc"), "/dev/video2", 1)
-                .is_empty()
-        );
+        // only on positive evidence, never on scan failure. None of these is a
+        // permission DENIAL, so none may mark the scan incomplete either; that
+        // bit carries "a process refused inspection", not "the tree was odd".
+        let missing =
+            foreign_consumers(std::path::Path::new("/nonexistent-proc"), "/dev/video2", 1);
+        assert!(missing.consumers.is_empty());
+        assert!(!missing.permission_denied);
         let root = fake_proc("odd", &[(4321, "sleep", &[])]);
         std::fs::remove_dir_all(root.join("4321").join("fd")).unwrap();
-        assert!(foreign_consumers(&root, "/dev/video2", 1).is_empty());
-        assert!(foreign_consumers(&root, "", 1).is_empty());
+        let fdless = foreign_consumers(&root, "/dev/video2", 1);
+        assert!(fdless.consumers.is_empty());
+        assert!(!fdless.permission_denied);
+        assert_eq!(foreign_consumers(&root, "", 1), ConsumerScan::default());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_unlistable_fd_dir_marks_the_scan_incomplete_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        // One process holds the node but its fd dir cannot be listed: the
+        // shape a ptrace-gated /proc presents to the packaged daemon (#207).
+        // The observation and its failure must stay distinct: consumers empty
+        // AND permission_denied set, never a bare empty list.
+        let root = fake_proc("denied-list", &[(4321, "chrome", &["/dev/video2"])]);
+        let fd_dir = root.join("4321").join("fd");
+        std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&fd_dir).is_ok() {
+            // A privileged run bypasses the denial this test constructs, so it
+            // would prove nothing; say so instead of passing vacuously.
+            eprintln!("not exercised: this uid bypasses directory permissions");
+        } else {
+            let scan = foreign_consumers(&root, "/dev/video2", 1);
+            assert!(scan.consumers.is_empty());
+            assert!(
+                scan.permission_denied,
+                "a denied fd listing must mark the scan incomplete"
+            );
+        }
+        std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_denied_readlink_marks_the_scan_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        // r without x on the fd dir: the entry names list, their targets do
+        // not resolve. Exercises the read_link arm, distinct from the
+        // unlistable-dir arm above.
+        let root = fake_proc("denied-link", &[(4321, "chrome", &["/dev/video2"])]);
+        let fd_dir = root.join("4321").join("fd");
+        std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        match std::fs::read_link(fd_dir.join("0")) {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let scan = foreign_consumers(&root, "/dev/video2", 1);
+                assert!(scan.consumers.is_empty());
+                assert!(
+                    scan.permission_denied,
+                    "a denied readlink must mark the scan incomplete"
+                );
+            }
+            _ => eprintln!("not exercised: this uid bypasses directory permissions"),
+        }
+        std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_blind_spot_alone_does_not_stand_the_emitter_down() {
+        // The packaged daemon sees permission_denied on essentially every
+        // scan; standing down on it would keep the emitter permanently dark.
+        // Only a consumer the scan SAW stands the write down.
+        let blind = ConsumerScan {
+            consumers: vec![],
+            permission_denied: true,
+        };
+        assert!(!blind.stands_down());
+        let seen = ConsumerScan {
+            consumers: vec![(1234, "chrome".to_string())],
+            permission_denied: true,
+        };
+        assert!(seen.stands_down());
     }
 
     /// A caught signal must set the flag the measurement loop polls, and the

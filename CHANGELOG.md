@@ -8,13 +8,18 @@ All notable changes to irlume are documented here. This project adheres to
 ### Added
 
 - **The emitter write honours the Windows exclusive-control model.** Windows
-  permits many camera consumers but only one may modify device configuration;
-  shared consumers are read-only and inherit the controlling application's
-  settings. irlume wrote the extension-unit control whenever it captured,
-  relying on its capture failing busy afterwards anyway. `ir_emitter::enable`
-  now stands down from the write when another process already holds the camera
-  node, leaving that application's configuration untouched, the fail-safe
-  direction, since an unlit emitter degrades one capture toward the password.
+  permits many camera consumers but only one controlling instance; sharing
+  consumers cannot change extended camera controls and inherit the controlling
+  application's media type. irlume wrote the extension-unit control whenever
+  it captured, relying on its capture failing busy afterwards anyway.
+  `ir_emitter::enable` now stands down from the write when it sees another
+  process holding the camera node, leaving that application's configuration
+  untouched, the fail-safe direction, since an unlit emitter degrades one
+  capture toward the password. The scan has a stated blind spot: reading
+  another user's `/proc/<pid>/fd` is ptrace-gated and the packaged daemon does
+  not hold `CAP_SYS_PTRACE`, so a cross-uid holder can go unseen. The scan
+  reports that instead of hiding it, the daemon logs the degradation once and
+  proceeds, and #207 tracks closing the blind spot.
   The threat model gains a sourced section on the whole Windows camera
   contract: the exclusive-control model, the certification tie between IR
   capture and visible indication (and irlume's position on it), why

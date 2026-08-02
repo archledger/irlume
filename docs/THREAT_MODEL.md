@@ -83,13 +83,27 @@ Hello's camera control through; the same page does let them change legacy
 `VIDEOPROCAMP`-style and vendor-specific controls
 ([MediaCaptureSharingMode][ms-share],
 [MF FrameServer share modes][ms-frameserver]). irlume takes the strict end of
-that contract: when another process already holds the camera node,
-`ir_emitter::enable` stands down from the control write entirely, even though
-a Windows sharing consumer could touch a vendor extension unit, and leaves the
-controlling application's configuration untouched (the capture then proceeds
-or fails on its own terms; an unlit emitter degrades toward the password,
-which is the fail-safe direction). irlume-vs-irlume exclusion is separate and
-kernel-enforced.
+that contract: when the `/proc` scan sees another process holding the camera
+node, `ir_emitter::enable` stands down from the control write entirely, even
+though a Windows sharing consumer could touch a vendor extension unit, and
+leaves the controlling application's configuration untouched (the capture
+then proceeds or fails on its own terms; an unlit emitter degrades toward the
+password, which is the fail-safe direction). irlume-vs-irlume exclusion is
+separate and kernel-enforced.
+
+The scan cannot see every holder in production. Reading another process's
+`/proc/<pid>/fd` is gated by `PTRACE_MODE_READ_FSCREDS` (proc_pid_fd(5),
+ptrace(2)), and the packaged unit grants the daemon only `CAP_DAC_OVERRIDE`
+and `CAP_FOWNER`, which do not pass that gate, so a camera holder in the
+user's desktop session (PipeWire, a browser) is invisible to the root daemon.
+The scan reports the blind spot (`ConsumerScan::permission_denied`) rather
+than collapsing it into "no consumer"; the daemon logs the degradation once
+per process and proceeds, which is the pre-#169 behaviour with the honesty
+added. Standing down on a blind spot instead would make every packaged
+capture inert, a permanent self-denial of the emitter. Closing the blind spot
+means granting `CAP_SYS_PTRACE` (a privilege expansion on an authentication
+daemon) or adding a separately confined observer; that decision is #207 and
+is not made here.
 
 **Privacy indication for IR-only capture.** irlume can illuminate a person
 with 850 nm light during authentication. Windows hardware certification ties

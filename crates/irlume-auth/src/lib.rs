@@ -1163,9 +1163,10 @@ impl Engine {
                 .map(|f| format!("{:.1}%", f * 100.0))
                 .unwrap_or_else(|| "n/a".into()));
         // Opt-in third-party PAD cue: score whenever an IR face is present (the
-        // `ir` frame is the brightest strobe phase, i.e. the LIT frame, which is
-        // the regime the cue was measured in), so the dark path can consult the
-        // result too. DENY-ONLY: it can downgrade Live to Spoof and nothing else.
+        // `ir` frame is a LIT strobe phase, since #221 the brightest one that
+        // is not clipped, which is closer to the regime the cue was measured in
+        // than a blown exposure), so the dark path can consult the result too.
+        // DENY-ONLY: it can downgrade Live to Spoof and nothing else.
         let thirdparty_fake = match (self.tp_pad.as_mut(), ir_top.as_ref()) {
             (Some((pad, _, _)), Some(f)) => match pad.p_fake(&ir_view, &f.bbox) {
                 Ok(p) => Some(p),

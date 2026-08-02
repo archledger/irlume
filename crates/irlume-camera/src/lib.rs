@@ -104,7 +104,7 @@ pub struct Frame {
 /// The span of time a frame's pixels came from, on the monotonic clock.
 ///
 /// Most frames are one dequeue, so `start == end`. Two are not: the denoised RGB
-/// frame is a per-pixel median over a burst, and the IR frame is the brightest of
+/// frame is a per-pixel median over a burst, and the IR frame is one chosen from
 /// a burst, so their contents belong to a stretch of time rather than an instant.
 /// Keeping the stretch (instead of stamping "now" at return) is what lets
 /// [`CaptureWindow::gap_to`] state a real bound rather than a flattering one.
@@ -1693,8 +1693,9 @@ pub struct IrSession<'a> {
 }
 
 impl IrSession<'_> {
-    /// One IR capture: a burst, the brightest (lit strobe phase) frame, and the
-    /// burst statistics.
+    /// One IR capture: a burst, the brightest clean (lit strobe phase, at most
+    /// [`ir_metadata::CLIPPED_FRAC_MAX`] clipped when measurable) frame, and
+    /// the burst statistics.
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
@@ -1791,10 +1792,22 @@ impl IrSession<'_> {
         }
         let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
         let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        // The brightest frame the CAMERA flagged lit. With no flags this is the
-        // first frame holding the max mean, exactly the original incremental
-        // scan, so the no-metadata path is unchanged.
-        let best_i = ir_metadata::brightest_lit(&means, &flags).unwrap_or(0);
+        // The brightest CLEAN frame the CAMERA flagged lit: a clipped frame
+        // compresses the centre/edge ratio toward the spoof floor and can
+        // defeat IR face detection outright (#221), and the brightest frame of
+        // a warming burst is the most likely to clip. Clipping is only
+        // measurable when the source format names its ceiling, and lit-ness
+        // only when the camera classified frames; on either fallback this is
+        // the first frame holding the max mean, exactly the original
+        // incremental scan.
+        let clipped_fracs: Option<Vec<f64>> = white_level.map(|_| {
+            frames
+                .iter()
+                .map(|f| ir_probe::saturated_fraction(f))
+                .collect()
+        });
+        let best_i =
+            ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref()).unwrap_or(0);
         let mut best = Some(frames[best_i].clone());
         let mut ir_window = CaptureWindow::at(taken[best_i]);
 
@@ -1857,7 +1870,7 @@ impl IrSession<'_> {
                         eprintln!(
                         "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}; lit clipped {:.1}%{}",
                         clipped * 100.0,
-                        if clipped > 0.05 {
+                        if clipped > ir_metadata::CLIPPED_FRAC_MAX {
                             " (blown exposure; subtracted frame unreliable)"
                         } else {
                             ""
@@ -1897,8 +1910,12 @@ impl IrSession<'_> {
             eprintln!("[ir_emitter] card={card:?} SET_CUR ok={lit}; burst {IR_BURST} frames, per-frame mean {bmin:.1}..{bmax:.1}");
             eprintln!(
                 "[ir] illumination: {from_camera}/{} frames classified by the camera; \
-                 chose frame {best_i} (mean {best_mean:.1}), lit {lit_level:.1} / ambient {ambient_level:.1}",
-                means.len()
+                 chose frame {best_i} (mean {best_mean:.1}{}), lit {lit_level:.1} / ambient {ambient_level:.1}",
+                means.len(),
+                match clipped_fracs.as_ref().and_then(|c| c.get(best_i)) {
+                    Some(c) => format!(", clipped {:.1}%", c * 100.0),
+                    None => String::new(),
+                }
             );
         }
         // An unusable burst gets a DIAGNOSIS, not the old one-size hint. The

@@ -320,6 +320,64 @@ pub(crate) fn brightest_lit(means: &[f64], flags: &[Option<Illumination>]) -> Op
     best.map(|(i, _)| i)
 }
 
+/// A gate frame may clip at most this fraction of its pixels before selection
+/// prefers a cleaner frame. 5% is the cutoff the ambient-subtract debug line
+/// has always used for "blown exposure", and it sits under the smallest
+/// clipping measured to move the centre/edge ratio (#221: captures at 0.9-13%
+/// read 1.41-1.54, 20.5% read 1.39, 70%+ read 1.11-1.19 against a 1.03 floor).
+pub(crate) const CLIPPED_FRAC_MAX: f64 = 0.05;
+
+/// Pick the burst frame the liveness gate and matcher read.
+///
+/// The brightest frame of a warming burst is precisely the most likely to
+/// clip: the first capture after a daemon restart at close range gated a frame
+/// with 78.8% of its pixels at the ceiling, the IR detector found no facial
+/// structure in it, and a real user was denied as a spoof; the same position
+/// one capture later read 12.7% (#221). So among the frames the camera itself
+/// flagged lit, take the brightest whose clipped fraction is at most
+/// [`CLIPPED_FRAC_MAX`], and when every lit frame clips harder than that, the
+/// least clipped one (brightest on a tie): the gate reads the best frame that
+/// exists rather than the worst.
+///
+/// `clipped[i]` is the fraction of frame `i`'s pixels at the sensor ceiling,
+/// `None` when the source format cannot say where its ceiling is
+/// ([`super::clipping_white_level`]). A missing per-frame entry is treated as
+/// fully clipped, never as clean: failure to observe must not authorize.
+///
+/// Both fallbacks keep the long-standing brightest scan unchanged: without
+/// camera illumination flags a strobing burst's cleanest frames are the
+/// emitter-OFF ones, so clip-aware selection there would trade a clipped face
+/// for no face at all.
+pub(crate) fn best_gate_frame(
+    means: &[f64],
+    flags: &[Option<Illumination>],
+    clipped: Option<&[f64]>,
+) -> Option<usize> {
+    let lit = |i: usize| matches!(flags.get(i), Some(Some(Illumination::Lit)));
+    let any_lit = (0..means.len()).any(lit);
+    let Some(clipped) = clipped.filter(|_| any_lit) else {
+        return brightest_lit(means, flags);
+    };
+    debug_assert_eq!(clipped.len(), means.len());
+    // Strictly-greater keeps the FIRST frame on a mean tie, matching
+    // `brightest_lit`'s long-standing scan.
+    let mut clean: Option<(usize, f64)> = None;
+    let mut least: Option<(usize, f64, f64)> = None; // (index, clipped, mean)
+    for (i, &m) in means.iter().enumerate() {
+        if !lit(i) {
+            continue;
+        }
+        let c = clipped.get(i).copied().unwrap_or(1.0);
+        if c <= CLIPPED_FRAC_MAX && clean.is_none_or(|(_, best)| m > best) {
+            clean = Some((i, m));
+        }
+        if least.is_none_or(|(_, bc, bm)| c < bc || (c == bc && m > bm)) {
+            least = Some((i, c, m));
+        }
+    }
+    clean.map(|(i, _)| i).or(least.map(|(i, _, _)| i))
+}
+
 /// Pick the ambient partner for `lit_i`: an adjacent frame the camera flagged
 /// dark, else the darker of the two neighbours.
 ///
@@ -936,6 +994,83 @@ mod tests {
         let flags = [None, None, None, None];
         // First frame holding the maximum, as the incremental scan always did.
         assert_eq!(brightest_lit(&means, &flags), Some(1));
+    }
+
+    #[test]
+    fn best_gate_frame_skips_a_clipped_brightest_lit_frame() {
+        // The #221 case: the brightest lit frame is blown, a dimmer lit frame
+        // is clean, and the gate must read the clean one.
+        let means = [200.0, 150.0, 3.0];
+        let flags = [
+            Some(Illumination::Lit),
+            Some(Illumination::Lit),
+            Some(Illumination::Dark),
+        ];
+        let clipped = [0.30, 0.01, 0.0];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(1));
+    }
+
+    #[test]
+    fn best_gate_frame_never_trades_a_clipped_face_for_an_emitter_off_frame() {
+        // Every lit frame clips. The dark frame is the cleanest in the burst
+        // and must still lose: least-clipped LIT wins.
+        let means = [2.0, 220.0, 150.0];
+        let flags = [
+            Some(Illumination::Dark),
+            Some(Illumination::Lit),
+            Some(Illumination::Lit),
+        ];
+        let clipped = [0.0, 0.60, 0.30];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(2));
+    }
+
+    #[test]
+    fn best_gate_frame_keeps_the_brightest_on_a_clean_burst() {
+        // No frame clips, so selection matches brightest_lit exactly,
+        // including first-on-tie.
+        let means = [50.0, 90.0, 90.0];
+        let flags = [Some(Illumination::Lit); 3];
+        let clipped = [0.0, 0.0, 0.0];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(1));
+    }
+
+    #[test]
+    fn best_gate_frame_without_clip_data_matches_brightest_lit() {
+        // A format with no known ceiling reports no clipping; the scan is the
+        // long-standing brightest-lit one.
+        let means = [90.0, 50.0];
+        let flags = [Some(Illumination::Lit), Some(Illumination::Lit)];
+        assert_eq!(best_gate_frame(&means, &flags, None), Some(0));
+    }
+
+    #[test]
+    fn best_gate_frame_without_camera_flags_keeps_the_brightest_scan() {
+        // Unclassified burst: the cleanest frames of a strobing burst are the
+        // emitter-off ones, so clip-aware selection must not run at all, even
+        // when the brightest frame is heavily clipped.
+        let means = [3.0, 220.0, 40.0];
+        let flags = [None, None, None];
+        let clipped = [0.0, 0.80, 0.0];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(1));
+    }
+
+    #[test]
+    fn best_gate_frame_counts_the_threshold_itself_as_clean() {
+        // The boundary belongs to the clean side; a frame at exactly
+        // CLIPPED_FRAC_MAX outranks a dimmer spotless one.
+        let means = [200.0, 150.0];
+        let flags = [Some(Illumination::Lit), Some(Illumination::Lit)];
+        let clipped = [CLIPPED_FRAC_MAX, 0.0];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(0));
+    }
+
+    #[test]
+    fn best_gate_frame_breaks_a_clipping_tie_toward_the_brighter_frame() {
+        // All-clipped fallback with equal clipping: brightness decides.
+        let means = [90.0, 180.0];
+        let flags = [Some(Illumination::Lit), Some(Illumination::Lit)];
+        let clipped = [0.30, 0.30];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(1));
     }
 
     #[test]

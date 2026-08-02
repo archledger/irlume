@@ -5,6 +5,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A status read can no longer make a login wait.** Every request used to
+  execute on the single engine worker, so a `ListProfiles` (a TPM unseal of
+  the template key, measured at 10.8 seconds on one laptop's TPM) made a
+  concurrently arriving authentication wait behind it: a Ping issued during
+  a listing measured 10.4 seconds. Read-only status requests (Ping, Health,
+  HasSealedPassword, KeyringInfo, RecoveryStatus, ListProfiles) now answer
+  on the connection's own thread, never entering the worker queue; Health
+  reads an engine snapshot published before the socket binds. Mutating
+  requests stay serialized on the worker, and the per-request authorization
+  gates moved with the code unchanged. Closes #212.
+
 ## [0.8.0] - 2026-08-02
 
 ### Fixed

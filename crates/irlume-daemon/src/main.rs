@@ -198,6 +198,8 @@ fn main() {
                 None => Ok(e),
             })
     };
+    // Bits are published before the socket binds (bind happens after the
+    // models load), so no connection can observe the default EngineBits.
     let mut engine = match build_engine() {
         Ok(e) => {
             eprintln!(
@@ -233,6 +235,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    publish_engine_bits(&engine);
 
     // One-time inoculation: stamp legacy (untagged) IR scans with the current
     // embedding space while it is still the space they were captured under.
@@ -399,6 +402,7 @@ fn main() {
                             match build_engine() {
                                 Ok(fresh) => {
                                     engine = fresh;
+                                    publish_engine_bits(&engine);
                                     eprintln!("irlumed: engine rebuilt after panic");
                                 }
                                 Err(e) => eprintln!(
@@ -1100,6 +1104,15 @@ fn serve(stream: UnixStream, arbiter: &arbiter::Arbiter<Queued>) -> std::io::Res
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
             let class = arbiter::classify(&req);
+            // Status is answered HERE, on the connection's own thread: it is
+            // read-only, engine-free, and possibly slow (ListProfiles is a
+            // TPM unseal), so it must neither wait behind the worker nor make
+            // an authentication wait behind it (#212).
+            if class == arbiter::Class::Status {
+                let resp = dispatch_status(&req, &peer)
+                    .unwrap_or_else(|| Response::Error("not a status request".into()));
+                return respond(stream, &resp);
+            }
             let (reply, answer) = std::sync::mpsc::channel();
             let queued = Queued {
                 req,
@@ -1205,13 +1218,61 @@ fn request_user(req: &Request) -> Option<&str> {
     }
 }
 
-fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
-    if let Some(u) = request_user(&req) {
+/// The engine-derived facts `Health` reports, published once the engine is
+/// built (and again after a panic rebuild) so status requests can answer on
+/// the connection thread without touching the engine. The socket binds only
+/// after the first publish, so no connection can observe the empty state.
+#[derive(Clone, Default)]
+struct EngineBits {
+    mesh: bool,
+    adapter: bool,
+    third_party_pad: Option<String>,
+}
+
+fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
+    static BITS: std::sync::OnceLock<std::sync::Mutex<EngineBits>> = std::sync::OnceLock::new();
+    BITS.get_or_init(|| std::sync::Mutex::new(EngineBits::default()))
+}
+
+fn publish_engine_bits_raw(bits: EngineBits) {
+    *engine_bits().lock().unwrap_or_else(|e| e.into_inner()) = bits;
+}
+
+fn publish_engine_bits(engine: &irlume_auth::Engine) {
+    publish_engine_bits_raw(EngineBits {
+        mesh: engine.has_mesh(),
+        adapter: engine.has_ir_adapter(),
+        third_party_pad: engine.thirdparty_pad_name().map(String::from),
+    });
+}
+
+/// The username-validity pregate every request passes before any arm runs,
+/// shared by the worker dispatch and the connection-thread status dispatch.
+fn precheck(req: &Request) -> Option<Response> {
+    if let Some(u) = request_user(req) {
         if !valid_username(u) {
-            return Response::Error("invalid username".into());
+            return Some(Response::Error("invalid username".into()));
         }
     }
-    match req {
+    None
+}
+
+/// Answer a [`arbiter::Class::Status`] request. Runs on the CONNECTION
+/// THREAD: everything here is read-only and engine-free (`Health` reads the
+/// published [`EngineBits`]), so a slow status read (`ListProfiles` is a TPM
+/// unseal, 10.8s measured on one machine) cannot make an authentication
+/// wait, and a wedged worker cannot make `Ping` lie about the daemon being
+/// down (#212). Returns `None` for requests that are not status, which the
+/// worker then serves as before.
+fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
+    if let Some(resp) = precheck(req) {
+        return Some(resp);
+    }
+    let bits = engine_bits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Some(match req {
         Request::Ping => Response::Pong,
         Request::Health => {
             // Live probe (cameras can appear/vanish); report selected nodes only
@@ -1231,18 +1292,149 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 tier: tier.into(),
                 rgb_dev,
                 ir_dev,
-                mesh: engine.has_mesh(),
-                adapter: engine.has_ir_adapter(),
+                mesh: bits.mesh,
+                adapter: bits.adapter,
                 version: env!("CARGO_PKG_VERSION").into(),
                 // Authoritative loaded-cue name so a non-root TUI can show the
                 // real on/off state (settings.conf is root-only).
-                third_party_pad: engine.thirdparty_pad_name().map(String::from),
+                third_party_pad: bits.third_party_pad.clone(),
                 apparmor: apparmor_confinement(),
             }
         }
         // Only tune the band to a user the peer may act for (root, or their own
         // account); else ignore it. Stops a non-root peer forcing a per-poll TPM
         // unseal of another user's (e.g. root's) enrollment via the framing guide.
+        Request::HasSealedPassword { user } => {
+            if !authorized_for(peer, user) {
+                return Some(Response::Error(format!("not authorized to query '{user}'")));
+            }
+            Response::HasPassword(irlume_core::keyring::has_sealed_password(user))
+        }
+        Request::KeyringInfo { user } => {
+            if !authorized_for(peer, user) {
+                return Some(Response::Error(format!("not authorized to query '{user}'")));
+            }
+            let armed = irlume_core::keyring::has_sealed_password(user);
+            let path = irlume_core::keyring::envelope_path(user);
+            match irlume_core::envelope::SealedEnvelope::load(&path) {
+                Ok(env) => Response::KeyringInfo {
+                    armed,
+                    policy: Some(env.policy.describe()),
+                    pcrs: env.pcrs.clone(),
+                    // None when the envelope carries no PCR snapshot or the
+                    // replay failed; the CLI then just omits the drift note.
+                    drifted: irlume_core::tpm::diagnose_pcrs(&env)
+                        .ok()
+                        .filter(|_| !env.pcr_values.is_empty())
+                        .map(|d| !d.is_empty()),
+                },
+                // Not armed, or the envelope is unreadable/corrupt: report the
+                // armed bit alone rather than failing the whole query.
+                Err(_) => Response::KeyringInfo {
+                    armed,
+                    policy: None,
+                    pcrs: Vec::new(),
+                    drifted: None,
+                },
+            }
+        }
+        Request::RecoveryStatus { user } => {
+            if !authorized_for(peer, user) {
+                return Some(Response::Error(format!("not authorized to query '{user}'")));
+            }
+            Response::RecoveryStatus {
+                encrypted: irlume_core::template_key::has_key(user),
+                recovery_set: irlume_core::template_key::has_recovery(user),
+                tpm_present: irlume_core::template_key::tpm_available(),
+            }
+        }
+        Request::ListProfiles {
+            user,
+            structured_errors,
+        } => {
+            // Only ever answer with a typed error when the request asked for
+            // one. An older client cannot deserialize an unknown response
+            // variant, so sending one unasked would break it across the upgrade
+            // window, which is the failure class of issue #93.
+            let fail = |code: irlume_common::OperationErrorCode, prose: String| {
+                if *structured_errors {
+                    Response::OperationError {
+                        code,
+                        retryable: false,
+                    }
+                } else {
+                    Response::Error(prose)
+                }
+            };
+            if !authorized_for(peer, user) {
+                return Some(fail(
+                    irlume_common::OperationErrorCode::NotAuthorized,
+                    format!("not authorized to list '{user}'"),
+                ));
+            }
+            match irlume_core::storage::load(user) {
+                Ok(Some(enr)) => Response::Enrollment {
+                    profiles: enr
+                        .profiles
+                        .iter()
+                        .map(|p| irlume_common::ProfileSummary {
+                            name: p.name.clone(),
+                            scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                        })
+                        .collect(),
+                    require_eyes_open: enr.require_eyes_open,
+                    require_challenge: enr.require_challenge,
+                    closure_calibrated: enr
+                        .closure_calibration
+                        .map(|(o, c)| {
+                            irlume_liveness::ClosureCalibration {
+                                ear_open: o,
+                                ear_closed: c,
+                            }
+                            .is_usable()
+                        })
+                        .unwrap_or(false),
+                    ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
+                },
+                Ok(None) => Response::Enrollment {
+                    profiles: vec![],
+                    require_eyes_open: false,
+                    require_challenge: false,
+                    closure_calibrated: false,
+                    ir_ratio_calibrated: false,
+                },
+                Err(e) => fail(
+                    irlume_common::OperationErrorCode::OperationFailed,
+                    e.to_string(),
+                ),
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
+    // Status requests are normally answered on the connection thread and
+    // never reach here; delegating keeps this dispatch total (and identical
+    // in behavior) if one is ever submitted anyway. precheck rides inside.
+    if let Some(resp) = dispatch_status(&req, peer) {
+        return resp;
+    }
+    if let Some(resp) = precheck(&req) {
+        return resp;
+    }
+    match req {
+        // Status variants are answered by dispatch_status above; this arm is
+        // unreachable and exists so the match stays exhaustive without a
+        // second implementation to drift.
+        Request::Ping
+        | Request::Health
+        | Request::HasSealedPassword { .. }
+        | Request::KeyringInfo { .. }
+        | Request::RecoveryStatus { .. }
+        | Request::ListProfiles { .. } => {
+            Response::Error("status request routed past its handler".into())
+        }
         Request::PositionSample { user } => {
             match engine.position_sample(user.as_deref().filter(|u| authorized_for(peer, u))) {
                 Ok(r) => Response::Position(r),
@@ -1731,40 +1923,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             }
         }
-        Request::HasSealedPassword { user } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to query '{user}'"));
-            }
-            Response::HasPassword(irlume_core::keyring::has_sealed_password(&user))
-        }
-        Request::KeyringInfo { user } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to query '{user}'"));
-            }
-            let armed = irlume_core::keyring::has_sealed_password(&user);
-            let path = irlume_core::keyring::envelope_path(&user);
-            match irlume_core::envelope::SealedEnvelope::load(&path) {
-                Ok(env) => Response::KeyringInfo {
-                    armed,
-                    policy: Some(env.policy.describe()),
-                    pcrs: env.pcrs.clone(),
-                    // None when the envelope carries no PCR snapshot or the
-                    // replay failed; the CLI then just omits the drift note.
-                    drifted: irlume_core::tpm::diagnose_pcrs(&env)
-                        .ok()
-                        .filter(|_| !env.pcr_values.is_empty())
-                        .map(|d| !d.is_empty()),
-                },
-                // Not armed, or the envelope is unreadable/corrupt: report the
-                // armed bit alone rather than failing the whole query.
-                Err(_) => Response::KeyringInfo {
-                    armed,
-                    policy: None,
-                    pcrs: Vec::new(),
-                    drifted: None,
-                },
-            }
-        }
         Request::ForgetPassword { user } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to forget password for '{user}'"));
@@ -1846,16 +2004,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::RecoveryStatus { user } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to query '{user}'"));
-            }
-            Response::RecoveryStatus {
-                encrypted: irlume_core::template_key::has_key(&user),
-                recovery_set: irlume_core::template_key::has_recovery(&user),
-                tpm_present: irlume_core::template_key::tpm_available(),
-            }
-        }
         Request::RecoveryForget { user } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to forget recovery for '{user}'"));
@@ -1863,67 +2011,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             match irlume_core::template_key::forget_recovery(&user) {
                 Ok(()) => Response::Ok(format!("recovery passphrase erased for '{user}'")),
                 Err(e) => Response::Error(e.to_string()),
-            }
-        }
-        Request::ListProfiles {
-            user,
-            structured_errors,
-        } => {
-            // Only ever answer with a typed error when the request asked for
-            // one. An older client cannot deserialize an unknown response
-            // variant, so sending one unasked would break it across the upgrade
-            // window, which is the failure class of issue #93.
-            let fail = |code: irlume_common::OperationErrorCode, prose: String| {
-                if structured_errors {
-                    Response::OperationError {
-                        code,
-                        retryable: false,
-                    }
-                } else {
-                    Response::Error(prose)
-                }
-            };
-            if !authorized_for(peer, &user) {
-                return fail(
-                    irlume_common::OperationErrorCode::NotAuthorized,
-                    format!("not authorized to list '{user}'"),
-                );
-            }
-            match irlume_core::storage::load(&user) {
-                Ok(Some(enr)) => Response::Enrollment {
-                    profiles: enr
-                        .profiles
-                        .iter()
-                        .map(|p| irlume_common::ProfileSummary {
-                            name: p.name.clone(),
-                            scans: p.scans.iter().map(|s| s.name.clone()).collect(),
-                        })
-                        .collect(),
-                    require_eyes_open: enr.require_eyes_open,
-                    require_challenge: enr.require_challenge,
-                    closure_calibrated: enr
-                        .closure_calibration
-                        .map(|(o, c)| {
-                            irlume_liveness::ClosureCalibration {
-                                ear_open: o,
-                                ear_closed: c,
-                            }
-                            .is_usable()
-                        })
-                        .unwrap_or(false),
-                    ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
-                },
-                Ok(None) => Response::Enrollment {
-                    profiles: vec![],
-                    require_eyes_open: false,
-                    require_challenge: false,
-                    closure_calibrated: false,
-                    ir_ratio_calibrated: false,
-                },
-                Err(e) => fail(
-                    irlume_common::OperationErrorCode::OperationFailed,
-                    e.to_string(),
-                ),
             }
         }
         Request::DeleteProfile { user, profile } => {
@@ -2838,6 +2925,153 @@ mod tests {
 
         arbiter.close();
         worker.join().unwrap();
+    }
+
+    /// The #212 invariant, both directions, with NO WORKER AT ALL: a status
+    /// request must answer on the connection thread even while an
+    /// authentication is queued and nobody drains the queue. Before this
+    /// class existed, Ping sat in the queue behind whatever the worker was
+    /// grinding (a 10.8s TPM-bound ListProfiles, measured), clients timed
+    /// out, and short-budget pollers read a working daemon as down. If this
+    /// test only passed because a worker drained the queue, it would hang.
+    #[test]
+    fn a_status_request_answers_while_the_queue_is_wedged_and_workerless() {
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        // Wedge: an authentication sits queued forever (no worker exists).
+        let (dead_reply, _keep) = std::sync::mpsc::channel();
+        arbiter
+            .submit(
+                arbiter::Class::Auth,
+                0,
+                Queued {
+                    req: Request::Ping,
+                    peer: Peer {
+                        uid: 0,
+                        gid: 0,
+                        pid: 0,
+                    },
+                    reply: dead_reply,
+                },
+            )
+            .unwrap();
+
+        for (wire, check) in [
+            (
+                "\"Ping\"\n".to_string(),
+                Box::new(|r: &Response| matches!(r, Response::Pong))
+                    as Box<dyn Fn(&Response) -> bool>,
+            ),
+            (
+                // Own-uid query: authorized, answered from files, no engine.
+                format!(
+                    "{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n",
+                    users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
+                ),
+                Box::new(|r: &Response| matches!(r, Response::HasPassword(_))),
+            ),
+        ] {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            // A status answer comes from the connection thread in
+            // microseconds; a regression queues it behind the wedge for the
+            // full 300s worker budget. The client-side deadline turns that
+            // hang into a fast, attributable failure.
+            ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            (&ours).write_all(wire.as_bytes()).unwrap();
+            let a = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || serve(theirs, &a).unwrap());
+            let mut line = String::new();
+            BufReader::new(&ours)
+                .read_line(&mut line)
+                .expect("a status answer within the deadline");
+            let resp: Response = serde_json::from_str(line.trim()).unwrap();
+            assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
+        }
+    }
+
+    #[test]
+    fn status_requests_classify_as_status_and_writers_stay_plain() {
+        use arbiter::{classify, Class};
+        let u = || "carol".to_string();
+        for req in [
+            Request::Ping,
+            Request::Health,
+            Request::HasSealedPassword { user: u() },
+            Request::KeyringInfo { user: u() },
+            Request::RecoveryStatus { user: u() },
+            Request::ListProfiles {
+                user: u(),
+                structured_errors: false,
+            },
+        ] {
+            assert_eq!(classify(&req), Class::Status, "{req:?}");
+        }
+        // Mutating requests stay serialized on the worker: reclassifying one
+        // as Status would let it race captures and other writers.
+        for req in [
+            Request::ForgetPassword { user: u() },
+            Request::DeleteProfile {
+                user: u(),
+                profile: "p".into(),
+            },
+            Request::SetRequireEyesOpen {
+                user: u(),
+                on: true,
+            },
+        ] {
+            assert_eq!(classify(&req), Class::Plain, "{req:?}");
+        }
+    }
+
+    #[test]
+    fn dispatch_status_keeps_the_authorization_gate() {
+        // A non-root peer asking about another user is refused on the
+        // connection thread exactly as the worker refused it: moving the
+        // arms must not have moved the gate.
+        let peer = Peer {
+            uid: 65534,
+            gid: 65534,
+            pid: 1,
+        };
+        let resp = dispatch_status(
+            &Request::HasSealedPassword {
+                user: "root".into(),
+            },
+            &peer,
+        )
+        .expect("status request");
+        match resp {
+            Response::Error(m) => assert!(m.contains("not authorized"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn health_reports_the_published_engine_bits() {
+        publish_engine_bits_raw(EngineBits {
+            mesh: true,
+            adapter: true,
+            third_party_pad: Some("flir".into()),
+        });
+        let peer = Peer {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let resp = dispatch_status(&Request::Health, &peer).expect("status request");
+        match resp {
+            Response::Health {
+                mesh,
+                adapter,
+                third_party_pad,
+                ..
+            } => {
+                assert!(mesh && adapter);
+                assert_eq!(third_party_pad.as_deref(), Some("flir"));
+            }
+            other => panic!("expected Health, got {other:?}"),
+        }
+        publish_engine_bits_raw(EngineBits::default());
     }
 
     #[test]

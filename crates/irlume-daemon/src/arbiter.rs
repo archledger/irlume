@@ -43,9 +43,17 @@ pub enum Class {
     /// Opens the camera without being an authentication: the framing guide,
     /// 1:N identify, enrollment, emitter setup, self-tests.
     Camera,
-    /// Touches no camera: listings, keyring metadata, settings. Cheap enough
-    /// that arbitration would cost more than it saves.
+    /// Touches no camera: settings writes, seals, deletions, renames. These
+    /// stay on the worker so every mutation of shared state stays serialized
+    /// against captures and against each other.
     Plain,
+    /// Read-only status that touches neither the camera nor the engine:
+    /// answered on the CONNECTION THREAD, never queued. This class exists
+    /// because one of its members (`ListProfiles`) is a TPM unseal that
+    /// measured 10.8 seconds on a slow TPM, and queued behind the worker it
+    /// made a concurrently arriving authentication wait that long (#212). A
+    /// status read has no business making a login wait.
+    Status,
 }
 
 /// Classify a request by what it does to the camera, not by who sent it.
@@ -58,6 +66,15 @@ pub fn classify(req: &Request) -> Class {
     use Request::*;
     match req {
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => Class::Auth,
+        // Read-only, engine-free, and possibly SLOW (ListProfiles pays a TPM
+        // unseal): answered where they arrive so they cannot delay a login
+        // and a login cannot delay them.
+        Ping
+        | Health
+        | HasSealedPassword { .. }
+        | KeyringInfo { .. }
+        | RecoveryStatus { .. }
+        | ListProfiles { .. } => Class::Status,
         PositionSample { .. }
         | Identify
         | Enroll { .. }
@@ -218,7 +235,10 @@ impl<T> Arbiter<T> {
                     payload,
                 });
             }
-            Class::Plain => inner.other.push_back(Job {
+            // Status is answered on the connection thread and never submitted;
+            // if a future caller submits one anyway it queues like Plain, which
+            // is correct (just slower) rather than lost.
+            Class::Plain | Class::Status => inner.other.push_back(Job {
                 class,
                 uid,
                 payload,
@@ -432,14 +452,17 @@ mod tests {
             classify(&Request::PositionSample { user: None }),
             Class::Camera
         );
+        // Read-only status answers on the connection thread (#212): a TPM-
+        // bound listing must not make a login wait, and Ping must answer
+        // while the worker grinds.
         assert_eq!(
             classify(&Request::ListProfiles {
                 user: "u".into(),
                 structured_errors: true
             }),
-            Class::Plain
+            Class::Status
         );
-        assert_eq!(classify(&Request::Ping), Class::Plain);
+        assert_eq!(classify(&Request::Ping), Class::Status);
         // A secret-carrying management request is not camera work.
         assert_eq!(
             classify(&Request::SealPassword {

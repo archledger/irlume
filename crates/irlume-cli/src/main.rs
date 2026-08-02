@@ -1099,15 +1099,45 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
 /// log records which stack produced the numbers. `--mesh` and `--blaze`
 /// default to `models/…` paths relative to the CURRENT DIRECTORY, i.e. a repo
 /// checkout; pass explicit paths when running from anywhere else.
+/// Which camera nodes the dev-tool engine should open, from the optional
+/// `--rgb`/`--ir` flags. `None` = no override (the engine's own defaults).
+///
+/// Either flag ALONE overrides its half; the partner comes from `selected`
+/// (in production [`irlume_camera::select_pair`]: the persisted pair with
+/// identity resolution, then discovery), because a lone flag used to be
+/// SILENTLY IGNORED: `blinkcap capture --ir /dev/video6` captured against
+/// the built-in default node and failed with "no camera found", saying
+/// nothing about the dropped flag (#209). `selected` runs only when needed,
+/// since it can probe devices.
+pub(crate) fn devices_from_flags(
+    rgb: Option<&str>,
+    ir: Option<&str>,
+    selected: impl FnOnce() -> (String, String),
+) -> Option<(String, String)> {
+    match (rgb, ir) {
+        (None, None) => None,
+        (Some(r), Some(i)) => Some((r.to_string(), i.to_string())),
+        (r, i) => {
+            let (sel_r, sel_i) = selected();
+            Some((
+                r.map(str::to_string).unwrap_or(sel_r),
+                i.map(str::to_string).unwrap_or(sel_i),
+            ))
+        }
+    }
+}
+
 pub(crate) fn engine(
     det: &str,
     model: &str,
     args: &[String],
 ) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
-    let e = match (flag(args, "--rgb"), flag(args, "--ir")) {
-        (Some(r), Some(i)) => e.with_devices(r, i),
-        _ => e,
+    let e = match devices_from_flags(flag(args, "--rgb"), flag(args, "--ir"), || {
+        irlume_camera::select_pair()
+    }) {
+        Some((r, i)) => e.with_devices(&r, &i),
+        None => e,
     };
     let adapter = flag(args, "--adapter").unwrap_or("");
     let e = e.with_ir_adapter(adapter)?;
@@ -3647,6 +3677,33 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn devices_from_flags_honors_either_flag_alone() {
+        let sel = || ("/dev/sel-rgb".to_string(), "/dev/sel-ir".to_string());
+        // No flags: no override, and the selection must not even run.
+        assert_eq!(
+            devices_from_flags(None, None, || unreachable!("no probe without flags")),
+            None
+        );
+        // Both flags: taken verbatim, selection not consulted.
+        assert_eq!(
+            devices_from_flags(Some("/dev/r"), Some("/dev/i"), || unreachable!()),
+            Some(("/dev/r".into(), "/dev/i".into()))
+        );
+        // --ir alone: the half the operator named is honored, the partner
+        // comes from the selection. This is the case that was silently
+        // dropped: the flag vanished and capture ran on the default node.
+        assert_eq!(
+            devices_from_flags(None, Some("/dev/video6"), sel),
+            Some(("/dev/sel-rgb".into(), "/dev/video6".into()))
+        );
+        // --rgb alone, symmetric.
+        assert_eq!(
+            devices_from_flags(Some("/dev/video4"), None, sel),
+            Some(("/dev/video4".into(), "/dev/sel-ir".into()))
+        );
     }
 
     #[test]

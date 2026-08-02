@@ -3097,9 +3097,8 @@ impl RecoveryOutcome {
             Self::Unchecked(why) => Some(format!(
                 "irlume: could not check whether an interrupted emitter setup left this \
                  camera changed ({why}). irlume will not write to this camera's emitter \
-                 from this process until it can check, so IR face authentication will \
-                 not light here. The daemon (root) checks and recovers on its own; an \
-                 unprivileged tool hitting this is expected and harmless."
+                 from this process until the lock error is resolved and the journal can \
+                 be checked, so IR face authentication will not light here."
             )),
             Self::Unresolved(why) => Some(format!(
                 "irlume: an emitter control on this camera was left changed by an interrupted \
@@ -4353,61 +4352,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A camera that says "yes" to the final write but holds something else must
-    /// not have its undo data deleted.
-    ///
-    /// `commit` used to clear on the strength of the `SET_CUR` returning
-    /// success, which is precisely the assumption the rest of this module
     /// A lock the process cannot take means the journal state was never
     /// examined; the outcome must SAY that, not fabricate a pending record.
     /// Every unprivileged dev-tool capture used to print "an emitter control
     /// ... was left changed by an interrupted setup" on machines whose
     /// journal directory did not even exist (#210).
+    ///
+    /// The blocking fixture is a regular FILE where the lock directory
+    /// belongs: ENOTDIR stops root and CAP_DAC_OVERRIDE exactly like an
+    /// unprivileged uid (the container suite uses the same trick), so this
+    /// test has no privileged skip arm to pass vacuously through.
     #[test]
     fn an_untakeable_lock_reports_unchecked_never_a_phantom_record() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = crate::testenv::env_lock();
-        let dir = std::env::temp_dir().join("irlume-unchecked-lockdir");
+        let dir =
+            std::env::temp_dir().join(format!("irlume-unchecked-lockdir-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
-            .expect("read-only lock dir");
+        std::fs::write(&dir, b"not a directory").expect("blocking file");
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
         let id = identity(0x3277, 0x0059);
-        let probe = dir.join("probe");
-        if std::fs::write(&probe, b"x").is_ok() {
-            // A privileged run bypasses the permission this test constructs;
-            // say so instead of passing vacuously.
-            let _ = std::fs::remove_file(&probe);
-            eprintln!("not exercised: this uid bypasses directory permissions");
-        } else {
-            let fd = non_uvc_fd();
-            use std::os::unix::io::AsRawFd as _;
-            let outcome = recover_pending_write(fd.as_raw_fd(), &id);
-            assert!(
-                matches!(outcome, RecoveryOutcome::Unchecked(_)),
-                "an untakeable lock is a failure to OBSERVE, got {outcome:?}"
-            );
-            let msg = outcome.message().expect("unchecked is loud");
-            assert!(msg.contains("could not check"), "{msg}");
-            assert!(
-                !msg.contains("was left changed"),
-                "the message must not claim a record was observed: {msg}"
-            );
-            assert!(
-                !msg.contains("recorded original"),
-                "the message must not claim a record exists: {msg}"
-            );
-            assert!(
-                !outcome.permits_capture_write(),
-                "refusing is the safe half"
-            );
-            assert!(outcome.blocks_discovery());
-        }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
-        let _ = std::fs::remove_dir_all(&dir);
+        let fd = non_uvc_fd();
+        use std::os::unix::io::AsRawFd as _;
+        let outcome = recover_pending_write(fd.as_raw_fd(), &id);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Unchecked(_)),
+            "a lock setup failure is a failure to OBSERVE, got {outcome:?}"
+        );
+        let msg = outcome.message().expect("unchecked is loud");
+        assert!(msg.contains("could not check"), "{msg}");
+        assert!(
+            !msg.contains("was left changed"),
+            "the message must not claim a record was observed: {msg}"
+        );
+        assert!(
+            !msg.contains("recorded original"),
+            "the message must not claim a record exists: {msg}"
+        );
+        // And no unsupported assurance in the other direction: nothing here
+        // knows whether any other process checked or recovered anything, and
+        // the daemon itself can land here (EROFS, ENOSPC, a bad lock path).
+        assert!(!msg.contains("checks and recovers on its own"), "{msg}");
+        assert!(!msg.contains("expected and harmless"), "{msg}");
+        assert!(
+            !outcome.permits_capture_write(),
+            "refusing is the safe half"
+        );
+        assert!(outcome.blocks_discovery());
+        std::fs::remove_file(&dir).expect("remove blocking file");
     }
 
+    /// A camera that says "yes" to the final write but holds something else
+    /// must not have its undo data deleted.
+    ///
+    /// `commit` used to clear on the strength of the `SET_CUR` returning
+    /// success, which is precisely the assumption the rest of this module
     /// refuses to make. `ir_emitter.conf` stores coordinates and no payload, so
     /// once the record is gone nothing holds the original bytes at all.
     #[test]

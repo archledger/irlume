@@ -8,15 +8,23 @@
 # open the pull request. Doing so needs "Allow GitHub Actions to create and
 # approve pull requests", a repository-wide permission that would apply to
 # every workflow here, and this monthly refresh is not worth carrying it for
-# (#228). A maintainer opens the PR from the pushed branch, which also means
-# the required checks run: a PR opened with the workflow token does not
-# trigger them.
+# (#228). A maintainer opens the PR from the pushed branch, so its checks run
+# as an ordinary PR: runs from a workflow-token PR are created but held in an
+# approval-required state, which is one more click on every refresh.
 name: Update flake.lock
 
 on:
   schedule:
     - cron: "15 6 1 * *"
   workflow_dispatch:
+
+# The branch below is force-pushed, and both triggers can otherwise run at
+# once: a slower earlier run would land its older lockfile on top of a newer
+# one that had already finished, leaving the branch disagreeing with the
+# summary that announced it.
+concurrency:
+  group: update-flake-lock
+  cancel-in-progress: true
 
 # Least privilege at the top; the one job that pushes a branch escalates
 # below (Scorecard Token-Permissions best practice). `pull-requests: write`
@@ -63,9 +71,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git commit -am "deps: update flake.lock"
-          # --force, not --force-with-lease: this branch is recreated from
-          # main by each run, and the checkout has no remote-tracking ref for
-          # it to lease against. Nothing but this workflow writes it.
+          # --force, not --force-with-lease: the branch is a rolling pointer
+          # to the latest validated lockfile, recreated from main each run,
+          # and the checkout has no remote-tracking ref to lease against. An
+          # open PR from a previous refresh is meant to be updated in place.
+          # The concurrency group above is what stops two runs racing here.
           git push --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "$BRANCH"

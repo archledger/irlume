@@ -47,9 +47,9 @@ use transform::*;
 // A glob `use` binds names privately, so the public surface is listed here
 // rather than inherited, which also keeps that surface visible in one place.
 pub(crate) use files::{is_managed_path, lock_pam, restore_surface};
-// The one PAM-grammar item shared outside this module: `fingerprint.rs` must
-// read stack lines with the same comment semantics the wiring uses, or the
-// two would disagree about what a file configures.
+// The PAM-grammar items shared outside this module: `fingerprint.rs` and the
+// TUI must read stack lines with the same comment and rule-field semantics
+// the wiring uses, or the two would disagree about what a file configures.
 pub(crate) use grammar::{directive, directive_has_auth_module, has_line_continuation};
 pub(crate) use report::{login_manager_fact, status_report, surface_facts};
 pub(crate) use stanzas::BACKUP;
@@ -1397,7 +1397,18 @@ fn wire_service(
                 );
             }
             let (base, _) = unwire_lines(&read(vendor)?);
-            let (wired, _) = wire(&base);
+            let (wired, changed) = wire(&base);
+            // The transform saying "unchanged" means it REFUSED (no anchor, a
+            // continued file): materializing anyway would shadow the vendor
+            // file with a copy carrying no irlume line and report ✓ while face
+            // login stayed off. The in-place branch below already refuses on
+            // this; the override branch must too.
+            if !changed {
+                return out(
+                    PlannedChange::NoAnchor,
+                    format!("· {}: no anchor to wire (skipped)", s.etc),
+                );
+            }
             let body = format!(
                 "{CREATED_PREFIX}{vendor}; delete this file to restore the vendor copy\n{wired}"
             );
@@ -3560,6 +3571,97 @@ auth       optional                     pam_irlume.so reseal\n\
         // Idempotent: a second pass is a no-op.
         let (w2, c2) = wire_fp_keyring(&w, "gdm-fingerprint");
         assert!(!c2 && w2 == w);
+    }
+
+    // A consumer only counts when ONE module holds BOTH halves in working
+    // positions, the same per-module rule `keyring_handoff` reports by. Any
+    // single keyring line used to suppress our pair, and the fingerprint
+    // login then succeeded with the wallet still locked.
+
+    #[test]
+    fn fp_session_only_does_not_suppress_the_auth_consumer() {
+        // Session half alone: nothing reads the token irlume releases.
+        let stack = "auth required pam_fprintd.so\n\
+-session optional pam_gnome_keyring.so auto_start\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        assert!(wired.contains(FP_GKR_AUTH), "{wired}");
+        assert!(
+            keyring_handoff(&wired, "gdm-fingerprint")
+                .expect("wired stack releases a credential")
+                .complete
+                .is_some(),
+            "the wired stack must form a complete hand-off:\n{wired}"
+        );
+    }
+
+    #[test]
+    fn fp_auth_only_does_not_suppress_the_session_consumer() {
+        // Auth half alone: the key is stashed and dropped, no daemon starts.
+        let stack = "auth required pam_fprintd.so\n\
+-auth optional pam_gnome_keyring.so\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        assert!(wired.contains(FP_GKR_SESSION), "{wired}");
+        assert!(
+            keyring_handoff(&wired, "gdm-fingerprint")
+                .expect("wired stack releases a credential")
+                .complete
+                .is_some(),
+            "the wired stack must form a complete hand-off:\n{wired}"
+        );
+    }
+
+    #[test]
+    fn fp_consumer_above_the_anchor_does_not_count() {
+        // Both halves present, but the auth half sits ABOVE pam_fprintd.so:
+        // it runs before PAM_AUTHTOK exists, so it consumes nothing, and it
+        // must not suppress a pair that would actually work.
+        let stack = "-auth optional pam_gnome_keyring.so\n\
+auth required pam_fprintd.so\n\
+-session optional pam_gnome_keyring.so auto_start\n";
+        let (wired, changed) = wire_fp_keyring(stack, "gdm-fingerprint");
+        assert!(changed);
+        let release = wired
+            .find("pam_irlume.so keyring")
+            .expect("unseal line present");
+        let tagged_auth = wired.find(FP_GKR_AUTH).expect("tagged auth supplied");
+        assert!(
+            release < tagged_auth,
+            "the supplied consumer must sit below the release:\n{wired}"
+        );
+    }
+
+    // Regression for the vendor-override path: the transform refusing (a
+    // continued vendor file has no judgeable lines) must refuse the
+    // materialization too. This branch used to discard `changed`, write an
+    // override with NO irlume line over the vendor file, and report ✓.
+    #[test]
+    fn wire_service_override_does_not_materialize_a_refused_vendor_stack() {
+        let dir = TestDir::new("override-refused");
+        let vendor = dir.0.join("plasmalogin.vendor");
+        std::fs::write(
+            &vendor,
+            "auth substack \\\n    password-auth\nsession include password-auth\n",
+        )
+        .unwrap();
+        let etc = dir.0.join("plasmalogin");
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: Some(leak(&vendor)),
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+        let outcome = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(outcome.change, PlannedChange::NoAnchor);
+        assert!(
+            !etc.exists(),
+            "a refused transform must not create an override"
+        );
+        assert!(
+            !outcome.message.starts_with('✓'),
+            "refusal must not read as successful wiring: {}",
+            outcome.message
+        );
     }
 
     #[test]

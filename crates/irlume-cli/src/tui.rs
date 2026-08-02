@@ -185,6 +185,12 @@ enum Suspend {
     SetCameras(String, String),
     /// Set up the IR emitter; root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
+    /// Measure whether the camera can stream RGB and IR at once and persist
+    /// the verdict (capture policy changes with it). The daemon root-gates the
+    /// write, and the measurement holds the camera and fires the emitter for
+    /// up to a minute, so like the other privileged one-shots it suspends to
+    /// `sudo irlume camera-tune`.
+    CameraTune,
     /// View the face-auth journal (`sudo irlume logs`); the daemon's lines live
     /// in the system journal, so it runs under sudo to guarantee they show.
     Logs,
@@ -1989,6 +1995,10 @@ impl App {
                 &["irlume", "set-cameras", &rgb, &ir],
             ),
             Suspend::IrSetup => self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
+            Suspend::CameraTune => self.sudo_step(
+                "measure simultaneous RGB+IR capture",
+                &["irlume", "camera-tune"],
+            ),
             Suspend::BitwardenSetup => self.sudo_step(
                 "install Bitwarden's polkit action",
                 &["irlume", "bitwarden", "setup", "--apply"],
@@ -2455,6 +2465,31 @@ impl App {
             (SC_CAMERAS, KeyCode::Char('s')) => {
                 self.log('→', "sudo irlume ir-setup: set up the 850nm emitter; this writes to the camera (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
+            }
+            // Capture-mode tuning: some Hello modules starve their own RGB
+            // interface when both stream, others keep the faster concurrent
+            // path; only a measurement can tell which camera this is. Said
+            // up front because it holds the camera for a while (#170).
+            (SC_CAMERAS, KeyCode::Char('t')) => {
+                // A modal, not an Activity line: the log-then-suspend shape
+                // never RENDERS before the terminal leaves the alt screen (the
+                // frame was drawn before the key was read, and the suspend
+                // runs in the same loop iteration), so the explanation the
+                // route promises would appear only after the run (#204
+                // review). The confirm modal is drawn before any key can
+                // schedule the suspend, which is the existing shape of every
+                // other consequential route here.
+                self.confirm = Some((
+                    concat!(
+                        "Tune capture mode? This holds the camera and fires the ",
+                        "IR emitter for up to a minute, then stores the verdict ",
+                        "in /etc/irlume/cameras.conf. Your password will be ",
+                        "requested."
+                    )
+                        .into(),
+                    "Tune",
+                    ConfirmAct::Sus(Suspend::CameraTune),
+                ));
             }
             (SC_CAMERAS, KeyCode::Char('p')) => self.start_async(
                 "IR emitter units",
@@ -3653,6 +3688,11 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled("  [s]", Style::new().fg(th().accent)),
             Span::styled(" set up emitter   ", Style::new().dim()),
+            Span::styled("[t]", Style::new().fg(th().accent)),
+            Span::styled(
+                " tune capture (holds the camera ~1 min)   ",
+                Style::new().dim(),
+            ),
             Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(" list units (writes nothing)", Style::new().dim()),
         ]));
@@ -6486,6 +6526,39 @@ mod tests {
         app.on_key(KeyCode::Char('s'));
         assert!(matches!(app.suspend, Some(Suspend::IrSetup)));
         app.suspend = None;
+        // [t] routes capture tuning to sudo (#170: previously no TUI route),
+        // through a confirm modal so the effects are RENDERED before anything
+        // can run: the first version logged an Activity line in the same loop
+        // iteration as the suspend, which never reached the screen (#204
+        // review), and its test read the in-memory vector, which could not
+        // notice.
+        app.on_key(KeyCode::Char('t'));
+        assert!(
+            app.suspend.is_none(),
+            "[t] must show the effects before scheduling camera-tune"
+        );
+        // The popup wraps its message at the box edge, so reflow the rendered
+        // text before asserting: borders become spaces, runs of whitespace
+        // collapse, and the phrases read as written regardless of wrap point.
+        let text = draw_text(&app);
+        let flat = text
+            .replace(['│', '╭', '╮', '╰', '╯', '─'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("fires the IR emitter for up to a minute")
+                && flat.contains("/etc/irlume/cameras.conf")
+                && flat.contains("password will be requested"),
+            "the pre-run confirmation must render every material effect:\n{text}"
+        );
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::CameraTune)));
+        app.suspend = None;
+        // And [n] declines without scheduling anything.
+        app.on_key(KeyCode::Char('t'));
+        app.on_key(KeyCode::Char('n'));
+        assert!(app.suspend.is_none() && app.confirm.is_none());
         app.on_key(KeyCode::Char('p'));
         assert!(app.op.is_some(), "[p] starts the read-only emitter probe");
         wait_op_done(&mut app);

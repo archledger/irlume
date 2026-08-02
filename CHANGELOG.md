@@ -5,6 +5,310 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The clipped fraction of the IR face is recorded with the liveness cues.**
+  A saturated centre cannot read brighter than a saturated rim, so a blown
+  exposure compresses the centre/edge ratio toward 1 the way strong ambient IR
+  does, and irlume guards only the ambient end. Two recorded corpora show the
+  case is reachable: in both, the session's first capture read about 235 mean
+  with a ratio of 1.06 and 1.12, against a 1.03 spoof floor and 1.19 to 1.42
+  for every later capture. `ir_saturated_frac` now rides in `Signals` and the
+  cross-spectrum debug line so #221 can be answered from ordinary output; it
+  gates nothing, and neither the ratio floor nor the warm-up length changes
+  until there is evidence from real authentications. The reading is absent,
+  not zero, when it cannot be taken: no IR face, or a negotiated format whose
+  decode cannot say where its ceiling is (the Y16 family is rescaled by a
+  shift taken from each frame's own maximum, and the YUV ceilings depend on a
+  quantization irlume does not carry), so the corpus never mixes "no clipping"
+  with "not measurable".
+
+- **Seating distance is recorded with the liveness cues.** `face_frac` (face
+  width as a fraction of frame width, the same quantity the framing guide
+  judges distance by) now rides in `Signals` and both liveness debug lines.
+  It gates nothing. Several existing cues are absolute thresholds on
+  quantities that may move across the guide's accepted 0.12 to 0.55 band, and
+  #174 asks which ones actually do before any of them is retuned; recording
+  the distance signal alongside them makes that answerable from ordinary
+  `IRLUME_LOG=debug` output rather than a special capture campaign.
+
+### Fixed
+
+- **A status read can no longer make a login wait.** Every request used to
+  execute on the single engine worker, so a `ListProfiles` (a TPM unseal of
+  the template key, measured at 10.8 seconds on one laptop's TPM) made a
+  concurrently arriving authentication wait behind it: a Ping issued during
+  a listing measured 10.4 seconds. Read-only status requests (Ping, Health,
+  HasSealedPassword, KeyringInfo, RecoveryStatus, ListProfiles) now answer
+  on the connection's own thread, never entering the worker queue; Health
+  reads an engine snapshot published before the socket binds. Mutating
+  requests stay serialized on the worker, and the per-request authorization
+  gates moved with the code unchanged. Closes #212.
+
+## [0.8.0] - 2026-08-02
+
+### Fixed
+
+- **The TUI never blocks on the machine.** Every observation (the fprintd and
+  busctl chain, PAM file walks, LSM and TPM probes, V4L2 opens, the daemon
+  polls, and the profile listing, which is a TPM unseal that measured 10.8
+  seconds on one laptop's TPM) now lands as a background snapshot; drawing
+  and the Repair checklist read memory only. On the machine that exposed it,
+  screen entries went from about eight seconds to under twenty milliseconds,
+  first frame in half a second, and the enrolled profile list actually
+  appears, which the old 1.5-second poll budget never allowed there. The
+  daemon-side costs are tracked separately (#211, #212). The TUI's PAM screen
+  now shows the keyring hand-off advisory `login status` prints, and its
+  Fingerprint screen shows the per-surface coverage table from `fingerprint
+  status`.
+
+- **The fingerprint-enable gate could pass on a comment.** `pam_fprintd_wired`
+  matched raw lines, so a stack whose only `pam_fprintd.so` sat in a trailing
+  comment counted as wired; libpam tokenizes nothing after the first `#`, so
+  no fingerprint prompt exists there. Recording a method on that gate, with
+  `--fingerprint-only`, stands face down on a box where no biometric answers
+  any prompt: the precise outcome the gate exists to prevent. The scan (and
+  `faillock_cohabits` and `fprintd_in_sudo`, which share it) now matches the
+  directive part only, using the same shared semantics as the wiring.
+
+- **`fingerprint enable` says which prompts a finger actually answers, instead
+  of implying all of them.** The gate before recording the method asked only
+  "does an active `pam_fprintd.so` line exist in some live stack". That is the right
+  gate (face must not stand down while nothing drives a prompt) but the wrong
+  report: on the issue-#155 Ubuntu box the only carrier was `gdm-fingerprint`,
+  so the success message promised finger unlock on a machine whose sudo and
+  console login had no fingerprint path at all. `enable` (and
+  `fingerprint status`) now print per-surface coverage (login screens, lock
+  screens, console login, sudo), resolved the way libpam actually evaluates a
+  stack: `auth include`/`substack` chains followed transitively, the Debian
+  `@include` form included, non-auth includes contributing nothing, and
+  include targets opened by name even when dotted (each behaviour pinned by
+  experiment against `pam_exec.so`; the authselect templates confirm Fedora's
+  `with-fingerprint` lands in `system-auth`, which is why one line covers
+  nearly everything there and one line covers almost nothing on the Ubuntu
+  layout). The gate itself is unchanged, so the documented Arch flow (add the
+  line to `system-local-login`, re-run) still enables, and now states that it
+  covered console login and not sudo. When the line reaches none of the
+  tracked surfaces, the report says that too. A file using backslash line
+  continuations contributes nothing to coverage: libpam joins those lines
+  before tokenizing, so a physical line that looks like an auth fingerprint
+  line can be the tail of another directive's arguments (verified: the spliced
+  line never ran), and under-reporting is the safe direction where
+  over-reporting is the defect this exists to fix. Closes #155.
+- **The wallet hand-off check was blind to the fingerprint path.** It anchored
+  on the face `unseal` line, but the post-auth `keyring` line releases the same
+  sealed password. On a fingerprint-only box the greeter carries ONLY that
+  line, so a missing or mis-ordered wallet module after a fingerprint login was
+  never reported: the wallet stayed locked with nothing naming why. The check
+  now anchors on the first credential-releasing line of either mode, and its
+  warning names both methods. Verified against the KDE sources while at it:
+  Plasma's login greeter authenticates through the single `plasmalogin` stack
+  (its PAM backend has no fingerprint service; kscreenlocker's `kde-fingerprint`
+  triple is the lock screen only), so the greeter `keyring` line is exactly
+  where the KDE cold-boot fingerprint→KWallet chain runs; new tests pin that
+  the line lands above `pam_kwallet5.so` on every upstream plasmalogin layout.
+
+- **A stack using backslash line continuations is refused, not corrupted.**
+  libpam's line assembler joins a directive ending in `\` with the next
+  physical line before tokenizing (whitespace after the backslash does not
+  defuse it; a backslash ending a comment does not continue; all three pinned
+  by experiment against `pam_exec.so`). irlume edits stacks line-by-line, so
+  on such a file every matcher reads a different unit than PAM evaluates, and
+  inserting a stanza directly after a continued anchor would splice irlume's
+  text into the middle of the neighbouring logical line, corrupting the auth
+  stack on write. Continuations are now detected up front: the wiring
+  transforms decline the whole file (staged, never written, the same contract
+  as a missing anchor) and the keyring hand-off advisory stays silent rather
+  than judging lines PAM does not see as written. No upstream `plasmalogin` or
+  `gdm-password` stack uses continuations, so behaviour on real systems is
+  unchanged; a test now pins that assumption too.
+
+- **A module named only in a comment counted as configured.** libpam strips a
+  trailing `#` comment before tokenizing a stack line, so `auth required
+  pam_unix.so  # was pam_irlume.so` loads no irlume module at all. Every
+  matcher compared against the raw line instead, and disagreed with the thing
+  it configures. The consequences ran from cosmetic to silent: an invented
+  anchor, a keyring consumer that does not exist, and, because
+  `content_has_module` gates the whole wiring path, a stack whose comment
+  merely mentioned `pam_irlume.so` reported as already wired, so `login
+  enable` wrote nothing and said it succeeded. All ten matchers now compare
+  against the directive, exactly what PAM tokenizes. The `# irlume-landing`
+  and `# irlume-keyring` tags are still matched on the raw line, since being
+  comments is the whole point of them.
+
+- **A keyring module that stands down for the service was counted as if it
+  worked.** `pam_gnome_keyring.so` takes `only_if=<comma,separated,services>`,
+  and for any service outside that list every one of its entry points returns
+  `PAM_SUCCESS` immediately: it reads no token, stashes nothing, unlocks
+  nothing. The hand-off check matched the module name alone, so such a line
+  counted as a working consumer, reporting a wallet that would open when
+  nothing would, which is the one thing this check exists to prevent. It also
+  suppressed the consumer irlume adds to a fingerprint stack, silently undoing
+  that unlock. The list is now evaluated per service, matching whole
+  comma-separated items the way gkr-pam's own `evaluate_inlist` does, so
+  `only_if=gdm` no longer satisfies `gdm-fingerprint`. `pam_kwallet5.so` has no
+  equivalent option, so only the GNOME case narrows.
+
+- **Fingerprint keyring unlock never wired on GNOME, and could not have worked
+  if it had.** Two defects in one stack. The wiring anchored on a literal
+  `pam_fprintd.so` auth line, but GDM's `gdm-fingerprint.pam` never names the
+  module (it delegates to `auth substack fingerprint-auth`), so the anchor
+  search found nothing and the whole step became a silent no-op: `login enable`
+  reported success and wrote nothing. And had it wired, the stack carries no
+  keyring module at all, so the released password would have gone to a stack
+  with no consumer. The anchor now recognizes a fingerprint substack or include
+  as well as the literal module, and when the stack has no keyring consumer of
+  its own the two `pam_gnome_keyring.so` halves it needs are added alongside.
+  Those added lines are tagged so unwiring removes exactly ours and never a
+  distro-shipped keyring line, and carry PAM's leading `-` so a machine without
+  gnome-keyring installed is unaffected. Face login was never involved.
+
+- **A renamed shared PAM stack no longer drops the face block onto the wrong
+  line.** The greeter block anchored on a fixed list of stack names
+  (`password-auth`, `system-auth`, …) and, failing that, on the first `auth`
+  line, a guess that puts the `success=1` jump above whatever module happens to
+  come first. GDM's development branch renames its shared stack to
+  `gdm-password-auth-substack`, which no name matches; the guess would then have
+  anchored above `pam_selinux_permit.so` and landed the jump *before* the
+  password substack, which still runs. No released GDM ships that rename, so
+  this was latent rather than live, but it would have arrived silently with an
+  upgrade. Any `auth … substack …` line is now preferred over the guess,
+  whatever the stack is called (a substack is atomic for jump counting, so the
+  jump form stays correct), and the first-auth-line guess is kept strictly last.
+
+- **openSUSE greeters anchored face auth on the wrong line, skipping the
+  nologin gate.** openSUSE's `plasmalogin` routes the password through
+  `auth substack common-auth`, a stack name the wiring did not recognize, so it
+  fell back to the first `auth` line and inserted the `success=1` jump above
+  `pam_nologin.so`. A face match then jumped over the nologin gate and landed
+  *before* `substack common-auth`, which ran anyway: face auth that neither
+  honoured nologin nor spared the user the password. The auth and session stack
+  names are now kind-aware and include openSUSE's `common-auth` and
+  `common-session`, so the jump anchors on the password substack (atomic for
+  jump counting, so the jump form stays correct) and `pam_nologin.so` keeps
+  running first. A bare `auth include common-auth` is treated as an include
+  instead, taking the `sufficient` form a jump cannot skip.
+
+### Added
+
+- **`login status` says when face login releases a password nothing will use.**
+  Wiring the greeter and arming the keyring is only half the KWallet path: the
+  released password still has to be read by `pam_kwallet5.so` (KDE) or
+  `pam_gnome_keyring.so` (GNOME), from an auth line BELOW irlume's, with a
+  matching session line to start the wallet daemon. When that module is absent,
+  or sits above ours where it runs before the token exists, the face login
+  succeeds and the wallet prompts anyway, and every command still reported the
+  greeter as `● wired`, so the one symptom the user could see pointed away from
+  the cause. `login status` and `login enable --apply` now inspect each wired
+  greeter and name which half is missing. Advisory only: it changes no stack and
+  fails no command, because an absent wallet module is a packaging choice rather
+  than a broken wiring.
+
+- **`camera-tune` is reachable from the TUI.** The Cameras screen gains `[t]`,
+  which routes to `sudo irlume camera-tune` like the other privileged
+  one-shots, after saying up front that it holds the camera and fires the IR
+  emitter for up to a minute and then persists the capture-mode verdict, since
+  that materially changes how authentication captures frames afterwards. It
+  was the one user-facing operation with no TUI route. Closes #170.
+
+- **Debug-enabled consent watches report the #101 candidate discriminator.**
+  `mean_step` (mean absolute pitch change per frame: |Δpitch|/Δidx over
+  usable pairs at most one strobe apart, since IR modules light alternate
+  frames; a longer, face-lost gap contributes nothing) now rides
+  in the nod evidence, the opt-in consent debug line (`IRLUME_LOG=debug`, off
+  by default; ordinary authentication runs still emit no diagnostic
+  evidence), and `blinkcap replay`'s per-label summary. It gates nothing:
+  #101 measured it separating a still head from a deliberate nod by 2.3x
+  where the gating pitch range manages 1.44x, then deliberately declined to
+  set a threshold on one user's single session, because this class of signal
+  is known to drift between sessions. The blocker is cross-session data, and
+  replay over recorded corpora is where that accumulates: replay now refuses
+  a damaged or truncated pose recording loudly instead of measuring its
+  fragments as a still head, accepts a single `.jsonl` file as documented
+  rather than only a directory, exits successfully on a pose-only corpus,
+  and captures are staged and renamed into place so a crash cannot leave a
+  valid header over a partial body.
+
+- **The emitter write honours the Windows exclusive-control model.** Windows
+  permits many camera consumers but only one controlling instance; sharing
+  consumers cannot change extended camera controls and inherit the controlling
+  application's media type. irlume wrote the extension-unit control whenever
+  it captured, relying on its capture failing busy afterwards anyway.
+  `ir_emitter::enable` now stands down from the write when it sees another
+  process holding the camera node, leaving that application's configuration
+  untouched, the fail-safe direction, since an unlit emitter degrades one
+  capture toward the password. The scan has a stated blind spot: reading
+  another user's `/proc/<pid>/fd` is ptrace-gated and the packaged daemon does
+  not hold `CAP_SYS_PTRACE`, so a cross-uid holder can go unseen. The scan
+  reports that instead of hiding it, the daemon logs the degradation once and
+  proceeds, and #207 tracks closing the blind spot.
+  The threat model gains a sourced section on the whole Windows camera
+  contract: the exclusive-control model, the certification tie between IR
+  capture and visible indication (and irlume's position on it), why
+  re-applying the control every capture is the deliberate answer to D3cold,
+  and what Linux does not reproduce (DeviceMFT, Enhanced Sign-in Security) and
+  irlume does not claim to. Closes #169.
+
+- **A dark or blinded IR capture reports what its evidence supports.** A dark
+  burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
+  even though shutters, covers, range, exposure and emitter failures all
+  produce similar frames. The capture path now reports from the camera's
+  per-frame illumination metadata, the privacy control, the emitter-control
+  state and the frame's mean and spread (its pixel standard deviation): it
+  names an engaged shutter,
+  separates frames the camera marked illuminated from a requested mode it
+  never reported as illuminated, and reserves `ir-setup` advice for the one
+  case with no active emitter. Illumination metadata is never treated as
+  proof of optical output: a failed LED and a subject out of range read the
+  same, and the diagnosis says so. The most common measured cover case was
+  not dark at all: an opaque cover under an active emitter produced a
+  saturated, nearly constant frame (measured 252.8 to 255.0 on the two test
+  cameras, against a standard deviation of 35 and up for every recorded real
+  scene), so that
+  signature is named too. And `IRLUME_IR_EMITTER=off` now silences this
+  output, which the old hint's own text promised while printing anyway.
+  Closes [#185] and [#197].
+
+- **Emitter-mode crash recovery for recorded capture writes.** Before
+  changing the camera's control, the capture path writes a per-camera stream
+  record and confirms it once the camera accepts the write; a later daemon
+  claims a confirmed leftover and finishes the interrupted restore, with
+  claims counted and capped. The guard arms with the value the write actually
+  displaced (one read, no window for another client's value to be lost in),
+  and it holds the camera handle itself, so a restore cannot land on a
+  descriptor number the kernel has recycled. The bookkeeping is deliberately
+  best-effort: when its lock, record write or confirmation is unavailable,
+  irlume warns and drives the emitter without crash recovery rather than
+  turning a full disk into a failed login, so a kill in that degraded path
+  can still strand the mode. Closes [#188], [#189] and [#190].
+
+- **`doctor` names each camera node's backend.** `(uvcvideo, USB)` for the
+  case irlume is built and tested for; the driver, the bus and a warning for
+  anything else; and a visible "backend unknown" when the observation fails.
+  Read from `VIDIOC_QUERYCAP`, the interface's own answer. This is the first
+  question of every camera bug report ([#187] had to collect it by shell
+  script), answered by the tool that should have known.
+
+### Fixed
+
+- **`ir-setup` refuses to write camera firmware while the privacy shutter is
+  engaged.** With the shutter shut the sensor substitutes a blank frame, so
+  discovery measured a constant, learned nothing from every exploratory write,
+  and told the user their camera "advertises no usable emitter control". Setup
+  now refuses up front when the shutter is engaged, and also when the privacy
+  control cannot be read at all ("could not read the switch" is not "the
+  switch is released"); it re-checks immediately before each exploratory
+  write, because the operator can engage the shutter mid-run; and restores are
+  never blocked. Closes [#186].
+
+[#185]: https://github.com/archledger/irlume/issues/185
+[#186]: https://github.com/archledger/irlume/issues/186
+[#187]: https://github.com/archledger/irlume/issues/187
+[#188]: https://github.com/archledger/irlume/issues/188
+[#189]: https://github.com/archledger/irlume/issues/189
+[#190]: https://github.com/archledger/irlume/issues/190
+[#197]: https://github.com/archledger/irlume/issues/197
+
 ## [0.7.2] - 2026-07-30
 
 Fixes a camera-firmware hazard present in 0.7.1. Please upgrade.

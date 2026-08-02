@@ -43,9 +43,22 @@ pub enum Class {
     /// Opens the camera without being an authentication: the framing guide,
     /// 1:N identify, enrollment, emitter setup, self-tests.
     Camera,
-    /// Touches no camera: listings, keyring metadata, settings. Cheap enough
-    /// that arbitration would cost more than it saves.
+    /// Touches no camera: settings writes, seals, deletions, renames. These
+    /// stay on the worker so every mutation of shared state stays serialized
+    /// against captures and against each other.
     Plain,
+    /// Status that can be answered on the CONNECTION THREAD without touching
+    /// the camera, the engine, the TPM, or any shared mutable state: pure
+    /// path checks, the published engine bits, and the worker-published
+    /// enrollment summary. This class exists because `ListProfiles` is a TPM
+    /// unseal that measured 10.8 seconds on a slow TPM, and queued behind
+    /// the worker it made a concurrently arriving authentication wait that
+    /// long (#212). Membership is strict on purpose: the physical TPM
+    /// executes one command at a time (tpmrm queues, it does not
+    /// parallelize), so ANY TPM-touching request serves from the worker,
+    /// and a status answer that would need the TPM (an unpublished summary)
+    /// falls through to the worker queue instead.
+    Status,
 }
 
 /// Classify a request by what it does to the camera, not by who sent it.
@@ -58,6 +71,16 @@ pub fn classify(req: &Request) -> Class {
     use Request::*;
     match req {
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => Class::Auth,
+        // Answerable from memory and path checks alone. ListProfiles is
+        // here because its ANSWER comes from the worker-published summary
+        // cache; a cache miss falls through to the worker queue, where the
+        // real load (a TPM unseal that may also re-seal the template key)
+        // stays serialized. KeyringInfo is NOT here: its PCR diagnosis is a
+        // TPM command, and the TPM executes one command at a time, so it
+        // serves from the worker with the other TPM users.
+        Ping | Health | HasSealedPassword { .. } | RecoveryStatus { .. } | ListProfiles { .. } => {
+            Class::Status
+        }
         PositionSample { .. }
         | Identify
         | Enroll { .. }
@@ -218,7 +241,10 @@ impl<T> Arbiter<T> {
                     payload,
                 });
             }
-            Class::Plain => inner.other.push_back(Job {
+            // Status is answered on the connection thread and never submitted;
+            // if a future caller submits one anyway it queues like Plain, which
+            // is correct (just slower) rather than lost.
+            Class::Plain | Class::Status => inner.other.push_back(Job {
                 class,
                 uid,
                 payload,
@@ -432,14 +458,17 @@ mod tests {
             classify(&Request::PositionSample { user: None }),
             Class::Camera
         );
+        // Read-only status answers on the connection thread (#212): a TPM-
+        // bound listing must not make a login wait, and Ping must answer
+        // while the worker grinds.
         assert_eq!(
             classify(&Request::ListProfiles {
                 user: "u".into(),
                 structured_errors: true
             }),
-            Class::Plain
+            Class::Status
         );
-        assert_eq!(classify(&Request::Ping), Class::Plain);
+        assert_eq!(classify(&Request::Ping), Class::Status);
         // A secret-carrying management request is not camera work.
         assert_eq!(
             classify(&Request::SealPassword {

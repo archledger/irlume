@@ -165,6 +165,20 @@ pub struct IrCaptureStats {
     /// always were. Recorded so "the metadata path ran" is something callers
     /// can check rather than assume.
     pub camera_classified_frames: usize,
+    /// The decoded value that means "this pixel was at or above the sensor's
+    /// ceiling", or `None` when the negotiated format cannot support that
+    /// claim. A caller measuring clipping (#221) must treat `None` as NOT
+    /// MEASURED, never as zero clipping.
+    ///
+    /// Only the native 8-bit greys qualify: there a decoded 255 IS the
+    /// sensor's full-scale sample. The Y16 family does not, because
+    /// `grey16_shift` picks the shift from the frame's OWN maximum, so a
+    /// decoded 255 means "the brightest pixel in this frame" and a dim frame
+    /// full of them is ordinary. NV12 and YUYV do not either, because their
+    /// ceiling depends on the negotiated quantization (limited range puts
+    /// nominal white at 235, full range at 255) and irlume does not carry that
+    /// field, so a clipped face could read as no clipping at all.
+    pub white_level: Option<u8>,
 }
 
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
@@ -185,11 +199,6 @@ pub const V4L2_CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
 /// yields 1 + budget frames instead of hanging).
 const FROZEN_RUN_BEFORE_RESTART: usize = 2;
 const FROZEN_RESTART_BUDGET: usize = 4;
-
-/// Below this 8-bit greyscale mean with no emitter fired, the IR sensor is
-/// dark and the onboarding hint (configure your emitter) is printed; see
-/// `ir_emitter::IR_LIT_MEAN` for the lit threshold on the other side.
-const IR_DARK_HINT_MAX: f64 = 35.0;
 
 /// mmap ring size for every V4L2 capture stream. Four buffers is the classic
 /// quad-buffer: enough that the driver never stalls waiting for a dequeue at
@@ -332,22 +341,156 @@ fn camera_holder(device: &str) -> Option<String> {
 pub enum Role {
     Rgb,
     Ir,
-    /// A capture node advertising neither (metadata node) or unreadable.
+    /// A capture node that answered and advertises neither colour nor grey,
+    /// which is what a UVC metadata node looks like. A node that could not be
+    /// read is NOT this: see `Unreadable`.
     Other,
 }
 
-/// Classify a single `/dev/videoN` node by enumerating its pixel formats.
-/// Defensive: enumerate FORMATS (safe), never `query_controls` (panics on some
-/// UVC drivers; a hard-won linhello lesson).
-pub fn classify(device: &str) -> Role {
-    let Ok(dev) = Device::with_path(device) else {
-        return Role::Other;
+/// Where reading a node failed. A node that could not be read is kept apart
+/// from `Role::Other` all the way to the report, because the two call for
+/// opposite actions: `Other` is a node correctly ignored, while this is a
+/// camera whose kind is still unknown. Collapsing them told a user with a busy
+/// or unreadable camera that the hardware was absent, which is the same
+/// mistake `control_read_failure_means_absent` exists to prevent one function
+/// below (#227).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedAt {
+    /// `open(2)` on the node itself.
+    Open,
+    /// The node opened, then would not enumerate its formats.
+    EnumFormats,
+}
+
+/// A `/dev/video*` node that exists but could not be classified.
+#[derive(Debug, Clone)]
+pub struct Unreadable {
+    pub path: String,
+    pub at: FailedAt,
+    /// `None` when the failure carried no OS error, which the v4l crate can
+    /// produce for a malformed response rather than a syscall failure.
+    pub errno: Option<i32>,
+    /// The process holding the node, captured at scan time because a holder
+    /// named a minute later may not be the one that caused the failure. Only
+    /// looked up for EBUSY, and best-effort even then: `camera_holder` reads
+    /// /proc and cannot see a holder owned by another uid (#207).
+    pub holder: Option<String>,
+}
+
+impl Unreadable {
+    /// The cause and its remedy, without the path, so a caller can state one
+    /// cause once over the several nodes that share it. Pure over the struct,
+    /// so the wording is testable without an unreadable camera to hand.
+    /// Deliberately says what `map_io` says for the same errnos: a user who
+    /// hits this in doctor and then again mid-capture should not get two
+    /// different explanations of one condition.
+    pub fn cause(&self) -> String {
+        let what = match self.at {
+            FailedAt::Open => "could not be opened",
+            FailedAt::EnumFormats => "opened but would not list its formats",
+        };
+        let why = match self.errno {
+            Some(libc::EACCES) | Some(libc::EPERM) => {
+                "permission denied; add your user to the 'video' group (camera) and re-login"
+                    .to_string()
+            }
+            Some(libc::EBUSY) => match &self.holder {
+                Some(h) => format!("camera busy, in use by {h}. Close that app and retry"),
+                None => {
+                    "camera busy, another app is using it. Close that app and retry".to_string()
+                }
+            },
+            Some(libc::ENODEV) | Some(libc::ENXIO) => {
+                "the node is present but the device behind it is gone, which is what an \
+                 unplugged or reset USB camera leaves behind"
+                    .to_string()
+            }
+            _ => "cause unknown; the errno above is reported as the driver gave it".to_string(),
+        };
+        let code = match self.errno {
+            Some(e) => format!("errno {e}: {}", std::io::Error::from_raw_os_error(e)),
+            None => "no OS error reported".to_string(),
+        };
+        format!("{what} ({code}). {why}")
+    }
+
+    /// The cause with this node's path in front, for reporting one node alone.
+    pub fn explain(&self) -> String {
+        format!("{} {}", self.path, self.cause())
+    }
+}
+
+/// Classify a single `/dev/videoN` node by enumerating its pixel formats,
+/// keeping a failure to read the node apart from a node that read as neither
+/// kind. Defensive: enumerate FORMATS (safe), never `query_controls` (panics on
+/// some UVC drivers; a hard-won linhello lesson).
+pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
+    let unreadable = |at, e: std::io::Error| Unreadable {
+        path: device.to_string(),
+        at,
+        errno: e.raw_os_error(),
+        // Filled in by `scan_nodes` for a busy node; classifying one node in
+        // isolation does not walk /proc.
+        holder: None,
     };
-    let Ok(formats) = Capture::enum_formats(&dev) else {
-        return Role::Other;
-    };
+    let dev = Device::with_path(device).map_err(|e| unreadable(FailedAt::Open, e))?;
+    capture_formats_answered(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
+    let formats = Capture::enum_formats(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let fourccs: Vec<[u8; 4]> = formats.iter().map(|f| f.fourcc.repr).collect();
-    role_from_formats(&fourccs)
+    Ok(role_from_formats(&fourccs))
+}
+
+/// Whether the node ANSWERED the format enumeration, separate from what it
+/// answered. `Capture::enum_formats` in the pinned v4l 0.14.0 returns
+/// `Ok(Vec::new())` for any error at index 0, so a node that refused to answer
+/// is indistinguishable there from one that legitimately offers no capture
+/// format. The kernel gives EINVAL for "no format at this index", which is both
+/// the normal end of enumeration and what a non-capture node (a UVC metadata
+/// node) returns at index 0; every other errno is a failed observation. Asking
+/// index 0 directly is the only way to tell those apart with this crate
+/// version, and telling them apart is the whole of #227.
+fn capture_formats_answered(dev: &Device) -> std::io::Result<()> {
+    let mut desc: v4l::v4l_sys::v4l2_fmtdesc = unsafe { std::mem::zeroed() };
+    desc.index = 0;
+    desc.type_ = v4l::buffer::Type::VideoCapture as u32;
+    // SAFETY: `dev` owns the fd for the length of this call, and `desc` is a
+    // correctly sized, zeroed v4l2_fmtdesc, which is what VIDIOC_ENUM_FMT
+    // reads and writes. Same shape as the ioctl helper in ir_metadata.rs.
+    let rc = unsafe {
+        libc::ioctl(
+            dev.handle().fd(),
+            v4l::v4l2::vidioc::VIDIOC_ENUM_FMT,
+            &mut desc as *mut _ as *mut libc::c_void,
+        )
+    };
+    if rc >= 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if enum_fmt_failure_means_no_formats(&e) {
+        return Ok(());
+    }
+    Err(e)
+}
+
+/// Whether a failed `VIDIOC_ENUM_FMT` at index 0 means the node HAS no capture
+/// format, as opposed to having formats it would not report. The kernel
+/// specifies EINVAL as "no format at this index", which is both the normal end
+/// of enumeration and what a non-capture node answers at index 0; every UVC
+/// camera puts a metadata node on the machine that lands here, and warning
+/// about those would bury the report this fix exists to produce. Every other
+/// errno is a failure to observe. Same shape and the same rule as
+/// `control_read_failure_means_absent`, and pure for the same reason: the
+/// decision is testable without a camera that misbehaves.
+fn enum_fmt_failure_means_no_formats(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EINVAL)
+}
+
+/// `classify_node` for callers that only act on a node they can use. An
+/// unreadable node answers `Other` here, so anything reporting to a human
+/// wants `classify_node` or `scan_nodes` instead.
+pub fn classify(device: &str) -> Role {
+    classify_node(device).unwrap_or(Role::Other)
 }
 
 /// Pure classification over a node's advertised fourccs (unit-testable without
@@ -372,17 +515,113 @@ pub(crate) fn role_from_formats(fourccs: &[[u8; 4]]) -> Role {
     }
 }
 
-/// Scan `/dev/video0..9`, returning (path, role) for each readable capture node.
+/// The video nodes found in a directory, and why the answer may be short.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NodeListing {
+    pub paths: Vec<String>,
+    /// Set when the directory could not be listed, or an entry in it could
+    /// not be read. An empty `paths` with this set means "could not look",
+    /// which is not the same answer as "nothing there" and must not be
+    /// reported as one.
+    pub error: Option<String>,
+}
+
+/// Every `video*` node in `dir`, in numeric order. Reads the directory rather
+/// than probing a fixed range: the old `/dev/video0..9` scan never looked at
+/// `/dev/video10`, which a machine with two cameras and a couple of
+/// v4l2loopback nodes reaches without being unusual (#227). Takes the
+/// directory so the ordering and filtering are testable against a fake root
+/// instead of whatever this machine happens to have plugged in.
+pub(crate) fn video_node_paths_in(dir: &std::path::Path) -> NodeListing {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return NodeListing {
+                paths: Vec::new(),
+                error: Some(format!("{} could not be listed: {e}", dir.display())),
+            }
+        }
+    };
+    let mut nodes: Vec<(u32, String)> = Vec::new();
+    let mut unreadable_entries = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable_entries += 1;
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(n) = name
+            .strip_prefix("video")
+            .and_then(|d| d.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        nodes.push((n, dir.join(&name).to_string_lossy().into_owned()));
+    }
+    // Numeric, not lexical: a string sort puts video10 before video9.
+    nodes.sort_unstable();
+    NodeListing {
+        paths: nodes.into_iter().map(|(_, p)| p).collect(),
+        error: (unreadable_entries > 0).then(|| {
+            format!(
+                "{unreadable_entries} entries in {} could not be read",
+                dir.display()
+            )
+        }),
+    }
+}
+
+pub(crate) fn video_node_paths() -> NodeListing {
+    video_node_paths_in(std::path::Path::new("/dev"))
+}
+
+/// Every video node split into the ones that answered and the ones that could
+/// not be read. `discover_nodes` throws the second group away, which is right
+/// for callers picking a camera to open and wrong for anything reporting to a
+/// person.
+#[derive(Debug, Clone, Default)]
+pub struct NodeScan {
+    /// Nodes that answered, excluding `Role::Other`.
+    pub classified: Vec<(String, Role)>,
+    pub unreadable: Vec<Unreadable>,
+    /// Why this scan may be incomplete. An empty scan with this set means the
+    /// nodes could not be listed, not that there are none.
+    pub listing_error: Option<String>,
+}
+
+/// `with_holders` walks /proc for each busy node to name what holds it. That
+/// is worth a report a person reads and not worth it for the camera-picking
+/// callers, which run on the TUI's refresh path.
+fn scan(with_holders: bool) -> NodeScan {
+    let mut scan = NodeScan::default();
+    let listing = video_node_paths();
+    scan.listing_error = listing.error;
+    for path in listing.paths {
+        match classify_node(&path) {
+            Ok(Role::Other) => {}
+            Ok(role) => scan.classified.push((path, role)),
+            Err(mut u) => {
+                if with_holders && u.errno == Some(libc::EBUSY) {
+                    u.holder = camera_holder(&u.path);
+                }
+                scan.unreadable.push(u);
+            }
+        }
+    }
+    scan
+}
+
+/// Classify every video node, keeping the failures and naming what holds a
+/// busy one. For reports; use `discover_nodes` to pick a camera.
+pub fn scan_nodes() -> NodeScan {
+    scan(true)
+}
+
+/// Scan for each readable capture node, returning (path, role).
 pub fn discover_nodes() -> Vec<(String, Role)> {
-    (0..10)
-        .map(|n| format!("/dev/video{n}"))
-        .filter(|p| std::path::Path::new(p).exists())
-        .map(|p| {
-            let role = classify(&p);
-            (p, role)
-        })
-        .filter(|(_, r)| *r != Role::Other)
-        .collect()
+    scan(false).classified
 }
 
 /// Whether a failed privacy-control read means the camera does not HAVE the
@@ -728,7 +967,7 @@ fn resolve_saved_pair(
 /// Hardware capability summary, for "smart Auto": what biometric face hardware
 /// is actually present. `IRLUME_FORCE_NO_IR=1` forces `ir_pair=false` (test the
 /// RGB-only convenience path on an IR box, or pin a box to convenience mode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Caps {
     /// A physical camera exposing BOTH an RGB and an IR node (full Hello cam).
     pub ir_pair: bool,
@@ -1168,6 +1407,16 @@ fn grey16_shift(buf: &[u8]) -> u32 {
     (16 - max.leading_zeros()).saturating_sub(8)
 }
 
+/// The decoded value that means "at or above the sensor's ceiling" for a
+/// negotiated IR format, or `None` when the decode cannot carry that claim.
+/// See [`IrCaptureStats::white_level`] for why only the 8-bit greys qualify.
+pub(crate) fn clipping_white_level(pix: IrPixel) -> Option<u8> {
+    match pix {
+        IrPixel::Grey8 => Some(u8::MAX),
+        IrPixel::Grey16 | IrPixel::Nv12Luma | IrPixel::YuyvLuma => None,
+    }
+}
+
 /// 16-bit-LE grey (Y16/Y10/Y12) → 8-bit at a given shift.
 fn grey16_to_8_at(buf: &[u8], shift: u32) -> Vec<u8> {
     buf.chunks_exact(2)
@@ -1195,6 +1444,13 @@ pub(crate) struct IrDecoder {
 impl IrDecoder {
     pub(crate) fn new(pix: IrPixel) -> Self {
         Self { pix, shift: None }
+    }
+
+    /// See [`clipping_white_level`]: the decoded value that means "at or above
+    /// the sensor's ceiling" for this decoder's format, or `None` when the
+    /// decode cannot carry that claim.
+    pub(crate) fn white_level(&self) -> Option<u8> {
+        clipping_white_level(self.pix)
     }
 
     pub(crate) fn decode(&mut self, buf: &[u8], w: u32, h: u32) -> Vec<u8> {
@@ -1444,6 +1700,7 @@ impl IrSession<'_> {
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
+        let white_level = self.dec.white_level();
         let stream = &mut self.stream;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
@@ -1522,8 +1779,12 @@ impl IrSession<'_> {
                     Some(_) => "agree",
                     None => "-",
                 };
+                // stddev too: whether a frame is a SCENE or a substituted
+                // constant is spread, not level (#197 wants the saturated
+                // cover's spread measured, and this line is the instrument).
                 eprintln!(
-                    "[ir_frame] {i:2} mean {m:6.1}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    "[ir_frame] {i:2} mean {m:6.1}  stddev {:6.2}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    ir_dark::frame_stddev(&frames[i]),
                     ir_emitter::IR_LIT_MEAN
                 );
             }
@@ -1640,21 +1901,26 @@ impl IrSession<'_> {
                 means.len()
             );
         }
-        // A dark burst gets a DIAGNOSIS, not the old one-size hint. The single
-        // "run ir-setup" line fit one of a dark frame's six causes and sent
-        // users to write camera firmware for shutters, covers and range
+        // An unusable burst gets a DIAGNOSIS, not the old one-size hint. The
+        // single "run ir-setup" line fit one of a dark frame's six causes and
+        // sent users to write camera firmware for shutters, covers and range
         // problems (#185); the evidence to do better is already in hand:
         // whether irlume drove the control, the camera's own per-frame
         // illumination metadata (#167), the privacy control, and the frame's
-        // variance (a firmware blank is a near-perfect constant, #186). The
-        // gate no longer requires `!lit`: an ACTIVE control with a dark frame
-        // is the broken case most worth explaining, and the causes that only
-        // exist when the control is active (lit-but-dark, applied-not-taken)
-        // were exactly the ones the old silence hid. `ir-setup` discovery
-        // advice survives only on the one cause it fits; the historical note
-        // about why irlume never recommends linux-enable-ir-emitter's blind
-        // search lives with that message's cause in `ir_dark` (#159).
-        if (0.0..IR_DARK_HINT_MAX).contains(&best_mean) {
+        // mean and spread. Two bands carry a diagnosis: dark, and
+        // saturated-flat, because the most common cover case is not dark at
+        // all: an opaque cover under the active emitter reflects it straight
+        // back and saturates the sensor (#197, measured 252.8-255.0 covered on
+        // both test cameras). This range check is only a shortcut past the
+        // stddev pass on ordinary scenes; `ir_dark::diagnose` re-applies the
+        // real gates and answers None for anything that is a scene after all.
+        // `ir-setup` discovery advice survives only on the one cause it fits;
+        // the historical note about why irlume never recommends
+        // linux-enable-ir-emitter's blind search lives with that message's
+        // cause in `ir_dark` (#159).
+        if (0.0..ir_dark::DARK_MEAN_MAX).contains(&best_mean)
+            || best_mean >= ir_dark::SATURATED_MIN_MEAN
+        {
             let frames_lit = flags
                 .iter()
                 .filter(|f| matches!(f, Some(ir_metadata::Illumination::Lit)))
@@ -1665,9 +1931,12 @@ impl IrSession<'_> {
                 privacy_engaged: privacy_engaged(device),
                 frames_lit,
                 frames_classified: from_camera,
+                frame_mean: best_mean,
                 frame_stddev: ir_dark::frame_stddev(&frames[best_i]),
             };
-            if let Some(line) = ir_dark::render(card, best_mean, &ir_dark::diagnose(&evidence)) {
+            if let Some(line) = ir_dark::diagnose(&evidence)
+                .and_then(|cause| ir_dark::render(card, best_mean, &cause))
+            {
                 eprintln!("{line}");
             }
         }
@@ -1688,6 +1957,7 @@ impl IrSession<'_> {
                 ambient_mean: ambient_level as f32,
                 burst_frames: IR_BURST,
                 camera_classified_frames: from_camera,
+                white_level,
             },
         ))
     }
@@ -2668,6 +2938,138 @@ fn warm_up_stream(
 mod tests {
     use super::*;
 
+    fn unreadable(at: FailedAt, errno: Option<i32>, holder: Option<&str>) -> Unreadable {
+        Unreadable {
+            path: "/dev/video4".into(),
+            at,
+            errno,
+            holder: holder.map(str::to_string),
+        }
+    }
+
+    /// The whole point of #227: the three conditions a camera node fails under
+    /// must reach the reader as three different sentences, each naming the act
+    /// that clears it. A permission problem that reads as absent hardware sends
+    /// someone after a driver bug they do not have.
+    #[test]
+    fn an_unreadable_node_explains_the_cause_it_actually_hit() {
+        let denied = unreadable(FailedAt::Open, Some(libc::EACCES), None).explain();
+        assert!(denied.contains("/dev/video4"), "{denied}");
+        assert!(denied.contains("could not be opened"), "{denied}");
+        assert!(denied.contains("'video' group"), "{denied}");
+
+        // A named holder is the difference between "something has your camera"
+        // and knowing which app to close.
+        let busy =
+            unreadable(FailedAt::Open, Some(libc::EBUSY), Some("firefox (pid 42)")).explain();
+        assert!(busy.contains("in use by firefox (pid 42)"), "{busy}");
+        assert!(!busy.contains("'video' group"), "{busy}");
+
+        // /proc could not name it (another uid, #207): still busy, no invention.
+        let anon = unreadable(FailedAt::Open, Some(libc::EBUSY), None).explain();
+        assert!(anon.contains("another app is using it"), "{anon}");
+
+        let gone = unreadable(FailedAt::EnumFormats, Some(libc::ENODEV), None).explain();
+        assert!(gone.contains("would not list its formats"), "{gone}");
+        assert!(gone.contains("device behind it is gone"), "{gone}");
+
+        // An errno with no mapping still reports the number rather than
+        // rounding down to silence.
+        let odd = unreadable(FailedAt::Open, Some(libc::EIO), None).explain();
+        assert!(odd.contains("errno 5"), "{odd}");
+        let none = unreadable(FailedAt::Open, None, None).explain();
+        assert!(none.contains("no OS error reported"), "{none}");
+    }
+
+    /// The old scan probed /dev/video0..9 by construction, so a tenth node was
+    /// invisible; archhost has one. Run against a fake root, because a test
+    /// reading the real /dev proves whatever that machine happens to have
+    /// plugged in and would pass on a box with three cameras and no video10.
+    #[test]
+    fn the_node_scan_reaches_past_nine_and_orders_numerically() {
+        let root = std::env::temp_dir().join(format!("irlume-nodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in [
+            "video10", "video2", "video9", "video0", "videoX", "video", "audio3", "video1a",
+        ] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+
+        let listing = video_node_paths_in(&root);
+        let names: Vec<String> = listing
+            .paths
+            .iter()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        // video10 present and last: the range cap is gone and the sort is
+        // numeric, which a lexical sort would render video0, video10, video2.
+        assert_eq!(names, ["video0", "video2", "video9", "video10"]);
+        assert!(listing.error.is_none(), "{:?}", listing.error);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The branch the Codex round on #229 found unreachable: a node that opens
+    /// and then refuses to enumerate must be reported, not silently classified
+    /// as `Other` and dropped. `/dev/null` is exactly that node on any Linux
+    /// machine, since `Device::with_path` only opens (no QUERYCAP) and
+    /// VIDIOC_ENUM_FMT on a non-v4l2 character device returns ENOTTY, so this
+    /// needs no camera, no privilege, and no hardware in CI.
+    #[test]
+    fn a_node_that_opens_then_refuses_to_enumerate_is_reported_not_dropped() {
+        let u = classify_node("/dev/null")
+            .expect_err("a device that cannot enumerate formats must not classify as a role");
+        assert_eq!(u.at, FailedAt::EnumFormats);
+        assert_eq!(u.errno, Some(libc::ENOTTY));
+        assert!(
+            u.explain().contains("would not list its formats"),
+            "{}",
+            u.explain()
+        );
+    }
+
+    /// EINVAL at index 0 is the kernel's "no format here", which every UVC
+    /// metadata node answers. Treating it as a failure would put a warning
+    /// against four correctly-ignored nodes on any machine with two cameras,
+    /// which is how a report that finally says something useful gets ignored.
+    /// Every other errno is a node that would not answer.
+    #[test]
+    fn only_einval_means_a_node_has_no_capture_formats() {
+        let err = |n| std::io::Error::from_raw_os_error(n);
+        assert!(enum_fmt_failure_means_no_formats(&err(libc::EINVAL)));
+        for other in [
+            libc::EBUSY,
+            libc::ENOTTY,
+            libc::EIO,
+            libc::ENODEV,
+            libc::EACCES,
+        ] {
+            assert!(
+                !enum_fmt_failure_means_no_formats(&err(other)),
+                "errno {other} is a failed observation, not an absence"
+            );
+        }
+    }
+
+    /// A directory that will not list must not read as a machine with no
+    /// cameras. This is the same defect #227 fixes, one level up.
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_not_an_empty_machine() {
+        let missing = std::env::temp_dir().join(format!("irlume-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let listing = video_node_paths_in(&missing);
+        assert!(listing.paths.is_empty());
+        let why = listing.error.expect("a listing failure must be reported");
+        assert!(why.contains("could not be listed"), "{why}");
+    }
+
     fn frame(data: &[u8]) -> Frame {
         Frame {
             width: data.len() as u32,
@@ -2842,6 +3244,41 @@ mod tests {
         assert_eq!(ir_probe::subtract(&lit, &ambient), vec![150, 0, 0]);
         // Size mismatch falls back to the lit frame unchanged.
         assert_eq!(ir_probe::subtract(&lit, &[1, 2]), lit.to_vec());
+    }
+
+    /// Which formats can support a clipping claim at all. A decoded 255 means
+    /// "the sensor's full-scale sample" ONLY for the native 8-bit greys: the
+    /// Y16 family is rescaled by a shift taken from the frame's own maximum,
+    /// and the YUV ceilings depend on a quantization irlume does not carry.
+    /// Saying None there is what keeps #221's corpus interpretable.
+    #[test]
+    fn only_native_8bit_grey_can_claim_a_clipping_ceiling() {
+        assert_eq!(clipping_white_level(IrPixel::Grey8), Some(255));
+        assert_eq!(clipping_white_level(IrPixel::Grey16), None);
+        assert_eq!(clipping_white_level(IrPixel::Nv12Luma), None);
+        assert_eq!(clipping_white_level(IrPixel::YuyvLuma), None);
+        // And the decoder reports its own format's answer, since that is what
+        // the capture actually negotiated.
+        assert_eq!(IrDecoder::new(IrPixel::Grey8).white_level(), Some(255));
+        assert_eq!(IrDecoder::new(IrPixel::Grey16).white_level(), None);
+    }
+
+    /// The reason Grey16 cannot: the shift comes from the frame's OWN maximum,
+    /// so a frame whose brightest sample is far below the container ceiling
+    /// still decodes that sample to 255.
+    #[test]
+    fn grey16_decoding_maps_a_dim_frames_maximum_to_full_scale() {
+        // 10-bit content in a 16-bit container: max 1023, nowhere near 0xFFFF.
+        let mut buf = Vec::new();
+        for v in [0u16, 256, 512, 1023] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let decoded = decode_ir(&buf, IrPixel::Grey16, 4, 1);
+        assert_eq!(
+            decoded.last().copied(),
+            Some(255),
+            "the frame maximum decodes to 255 even though the sensor did not clip"
+        );
     }
 
     #[test]

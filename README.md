@@ -73,7 +73,7 @@ Enrollment on IR hardware offers to enable it. See [Honest limitations](#-honest
 
 ## 📦 Install
 
-> **v0.7.0.** Works end-to-end on real hardware across all three families,
+> **v0.8.0.** Works end-to-end on real hardware across all three families,
 > including face-approved app prompts (Bitwarden). Not yet certified (no iBeta
 > lab pass); see [Honest limitations](#-honest-limitations).
 
@@ -454,7 +454,7 @@ default IR-structure gate already rejects photos, screens, and video replays.
 
 ## 🛠️ Status
 
-**v0.7.0: working and validated on real hardware.** Fedora runs the full IR
+**v0.8.0: working and validated on real hardware.** Fedora runs the full IR
 Secure tier end to end, including face-approved app prompts (Bitwarden biometric
 unlock via polkit, verified live); Ubuntu / Pop!_OS runs the RGB Convenience tier
 plus a fingerprint; Arch is validated for packaging and the CLI/daemon on a
@@ -474,7 +474,7 @@ Interfaces may still shift before 1.0.
   [developer guide](docs/DEVELOPMENT.md); CI runs fmt / clippy / build / test on
   every push and PR.
 
-The per-release detail (0.1.x through 0.7.0) lives in [`CHANGELOG.md`](CHANGELOG.md).
+The per-release detail (0.1.x through 0.8.0) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🙏 Credits
 

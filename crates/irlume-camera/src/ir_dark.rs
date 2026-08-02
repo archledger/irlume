@@ -1,27 +1,40 @@
-//! Why an IR burst came back dark, named from evidence instead of guessed.
+//! Why an IR burst is not a usable scene, named from evidence, not guessed.
 //!
 //! `capture_with_stats` used to answer every dark burst with one hint: "no
 //! active emitter; run `sudo irlume ir-setup`". A dark IR frame has at least
 //! six causes and that advice fits exactly one of them; for a covered sensor,
 //! an out-of-range subject or an emitter firing uselessly into a bright room
 //! it sends the user to write to camera firmware for a problem that is not
-//! there (#185). The capture path already holds the evidence to do better:
-//! whether irlume drove the control this stream, the camera's own per-frame
-//! illumination metadata (#167), the privacy control where the camera
-//! publishes one, and the chosen frame's pixel statistics.
+//! there (#185). And the most common cover case is not dark at all: an opaque
+//! cover under an active emitter reflects it straight back and SATURATES the
+//! sensor (#197, measured on both test cameras). The capture path already
+//! holds the evidence to do better: whether irlume drove the control this
+//! stream, the camera's own per-frame illumination metadata (#167), the
+//! privacy control where the camera publishes one, and the chosen frame's
+//! mean and spread.
 //!
 //! The decision is a pure function over that evidence, so every arm is
 //! testable without a camera, and the renderer returns the full message so
 //! wording and advice stay in one place.
 
-/// The chosen frame's pixel standard deviation below which it is treated as a
-/// firmware-substituted blank rather than a dark scene. Measured on the ASUS
-/// 3277:0059 (#186, eight frames per state): an engaged shutter's blank is a
-/// constant 144.0 with a standard deviation of exactly 0.00, six runs out of
-/// six, while every real scene measured there reads 34 or higher. The floor
-/// only has to sit between "exactly constant" and "carries any signal at all";
-/// 0.5 is an order of magnitude from both measurements.
-const FLAT_STDDEV_MAX: f64 = 0.5;
+/// The dark gate: below this mean a burst is dark and gets a diagnosis.
+/// Public so the call site's shortcut range and this module's real gate are
+/// one constant and cannot drift apart.
+pub const DARK_MEAN_MAX: f64 = 35.0;
+
+/// At or above this mean the frame is treated as saturated. Covered chosen
+/// frames measured 252.8 (NexiGo, its clip point) to 255.0 (ASUS) across
+/// twelve runs; the brightest real scene this hardware has ever measured is
+/// 168 (`ir_emitter` records it), so 250 sits far from both.
+pub const SATURATED_MIN_MEAN: f64 = 250.0;
+
+/// A saturated frame at or below this spread is a constant, not a scene.
+/// Measured covered chosen frames: stddev 0.00 (ASUS, fully clipped), 0.76
+/// (NexiGo at its 252.8 clip), up to 3.63 mid auto-exposure walk-down; real
+/// scenes measure 35 and up. Deliberately wider than "exactly constant":
+/// saturation clips UNEVENLY on the NexiGo (0.76 at its 252.8 clip point),
+/// so a zero floor would miss a fully covered camera there.
+const SATURATED_FLAT_MAX: f64 = 8.0;
 
 /// What the capture path observed about a dark burst. Every field is a plain
 /// value so [`diagnose`] stays pure.
@@ -41,6 +54,8 @@ pub struct DarkEvidence {
     pub frames_lit: usize,
     /// Burst frames carrying any illumination metadata at all.
     pub frames_classified: usize,
+    /// Mean of the chosen frame.
+    pub frame_mean: f64,
     /// Pixel standard deviation of the chosen frame.
     pub frame_stddev: f64,
 }
@@ -50,6 +65,17 @@ pub struct DarkEvidence {
 pub enum IrDarkCause {
     /// The privacy control reads engaged: the sensor is blanked by the shutter.
     PrivacyEngaged,
+    /// The frame is saturated AND nearly constant: on both test cameras this
+    /// matched an opaque cover directly in front of the active emitter,
+    /// reflecting it straight back (measured 252.8-255.0 covered, twelve runs;
+    /// see `SATURATED_MIN_MEAN`/`SATURATED_FLAT_MAX` for the floors). A
+    /// saturated frame WITH texture is a scene, extremely close and bright,
+    /// and gets no diagnosis.
+    SaturatedFlat {
+        stddev: f64,
+        frames_lit: usize,
+        frames_classified: usize,
+    },
     /// The camera marked frames as captured with illumination ON, yet the
     /// image stayed dark. The Microsoft metadata reports the illumination
     /// STATE; it does not measure optical output, so a failed LED and a
@@ -58,11 +84,6 @@ pub enum IrDarkCause {
         frames_lit: usize,
         frames_classified: usize,
     },
-    /// The decoded frame is nearly constant. Evidence of a FLAT OUTPUT, not
-    /// by itself evidence of why: the blank-vs-scene gap behind
-    /// `FLAT_STDDEV_MAX` was measured on one camera, and an ISP may clamp a
-    /// genuinely dark scene to a constant (#196 review).
-    FlatFrame { stddev: f64 },
     /// The requested control value was ACTIVE for the stream (irlume wrote
     /// it, or it was already held: `StreamMode::lit` does not distinguish),
     /// but no classified frame was marked illuminated. Whether the camera
@@ -86,38 +107,66 @@ pub enum IrDarkCause {
     Undetermined,
 }
 
-/// Name the cause of a dark burst. Pure; the caller decides whether the burst
-/// was dark at all (the `IR_DARK_HINT_MAX` gate, unchanged).
-pub fn diagnose(e: &DarkEvidence) -> IrDarkCause {
+/// Name the cause of an unusable burst, or `None` for a scene. Self-gating:
+/// the two bands that carry a diagnosis are dark (mean below `DARK_MEAN_MAX`)
+/// and saturated-flat (`SATURATED_MIN_MEAN` up, spread under
+/// `SATURATED_FLAT_MAX`); everything else is a frame to authenticate against,
+/// not to explain. The call site may skip building evidence for frames
+/// outside both bands; that shortcut must agree with the gates here.
+pub fn diagnose(e: &DarkEvidence) -> Option<IrDarkCause> {
     // An explicit output policy, not an inferred hardware cause: the user
     // said "drive nothing", and every line below is chatter they opted out
     // of, so it precedes every diagnosis that would speak (#196 review).
     if e.emitter_disabled {
-        return IrDarkCause::EmitterDisabled;
+        return match () {
+            _ if e.frame_mean < DARK_MEAN_MAX || saturated_flat(e) => {
+                Some(IrDarkCause::EmitterDisabled)
+            }
+            _ => None,
+        };
     }
-    if e.privacy_engaged {
-        return IrDarkCause::PrivacyEngaged;
-    }
-    if e.frames_lit > 0 {
-        return IrDarkCause::LitButDark {
+    if e.frame_mean >= SATURATED_MIN_MEAN {
+        return saturated_flat(e).then_some(IrDarkCause::SaturatedFlat {
+            stddev: e.frame_stddev,
             frames_lit: e.frames_lit,
             frames_classified: e.frames_classified,
-        };
+        });
     }
-    if e.frame_stddev < FLAT_STDDEV_MAX {
-        return IrDarkCause::FlatFrame {
-            stddev: e.frame_stddev,
-        };
+    if e.frame_mean >= DARK_MEAN_MAX {
+        return None;
     }
-    if e.emitter_active && e.frames_classified > 0 {
-        return IrDarkCause::ActiveButNotReported {
+    if e.privacy_engaged {
+        return Some(IrDarkCause::PrivacyEngaged);
+    }
+    if e.frames_lit > 0 {
+        return Some(IrDarkCause::LitButDark {
+            frames_lit: e.frames_lit,
             frames_classified: e.frames_classified,
-        };
+        });
+    }
+    // No dark-flat arm. Two measured facts killed it (#198 review): a
+    // genuine strobe-off exposure is itself nearly constant (mean 0.0 at
+    // stddev 0.08-0.13 on both test cameras), and the one measured dark-band
+    // blank, the ASUS shutter's constant 144.0, never reaches capture because
+    // the privacy control refuses at open. What remained was an inference
+    // about the 5-35 mean band that nothing has ever measured, so a dark flat
+    // frame falls through to the emitter causes, where the advice is at least
+    // grounded; the shutter keeps its named cause through the privacy
+    // evidence above.
+    if e.emitter_active && e.frames_classified > 0 {
+        return Some(IrDarkCause::ActiveButNotReported {
+            frames_classified: e.frames_classified,
+        });
     }
     if !e.emitter_active {
-        return IrDarkCause::NoEmitterDriven;
+        return Some(IrDarkCause::NoEmitterDriven);
     }
-    IrDarkCause::Undetermined
+    Some(IrDarkCause::Undetermined)
+}
+
+/// Saturated and nearly constant: the measured cover-under-emitter signature.
+fn saturated_flat(e: &DarkEvidence) -> bool {
+    e.frame_mean >= SATURATED_MIN_MEAN && e.frame_stddev <= SATURATED_FLAT_MAX
 }
 
 /// The user-facing line for a cause, or `None` where silence is the right
@@ -129,6 +178,31 @@ pub fn render(card: &str, mean: f64, cause: &IrDarkCause) -> Option<String> {
             "[ir] {card:?}: IR is dark because the privacy shutter is engaged (the \
              `privacy` control reads 1); release it. No emitter problem is in evidence."
         )),
+        IrDarkCause::SaturatedFlat {
+            stddev,
+            frames_lit,
+            frames_classified,
+        } => Some(format!(
+            "[ir] {card:?}: the IR frame is saturated and nearly constant (mean \
+             {mean:.0}, stddev {stddev:.2}){}. On both tested cameras this pattern \
+             matched an opaque cover directly in front of the lens{}; strong IR \
+             flooding the lens could read the same (covered measured 252.8-255.0; \
+             real scenes carry spread 35+). Check for a cover or anything flush \
+             against the camera.",
+            if *frames_lit > 0 {
+                format!(", with {frames_lit}/{frames_classified} frames marked illuminated")
+            } else {
+                String::new()
+            },
+            // The reflection mechanism is asserted only when the camera says
+            // its illuminator was on; a saturated frame without that flag
+            // could as easily be ambient overexposure (review thread).
+            if *frames_lit > 0 {
+                ", bouncing the emitter straight back"
+            } else {
+                ""
+            }
+        )),
         IrDarkCause::LitButDark {
             frames_lit,
             frames_classified,
@@ -139,13 +213,6 @@ pub fn render(card: &str, mean: f64, cause: &IrDarkCause) -> Option<String> {
              cannot distinguish a failed or ignored emitter from a lens cover, range, \
              or exposure problem. Check the cover, distance and exposure; if those do \
              not explain it, `sudo irlume ir-setup` re-measures the control."
-        )),
-        IrDarkCause::FlatFrame { stddev } => Some(format!(
-            "[ir] {card:?}: the IR frame is nearly constant (mean {mean:.0}, stddev \
-             {stddev:.2}). On the tested ASUS camera this matched a privacy-blanked \
-             frame, but pixel variance alone cannot distinguish a blanked or covered \
-             sensor from camera processing of a dark scene. Check the privacy shutter \
-             and lens cover; if neither explains it, move closer and re-test."
         )),
         IrDarkCause::ActiveButNotReported { frames_classified } => Some(format!(
             "[ir] {card:?}: the emitter control held the requested value, but none of \
@@ -199,6 +266,7 @@ mod tests {
             privacy_engaged: false,
             frames_lit: 0,
             frames_classified: 0,
+            frame_mean: 20.0,
             frame_stddev: 40.0,
         }
     }
@@ -214,7 +282,7 @@ mod tests {
                 frames_lit: 3,
                 ..textured_dark()
             }),
-            IrDarkCause::PrivacyEngaged,
+            Some(IrDarkCause::PrivacyEngaged),
             "an engaged shutter outranks even a lit flag"
         );
         assert_eq!(
@@ -222,42 +290,36 @@ mod tests {
                 frames_lit: 3,
                 frames_classified: 8,
                 frame_stddev: 0.0,
+                frame_mean: 10.0,
                 ..textured_dark()
             }),
-            IrDarkCause::LitButDark {
+            Some(IrDarkCause::LitButDark {
                 frames_lit: 3,
                 frames_classified: 8
-            },
+            }),
             "the camera saying FIRED outranks the flat-frame inference"
         );
         assert_eq!(
             diagnose(&DarkEvidence {
-                frame_stddev: 0.0,
                 emitter_active: true,
                 frames_classified: 8,
                 ..textured_dark()
             }),
-            IrDarkCause::FlatFrame { stddev: 0.0 },
-            "a flat frame outranks active-but-not-reported"
-        );
-        assert_eq!(
-            diagnose(&DarkEvidence {
-                emitter_active: true,
-                frames_classified: 8,
-                ..textured_dark()
-            }),
-            IrDarkCause::ActiveButNotReported {
+            Some(IrDarkCause::ActiveButNotReported {
                 frames_classified: 8
-            },
+            }),
         );
         assert_eq!(
             diagnose(&DarkEvidence {
                 emitter_disabled: true,
                 ..textured_dark()
             }),
-            IrDarkCause::EmitterDisabled,
+            Some(IrDarkCause::EmitterDisabled),
         );
-        assert_eq!(diagnose(&textured_dark()), IrDarkCause::NoEmitterDriven);
+        assert_eq!(
+            diagnose(&textured_dark()),
+            Some(IrDarkCause::NoEmitterDriven)
+        );
         // `off` is an output policy, not an inferred cause: it silences every
         // other observation, through the production precedence, because the
         // render-only check could not fail when diagnose never picked it
@@ -268,8 +330,10 @@ mod tests {
             privacy_engaged: true,
             frames_lit: 8,
             frames_classified: 8,
+            frame_mean: 20.0,
             frame_stddev: 0.0,
-        });
+        })
+        .expect("a dark burst under off still resolves, to a silent cause");
         assert_eq!(off, IrDarkCause::EmitterDisabled);
         assert!(render("cam", 20.0, &off).is_none());
         assert_eq!(
@@ -277,8 +341,161 @@ mod tests {
                 emitter_active: true,
                 ..textured_dark()
             }),
-            IrDarkCause::Undetermined,
+            Some(IrDarkCause::Undetermined),
             "active control, no metadata, real signal: the honest answer is no answer"
+        );
+    }
+
+    /// The self-gate: scenes get no diagnosis, in both directions. A textured
+    /// mid frame is an authentication subject; a SATURATED textured frame is a
+    /// close bright subject, not a cover (#197: covers measured stddev 0.00
+    /// to 3.63, scenes 35+).
+    #[test]
+    fn scenes_are_not_diagnosed() {
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                frame_mean: 100.0,
+                ..textured_dark()
+            }),
+            None,
+            "a mid-brightness textured frame is a scene"
+        );
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                frame_mean: 252.0,
+                frame_stddev: 40.0,
+                emitter_active: true,
+                frames_lit: 5,
+                frames_classified: 10,
+                ..textured_dark()
+            }),
+            None,
+            "a saturated frame WITH texture is a close subject, not a cover"
+        );
+        // Off is silent for scenes too, and resolves for both covered bands.
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                emitter_disabled: true,
+                frame_mean: 100.0,
+                ..textured_dark()
+            }),
+            None
+        );
+        // Flat at MID brightness is unmeasured territory: neither band claims
+        // it (the 144 shutter blank never reaches capture on cameras with a
+        // privacy control, and no other mid-flat source has been measured).
+        // This row pins the saturated floor at its measured height.
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                frame_mean: 200.0,
+                frame_stddev: 0.5,
+                ..textured_dark()
+            }),
+            None
+        );
+    }
+
+    /// The measured cover signature: saturated and nearly constant fires on
+    /// the exact chosen-frame values from the #197 measurement runs, on both
+    /// cameras, including the NexiGo's non-zero clip spread that the dark
+    /// flat floor would have missed.
+    #[test]
+    fn the_measured_covers_are_named_and_off_still_silences_them() {
+        for (mean, sd) in [(255.0, 0.0), (252.8, 0.76), (254.7, 3.63)] {
+            let cause = diagnose(&DarkEvidence {
+                frame_mean: mean,
+                frame_stddev: sd,
+                emitter_active: true,
+                frames_lit: 5,
+                frames_classified: 10,
+                ..textured_dark()
+            })
+            .unwrap_or_else(|| panic!("covered at mean {mean} stddev {sd} must be named"));
+            assert_eq!(
+                cause,
+                IrDarkCause::SaturatedFlat {
+                    stddev: sd,
+                    frames_lit: 5,
+                    frames_classified: 10
+                }
+            );
+            let msg = render("cam", mean, &cause).expect("the cover speaks");
+            assert!(msg.contains("saturated and nearly constant"), "{msg}");
+            assert!(
+                !msg.contains("ir-setup"),
+                "no firmware advice for a cover: {msg}"
+            );
+            assert!(
+                msg.contains("bouncing the emitter"),
+                "lit flags support the mechanism: {msg}"
+            );
+        }
+        {
+            // Without lit flags the mechanism claim must vanish: saturation
+            // could be ambient overexposure, and the message may only name
+            // the pattern (review thread on this PR).
+            let msg = render(
+                "cam",
+                255.0,
+                &IrDarkCause::SaturatedFlat {
+                    stddev: 0.0,
+                    frames_lit: 0,
+                    frames_classified: 0,
+                },
+            )
+            .expect("still speaks");
+            assert!(!msg.contains("bouncing the emitter"), "{msg}");
+            assert!(!msg.contains("marked illuminated"), "{msg}");
+        }
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                emitter_disabled: true,
+                frame_mean: 255.0,
+                frame_stddev: 0.0,
+                ..textured_dark()
+            }),
+            Some(IrDarkCause::EmitterDisabled),
+            "off silences the saturated band too"
+        );
+    }
+
+    /// Near-zero flatness is what clean darkness looks like (measured mean
+    /// 0.0 at stddev 0.08-0.13 on both cameras), so it falls through to the
+    /// emitter causes instead of claiming a cover; the informative flat band
+    /// (the 144 shutter blank) still names one.
+    #[test]
+    fn near_zero_flat_is_darkness_not_a_cover() {
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                frame_mean: 0.0,
+                frame_stddev: 0.1,
+                ..textured_dark()
+            }),
+            Some(IrDarkCause::NoEmitterDriven),
+            "a flat zero frame with no emitter is a dark room, and ir-setup is right"
+        );
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                frame_mean: 0.0,
+                frame_stddev: 0.1,
+                emitter_active: true,
+                frames_classified: 10,
+                ..textured_dark()
+            }),
+            Some(IrDarkCause::ActiveButNotReported {
+                frames_classified: 10
+            }),
+        );
+        assert_eq!(
+            diagnose(&DarkEvidence {
+                frame_mean: 20.0,
+                frame_stddev: 0.0,
+                ..textured_dark()
+            }),
+            Some(IrDarkCause::NoEmitterDriven),
+            "a dark flat frame carries no measured cover signature (#198 review: \
+             the only measured dark-band blank never reaches capture), so the \
+             emitter causes answer"
         );
     }
 
@@ -299,7 +516,14 @@ mod tests {
                 false,
             ),
             (IrDarkCause::PrivacyEngaged, false),
-            (IrDarkCause::FlatFrame { stddev: 0.0 }, false),
+            (
+                IrDarkCause::SaturatedFlat {
+                    stddev: 0.0,
+                    frames_lit: 5,
+                    frames_classified: 10,
+                },
+                false,
+            ),
         ] {
             let msg = render("cam", 20.0, &cause).expect("these causes all speak");
             assert_eq!(
@@ -331,18 +555,16 @@ mod tests {
         assert!(!msg.contains("will not help"), "{msg}");
     }
 
-    /// The arithmetic separates a constant sample from a non-constant one.
-    /// That is ALL it establishes: the hardware meaning of a constant frame
-    /// is measured on one camera and worded accordingly in the renderer.
+    /// The arithmetic separates a constant sample from a non-constant one,
+    /// against the saturated floor that now carries the flat inference.
     #[test]
     fn frame_stddev_classifies_constant_and_nonconstant_samples() {
-        assert_eq!(frame_stddev(&[144; 1000]), 0.0);
-        assert!(frame_stddev(&[144; 1000]) < FLAT_STDDEV_MAX);
-        // Alternating values two apart: stddev 1.0, above the floor.
+        assert_eq!(frame_stddev(&[255; 1000]), 0.0);
+        // Alternating values two apart: stddev 1.0.
         let noisy: Vec<u8> = (0..1000)
             .map(|i| if i % 2 == 0 { 19 } else { 21 })
             .collect();
-        assert!(frame_stddev(&noisy) > FLAT_STDDEV_MAX);
+        assert!(frame_stddev(&noisy) > 0.5);
         assert_eq!(frame_stddev(&[]), 0.0);
     }
 }

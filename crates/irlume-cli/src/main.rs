@@ -1099,15 +1099,45 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
 /// log records which stack produced the numbers. `--mesh` and `--blaze`
 /// default to `models/…` paths relative to the CURRENT DIRECTORY, i.e. a repo
 /// checkout; pass explicit paths when running from anywhere else.
+/// Which camera nodes the dev-tool engine should open, from the optional
+/// `--rgb`/`--ir` flags. `None` = no override (the engine's own defaults).
+///
+/// Either flag ALONE overrides its half; the partner comes from `selected`
+/// (in production [`irlume_camera::select_pair`]: the persisted pair with
+/// identity resolution, then discovery), because a lone flag used to be
+/// SILENTLY IGNORED: `blinkcap capture --ir /dev/video6` captured against
+/// the built-in default node and failed with "no camera found", saying
+/// nothing about the dropped flag (#209). `selected` runs only when needed,
+/// since it can probe devices.
+pub(crate) fn devices_from_flags(
+    rgb: Option<&str>,
+    ir: Option<&str>,
+    selected: impl FnOnce() -> (String, String),
+) -> Option<(String, String)> {
+    match (rgb, ir) {
+        (None, None) => None,
+        (Some(r), Some(i)) => Some((r.to_string(), i.to_string())),
+        (r, i) => {
+            let (sel_r, sel_i) = selected();
+            Some((
+                r.map(str::to_string).unwrap_or(sel_r),
+                i.map(str::to_string).unwrap_or(sel_i),
+            ))
+        }
+    }
+}
+
 pub(crate) fn engine(
     det: &str,
     model: &str,
     args: &[String],
 ) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
-    let e = match (flag(args, "--rgb"), flag(args, "--ir")) {
-        (Some(r), Some(i)) => e.with_devices(r, i),
-        _ => e,
+    let e = match devices_from_flags(flag(args, "--rgb"), flag(args, "--ir"), || {
+        irlume_camera::select_pair()
+    }) {
+        Some((r, i)) => e.with_devices(&r, &i),
+        None => e,
     };
     let adapter = flag(args, "--adapter").unwrap_or("");
     let e = e.with_ir_adapter(adapter)?;
@@ -1824,12 +1854,23 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // dev gate probe: single frame, no burst stats
+            face_frac: ir_top_face
+                .map(|f| irlume_auth::bbox_width_frac(&f.bbox, ir.width))
+                .unwrap_or(0.0),
+            // Dev gate probe: a single frame with no burst stats, so the
+            // negotiated format's ceiling is not available here and the
+            // reading is honestly absent rather than guessed at 255.
+            ir_saturated_frac: None,
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}");
+        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}  face_frac {:.3}  clipped {}", signals.face_frac,
+            signals
+                .ir_saturated_frac
+                .map(|f| format!("{:.1}%", f * 100.0))
+                .unwrap_or_else(|| "n/a".into()));
         println!(
             "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
             cues.face_in_rgb,
@@ -2980,10 +3021,14 @@ fn doctor_run(
         report,
         "[doctor] camera nodes (classified by pixel format):"
     );
-    let nodes = irlume_camera::discover_nodes();
+    let scan = irlume_camera::scan_nodes();
+    let nodes = scan.classified.clone();
     // Capability, not identity: a consumer is told an IR node was classified,
     // never which device it is. The human report below still names them, since
     // a person debugging their own machine needs the path.
+    // The verdict is unchanged by #227: a node irlume cannot read is still a
+    // node it cannot use, so "nodes present, none readable" fails exactly as
+    // "no nodes" does. What changed is that the lines below now say which.
     report.check(
         "camera-nodes",
         if nodes.iter().any(|(_, r)| *r == irlume_camera::Role::Ir) {
@@ -2994,8 +3039,17 @@ fn doctor_run(
             State::Warn
         },
     );
+    // "Could not look" is not "nothing there". Reporting a /dev that would not
+    // list as a machine with no cameras is the same mistake at one level up.
+    if let Some(why) = &scan.listing_error {
+        dout!(
+            report,
+            "  ⚠ {why}; whether this machine has camera nodes is unknown"
+        );
+    } else if nodes.is_empty() && scan.unreadable.is_empty() {
+        dout!(report, "  (no /dev/video* nodes on this machine)");
+    }
     if nodes.is_empty() {
-        dout!(report, "  (none found under /dev/video0..9)");
         if let Some(gen) = irlume_camera::intel_ipu_present() {
             dout!(report,
                 "  ⚠ this laptop has an Intel {gen} MIPI camera, which irlume cannot use:\n     \
@@ -3055,6 +3109,18 @@ fn doctor_run(
                 );
             }
         }
+    }
+    // A node irlume could not read is named with its errno, never omitted.
+    // Dropping these is what let a permission problem read as absent hardware
+    // and sent the reader after a driver bug they did not have (#227).
+    // Nodes are grouped by cause: one missing 'video' group membership denies
+    // every node on the machine, and that is one fact, not eleven.
+    let mut by_cause: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+    for u in &scan.unreadable {
+        by_cause.entry(u.cause()).or_default().push(&u.path);
+    }
+    for (cause, paths) in &by_cause {
+        dout!(report, "  ⚠ {}: {cause}", paths.join(", "));
     }
 
     // --- models / runtime --------------------------------------------------
@@ -3148,8 +3214,10 @@ fn doctor_run(
                  appear; common after suspend/resume); fix: sudo systemctl restart fprintd"
             );
         }
-        let pam_dir = std::path::Path::new("/etc/pam.d");
-        if fingerprint::faillock_cohabits(pam_dir) {
+        // The same search path libpam uses, so a vendor-only stack is not
+        // missed by a warning whose whole job is noticing one (#208).
+        let pam_path = fingerprint::PamSearchPath::live();
+        if fingerprint::faillock_cohabits(&pam_path) {
             dout!(
                 report,
                 "  ⚠ pam_faillock and pam_fprintd share a PAM stack: a touch-sensor misread \
@@ -3157,7 +3225,7 @@ fn doctor_run(
                  account lockout. If you get locked out: faillock --user <you> --reset"
             );
         }
-        if fingerprint::fprintd_in_sudo(pam_dir) && fingerprint::sshd_present() {
+        if fingerprint::fprintd_in_sudo(&pam_path) && fingerprint::sshd_present() {
             dout!(
                 report,
                 "  ⚠ pam_fprintd is reachable from the sudo stack and an SSH server is \
@@ -3647,6 +3715,33 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn devices_from_flags_honors_either_flag_alone() {
+        let sel = || ("/dev/sel-rgb".to_string(), "/dev/sel-ir".to_string());
+        // No flags: no override, and the selection must not even run.
+        assert_eq!(
+            devices_from_flags(None, None, || unreachable!("no probe without flags")),
+            None
+        );
+        // Both flags: taken verbatim, selection not consulted.
+        assert_eq!(
+            devices_from_flags(Some("/dev/r"), Some("/dev/i"), || unreachable!()),
+            Some(("/dev/r".into(), "/dev/i".into()))
+        );
+        // --ir alone: the half the operator named is honored, the partner
+        // comes from the selection. This is the case that was silently
+        // dropped: the flag vanished and capture ran on the default node.
+        assert_eq!(
+            devices_from_flags(None, Some("/dev/video6"), sel),
+            Some(("/dev/sel-rgb".into(), "/dev/video6".into()))
+        );
+        // --rgb alone, symmetric.
+        assert_eq!(
+            devices_from_flags(Some("/dev/video4"), None, sel),
+            Some(("/dev/video4".into(), "/dev/sel-ir".into()))
+        );
     }
 
     #[test]

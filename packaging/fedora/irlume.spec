@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.7.2
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -210,6 +210,16 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sun Aug 02 2026 archledger <archledger236@gmail.com> - 0.8.0-1
+- Emitter write honours the Windows exclusive-control model; consumer scan reports its blind spot (#169, #207)
+- fingerprint enable and status print per-surface coverage; the fingerprint-only gate parses PAM rule fields (#155)
+- Keyring hand-off check for KWallet and GNOME Keyring; openSUSE and renamed-substack wiring fixes
+- gdm-fingerprint gains the keyring release pair so a fingerprint login opens the wallet
+- camera-tune is reachable from the TUI with an upfront cost explanation (#170)
+- mean_step consent discriminator recorded with the evidence, strobe-aware (#101)
+- TUI: all machine probes moved off the UI thread; slow-TPM machines get a responsive TUI and a visible profile list
+- pamwire split into submodules; origin_tests flake fixed structurally (#194)
+
 * Thu Jul 30 2026 archledger <archledger236@gmail.com> - 0.7.2-1
 - IRLUME_IR_EMITTER is checked against the camera's descriptor before any write
 - Login transactions in the machine API: plan, apply, verify, rollback

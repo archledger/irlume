@@ -183,15 +183,31 @@ struct RecordedPose {
     bri: f32,
 }
 
+/// Install a finished capture at `out` through a `.tmp` file in the same
+/// directory, synced before the rename. Writing the destination directly
+/// left a crash window where a valid header sat over a truncated body, and
+/// replay refuses such a file loudly; a capture killed mid-write must leave
+/// either the previous file or nothing. The `.tmp` suffix also keeps a
+/// leftover out of replay's `.jsonl` scan.
+fn install_capture(out: &str, contents: &str) -> irlume_common::Result<()> {
+    use std::io::Write;
+    let io = |e: std::io::Error| irlume_common::Error::Io(e.to_string());
+    let tmp = format!("{out}.tmp");
+    let mut f = std::fs::File::create(&tmp).map_err(io)?;
+    f.write_all(contents.as_bytes()).map_err(io)?;
+    f.sync_all().map_err(io)?;
+    std::fs::rename(&tmp, out).map_err(io)?;
+    Ok(())
+}
+
 fn write_pose_jsonl(
     out: &str,
     label: &str,
     samples: &[irlume_liveness::PoseSample],
 ) -> irlume_common::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(out).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    use std::fmt::Write;
     let header = serde_json::json!({ "posecap": true, "label": label, "frames": samples.len() });
-    writeln!(f, "{header}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    let mut contents = format!("{header}\n");
     for s in samples {
         let rec = RecordedPose {
             idx: s.idx,
@@ -199,15 +215,13 @@ fn write_pose_jsonl(
             yaw_signed: s.yaw_signed,
             bri: s.bri,
         };
-        writeln!(f, "{}", serde_json::to_string(&rec).unwrap())
-            .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+        let _ = writeln!(contents, "{}", serde_json::to_string(&rec).unwrap());
     }
-    Ok(())
+    install_capture(out, &contents)
 }
 
 fn write_jsonl(out: &str, label: &str, samples: &[EarSample]) -> irlume_common::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(out).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    use std::fmt::Write;
     let header = serde_json::json!({
         "blinkcap": true,
         "label": label,
@@ -215,13 +229,12 @@ fn write_jsonl(out: &str, label: &str, samples: &[EarSample]) -> irlume_common::
         "host": std::fs::read_to_string("/proc/sys/kernel/hostname")
             .unwrap_or_default().trim().to_string(),
     });
-    writeln!(f, "{header}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    let mut contents = format!("{header}\n");
     for s in samples {
         let rec = RecordedSample::from(s);
-        writeln!(f, "{}", serde_json::to_string(&rec).unwrap())
-            .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+        let _ = writeln!(contents, "{}", serde_json::to_string(&rec).unwrap());
     }
-    Ok(())
+    install_capture(out, &contents)
 }
 
 /// A loaded recording: its label and the samples the detectors consume.
@@ -255,30 +268,42 @@ fn load_recording(path: &Path) -> Option<Recording> {
     })
 }
 
-/// Run the head-nod detector over every pose (`--pose`) recording under `dir`
-/// and tally acceptance per label. Returns false if no pose recordings exist.
-fn replay_pose(dir: &Path) -> bool {
-    use irlume_liveness::{detect_nod, HeadGesture, PoseSample};
+/// Run the head-nod detector over `path` (one pose recording, or every pose
+/// recording under a directory) and tally acceptance per label.
+///
+/// `Ok(true)` means at least one pose recording replayed; `Ok(false)` means
+/// none of the files were pose recordings, which is not an error because
+/// blink recordings share the same directories and extension. A file whose
+/// header DECLARES it a pose recording and whose body then cannot be read in
+/// full is an `Err`, never a skip: a truncated capture replayed anyway reads
+/// as `mean_step 0.0` and sits in the per-label minimum exactly like a still
+/// head, and the cross-session corpus this output feeds (#101) cannot tell
+/// "observed no motion" from "failed to read the observation".
+fn replay_pose(path: &Path) -> Result<bool, String> {
+    use irlume_liveness::{HeadGesture, PoseSample};
     use std::collections::BTreeMap;
-    let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut tally: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let files: Vec<std::path::PathBuf> = if path.is_dir() {
+        let mut v: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .collect();
+        v.sort();
+        v
+    } else {
+        vec![path.to_path_buf()]
+    };
+    let mut tally: BTreeMap<String, (usize, usize, f32, f32)> = BTreeMap::new();
     let mut any = false;
     for path in files {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut lines = text.lines();
         let Some(header) = lines
             .next()
             .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         else {
-            continue;
+            continue; // no parseable header: not a recording of any kind
         };
         if header.get("posecap").and_then(|v| v.as_bool()) != Some(true) {
             continue; // not a pose recording
@@ -289,29 +314,65 @@ fn replay_pose(dir: &Path) -> bool {
             .and_then(|v| v.as_str())
             .unwrap_or("unlabeled")
             .to_string();
-        let samples: Vec<PoseSample> = lines
-            .filter_map(|l| serde_json::from_str::<RecordedPose>(l).ok())
-            .map(|r| PoseSample {
+        // Strict from here down. Every posecap header ever written carries
+        // "frames" (the field predates this check), so a mismatch or an
+        // unparseable record is a damaged file, and damage is reported, not
+        // measured.
+        let expected = header
+            .get("frames")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{}: posecap header has no valid 'frames' count",
+                    path.display()
+                )
+            })?;
+        let mut samples: Vec<PoseSample> = Vec::new();
+        for (i, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let r: RecordedPose = serde_json::from_str(line)
+                .map_err(|e| format!("{}:{}: invalid pose record: {e}", path.display(), i + 2))?;
+            samples.push(PoseSample {
                 idx: r.idx,
                 pitch_frac: r.pitch_frac,
                 yaw_signed: r.yaw_signed,
                 bri: r.bri,
-            })
-            .collect();
-        let e = tally.entry(label).or_default();
+            });
+        }
+        if samples.len() != expected {
+            return Err(format!(
+                "{}: header declares {expected} frames but {} were read; refusing to \
+                 measure a partial capture",
+                path.display(),
+                samples.len()
+            ));
+        }
+        let e = tally
+            .entry(label)
+            .or_insert((0usize, 0usize, f32::INFINITY, f32::NEG_INFINITY));
         e.1 += 1;
-        if detect_nod(&samples) == HeadGesture::Nod {
+        // Verdict and evidence from the same call, so the replayed corpus
+        // accumulates the #101 shadow metric alongside the accept rate: the
+        // per-label mean_step spread is exactly the cross-session data that
+        // issue is blocked on, and old recordings are sessions too.
+        let (verdict, ev) = irlume_liveness::detect_nod_with_evidence(&samples);
+        if verdict == HeadGesture::Nod {
             e.0 += 1;
         }
+        e.2 = e.2.min(ev.mean_step);
+        e.3 = e.3.max(ev.mean_step);
     }
     if any {
         println!("== head-nod acceptance (detect_nod) by label ==");
-        for (label, (acc, total)) in &tally {
-            println!("  {label:<16} {acc}/{total}");
+        for (label, (acc, total, lo, hi)) in &tally {
+            println!("  {label:<16} {acc}/{total}   mean_step {lo:.4}..{hi:.4} (#101, not gating)");
         }
         println!("\n  A nod should be accepted; still / look-around / reclined-still should not.");
     }
-    any
+    Ok(any)
 }
 
 fn replay(args: &[String]) -> ExitCode {
@@ -321,10 +382,17 @@ fn replay(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let path = Path::new(target);
-    // Pose (head-nod) recordings replay through their own detector.
-    if path.is_dir() && replay_pose(path) {
-        // Fall through to the blink/closure replay too if any of those exist.
-    }
+    // Pose (head-nod) recordings replay through their own detector; a single
+    // .jsonl argument can be either kind, so the pose pass sees files too. A
+    // damaged pose recording fails the whole replay rather than shrinking the
+    // corpus silently.
+    let pose_found = match replay_pose(path) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("[blinkcap] {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
         let mut v: Vec<_> = std::fs::read_dir(path)
             .map(|rd| {
@@ -341,7 +409,12 @@ fn replay(args: &[String]) -> ExitCode {
     files.sort();
     let recordings: Vec<Recording> = files.iter().filter_map(|p| load_recording(p)).collect();
     if recordings.is_empty() {
-        eprintln!("[blinkcap] no blinkcap recordings found at {target}");
+        // A pose-only corpus is a successful replay: its summary printed
+        // above, and there was never a blink recording to miss.
+        if pose_found {
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("[blinkcap] no blinkcap or posecap recordings found at {target}");
         return ExitCode::FAILURE;
     }
 

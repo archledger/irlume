@@ -185,6 +185,12 @@ enum Suspend {
     SetCameras(String, String),
     /// Set up the IR emitter; root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
+    /// Measure whether the camera can stream RGB and IR at once and persist
+    /// the verdict (capture policy changes with it). The daemon root-gates the
+    /// write, and the measurement holds the camera and fires the emitter for
+    /// up to a minute, so like the other privileged one-shots it suspends to
+    /// `sudo irlume camera-tune`.
+    CameraTune,
     /// View the face-auth journal (`sudo irlume logs`); the daemon's lines live
     /// in the system journal, so it runs under sudo to guarantee they show.
     Logs,
@@ -330,7 +336,7 @@ enum OpTag {
 }
 
 /// Fingerprint snapshot for the Fingerprint screen.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct FpInfo {
     available: bool,
     device: Option<String>,
@@ -490,8 +496,283 @@ struct App {
     caps: irlume_camera::Caps,
     /// A fingerprint reader is present.
     fp_present: bool,
+    /// An in-flight background ListProfiles, drained by `poll()`. The listing
+    /// decrypts every profile under the TPM template key: ~350ms on the
+    /// reference Zenbook, MEASURED 10.8s on a ThinkPad X13 Yoga Gen 4 whose
+    /// TPM workqueue was hogging. Run synchronously it froze the UI for that
+    /// long at startup and on every Profiles entry, and the short poll budget
+    /// then read the still-working daemon as down; on its own thread it gets
+    /// a real budget and the UI keeps drawing.
+    profiles_load: Option<std::sync::mpsc::Receiver<ProfilesOutcome>>,
+    /// True after at least one successful ListProfiles response has landed.
+    /// An empty list is VALID OBSERVED STATE, not "never loaded": deriving
+    /// "unloaded" from emptiness made every light poll on an unenrolled
+    /// machine start another TPM-backed listing, and each one occupies the
+    /// daemon worker, which a login then waits behind.
+    profiles_loaded: bool,
+    /// The last landed machine snapshot; see [`Probes`]. Draw and run_checks
+    /// only ever READ it, so both stay off every external interface.
+    probes: Probes,
+    /// An in-flight background probe sweep, drained by `poll()`.
+    probes_load: Option<std::sync::mpsc::Receiver<Probes>>,
+    /// At least one sweep has landed. Until then `probes` holds defaults,
+    /// and copying defaults over the capabilities `App::new` observed hides
+    /// real hardware; recompute_checks gates its copies on this.
+    probes_landed: bool,
+    /// An in-flight background light poll (daemon reads), drained by `poll()`.
+    light_load: Option<std::sync::mpsc::Receiver<LightState>>,
+    /// PAM-screen state, computed with the diagnostics (10s tier + screen
+    /// entry), never in draw: rendering used to re-read every PAM service
+    /// file and probe the LSM per FRAME.
+    pam_cache: PamCache,
+    /// Per-surface fingerprint coverage (#155), the same table `fingerprint
+    /// status` prints; refreshed with the diagnostics when a reader exists.
+    fp_coverage: Vec<(&'static str, &'static str, bool)>,
     spin: usize,
     quit: bool,
+}
+
+/// What one background `ListProfiles` produced (see `App::profiles_load`).
+enum ProfilesOutcome {
+    Loaded {
+        profiles: Vec<ProfileSummary>,
+        eyes_open: bool,
+        challenge: bool,
+    },
+    /// The daemon answered with an error (corrupt enrollment, missing
+    /// template key): real state, shown on Repair like the sync path did.
+    DaemonError(String),
+    /// The request itself failed (daemon down mid-load, timeout). Not state:
+    /// the previous list stays and the next refresh retries.
+    Transport(String),
+}
+
+/// Everything the PAM screen renders, gathered off the draw path.
+#[derive(Default, Clone)]
+struct PamCache {
+    /// `(label, present, wired)` per service, as `login status` reports.
+    rows: Vec<(String, bool, bool)>,
+    /// `/sys/fs/selinux` existed at refresh time (Fedora-family).
+    selinux_present: bool,
+    /// SELinux module state when present (`None` = needs root to tell).
+    selinux: Option<bool>,
+    /// AppArmor enabled this boot (Debian/Ubuntu-family).
+    apparmor_enabled: bool,
+    /// An irlume AppArmor profile is installed on disk.
+    apparmor_profiled: bool,
+    /// Wired greeters whose released password nothing turns into an open
+    /// wallet (#200's advisory, the same walk `login status` prints).
+    handoffs: Vec<crate::pamwire::HandoffWarning>,
+}
+
+/// Every observation of the MACHINE the diagnostics and screens read,
+/// gathered on a background thread. The sweep behind this struct spawns
+/// fprintd-list two to three times, busctl three times, walks $PATH for
+/// semodule, runs `ls -Z`, and touches V4L2 and sysfs; on a ThinkPad with a
+/// slow TPM keeping the daemon busy, running it inline put every keypress
+/// behind ~8.8s of it (measured), because each slow iteration made the next
+/// sweep due immediately. The UI thread only ever READS the last snapshot;
+/// tests construct one directly, which also makes the Repair checklist
+/// deterministic under test for the first time.
+#[derive(Default, Clone)]
+struct Probes {
+    caps: irlume_camera::Caps,
+    fp_present: bool,
+    fp: FpInfo,
+    pam_cache: PamCache,
+    fp_coverage: Vec<(&'static str, &'static str, bool)>,
+    /// The reader is claimed by a stale fprintd session (prompts fail silently).
+    reader_stuck: bool,
+    /// A privacy shutter/switch is engaged on any camera node.
+    privacy_engaged: bool,
+    /// Per-pair privacy state, keyed by the pair's RGB node (Cameras screen).
+    pair_privacy: Vec<(String, bool)>,
+    /// SELinux is enforcing this boot.
+    selinux_enforcing: bool,
+    /// The daemon socket carries the irlume SELinux label.
+    selinux_socket_labeled: bool,
+    /// Face login is wired into at least one greeter.
+    login_wired: bool,
+    /// The fingerprint keyring-unlock line is present in every service the
+    /// active login manager consults.
+    fp_keyring_wired: bool,
+    /// A TPM device exists.
+    tpm_present: bool,
+    /// A distro PAM regeneration dropped the wiring (self-heal pending).
+    reconcile_needed: bool,
+    /// The login keyring is locked right now (`None` = could not tell).
+    keyring_locked: Option<bool>,
+    /// Secure Boot: (firmware supports it, currently enabled, setup mode).
+    secureboot: (bool, bool, bool),
+    /// Firmware boot mode label (UEFI/legacy), from efivars.
+    boot_mode: String,
+}
+
+impl Probes {
+    /// The full sweep, verbatim from the code that used to run inline. Runs
+    /// on a worker thread; everything here may block on D-Bus activation, a
+    /// subprocess, or a device open without costing the UI a frame.
+    fn gather(user: &str) -> Self {
+        use irlume_common::secureboot;
+        let caps = irlume_camera::capabilities();
+        let fp_present = irlume_fingerprint::available();
+        let fp = FpInfo {
+            available: fp_present,
+            device: irlume_fingerprint::device_name(),
+            enrolled: irlume_fingerprint::enrolled_fingers(user),
+            method: irlume_core::policy::method().as_str().to_string(),
+        };
+        let pam_cache = PamCache {
+            rows: crate::pamwire::status_report(),
+            selinux_present: std::path::Path::new("/sys/fs/selinux").exists(),
+            selinux: crate::pamwire::selinux_state(),
+            apparmor_enabled: std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+                .map(|s| s.trim() == "Y")
+                .unwrap_or(false),
+            apparmor_profiled: std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
+                || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists(),
+            handoffs: crate::pamwire::keyring_handoff_warnings(),
+        };
+        let nodes = irlume_camera::discover_nodes();
+        let pairs = irlume_camera::list_pairs();
+        Probes {
+            caps,
+            fp_present,
+            reader_stuck: fp_present && irlume_fingerprint::reader_stuck(user),
+            fp,
+            fp_coverage: if fp_present {
+                crate::fingerprint::fprintd_coverage_live()
+            } else {
+                Vec::new()
+            },
+            pam_cache,
+            privacy_engaged: nodes.iter().any(|(p, _)| irlume_camera::privacy_engaged(p)),
+            pair_privacy: pairs
+                .iter()
+                .map(|p| {
+                    (
+                        p.rgb.clone(),
+                        irlume_camera::privacy_engaged(&p.rgb)
+                            || irlume_camera::privacy_engaged(&p.ir),
+                    )
+                })
+                .collect(),
+            selinux_enforcing: std::fs::read_to_string("/sys/fs/selinux/enforce")
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false),
+            selinux_socket_labeled: std::process::Command::new("ls")
+                .args(["-Z", "/run/irlume.sock"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("irlume_runtime_t"))
+                .unwrap_or(false),
+            login_wired: crate::pamwire::login_wired(),
+            fp_keyring_wired: crate::pamwire::fp_keyring_wired(),
+            tpm_present: crate::tpm_device().is_some(),
+            reconcile_needed: crate::pamwire::reconcile_needed(),
+            keyring_locked: crate::secrets::login_keyring_locked(),
+            secureboot: (
+                secureboot::secure_boot_present(),
+                secureboot::is_secure_boot_enabled(),
+                secureboot::is_setup_mode(),
+            ),
+            boot_mode: secureboot::detect_boot_mode().as_str().to_string(),
+        }
+    }
+}
+
+/// The cheap live poll's results (daemon socket reads + camera enumeration),
+/// also gathered off the UI thread: when the daemon is busy, even the SHORT
+/// poll budget is 1.5s per request, and paying that between keystrokes is
+/// what made the whole TUI feel wedged whenever the daemon was.
+struct LightState {
+    daemon_up: bool,
+    health: Option<HealthInfo>,
+    keyring_armed: Option<bool>,
+    keyring_policy: Option<String>,
+    keyring_drift: Option<bool>,
+    recovery: Option<RecoveryInfo>,
+    nodes: Vec<(String, irlume_camera::Role)>,
+    pairs: Vec<irlume_camera::CameraPair>,
+}
+
+impl LightState {
+    /// Verbatim the reads `refresh_light` used to make inline.
+    fn gather(user: &str, prev_armed: Option<bool>) -> Self {
+        let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
+        let mut out = LightState {
+            daemon_up,
+            health: None,
+            keyring_armed: prev_armed,
+            keyring_policy: None,
+            keyring_drift: None,
+            recovery: None,
+            nodes: irlume_camera::discover_nodes(),
+            pairs: irlume_camera::list_pairs(),
+        };
+        if !daemon_up {
+            return out;
+        }
+        out.health = match crate::daemon_poll(&Request::Health) {
+            Ok(Response::Health {
+                tier,
+                rgb_dev,
+                ir_dev,
+                mesh,
+                adapter,
+                version,
+                third_party_pad,
+                apparmor,
+            }) => Some(HealthInfo {
+                tier,
+                rgb_dev,
+                ir_dev,
+                mesh,
+                adapter,
+                version,
+                third_party_pad,
+                apparmor,
+            }),
+            _ => None, // older daemon / daemon down → Repair falls back to local probes
+        };
+        // KeyringInfo adds the seal tier and PCR drift; an older daemon
+        // answers it with an error, so fall back to the plain armed bit.
+        match crate::daemon_poll(&Request::KeyringInfo {
+            user: user.to_string(),
+        }) {
+            Ok(Response::KeyringInfo {
+                armed,
+                policy,
+                drifted,
+                ..
+            }) => {
+                out.keyring_armed = Some(armed);
+                out.keyring_policy = policy;
+                out.keyring_drift = drifted;
+            }
+            _ => {
+                out.keyring_armed = match crate::daemon_poll(&Request::HasSealedPassword {
+                    user: user.to_string(),
+                }) {
+                    Ok(Response::HasPassword(b)) => Some(b),
+                    _ => prev_armed,
+                };
+            }
+        }
+        if let Ok(Response::RecoveryStatus {
+            encrypted,
+            recovery_set,
+            tpm_present,
+        }) = crate::daemon_poll(&Request::RecoveryStatus {
+            user: user.to_string(),
+        }) {
+            out.recovery = Some(RecoveryInfo {
+                encrypted,
+                recovery_set,
+                tpm_present,
+            });
+        }
+        out
+    }
 }
 
 pub fn run(args: &[String]) -> std::io::Result<()> {
@@ -584,6 +865,14 @@ impl App {
             caps,
             fp_present,
             advanced: false,
+            profiles_load: None,
+            profiles_loaded: false,
+            probes: Probes::default(),
+            probes_load: None,
+            probes_landed: false,
+            light_load: None,
+            pam_cache: PamCache::default(),
+            fp_coverage: Vec::new(),
             spin: 0,
             quit: false,
         }
@@ -693,83 +982,47 @@ impl App {
         self.error = Some(m);
     }
 
-    /// CHEAP live poll (runs on the fast ~2.5s timer): daemon state + camera
-    /// nodes only; all sub-millisecond, no subprocess spawns. Keeps the panel
-    /// live without periodic UI hitches. SILENT (no Activity spam).
+    /// Request a CHEAP live poll (daemon state + camera nodes) on the worker;
+    /// `poll()` lands it. Even the short poll budget is 1.5s PER REQUEST when
+    /// the daemon is busy behind a slow TPM operation, and paying that
+    /// between keystrokes is what made the whole TUI feel wedged whenever the
+    /// daemon was. SILENT (no Activity spam).
     fn refresh_light(&mut self) {
-        // Short-budget poll: if the daemon isn't answering (down, or busy
-        // mid-capture and not accepting), fail fast and skip the rest of the
-        // reads rather than stalling the UI thread on each one. Next tick retries.
-        self.daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
-        if self.daemon_up {
-            self.health = match crate::daemon_poll(&Request::Health) {
-                Ok(Response::Health {
-                    tier,
-                    rgb_dev,
-                    ir_dev,
-                    mesh,
-                    adapter,
-                    version,
-                    third_party_pad,
-                    apparmor,
-                }) => Some(HealthInfo {
-                    tier,
-                    rgb_dev,
-                    ir_dev,
-                    mesh,
-                    adapter,
-                    version,
-                    third_party_pad,
-                    apparmor,
-                }),
-                _ => None, // older daemon / daemon down → Repair falls back to local probes
-            };
-            // KeyringInfo adds the seal tier and PCR drift; an older daemon
-            // answers it with an error, so fall back to the plain armed bit.
-            match crate::daemon_poll(&Request::KeyringInfo {
-                user: self.user.clone(),
-            }) {
-                Ok(Response::KeyringInfo {
-                    armed,
-                    policy,
-                    drifted,
-                    ..
-                }) => {
-                    self.keyring_armed = Some(armed);
-                    self.keyring_policy = policy;
-                    self.keyring_drift = drifted;
-                }
-                _ => {
-                    self.keyring_armed = match crate::daemon_poll(&Request::HasSealedPassword {
-                        user: self.user.clone(),
-                    }) {
-                        Ok(Response::HasPassword(b)) => Some(b),
-                        _ => self.keyring_armed,
-                    };
-                    self.keyring_policy = None;
-                    self.keyring_drift = None;
-                }
-            }
-            if let Ok(Response::RecoveryStatus {
-                encrypted,
-                recovery_set,
-                tpm_present,
-            }) = crate::daemon_poll(&Request::RecoveryStatus {
-                user: self.user.clone(),
-            }) {
-                self.recovery = Some(RecoveryInfo {
-                    encrypted,
-                    recovery_set,
-                    tpm_present,
-                });
-            }
-        } else {
-            // Daemon down/unresponsive: show the down state; local probes below
-            // still run so Repair can diagnose.
-            self.health = None;
+        if self.light_load.is_some() {
+            return;
         }
-        self.nodes = irlume_camera::discover_nodes();
-        self.pairs = irlume_camera::list_pairs();
+        let (tx, rx) = mpsc::channel();
+        let user = self.user.clone();
+        let prev_armed = self.keyring_armed;
+        std::thread::spawn(move || {
+            let _ = tx.send(LightState::gather(&user, prev_armed));
+        });
+        self.light_load = Some(rx);
+    }
+
+    /// Land a background light poll: the daemon reads plus the selection
+    /// clamps the inline version used to apply.
+    fn apply_light(&mut self, l: LightState) {
+        self.daemon_up = l.daemon_up;
+        // Daemon down/unresponsive: show the down state; the local probes
+        // still land via the heavy sweep so Repair can diagnose.
+        self.health = l.health;
+        if l.daemon_up {
+            self.keyring_armed = l.keyring_armed;
+            self.keyring_policy = l.keyring_policy;
+            self.keyring_drift = l.keyring_drift;
+            if l.recovery.is_some() {
+                self.recovery = l.recovery;
+            }
+        }
+        // The daemon just became reachable and no list was ever loaded (the
+        // startup attempt may have raced a still-booting daemon): fetch it
+        // now instead of waiting for a tab visit.
+        if self.daemon_up && !self.profiles_loaded && self.enroll_error.is_none() {
+            self.refresh_profiles();
+        }
+        self.nodes = l.nodes;
+        self.pairs = l.pairs;
         let max = self.rows().len().max(1);
         if self.sel >= max {
             self.sel = max - 1;
@@ -780,59 +1033,97 @@ impl App {
         }
     }
 
-    /// FULL refresh = cheap poll + the heavier probes (fingerprint via fprintd,
-    /// the Repair diagnostics which spawn `ls -Z` etc.). Runs on the slow timer,
-    /// on demand (`[r]`), after an op, and when opening Repair/Fingerprint, but
-    /// NOT every fast tick, so fprintd/subprocess calls can't hitch the UI.
-    /// Poll the enrollment list. This is the ONE slow read (a ListProfiles
-    /// triggers a TPM unseal of the template key to decrypt the profiles,
-    /// ~350ms measured), so it is kept OUT of the frequent refresh paths and
-    /// out of tab switches. Called only where a change can have happened: at
-    /// startup, after a TUI mutation, when entering the Profiles tab, and on
-    /// the slow heavy timer (for external `irlume enroll` changes).
-    fn refresh_profiles(&mut self) {
-        if !self.daemon_up {
+    /// Request the FULL machine sweep (fingerprint via fprintd, the PAM and
+    /// coverage walks, LSM and TPM probes) on the worker; `poll()` lands it
+    /// and recomputes the checks. See [`Probes`] for why this must never run
+    /// on the UI thread.
+    fn request_probes(&mut self) {
+        if self.probes_load.is_some() {
             return;
         }
-        match crate::daemon_poll(&Request::ListProfiles {
-            user: self.user.clone(),
-            structured_errors: false,
-        }) {
-            Ok(Response::Enrollment {
-                profiles,
-                require_eyes_open,
-                require_challenge,
-                ..
-            }) => {
-                self.profiles = profiles;
-                self.eyes_open = require_eyes_open;
-                self.challenge = require_challenge;
-                self.enroll_error = None;
-            }
-            // A corrupt/unreadable enrollment (or a missing template key for an
-            // encrypted file) surfaces as an Error, not empty; don't silently
-            // show "no face enrolled"; capture it so Repair can flag+fix it.
-            Ok(Response::Error(e)) => self.enroll_error = Some(e),
-            _ => {}
-        }
+        let (tx, rx) = mpsc::channel();
+        let user = self.user.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Probes::gather(&user));
+        });
+        self.probes_load = Some(rx);
     }
 
-    /// Re-derive hardware caps + fingerprint + the Repair checklist from the
-    /// CURRENT state (daemon reads + self.profiles). Split out so both refresh
-    /// paths run it AFTER their state reads, and run_checks never sees stale
-    /// profiles (a startup ordering bug showed a spurious "no enrollment" warn).
+    /// Start a BACKGROUND enrollment-list load; `poll()` lands the result.
+    /// This is the ONE slow read: ListProfiles triggers a TPM unseal of the
+    /// template key to decrypt the profiles, ~350ms on the reference Zenbook
+    /// and a MEASURED 10.8s on a ThinkPad X13 Yoga Gen 4 (its TPM workqueue
+    /// hogging; dmesg said so). Run inline it froze the UI for the whole
+    /// unseal, and the 1.5s poll budget then abandoned the reply entirely, so
+    /// that machine never saw its profiles at all. The worker gets a budget
+    /// sized to the slowest TPM observed, and the UI keeps drawing. Called
+    /// only where a change can have happened: at startup, after a TUI
+    /// mutation, and when entering the Profiles tab.
+    fn refresh_profiles(&mut self) {
+        // No daemon_up gate: at startup the async light poll has not landed
+        // yet, so the flag still reads false and gating on it meant the
+        // profile list never loaded until the user visited the Profiles tab
+        // (seen live: an enrolled machine's Repair row claiming "no face
+        // enrolled"). A down daemon just costs the worker a fast connect
+        // error, reported as a Transport outcome.
+        if self.profiles_load.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let user = self.user.clone();
+        std::thread::spawn(move || {
+            let outcome = match irlume_common::client::request_with_timeout(
+                &Request::ListProfiles {
+                    user,
+                    structured_errors: false,
+                },
+                std::time::Duration::from_secs(60),
+            ) {
+                Ok(Response::Enrollment {
+                    profiles,
+                    require_eyes_open,
+                    require_challenge,
+                    ..
+                }) => ProfilesOutcome::Loaded {
+                    profiles,
+                    eyes_open: require_eyes_open,
+                    challenge: require_challenge,
+                },
+                // A corrupt/unreadable enrollment (or a missing template key
+                // for an encrypted file) surfaces as an Error, not empty;
+                // don't silently show "no face enrolled"; capture it so
+                // Repair can flag+fix it.
+                Ok(Response::Error(e)) => ProfilesOutcome::DaemonError(e),
+                Ok(_) => ProfilesOutcome::Transport("unexpected daemon reply".into()),
+                Err(e) => ProfilesOutcome::Transport(e.to_string()),
+            };
+            let _ = tx.send(outcome);
+        });
+        self.profiles_load = Some(rx);
+    }
+
+    /// Re-derive hardware caps + fingerprint + the PAM/coverage caches + the
+    /// Repair checklist from the CURRENT state (daemon reads + self.profiles).
+    /// Split out so both refresh paths run it AFTER their state reads, and
+    /// run_checks never sees stale profiles (a startup ordering bug showed a
+    /// spurious "no enrollment" warn; the async profile load closes the same
+    /// hole by reporting "loading" instead of "none" while in flight).
     fn recompute_checks(&mut self) {
-        // Re-derive hardware capabilities so a camera or reader hot-plugged
-        // after launch reveals its tabs (caps/fp_present drive `visible` and the
-        // Welcome gates, and were otherwise frozen at startup).
-        self.caps = irlume_camera::capabilities();
-        self.fp_present = irlume_fingerprint::available();
-        self.fp = FpInfo {
-            available: self.fp_present,
-            device: irlume_fingerprint::device_name(),
-            enrolled: irlume_fingerprint::enrolled_fingers(&self.user),
-            method: irlume_core::policy::method().as_str().to_string(),
-        };
+        // Copy the landed snapshot into the fields draw reads (hardware caps
+        // so a hot-plugged camera or reader reveals its tabs, the fingerprint
+        // trio, the PAM screen's cache, the coverage table), then rebuild the
+        // checklist. Everything here is in-memory: the machine was observed
+        // by `Probes::gather` on the worker. Before the FIRST sweep lands the
+        // snapshot holds defaults, and defaults are not observations: copying
+        // them would erase the capabilities `App::new` detected and hide the
+        // camera screens until the sweep arrives.
+        if self.probes_landed {
+            self.caps = self.probes.caps;
+            self.fp_present = self.probes.fp_present;
+            self.fp = self.probes.fp.clone();
+            self.pam_cache = self.probes.pam_cache.clone();
+            self.fp_coverage = self.probes.fp_coverage.clone();
+        }
         self.run_checks();
         // Visibility is state-driven (Repair appears when something fails);
         // re-derive it from the fresh diagnostics.
@@ -845,17 +1136,23 @@ impl App {
     /// TPM-unseal cost.
     fn refresh_diagnostics(&mut self) {
         self.refresh_light();
-        self.recompute_checks();
+        self.request_probes();
     }
 
     /// Full refresh incl. the slow profile poll: startup, after mutations, and
     /// suspend-return. Order matters: refresh_light sets `daemon_up` (which
     /// refresh_profiles needs), profiles load, THEN recompute_checks runs so
     /// run_checks sees the fresh profile list (not the stale/empty one).
+    /// Full refresh: request daemon state, enrollment state, and the complete
+    /// machine snapshot. Existing landed state stays visible until the
+    /// replacements arrive through `poll()`; recomputing here would copy a
+    /// default (unlanded) snapshot over real observations, which at startup
+    /// erased the capabilities `App::new` had just detected and hid whole
+    /// screens for the first ten seconds.
     fn refresh(&mut self) {
         self.refresh_light();
         self.refresh_profiles();
-        self.recompute_checks();
+        self.request_probes();
     }
 
     /// Build the Repair-tab diagnostics from current state + quick local probes.
@@ -868,7 +1165,12 @@ impl App {
             fix,
         };
 
-        let up = matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong));
+        // refresh_light already pinged with the SHORT poll budget and both
+        // refresh paths run it first; asking again here with daemon_request's
+        // 120s budget meant every heavy tick blocked the UI for the whole
+        // arbiter queue whenever the daemon was busy (measured: ~9s per tab
+        // press on a ThinkPad while a TPM-bound ListProfiles was in flight).
+        let up = self.daemon_up;
         v.push(mk(
             "Daemon (irlumed)",
             if up { Sev::Ok } else { Sev::Fail },
@@ -906,10 +1208,7 @@ impl App {
                 Fix::None,
             ));
             // Camera row from the daemon's validated tier (never the raw fallback).
-            let priv_on = self
-                .nodes
-                .iter()
-                .any(|(p, _)| irlume_camera::privacy_engaged(p));
+            let priv_on = self.probes.privacy_engaged;
             let (csev, cdetail, cfix) = match h.tier.as_str() {
                 _ if priv_on => (Sev::Warn, "camera present, but a privacy switch is ON".to_string(),
                     Fix::Manual("turn off the camera privacy switch".into())),
@@ -996,10 +1295,7 @@ impl App {
                 .nodes
                 .iter()
                 .any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
-            let priv_on = self
-                .nodes
-                .iter()
-                .any(|(p, _)| irlume_camera::privacy_engaged(p));
+            let priv_on = self.probes.privacy_engaged;
             let (csev, cdetail, cfix) = if !rgb && !ir {
                 (
                     Sev::Warn,
@@ -1036,19 +1332,12 @@ impl App {
             }
         }
 
-        if std::fs::read_to_string("/sys/fs/selinux/enforce")
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false)
-        {
-            let labeled = std::process::Command::new("ls")
-                .args(["-Z", "/run/irlume.sock"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("irlume_runtime_t"))
-                .unwrap_or(false);
+        if self.probes.selinux_enforcing {
+            let labeled = self.probes.selinux_socket_labeled;
             // Only a FAILURE once login is wired (the greeter actually needs it
             // then). Pre-wiring it's informational: `login enable --apply`
             // loads the module itself, so don't alarm a fresh install.
-            let wired = crate::pamwire::login_wired();
+            let wired = self.probes.login_wired;
             v.push(mk(
                 "SELinux policy",
                 if labeled {
@@ -1079,6 +1368,16 @@ impl App {
             v.push(mk("Enrollment", Sev::Fail,
                 format!("enrollment unreadable: {err}"),
                 Fix::Manual("restore the backup, or re-enroll (Profiles → [e]); if encrypted, the template key may be missing".into())));
+        } else if self.profiles_load.is_some() && self.profiles.is_empty() {
+            // The list is still loading in the background (a slow TPM makes
+            // this take seconds): "no face enrolled" would be a claim about
+            // state nobody has observed yet.
+            v.push(mk(
+                "Enrollment",
+                Sev::Ok,
+                "loading profiles…".into(),
+                Fix::None,
+            ));
         } else {
             v.push(mk(
                 "Enrollment",
@@ -1132,7 +1431,7 @@ impl App {
         // Fingerprint reader health: a crashed/aborted enrollment leaves the
         // device CLAIMED and pam_fprintd fails silently (no finger prompt).
         if self.fp.available {
-            if irlume_fingerprint::reader_stuck(&self.user) {
+            if self.probes.reader_stuck {
                 v.push(mk(
                     "Fingerprint reader",
                     Sev::Fail,
@@ -1150,7 +1449,15 @@ impl App {
         }
         // Method ↔ PAM-wiring coherence: competing biometric stacks intercept
         // each other's prompts; a chosen method that isn't wired does nothing.
-        // Active (non-comment) PAM lines only; a commented-out module is not wired.
+        // Matched on the DIRECTIVE part (everything before the first '#', all
+        // libpam tokenizes), via the same shared semantics as the wiring: a
+        // module named only in a trailing comment is not wired, and reading it
+        // as wired would suppress this exact Fail diagnostic. `pam_has` stays
+        // a substring scan because its callers hunt LEFTOVERS of other tools
+        // wherever they appear on an active line; the fprintd check below
+        // instead asks "does an auth RULE run this module", the same parsed
+        // question the enable gate asks, so a session line or an argument
+        // naming the file cannot suppress the not-wired Fail.
         let pam_has = |needle: &str| {
             ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
                 .iter()
@@ -1158,12 +1465,21 @@ impl App {
                     std::fs::read_to_string(p)
                         .map(|s| {
                             s.lines()
-                                .any(|l| !l.trim_start().starts_with('#') && l.contains(needle))
+                                .any(|l| crate::pamwire::directive(l).contains(needle))
                         })
                         .unwrap_or(false)
                 })
         };
-        let fprintd_wired = pam_has("pam_fprintd");
+        let fprintd_wired = ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
+            .iter()
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| {
+                        s.lines()
+                            .any(|l| crate::pamwire::directive_has_auth_module(l, "pam_fprintd.so"))
+                    })
+                    .unwrap_or(false)
+            });
         match self.fp.method.as_str() {
             "fingerprint" => {
                 if !fprintd_wired {
@@ -1193,11 +1509,11 @@ impl App {
                 // (TPM-seal the password) AND the greeter carries the `keyring`
                 // line. Surface it so the user isn't left typing the keyring
                 // password after every fingerprint login.
-                if fprintd_wired && !self.fp.enrolled.is_empty() && crate::tpm_device().is_some() {
+                if fprintd_wired && !self.fp.enrolled.is_empty() && self.probes.tpm_present {
                     let armed = self.keyring_armed.unwrap_or(false);
                     // DM-aware: the keyring line must be in EVERY login service
                     // the active DM uses (GDM: gdm-password AND gdm-fingerprint).
-                    let wired = crate::pamwire::fp_keyring_wired();
+                    let wired = self.probes.fp_keyring_wired;
                     if !armed {
                         v.push(mk(
                             "FP keyring unlock",
@@ -1256,7 +1572,7 @@ impl App {
         // Wiring drift: login WAS enabled (marker) but the active greeter's
         // stack lost the module (authselect/pam-auth-update regenerated the
         // PAM files). Face silently falls back to password until re-applied.
-        if crate::pamwire::reconcile_needed() {
+        if self.probes.reconcile_needed {
             v.push(mk(
                 "Login wiring",
                 Sev::Fail,
@@ -1345,7 +1661,7 @@ impl App {
         // armed (else it's expected) and a provider actually answered. The TUI
         // runs as the user, so unlike `sudo doctor` it can see the session bus.
         if self.keyring_armed == Some(true) {
-            if let Some(true) = crate::secrets::login_keyring_locked() {
+            if let Some(true) = self.probes.keyring_locked {
                 v.push(mk(
                     "Login keyring",
                     Sev::Warn,
@@ -1425,7 +1741,7 @@ impl App {
         let tpm = self
             .recovery
             .map(|r| r.tpm_present)
-            .unwrap_or_else(|| crate::tpm_device().is_some());
+            .unwrap_or(self.probes.tpm_present);
         if !tpm {
             v.push(mk("TPM", Sev::Warn,
                 "no TPM: templates stored root-only plaintext; keyring auto-unlock unavailable (face login/sudo still work)".into(),
@@ -1433,8 +1749,8 @@ impl App {
         } else {
             // Secure Boot binds the TPM seal to the boot state (PCR-7). Off ⇒ the
             // seal still works but isn't tamper-bound to a trusted boot chain.
-            use irlume_common::secureboot;
-            if secureboot::secure_boot_present() && !secureboot::is_secure_boot_enabled() {
+            let (sb_present, sb_enabled, _) = self.probes.secureboot;
+            if sb_present && !sb_enabled {
                 v.push(mk("Secure Boot", Sev::Warn,
                     "Secure Boot is OFF; TPM seals still work but aren't bound to a trusted boot chain (weaker tamper resistance)".into(),
                     Fix::Manual("optional: enable Secure Boot in firmware for boot-state-bound sealing".into())));
@@ -1640,6 +1956,52 @@ impl App {
     }
 
     fn poll(&mut self) {
+        if let Some(rx) = &self.light_load {
+            if let Ok(l) = rx.try_recv() {
+                self.light_load = None;
+                self.apply_light(l);
+                // The checklist reads daemon_up/health; rebuild it from the
+                // fresh reads (pure: no probes are taken here).
+                self.run_checks();
+                self.recompute_visible();
+            }
+        }
+        if let Some(rx) = &self.probes_load {
+            if let Ok(p) = rx.try_recv() {
+                self.probes_load = None;
+                self.probes = p;
+                self.probes_landed = true;
+                self.recompute_checks();
+            }
+        }
+        if let Some(rx) = &self.profiles_load {
+            if let Ok(outcome) = rx.try_recv() {
+                self.profiles_load = None;
+                match outcome {
+                    ProfilesOutcome::Loaded {
+                        profiles,
+                        eyes_open,
+                        challenge,
+                    } => {
+                        self.profiles = profiles;
+                        self.eyes_open = eyes_open;
+                        self.challenge = challenge;
+                        self.enroll_error = None;
+                        self.profiles_loaded = true;
+                    }
+                    ProfilesOutcome::DaemonError(e) => self.enroll_error = Some(e),
+                    // Transport failures are not state: the previous list
+                    // stays, the next refresh retries, and the Activity log
+                    // says why the list may be stale.
+                    ProfilesOutcome::Transport(e) => {
+                        self.log('·', format!("profile list not refreshed: {e}"));
+                    }
+                }
+                // The checks read the profile list (the no-enrollment warn);
+                // recompute now that it is current.
+                self.recompute_checks();
+            }
+        }
         if let Some(op) = &self.op {
             if let Ok((ok, msg)) = op.rx.try_recv() {
                 let tag = op.tag;
@@ -1820,7 +2182,7 @@ impl App {
                 if self.resume_enroll.is_some() && !self.daemon_up {
                     for _ in 0..DAEMON_WAIT_TRIES {
                         std::thread::sleep(Duration::from_millis(DAEMON_WAIT_POLL_MS));
-                        if matches!(crate::daemon_request(&Request::Ping), Ok(Response::Pong)) {
+                        if matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong)) {
                             self.daemon_up = true;
                             break;
                         }
@@ -1972,6 +2334,10 @@ impl App {
                 &["irlume", "set-cameras", &rgb, &ir],
             ),
             Suspend::IrSetup => self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
+            Suspend::CameraTune => self.sudo_step(
+                "measure simultaneous RGB+IR capture",
+                &["irlume", "camera-tune"],
+            ),
             Suspend::BitwardenSetup => self.sudo_step(
                 "install Bitwarden's polkit action",
                 &["irlume", "bitwarden", "setup", "--apply"],
@@ -2438,6 +2804,31 @@ impl App {
             (SC_CAMERAS, KeyCode::Char('s')) => {
                 self.log('→', "sudo irlume ir-setup: set up the 850nm emitter; this writes to the camera (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
+            }
+            // Capture-mode tuning: some Hello modules starve their own RGB
+            // interface when both stream, others keep the faster concurrent
+            // path; only a measurement can tell which camera this is. Said
+            // up front because it holds the camera for a while (#170).
+            (SC_CAMERAS, KeyCode::Char('t')) => {
+                // A modal, not an Activity line: the log-then-suspend shape
+                // never RENDERS before the terminal leaves the alt screen (the
+                // frame was drawn before the key was read, and the suspend
+                // runs in the same loop iteration), so the explanation the
+                // route promises would appear only after the run (#204
+                // review). The confirm modal is drawn before any key can
+                // schedule the suspend, which is the existing shape of every
+                // other consequential route here.
+                self.confirm = Some((
+                    concat!(
+                        "Tune capture mode? This holds the camera and fires the ",
+                        "IR emitter for up to a minute, then stores the verdict ",
+                        "in /etc/irlume/cameras.conf. Your password will be ",
+                        "requested."
+                    )
+                        .into(),
+                    "Tune",
+                    ConfirmAct::Sus(Suspend::CameraTune),
+                ));
             }
             (SC_CAMERAS, KeyCode::Char('p')) => self.start_async(
                 "IR emitter units",
@@ -3257,8 +3648,16 @@ impl App {
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
         if self.profiles.is_empty() {
-            f.render_widget(Paragraph::new("\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically.")
-                .wrap(Wrap { trim: false }).dim(), area);
+            // The list loads in the background (a TPM unseal, seconds on slow
+            // TPMs). Until it lands, an empty list is "not loaded yet", and
+            // saying "no profiles" would tell an enrolled user their face is
+            // gone every time they open this tab.
+            let msg = if self.profiles_load.is_some() {
+                "\nLoading profiles… (decrypting the enrollment under the TPM key)"
+            } else {
+                "\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically."
+            };
+            f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }).dim(), area);
             return;
         }
         let rows = self.rows();
@@ -3543,8 +3942,11 @@ impl App {
                     let active = p.rgb == argb && p.ir == air;
                     let kind = if p.fixed { "built-in" } else { "external" };
                     let id = p.id.clone().unwrap_or_else(|| "?".into());
-                    let priv_on = irlume_camera::privacy_engaged(&p.rgb)
-                        || irlume_camera::privacy_engaged(&p.ir);
+                    let priv_on = self
+                        .probes
+                        .pair_privacy
+                        .iter()
+                        .any(|(rgb, on)| *on && *rgb == p.rgb);
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
@@ -3636,6 +4038,11 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled("  [s]", Style::new().fg(th().accent)),
             Span::styled(" set up emitter   ", Style::new().dim()),
+            Span::styled("[t]", Style::new().fg(th().accent)),
+            Span::styled(
+                " tune capture (holds the camera ~1 min)   ",
+                Style::new().dim(),
+            ),
             Span::styled("[p]", Style::new().fg(th().accent)),
             Span::styled(" list units (writes nothing)", Style::new().dim()),
         ]));
@@ -3677,6 +4084,30 @@ impl App {
                 "  Stock fprintd + pam_fprintd; unlocks alongside face, never instead.",
                 Style::new().dim(),
             )));
+            // Per-surface coverage (#155), the same table `fingerprint status`
+            // prints: which prompts a finger actually answers, over the same
+            // search path libpam uses (machine then vendor, #208).
+            // Shown only when at least one surface reaches the module; a
+            // face-only box would render a column of ✗ noise.
+            if self.fp_coverage.iter().any(|(_, _, reaches)| *reaches) {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "  Where a finger can answer the prompt (per the PAM service path):",
+                    Style::new().dim(),
+                )));
+                for (_, label, reaches) in &self.fp_coverage {
+                    let mark = if *reaches {
+                        Span::styled("✓ ", Style::new().fg(th().ok))
+                    } else {
+                        Span::styled("✗ ", Style::new().dim())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        mark,
+                        Span::styled((*label).to_string(), Style::new().dim()),
+                    ]));
+                }
+            }
             lines.push(Line::raw(""));
             lines.push(action_line(&[
                 ("a", "enroll a finger"),
@@ -3759,7 +4190,7 @@ impl App {
             Some(false) => Span::styled("○ not armed", Style::new().dim()),
             None => Span::styled("unknown (daemon unreachable)", Style::new().dim()),
         };
-        let tpm = crate::tpm_device().is_some();
+        let tpm = self.probes.tpm_present;
         let mut lines = vec![
             section("TPM keyring unlock"),
             Line::from(vec![Span::raw("  state    "), status]),
@@ -3894,7 +4325,7 @@ impl App {
                 rec.encrypted && rec.recovery_set,
                 SC_RECOVERY,
             ),
-            ("login wiring", crate::pamwire::login_wired(), SC_PAM),
+            ("login wiring", self.probes.login_wired, SC_PAM),
             ("settings", true, SC_SETTINGS),
         ];
         all.into_iter()
@@ -4035,7 +4466,6 @@ impl App {
     /// advisory-only doctor lines (fingerprint
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
-        use irlume_common::secureboot;
         let [list_area, info_area] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(9)]).areas(area);
 
@@ -4085,11 +4515,12 @@ impl App {
         );
 
         // ---- info / platform / live test --------------------------------
-        let sb = if secureboot::is_secure_boot_enabled() {
+        let (sb_present, sb_enabled, sb_setup) = self.probes.secureboot;
+        let sb = if sb_enabled {
             ("enabled", th().ok)
-        } else if secureboot::is_setup_mode() {
+        } else if sb_setup {
             ("setup mode", th().warn)
-        } else if secureboot::secure_boot_present() {
+        } else if sb_present {
             ("disabled", th().warn)
         } else {
             ("n/a", th().warn)
@@ -4127,7 +4558,7 @@ impl App {
             Span::styled(
                 format!(
                     "TPM {} · ",
-                    if crate::tpm_device().is_some() {
+                    if self.probes.tpm_present {
                         "✓"
                     } else {
                         "✗"
@@ -4136,10 +4567,7 @@ impl App {
                 Style::new(),
             ),
             Span::styled(format!("Secure Boot {} · ", sb.0), Style::new().fg(sb.1)),
-            Span::styled(
-                secureboot::detect_boot_mode().as_str().to_string(),
-                Style::new().dim(),
-            ),
+            Span::styled(self.probes.boot_mode.clone(), Style::new().dim()),
         ]));
         lines.push(Line::from(vec![
             Span::styled("  PCR policy ", Style::new().dim()),
@@ -4217,11 +4645,13 @@ impl App {
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![section("PAM services (face auth wiring)")];
-        // Inline per-service status, same data as `irlume login status`.
-        for (label, present, wired) in crate::pamwire::status_report() {
+        // Everything below renders `self.pam_cache`, computed with the
+        // diagnostics: draw used to re-read every PAM service file and probe
+        // the LSM on EVERY FRAME, which is I/O in a render loop.
+        for (label, present, wired) in &self.pam_cache.rows {
             let val = if !present {
                 Span::styled("(not present)", Style::new().dim())
-            } else if wired {
+            } else if *wired {
                 Span::styled(
                     "● wired",
                     Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
@@ -4231,11 +4661,28 @@ impl App {
             };
             lines.push(Line::from(vec![Span::raw(format!("  {label:<16}")), val]));
         }
+        // The #200 advisory, same walk as `login status`: a wired greeter
+        // whose released password nothing turns into an open wallet is the
+        // one failure the user sees as "KWallet prompts anyway", and every
+        // other row here says wired ✓ while it happens.
+        for w in &self.pam_cache.handoffs {
+            let detail = match w.auth_only {
+                Some(m) => format!(
+                    "  ⚠ {}: {m} reads the password but has no session line; the wallet will still prompt",
+                    w.service
+                ),
+                None => format!(
+                    "  ⚠ {}: nothing reads the released password; the wallet will still prompt",
+                    w.service
+                ),
+            };
+            lines.push(Line::from(Span::styled(detail, Style::new().fg(th().err))));
+        }
         // LSM row is distro-aware: SELinux (Fedora-family), AppArmor
         // (Debian/Ubuntu-family), or nothing (e.g. Arch default); showing a
         // SELinux row on a non-SELinux system reads as a fault that isn't one.
-        if std::path::Path::new("/sys/fs/selinux").exists() {
-            let sel = match crate::pamwire::selinux_state() {
+        if self.pam_cache.selinux_present {
+            let sel = match self.pam_cache.selinux {
                 Some(true) => Span::styled("● loaded", Style::new().fg(th().ok)),
                 Some(false) => Span::styled("✗ not loaded", Style::new().fg(th().err)),
                 None => Span::styled("unknown (needs root)", Style::new().dim()),
@@ -4251,9 +4698,6 @@ impl App {
             // install). Fall back to the on-disk-profile heuristic only for an
             // older daemon that doesn't report the field.
             let aa = self.health.as_ref().and_then(|h| h.apparmor.as_deref());
-            let enabled = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
-                .map(|s| s.trim() == "Y")
-                .unwrap_or(false);
             let val = match aa {
                 Some(l) if l.contains("unconfined") => Some(Span::styled(
                     "✗ daemon UNCONFINED (profile installed but not loaded)",
@@ -4267,10 +4711,8 @@ impl App {
                     "● daemon confined (enforce)",
                     Style::new().fg(th().ok),
                 )),
-                None if enabled => {
-                    let profiled = std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
-                        || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists();
-                    Some(if profiled {
+                None if self.pam_cache.apparmor_enabled => {
+                    Some(if self.pam_cache.apparmor_profiled {
                         Span::styled("● irlume profile installed", Style::new().fg(th().ok))
                     } else {
                         Span::styled(
@@ -4415,7 +4857,7 @@ impl App {
     fn draw_done(&self, f: &mut Frame, area: Rect) {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         let rec = self.recovery.unwrap_or_default();
-        let wired = crate::pamwire::login_wired();
+        let wired = self.probes.login_wired;
         let lines = vec![
             section("Setup dashboard"),
             Line::raw(""),
@@ -5128,6 +5570,14 @@ mod tests {
             advanced: false,
             caps,
             fp_present: false,
+            profiles_load: None,
+            profiles_loaded: false,
+            probes: Probes::default(),
+            probes_load: None,
+            probes_landed: false,
+            light_load: None,
+            pam_cache: PamCache::default(),
+            fp_coverage: Vec::new(),
             spin: 0,
             quit: false,
         }
@@ -5223,6 +5673,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.enroll.is_none(), "enroll worker never finished");
+    }
+
+    /// Wait for every in-flight background load to land (or the budget to
+    /// run out), so a test that triggered spawns does not leak workers into
+    /// the NEXT test's environment: a leaked worker reads IRLUME_SOCKET at
+    /// request time and connects to whatever socket that test set up.
+    fn drain_loads(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (app.light_load.is_some() || app.probes_load.is_some() || app.profiles_load.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Render the full frame at 120x50 and return the flattened text.
@@ -5643,19 +6107,24 @@ mod tests {
     // a re-derived one cannot.
     #[test]
     fn refresh_rederives_hardware_capabilities() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("IRLUME_SOCKET", "/nonexistent/irlume-test.sock");
+        // The async flavor of the old property: a LANDED sweep replaces a
+        // stale capability snapshot. refresh() itself only requests
+        // (full_refresh_requests_the_machine_snapshot pins that), and an
+        // unlanded snapshot must replace nothing
+        // (full_refresh_does_not_replace_known_caps_with_unobserved_defaults).
+        let _guard = dead_socket();
         let impossible = irlume_camera::Caps {
             ir_pair: true,
             rgb: false,
         };
         let mut app = test_app();
         app.caps = impossible;
-        app.refresh();
-        std::env::remove_var("IRLUME_SOCKET");
+        app.probes = Probes::default(); // an observed no-camera machine
+        app.probes_landed = true;
+        app.recompute_checks();
         assert_ne!(
             app.caps, impossible,
-            "refresh() left the startup capability snapshot in place"
+            "a landed sweep must replace the stale capability snapshot"
         );
         assert!(
             app.caps.rgb || !app.caps.ir_pair,
@@ -5709,6 +6178,33 @@ mod tests {
             }
         });
         std::env::set_var("IRLUME_SOCKET", &sock);
+        // The gather itself (now on a worker) still short-circuits: one
+        // unanswered Ping, nothing else touches the wedged daemon.
+        let start = std::time::Instant::now();
+        let l = LightState::gather("testuser", None);
+        assert!(!l.daemon_up, "an unanswered Ping means the daemon is down");
+        assert!(l.health.is_none());
+        // Not an exact count: other tests' background workers are detached
+        // and one can connect to whatever IRLUME_SOCKET names at that moment,
+        // which put a stray accept here on the archhost runner. The bound
+        // still discriminates the defect this guards: a gather that does NOT
+        // skip after the failed Ping makes five connections BY ITSELF
+        // (Ping, Health, KeyringInfo, HasSealedPassword, RecoveryStatus), so
+        // any non-skipping gather fails this even with zero strays.
+        let accepted = accepted.load(Ordering::SeqCst);
+        assert!(
+            (1..5).contains(&accepted),
+            "a wedged daemon may see the Ping probe (plus a stray worker), never \
+             the full poll set; accepted {accepted}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the status poll must fail fast, not sit through full read budgets"
+        );
+        // And the UI-thread side never blocks at all: refresh_light only
+        // SPAWNS the gather. This is the property the whole async split
+        // exists for; the inline version cost up to one full poll budget
+        // per tick against a busy daemon.
         let mut app = test_app();
         app.daemon_up = true;
         app.health = Some(HealthInfo {
@@ -5723,22 +6219,23 @@ mod tests {
         });
         let start = std::time::Instant::now();
         app.refresh_light();
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "refresh_light must not block the UI thread"
+        );
+        assert!(app.light_load.is_some(), "a gather must be in flight");
+        // Landing the wedge result applies it: daemon down, stale health gone.
+        for _ in 0..200 {
+            app.poll();
+            if !app.daemon_up {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
         std::env::remove_var("IRLUME_SOCKET");
         let _ = std::fs::remove_file(&sock);
-        assert!(
-            !app.daemon_up,
-            "an unanswered Ping means the daemon is down"
-        );
+        assert!(!app.daemon_up, "the landed wedge result must apply");
         assert!(app.health.is_none(), "stale health must be cleared");
-        assert_eq!(
-            accepted.load(Ordering::SeqCst),
-            1,
-            "only the Ping probe may touch a wedged daemon; the rest must be skipped"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "the status poll must fail fast, not sit through full read budgets"
-        );
     }
 
     // Regression: 1da8bd3. After a merge confirm the continuation worker
@@ -6469,6 +6966,39 @@ mod tests {
         app.on_key(KeyCode::Char('s'));
         assert!(matches!(app.suspend, Some(Suspend::IrSetup)));
         app.suspend = None;
+        // [t] routes capture tuning to sudo (#170: previously no TUI route),
+        // through a confirm modal so the effects are RENDERED before anything
+        // can run: the first version logged an Activity line in the same loop
+        // iteration as the suspend, which never reached the screen (#204
+        // review), and its test read the in-memory vector, which could not
+        // notice.
+        app.on_key(KeyCode::Char('t'));
+        assert!(
+            app.suspend.is_none(),
+            "[t] must show the effects before scheduling camera-tune"
+        );
+        // The popup wraps its message at the box edge, so reflow the rendered
+        // text before asserting: borders become spaces, runs of whitespace
+        // collapse, and the phrases read as written regardless of wrap point.
+        let text = draw_text(&app);
+        let flat = text
+            .replace(['│', '╭', '╮', '╰', '╯', '─'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("fires the IR emitter for up to a minute")
+                && flat.contains("/etc/irlume/cameras.conf")
+                && flat.contains("password will be requested"),
+            "the pre-run confirmation must render every material effect:\n{text}"
+        );
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::CameraTune)));
+        app.suspend = None;
+        // And [n] declines without scheduling anything.
+        app.on_key(KeyCode::Char('t'));
+        app.on_key(KeyCode::Char('n'));
+        assert!(app.suspend.is_none() && app.confirm.is_none());
         app.on_key(KeyCode::Char('p'));
         assert!(app.op.is_some(), "[p] starts the read-only emitter probe");
         wait_op_done(&mut app);
@@ -7063,6 +7593,197 @@ mod tests {
     }
 
     #[test]
+    fn a_loading_profile_list_never_reads_as_no_profiles() {
+        // The list loads in the background (a TPM unseal, 10.8s measured on
+        // one machine). Until it lands, an empty list is "not loaded yet";
+        // claiming "no profiles" told an enrolled user their face was gone.
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        let text = draw_text(&app);
+        assert!(text.contains("Loading profiles"), "{text}");
+        assert!(
+            !text.contains("No face profiles yet"),
+            "an unloaded list must not claim absence"
+        );
+    }
+
+    #[test]
+    fn poll_lands_the_background_profile_list() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["s1"])],
+            eyes_open: true,
+            challenge: false,
+        })
+        .unwrap();
+        app.poll();
+        assert!(app.profiles_load.is_none(), "the landed load must clear");
+        assert_eq!(app.profiles.len(), 1);
+        assert!(app.eyes_open);
+
+        // A daemon-side error is STATE (corrupt enrollment): it lands on
+        // enroll_error so Repair can flag it, exactly as the sync path did.
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::DaemonError("corrupt".into()))
+            .unwrap();
+        app.poll();
+        assert_eq!(app.enroll_error.as_deref(), Some("corrupt"));
+
+        // A transport failure is NOT state: the loaded list stays, and the
+        // next refresh retries.
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Transport("timeout".into()))
+            .unwrap();
+        app.poll();
+        assert_eq!(
+            app.profiles.len(),
+            1,
+            "a failed refresh must not clear the list"
+        );
+    }
+
+    #[test]
+    fn an_observed_empty_profile_list_is_not_reloaded_by_every_light_poll() {
+        // An empty list is valid observed state (a new machine). Deriving
+        // "never loaded" from emptiness made every light poll start another
+        // TPM-backed listing, each occupying the daemon worker a login then
+        // waits behind.
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: Vec::new(),
+            eyes_open: false,
+            challenge: false,
+        })
+        .unwrap();
+        app.poll();
+        assert!(app.profiles_loaded);
+        assert!(app.profiles_load.is_none());
+        app.apply_light(LightState {
+            daemon_up: true,
+            health: None,
+            keyring_armed: None,
+            keyring_policy: None,
+            keyring_drift: None,
+            recovery: None,
+            nodes: Vec::new(),
+            pairs: Vec::new(),
+        });
+        assert!(
+            app.profiles_load.is_none(),
+            "a valid observed empty enrollment must not trigger another listing"
+        );
+    }
+
+    #[test]
+    fn full_refresh_requests_the_machine_snapshot() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        assert!(app.probes_load.is_none());
+        app.refresh();
+        assert!(
+            app.probes_load.is_some(),
+            "startup/manual full refresh must launch the heavy snapshot"
+        );
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn full_refresh_does_not_replace_known_caps_with_unobserved_defaults() {
+        // App::new observed real hardware; a refresh before the first sweep
+        // lands must not overwrite that with Probes::default() and hide the
+        // camera screens.
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.refresh();
+        app.recompute_checks();
+        assert!(app.caps.ir_pair);
+        assert!(app.caps.rgb);
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn the_repair_enrollment_row_says_loading_while_the_list_is_in_flight() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (_tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        app.run_checks();
+        let row = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Enrollment")
+            .expect("an Enrollment row");
+        assert!(row.detail.contains("loading"), "{}", row.detail);
+        assert!(
+            !row.detail.contains("no face enrolled"),
+            "an in-flight load must not read as absence: {}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn the_pam_screen_renders_cached_state_and_the_handoff_warning() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        app.pam_cache = PamCache {
+            rows: vec![("plasmalogin".into(), true, true)],
+            selinux_present: false,
+            selinux: None,
+            apparmor_enabled: false,
+            apparmor_profiled: false,
+            handoffs: vec![crate::pamwire::HandoffWarning {
+                service: "/etc/pam.d/plasmalogin",
+                auth_only: None,
+            }],
+        };
+        let text = draw_text(&app);
+        assert!(text.contains("● wired"), "{text}");
+        // The #200 advisory: wired ✓ rows alone would hide the one failure
+        // the user actually sees (the wallet prompting after a face login).
+        assert!(
+            text.contains("nothing reads the released password"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_screen_shows_coverage_only_when_something_reaches() {
+        let mut app = test_app();
+        app.screen = SC_FINGERPRINT;
+        app.fp.available = true;
+        app.fp_coverage = vec![
+            (
+                "gdm-fingerprint",
+                "login screen (GNOME, fingerprint service)",
+                true,
+            ),
+            ("sudo", "sudo", false),
+        ];
+        let text = draw_text(&app);
+        assert!(text.contains("Where a finger can answer"), "{text}");
+        assert!(text.contains("login screen (GNOME"), "{text}");
+        // All-✗ coverage is noise, not information: the block stays hidden,
+        // matching `fingerprint status` gating the table on a wired line.
+        app.fp_coverage = vec![("sudo", "sudo", false)];
+        let text = draw_text(&app);
+        assert!(!text.contains("Where a finger can answer"), "{text}");
+    }
+
+    #[test]
     fn keyring_screen_states_render_distinctly() {
         let mut app = test_app();
         app.screen = SC_KEYRING;
@@ -7607,12 +8328,20 @@ mod tests {
 
     #[test]
     fn refresh_light_clamps_selections_to_the_shrunken_lists() {
-        let _sock = dead_socket();
         let mut app = test_app();
         app.profiles = vec![profile("a", &["s1"])]; // 2 rows
         app.sel = 9;
         app.cam_sel = 9;
-        app.refresh_light();
+        app.apply_light(LightState {
+            daemon_up: false,
+            health: None,
+            keyring_armed: None,
+            keyring_policy: None,
+            keyring_drift: None,
+            recovery: None,
+            nodes: Vec::new(),
+            pairs: Vec::new(),
+        });
         assert_eq!(app.sel, 1, "sel must clamp to the last real row");
         assert!(
             app.cam_sel < app.pairs.len().max(1),

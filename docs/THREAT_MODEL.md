@@ -68,6 +68,98 @@ logged. It weakens nothing in production: the daemon's environment comes from
 its root-owned systemd unit, so setting it requires the same root the pin does
 not defend against, and a unit test pins the escape to exact-path matches.
 
+## The Windows camera contract (#169)
+
+These Hello modules are designed and certified against Windows, so the Windows
+contract is the closest thing to a specification for the hardware. Where irlume
+diverges, the divergence should be deliberate. Positions, each against the
+primary source:
+
+**Exclusive control.** Windows permits many frame consumers but exactly one
+controlling instance. Sharing-mode consumers must use the controlling
+application's media type and explicitly "cannot change
+KSPROPERTYSETID_ExtendedCameraControl controls", the class Windows routes
+Hello's camera control through; the same page does let them change legacy
+`VIDEOPROCAMP`-style and vendor-specific controls
+([MediaCaptureSharingMode][ms-share],
+[MF FrameServer share modes][ms-frameserver]). irlume takes the strict end of
+that contract: when the `/proc` scan sees another process holding the camera
+node, `ir_emitter::enable` stands down from the control write entirely, even
+though a Windows sharing consumer could touch a vendor extension unit, and
+leaves the controlling application's configuration untouched (the capture
+then proceeds or fails on its own terms; an unlit emitter degrades toward the
+password, which is the fail-safe direction). irlume-vs-irlume exclusion is
+separate and kernel-enforced.
+
+The scan cannot see every holder in production. Reading another process's
+`/proc/<pid>/fd` is gated by `PTRACE_MODE_READ_FSCREDS` (proc_pid_fd(5),
+ptrace(2)), and the packaged unit grants the daemon only `CAP_DAC_OVERRIDE`
+and `CAP_FOWNER`, which do not pass that gate, so a camera holder in the
+user's desktop session (PipeWire, a browser) is invisible to the root daemon.
+The scan reports the blind spot (`ConsumerScan::permission_denied`) rather
+than collapsing it into "no consumer"; the daemon logs the degradation once
+per process and proceeds, which is the pre-#169 behaviour with the honesty
+added. Standing down on a blind spot instead would make every packaged
+capture inert, a permanent self-denial of the emitter. Closing the blind spot
+means granting `CAP_SYS_PTRACE` (a privilege expansion on an authentication
+daemon) or adding a separately confined observer; that decision is #207 and
+is not made here.
+
+**Privacy indication for IR-only capture.** irlume can illuminate a person
+with 850 nm light during authentication. Windows hardware certification ties
+visible indication to sensor capture, including for IR-only streams: a visible-
+wavelength (850 nm) illuminator may itself serve as the indicator (it glows
+faint red), while designs with an invisible (940 nm) illuminator must light a
+separate visible LED whenever the IR sensor is on
+([camera privacy controls][ms-privacy]). The certification phrases that
+obligation against the module's ISP capturing sensor data, not against any
+host application, which is why on certified modules indication follows
+irlume's captures without irlume's involvement. irlume's position: it never suppresses or
+controls indication, adds no software indicator (software indication is
+exactly what that certification distrusts), and inherits whatever the hardware
+provides. A user of an uncertified or external camera should know its IR
+capture may be visually silent; `ir-setup`'s shutter handling and the doctor's
+camera lines are where irlume already reasons about what the user can see.
+
+**Control state across power transitions.** Windows powers camera components
+fully off in D3cold and preserves no control context; its optional
+[UVC control cache][ms-cache] restores a fixed list of ordinary
+`VIDEOPROCAMP` controls (brightness, contrast, …) across such transitions, and
+extension-unit state is not on that list. irlume's policy, re-apply the
+emitter control at every capture and restore on stream end, is therefore the
+deliberate response to the same power behaviour, not an incidental habit:
+nothing below irlume undertakes to preserve this state, on either OS. (#168
+tracks narrowing WHEN within a capture the control is held.)
+
+**What Linux does not reproduce, and irlume does not claim to.** Windows
+routes Hello controls through a vendor DeviceMFT that can translate or refuse
+them; writing the extension unit directly bypasses whatever policy that
+component implements, and no Linux equivalent exists. And Enhanced Sign-in
+Security is not "the same camera with a better application": it requires
+ESS-capable camera firmware under the inbox UVC driver, compatible chipsets,
+VBS with a protected memory pathway from camera to matcher, and an
+OEM-provisioned Secure Devices (SDEV) ACPI table
+([ESS requirements][ms-ess]). Opening the same IR node on Linux does not
+approximate that trust path, and nothing in this document should be read as
+claiming it does.
+
+**Where Windows and irlume agree, since 0.7.1.** Windows' UVC driver probes
+only descriptor-advertised controls and disables a control whose
+initialization queries fail ([extension-unit device requirements][ms-xu]),
+rather than sweeping unit/selector combinations or continuing past a failed
+selector. That is the model irlume's discovery adopted in 0.7.1.
+
+**Not established.** Microsoft does not publish how many frames Hello consumes
+per authentication, its recognition window, or its stopping threshold; nothing
+here is a claim about those.
+
+[ms-share]: https://learn.microsoft.com/uwp/api/windows.media.capture.mediacaptureinitializationsettings.sharingmode
+[ms-frameserver]: https://learn.microsoft.com/windows/win32/medfound/mf-devsource-attribute-frameserver-share-mode
+[ms-privacy]: https://learn.microsoft.com/windows-hardware/drivers/stream/camera-privacy-controls
+[ms-cache]: https://learn.microsoft.com/windows-hardware/drivers/stream/camera-device-uvc-control-cache
+[ms-ess]: https://learn.microsoft.com/windows-hardware/design/device-experiences/windows-hello-enhanced-sign-in-security
+[ms-xu]: https://learn.microsoft.com/windows-hardware/drivers/stream/device-requirements-for-usb-video-class-extension-units
+
 ## Liveness: algorithmic single-frame gate (no trained weights)
 
 The default gate uses no trained weights. (The opt-in passive-blink stage

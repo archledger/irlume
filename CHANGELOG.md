@@ -25,6 +25,26 @@ All notable changes to irlume are documented here. This project adheres to
   and captures are staged and renamed into place so a crash cannot leave a
   valid header over a partial body.
 
+- **The emitter write honours the Windows exclusive-control model.** Windows
+  permits many camera consumers but only one controlling instance; sharing
+  consumers cannot change extended camera controls and inherit the controlling
+  application's media type. irlume wrote the extension-unit control whenever
+  it captured, relying on its capture failing busy afterwards anyway.
+  `ir_emitter::enable` now stands down from the write when it sees another
+  process holding the camera node, leaving that application's configuration
+  untouched, the fail-safe direction, since an unlit emitter degrades one
+  capture toward the password. The scan has a stated blind spot: reading
+  another user's `/proc/<pid>/fd` is ptrace-gated and the packaged daemon does
+  not hold `CAP_SYS_PTRACE`, so a cross-uid holder can go unseen. The scan
+  reports that instead of hiding it, the daemon logs the degradation once and
+  proceeds, and #207 tracks closing the blind spot.
+  The threat model gains a sourced section on the whole Windows camera
+  contract: the exclusive-control model, the certification tie between IR
+  capture and visible indication (and irlume's position on it), why
+  re-applying the control every capture is the deliberate answer to D3cold,
+  and what Linux does not reproduce (DeviceMFT, Enhanced Sign-in Security) and
+  irlume does not claim to. Closes #169.
+
 - **A dark or blinded IR capture reports what its evidence supports.** A dark
   burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
   even though shutters, covers, range, exposure and emitter failures all

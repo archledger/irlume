@@ -3064,11 +3064,14 @@ mod tests {
     /// and turns a real pass into an intermittent failure (or worse, a false
     /// pass in a mutation run, which is how a flake becomes a lie about
     /// coverage).
+    ///
+    /// This is `env_lock()` and not a lock of its own: `sandbox()` clears the
+    /// whole cache, so a sandbox test would otherwise be free to wipe the map
+    /// between a cache test's `publish` and its read, turning the hit these
+    /// tests assert into a miss. One lock covers both kinds of shared state.
+    /// No test acquires both helpers, so this cannot recurse.
     fn enrollment_summary_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        env_lock()
     }
 
     /// A Status request the connection thread CANNOT answer from memory must

@@ -8,8 +8,9 @@ All notable changes to irlume are documented here. This project adheres to
 ### Added
 
 - **Debug-enabled consent watches report the #101 candidate discriminator.**
-  `mean_step` (mean absolute pitch change per consecutive usable frame pair;
-  a face-lost frame or a missing frame index contributes nothing) now rides
+  `mean_step` (mean absolute pitch change per frame: |Δpitch|/Δidx over
+  usable pairs at most one strobe apart, since IR modules light alternate
+  frames; a longer, face-lost gap contributes nothing) now rides
   in the nod evidence, the opt-in consent debug line (`IRLUME_LOG=debug`, off
   by default; ordinary authentication runs still emit no diagnostic
   evidence), and `blinkcap replay`'s per-label summary. It gates nothing:

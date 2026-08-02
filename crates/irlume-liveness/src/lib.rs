@@ -668,11 +668,13 @@ pub struct NodEvidence {
     pub yaw_range: f32,
     /// Median crossings of sufficient amplitude, against [`NOD_MIN_CROSSINGS`].
     pub crossings: usize,
-    /// Mean absolute pitch change per frame, over CONSECUTIVE frame pairs
-    /// (`idx` differing by exactly one) where both readings exist. A face-lost
-    /// gap contributes nothing, and so does a missing frame index: a sample
-    /// dropped before this function sees it must not turn a two-frame move
-    /// into one frame's motion.
+    /// Mean absolute pitch change PER FRAME: |Δpitch| / Δidx over pairs of
+    /// usable samples whose recorded frame indices differ by 1 (plain
+    /// cadence) or 2 (strobe cadence; the ASUS module lights alternate
+    /// frames, so live captures there have every usable pair at gap 2). The
+    /// division keeps a strobe pair a rate rather than a double step, so a
+    /// gap cannot inflate the metric, and a gap longer than 2 (face lost,
+    /// detection loss) contributes nothing.
     ///
     /// RECORDED, NEVER GATING. This is the candidate discriminator #101 left
     /// on the table: measured there once, it separated a still head from a
@@ -717,20 +719,36 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
         }
     };
     let pitch_range = range(&pitch);
-    // Adjacent FRAMES, not adjacent elements of the vector: `windows(2)` pairs
-    // whatever sits next to each other, and a sample dropped upstream (a
-    // record replay could not parse, a frame a caller filtered out) leaves
-    // `idx` 10 beside `idx` 12. Pairing those would read a two-frame move as
-    // one frame's motion and inflate the very statistic this exists to record
-    // faithfully, so a pair only counts when the indices are consecutive AND
-    // both readings exist and are finite.
-    let (step_sum, step_n) = samples.windows(2).fold((0.0f32, 0usize), |acc, w| {
-        let consecutive = w[0].idx.checked_add(1) == Some(w[1].idx);
-        match (consecutive, w[0].pitch_frac, w[1].pitch_frac) {
-            (true, Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
-                (acc.0 + (b - a).abs(), acc.1 + 1)
-            }
-            _ => acc,
+    // A per-FRAME rate over usable pairs at most one strobe apart, keyed on
+    // the recorded frame index, not vector position. Three constraints shaped
+    // this, each learned the hard way:
+    //
+    //   * position-based pairing let a sample dropped upstream turn a
+    //     two-frame move into one frame's motion (the review round's finding);
+    //   * requiring idx to differ by exactly 1 then zeroed the metric on real
+    //     hardware: the ASUS module strobes alternate frames, so a live 75-
+    //     frame take had 38 usable samples and ALL 37 usable pairs at gap 2
+    //     (measured 2026-08-01, nod and still takes both);
+    //   * dividing |Δpitch| by the gap keeps a strobe pair a per-frame rate
+    //     instead of a double step, so a gap CANNOT inflate the metric.
+    //
+    // Gap 1 is plain cadence, gap 2 is strobe cadence (or one dropped frame,
+    // indistinguishable and equally honest once normalized); anything longer
+    // is a detection loss and contributes nothing, which is the face-lost
+    // rule the field documentation promises. On those live takes this reads
+    // nod 0.0116 against still 0.0018.
+    let usable: Vec<(usize, f32)> = samples
+        .iter()
+        .filter_map(|s| s.pitch_frac.filter(|p| p.is_finite()).map(|p| (s.idx, p)))
+        .collect();
+    let (step_sum, step_n) = usable.windows(2).fold((0.0f32, 0usize), |acc, w| {
+        // saturating_sub: a disordered or duplicate idx yields gap 0 and is
+        // skipped rather than wrapping into a huge divisor.
+        let gap = w[1].0.saturating_sub(w[0].0);
+        if (1..=2).contains(&gap) {
+            (acc.0 + (w[1].1 - w[0].1).abs() / gap as f32, acc.1 + 1)
+        } else {
+            acc
         }
     });
     let evidence = NodEvidence {
@@ -1954,12 +1972,13 @@ mod nod_evidence_tests {
     }
 
     /// `mean_step` is the #101 shadow metric: recorded with the verdict,
-    /// never part of it. Pin the arithmetic (mean |Δpitch| over ADJACENT
-    /// pairs with both readings) and the gap rule that keeps it honest: a
-    /// face-lost frame contributes no pair, rather than a fake jump across
-    /// the gap. The measured populations that motivated it (still ≤0.0064,
-    /// nods ≥0.0149) are provenance in the field's docs, deliberately NOT
-    /// asserted here: one session's numbers are not a contract.
+    /// never part of it. Pin the arithmetic (|Δpitch| / Δidx over usable
+    /// pairs at gap 1 or 2) and the two rules that keep it honest: a strobe
+    /// pair is normalized to a per-frame rate rather than inflated, and a
+    /// longer gap (face lost) contributes nothing. The measured populations
+    /// that motivated it (still ≤0.0064, nods ≥0.0149) are provenance in the
+    /// field's docs, deliberately NOT asserted here: one session's numbers
+    /// are not a contract.
     #[test]
     fn mean_step_is_recorded_per_adjacent_pair_and_skips_gaps() {
         // Known arithmetic: steps 0.02, 0.03, 0.01 → mean 0.02.
@@ -1988,12 +2007,21 @@ mod nod_evidence_tests {
                 bri: 100.0,
             },
         ];
+        // One missing frame is the strobe shape (the ASUS lights alternate
+        // frames; a live 75-frame take had all 37 usable pairs at gap 2), so
+        // this pair COUNTS, normalized: (0.60-0.50)/2, a per-frame rate. The
+        // division is the load-bearing assertion: unnormalized it would read
+        // 0.10 and a gap would inflate the metric.
         let (_, ev) = detect_nod_with_evidence(&gappy);
-        assert_eq!(ev.mean_step, 0.0, "a gap-spanning jump is not a step");
+        assert!(
+            (ev.mean_step - 0.05).abs() < 1e-6,
+            "a strobe pair is one per-frame rate, got {}",
+            ev.mean_step
+        );
 
-        // A missing frame INDEX breaks adjacency the same way: these samples
-        // sit next to each other in the vector but two frames apart in time,
-        // the shape left behind when something upstream drops one frame.
+        // Two samples two frames apart with nothing between them read the
+        // same as the strobe case above: gap alone cannot say whether a frame
+        // was dark or dropped, and normalization makes both readings honest.
         let sparse = vec![
             PoseSample {
                 idx: 10,
@@ -2008,13 +2036,53 @@ mod nod_evidence_tests {
                 bri: 100.0,
             },
         ];
-        assert_eq!(
-            detect_nod_with_evidence(&sparse).1.mean_step,
-            0.0,
-            "nonconsecutive frame indices must not form a step"
+        let sparse_step = detect_nod_with_evidence(&sparse).1.mean_step;
+        assert!(
+            (sparse_step - 0.05).abs() < 1e-6,
+            "a gap-2 pair must be normalized, never a full step, got {sparse_step}"
         );
 
-        // And the adjacency check itself must not overflow on a hostile idx.
+        // A LONGER gap is a detection loss and contributes nothing: the
+        // face-lost rule the field documentation promises.
+        let lost = vec![
+            PoseSample {
+                idx: 0,
+                pitch_frac: Some(0.50),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+            PoseSample {
+                idx: 4,
+                pitch_frac: Some(0.60),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            },
+        ];
+        assert_eq!(
+            detect_nod_with_evidence(&lost).1.mean_step,
+            0.0,
+            "a face-lost gap must not form a step"
+        );
+
+        // A strobed series end to end: gaps of 2 throughout, steps 0.02,
+        // 0.03, 0.01 across pairs → per-frame mean 0.02 / 2 = 0.01.
+        let strobed: Vec<PoseSample> = [0.50f32, 0.52, 0.55, 0.54]
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| PoseSample {
+                idx: i * 2,
+                pitch_frac: Some(p),
+                yaw_signed: Some(0.0),
+                bri: 100.0,
+            })
+            .collect();
+        let strobed_step = detect_nod_with_evidence(&strobed).1.mean_step;
+        assert!(
+            (strobed_step - 0.01).abs() < 1e-6,
+            "a strobed take must read as per-frame rates, got {strobed_step}"
+        );
+
+        // And the gap arithmetic must not overflow on a hostile idx.
         let wrap = vec![
             PoseSample {
                 idx: usize::MAX,

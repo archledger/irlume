@@ -3039,7 +3039,14 @@ fn doctor_run(
             State::Warn
         },
     );
-    if nodes.is_empty() && scan.unreadable.is_empty() {
+    // "Could not look" is not "nothing there". Reporting a /dev that would not
+    // list as a machine with no cameras is the same mistake at one level up.
+    if let Some(why) = &scan.listing_error {
+        dout!(
+            report,
+            "  ⚠ {why}; whether this machine has camera nodes is unknown"
+        );
+    } else if nodes.is_empty() && scan.unreadable.is_empty() {
         dout!(report, "  (no /dev/video* nodes on this machine)");
     }
     if nodes.is_empty() {

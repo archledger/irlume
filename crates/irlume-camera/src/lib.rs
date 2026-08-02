@@ -434,9 +434,46 @@ pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
         holder: None,
     };
     let dev = Device::with_path(device).map_err(|e| unreadable(FailedAt::Open, e))?;
+    capture_formats_answered(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let formats = Capture::enum_formats(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let fourccs: Vec<[u8; 4]> = formats.iter().map(|f| f.fourcc.repr).collect();
     Ok(role_from_formats(&fourccs))
+}
+
+/// Whether the node ANSWERED the format enumeration, separate from what it
+/// answered. `Capture::enum_formats` in the pinned v4l 0.14.0 returns
+/// `Ok(Vec::new())` for any error at index 0, so a node that refused to answer
+/// is indistinguishable there from one that legitimately offers no capture
+/// format. The kernel gives EINVAL for "no format at this index", which is both
+/// the normal end of enumeration and what a non-capture node (a UVC metadata
+/// node) returns at index 0; every other errno is a failed observation. Asking
+/// index 0 directly is the only way to tell those apart with this crate
+/// version, and telling them apart is the whole of #227.
+fn capture_formats_answered(dev: &Device) -> std::io::Result<()> {
+    let mut desc: v4l::v4l_sys::v4l2_fmtdesc = unsafe { std::mem::zeroed() };
+    desc.index = 0;
+    desc.type_ = v4l::buffer::Type::VideoCapture as u32;
+    // SAFETY: `dev` owns the fd for the length of this call, and `desc` is a
+    // correctly sized, zeroed v4l2_fmtdesc, which is what VIDIOC_ENUM_FMT
+    // reads and writes. Same shape as the ioctl helper in ir_metadata.rs.
+    let rc = unsafe {
+        libc::ioctl(
+            dev.handle().fd(),
+            v4l::v4l2::vidioc::VIDIOC_ENUM_FMT,
+            &mut desc as *mut _ as *mut libc::c_void,
+        )
+    };
+    if rc >= 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        // The node answered: it has no capture format at index 0. A metadata
+        // node reaches here on every machine with a UVC camera, so treating
+        // this as a failure would warn about correctly-ignored nodes.
+        Some(libc::EINVAL) => Ok(()),
+        _ => Err(e),
+    }
 }
 
 /// `classify_node` for callers that only act on a node they can use. An
@@ -468,24 +505,66 @@ pub(crate) fn role_from_formats(fourccs: &[[u8; 4]]) -> Role {
     }
 }
 
-/// Every `/dev/video*` node on the machine, in numeric order. Read from the
-/// directory rather than probing a fixed range: the old `0..10` scan never
-/// looked at `/dev/video10`, which a machine with two cameras and a couple of
-/// v4l2loopback nodes reaches without being unusual (#227).
-pub(crate) fn video_node_paths() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/dev") else {
-        return Vec::new();
+/// The video nodes found in a directory, and why the answer may be short.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NodeListing {
+    pub paths: Vec<String>,
+    /// Set when the directory could not be listed, or an entry in it could
+    /// not be read. An empty `paths` with this set means "could not look",
+    /// which is not the same answer as "nothing there" and must not be
+    /// reported as one.
+    pub error: Option<String>,
+}
+
+/// Every `video*` node in `dir`, in numeric order. Reads the directory rather
+/// than probing a fixed range: the old `/dev/video0..9` scan never looked at
+/// `/dev/video10`, which a machine with two cameras and a couple of
+/// v4l2loopback nodes reaches without being unusual (#227). Takes the
+/// directory so the ordering and filtering are testable against a fake root
+/// instead of whatever this machine happens to have plugged in.
+pub(crate) fn video_node_paths_in(dir: &std::path::Path) -> NodeListing {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return NodeListing {
+                paths: Vec::new(),
+                error: Some(format!("{} could not be listed: {e}", dir.display())),
+            }
+        }
     };
-    let mut nodes: Vec<(u32, String)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let n: u32 = name.strip_prefix("video")?.parse().ok()?;
-            Some((n, format!("/dev/{name}")))
-        })
-        .collect();
+    let mut nodes: Vec<(u32, String)> = Vec::new();
+    let mut unreadable_entries = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable_entries += 1;
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(n) = name
+            .strip_prefix("video")
+            .and_then(|d| d.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        nodes.push((n, dir.join(&name).to_string_lossy().into_owned()));
+    }
+    // Numeric, not lexical: a string sort puts video10 before video9.
     nodes.sort_unstable();
-    nodes.into_iter().map(|(_, p)| p).collect()
+    NodeListing {
+        paths: nodes.into_iter().map(|(_, p)| p).collect(),
+        error: (unreadable_entries > 0).then(|| {
+            format!(
+                "{unreadable_entries} entries in {} could not be read",
+                dir.display()
+            )
+        }),
+    }
+}
+
+pub(crate) fn video_node_paths() -> NodeListing {
+    video_node_paths_in(std::path::Path::new("/dev"))
 }
 
 /// Every video node split into the ones that answered and the ones that could
@@ -497,6 +576,9 @@ pub struct NodeScan {
     /// Nodes that answered, excluding `Role::Other`.
     pub classified: Vec<(String, Role)>,
     pub unreadable: Vec<Unreadable>,
+    /// Why this scan may be incomplete. An empty scan with this set means the
+    /// nodes could not be listed, not that there are none.
+    pub listing_error: Option<String>,
 }
 
 /// `with_holders` walks /proc for each busy node to name what holds it. That
@@ -504,7 +586,9 @@ pub struct NodeScan {
 /// callers, which run on the TUI's refresh path.
 fn scan(with_holders: bool) -> NodeScan {
     let mut scan = NodeScan::default();
-    for path in video_node_paths() {
+    let listing = video_node_paths();
+    scan.listing_error = listing.error;
+    for path in listing.paths {
         match classify_node(&path) {
             Ok(Role::Other) => {}
             Ok(role) => scan.classified.push((path, role)),
@@ -2888,25 +2972,50 @@ mod tests {
     }
 
     /// The old scan probed /dev/video0..9 by construction, so a tenth node was
-    /// invisible. archhost has one.
+    /// invisible; archhost has one. Run against a fake root, because a test
+    /// reading the real /dev proves whatever that machine happens to have
+    /// plugged in and would pass on a box with three cameras and no video10.
     #[test]
-    fn the_node_scan_is_not_capped_at_ten() {
-        let paths = video_node_paths();
-        // Ordering is numeric, not lexical: video10 sorts after video9, which
-        // a string sort gets backwards.
-        let numbers: Vec<u32> = paths
-            .iter()
-            .filter_map(|p| p.strip_prefix("/dev/video")?.parse().ok())
-            .collect();
-        assert!(
-            numbers.windows(2).all(|w| w[0] < w[1]),
-            "nodes must be numerically ordered, got {paths:?}"
-        );
-        // Every path this yields is a real entry under /dev, whatever this
-        // machine happens to have.
-        for p in &paths {
-            assert!(std::path::Path::new(p).exists(), "{p} does not exist");
+    fn the_node_scan_reaches_past_nine_and_orders_numerically() {
+        let root = std::env::temp_dir().join(format!("irlume-nodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in [
+            "video10", "video2", "video9", "video0", "videoX", "video", "audio3", "video1a",
+        ] {
+            std::fs::write(root.join(name), b"").unwrap();
         }
+
+        let listing = video_node_paths_in(&root);
+        let names: Vec<String> = listing
+            .paths
+            .iter()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        // video10 present and last: the range cap is gone and the sort is
+        // numeric, which a lexical sort would render video0, video10, video2.
+        assert_eq!(names, ["video0", "video2", "video9", "video10"]);
+        assert!(listing.error.is_none(), "{:?}", listing.error);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A directory that will not list must not read as a machine with no
+    /// cameras. This is the same defect #227 fixes, one level up.
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_not_an_empty_machine() {
+        let missing = std::env::temp_dir().join(format!("irlume-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let listing = video_node_paths_in(&missing);
+        assert!(listing.paths.is_empty());
+        let why = listing.error.expect("a listing failure must be reported");
+        assert!(why.contains("could not be listed"), "{why}");
     }
 
     fn frame(data: &[u8]) -> Frame {

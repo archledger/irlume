@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! Stack rewrites: given the text of a PAM file, return the text irlume wants
-//! it to have.
+//! Pure PAM-stack transformations and analysis, with no filesystem I/O, which
+//! is what lets the upstream greeter files be checked in as fixtures and
+//! compared byte-for-byte.
 //!
-//! Every function here is `&str -> (String, bool)` with no I/O, which is what
-//! lets the upstream greeter files be checked in as fixtures and compared
-//! byte-for-byte. Deciding WHICH files to rewrite, and writing them safely,
-//! belongs to the parent module.
+//! Rewrite functions take stack text plus the policy inputs they need and
+//! return `(rewritten_text, changed)`; `keyring_handoff` inspects a stack
+//! without rewriting it. Deciding WHICH files to rewrite, and writing them
+//! safely, belongs to the parent module.
 
 use super::grammar::*;
 use super::stanzas::*;

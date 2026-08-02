@@ -2808,8 +2808,8 @@ fn frontality_hint(pose: &irlume_vision::HeadPose, pitch_neutral: Option<f32>) -
 
 /// Mean BT.601 luma (0–255) of the RGB8 face region.
 fn luma_in_bbox(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
-    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
-    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x1 = (bbox[0].max(0.0) as u32).min(w);
+    let y1 = (bbox[1].max(0.0) as u32).min(h);
     let x2 = (bbox[2].max(0.0) as u32).min(w);
     let y2 = (bbox[3].max(0.0) as u32).min(h);
     let (mut sum, mut n) = (0f64, 0u64);
@@ -2946,8 +2946,8 @@ fn eye_open_at(grey: &[u8], w: u32, h: u32, (ex, ey): (f32, f32), r: i32) -> boo
 /// and glossy prints blow out highlights, so an unusually high fraction is a
 /// (deterrent-grade) screen/glare signal.
 fn rgb_luma_stats(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> (f32, f32) {
-    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
-    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x1 = (bbox[0].max(0.0) as u32).min(w);
+    let y1 = (bbox[1].max(0.0) as u32).min(h);
     let x2 = (bbox[2].max(0.0) as u32).min(w);
     let y2 = (bbox[3].max(0.0) as u32).min(h);
     let (mut sum, mut n, mut hot) = (0u64, 0u64, 0u64);
@@ -2983,8 +2983,8 @@ pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return 0.0;
     }
-    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
-    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x1 = (bbox[0].max(0.0) as u32).min(w);
+    let y1 = (bbox[1].max(0.0) as u32).min(h);
     let x2 = (bbox[2].max(0.0) as u32).min(w);
     let y2 = (bbox[3].max(0.0) as u32).min(h);
     let (mut sum, mut n) = (0u64, 0u64);
@@ -3824,12 +3824,47 @@ mod tests {
         let grey = [10u8, 20, 30, 40, 50, 60, 70, 80];
         assert!((mean_in_bbox(&grey, w, h, &[0.0, 0.0, 4.0, 2.0]) - 45.0).abs() < 1e-4);
         assert!((mean_in_bbox(&grey, w, h, &[0.0, 0.0, 2.0, 1.0]) - 15.0).abs() < 1e-4);
-        // Out-of-frame bbox clamps to the frame.
+        // A bbox that straddles the frame clamps to the frame.
         assert!((mean_in_bbox(&grey, w, h, &[-9.0, -9.0, 99.0, 99.0]) - 45.0).abs() < 1e-4);
         assert_eq!(mean_in_bbox(&grey, w, h, &[3.0, 1.0, 3.0, 1.0]), 0.0);
         // A frame shorter than w*h (truncated/mismatched capture) must degrade
         // to 0.0, not panic on the out-of-bounds index.
         assert_eq!(mean_in_bbox(&grey[..3], w, h, &[0.0, 0.0, 4.0, 2.0]), 0.0);
+    }
+
+    /// A region wholly outside the frame contains no pixels, so every
+    /// bbox-sampling helper must measure nothing rather than substitute the
+    /// frame's far edge. The old clamp put the near corner at w-1 and the far
+    /// one at w, leaving a one-pixel strip of the opposite side of the image
+    /// whose mean was returned as the region's (#225). All three helpers had
+    /// the same clamp, so all three are pinned here: fixing one and leaving
+    /// its siblings is how this survived the first time.
+    #[test]
+    fn a_region_off_the_frame_measures_nothing_in_every_helper() {
+        let (w, h) = (4u32, 2u32);
+        let grey = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        // Bright far edge, so an accidental one-column sample is loud.
+        let rgb: Vec<u8> = (0..(w * h)).flat_map(|i| [(i * 30) as u8; 3]).collect();
+
+        for off in [
+            [9.0f32, 0.0, 99.0, 2.0], // wholly right of the frame
+            [0.0, 9.0, 4.0, 99.0],    // wholly below it
+            [9.0, 9.0, 99.0, 99.0],   // past the corner
+            [-99.0, 0.0, -9.0, 2.0],  // wholly left, clamped to zero width
+        ] {
+            assert_eq!(mean_in_bbox(&grey, w, h, &off), 0.0, "mean_in_bbox {off:?}");
+            assert_eq!(luma_in_bbox(&rgb, w, h, &off), 0.0, "luma_in_bbox {off:?}");
+            assert_eq!(
+                rgb_luma_stats(&rgb, w, h, &off),
+                (0.0, 0.0),
+                "rgb_luma_stats {off:?}"
+            );
+        }
+
+        // The on-frame answers are untouched: this changes off-frame boxes
+        // only, and a face detection is always at least partly on-frame.
+        assert!((mean_in_bbox(&grey, w, h, &[0.0, 0.0, 4.0, 2.0]) - 45.0).abs() < 1e-4);
+        assert!((mean_in_bbox(&grey, w, h, &[2.0, 0.0, 4.0, 2.0]) - 55.0).abs() < 1e-4);
     }
 
     /// `face_frac` is the seating-distance signal the framing guide already

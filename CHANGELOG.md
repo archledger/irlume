@@ -14,6 +14,44 @@ All notable changes to irlume are documented here. This project adheres to
   that materially changes how authentication captures frames afterwards. It
   was the one user-facing operation with no TUI route. Closes #170.
 
+- **Debug-enabled consent watches report the #101 candidate discriminator.**
+  `mean_step` (mean absolute pitch change per frame: |Δpitch|/Δidx over
+  usable pairs at most one strobe apart, since IR modules light alternate
+  frames; a longer, face-lost gap contributes nothing) now rides
+  in the nod evidence, the opt-in consent debug line (`IRLUME_LOG=debug`, off
+  by default; ordinary authentication runs still emit no diagnostic
+  evidence), and `blinkcap replay`'s per-label summary. It gates nothing:
+  #101 measured it separating a still head from a deliberate nod by 2.3x
+  where the gating pitch range manages 1.44x, then deliberately declined to
+  set a threshold on one user's single session, because this class of signal
+  is known to drift between sessions. The blocker is cross-session data, and
+  replay over recorded corpora is where that accumulates: replay now refuses
+  a damaged or truncated pose recording loudly instead of measuring its
+  fragments as a still head, accepts a single `.jsonl` file as documented
+  rather than only a directory, exits successfully on a pose-only corpus,
+  and captures are staged and renamed into place so a crash cannot leave a
+  valid header over a partial body.
+
+- **The emitter write honours the Windows exclusive-control model.** Windows
+  permits many camera consumers but only one controlling instance; sharing
+  consumers cannot change extended camera controls and inherit the controlling
+  application's media type. irlume wrote the extension-unit control whenever
+  it captured, relying on its capture failing busy afterwards anyway.
+  `ir_emitter::enable` now stands down from the write when it sees another
+  process holding the camera node, leaving that application's configuration
+  untouched, the fail-safe direction, since an unlit emitter degrades one
+  capture toward the password. The scan has a stated blind spot: reading
+  another user's `/proc/<pid>/fd` is ptrace-gated and the packaged daemon does
+  not hold `CAP_SYS_PTRACE`, so a cross-uid holder can go unseen. The scan
+  reports that instead of hiding it, the daemon logs the degradation once and
+  proceeds, and #207 tracks closing the blind spot.
+  The threat model gains a sourced section on the whole Windows camera
+  contract: the exclusive-control model, the certification tie between IR
+  capture and visible indication (and irlume's position on it), why
+  re-applying the control every capture is the deliberate answer to D3cold,
+  and what Linux does not reproduce (DeviceMFT, Enhanced Sign-in Security) and
+  irlume does not claim to. Closes #169.
+
 - **A dark or blinded IR capture reports what its evidence supports.** A dark
   burst used to get one hint ("no active emitter; run `sudo irlume ir-setup`")
   even though shutters, covers, range, exposure and emitter failures all

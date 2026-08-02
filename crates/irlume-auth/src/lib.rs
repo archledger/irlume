@@ -1561,7 +1561,8 @@ impl Engine {
             // naming a limit the run did not apply is worse than no line.
             irlume_common::dlog!(
                 "consent: {} in {} frames; nod evidence: usable_pitch_frames={} (need {}) \
-                 pitch_range={:.3} (need {:.3}) yaw_range={:.2} (max {:.2}) crossings={} (need {})",
+                 pitch_range={:.3} (need {:.3}) yaw_range={:.2} (max {:.2}) crossings={} (need {}) \
+                 mean_step={:.4} (recorded for #101, gates nothing)",
                 if hit == Some(true) {
                     "GESTURE ACCEPTED"
                 } else {
@@ -1576,6 +1577,7 @@ impl Engine {
                 irlume_liveness::NOD_YAW_MAX,
                 ev.crossings,
                 irlume_liveness::NOD_MIN_CROSSINGS,
+                ev.mean_step,
             );
         }
         Ok(hit == Some(true))

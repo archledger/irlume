@@ -80,6 +80,21 @@ pub struct Signals {
     ///
     /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
     pub face_frac: f32,
+    /// Fraction (0-1) of the IR face region the sensor clipped at 255.
+    ///
+    /// RECORDED, NEVER GATED, for the same reason as [`face_frac`]. Saturation
+    /// compresses [`ir_center_edge_ratio`] toward 1 the way an ambient pedestal
+    /// does, because a clipped centre cannot read brighter than a clipped rim,
+    /// and the recorded corpora show the case is reachable: in two independent
+    /// sessions the first capture read ~235 mean with a ratio of 1.06 and 1.12
+    /// against a 1.03 floor, while every later capture in the same session
+    /// cleared it by 0.16 or more (#221). irlume guards the ambient end of this
+    /// same starvation and nothing at this end; whether real authentications
+    /// ever run clipped is what this field is for.
+    ///
+    /// [`face_frac`]: Self::face_frac
+    /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
+    pub ir_saturated_frac: f32,
 }
 
 impl Default for Signals {
@@ -93,6 +108,7 @@ impl Default for Signals {
             head_yaw_asym: 0.0,   // frontal
             head_pitch_frac: 0.5, // frontal
             face_frac: 0.0,
+            ir_saturated_frac: 0.0,
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
@@ -1456,6 +1472,32 @@ mod tests {
     /// seating distance BEFORE anything is normalised by it. A verdict that
     /// changed with this field would be exactly the retune-against-
     /// contaminated-samples the issue warns off.
+    /// The clipped fraction is recorded and read by nothing. #221 exists to
+    /// find out whether authentications ever run clipped BEFORE any threshold
+    /// or warm-up constant changes; a verdict that moved with this field would
+    /// prejudge that.
+    #[test]
+    fn ir_saturated_frac_changes_no_verdict() {
+        let gate = LivenessGate::new();
+        for frac in [0.0, 0.01, 0.25, 0.9, 1.0] {
+            let mut live = live_signals();
+            live.ir_saturated_frac = frac;
+            assert_eq!(
+                gate.evaluate(&live).0,
+                Verdict::Live,
+                "a live face must stay Live at ir_saturated_frac {frac}"
+            );
+            let mut flat = live_signals();
+            flat.ir_saturated_frac = frac;
+            flat.ir_center_edge_ratio = 1.0; // flat
+            assert_ne!(
+                gate.evaluate(&flat).0,
+                Verdict::Live,
+                "a flat target must not pass at ir_saturated_frac {frac}"
+            );
+        }
+    }
+
     #[test]
     fn face_frac_changes_no_verdict() {
         let gate = LivenessGate::new();

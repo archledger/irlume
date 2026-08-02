@@ -7,6 +7,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **The clipped fraction of the IR face is recorded with the liveness cues.**
+  A saturated centre cannot read brighter than a saturated rim, so a blown
+  exposure compresses the centre/edge ratio toward 1 the way strong ambient IR
+  does, and irlume guards only the ambient end. Two recorded corpora show the
+  case is reachable: in both, the session's first capture read about 235 mean
+  with a ratio of 1.06 and 1.12, against a 1.03 spoof floor and 1.19 to 1.42
+  for every later capture. `ir_saturated_frac` now rides in `Signals` and the
+  cross-spectrum debug line so #221 can be answered from ordinary output; it
+  gates nothing, and neither the ratio floor nor the warm-up length changes
+  until there is evidence from real authentications.
+
 - **Seating distance is recorded with the liveness cues.** `face_frac` (face
   width as a fraction of frame width, the same quantity the framing guide
   judges distance by) now rides in `Signals` and both liveness debug lines.

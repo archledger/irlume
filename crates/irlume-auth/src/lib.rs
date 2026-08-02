@@ -782,6 +782,8 @@ impl Engine {
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // RGB-only path: no IR burst to measure
             face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
+            // RGB-only path: no IR frame exists to clip.
+            ir_saturated_frac: 0.0,
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
@@ -1135,6 +1137,12 @@ impl Engine {
             ir_ambient: ir_stats.ambient_mean,
             // From the IR frame, because the IR cues are measured there.
             face_frac: face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
+            ir_saturated_frac: saturated_frac_of(
+                &ir.data,
+                ir.width,
+                ir.height,
+                ir_top.as_ref().map(|f| &f.bbox),
+            ),
             rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -1143,10 +1151,10 @@ impl Engine {
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
-            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} (recorded for #174, gates nothing)",
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} ir_clipped={:.1}% (face_frac #174, clipped #221; both gate nothing)",
             signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
             signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac,
-            signals.face_frac);
+            signals.face_frac, signals.ir_saturated_frac * 100.0);
         // Opt-in third-party PAD cue: score whenever an IR face is present (the
         // `ir` frame is the brightest strobe phase, i.e. the LIT frame, which is
         // the regime the cue was measured in), so the dark path can consult the
@@ -2986,6 +2994,54 @@ pub fn mean_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
     }
 }
 
+/// Fraction (0-1) of pixels at full scale (255) inside `bbox`: how much of the
+/// face region the sensor clipped.
+///
+/// A clipped centre cannot read brighter than a clipped rim, so saturation
+/// compresses [`center_edge_ratio`] toward 1 exactly as an ambient pedestal
+/// does. irlume guards the ambient end (`IR_AMBIENT_FLOOD`) and has nothing at
+/// this one, and the recorded corpora show the case is reachable: in both
+/// `depth_real_*` sessions the first capture read ~235 mean with a ratio of
+/// 1.06 and 1.12, against a 1.03 spoof floor and 1.19-1.42 for every later
+/// capture (#221). The whole-frame equivalent already exists in the camera
+/// crate; this is the face region, which is what the cues are measured on.
+pub fn saturated_frac_in_bbox(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
+    // Same guard and clamping as mean_in_bbox: a truncated frame degrades to
+    // 0.0 rather than panicking the daemon.
+    if grey.len() < (w as usize).saturating_mul(h as usize) {
+        return 0.0;
+    }
+    let x1 = (bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
+    let y1 = (bbox[1].max(0.0) as u32).min(h.saturating_sub(1));
+    let x2 = (bbox[2].max(0.0) as u32).min(w);
+    let y2 = (bbox[3].max(0.0) as u32).min(h);
+    let (mut clipped, mut n) = (0u64, 0u64);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            if grey[(y * w + x) as usize] == 255 {
+                clipped += 1;
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        clipped as f32 / n as f32
+    }
+}
+
+/// [`Signals::ir_saturated_frac`] for a capture: the clipped fraction of the
+/// detected face region, or 0.0 when nothing was detected.
+///
+/// Separated from the call site for the same reason as [`face_frac_of`]: no
+/// face means no reading, not a fabricated one, and that decision is a value a
+/// test can construct.
+pub fn saturated_frac_of(grey: &[u8], w: u32, h: u32, bbox: Option<&[f32; 4]>) -> f32 {
+    bbox.map(|b| saturated_frac_in_bbox(grey, w, h, b))
+        .unwrap_or(0.0)
+}
+
 /// Face width as a fraction of frame width: the framing guide's `face_frac`,
 /// computed from a detection box so the liveness path can record the same
 /// quantity the guide judges seating distance by (#174).
@@ -3767,6 +3823,58 @@ mod tests {
         // Degenerate inputs report no face rather than a negative or a NaN.
         assert_eq!(bbox_width_frac(&[300.0, 0.0, 100.0, 50.0], 640), 0.0);
         assert_eq!(bbox_width_frac(&[0.0, 0.0, 100.0, 50.0], 0), 0.0);
+    }
+
+    /// The clipped fraction is what #221 needs to know whether a real
+    /// authentication ever measures its cues on a blown exposure. It must
+    /// count only full-scale pixels, and only inside the face region, since
+    /// that is where the cues are measured.
+    #[test]
+    fn saturated_frac_counts_full_scale_pixels_in_the_region() {
+        let (w, h) = (4u32, 2u32);
+        // Row 0 fully clipped, row 1 not clipped at all.
+        let grey = [255u8, 255, 255, 255, 200, 254, 0, 128];
+        assert_eq!(
+            saturated_frac_in_bbox(&grey, w, h, &[0.0, 0.0, 4.0, 1.0]),
+            1.0
+        );
+        assert_eq!(
+            saturated_frac_in_bbox(&grey, w, h, &[0.0, 1.0, 4.0, 2.0]),
+            0.0
+        );
+        assert_eq!(
+            saturated_frac_in_bbox(&grey, w, h, &[0.0, 0.0, 4.0, 2.0]),
+            0.5
+        );
+        // 254 is NOT clipped: the compression this measures needs the ceiling.
+        assert_eq!(
+            saturated_frac_in_bbox(&[254u8; 4], 2, 2, &[0.0, 0.0, 2.0, 2.0]),
+            0.0
+        );
+        // Out-of-frame boxes clamp; a degenerate box reports nothing.
+        assert_eq!(
+            saturated_frac_in_bbox(&grey, w, h, &[-9.0, -9.0, 99.0, 99.0]),
+            0.5
+        );
+        assert_eq!(
+            saturated_frac_in_bbox(&grey, w, h, &[3.0, 1.0, 3.0, 1.0]),
+            0.0
+        );
+        // A truncated frame degrades like mean_in_bbox, never panics.
+        assert_eq!(
+            saturated_frac_in_bbox(&grey[..3], w, h, &[0.0, 0.0, 4.0, 2.0]),
+            0.0
+        );
+    }
+
+    #[test]
+    fn saturated_frac_of_reports_zero_when_nothing_was_detected() {
+        let grey = [255u8; 16];
+        // No face: no reading. NOT "the whole frame is clipped", which would
+        // be a measurement nobody took.
+        assert_eq!(saturated_frac_of(&grey, 4, 4, None), 0.0);
+        let bbox = [0.0f32, 0.0, 4.0, 4.0];
+        assert_eq!(saturated_frac_of(&grey, 4, 4, Some(&bbox)), 1.0);
     }
 
     /// No detection means NO distance signal, and 0.0 is how that is spelled:

@@ -80,7 +80,11 @@ pub struct Signals {
     ///
     /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
     pub face_frac: f32,
-    /// Fraction (0-1) of the IR face region the sensor clipped at 255.
+    /// Fraction (0-1) of the IR face region at or above the sensor's ceiling,
+    /// or `None` when the reading could not be taken: no IR face, the RGB-only
+    /// path, or a negotiated format whose decode cannot say where its ceiling
+    /// is (the Y16 family is rescaled per frame; YUV ceilings depend on a
+    /// quantization irlume does not carry). `None` is NOT zero clipping.
     ///
     /// RECORDED, NEVER GATED, for the same reason as [`face_frac`]. Saturation
     /// compresses [`ir_center_edge_ratio`] toward 1 the way an ambient pedestal
@@ -94,7 +98,7 @@ pub struct Signals {
     ///
     /// [`face_frac`]: Self::face_frac
     /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
-    pub ir_saturated_frac: f32,
+    pub ir_saturated_frac: Option<f32>,
 }
 
 impl Default for Signals {
@@ -108,7 +112,7 @@ impl Default for Signals {
             head_yaw_asym: 0.0,   // frontal
             head_pitch_frac: 0.5, // frontal
             face_frac: 0.0,
-            ir_saturated_frac: 0.0,
+            ir_saturated_frac: None,
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
@@ -1479,13 +1483,20 @@ mod tests {
     #[test]
     fn ir_saturated_frac_changes_no_verdict() {
         let gate = LivenessGate::new();
-        for frac in [0.0, 0.01, 0.25, 0.9, 1.0] {
+        for frac in [
+            None,
+            Some(0.0),
+            Some(0.01),
+            Some(0.25),
+            Some(0.9),
+            Some(1.0),
+        ] {
             let mut live = live_signals();
             live.ir_saturated_frac = frac;
             assert_eq!(
                 gate.evaluate(&live).0,
                 Verdict::Live,
-                "a live face must stay Live at ir_saturated_frac {frac}"
+                "a live face must stay Live at ir_saturated_frac {frac:?}"
             );
             let mut flat = live_signals();
             flat.ir_saturated_frac = frac;
@@ -1493,7 +1504,7 @@ mod tests {
             assert_ne!(
                 gate.evaluate(&flat).0,
                 Verdict::Live,
-                "a flat target must not pass at ir_saturated_frac {frac}"
+                "a flat target must not pass at ir_saturated_frac {frac:?}"
             );
         }
     }

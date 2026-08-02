@@ -165,6 +165,20 @@ pub struct IrCaptureStats {
     /// always were. Recorded so "the metadata path ran" is something callers
     /// can check rather than assume.
     pub camera_classified_frames: usize,
+    /// The decoded value that means "this pixel was at or above the sensor's
+    /// ceiling", or `None` when the negotiated format cannot support that
+    /// claim. A caller measuring clipping (#221) must treat `None` as NOT
+    /// MEASURED, never as zero clipping.
+    ///
+    /// Only the native 8-bit greys qualify: there a decoded 255 IS the
+    /// sensor's full-scale sample. The Y16 family does not, because
+    /// `grey16_shift` picks the shift from the frame's OWN maximum, so a
+    /// decoded 255 means "the brightest pixel in this frame" and a dim frame
+    /// full of them is ordinary. NV12 and YUYV do not either, because their
+    /// ceiling depends on the negotiated quantization (limited range puts
+    /// nominal white at 235, full range at 255) and irlume does not carry that
+    /// field, so a clipped face could read as no clipping at all.
+    pub white_level: Option<u8>,
 }
 
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
@@ -1163,6 +1177,16 @@ fn grey16_shift(buf: &[u8]) -> u32 {
     (16 - max.leading_zeros()).saturating_sub(8)
 }
 
+/// The decoded value that means "at or above the sensor's ceiling" for a
+/// negotiated IR format, or `None` when the decode cannot carry that claim.
+/// See [`IrCaptureStats::white_level`] for why only the 8-bit greys qualify.
+pub(crate) fn clipping_white_level(pix: IrPixel) -> Option<u8> {
+    match pix {
+        IrPixel::Grey8 => Some(u8::MAX),
+        IrPixel::Grey16 | IrPixel::Nv12Luma | IrPixel::YuyvLuma => None,
+    }
+}
+
 /// 16-bit-LE grey (Y16/Y10/Y12) → 8-bit at a given shift.
 fn grey16_to_8_at(buf: &[u8], shift: u32) -> Vec<u8> {
     buf.chunks_exact(2)
@@ -1190,6 +1214,13 @@ pub(crate) struct IrDecoder {
 impl IrDecoder {
     pub(crate) fn new(pix: IrPixel) -> Self {
         Self { pix, shift: None }
+    }
+
+    /// See [`clipping_white_level`]: the decoded value that means "at or above
+    /// the sensor's ceiling" for this decoder's format, or `None` when the
+    /// decode cannot carry that claim.
+    pub(crate) fn white_level(&self) -> Option<u8> {
+        clipping_white_level(self.pix)
     }
 
     pub(crate) fn decode(&mut self, buf: &[u8], w: u32, h: u32) -> Vec<u8> {
@@ -1439,6 +1470,7 @@ impl IrSession<'_> {
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
+        let white_level = self.dec.white_level();
         let stream = &mut self.stream;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
@@ -1695,6 +1727,7 @@ impl IrSession<'_> {
                 ambient_mean: ambient_level as f32,
                 burst_frames: IR_BURST,
                 camera_classified_frames: from_camera,
+                white_level,
             },
         ))
     }
@@ -2849,6 +2882,41 @@ mod tests {
         assert_eq!(ir_probe::subtract(&lit, &ambient), vec![150, 0, 0]);
         // Size mismatch falls back to the lit frame unchanged.
         assert_eq!(ir_probe::subtract(&lit, &[1, 2]), lit.to_vec());
+    }
+
+    /// Which formats can support a clipping claim at all. A decoded 255 means
+    /// "the sensor's full-scale sample" ONLY for the native 8-bit greys: the
+    /// Y16 family is rescaled by a shift taken from the frame's own maximum,
+    /// and the YUV ceilings depend on a quantization irlume does not carry.
+    /// Saying None there is what keeps #221's corpus interpretable.
+    #[test]
+    fn only_native_8bit_grey_can_claim_a_clipping_ceiling() {
+        assert_eq!(clipping_white_level(IrPixel::Grey8), Some(255));
+        assert_eq!(clipping_white_level(IrPixel::Grey16), None);
+        assert_eq!(clipping_white_level(IrPixel::Nv12Luma), None);
+        assert_eq!(clipping_white_level(IrPixel::YuyvLuma), None);
+        // And the decoder reports its own format's answer, since that is what
+        // the capture actually negotiated.
+        assert_eq!(IrDecoder::new(IrPixel::Grey8).white_level(), Some(255));
+        assert_eq!(IrDecoder::new(IrPixel::Grey16).white_level(), None);
+    }
+
+    /// The reason Grey16 cannot: the shift comes from the frame's OWN maximum,
+    /// so a frame whose brightest sample is far below the container ceiling
+    /// still decodes that sample to 255.
+    #[test]
+    fn grey16_decoding_maps_a_dim_frames_maximum_to_full_scale() {
+        // 10-bit content in a 16-bit container: max 1023, nowhere near 0xFFFF.
+        let mut buf = Vec::new();
+        for v in [0u16, 256, 512, 1023] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let decoded = decode_ir(&buf, IrPixel::Grey16, 4, 1);
+        assert_eq!(
+            decoded.last().copied(),
+            Some(255),
+            "the frame maximum decodes to 255 even though the sensor did not clip"
+        );
     }
 
     #[test]

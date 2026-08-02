@@ -16,7 +16,12 @@ All notable changes to irlume are documented here. This project adheres to
   for every later capture. `ir_saturated_frac` now rides in `Signals` and the
   cross-spectrum debug line so #221 can be answered from ordinary output; it
   gates nothing, and neither the ratio floor nor the warm-up length changes
-  until there is evidence from real authentications.
+  until there is evidence from real authentications. The reading is absent,
+  not zero, when it cannot be taken: no IR face, or a negotiated format whose
+  decode cannot say where its ceiling is (the Y16 family is rescaled by a
+  shift taken from each frame's own maximum, and the YUV ceilings depend on a
+  quantization irlume does not carry), so the corpus never mixes "no clipping"
+  with "not measurable".
 
 - **Seating distance is recorded with the liveness cues.** `face_frac` (face
   width as a fraction of frame width, the same quantity the framing guide

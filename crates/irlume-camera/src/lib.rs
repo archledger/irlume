@@ -3006,6 +3006,25 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The branch the Codex round on #229 found unreachable: a node that opens
+    /// and then refuses to enumerate must be reported, not silently classified
+    /// as `Other` and dropped. `/dev/null` is exactly that node on any Linux
+    /// machine, since `Device::with_path` only opens (no QUERYCAP) and
+    /// VIDIOC_ENUM_FMT on a non-v4l2 character device returns ENOTTY, so this
+    /// needs no camera, no privilege, and no hardware in CI.
+    #[test]
+    fn a_node_that_opens_then_refuses_to_enumerate_is_reported_not_dropped() {
+        let u = classify_node("/dev/null")
+            .expect_err("a device that cannot enumerate formats must not classify as a role");
+        assert_eq!(u.at, FailedAt::EnumFormats);
+        assert_eq!(u.errno, Some(libc::ENOTTY));
+        assert!(
+            u.explain().contains("would not list its formats"),
+            "{}",
+            u.explain()
+        );
+    }
+
     /// A directory that will not list must not read as a machine with no
     /// cameras. This is the same defect #227 fixes, one level up.
     #[test]

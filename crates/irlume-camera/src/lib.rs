@@ -723,7 +723,7 @@ fn resolve_saved_pair(
 /// Hardware capability summary, for "smart Auto": what biometric face hardware
 /// is actually present. `IRLUME_FORCE_NO_IR=1` forces `ir_pair=false` (test the
 /// RGB-only convenience path on an IR box, or pin a box to convenience mode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Caps {
     /// A physical camera exposing BOTH an RGB and an IR node (full Hello cam).
     pub ir_pair: bool,

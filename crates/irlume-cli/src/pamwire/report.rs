@@ -99,6 +99,7 @@ pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
 /// One wired greeter whose released password nothing turns into an open
 /// wallet: either a module read it with no session half (`auth_only`), or no
 /// keyring module reads it at all (`auth_only: None`).
+#[derive(Clone, Copy)]
 pub(crate) struct HandoffWarning {
     /// The `/etc/pam.d` path of the affected greeter.
     pub(crate) service: &'static str,

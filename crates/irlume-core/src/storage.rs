@@ -559,6 +559,13 @@ mod tests {
     /// which is why it lives beside the enrollments rather than inside one.
     #[test]
     fn the_retag_marker_only_matches_the_space_it_recorded() {
+        // Held across the whole test, not just the set_var: every assertion
+        // below reads a path derived from IRLUME_STATE_DIR, and another test
+        // repointing it mid-run makes those reads describe a different
+        // directory than the one just written.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("irlume-retag-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -867,6 +874,14 @@ mod tests {
     #[cfg(unix)]
     fn save_writes_temp_then_rename_and_survives_a_failed_save() {
         use std::os::unix::fs::PermissionsExt;
+        // See the sibling test: this one writes through save() and then stats
+        // profile_path(), two reads of the same process-global. Without the
+        // lock a concurrent test that repoints IRLUME_STATE_DIR makes the stat
+        // look for a file under a directory nothing wrote to, which surfaces
+        // as a NotFound unwrap far from the cause.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The no-TPM plaintext path is the one exercisable in a unit test; on
         // a box with /dev/tpm* present, save() would try to seal a real key.
         if crate::template_key::tpm_available() {

@@ -26,6 +26,7 @@
 use irlume_common::gkr_wire::{self, ControlResult, Op};
 use std::ffi::CString;
 use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -33,6 +34,11 @@ use std::path::PathBuf;
 /// the margin tolerates a future longer format without accepting arbitrary
 /// stream lengths from a confused caller.
 const MAX_TOKEN_LEN: usize = 256;
+
+/// Deadline for each control-socket read and write. The daemon imposes none,
+/// and this runs inside the PAM session phase, so an unbounded wait is a hung
+/// login. Generous enough for a socket-activated daemon's cold start.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -73,13 +79,25 @@ fn run(user: &str) -> Result<(), String> {
     }
 
     let pw = lookup_user(user)?;
-    let runtime_dir = PathBuf::from(format!("/run/user/{}", pw.uid));
-    if !runtime_dir.is_dir() {
+    // Refuse when there is no login keyring to unlock.
+    //
+    // UNLOCK is not read-only: `unlock_or_create_login()` CREATES the login
+    // keyring keyed to whatever secret it was handed when none exists
+    // (gnome-keyring's `daemon/login/gkd-login.c`). Firing blind after the
+    // user deleted their keyring would silently mint a new one whose password
+    // is a 64-character random token they have never seen and no GNOME
+    // interface can tell them. Unlocking an existing keyring is this program's
+    // whole job; creating one is not.
+    let keyring = login_keyring_path(&pw)?;
+    if !keyring.exists() {
         return Err(format!(
-            "{} does not exist; the session is not far enough along for a keyring",
-            runtime_dir.display()
+            "{} does not exist; refusing to UNLOCK, which would CREATE a login keyring \
+             keyed to the sealed token instead of unlocking one. Run `irlume keyring \
+             forget` to disarm, or create the keyring first.",
+            keyring.display()
         ));
     }
+    let runtime_dir = runtime_dir_for(&pw)?;
 
     // EVERYTHING below runs as the target user: the daemon compares the
     // connecting peer's uid against its own, and root pathname work inside a
@@ -95,10 +113,102 @@ fn run(user: &str) -> Result<(), String> {
             sock.display()
         )
     })?;
+    // The daemon applies NO timeout of its own to a control connection
+    // (`gkd-control-server.c` drives the fd from the main loop with no timer),
+    // and the socket may be a systemd listener whose daemon is still starting.
+    // Without deadlines here, a wedged or slow-starting daemon would hang the
+    // PAM session phase, i.e. the login.
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
+        .map_err(|e| format!("setting control socket timeouts: {e}"))?;
     match gkr_wire::call(&mut stream, Op::Unlock, &[&token])? {
         ControlResult::Ok => Ok(()),
+        // A DENIED here is not merely a failed unlock. The daemon remembers
+        // the rejected secret (`gkm_wrap_layer_mark_login_unlock_failure`) and
+        // re-keys the login keyring TO IT the next time the user unlocks that
+        // keyring through a successful prompt. If the token we sent is the one
+        // in the envelope, that self-heal is benign (it converges on the token
+        // irlume holds); if it is stale, the keyring ends up keyed to a secret
+        // nobody has. Say so loudly rather than exiting quietly, because the
+        // journal line is the only place this becomes visible.
+        ControlResult::Denied => Err(format!(
+            "keyring UNLOCK denied: the login keyring is not keyed to the sealed token. \
+             gnome-keyring has cached this rejected secret and may re-key the keyring to \
+             it after the next manual unlock; re-run `irlume keyring arm` (or `irlume \
+             keyring forget`) as {user} to put the keyring and the envelope back in step."
+        )),
         other => Err(format!("keyring UNLOCK: {}", other.describe())),
     }
+}
+
+/// The login keyring file, under the home NSS reports.
+///
+/// `$HOME` is deliberately not consulted: this may run as root with the login
+/// stack's environment, where `$HOME` is root's or unset.
+/// `IRLUME_GKR_HOME` overrides it under the same not-privileged rule as
+/// [`runtime_dir_for`], so the harness can point at a throwaway home.
+fn login_keyring_path(pw: &User) -> Result<PathBuf, String> {
+    let home = match std::env::var_os("IRLUME_GKR_HOME") {
+        Some(over) if !privileged() => PathBuf::from(over),
+        Some(_) => {
+            return Err(
+                "IRLUME_GKR_HOME is set but this process is privileged; refusing to take \
+                 the home directory from the environment"
+                    .into(),
+            )
+        }
+        None => PathBuf::from(&pw.home),
+    };
+    Ok(home.join(".local/share/keyrings/login.keyring"))
+}
+
+/// Whether this process holds privilege that the environment must not steer.
+fn privileged() -> bool {
+    let (euid, uid) = unsafe { (libc::geteuid(), libc::getuid()) };
+    euid == 0 || uid == 0
+}
+
+/// Where the target user's control socket lives.
+///
+/// Derived from the uid, NOT from `XDG_RUNTIME_DIR`. When this runs from the
+/// PAM stack it runs as root, and the environment is the caller's: honouring
+/// an inherited path there would let whoever controls that environment name
+/// the socket this program writes the token to, which is a direct secret leak.
+///
+/// `IRLUME_GKR_RUNTIME_DIR` overrides it for the test harness, and ONLY when
+/// this process is not privileged. An unprivileged process can already reach
+/// everything its own uid can, so the override grants nothing; refusing it
+/// under root keeps the production path environment-independent.
+///
+/// This is a deliberate divergence from `gkr-pam`, which prefers
+/// `$GNOME_KEYRING_CONTROL` and only then falls back to `$XDG_RUNTIME_DIR`
+/// (`get_control_file()` in `gkr-pam-module.c`). That module already runs
+/// inside the user's own environment; this one runs as root with whatever
+/// environment the login stack happened to carry, and honouring a variable
+/// from there would let it name the socket a secret is written to. The
+/// fallback path is what gnome-keyring's own systemd units bind
+/// (`ListenStream=%t/keyring/control`), so the divergence only shows up on a
+/// setup that relocates the socket by hand.
+fn runtime_dir_for(pw: &User) -> Result<PathBuf, String> {
+    let dir = match std::env::var_os("IRLUME_GKR_RUNTIME_DIR") {
+        Some(over) if !privileged() => PathBuf::from(over),
+        Some(_) => {
+            return Err(
+                "IRLUME_GKR_RUNTIME_DIR is set but this process is privileged; refusing to \
+                 take the socket path from the environment"
+                    .into(),
+            )
+        }
+        None => PathBuf::from(format!("/run/user/{}", pw.uid)),
+    };
+    if !dir.is_dir() {
+        return Err(format!(
+            "{} does not exist; the session is not far enough along for a keyring",
+            dir.display()
+        ));
+    }
+    Ok(dir)
 }
 
 /// Become the target user, permanently. Same order and same paranoia as
@@ -107,6 +217,17 @@ fn run(user: &str) -> Result<(), String> {
 /// connection coming from root and everything below running with privilege it
 /// must not have.
 fn drop_privileges(pw: &User) -> Result<(), String> {
+    // Already the target user (the test harness, and any future caller that
+    // runs in-session): there is nothing to drop, and `initgroups` would fail
+    // with EPERM for an unprivileged process. Verified below either way, so
+    // this cannot skip a drop that was actually needed.
+    let already = unsafe { libc::getuid() } == pw.uid
+        && unsafe { libc::geteuid() } == pw.uid
+        && unsafe { libc::getgid() } == pw.gid
+        && unsafe { libc::getegid() } == pw.gid;
+    if already {
+        return Ok(());
+    }
     if unsafe { libc::initgroups(pw.name.as_ptr(), pw.gid) } != 0 {
         return Err(format!("initgroups: {}", std::io::Error::last_os_error()));
     }
@@ -130,6 +251,9 @@ struct User {
     uid: libc::uid_t,
     gid: libc::gid_t,
     name: CString,
+    /// Home directory, read from NSS rather than `$HOME`: this may run as root
+    /// with the login stack's environment, where `$HOME` is not yet the user's.
+    home: std::ffi::OsString,
 }
 
 fn lookup_user(user: &str) -> Result<User, String> {
@@ -144,9 +268,18 @@ fn lookup_user(user: &str) -> Result<User, String> {
     if uid == 0 {
         return Err("refusing to unlock a keyring for uid 0".to_string());
     }
+    // SAFETY: same static buffer as above, still valid; copied out immediately.
+    let home = unsafe {
+        let d = (*pw).pw_dir;
+        if d.is_null() {
+            return Err(format!("no home directory for {user}"));
+        }
+        std::ffi::OsString::from_vec(std::ffi::CStr::from_ptr(d).to_bytes().to_vec())
+    };
     Ok(User {
         uid,
         gid,
         name: cname,
+        home,
     })
 }

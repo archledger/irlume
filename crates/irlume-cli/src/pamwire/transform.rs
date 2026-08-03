@@ -305,6 +305,27 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
         // session is otherwise set up.
         out.push(FP_GKR_SESSION.to_string());
     }
+    // Our own session half, and on a token-armed GNOME account it is the only
+    // thing that opens the keyring at all.
+    //
+    // A `keyring` auth line releases a GNOME keyring token into PAM data; the
+    // delivery to gnome-keyring's control socket happens in `open_session`,
+    // because at auth time the user's runtime directory (and so the socket)
+    // need not exist yet. Without this line the token is released and then
+    // dropped when the transaction ends, and the login keyring stays locked
+    // with nothing saying why. GDM runs auth and session for a fingerprint
+    // login on ONE pam handle for THIS service, so the PAM data set above is
+    // readable here and nowhere else.
+    //
+    // After `FP_GKR_SESSION` on purpose: that line may be what starts the
+    // daemon (`auto_start`), and our helper needs something listening.
+    if !lines.iter().any(|l| {
+        let d = directive(l);
+        let phase = d.strip_prefix('-').unwrap_or(d);
+        phase.split_whitespace().next() == Some("session") && d.contains(MODULE)
+    }) {
+        out.push(RESEAL_SESSION.to_string());
+    }
     (format!("{}\n", out.join("\n")), true)
 }
 

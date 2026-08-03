@@ -2227,6 +2227,25 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // live credential is the old token, and overwriting its only copy
             // with a fresh one would strand the keyring permanently.
             if core_kind == irlume_core::envelope::SecretKind::GnomeKeyringToken {
+                // The re-key that completes a token arm CREATES the login
+                // keyring when none exists, keyed to the token, rather than
+                // failing (`change_or_create_login()` in gnome-keyring's
+                // gkd-login.c never checks the old password in that case). The
+                // user would end up with a keyring whose password is 64 random
+                // characters they have never seen. Detection already declines
+                // a home with no login keyring; this catches a client that
+                // asked for the kind explicitly.
+                let keyring_present = home
+                    .as_deref()
+                    .map(|h| h.join(".local/share/keyrings/login.keyring").exists())
+                    .unwrap_or(false);
+                if !keyring_present {
+                    return Response::Error(format!(
+                        "'{user}' has no GNOME login keyring, so there is nothing to re-key; \
+                         arming a token would create one keyed to a random secret. Log into \
+                         GNOME once to create the keyring, or arm without forcing a kind."
+                    ));
+                }
                 let already_token = irlume_core::keyring::sealed_kind(&user)
                     == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken);
                 let armed = if already_token {

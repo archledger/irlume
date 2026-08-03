@@ -2681,6 +2681,41 @@ session     include       postlogin
         // gnome-keyring installed does not get an error logged.
         assert!(w.contains(KEYRING_TAG));
         assert!(w.contains("-auth") && w.contains("-session"));
+
+        // Our OWN session half. On a GNOME account armed with a keyring token
+        // (#250) the auth line above only releases the token into PAM data;
+        // `open_session` is what delivers it to gnome-keyring's control
+        // socket, because the user's runtime directory need not exist yet at
+        // auth time. Without this line the token is released and dropped, and
+        // the keyring stays locked with nothing naming the reason.
+        let ours = lines
+            .iter()
+            .position(|l| l.contains("pam_irlume.so reseal"))
+            .expect("irlume session line: without it a token is never delivered");
+        let gkr_session = lines
+            .iter()
+            .position(|l| l.contains("pam_gnome_keyring.so") && l.contains("auto_start"))
+            .expect("gnome-keyring session half");
+        assert!(
+            ours > gkr_session,
+            "ours must run after the line that may START the daemon, or the \
+             helper finds nothing listening"
+        );
+    }
+
+    /// A stack that already carries an irlume session line must not get a
+    /// second one: two `reseal` lines mean two reseals and two deliveries per
+    /// login, and a duplicate that `unwire` would leave half of behind.
+    #[test]
+    fn wire_fp_keyring_adds_only_one_irlume_session_line() {
+        let (once, _) = wire_fp_keyring(UPSTREAM_GDM_FINGERPRINT, "gdm-fingerprint");
+        assert_eq!(once.matches("pam_irlume.so reseal").count(), 1);
+        let (twice, _) = wire_fp_keyring(&once, "gdm-fingerprint");
+        assert_eq!(
+            twice.matches("pam_irlume.so reseal").count(),
+            1,
+            "re-wiring an already-wired stack duplicated our session line"
+        );
     }
 
     #[test]

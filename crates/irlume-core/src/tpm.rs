@@ -482,17 +482,82 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     })
 }
 
+/// Marker on the transient "a PCR moved while our policy session was open"
+/// failure, so the retry decision never re-parses a TPM message itself.
+const PCR_CHANGED_MARKER: &str = "pcr-update-counter-moved";
+
+/// How many times to rebuild the policy session after [`Error::Tpm`] carrying
+/// [`PCR_CHANGED_MARKER`].
+///
+/// Three, because the trigger is another process extending a PCR and the boot
+/// window that produces them is short: systemd extends PCR 11 at each boot
+/// phase and PCR 15 when a user session starts, and the second of those is
+/// fired BY the login we are serving. Retrying forever would instead hide a
+/// machine whose PCRs are genuinely churning.
+const PCR_CHANGED_RETRIES: u32 = 3;
+
+/// Turn a TPM failure into an [`Error`], tagging the one response code that is
+/// worth retrying.
+///
+/// `TPM2_RC_PCR_CHANGED` (`TPM2_RC_VER1 + 0x028`) does not mean the policy was
+/// wrong. `PolicyPCR` records the TPM's global `pcrUpdateCounter` in the
+/// session; ANY process extending ANY PCR bumps that counter and invalidates
+/// the session, whether or not the PCR it touched is one we bind. It is a race,
+/// not a verdict, and the same attempt run again normally succeeds.
+fn retryable_tpm_err(e: tss_esapi::Error) -> Error {
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind;
+    if let tss_esapi::Error::Tss2Error(rc) = e {
+        if rc.kind() == Some(Tss2ResponseCodeKind::PcrChanged) {
+            return Error::Tpm(format!("{PCR_CHANGED_MARKER}: {e}"));
+        }
+    }
+    Error::Tpm(e.to_string())
+}
+
+/// Whether `e` is the transient PCR-counter race, i.e. worth another attempt.
+///
+/// A predicate rather than an inline match so the retry decision is a value a
+/// test can construct directly; the condition itself needs a concurrent PCR
+/// extend to produce, which no unit test can arrange.
+pub fn is_pcr_changed_race(e: &Error) -> bool {
+    matches!(e, Error::Tpm(m) if m.contains(PCR_CHANGED_MARKER))
+}
+
 /// Release the sealed secret iff the bound policy is satisfied. Dispatches on the
 /// envelope's [`PolicyKind`].
+///
+/// Retries the whole attempt on the PCR-counter race described in
+/// [`retryable_tpm_err`]. Each try must start a FRESH session: once the TPM has
+/// rejected a policy session for a moved counter, that session stays dead, so
+/// re-running the dispatch (which opens its own session) is the recovery, not
+/// re-issuing the failed command. This is the same gap systemd closed in
+/// systemd/systemd#35657, where unsealing already retried but the `PolicyPCR`
+/// leg did not.
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
-    let out = match &env.policy {
-        PolicyKind::PcrLiteral => unseal_literal(env),
-        PolicyKind::Authorized {
-            pubkey_pem,
-            policy_ref,
-        } => unseal_authorized(env, pubkey_pem, policy_ref),
-        PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
-    }?;
+    let mut attempt = 0;
+    let out = loop {
+        let result = match &env.policy {
+            PolicyKind::PcrLiteral => unseal_literal(env),
+            PolicyKind::Authorized {
+                pubkey_pem,
+                policy_ref,
+            } => unseal_authorized(env, pubkey_pem, policy_ref),
+            PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
+        };
+        match result {
+            Err(e) if is_pcr_changed_race(&e) && attempt < PCR_CHANGED_RETRIES => {
+                attempt += 1;
+                // Worth a line: without it a retried unseal is invisible, and
+                // the difference between "this machine races occasionally" and
+                // "this machine races every time" is the whole diagnosis.
+                eprintln!(
+                    "irlume: TPM policy session lost to a concurrent PCR extend; \
+                     retrying unseal ({attempt}/{PCR_CHANGED_RETRIES})"
+                );
+            }
+            other => break other?,
+        }
+    };
     // Lock the unsealed secret (login password / template key) against swap and
     // core dumps for as long as it lives.
     irlume_common::memlock::lock_slice(&out);
@@ -520,7 +585,7 @@ fn unseal_literal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
                     let sel = pcr_selection(&env.pcrs)?;
                     let policy = PolicySession::try_from(session).map_err(tpm_err)?;
                     ctx.policy_pcr(policy, Digest::default(), sel)
-                        .map_err(tpm_err)?;
+                        .map_err(retryable_tpm_err)?;
                 }
                 let data = ctx
                     .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
@@ -615,7 +680,7 @@ fn unseal_authorized(
                 //    digest, the "approved policy" that must carry a signature.
                 let sel = pcr_selection(&env.pcrs)?;
                 ctx.policy_pcr(policy_session, Digest::default(), sel)
-                    .map_err(tpm_err)?;
+                    .map_err(retryable_tpm_err)?;
                 let approved = ctx.policy_get_digest(policy_session).map_err(tpm_err)?;
 
                 // 2. Find a signature for exactly this PCR set + policy digest.
@@ -1180,13 +1245,13 @@ fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u
                         Digest::default(),
                         pcr_selection(&super_pcr.singles)?,
                     )
-                    .map_err(tpm_err)?;
+                    .map_err(retryable_tpm_err)?;
                 }
                 for (pcr, branches) in &super_pcr.multis {
                     ctx.policy_pcr(policy, Digest::default(), pcr_selection(&[*pcr])?)
-                        .map_err(tpm_err)?;
+                        .map_err(retryable_tpm_err)?;
                     ctx.policy_or(policy, digest_list(branches)?)
-                        .map_err(tpm_err)?;
+                        .map_err(retryable_tpm_err)?;
                 }
 
                 ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
@@ -1227,7 +1292,15 @@ const PCR_MISMATCH_MARKER: &str = "PCR mismatch";
 
 /// If the TSS error looks like a policy mismatch, enrich it with the list of
 /// PCRs that have changed since seal time.
-fn policy_aware_err<E: std::fmt::Display>(e: E, env: &SealedEnvelope) -> Error {
+fn policy_aware_err(e: tss_esapi::Error, env: &SealedEnvelope) -> Error {
+    // The counter race first, and it must not be diagnosed as drift: it is not
+    // a statement about any PCR's VALUE, so `diagnose_pcrs` would find nothing
+    // changed and the failure would be reported as a plain TPM error that
+    // nothing retries. `Unseal` itself can return it, not just `PolicyPCR`.
+    let retryable = retryable_tpm_err(e);
+    if is_pcr_changed_race(&retryable) {
+        return retryable;
+    }
     let base = e.to_string();
     match diagnose_pcrs(env) {
         Ok(changed) if !changed.is_empty() => Error::Policy(format!(
@@ -1356,6 +1429,66 @@ mod tests {
                 .expect("parse")
                 .nv_index,
             None
+        );
+    }
+
+    /// The retry decision, as a value.
+    ///
+    /// The condition it keys on needs another process to extend a PCR while our
+    /// policy session is open, which no unit test can arrange; the CHOICE made
+    /// about that condition is a pure function and is what is asserted here.
+    /// `scripts/tpm-pcr-race-check.sh` produces the real thing on hardware.
+    #[test]
+    fn only_the_pcr_counter_race_is_treated_as_retryable() {
+        use tss_esapi::constants::response_code::Tss2ResponseCodeKind;
+
+        // TPM2_RC_PCR_CHANGED = TPM2_RC_VER1 (0x100) + 0x028.
+        let raced = tss_esapi::Error::Tss2Error(0x128u32.into());
+        assert_eq!(
+            match raced {
+                tss_esapi::Error::Tss2Error(rc) => rc.kind(),
+                _ => None,
+            },
+            Some(Tss2ResponseCodeKind::PcrChanged),
+            "0x128 must decode as PcrChanged, or the mapper below keys on nothing"
+        );
+        assert!(
+            is_pcr_changed_race(&retryable_tpm_err(raced)),
+            "the counter race must be retryable"
+        );
+
+        // A neighbouring code must NOT be: retrying a real policy failure would
+        // spin on a machine whose PCRs genuinely no longer match.
+        for other in [
+            0x12f_u32, // TPM2_RC_VER1 + 0x02f, a different VER1 code
+            0x99f,     // PolicyFail-class, formatted differently
+            0x1,       // a bare failure
+        ] {
+            let e = retryable_tpm_err(tss_esapi::Error::Tss2Error(other.into()));
+            assert!(
+                !is_pcr_changed_race(&e),
+                "rc {other:#x} must not be retried: {e}"
+            );
+        }
+
+        // A wrapper-level error carries no response code at all.
+        assert!(!is_pcr_changed_race(&retryable_tpm_err(
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+        )));
+    }
+
+    /// PCR drift and the counter race are different failures and must not be
+    /// confused: drift means the machine's state genuinely changed and the user
+    /// must re-arm, the race means "try again". Reporting the race as drift
+    /// would send someone to re-arm over a transient, and reporting drift as
+    /// the race would retry three times and still fail.
+    #[test]
+    fn the_counter_race_is_not_reported_as_pcr_drift() {
+        let raced = retryable_tpm_err(tss_esapi::Error::Tss2Error(0x128u32.into()));
+        assert!(is_pcr_changed_race(&raced));
+        assert!(
+            !is_pcr_mismatch(&raced),
+            "the race must not masquerade as drift: {raced}"
         );
     }
 

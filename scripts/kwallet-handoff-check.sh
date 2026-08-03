@@ -15,7 +15,8 @@
 # Exit 0 only if every control holds:
 #   * the correct key opens the wallet and the canary reads back
 #   * a key from the WRONG password does not
-#   * repeated handoffs leak neither processes nor file descriptors
+#   * a wallet daemon that cannot start is reported as a failure, not a success
+#   * repeated handoffs leak neither processes nor sockets
 set -u
 
 ITER=${1:-15}
@@ -118,32 +119,56 @@ if [ -z "$got" ]; then note "PASS: a key from the wrong password was refused"
 else bad "the WRONG key opened the wallet (read back '$got')"; fi
 reap_daemon
 
-# --- 3. stress: repeated handoffs must not accumulate anything --------------
+# --- 3. a daemon that cannot start must be reported as a failure ------------
+# This one guards a fail-open path rather than a feature. The caller exports
+# PAM_KWALLET5_LOGIN on the strength of this program's exit status, and that
+# variable makes pam_kwallet5 stand down, so reporting success when the wallet
+# daemon never started would leave the wallet locked AND remove the fallback
+# that would have opened it.
+notexec=$WORK/not-executable
+: > "$notexec"; chmod 0644 "$notexec"
+if IRLUME_KSECRETD="$notexec" "$HELPER" "$TESTUSER" < "$WORK/right.key" >/dev/null 2>&1; then
+  bad "the helper reported success when the wallet daemon could not be executed"
+else
+  note "PASS: a daemon that cannot exec is reported as a failure"
+fi
+reap_daemon
+
+# --- 4. stress: repeated handoffs must not accumulate anything --------------
 # One handoff working says nothing about a session that logs in and out all day.
 # Each round is a fresh daemon, so leaked processes or descriptors show up as a
 # trend rather than as a single failure.
 note "stress: $ITER handoffs"
 procs0=$(pgrep -c -u "$TUID" -f ksecretd || true)
-fd0=$(ls /proc/self/fd | wc -l)
 ok=0
+fdmax=0
 for i in $(seq "$ITER"); do
   handoff "$WORK/right.key" >/dev/null
   got=$(asuser timeout 20 secret-tool lookup svc handoffcheck 2>/dev/null)
   [ "$got" = "$CANARY" ] && ok=$((ok + 1))
   live=$(pgrep -c -u "$TUID" -f ksecretd || true)
-  printf '  %2d/%s opened=%s live_daemons=%s\n' "$i" "$ITER" \
-    "$([ "$got" = "$CANARY" ] && echo yes || echo NO)" "$live"
+  # Count the WALLET DAEMON's descriptors, not this script's. The earlier
+  # version measured /proc/self/fd, which belongs to the shell and never
+  # touches the handoff, so it could not have caught a leak in it.
+  dpid=$(pgrep -u "$TUID" -f ksecretd | head -1)
+  dfd=0
+  [ -n "$dpid" ] && dfd=$(ls "/proc/$dpid/fd" 2>/dev/null | wc -l)
+  [ "$dfd" -gt "$fdmax" ] && fdmax=$dfd
+  printf '  %2d/%s opened=%s live_daemons=%s daemon_fds=%s\n' "$i" "$ITER" \
+    "$([ "$got" = "$CANARY" ] && echo yes || echo NO)" "$live" "$dfd"
   reap_daemon
   # A stale socket must not block the next login; the helper replaces it.
   [ -S "$RT/kwallet5.socket" ] || bad "round $i left no socket behind to replace"
 done
-fd1=$(ls /proc/self/fd | wc -l)
 procs1=$(pgrep -c -u "$TUID" -f ksecretd || true)
+leftover=$(ls "$RT" 2>/dev/null | grep -c kwallet5 || true)
 
 [ "$ok" -eq "$ITER" ] || bad "stress: only $ok/$ITER handoffs opened the wallet"
 [ "$procs1" -le "$((procs0 + 1))" ] || bad "stress: wallet daemons accumulated ($procs0 -> $procs1)"
-[ "$fd1" -le "$((fd0 + 2))" ] || bad "stress: descriptors grew in the caller ($fd0 -> $fd1)"
-note "stress: $ok/$ITER opened, daemons $procs0 -> $procs1, caller fds $fd0 -> $fd1"
+# Each round replaces the one socket; more than one means the helper is
+# creating a new name per handoff and leaving the old behind.
+[ "$leftover" -le 1 ] || bad "stress: $leftover handoff sockets left in $RT"
+note "stress: $ok/$ITER opened, daemons $procs0 -> $procs1, peak daemon fds $fdmax, sockets left $leftover"
 
 if [ "$fail" -eq 0 ]; then note "ALL CHECKS PASSED"; else note "CHECKS FAILED"; fi
 exit "$fail"

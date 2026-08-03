@@ -26,7 +26,7 @@
 //! irlume would take the user's wallet daemon down with it.
 
 use irlume_common::kwallet_wire::{KEY_LEN, LOGIN_ENV, SOCKET_NAME};
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -88,10 +88,24 @@ fn run(user: &str) -> Result<PathBuf, String> {
         ));
     }
     let sock_path = runtime_dir.join(SOCKET_NAME);
+    // Resolved while still privileged: after the drop below, a user-writable
+    // PATH or a swapped file could change which program this becomes.
     let exe = wallet_daemon()?;
 
-    let listener = bind_listener(&sock_path, &pw)?;
+    // EVERYTHING below runs as the target user. Nothing after this point needs
+    // privilege, and doing pathname work as root inside /run/user/<uid>, which
+    // that user owns and can rename underneath us, is how KDE shipped
+    // CVE-2018-10380: chown() follows a final symlink, so a socket path swapped
+    // for a link to /etc/shadow between bind() and chown() hands the file to the
+    // attacker. Dropping first removes the primitive rather than racing it.
+    drop_privileges(&pw)?;
+
+    let listener = bind_listener(&sock_path)?;
     let (read_fd, write_fd) = make_pipe()?;
+    // Close-on-exec, so the child end closing is itself the signal that execve
+    // succeeded. Without it the parent cannot tell a running wallet daemon from
+    // one that died before exec, and it would report success either way.
+    let (status_read, status_write) = make_status_pipe()?;
 
     // SAFETY: between fork() and execve() the child runs in a single thread and
     // touches only async-signal-safe calls, which is the constraint fork()
@@ -101,21 +115,96 @@ fn run(user: &str) -> Result<PathBuf, String> {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
-        unsafe { child_exec(&exe, &pw, read_fd, listener, &sock_path) };
-        // child_exec only returns when execve failed.
-        unsafe { libc::_exit(127) };
+        unsafe {
+            libc::close(status_read);
+            libc::close(write_fd);
+            child_exec(&exe, read_fd, listener, &sock_path);
+            // Only reached when execve failed. The byte distinguishes that from
+            // the EOF a successful exec produces.
+            let failed = [1u8];
+            libc::write(status_write, failed.as_ptr() as *const libc::c_void, 1);
+            libc::_exit(127);
+        }
     }
 
-    // Parent: hand over the key, then get out of the way. ksecretd goes on to
-    // block in waitForEnvironment() until Plasma's pam_kwallet_init connects, so
-    // we deliberately do NOT wait for it.
     unsafe {
+        libc::close(status_write);
         libc::close(read_fd);
         libc::close(listener);
     }
+
+    // Wait for exec before claiming anything. Reporting success here is not
+    // cosmetic: the caller exports PAM_KWALLET5_LOGIN on the strength of it, and
+    // that variable makes pam_kwallet5 stand down. A false success therefore
+    // leaves the wallet locked AND removes the fallback that would have opened
+    // it.
+    if let Err(e) = await_exec(status_read) {
+        unsafe { libc::close(write_fd) };
+        return Err(e);
+    }
+
+    // Hand over the key, then get out of the way. ksecretd goes on to block in
+    // waitForEnvironment() until Plasma's pam_kwallet_init connects, so we
+    // deliberately do NOT wait for it to finish starting.
     write_all(write_fd, &key)?;
     unsafe { libc::close(write_fd) };
     Ok(sock_path)
+}
+
+/// Become the target user, permanently.
+///
+/// Order matters: supplementary groups and the gid must be set before the uid,
+/// or the process no longer holds the privilege needed to drop them.
+fn drop_privileges(pw: &User) -> Result<(), String> {
+    if unsafe { libc::initgroups(pw.name.as_ptr(), pw.gid) } != 0 {
+        return Err(format!("initgroups: {}", std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::setgid(pw.gid) } != 0 {
+        return Err(format!("setgid: {}", std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::setuid(pw.uid) } != 0 {
+        return Err(format!("setuid: {}", std::io::Error::last_os_error()));
+    }
+    // Checked rather than assumed: a drop that silently did not take would leave
+    // every path below running as root, which is the whole thing being avoided.
+    if unsafe { libc::getuid() } != pw.uid
+        || unsafe { libc::geteuid() } != pw.uid
+        || unsafe { libc::getgid() } != pw.gid
+        || unsafe { libc::getegid() } != pw.gid
+    {
+        return Err("privilege drop did not take effect".into());
+    }
+    Ok(())
+}
+
+fn make_status_pipe() -> Result<(libc::c_int, libc::c_int), String> {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(format!("status pipe: {}", std::io::Error::last_os_error()));
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Block until the child either execs (EOF, because the write end was
+/// close-on-exec) or reports a pre-exec failure (one byte).
+fn await_exec(status_fd: libc::c_int) -> Result<(), String> {
+    let mut byte = 0u8;
+    loop {
+        let n = unsafe { libc::read(status_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+        if n == 0 {
+            unsafe { libc::close(status_fd) };
+            return Ok(());
+        }
+        if n == 1 {
+            unsafe { libc::close(status_fd) };
+            return Err("the wallet daemon failed to start (exec did not happen)".into());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            unsafe { libc::close(status_fd) };
+            return Err(format!("reading the wallet daemon's start status: {e}"));
+        }
+    }
 }
 
 struct User {
@@ -158,8 +247,13 @@ fn wallet_daemon() -> Result<CString, String> {
     ))
 }
 
-/// Bind and listen on the handoff socket, owned by the target user.
-fn bind_listener(path: &std::path::Path, pw: &User) -> Result<libc::c_int, String> {
+/// Bind and listen on the handoff socket.
+///
+/// Runs unprivileged, so the socket is created owned by the user and there is
+/// no second pathname resolution to race. The previous version bound as root
+/// and then chown()ed the path, which follows a final symlink and let the
+/// directory's owner redirect it at any root-owned file.
+fn bind_listener(path: &std::path::Path) -> Result<libc::c_int, String> {
     let bytes = path.as_os_str().as_bytes();
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if bytes.len() >= std::mem::size_of_val(&addr.sun_path) {
@@ -174,7 +268,13 @@ fn bind_listener(path: &std::path::Path, pw: &User) -> Result<libc::c_int, Strin
     // EADDRINUSE. pam_kwallet5 replaces it the same way, and ksecretd uses
     // ReplaceExisting when PAM-launched (KDE BUG 509680), so the newest login
     // wins rather than colliding.
-    let _ = std::fs::remove_file(path);
+    // A real error here (a directory in the way, EACCES) must not be swallowed:
+    // bind() would then fail with EADDRINUSE and the reason would be lost.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("removing the stale {}: {e}", path.display())),
+    }
 
     // SAFETY: addr is fully initialised above and the length is the real size.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
@@ -198,13 +298,6 @@ fn bind_listener(path: &std::path::Path, pw: &User) -> Result<libc::c_int, Strin
         unsafe { libc::close(fd) };
         return Err(format!("listen: {e}"));
     }
-    // The connecting side is Plasma's pam_kwallet_init, running as the user.
-    let cpath = CString::new(bytes).map_err(|_| "socket path has a NUL".to_string())?;
-    if unsafe { libc::chown(cpath.as_ptr(), pw.uid, pw.gid) } < 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(format!("chown {}: {e}", path.display()));
-    }
     Ok(fd)
 }
 
@@ -224,24 +317,12 @@ fn make_pipe() -> Result<(libc::c_int, libc::c_int), String> {
 /// Must only be called in the child of a `fork()`, before any other work.
 unsafe fn child_exec(
     exe: &CString,
-    pw: &User,
     read_fd: libc::c_int,
     listen_fd: libc::c_int,
     sock_path: &std::path::Path,
 ) {
-    // Order matters: supplementary groups and gid must go before setuid, or the
-    // process no longer has the privilege to drop them.
-    if libc::initgroups(pw.name.as_ptr(), pw.gid) != 0
-        || libc::setgid(pw.gid) != 0
-        || libc::setuid(pw.uid) != 0
-    {
-        libc::_exit(126);
-    }
-    // A failed drop that we did not notice would run the wallet daemon as root.
-    if libc::getuid() != pw.uid || libc::geteuid() != pw.uid {
-        libc::_exit(126);
-    }
-
+    // No privilege drop here: the parent already dropped, before it touched the
+    // user-owned runtime directory at all.
     // Detach the standard streams before exec. The wallet daemon outlives this
     // helper by design, and if it kept our stdout the caller would block: a
     // pipe or a `$(...)` capture waits for EVERY writer to close, not just the
@@ -276,14 +357,11 @@ unsafe fn child_exec(
     // Without LOGIN_ENV, ksecretd never calls checkPamModule() and its argument
     // parser rejects --pam-login as an unknown option. Verified: it exits with
     // "Unknown option 'pam-login'" when the variable is absent.
+    let uid = libc::getuid();
     let login = CString::new(format!("{LOGIN_ENV}={}", sock_path.display())).unwrap();
-    let runtime = CString::new(format!("XDG_RUNTIME_DIR=/run/user/{}", pw.uid)).unwrap();
-    let home = CString::new(format!("HOME={}", home_of(pw.uid))).unwrap();
-    let user = CString::new(format!(
-        "USER={}",
-        OsStr::from_bytes(pw.name.as_bytes()).to_string_lossy()
-    ))
-    .unwrap();
+    let runtime = CString::new(format!("XDG_RUNTIME_DIR=/run/user/{uid}")).unwrap();
+    let home = CString::new(format!("HOME={}", home_of(uid))).unwrap();
+    let user = CString::new(format!("USER={}", name_of(uid))).unwrap();
     // The rest of the session environment (bus address, display) arrives later
     // over the socket; ksecretd is written to wait for exactly that.
     let envp = [
@@ -302,6 +380,17 @@ unsafe fn clear_cloexec(fd: libc::c_int) {
     if flags >= 0 {
         libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
     }
+}
+
+fn name_of(uid: libc::uid_t) -> String {
+    // SAFETY: read straight out of the static buffer before any other libc call.
+    let pw = unsafe { libc::getpwuid(uid) };
+    if pw.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn home_of(uid: libc::uid_t) -> String {

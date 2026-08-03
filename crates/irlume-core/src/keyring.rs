@@ -104,11 +104,26 @@ pub fn sealed_kind(user: &str) -> Option<SecretKind> {
         .map(|e| e.secret)
 }
 
-/// Release `user`'s sealed password from the TPM. Fails if none is armed or if
-/// the bound PCR policy is no longer satisfied (e.g. Secure Boot config changed);
-/// the caller then falls back to the typed password and the wallet stays
-/// locked until the user re-arms.
-pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+/// A released secret together with what it is.
+pub struct Unsealed {
+    pub secret: Zeroizing<Vec<u8>>,
+    pub kind: SecretKind,
+}
+
+/// Release `user`'s sealed secret from the TPM, and say what it is.
+///
+/// One envelope load produces both. Reading the bytes and then re-reading the
+/// file for its kind is two observations of something a concurrent `keyring
+/// arm` can replace between them, which would tag one envelope's bytes with
+/// another's kind: a 56-byte wallet key routed into `PAM_AUTHTOK`, or a
+/// password sent to the wallet daemon. It also removes the second read's
+/// failure path, which collapsed "could not read the kind" into "login
+/// password" and let an unreadable file authorise the wrong delivery.
+///
+/// Fails if none is armed or if the bound PCR policy is no longer satisfied
+/// (e.g. Secure Boot config changed); the caller then falls back to the typed
+/// password and the wallet stays locked until the user re-arms.
+pub fn unseal_secret(user: &str) -> Result<Unsealed> {
     let path = envelope_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
@@ -116,7 +131,19 @@ pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
         )));
     }
     let env = SealedEnvelope::load(&path)?;
-    tpm::unseal(&env)
+    let kind = env.secret;
+    Ok(Unsealed {
+        secret: tpm::unseal(&env)?,
+        kind,
+    })
+}
+
+/// Release `user`'s sealed secret, discarding what kind it is.
+///
+/// Only for callers that genuinely do not route on the kind. Anything that
+/// delivers the secret somewhere must use [`unseal_secret`].
+pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+    unseal_secret(user).map(|u| u.secret)
 }
 
 /// Outcome of [`reseal_password`].

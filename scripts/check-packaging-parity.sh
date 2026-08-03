@@ -43,9 +43,13 @@ for helper in "${HELPERS[@]}"; do
       fail=1
     fi
   done
-  # The Nix lane is not a package-manifest file, so it is checked separately
-  # rather than left out and silently drifting.
-  if grep -q -- "$helper" nix/package.nix; then
+  # The Nix lane is not a package-manifest file, so it is checked separately.
+  # Checked by DESTINATION, not by the name appearing somewhere: the first
+  # version of this check passed while the Nix build installed the helper to a
+  # store path that the compiled-in FHS path could never find.
+  if grep -Fq "libexec/irlume/$helper" nix/package.nix \
+     && grep -Fq "test -x \"\$out/bin/$helper\"" nix/package.nix \
+     && grep -Fq -- "--replace-fail" nix/package.nix; then
     printf '  ok    %-30s %s\n' "$helper" nix/package.nix
   else
     printf '  MISS  %-30s %s\n' "$helper" nix/package.nix

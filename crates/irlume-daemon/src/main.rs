@@ -1300,14 +1300,17 @@ fn unseal_keyring(user: &str, service: Option<&str>, peer: &Peer) -> Response {
             return Response::Error(format!("keyring unseal not allowed for {class:?}"));
         }
     }
-    match irlume_core::keyring::unseal_password(&user) {
-        Ok(secret) => {
-            eprintln!("irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), password unsealed");
+    // One load yields both the bytes and their kind, so a concurrent re-arm
+    // cannot tag one envelope's secret with another's kind.
+    match irlume_core::keyring::unseal_secret(&user) {
+        Ok(unsealed) => {
+            eprintln!(
+                "irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), {} unsealed",
+                unsealed.kind.describe()
+            );
             Response::PasswordUnsealed {
-                kind: crate::users::core_to_wire_kind(
-                    irlume_core::keyring::sealed_kind(&user).unwrap_or_default(),
-                ),
-                secret: irlume_common::SecretBytes::new(secret.to_vec()),
+                kind: crate::users::core_to_wire_kind(unsealed.kind),
+                secret: irlume_common::SecretBytes::new(unsealed.secret.to_vec()),
             }
         }
         Err(e) => {
@@ -2800,21 +2803,22 @@ fn do_unseal_password(
         );
         return Response::Error(format!("face not granted: {}", outcome.reason));
     }
-    match irlume_core::keyring::unseal_password(user) {
-        Ok(secret) => {
+    // See the UnsealKeyring path: one load, so the bytes and their kind always
+    // come from the same envelope.
+    match irlume_core::keyring::unseal_secret(user) {
+        Ok(unsealed) => {
             eprintln!(
-                "irlumed: UnsealPassword: OK for '{user}' (score {:.4}), password unsealed",
-                outcome.score
+                "irlumed: UnsealPassword: OK for '{user}' (score {:.4}), {} unsealed",
+                outcome.score,
+                unsealed.kind.describe()
             );
             irlume_common::dlog!(
                 "unseal '{user}' total {}ms (face + TPM)",
                 t.elapsed().as_millis()
             );
             Response::PasswordUnsealed {
-                kind: crate::users::core_to_wire_kind(
-                    irlume_core::keyring::sealed_kind(user).unwrap_or_default(),
-                ),
-                secret: irlume_common::SecretBytes::new(secret.to_vec()),
+                kind: crate::users::core_to_wire_kind(unsealed.kind),
+                secret: irlume_common::SecretBytes::new(unsealed.secret.to_vec()),
             }
         }
         // Face matched but the TPM could not release the secret (e.g. PCR drift

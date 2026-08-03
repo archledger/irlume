@@ -903,6 +903,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 return std::process::ExitCode::from(2);
             }
             let req = irlume_common::Request::SealPassword {
+                kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
                 password: irlume_common::SecretBytes::new(pw.into_bytes()),
             };

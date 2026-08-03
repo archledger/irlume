@@ -28,6 +28,32 @@ LANES=(
 
 fail=0
 
+# Installed programs that are not the two obvious bins. A helper added to
+# three lanes and forgotten in the fourth is invisible until someone on that
+# distro logs in and their wallet silently stays locked, which is the same
+# class of miss the units check above exists for.
+echo "== helper programs in every lane =="
+HELPERS=(irlume-kwallet-init)
+for helper in "${HELPERS[@]}"; do
+  for lane in "${LANES[@]}"; do
+    if grep -q -- "$helper" "$lane"; then
+      printf '  ok    %-30s %s\n' "$helper" "$lane"
+    else
+      printf '  MISS  %-30s %s\n' "$helper" "$lane"
+      fail=1
+    fi
+  done
+  # The Nix lane is not a package-manifest file, so it is checked separately
+  # rather than left out and silently drifting.
+  if grep -q -- "$helper" nix/package.nix; then
+    printf '  ok    %-30s %s\n' "$helper" nix/package.nix
+  else
+    printf '  MISS  %-30s %s\n' "$helper" nix/package.nix
+    fail=1
+  fi
+done
+echo
+
 echo "== systemd units in every lane =="
 units=(packaging/systemd/*)
 if [ "${#units[@]}" -eq 0 ]; then

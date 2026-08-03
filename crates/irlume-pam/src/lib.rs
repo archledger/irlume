@@ -175,18 +175,16 @@ impl PamServiceModule for IrlumePam {
                     .ok()
                     .flatten()
                     .and_then(|c| c.to_str().ok().map(str::to_string));
-                if let Ok(Response::PasswordUnsealed { secret }) =
+                if let Ok(Response::PasswordUnsealed { secret, kind }) =
                     request(&Request::UnsealKeyring {
                         user: user.clone(),
                         service,
                     })
                 {
-                    if let Ok(tok) = CString::new(secret.expose()) {
-                        let _ = pamh.set_authtok(&tok);
-                        // PAM copied the token into its own store; wipe our copy so
-                        // the plaintext password does not linger on this heap.
-                        zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
-                    }
+                    // Routed by kind, not assumed: on KDE this starts the wallet
+                    // daemon instead of setting an AUTHTOK. Best-effort either
+                    // way; the IGNORE below never becomes a failed login.
+                    let _ = release_secret(&pamh, &user, &secret, kind);
                 }
                 return PamError::IGNORE;
             }
@@ -448,7 +446,32 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
         user: user.to_string(),
         service,
     }) {
-        Ok(Response::PasswordUnsealed { secret }) => {
+        Ok(Response::PasswordUnsealed { secret, kind }) => {
+            match release_secret(pamh, user, &secret, kind) {
+                true => PamError::SUCCESS,
+                false => PamError::IGNORE,
+            }
+        }
+        _ => PamError::IGNORE,
+    }
+}
+
+/// Deliver a released keyring secret to whatever actually consumes it.
+///
+/// The two kinds are not interchangeable. A login password becomes
+/// `PAM_AUTHTOK`, which `pam_gnome_keyring` reads. A KDE wallet key would be
+/// meaningless as an `AUTHTOK`: `pam_kwallet5` would run PBKDF2 over it a second
+/// time and hand `ksecretd` the wrong bytes. It has to go to `ksecretd` on its
+/// startup pipe instead, which is what the helper does.
+fn release_secret(
+    pamh: &Pam,
+    user: &str,
+    secret: &irlume_common::SecretBytes,
+    kind: irlume_common::KeyringSecretKind,
+) -> bool {
+    use irlume_common::KeyringSecretKind as K;
+    match kind {
+        K::LoginPassword => {
             // CString copies the bytes; PAM then copies them into its own store,
             // after which we wipe our copy so the plaintext password does not
             // linger on this heap. A login password cannot contain a NUL, so
@@ -457,16 +480,76 @@ fn try_unseal(pamh: &Pam, user: &str) -> PamError {
                 Ok(tok) => {
                     let set = pamh.set_authtok(&tok);
                     zeroize::Zeroize::zeroize(&mut tok.into_bytes_with_nul());
-                    match set {
-                        Ok(()) => PamError::SUCCESS,
-                        Err(_) => PamError::IGNORE,
-                    }
+                    set.is_ok()
                 }
-                Err(_) => PamError::IGNORE,
+                Err(_) => false,
             }
         }
-        _ => PamError::IGNORE,
+        K::KdeWalletKey => hand_key_to_wallet_daemon(pamh, user, secret.expose()),
     }
+}
+
+/// Start the KDE wallet daemon with `key`, via `irlume-kwallet-init`.
+///
+/// The key goes on the helper's stdin, never in argv, which is world-readable
+/// through `/proc`. The helper prints the socket it created, and that path is
+/// exported into the PAM environment under the name Plasma's
+/// `plasma-kwallet-pam.service` reads, so Plasma delivers the session
+/// environment to our daemon with no change on its side.
+fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let helper = std::env::var("IRLUME_KWALLET_INIT")
+        .unwrap_or_else(|_| irlume_common::KWALLET_INIT_PATH.to_string());
+    if !std::path::Path::new(&helper).is_file() {
+        return false;
+    }
+    let mut child = match Command::new(&helper)
+        .arg(user)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut sin) = child.stdin.take() {
+        if sin.write_all(key).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        // Dropping the handle closes the pipe; the helper reads a fixed length
+        // and would otherwise sit waiting for more.
+        drop(sin);
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let sock = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sock.is_empty() {
+        return false;
+    }
+    // This variable does two jobs, and both are load-bearing.
+    //
+    // Plasma's plasma-kwallet-pam.service only connects to the socket when it
+    // is set, and until something connects, the wallet daemon sits in
+    // waitForEnvironment() with the wallet still shut.
+    //
+    // It is also the interlock with pam_kwallet5. Both its pam_sm_authenticate
+    // and its pam_sm_open_session begin by checking this exact variable and
+    // returning early with "we were already executed" when it is present. So
+    // setting it stops pam_kwallet5 launching a second wallet daemon, and stops
+    // it calling prompt_for_password() because a face login left PAM_AUTHTOK
+    // empty. No change to the PAM stack is needed for either.
+    let entry = format!("{}={sock}", irlume_common::kwallet_wire::LOGIN_ENV);
+    pamh.putenv(&entry).is_ok()
 }
 
 /// Round-trip one request to `irlumed` and return its reply. Delegates to the

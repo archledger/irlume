@@ -94,6 +94,10 @@ make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux irlume.pp
 install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
 install -Dm0755 target/release/irlume  %{buildroot}%{_bindir}/irlume
 install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/pam_irlume.so
+# The KDE wallet handoff helper. libexec, not bindir: it is not a command a
+# user runs, it takes a secret on stdin, and it is only meaningful inside a
+# PAM transaction.
+install -Dm0755 target/release/irlume-kwallet-init %{buildroot}%{_libexecdir}/%{name}/irlume-kwallet-init
 # Bundled models (release assets, verified in %prep) → /usr/share/irlume/models
 install -Dm0644 %{SOURCE2} %{buildroot}%{_datadir}/%{name}/models/glintr100.onnx
 install -Dm0644 %{SOURCE3} %{buildroot}%{_datadir}/%{name}/models/face_detection_yunet_2023mar.onnx
@@ -190,6 +194,8 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_bindir}/irlumed
 %{_bindir}/irlume
 %{_libdir}/security/pam_irlume.so
+%dir %{_libexecdir}/%{name}
+%{_libexecdir}/%{name}/irlume-kwallet-init
 # Own the directories the globs populate (rpmlint: "directory not owned by a
 # package"; also leaves them behind on erase otherwise).
 %dir %{_datadir}/%{name}

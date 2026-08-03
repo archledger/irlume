@@ -1142,7 +1142,7 @@ fn keyring_success_paths_with_a_live_daemon() {
     let sealed = log
         .iter()
         .find_map(|r| match r {
-            Request::SealPassword { user, password } => {
+            Request::SealPassword { user, password, .. } => {
                 Some((user.clone(), password.expose().to_vec()))
             }
             _ => None,

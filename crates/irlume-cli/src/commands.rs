@@ -1328,6 +1328,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let req = Request::SealPassword {
+        kind: None, // let the daemon judge from what the user has
         user,
         password: irlume_common::SecretBytes::new(pw.into_bytes()),
     };
@@ -1425,6 +1426,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     ) {
         if let Some(pw) = prompt_login_password() {
             match daemon_request(&Request::SealPassword {
+                kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
                 password: irlume_common::SecretBytes::new(pw.into_bytes()),
             }) {

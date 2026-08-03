@@ -57,8 +57,7 @@ pub fn read_salt(home: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let raw = std::fs::read(&path).map_err(|e| {
         Error::Policy(format!(
             "no KDE wallet salt at {}: {e}. Log into a Plasma session once so \
-             the wallet exists, then arm again"
-        ,
+             the wallet exists, then arm again",
             path.display()
         ))
     })?;
@@ -96,6 +95,27 @@ pub fn derive_key(secret: &[u8], salt: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
 pub fn derive_for_home(password: &[u8], home: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let salt = read_salt(home)?;
     derive_key(password, &salt)
+}
+
+/// Which secret to seal for a user, judged by what they actually have.
+///
+/// A KDE wallet key only makes sense where there is a KDE wallet, and it must
+/// not be chosen on a machine that also runs gnome-keyring: that backend takes
+/// the password string itself, so sealing a wallet key there would leave the
+/// GNOME login keyring locked with nothing to unlock it.
+///
+/// The conservative direction is [`SecretKind::LoginPassword`], which is the
+/// behaviour before #250, so anything ambiguous resolves to it.
+pub fn detect_kind(home: &Path) -> crate::envelope::SecretKind {
+    use crate::envelope::SecretKind;
+    let has_kde = salt_path(home).exists();
+    // gnome-keyring's login keyring, the thing that would break.
+    let has_gnome = home.join(".local/share/keyrings/login.keyring").exists();
+    if has_kde && !has_gnome {
+        SecretKind::KdeWalletKey
+    } else {
+        SecretKind::LoginPassword
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +181,49 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Detection has to be conservative in both directions: no KDE wallet means
+    /// there is nothing a wallet key could open, and a machine running both
+    /// backends must keep the password, or its GNOME login keyring is stranded.
+    #[test]
+    fn detect_kind_only_picks_the_wallet_key_on_a_kde_only_home() {
+        use crate::envelope::SecretKind;
+        let base = std::env::temp_dir().join(format!("irlume-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mk = |name: &str, kde: bool, gnome: bool| {
+            let h = base.join(name);
+            if kde {
+                std::fs::create_dir_all(salt_path(&h).parent().unwrap()).unwrap();
+                std::fs::write(salt_path(&h), [0u8; SALT_LEN]).unwrap();
+            }
+            if gnome {
+                let g = h.join(".local/share/keyrings");
+                std::fs::create_dir_all(&g).unwrap();
+                std::fs::write(g.join("login.keyring"), b"x").unwrap();
+            }
+            std::fs::create_dir_all(&h).unwrap();
+            h
+        };
+
+        assert_eq!(
+            detect_kind(&mk("neither", false, false)),
+            SecretKind::LoginPassword
+        );
+        assert_eq!(
+            detect_kind(&mk("gnome", false, true)),
+            SecretKind::LoginPassword
+        );
+        assert_eq!(
+            detect_kind(&mk("both", true, true)),
+            SecretKind::LoginPassword
+        );
+        assert_eq!(
+            detect_kind(&mk("kde", true, false)),
+            SecretKind::KdeWalletKey
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

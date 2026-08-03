@@ -1304,6 +1304,9 @@ fn unseal_keyring(user: &str, service: Option<&str>, peer: &Peer) -> Response {
         Ok(secret) => {
             eprintln!("irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), password unsealed");
             Response::PasswordUnsealed {
+                kind: crate::users::core_to_wire_kind(
+                    irlume_core::keyring::sealed_kind(&user).unwrap_or_default(),
+                ),
                 secret: irlume_common::SecretBytes::new(secret.to_vec()),
             }
         }
@@ -2159,7 +2162,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         // --- keyring unlock (TPM-sealed password) ---------------------------
-        Request::SealPassword { user, password } => {
+        Request::SealPassword {
+            user,
+            password,
+            kind,
+        } => {
             // Arming the keyring: root or the user themselves. `password`
             // zeroizes on drop, covering every return path.
             if !authorized_for(peer, &user) {
@@ -2174,9 +2181,44 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                      the login password, so arming a different one would leave the wallet locked"
                 ));
             }
-            match irlume_core::keyring::seal_password(&user, password.expose()) {
+            // On KDE, seal the wallet key derived from this password rather
+            // than the password itself. The wallet is keyed to exactly those
+            // bytes already, so nothing is re-keyed and a typed password still
+            // opens it through pam_kwallet5; what changes is that the envelope
+            // stops being a Unix password. See #250 and irlume_core::kwallet.
+            // Resolve the kind from what the user actually has when the client
+            // did not force one, so a KDE-only machine gets the wallet key
+            // without the client needing to know to ask.
+            let home = crate::users::home_for_name(&user);
+            let core_kind = match kind {
+                Some(k) => crate::users::wire_to_core_kind(k),
+                None => match home.as_deref() {
+                    Some(h) => irlume_core::kwallet::detect_kind(h),
+                    None => irlume_core::envelope::SecretKind::LoginPassword,
+                },
+            };
+            let secret = match core_kind {
+                irlume_core::envelope::SecretKind::LoginPassword => {
+                    Ok(zeroize::Zeroizing::new(password.expose().to_vec()))
+                }
+                irlume_core::envelope::SecretKind::KdeWalletKey => {
+                    irlume_core::keyring::derive_secret(
+                        core_kind,
+                        password.expose(),
+                        home.as_deref(),
+                    )
+                }
+            };
+            let secret = match secret {
+                Ok(s) => s,
+                Err(e) => return Response::Error(e.to_string()),
+            };
+            match irlume_core::keyring::seal_secret(&user, &secret, core_kind) {
                 Ok(()) => {
-                    eprintln!("irlumed: SealPassword: armed keyring unlock for '{user}'");
+                    eprintln!(
+                        "irlumed: SealPassword: armed keyring unlock for '{user}' ({})",
+                        core_kind.describe()
+                    );
                     Response::PasswordSealed
                 }
                 Err(e) => Response::Error(e.to_string()),
@@ -2298,15 +2340,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 return Response::Error(format!("not authorized to reseal password for '{user}'"));
             }
             // The home directory is where the KDE wallet salt lives; a
-            // login-password envelope ignores it. Resolved via NSS rather than
-            // assumed, so a non-/home account derives against its real salt.
-            let home = match crate::users::home_for_name(&user) {
-                Some(h) => h,
-                None => {
-                    return Response::Error(format!("no home directory for '{user}'"));
-                }
-            };
-            match irlume_core::keyring::reseal_password(&user, password.expose(), &home) {
+            // login-password envelope ignores it, so an unresolvable home is
+            // only fatal for the wallet kind and reseal decides that itself.
+            let home = crate::users::home_for_name(&user);
+            match irlume_core::keyring::reseal_password(&user, password.expose(), home.as_deref()) {
                 Ok(outcome) => {
                     use irlume_core::keyring::Reseal;
                     if outcome == Reseal::Resealed {
@@ -2774,6 +2811,9 @@ fn do_unseal_password(
                 t.elapsed().as_millis()
             );
             Response::PasswordUnsealed {
+                kind: crate::users::core_to_wire_kind(
+                    irlume_core::keyring::sealed_kind(user).unwrap_or_default(),
+                ),
                 secret: irlume_common::SecretBytes::new(secret.to_vec()),
             }
         }
@@ -3195,6 +3235,7 @@ mod tests {
                 on: false,
             },
             Request::SealPassword {
+                kind: None,
                 user: u(),
                 password: secret(),
             },
@@ -3811,6 +3852,7 @@ mod tests {
         respond(
             ours,
             &Response::PasswordUnsealed {
+                kind: irlume_common::KeyringSecretKind::LoginPassword,
                 secret: irlume_common::SecretBytes::new(b"hunter2".to_vec()),
             },
         )
@@ -3818,7 +3860,7 @@ mod tests {
         let mut line = String::new();
         BufReader::new(&theirs).read_line(&mut line).unwrap();
         match serde_json::from_str::<Response>(line.trim()).unwrap() {
-            Response::PasswordUnsealed { secret } => {
+            Response::PasswordUnsealed { secret, .. } => {
                 assert_eq!(secret.expose(), b"hunter2")
             }
             other => panic!("expected PasswordUnsealed, got {other:?}"),
@@ -5133,6 +5175,7 @@ mod tests {
         let _ = &sb;
         match dispatch(
             Request::SealPassword {
+                kind: None,
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(b"pw".to_vec()),
             },
@@ -5146,6 +5189,7 @@ mod tests {
         // is safe (and deterministic) on every host.
         match dispatch(
             Request::SealPassword {
+                kind: None,
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(Vec::new()),
             },
@@ -5812,6 +5856,7 @@ mod tests {
         let secret = b"hunter2-swtpm".to_vec();
         match dispatch(
             Request::SealPassword {
+                kind: None,
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(secret.clone()),
             },
@@ -5874,7 +5919,7 @@ mod tests {
             &root,
             &mut e,
         ) {
-            Response::PasswordUnsealed { secret: got } => assert_eq!(got.expose(), secret),
+            Response::PasswordUnsealed { secret: got, .. } => assert_eq!(got.expose(), secret),
             other => panic!("root keyring unseal must release the secret, got {other:?}"),
         }
         match dispatch(

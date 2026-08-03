@@ -322,6 +322,7 @@ fn grant() -> Response {
 
 fn unsealed(pw: &str) -> Response {
     Response::PasswordUnsealed {
+        kind: irlume_common::KeyringSecretKind::LoginPassword,
         secret: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
     }
 }
@@ -648,6 +649,7 @@ fn pamwrap_nul_poisoned_secret_is_ignore_fail_closed() {
     h.write_service("irlume-nul", &[h.auth_line("required", "unseal")]);
     serve(&h.socket, |req| match req {
         Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+            kind: irlume_common::KeyringSecretKind::LoginPassword,
             secret: irlume_common::SecretBytes::new(b"hun\0ter".to_vec()),
         },
         _ => Response::Error("unexpected request".into()),

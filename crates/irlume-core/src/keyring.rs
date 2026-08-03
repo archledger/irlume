@@ -43,10 +43,15 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
 /// has no business knowing what they mean.
 pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
     if secret.is_empty() {
-        return Err(Error::Protocol(format!(
-            "refusing to seal an empty {}",
-            kind.describe()
-        )));
+        // Keep the wording the login path has always used; the wallet key gets
+        // its own so the message names what was actually empty.
+        return Err(Error::Protocol(
+            match kind {
+                SecretKind::LoginPassword => "refusing to seal an empty password",
+                SecretKind::KdeWalletKey => "refusing to seal an empty KDE wallet key",
+            }
+            .to_string(),
+        ));
     }
     if kind == SecretKind::KdeWalletKey && secret.len() != crate::kwallet::KEY_LEN {
         // ksecretd reads exactly KEY_LEN bytes off the pipe. Sealing any other
@@ -76,11 +81,19 @@ pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
 pub fn derive_secret(
     kind: SecretKind,
     password: &[u8],
-    home: &std::path::Path,
+    home: Option<&std::path::Path>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     match kind {
+        // A login password needs no home, and demanding one would strand any
+        // account NSS cannot resolve a home directory for.
         SecretKind::LoginPassword => Ok(Zeroizing::new(password.to_vec())),
-        SecretKind::KdeWalletKey => crate::kwallet::derive_for_home(password, home),
+        SecretKind::KdeWalletKey => match home {
+            Some(h) => crate::kwallet::derive_for_home(password, h),
+            None => Err(Error::Policy(
+                "a KDE wallet key needs the user's home directory, and none could be resolved"
+                    .into(),
+            )),
+        },
     }
 }
 
@@ -146,7 +159,11 @@ pub enum Reseal {
 /// The "unseal fails" branch is what fixes a dbx/Secure-Boot update: the old
 /// envelope's PCR7 policy no longer satisfies, so we rebind to today's PCRs
 /// using the password the user just proved (via a successful login) they know.
-pub fn reseal_password(user: &str, password: &[u8], home: &std::path::Path) -> Result<Reseal> {
+pub fn reseal_password(
+    user: &str,
+    password: &[u8],
+    home: Option<&std::path::Path>,
+) -> Result<Reseal> {
     if password.is_empty() {
         return Err(Error::Protocol(
             "refusing to reseal an empty password".into(),
@@ -283,7 +300,7 @@ mod tests {
         assert_eq!(
             // A login-password envelope never reads `home`: derive_secret
             // returns the password unchanged.
-            reseal_password("tester", pw, std::path::Path::new("/nonexistent")).unwrap(),
+            reseal_password("tester", pw, None).unwrap(),
             Reseal::Upgraded
         );
         let env = SealedEnvelope::load(&envelope_path("tester")).unwrap();
@@ -330,8 +347,11 @@ mod tests {
         let home = std::path::PathBuf::from("/tmp/irlume-kr-kind-home");
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(crate::kwallet::salt_path(&home).parent().unwrap()).unwrap();
-        std::fs::write(crate::kwallet::salt_path(&home), [0x33u8; crate::kwallet::SALT_LEN])
-            .unwrap();
+        std::fs::write(
+            crate::kwallet::salt_path(&home),
+            [0x33u8; crate::kwallet::SALT_LEN],
+        )
+        .unwrap();
 
         let pw = b"a-login-password";
         let key = crate::kwallet::derive_for_home(pw, &home).expect("derive");
@@ -347,7 +367,7 @@ mod tests {
         assert_eq!(sealed_kind("kindtest"), Some(SecretKind::KdeWalletKey));
 
         // Same password, weaker tier on disk -> the tier-climb rewrite.
-        let first = reseal_password("kindtest", pw, &home).expect("reseal");
+        let first = reseal_password("kindtest", pw, Some(&home)).expect("reseal");
         assert_eq!(
             first,
             Reseal::Upgraded,
@@ -363,7 +383,7 @@ mod tests {
         // A changed password takes the Resealed path, which rebuilds the
         // envelope from scratch.
         assert_eq!(
-            reseal_password("kindtest", b"a-different-password", &home).unwrap(),
+            reseal_password("kindtest", b"a-different-password", Some(&home)).unwrap(),
             Reseal::Resealed
         );
         assert_eq!(
@@ -392,24 +412,22 @@ mod tests {
         let dir = "/tmp/irlume-kr-reseal";
         std::env::set_var("IRLUME_KEYRING_DIR", dir);
         let _ = std::fs::remove_dir_all(dir);
-        // Unused for login-password envelopes; see the note in the tier test.
-        let home = std::path::Path::new("/nonexistent");
 
         // Not armed -> nothing happens.
         assert_eq!(
-            reseal_password("rt", b"whatever", home).unwrap(),
+            reseal_password("rt", b"whatever", None).unwrap(),
             Reseal::NotArmed
         );
 
         seal_password("rt", b"first-password").expect("arm");
         // Same password still unseals under current PCRs -> no rewrite.
         assert_eq!(
-            reseal_password("rt", b"first-password", home).unwrap(),
+            reseal_password("rt", b"first-password", None).unwrap(),
             Reseal::Unchanged
         );
         // Different password (simulates a password change) -> reseal.
         assert_eq!(
-            reseal_password("rt", b"second-password", home).unwrap(),
+            reseal_password("rt", b"second-password", None).unwrap(),
             Reseal::Resealed
         );
         // And it now unseals to the new one.

@@ -85,6 +85,34 @@ pub fn home_for_name(name: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(s))
 }
 
+/// Translate the wire secret kind to the core one.
+///
+/// The two enums are deliberately separate: `irlume-common` carries the wire
+/// form and cannot depend on `irlume-core`, which owns the on-disk form. This is
+/// the single place they meet.
+pub fn wire_to_core_kind(k: irlume_common::KeyringSecretKind) -> irlume_core::envelope::SecretKind {
+    match k {
+        irlume_common::KeyringSecretKind::LoginPassword => {
+            irlume_core::envelope::SecretKind::LoginPassword
+        }
+        irlume_common::KeyringSecretKind::KdeWalletKey => {
+            irlume_core::envelope::SecretKind::KdeWalletKey
+        }
+    }
+}
+
+/// Translate the core secret kind to the wire one.
+pub fn core_to_wire_kind(k: irlume_core::envelope::SecretKind) -> irlume_common::KeyringSecretKind {
+    match k {
+        irlume_core::envelope::SecretKind::LoginPassword => {
+            irlume_common::KeyringSecretKind::LoginPassword
+        }
+        irlume_core::envelope::SecretKind::KdeWalletKey => {
+            irlume_common::KeyringSecretKind::KdeWalletKey
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

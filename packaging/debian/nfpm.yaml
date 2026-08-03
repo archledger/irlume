@@ -43,6 +43,11 @@ contents:
     dst: /usr/bin/irlume
   - src: ../../target/release/libpam_irlume.so
     dst: /usr/lib/x86_64-linux-gnu/security/pam_irlume.so
+  # KDE wallet handoff helper. libexec, not bin: it is not a command a user
+  # runs, it takes a secret on stdin, and it is only meaningful inside a PAM
+  # transaction.
+  - src: ../../target/release/irlume-kwallet-init
+    dst: /usr/libexec/irlume/irlume-kwallet-init
   # Bundled models (fetched from the models-v1 release by build-deb.sh)
   - src: ../../models/glintr100.onnx
     dst: /usr/share/irlume/models/glintr100.onnx

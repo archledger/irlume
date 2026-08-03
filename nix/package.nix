@@ -103,6 +103,15 @@ rustPlatform.buildRustPackage {
       "$(find target -name libpam_irlume.so -print -quit)" \
       "$out/lib/security/pam_irlume.so"
 
+    # KDE wallet handoff helper. buildRustPackage puts every bin in $out/bin;
+    # this one belongs in libexec, since it takes a secret on stdin and is only
+    # meaningful inside a PAM transaction.
+    if [ -e "$out/bin/irlume-kwallet-init" ]; then
+      install -Dm0755 "$out/bin/irlume-kwallet-init" \
+        "$out/libexec/irlume/irlume-kwallet-init"
+      rm "$out/bin/irlume-kwallet-init"
+    fi
+
     install -d "$out/share/irlume/models"
     install -m0644 ${models}/*.onnx "$out/share/irlume/models/"
 

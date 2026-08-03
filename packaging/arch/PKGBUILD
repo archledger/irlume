@@ -51,6 +51,10 @@ package() {
     install -Dm0755 target/release/irlumed "$pkgdir/usr/bin/irlumed"
     install -Dm0755 target/release/irlume  "$pkgdir/usr/bin/irlume"
     install -Dm0644 target/release/libpam_irlume.so "$pkgdir/usr/lib/security/pam_irlume.so"
+    # KDE wallet handoff helper. Not in /usr/bin: it is not a command a user
+    # runs, it takes a secret on stdin, and it is only meaningful inside a PAM
+    # transaction.
+    install -Dm0755 target/release/irlume-kwallet-init "$pkgdir/usr/libexec/irlume/irlume-kwallet-init"
     for m in glintr100 face_detection_yunet_2023mar face_landmark blaze_face_short_range; do
         install -Dm0644 "models/$m.onnx" "$pkgdir/usr/share/irlume/models/$m.onnx"
     done

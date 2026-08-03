@@ -451,7 +451,20 @@ pub enum Request {
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
     /// it to unlock the GNOME-keyring / KWallet. PRIVILEGED: root or `user`.
-    SealPassword { user: String, password: SecretBytes },
+    SealPassword {
+        user: String,
+        password: SecretBytes,
+        /// What to seal, or `None` to let the daemon decide from what the user
+        /// actually has. `LoginPassword` seals `password` itself; `KdeWalletKey`
+        /// derives the wallet key from it and seals that, leaving the password
+        /// out of the envelope entirely.
+        ///
+        /// `None` is also what an older client sends, and resolving it by
+        /// inspection is the right answer for one: a KDE-only machine gets the
+        /// wallet key without the client having to know to ask.
+        #[serde(default)]
+        kind: Option<KeyringSecretKind>,
+    },
     /// Face-verify `user` and, on a live match, release the TPM-sealed password
     /// so the caller can set it as `PAM_AUTHTOK` (login keyring unlock).
     /// PRIVILEGED: root only; the sealed login password is never released to a
@@ -704,9 +717,14 @@ pub enum Response {
     // --- keyring unlock responses -------------------------------------------
     /// The password was sealed (`SealPassword`).
     PasswordSealed,
-    /// Face matched and the TPM released the password (`UnsealPassword`).
+    /// Face matched and the TPM released the secret (`UnsealPassword` /
+    /// `UnsealKeyring`).
     PasswordUnsealed {
         secret: SecretBytes,
+        /// What `secret` is. Absent from an older daemon's reply, which only
+        /// ever sealed login passwords, so the default is correct for it.
+        #[serde(default)]
+        kind: KeyringSecretKind,
     },
     /// Whether a sealed password exists (`HasSealedPassword`).
     HasPassword(bool),
@@ -1217,6 +1235,24 @@ mod tests {
     }
 }
 
+/// What a released keyring secret actually is, on the wire.
+///
+/// Mirrors `irlume_core::envelope::SecretKind`. It is declared here rather than
+/// shared because irlume-common is the dependency of irlume-core, not the other
+/// way round, and the PAM module needs it without the TPM stack.
+///
+/// The consumer differs by kind: a login password goes into `PAM_AUTHTOK`, a
+/// wallet key goes to `ksecretd` through `irlume-kwallet-init`. Sending it on
+/// the wire means the PAM module never has to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum KeyringSecretKind {
+    /// The user's Unix login password.
+    #[default]
+    LoginPassword,
+    /// The 56-byte key `ksecretd` opens the KDE wallet with.
+    KdeWalletKey,
+}
+
 /// Wire constants for the KDE wallet handoff.
 ///
 /// These are shared with software we do not ship (`pam_kwallet5`, `ksecretd`).
@@ -1249,3 +1285,11 @@ pub mod kwallet_wire {
     /// The environment variable Plasma's autostart reads.
     pub const LOGIN_ENV: &str = "PAM_KWALLET5_LOGIN";
 }
+
+/// Installed path of the KDE wallet handoff helper.
+///
+/// Under `libexec` rather than `bin`: it is not a command a user runs, it takes
+/// a secret on stdin, and it is only meaningful inside a PAM transaction.
+/// `IRLUME_KWALLET_INIT` overrides it for tests and for distributions that
+/// place libexec elsewhere.
+pub const KWALLET_INIT_PATH: &str = "/usr/libexec/irlume/irlume-kwallet-init";

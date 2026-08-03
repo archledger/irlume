@@ -3302,6 +3302,7 @@ impl App {
                     return;
                 }
                 let req = Request::SealPassword {
+                    kind: None, // let the daemon judge from what the user has
                     user: self.user.clone(),
                     password: irlume_common::SecretBytes::new(buf.as_bytes().to_vec()),
                 };

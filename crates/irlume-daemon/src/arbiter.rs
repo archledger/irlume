@@ -472,6 +472,7 @@ mod tests {
         // A secret-carrying management request is not camera work.
         assert_eq!(
             classify(&Request::SealPassword {
+                kind: None,
                 user: "u".into(),
                 password: SecretBytes::new(vec![1u8]),
             }),

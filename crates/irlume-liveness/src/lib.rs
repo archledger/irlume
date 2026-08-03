@@ -193,12 +193,39 @@ pub const CROSS_SPECTRUM_TOLERANCE: f32 = 0.30;
 /// Minimum detector score to trust a face.
 pub const MIN_FACE_SCORE: f32 = 0.6;
 /// Center/edge IR brightness ratio above which the face region is treated as
-/// having 3D falloff. Calibrated 2026-06-26: a real lit face measured 1.36; a
-/// flat matte spoof is ~1.0. The 1.03 floor is lenient to avoid false-rejects
-/// across poses, and that leniency is measured: a glossy IR print cleared it in
-/// 69 of 70 trials (docs/pad-results/2026-06-30-ir-liveness-selftest.md). Treat
-/// it as one weak cue, never as proof of a live face.
-pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
+/// having 3D falloff. A real lit face falls off from the middle outward; a flat
+/// surface held at the same distance mostly does not.
+///
+/// **Raised from 1.03 to 1.25 on 2026-08-02**, because 1.03 was not a floor in
+/// any useful sense: `padcapture` put a flat vinyl print in front of the ASUS
+/// module 24 times and the gate called 22 of them Live. The corpus behind the
+/// new value is `~/irlume-research/2026-08-02-ratio-corpus/pad.jsonl`, 84
+/// presentations, one subject, one camera, dark room:
+///
+/// | presentation | n | ratio range |
+/// |---|---|---|
+/// | live, normal distance, glasses on and off | 24 | 1.40 to 1.47 |
+/// | live, arm's length | 12 | 1.36 to 1.41 |
+/// | live, off-angle (~15 degrees) | 12 | 1.43 to 1.49 |
+/// | live, close (~20cm) | 12 | 1.26 to 1.37 |
+/// | vinyl print, normal and close | 24 | 1.02 to 1.21 |
+///
+/// The lowest genuine capture that passed liveness read 1.31 and the highest
+/// attack read 1.21, so anything from 1.22 to 1.30 separates them completely on
+/// this corpus. 1.25 sits near the middle, 0.04 above the attack ceiling and
+/// 0.06 below the genuine floor.
+///
+/// **What this does not establish.** One subject, one camera, one room, one
+/// attack medium. A face that reads lower than this subject's (different
+/// geometry, a module with a wider emitter baseline, bright ambient IR) could
+/// be false-rejected where 1.03 passed it, and the fallback is a password, not
+/// a lockout. A GLOSSIER print may still clear 1.25: the 69-of-70 result on
+/// 2026-06-30 used a glossy medium and this corpus did not
+/// (docs/pad-results/2026-06-30-ir-liveness-selftest.md). This raises the bar
+/// from "essentially no barrier" to "stops the medium that was measured"; it is
+/// still one weak cue and still not proof of a live face. #101 is the corpus
+/// that would let it be tuned against more than one person.
+pub const MIN_CENTER_EDGE_RATIO: f32 = 1.25;
 
 /// Fraction of the IR face region at the sensor ceiling above which the frame
 /// is refused as unreadable rather than judged.
@@ -1534,7 +1561,12 @@ mod tests {
             rgb_face: Some(fb(0.5, 0.5)),
             ir_face: Some(fb(0.52, 0.49)),
             ir_face_brightness: 90.0,
-            ir_center_edge_ratio: 1.2,
+            // A measured genuine reading, not a value chosen to clear the
+            // floor: the 2026-08-02 corpus put a live face at normal seating
+            // distance between 1.40 and 1.47. The old fixture used 1.20, which
+            // that same corpus says is a PRINT, so every test built on it was
+            // asserting live-face behaviour about spoof-shaped input.
+            ir_center_edge_ratio: 1.42,
             ir_eye_glint: 220.0,
             ..Default::default() // frontal pose
         }
@@ -1646,6 +1678,39 @@ mod tests {
         assert_eq!(
             LivenessGate::new().evaluate(&live_signals()).0,
             Verdict::Live
+        );
+    }
+
+    /// The floor has to sit between two MEASURED populations, not merely hold
+    /// whatever number is written down. These are the extremes from the
+    /// 2026-08-02 corpus (84 presentations, ASUS module, dark room): the
+    /// highest ratio a flat vinyl print produced, and the lowest a live face
+    /// that passed liveness produced. A change that lets the print's best
+    /// showing through, or rejects the face's worst, fails here.
+    ///
+    /// Both numbers are one subject and one attack medium; see
+    /// [`MIN_CENTER_EDGE_RATIO`] for what that does and does not establish.
+    #[test]
+    fn the_floor_separates_the_measured_print_from_the_measured_face() {
+        const CORPUS_ATTACK_MAX: f32 = 1.21;
+        const CORPUS_LIVE_MIN: f32 = 1.31;
+        let gate = LivenessGate::new();
+
+        let mut print_at_its_best = live_signals();
+        print_at_its_best.ir_center_edge_ratio = CORPUS_ATTACK_MAX;
+        let (verdict, _, reason) = gate.evaluate(&print_at_its_best);
+        assert_eq!(
+            verdict,
+            Verdict::Spoof,
+            "the best the measured print managed ({CORPUS_ATTACK_MAX}) must not pass: {reason}"
+        );
+
+        let mut face_at_its_worst = live_signals();
+        face_at_its_worst.ir_center_edge_ratio = CORPUS_LIVE_MIN;
+        assert_eq!(
+            gate.evaluate(&face_at_its_worst).0,
+            Verdict::Live,
+            "the dimmest genuine capture in the corpus ({CORPUS_LIVE_MIN}) must still authenticate"
         );
     }
 

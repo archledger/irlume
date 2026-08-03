@@ -55,6 +55,7 @@ package() {
     # runs, it takes a secret on stdin, and it is only meaningful inside a PAM
     # transaction.
     install -Dm0755 target/release/irlume-kwallet-init "$pkgdir/usr/libexec/irlume/irlume-kwallet-init"
+    install -Dm0755 target/release/irlume-gkr-unlock "$pkgdir/usr/libexec/irlume/irlume-gkr-unlock"
     for m in glintr100 face_detection_yunet_2023mar face_landmark blaze_face_short_range; do
         install -Dm0644 "models/$m.onnx" "$pkgdir/usr/share/irlume/models/$m.onnx"
     done

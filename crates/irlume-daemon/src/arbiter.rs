@@ -451,6 +451,7 @@ mod tests {
             classify(&Request::UnsealKeyring {
                 user: "u".into(),
                 service: None,
+                have_password: false,
             }),
             Class::Auth
         );

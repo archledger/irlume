@@ -1,0 +1,16 @@
+[package]
+name = "irlume-gkr-unlock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "irlume-gkr-unlock"
+path = "src/main.rs"
+
+# Deliberately minimal, like irlume-kwallet-init: this runs as root in the
+# login path, so it takes no dependency on the TPM, inference or serialization
+# stacks.
+[dependencies]
+irlume-common.workspace = true
+libc.workspace = true

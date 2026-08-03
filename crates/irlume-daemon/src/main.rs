@@ -1258,7 +1258,7 @@ static SOCKET_ACTIVATED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// credentials. That is what lets the daemon answer it while the engine is still
 /// loading (#244). Every authorization check below is a property of the REQUEST,
 /// never of startup state, so answering early cannot weaken any of them.
-fn unseal_keyring(user: &str, service: Option<&str>, peer: &Peer) -> Response {
+fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: &Peer) -> Response {
     let user = user.to_string();
     let service = service.map(str::to_string);
 
@@ -1300,6 +1300,19 @@ fn unseal_keyring(user: &str, service: Option<&str>, peer: &Peer) -> Response {
             return Response::Error(format!("keyring unseal not allowed for {class:?}"));
         }
     }
+    // A typed password already opens a password-keyed keyring, so touching the
+    // TPM would spend an unseal (up to seconds on a discrete TPM) to release a
+    // secret the caller then discards. For a token envelope the typed password
+    // opens nothing, so the release must proceed. The kind read here is a
+    // cheap envelope-file read, not an unseal; the release below re-reads
+    // atomically, so a concurrent re-arm at worst turns this into the old
+    // always-unseal behaviour.
+    if have_password
+        && irlume_core::keyring::sealed_kind(&user)
+            == Some(irlume_core::envelope::SecretKind::LoginPassword)
+    {
+        return Response::KeyringUnlockNotNeeded;
+    }
     // One load yields both the bytes and their kind, so a concurrent re-arm
     // cannot tag one envelope's secret with another's kind.
     match irlume_core::keyring::unseal_secret(&user) {
@@ -1330,7 +1343,11 @@ fn unseal_keyring(user: &str, service: Option<&str>, peer: &Peer) -> Response {
 /// and no early caller occupies a slot for the length of it.
 fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
     match req {
-        Request::UnsealKeyring { user, service } => unseal_keyring(&user, service.as_deref(), peer),
+        Request::UnsealKeyring {
+            user,
+            service,
+            have_password,
+        } => unseal_keyring(&user, service.as_deref(), have_password, peer),
         Request::Ping => Response::Ok("starting".into()),
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
@@ -1790,6 +1807,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         .ok()
                         .filter(|_| !env.pcr_values.is_empty())
                         .map(|d| !d.is_empty()),
+                    kind: Some(crate::users::core_to_wire_kind(env.secret)),
                 },
                 // Not armed, or the envelope is unreadable/corrupt: report the
                 // armed bit alone rather than failing the whole query.
@@ -1798,6 +1816,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     policy: None,
                     pcrs: Vec::new(),
                     drifted: None,
+                    kind: None,
                 },
             }
         }
@@ -2200,11 +2219,47 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     None => irlume_core::envelope::SecretKind::LoginPassword,
                 },
             };
+            // A token arm returns the token: the re-key of the login keyring
+            // can only happen in the user's session (the control socket
+            // authenticates the peer uid), so the caller finishes the job.
+            // Envelope-before-re-key ordering is inside arm_gnome_token. A
+            // RE-arm must reuse the existing token, not mint: the keyring's
+            // live credential is the old token, and overwriting its only copy
+            // with a fresh one would strand the keyring permanently.
+            if core_kind == irlume_core::envelope::SecretKind::GnomeKeyringToken {
+                let already_token = irlume_core::keyring::sealed_kind(&user)
+                    == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken);
+                let armed = if already_token {
+                    irlume_core::keyring::rearm_gnome_token(&user, password.expose())
+                } else {
+                    irlume_core::keyring::arm_gnome_token(&user, password.expose())
+                        .map(|t| zeroize::Zeroizing::new(t.as_bytes().to_vec()))
+                };
+                return match armed {
+                    Ok(token) => {
+                        eprintln!(
+                            "irlumed: SealPassword: sealed a GNOME keyring token for '{user}' \
+                             ({}); caller must now re-key the login keyring",
+                            if already_token {
+                                "reused from the existing envelope"
+                            } else {
+                                "freshly minted"
+                            }
+                        );
+                        Response::TokenSealed {
+                            token: irlume_common::SecretBytes::new(token.to_vec()),
+                            minted: !already_token,
+                        }
+                    }
+                    Err(e) => Response::Error(e.to_string()),
+                };
+            }
             let secret = match core_kind {
                 irlume_core::envelope::SecretKind::LoginPassword => {
                     Ok(zeroize::Zeroizing::new(password.expose().to_vec()))
                 }
-                irlume_core::envelope::SecretKind::KdeWalletKey => {
+                irlume_core::envelope::SecretKind::KdeWalletKey
+                | irlume_core::envelope::SecretKind::GnomeKeyringToken => {
                     irlume_core::keyring::derive_secret(
                         core_kind,
                         password.expose(),
@@ -2323,13 +2378,41 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             do_unseal_password(&user, service.as_deref(), engine)
         }
-        Request::UnsealKeyring { user, service } => unseal_keyring(&user, service.as_deref(), peer),
+        Request::UnsealKeyring {
+            user,
+            service,
+            have_password,
+        } => unseal_keyring(&user, service.as_deref(), have_password, peer),
         Request::ForgetPassword { user } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to forget password for '{user}'"));
             }
             match irlume_core::keyring::forget_password(&user) {
                 Ok(()) => Response::PasswordForgotten,
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
+        Request::ReleaseTokenForDisarm { user, password } => {
+            // Same authz as arming; the password check inside (the token's own
+            // AES-GCM wrap) is what actually gates the release, so a root
+            // caller still has to present the user's password. `password`
+            // zeroizes on drop.
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!(
+                    "not authorized to release the keyring token for '{user}'"
+                ));
+            }
+            match irlume_core::keyring::release_token_with_password(&user, password.expose()) {
+                Ok(token) => {
+                    eprintln!(
+                        "irlumed: ReleaseTokenForDisarm: released '{user}'s keyring token \
+                         (password verified against the recovery wrap)"
+                    );
+                    Response::PasswordUnsealed {
+                        kind: irlume_common::KeyringSecretKind::GnomeKeyringToken,
+                        secret: irlume_common::SecretBytes::new(token.to_vec()),
+                    }
+                }
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -3250,6 +3333,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: u(),
                 service: None,
+                have_password: false,
             },
             Request::HasSealedPassword { user: u() },
             Request::KeyringInfo { user: u() },
@@ -5332,6 +5416,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                have_password: false,
             },
             &peer(NOBODY),
             &mut e,
@@ -5348,6 +5433,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                have_password: false,
             },
             &peer(0),
             &mut e,
@@ -5366,6 +5452,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: "carol".into(),
                 service: Some("sudo".into()),
+                have_password: false,
             },
             &peer(0),
             &mut e,
@@ -5378,6 +5465,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                have_password: false,
             },
             &peer(0),
             &mut e,
@@ -5460,6 +5548,7 @@ mod tests {
                 policy,
                 pcrs,
                 drifted,
+                ..
             } => {
                 assert!(!armed);
                 assert_eq!(policy, None);
@@ -5903,6 +5992,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                have_password: false,
             },
             &peer(NOBODY),
             &mut e,
@@ -5919,6 +6009,7 @@ mod tests {
             Request::UnsealKeyring {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                have_password: false,
             },
             &root,
             &mut e,

@@ -99,22 +99,27 @@ pub fn derive_for_home(password: &[u8], home: &Path) -> Result<Zeroizing<Vec<u8>
 
 /// Which secret to seal for a user, judged by what they actually have.
 ///
-/// A KDE wallet key only makes sense where there is a KDE wallet, and it must
-/// not be chosen on a machine that also runs gnome-keyring: that backend takes
-/// the password string itself, so sealing a wallet key there would leave the
-/// GNOME login keyring locked with nothing to unlock it.
+/// A KDE wallet key only makes sense where there is a KDE wallet. A GNOME
+/// keyring token only makes sense where there is a GNOME login keyring to
+/// re-key to it, and not where a KDE wallet also exists: the wallet key is
+/// derived from the password, so a token arm would leave the KDE wallet with
+/// nothing to open it.
 ///
 /// The conservative direction is [`crate::envelope::SecretKind::LoginPassword`],
-/// the behaviour before #250, so anything ambiguous resolves to it.
+/// the behaviour before #250, so anything ambiguous (both backends, neither)
+/// resolves to it. A home with neither also lands there deliberately: a token
+/// arm on a fresh account would have no keyring to re-key, and the envelope it
+/// wrote would unlock nothing.
 pub fn detect_kind(home: &Path) -> crate::envelope::SecretKind {
     use crate::envelope::SecretKind;
     let has_kde = salt_path(home).exists();
-    // gnome-keyring's login keyring, the thing that would break.
+    // gnome-keyring's login keyring: what a token re-keys, and what a wallet
+    // key arm would break.
     let has_gnome = home.join(".local/share/keyrings/login.keyring").exists();
-    if has_kde && !has_gnome {
-        SecretKind::KdeWalletKey
-    } else {
-        SecretKind::LoginPassword
+    match (has_kde, has_gnome) {
+        (true, false) => SecretKind::KdeWalletKey,
+        (false, true) => SecretKind::GnomeKeyringToken,
+        _ => SecretKind::LoginPassword,
     }
 }
 
@@ -183,9 +188,11 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// Detection has to be conservative in both directions: no KDE wallet means
-    /// there is nothing a wallet key could open, and a machine running both
-    /// backends must keep the password, or its GNOME login keyring is stranded.
+    /// Detection has to be conservative in every ambiguous direction: a home
+    /// with neither backend has nothing to unlock, and a machine running both
+    /// backends must keep the password, or whichever backend the arm did not
+    /// pick is stranded. Only an unambiguous single-backend home gets that
+    /// backend's dedicated secret.
     #[test]
     fn detect_kind_only_picks_the_wallet_key_on_a_kde_only_home() {
         use crate::envelope::SecretKind;
@@ -213,7 +220,7 @@ mod tests {
         );
         assert_eq!(
             detect_kind(&mk("gnome", false, true)),
-            SecretKind::LoginPassword
+            SecretKind::GnomeKeyringToken
         );
         assert_eq!(
             detect_kind(&mk("both", true, true)),

@@ -1133,7 +1133,7 @@ fn keyring_success_paths_with_a_live_daemon() {
     let (code, out, _) = run(&mut sb.cmd(&["keyring", "forget", "--user", "tester"]));
     assert_eq!(code, 0);
     assert!(
-        out.contains("sealed password erased; keyring unlock disarmed"),
+        out.contains("sealed secret erased; keyring unlock disarmed"),
         "{out}"
     );
 
@@ -1376,6 +1376,7 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             policy: Some("Tier 2 (pcrlock)".into()),
             pcrs: vec![7],
             drifted: Some(true),
+            kind: None,
         },
         Request::RecoveryStatus { .. } => Response::RecoveryStatus {
             encrypted: true,

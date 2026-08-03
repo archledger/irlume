@@ -225,6 +225,7 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
             policy: None,
             pcrs: vec![],
             drifted: None,
+            kind: None,
         },
         Request::RecoveryStatus { .. } => Response::RecoveryStatus {
             encrypted: false,

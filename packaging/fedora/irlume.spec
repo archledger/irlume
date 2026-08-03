@@ -98,6 +98,7 @@ install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/
 # user runs, it takes a secret on stdin, and it is only meaningful inside a
 # PAM transaction.
 install -Dm0755 target/release/irlume-kwallet-init %{buildroot}%{_libexecdir}/%{name}/irlume-kwallet-init
+install -Dm0755 target/release/irlume-gkr-unlock %{buildroot}%{_libexecdir}/%{name}/irlume-gkr-unlock
 # Bundled models (release assets, verified in %prep) → /usr/share/irlume/models
 install -Dm0644 %{SOURCE2} %{buildroot}%{_datadir}/%{name}/models/glintr100.onnx
 install -Dm0644 %{SOURCE3} %{buildroot}%{_datadir}/%{name}/models/face_detection_yunet_2023mar.onnx
@@ -196,6 +197,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_libdir}/security/pam_irlume.so
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/irlume-kwallet-init
+%{_libexecdir}/%{name}/irlume-gkr-unlock
 # Own the directories the globs populate (rpmlint: "directory not owned by a
 # package"; also leaves them behind on erase otherwise).
 %dir %{_datadir}/%{name}

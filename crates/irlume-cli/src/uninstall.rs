@@ -46,6 +46,35 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // A GNOME keyring token arm (#250) means the user's login keyring is keyed
+    // to a secret that exists ONLY in the sealed envelope. Deleting it here
+    // would make that keyring permanently unreachable, and the re-key back to
+    // the password cannot happen from this root process (the keyring control
+    // socket authenticates the session's uid). Refuse until each such user has
+    // disarmed from their own session; this is a data-loss guard, so there is
+    // deliberately no flag to bypass it (`irlume keyring forget --force` per
+    // user is the explicit, per-user override).
+    let token_users: Vec<String> = irlume_core::storage::list_users()
+        .into_iter()
+        .filter(|u| {
+            irlume_core::keyring::sealed_kind(u)
+                == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)
+        })
+        .collect();
+    if !token_users.is_empty() {
+        eprintln!(
+            "[uninstall] refusing: the login keyring of {} is keyed to an irlume-held \
+             token, and uninstalling now would lock it permanently.",
+            token_users.join(", ")
+        );
+        eprintln!(
+            "[uninstall] Have each of these users run `irlume keyring forget` in their \
+             own session first (it re-keys the keyring back to their password), then \
+             re-run the uninstall."
+        );
+        return ExitCode::FAILURE;
+    }
+
     println!("irlume uninstall will:");
     println!("  1. remove irlume from every PAM stack (greeters, sudo, lock screen)");
     println!("  2. stop and disable the irlumed service");

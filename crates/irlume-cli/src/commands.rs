@@ -1323,6 +1323,24 @@ pub fn reseal(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // A token envelope (#250) heals itself: the session-phase reseal re-seals
+    // it from its password wrap on the next typed-password login. Re-arming it
+    // here would mint a NEW token and hand it back for a keyring re-key this
+    // command does not perform, stranding the keyring on the old one.
+    if matches!(
+        daemon_request(&Request::KeyringInfo { user: user.clone() }),
+        Ok(Response::KeyringInfo {
+            kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+            ..
+        })
+    ) {
+        println!(
+            "[reseal] '{user}' is armed with a GNOME keyring token; it re-binds itself on \
+             your next password login. To rebuild it from scratch, run `irlume keyring \
+             forget` then `irlume keyring arm`."
+        );
+        return ExitCode::SUCCESS;
+    }
     println!("[reseal] Re-binding '{user}'s sealed password to the current TPM/PCR state.");
     let Some(pw) = prompt_login_password() else {
         return ExitCode::from(2);
@@ -1428,9 +1446,17 @@ pub fn setup(args: &[String]) -> ExitCode {
             match daemon_request(&Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
-                password: irlume_common::SecretBytes::new(pw.into_bytes()),
+                password: irlume_common::SecretBytes::new(pw.clone().into_bytes()),
             }) {
                 Ok(Response::PasswordSealed) => println!("  armed {OK}"),
+                // GNOME token arm: the wizard runs in the user's session, so
+                // it can finish the re-key exactly like `keyring arm`.
+                Ok(Response::TokenSealed { token, minted }) => {
+                    match crate::finish_token_arm(&user, pw.as_bytes(), token.expose(), minted) {
+                        Ok(()) => println!("  armed with a keyring token {OK}"),
+                        Err(e) => eprintln!("  arm failed: {e}"),
+                    }
+                }
                 r => eprintln!("  arm failed: {r:?}"),
             }
         }

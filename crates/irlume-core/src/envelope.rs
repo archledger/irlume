@@ -96,6 +96,12 @@ pub enum SecretKind {
     /// The 56-byte PBKDF2 key `ksecretd` opens the KDE wallet with. See
     /// [`crate::kwallet`].
     KdeWalletKey,
+    /// A random token the GNOME login keyring was re-keyed to at arm time
+    /// (#250). Unlike the other two kinds it is not derivable from the login
+    /// password, so an envelope of this kind also carries a
+    /// [`SealedEnvelope::password_wrap`]: without it, the first PCR drift would
+    /// strand the keyring on a secret nothing can reproduce.
+    GnomeKeyringToken,
 }
 
 impl SecretKind {
@@ -105,6 +111,7 @@ impl SecretKind {
         match self {
             SecretKind::LoginPassword => "login password",
             SecretKind::KdeWalletKey => "KDE wallet key",
+            SecretKind::GnomeKeyringToken => "GNOME keyring token",
         }
     }
 }
@@ -136,6 +143,16 @@ pub struct SealedEnvelope {
     /// SHA-256 values for `pcrs`, same order, captured at seal time (diagnostics).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pcr_values: Vec<PcrValue>,
+    /// The same secret again, wrapped under an Argon2id key derived from the
+    /// user's LOGIN password ([`crate::recovery`]). Present only for
+    /// [`SecretKind::GnomeKeyringToken`], where it is the recovery path the TPM
+    /// seal cannot provide: when the PCRs drift, the next verified-password
+    /// login unwraps the token from this and re-seals it (see
+    /// [`crate::keyring::reseal_password`]). For the other kinds the password
+    /// already reproduces the secret, so wrapping it would only add an offline
+    /// crack surface for no capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_wrap: Option<crate::recovery::RecoveryEnvelope>,
 }
 
 impl SealedEnvelope {
@@ -206,6 +223,7 @@ mod tests {
                 pcr: 7,
                 value: vec![0xab; 32],
             }],
+            password_wrap: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         let back: SealedEnvelope = serde_json::from_str(&s).unwrap();
@@ -263,6 +281,7 @@ mod tests {
             public: vec![1],
             private: vec![2],
             pcr_values: vec![],
+            password_wrap: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         assert!(s.contains(r#""kind":"Authorized""#), "{s}");
@@ -281,6 +300,7 @@ mod tests {
             public: vec![1],
             private: vec![2],
             pcr_values: vec![],
+            password_wrap: None,
         };
         let s2 = serde_json::to_string(&env2).unwrap();
         assert!(!s2.contains("policy_ref"), "{s2}");
@@ -319,6 +339,7 @@ mod tests {
                 pcr: 7,
                 value: vec![0x11; 32],
             }],
+            password_wrap: None,
         };
         env.save(&p).unwrap();
 

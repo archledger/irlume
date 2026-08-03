@@ -42,6 +42,15 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
 /// The kind is stamped here rather than in [`tpm::seal`], which wraps bytes and
 /// has no business knowing what they mean.
 pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
+    if kind == SecretKind::GnomeKeyringToken {
+        // Tokens are armed through [`arm_gnome_token`], which mints the bytes
+        // and writes the password wrap in the same envelope. Accepting one here
+        // would write a token envelope with no wrap, and the first PCR drift
+        // would strand the keyring it was re-keyed to.
+        return Err(Error::Protocol(
+            "a GNOME keyring token is armed via arm_gnome_token, not sealed directly".into(),
+        ));
+    }
     if secret.is_empty() {
         // Keep the wording the login path has always used; the wallet key gets
         // its own so the message names what was actually empty.
@@ -49,6 +58,7 @@ pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
             match kind {
                 SecretKind::LoginPassword => "refusing to seal an empty password",
                 SecretKind::KdeWalletKey => "refusing to seal an empty KDE wallet key",
+                SecretKind::GnomeKeyringToken => unreachable!("refused above"),
             }
             .to_string(),
         ));
@@ -66,6 +76,92 @@ pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
     let mut env = tpm::seal(secret)?;
     env.secret = kind;
     env.save(&envelope_path(user))
+}
+
+/// Length in bytes of entropy behind a GNOME keyring token; the token itself is
+/// its lowercase-hex form (64 ASCII characters), because the keyring credential
+/// is a string and hex survives every string channel it must cross (the control
+/// socket, PAM data, the daemon wire) without escaping.
+pub const GNOME_TOKEN_BYTES: usize = 32;
+
+/// Mint a fresh keyring token: 256 bits from the OS RNG, hex-encoded.
+fn mint_gnome_token() -> Zeroizing<String> {
+    use rand::Rng;
+    let mut raw = Zeroizing::new([0u8; GNOME_TOKEN_BYTES]);
+    rand::rng().fill_bytes(&mut *raw);
+    let mut out = Zeroizing::new(String::with_capacity(GNOME_TOKEN_BYTES * 2));
+    for b in raw.iter() {
+        use std::fmt::Write;
+        // Infallible for String; expect() documents that rather than unwrap.
+        write!(out, "{b:02x}").expect("writing hex to a String cannot fail");
+    }
+    out
+}
+
+/// Arm GNOME-keyring unlock for `user`: mint a token, seal it in the TPM, wrap
+/// it under the VERIFIED login `password` (the recovery path for PCR drift),
+/// save the envelope, and return the token so the caller can re-key the login
+/// keyring to it.
+///
+/// Ordering is load-bearing: the envelope is durable BEFORE the caller re-keys
+/// the keyring. A crash after this returns but before the re-key leaves the
+/// keyring still keyed to the password (the envelope's token merely goes
+/// unused until a re-arm); the other order would re-key the keyring to a token
+/// that no longer exists anywhere, which is unrecoverable.
+pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>> {
+    if password.is_empty() {
+        return Err(Error::Protocol(
+            "refusing to arm a keyring token for an empty password".into(),
+        ));
+    }
+    let token = mint_gnome_token();
+    let mut env = tpm::seal(token.as_bytes())?;
+    env.secret = SecretKind::GnomeKeyringToken;
+    env.password_wrap = Some(crate::recovery::wrap(password, token.as_bytes())?);
+    env.save(&envelope_path(user))?;
+    Ok(token)
+}
+
+/// Re-arm an EXISTING token envelope, reusing its token.
+///
+/// Minting a fresh token here would be the trap: the login keyring's current
+/// credential is the old token, so the caller's `CHANGE(password -> new)`
+/// would be denied while the only copy of the old token had already been
+/// overwritten, stranding the keyring permanently. Instead the existing token
+/// is recovered (TPM seal first, password wrap second, so this also works
+/// after PCR drift), the envelope is rebuilt against today's policy and
+/// re-wrapped under the possibly-new password, and the SAME token is returned.
+pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let path = envelope_path(user);
+    let env = SealedEnvelope::load(&path)?;
+    if env.secret != SecretKind::GnomeKeyringToken {
+        return Err(Error::Policy(format!(
+            "'{user}' has a {} armed, not a keyring token",
+            env.secret.describe()
+        )));
+    }
+    let token = match tpm::unseal(&env) {
+        Ok(t) => t,
+        Err(unseal_err) => {
+            let Some(wrap) = env.password_wrap.as_ref() else {
+                return Err(Error::Policy(format!(
+                    "keyring token for '{user}': TPM unseal failed ({unseal_err}) and the \
+                     envelope has no password wrap; `irlume keyring forget --force` and re-arm"
+                )));
+            };
+            crate::recovery::unwrap(password, wrap).map_err(|_| {
+                Error::Policy(format!(
+                    "keyring token for '{user}': TPM unseal failed ({unseal_err}) and this \
+                     password does not open the recovery wrap; envelope left untouched"
+                ))
+            })?
+        }
+    };
+    let mut fresh = tpm::seal(&token)?;
+    fresh.secret = SecretKind::GnomeKeyringToken;
+    fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
+    fresh.save(&path)?;
+    Ok(token)
 }
 
 /// Derive the secret of `kind` that `user` should have sealed, from their
@@ -94,6 +190,12 @@ pub fn derive_secret(
                     .into(),
             )),
         },
+        // Random by construction. Every caller that wants "the secret this
+        // password implies" must not exist for tokens; the reseal path handles
+        // them through the envelope's password_wrap instead.
+        SecretKind::GnomeKeyringToken => Err(Error::Policy(
+            "a GNOME keyring token is random and cannot be derived from the password".into(),
+        )),
     }
 }
 
@@ -201,8 +303,15 @@ pub fn reseal_password(
     }
     // Reseal whatever kind is already armed. Deriving the wrong kind here would
     // quietly replace a working envelope with one that opens nothing, and the
-    // damage would not show up until the next login.
-    let kind = sealed_kind(user).unwrap_or_default();
+    // damage would not show up until the next login. A LOAD error must
+    // propagate rather than default the kind: defaulting an unreadable token
+    // envelope to `LoginPassword` would overwrite it with a password seal
+    // below, and the keyring it was re-keyed to would be stranded.
+    let env = SealedEnvelope::load(&envelope_path(user))?;
+    let kind = env.secret;
+    if kind == SecretKind::GnomeKeyringToken {
+        return reseal_token(user, password, env);
+    }
     let secret = match derive_secret(kind, password, home) {
         Ok(s) => s,
         // A KDE wallet key cannot be derived without the salt. Leaving the
@@ -248,6 +357,105 @@ pub fn reseal_password(
     }
     seal_secret(user, password, kind)?;
     Ok(Reseal::Resealed)
+}
+
+/// The token half of [`reseal_password`]. A token cannot be re-derived, so the
+/// self-heal runs through the envelope itself: the TPM seal and the password
+/// wrap each recover the other.
+///
+///   * seal unseals, wrap opens under `password`  -> `Unchanged` (or the same
+///     tier climb the password kinds get)
+///   * seal unseals, wrap does not open           -> the user changed their
+///     password; re-wrap under the new one, `Resealed`
+///   * seal fails, wrap opens                     -> PCR drift; re-seal the
+///     recovered token, `Resealed`
+///   * both fail                                  -> error, envelope untouched:
+///     it may still be the only copy of the token, and the caller's password,
+///     though PAM-verified, may simply be newer than the wrap
+fn reseal_token(user: &str, password: &[u8], env: SealedEnvelope) -> Result<Reseal> {
+    match tpm::unseal(&env) {
+        Ok(token) => {
+            let wrap_current = env.password_wrap.as_ref().is_some_and(|w| {
+                crate::recovery::unwrap(password, w).is_ok_and(|t| t.as_slice() == token.as_slice())
+            });
+            if !wrap_current {
+                // Only the wrap is stale (password change, or an envelope
+                // missing its wrap): refresh it and keep the seal as-is.
+                let mut env = env;
+                env.password_wrap = Some(crate::recovery::wrap(password, &token)?);
+                env.save(&envelope_path(user))?;
+                return Ok(Reseal::Resealed);
+            }
+            if tpm::stronger_tier_available_than(&env.policy) {
+                let mut candidate = tpm::seal(&token)?;
+                // tpm::seal knows nothing of kinds or wraps; dropping either
+                // here would downgrade the envelope to a password seal (next
+                // login routes the token into PAM_AUTHTOK) or amputate the
+                // recovery path until the next password change.
+                candidate.secret = SecretKind::GnomeKeyringToken;
+                candidate.password_wrap = env.password_wrap.clone();
+                if candidate.policy.strength_rank() > env.policy.strength_rank() {
+                    candidate.save(&envelope_path(user))?;
+                    return Ok(Reseal::Upgraded);
+                }
+            }
+            Ok(Reseal::Unchanged)
+        }
+        Err(unseal_err) => {
+            let Some(wrap) = env.password_wrap.as_ref() else {
+                return Err(Error::Policy(format!(
+                    "keyring token for '{user}': TPM unseal failed ({unseal_err}) and the \
+                     envelope has no password wrap to recover from; run `irlume keyring arm`"
+                )));
+            };
+            let token = crate::recovery::unwrap(password, wrap).map_err(|_| {
+                Error::Policy(format!(
+                    "keyring token for '{user}': TPM unseal failed ({unseal_err}) and this \
+                     password does not open the recovery wrap (wrapped under an older \
+                     password?); envelope left untouched"
+                ))
+            })?;
+            let mut fresh = tpm::seal(&token)?;
+            fresh.secret = SecretKind::GnomeKeyringToken;
+            fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
+            fresh.save(&envelope_path(user))?;
+            Ok(Reseal::Resealed)
+        }
+    }
+}
+
+/// Release `user`'s sealed GNOME keyring token to a caller who proves they
+/// know the login password, for `keyring forget`'s re-key-back step.
+///
+/// The proof is the envelope's own password wrap: only the right password
+/// opens it (AES-GCM authenticates), so no shadow lookup is needed, and it
+/// works with the TPM seal broken, which is exactly when a disarm matters
+/// most. Fails closed: a wrong password, a stale wrap (password changed with
+/// no login since), and a non-token envelope are all refusals, each named.
+pub fn release_token_with_password(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let path = envelope_path(user);
+    if !path.exists() {
+        return Err(Error::Policy(format!("no sealed secret for '{user}'")));
+    }
+    let env = SealedEnvelope::load(&path)?;
+    if env.secret != SecretKind::GnomeKeyringToken {
+        return Err(Error::Policy(format!(
+            "'{user}' has a {} armed, not a keyring token; nothing to release for a disarm",
+            env.secret.describe()
+        )));
+    }
+    let Some(wrap) = env.password_wrap.as_ref() else {
+        return Err(Error::Policy(format!(
+            "keyring token for '{user}' has no password wrap; cannot verify the password"
+        )));
+    };
+    crate::recovery::unwrap(password, wrap).map_err(|_| {
+        Error::Policy(
+            "that password does not open the token's recovery wrap; if you changed your \
+             password recently and have not logged in since, use the previous one"
+                .into(),
+        )
+    })
 }
 
 /// Whether `user` has a sealed password armed.
@@ -424,6 +632,241 @@ mod tests {
 
         forget_password("kindtest").unwrap();
         let _ = std::fs::remove_dir_all(&home);
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    #[test]
+    fn a_minted_token_is_64_hex_characters_and_never_repeats() {
+        let a = mint_gnome_token();
+        let b = mint_gnome_token();
+        assert_eq!(a.len(), GNOME_TOKEN_BYTES * 2, "hex of 32 bytes");
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "the token crosses string channels (control socket, PAM data); it must be \
+             lowercase hex with nothing to escape: {a:?}"
+        );
+        assert_ne!(*a, *b, "two mints must not collide");
+    }
+
+    /// `seal_secret` is the generic path every other kind uses; a token must
+    /// not be reachable through it, because that path writes no password wrap
+    /// and the first PCR drift would then strand the re-keyed keyring with no
+    /// way back.
+    #[test]
+    fn seal_secret_refuses_a_token_so_it_cannot_be_armed_without_a_wrap() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        std::env::set_var("IRLUME_KEYRING_DIR", "/tmp/irlume-kr-notoken");
+        let err = seal_secret("t", b"0123456789abcdef", SecretKind::GnomeKeyringToken)
+            .expect_err("a token must not be sealable through the generic path");
+        assert!(
+            err.to_string().contains("arm_gnome_token"),
+            "the error must name the right path: {err}"
+        );
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    /// A token is random, so "the secret this password implies" has no answer.
+    /// Returning the password itself here (the shape `LoginPassword` uses)
+    /// would make `reseal` overwrite a live token envelope with the password,
+    /// and the keyring keyed to that token would be unreachable.
+    #[test]
+    fn a_token_cannot_be_derived_from_a_password() {
+        let err = derive_secret(SecretKind::GnomeKeyringToken, b"hunter2", None)
+            .expect_err("a random token is not derivable");
+        assert!(
+            err.to_string().contains("random"),
+            "the error must say why: {err}"
+        );
+    }
+
+    /// The token self-heal matrix, which is the whole recovery story for a
+    /// secret that cannot be re-derived. Each arm is checked by BREAKING one
+    /// half of the envelope and asserting the other half recovers the SAME
+    /// token: a reseal that produced a different token would be silent data
+    /// loss (the keyring stays keyed to the old one).
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn a_token_envelope_heals_from_whichever_half_survives() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = "/tmp/irlume-kr-token-heal";
+        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let pw = b"first-password";
+        let token = arm_gnome_token("tok", pw).expect("arm");
+        assert_eq!(
+            sealed_kind("tok"),
+            Some(SecretKind::GnomeKeyringToken),
+            "arm must stamp the kind"
+        );
+        assert_eq!(
+            &*unseal_password("tok").unwrap(),
+            token.as_bytes(),
+            "the sealed bytes are the token that was returned"
+        );
+
+        // 1. Both halves current -> nothing rewritten.
+        assert_eq!(
+            reseal_password("tok", pw, None).unwrap(),
+            Reseal::Unchanged,
+            "a healthy token envelope must not churn the TPM on every login"
+        );
+
+        // 2. Password changed: the seal still opens, the wrap does not. The
+        //    token must survive and the wrap must be re-made under the new
+        //    password (proved by unwrapping with it below).
+        let newpw = b"second-password";
+        assert_eq!(
+            reseal_password("tok", newpw, None).unwrap(),
+            Reseal::Resealed
+        );
+        assert_eq!(
+            &*unseal_password("tok").unwrap(),
+            token.as_bytes(),
+            "a password change must NOT change the token: the keyring is keyed to it"
+        );
+        let env = SealedEnvelope::load(&envelope_path("tok")).unwrap();
+        let wrap = env.password_wrap.as_ref().expect("wrap kept");
+        assert_eq!(
+            &*crate::recovery::unwrap(newpw, wrap).expect("wrap now opens with the new password"),
+            token.as_bytes()
+        );
+        assert!(
+            crate::recovery::unwrap(pw, wrap).is_err(),
+            "the old password must no longer open the wrap"
+        );
+
+        // 3. PCR drift: replace the seal with one that cannot unseal, leaving
+        //    the wrap intact. Recovery must come from the wrap and produce the
+        //    same token, re-sealed against today's policy.
+        let mut broken = SealedEnvelope::load(&envelope_path("tok")).unwrap();
+        broken.private = vec![0u8; broken.private.len()];
+        broken.save(&envelope_path("tok")).unwrap();
+        assert!(
+            unseal_password("tok").is_err(),
+            "precondition: the seal must really be broken, or this arm proves nothing"
+        );
+        assert_eq!(
+            reseal_password("tok", newpw, None).unwrap(),
+            Reseal::Resealed,
+            "a broken seal with a good wrap must heal"
+        );
+        assert_eq!(
+            &*unseal_password("tok").unwrap(),
+            token.as_bytes(),
+            "healing must restore the SAME token, not mint a new one"
+        );
+
+        // 4. Both halves broken: refuse and leave the envelope alone. It may
+        //    be the only copy of the token, and a wrong-password caller must
+        //    not be able to destroy it.
+        let mut broken = SealedEnvelope::load(&envelope_path("tok")).unwrap();
+        broken.private = vec![0u8; broken.private.len()];
+        broken.save(&envelope_path("tok")).unwrap();
+        let before = std::fs::read(envelope_path("tok")).unwrap();
+        assert!(
+            reseal_password("tok", b"a-third-password", None).is_err(),
+            "no path may claim success when neither half opens"
+        );
+        assert_eq!(
+            std::fs::read(envelope_path("tok")).unwrap(),
+            before,
+            "a failed heal must not rewrite the envelope"
+        );
+
+        forget_password("tok").unwrap();
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    /// A re-arm must hand back the EXISTING token. Minting a fresh one would
+    /// overwrite the only copy of the secret the login keyring is currently
+    /// keyed to, and the caller's re-key from the password would then be
+    /// denied, leaving the keyring permanently unreachable.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn rearming_reuses_the_existing_token_rather_than_minting() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = "/tmp/irlume-kr-rearm";
+        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let pw = b"a-password";
+        let first = arm_gnome_token("re", pw).expect("arm");
+        let again = rearm_gnome_token("re", pw).expect("re-arm");
+        assert_eq!(
+            &*again,
+            first.as_bytes(),
+            "a re-arm handed back a DIFFERENT token; the keyring keyed to the first \
+             one would be stranded"
+        );
+
+        // Even with the seal broken, the re-arm recovers via the wrap and
+        // still yields the same token.
+        let mut broken = SealedEnvelope::load(&envelope_path("re")).unwrap();
+        broken.private = vec![0u8; broken.private.len()];
+        broken.save(&envelope_path("re")).unwrap();
+        assert_eq!(
+            &*rearm_gnome_token("re", pw).expect("re-arm after drift"),
+            first.as_bytes()
+        );
+        assert!(
+            unseal_password("re").is_ok(),
+            "the re-arm must leave a working seal behind"
+        );
+
+        // A wrong password cannot re-arm once the seal is broken: that is the
+        // only proof of identity left.
+        let mut broken = SealedEnvelope::load(&envelope_path("re")).unwrap();
+        broken.private = vec![0u8; broken.private.len()];
+        broken.save(&envelope_path("re")).unwrap();
+        assert!(rearm_gnome_token("re", b"wrong-password").is_err());
+
+        forget_password("re").unwrap();
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    /// The disarm release is the one place a token leaves the daemon on a
+    /// password alone, so its gate has to hold in all three failure shapes.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn releasing_a_token_for_disarm_needs_the_right_password() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = "/tmp/irlume-kr-disarm";
+        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(
+            release_token_with_password("nobody", b"pw").is_err(),
+            "nothing armed"
+        );
+
+        seal_password("pwuser", b"pw").expect("arm a password envelope");
+        let err = release_token_with_password("pwuser", b"pw")
+            .expect_err("a password envelope has no token to release");
+        assert!(err.to_string().contains("login password"), "{err}");
+
+        let token = arm_gnome_token("tokuser", b"right-pw").expect("arm");
+        assert!(release_token_with_password("tokuser", b"wrong-pw").is_err());
+        assert_eq!(
+            &*release_token_with_password("tokuser", b"right-pw").expect("correct password"),
+            token.as_bytes()
+        );
+
+        // It must work with the TPM seal broken: that is exactly when a user
+        // needs to disarm and get their keyring back.
+        let mut broken = SealedEnvelope::load(&envelope_path("tokuser")).unwrap();
+        broken.private = vec![0u8; broken.private.len()];
+        broken.save(&envelope_path("tokuser")).unwrap();
+        assert!(unseal_password("tokuser").is_err(), "precondition");
+        assert_eq!(
+            &*release_token_with_password("tokuser", b"right-pw")
+                .expect("the wrap must work without the TPM"),
+            token.as_bytes()
+        );
+
+        forget_password("pwuser").unwrap();
+        forget_password("tokuser").unwrap();
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 

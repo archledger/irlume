@@ -439,6 +439,10 @@ struct App {
     keyring_policy: Option<String>,
     /// Whether the bound PCRs drifted since sealing (`KeyringInfo`).
     keyring_drift: Option<bool>,
+    /// What kind of secret is armed (`KeyringInfo`); `None` from an older
+    /// daemon. Routes the disarm key: a token disarm needs the CLI's re-key
+    /// flow, and a bare `ForgetPassword` on it would strand the keyring.
+    keyring_kind: Option<irlume_common::KeyringSecretKind>,
     nodes: Vec<(String, irlume_camera::Role)>,
     /// Cached camera pairs, refreshed on the slow timer so the Cameras tab and
     /// move_sel don't re-probe the hardware on every keystroke and frame.
@@ -690,6 +694,7 @@ struct LightState {
     keyring_armed: Option<bool>,
     keyring_policy: Option<String>,
     keyring_drift: Option<bool>,
+    keyring_kind: Option<irlume_common::KeyringSecretKind>,
     recovery: Option<RecoveryInfo>,
     nodes: Vec<(String, irlume_camera::Role)>,
     pairs: Vec<irlume_camera::CameraPair>,
@@ -705,6 +710,7 @@ impl LightState {
             keyring_armed: prev_armed,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_kind: None,
             recovery: None,
             nodes: irlume_camera::discover_nodes(),
             pairs: irlume_camera::list_pairs(),
@@ -743,11 +749,13 @@ impl LightState {
                 armed,
                 policy,
                 drifted,
+                kind,
                 ..
             }) => {
                 out.keyring_armed = Some(armed);
                 out.keyring_policy = policy;
                 out.keyring_drift = drifted;
+                out.keyring_kind = kind;
             }
             _ => {
                 out.keyring_armed = match crate::daemon_poll(&Request::HasSealedPassword {
@@ -837,6 +845,7 @@ impl App {
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_kind: None,
             nodes: irlume_camera::discover_nodes(),
             pairs: irlume_camera::list_pairs(),
             activity: Vec::new(),
@@ -1010,6 +1019,7 @@ impl App {
         if l.daemon_up {
             self.keyring_armed = l.keyring_armed;
             self.keyring_policy = l.keyring_policy;
+            self.keyring_kind = l.keyring_kind;
             self.keyring_drift = l.keyring_drift;
             if l.recovery.is_some() {
                 self.recovery = l.recovery;
@@ -1855,6 +1865,26 @@ impl App {
                 Err(e) => (false, e),
             };
             let _ = tx.send(r);
+        });
+        self.op = Some(Op { label, tag, rx });
+    }
+
+    /// `start_async` for work that is more than one request→map: the whole
+    /// closure runs on the worker thread. Exists for the token arm (#250),
+    /// where a `TokenSealed` reply must be followed by the keyring re-key,
+    /// which needs the password and user the plain fn-pointer mapper cannot
+    /// capture.
+    fn start_async_task(
+        &mut self,
+        label: impl Into<String>,
+        tag: OpTag,
+        task: Box<dyn FnOnce() -> (bool, String) + Send>,
+    ) {
+        let label = label.into();
+        self.log('→', format!("daemon: {label}"));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(task());
         });
         self.op = Some(Op { label, tag, rx });
     }
@@ -2883,6 +2913,19 @@ impl App {
                 ));
             }
             (SC_KEYRING, KeyCode::Char('f')) => {
+                // A token arm (#250) must re-key the login keyring back to the
+                // password before the envelope is erased; a bare forget here
+                // would delete the keyring's live credential. That flow needs
+                // a password prompt and the control socket, so route it to the
+                // CLI rather than duplicating it in TUI state.
+                if self.keyring_kind == Some(irlume_common::KeyringSecretKind::GnomeKeyringToken) {
+                    self.log(
+                        '!',
+                        "this arm is a keyring token; run `irlume keyring forget` in a \
+                         terminal (it re-keys the keyring back to your password first)",
+                    );
+                    return;
+                }
                 self.confirm = Some((
                     "Erase the TPM-sealed login password?".into(),
                     "Erase",
@@ -3301,13 +3344,38 @@ impl App {
                     self.set_error("passwords don't match; aborted (nothing sealed)");
                     return;
                 }
-                let req = Request::SealPassword {
-                    kind: None, // let the daemon judge from what the user has
-                    user: self.user.clone(),
-                    password: irlume_common::SecretBytes::new(buf.as_bytes().to_vec()),
-                };
-                // Async: the TPM seal is the slowest daemon op; don't freeze the frame.
-                self.start_async("SealPassword", OpTag::Generic, req, map_sealed);
+                let user = self.user.clone();
+                let pw = zeroize::Zeroizing::new(buf.as_bytes().to_vec());
+                // Async: the TPM seal is the slowest daemon op; don't freeze
+                // the frame. A closure task rather than a mapper, because a
+                // TokenSealed reply (GNOME, #250) must be followed by the
+                // keyring re-key, which needs the password and user.
+                self.start_async_task(
+                    "SealPassword",
+                    OpTag::Generic,
+                    Box::new(move || {
+                        let req = Request::SealPassword {
+                            kind: None, // let the daemon judge from what the user has
+                            user: user.clone(),
+                            password: irlume_common::SecretBytes::new(pw.to_vec()),
+                        };
+                        match crate::daemon_request(&req) {
+                            Ok(Response::TokenSealed { token, minted }) => {
+                                match crate::finish_token_arm(&user, &pw, token.expose(), minted) {
+                                    Ok(()) => (
+                                        true,
+                                        "keyring armed with a token; the login keyring was \
+                                         re-keyed to it"
+                                            .into(),
+                                    ),
+                                    Err(e) => (false, e),
+                                }
+                            }
+                            Ok(resp) => map_sealed(resp),
+                            Err(e) => (false, e),
+                        }
+                    }),
+                );
             }
             Pending::RecoveryPw(None) => {
                 if buf.is_empty() {
@@ -5543,6 +5611,7 @@ mod tests {
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_kind: None,
             nodes: Vec::new(),
             pairs: Vec::new(),
             activity: Vec::new(),
@@ -7675,6 +7744,7 @@ mod tests {
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_kind: None,
             recovery: None,
             nodes: Vec::new(),
             pairs: Vec::new(),
@@ -8339,6 +8409,7 @@ mod tests {
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_kind: None,
             recovery: None,
             nodes: Vec::new(),
             pairs: Vec::new(),

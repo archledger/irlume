@@ -99,7 +99,10 @@ rustPlatform.buildRustPackage {
     substituteInPlace crates/irlume-common/src/lib.rs \
       --replace-fail \
         '"/usr/libexec/irlume/irlume-kwallet-init"' \
-        "\"$out/libexec/irlume/irlume-kwallet-init\""
+        "\"$out/libexec/irlume/irlume-kwallet-init\"" \
+      --replace-fail \
+        '"/usr/libexec/irlume/irlume-gkr-unlock"' \
+        "\"$out/libexec/irlume/irlume-gkr-unlock\""
   '';
 
   # The suite needs a camera, a TPM, and PAM; none exist in the sandbox.
@@ -122,6 +125,13 @@ rustPlatform.buildRustPackage {
     install -Dm0755 "$out/bin/irlume-kwallet-init" \
       "$out/libexec/irlume/irlume-kwallet-init"
     rm "$out/bin/irlume-kwallet-init"
+
+    # GNOME keyring unlock helper (#250), same libexec reasoning and the same
+    # fail-loudly rule as the KDE helper above.
+    test -x "$out/bin/irlume-gkr-unlock"
+    install -Dm0755 "$out/bin/irlume-gkr-unlock" \
+      "$out/libexec/irlume/irlume-gkr-unlock"
+    rm "$out/bin/irlume-gkr-unlock"
 
     install -d "$out/share/irlume/models"
     install -m0644 ${models}/*.onnx "$out/share/irlume/models/"

@@ -13,6 +13,7 @@
 pub mod client;
 pub mod config;
 pub mod dbglog;
+pub mod gkr_wire;
 pub mod memlock;
 pub mod platform;
 pub mod secureboot;
@@ -488,6 +489,17 @@ pub enum Request {
         user: String,
         #[serde(default)]
         service: Option<String>,
+        /// Whether the PAM stack already holds a typed password. For a
+        /// `LoginPassword` envelope that makes the unseal pointless (the keyring
+        /// self-unlocks from the typed password) and the daemon answers
+        /// [`Response::KeyringUnlockNotNeeded`] without touching the TPM. For a
+        /// `GnomeKeyringToken` envelope the typed password does NOT open the
+        /// keyring, so the unseal proceeds regardless. The decision lives in
+        /// the daemon because only it can read the envelope's kind. Defaults to
+        /// `false`, which preserves the old always-unseal behaviour for a PAM
+        /// module from before this field.
+        #[serde(default)]
+        have_password: bool,
     },
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.
@@ -503,6 +515,15 @@ pub enum Request {
     /// Erase `user`'s sealed password (disarms keyring unlock). PRIVILEGED:
     /// root or `user`.
     ForgetPassword { user: String },
+    /// Release `user`'s sealed GNOME keyring token to the caller so `keyring
+    /// forget` can re-key the login keyring BACK to the password before the
+    /// envelope is erased. Without that re-key, deleting a token envelope
+    /// strands the keyring on a secret that no longer exists anywhere.
+    /// `password` must be the user's current login password; the daemon
+    /// verifies it before releasing (the caller proves they could have obtained
+    /// the keyring contents anyway). Refused for envelopes of any other kind.
+    /// PRIVILEGED: root or `user`.
+    ReleaseTokenForDisarm { user: String, password: SecretBytes },
     /// Re-seal `user`'s login password against the *current* PCR policy, but
     /// ONLY if a sealed password is already armed (never auto-arms a fresh user)
     /// and only if it actually changed (the PCRs moved, e.g. a dbx/Secure Boot
@@ -717,6 +738,28 @@ pub enum Response {
     // --- keyring unlock responses -------------------------------------------
     /// The password was sealed (`SealPassword`).
     PasswordSealed,
+    /// A GNOME keyring token was sealed (`SealPassword` that resolved to
+    /// [`KeyringSecretKind::GnomeKeyringToken`]). Carries the token because
+    /// sealing is only half the arm: the caller, which runs in the user's
+    /// session and can reach the keyring control socket, must now re-key the
+    /// login keyring to it. Released only to the requesting peer, which
+    /// `SealPassword` already restricts to root or the user themselves.
+    TokenSealed {
+        token: SecretBytes,
+        /// Whether the token was freshly minted (first arm) or reused from an
+        /// existing envelope (re-arm). Governs the caller's failure handling:
+        /// a minted envelope is inert and safe to roll back with
+        /// `ForgetPassword`; a reused one may hold the LIVE keyring credential
+        /// and must never be deleted on error. Defaults to `false`, the
+        /// never-delete reading, so an older caller cannot inherit the
+        /// destructive branch.
+        #[serde(default)]
+        minted: bool,
+    },
+    /// `UnsealKeyring` with `have_password: true` against a `LoginPassword`
+    /// envelope: the typed password already opens the keyring, so nothing was
+    /// unsealed and nothing needs releasing.
+    KeyringUnlockNotNeeded,
     /// Face matched and the TPM released the secret (`UnsealPassword` /
     /// `UnsealKeyring`).
     PasswordUnsealed {
@@ -739,6 +782,12 @@ pub enum Response {
         pcrs: Vec<u32>,
         #[serde(default)]
         drifted: Option<bool>,
+        /// What kind of secret is armed. `None` from a daemon predating #250's
+        /// GNOME half, or when nothing is armed. `keyring forget` routes on
+        /// this: a token disarm must re-key the keyring back to the password
+        /// first, a password disarm just deletes the envelope.
+        #[serde(default)]
+        kind: Option<KeyringSecretKind>,
     },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
@@ -1251,6 +1300,12 @@ pub enum KeyringSecretKind {
     LoginPassword,
     /// The 56-byte key `ksecretd` opens the KDE wallet with.
     KdeWalletKey,
+    /// A random token the GNOME login keyring has been re-keyed to (#250). Not
+    /// a password: it must never reach `PAM_AUTHTOK`, where `pam_unix` on a
+    /// Debian-style stack would consume it as the Unix password and fail the
+    /// login. It goes to `gnome-keyring-daemon`'s control socket instead, via
+    /// the session helper.
+    GnomeKeyringToken,
 }
 
 /// Wire constants for the KDE wallet handoff.
@@ -1293,3 +1348,8 @@ pub mod kwallet_wire {
 /// `IRLUME_KWALLET_INIT` overrides it for tests and for distributions that
 /// place libexec elsewhere.
 pub const KWALLET_INIT_PATH: &str = "/usr/libexec/irlume/irlume-kwallet-init";
+
+/// Installed path of the GNOME keyring unlock helper (#250). Same reasoning as
+/// [`KWALLET_INIT_PATH`]: takes a secret on stdin, only meaningful inside a PAM
+/// transaction, overridable via `IRLUME_GKR_UNLOCK` for tests.
+pub const GKR_UNLOCK_PATH: &str = "/usr/libexec/irlume/irlume-gkr-unlock";

@@ -992,6 +992,14 @@ name = "irlume-fingerprint"
 version = "0.8.0"
 
 [[package]]
+name = "irlume-gkr-unlock"
+version = "0.8.0"
+dependencies = [
+ "irlume-common",
+ "libc",
+]
+
+[[package]]
 name = "irlume-kwallet-init"
 version = "0.8.0"
 dependencies = [

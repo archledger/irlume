@@ -33,7 +33,7 @@ fail=0
 # distro logs in and their wallet silently stays locked, which is the same
 # class of miss the units check above exists for.
 echo "== helper programs in every lane =="
-HELPERS=(irlume-kwallet-init)
+HELPERS=(irlume-kwallet-init irlume-gkr-unlock)
 for helper in "${HELPERS[@]}"; do
   for lane in "${LANES[@]}"; do
     if grep -q -- "$helper" "$lane"; then

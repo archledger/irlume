@@ -48,6 +48,8 @@ contents:
   # transaction.
   - src: ../../target/release/irlume-kwallet-init
     dst: /usr/libexec/irlume/irlume-kwallet-init
+  - src: ../../target/release/irlume-gkr-unlock
+    dst: /usr/libexec/irlume/irlume-gkr-unlock
   # Bundled models (fetched from the models-v1 release by build-deb.sh)
   - src: ../../models/glintr100.onnx
     dst: /usr/share/irlume/models/glintr100.onnx

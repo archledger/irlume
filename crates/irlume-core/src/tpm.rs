@@ -478,6 +478,7 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
             public: created.out_public.marshall().map_err(tpm_err)?,
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
+            password_wrap: None,
         })
     })
 }
@@ -689,6 +690,7 @@ fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
             public: created.out_public.marshall().map_err(tpm_err)?,
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
+            password_wrap: None,
         })
     })
 }
@@ -1249,6 +1251,7 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
             public: created.out_public.marshall().map_err(tpm_err)?,
             private: created.out_private.to_vec(),
             pcr_values: pcr_values.clone(),
+            password_wrap: None,
         })
     })
 }

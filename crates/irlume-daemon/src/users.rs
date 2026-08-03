@@ -98,6 +98,9 @@ pub fn wire_to_core_kind(k: irlume_common::KeyringSecretKind) -> irlume_core::en
         irlume_common::KeyringSecretKind::KdeWalletKey => {
             irlume_core::envelope::SecretKind::KdeWalletKey
         }
+        irlume_common::KeyringSecretKind::GnomeKeyringToken => {
+            irlume_core::envelope::SecretKind::GnomeKeyringToken
+        }
     }
 }
 
@@ -109,6 +112,9 @@ pub fn core_to_wire_kind(k: irlume_core::envelope::SecretKind) -> irlume_common:
         }
         irlume_core::envelope::SecretKind::KdeWalletKey => {
             irlume_common::KeyringSecretKind::KdeWalletKey
+        }
+        irlume_core::envelope::SecretKind::GnomeKeyringToken => {
+            irlume_common::KeyringSecretKind::GnomeKeyringToken
         }
     }
 }

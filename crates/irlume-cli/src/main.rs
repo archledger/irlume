@@ -854,6 +854,101 @@ fn verify(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// One CHANGE against the caller's own gnome-keyring control socket. The
+/// control socket authenticates the peer's uid, so this only works for the
+/// invoking user's own keyring, in their own session; arming another user's
+/// token therefore fails here (and rolls back) rather than half-arming.
+fn rekey_login_keyring(current: &[u8], new: &[u8]) -> Result<(), String> {
+    use irlume_common::gkr_wire::{self, ControlResult, Op};
+    let rt = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or("no XDG_RUNTIME_DIR; run this inside the user's own session")?;
+    let sock = gkr_wire::control_socket_path(std::path::Path::new(&rt));
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| {
+        format!(
+            "connect {}: {e} (is gnome-keyring-daemon running in this session?)",
+            sock.display()
+        )
+    })?;
+    match gkr_wire::call(&mut stream, Op::Change, &[current, new])? {
+        ControlResult::Ok => Ok(()),
+        other => Err(format!("keyring re-key: {}", other.describe())),
+    }
+}
+
+/// Prove `secret` is the login keyring's current credential: a CHANGE from it
+/// to itself succeeds only then, changes nothing, and needs no prompt. This is
+/// the post-re-key verification, so "armed" is never claimed on the strength
+/// of a re-key reply alone.
+fn verify_keyring_credential(secret: &[u8]) -> Result<(), String> {
+    rekey_login_keyring(secret, secret)
+}
+
+/// Second half of a GNOME token arm, shared by `keyring arm`, the setup wizard
+/// and the TUI: re-key the login keyring from `password` to `token` and verify
+/// the token is now the live credential. On a RE-arm the keyring is usually
+/// keyed to the token already, so a denied re-key followed by a passing
+/// verification is success, not failure.
+///
+/// `minted` is the daemon's word on whether this token is fresh: only then is
+/// the envelope inert and safe to roll back with `ForgetPassword` on failure.
+/// A reused token may BE the live keyring credential, and deleting its
+/// envelope on an error path would strand the keyring; that branch only
+/// reports. Returns a human-readable error; success needs no message beyond
+/// the caller's own.
+pub(crate) fn finish_token_arm(
+    user: &str,
+    password: &[u8],
+    token: &[u8],
+    minted: bool,
+) -> Result<(), String> {
+    let keyed = match rekey_login_keyring(password, token) {
+        Ok(()) => verify_keyring_credential(token),
+        // The keyring may already be keyed to this exact token (idempotent
+        // re-arm); verification decides. Keep the original error if not.
+        Err(rekey_err) => verify_keyring_credential(token).map_err(|_| rekey_err),
+    };
+    match keyed {
+        Ok(()) => Ok(()),
+        Err(e) if minted => {
+            let cleanup = match daemon_request(&irlume_common::Request::ForgetPassword {
+                user: user.to_string(),
+            }) {
+                Ok(irlume_common::Response::PasswordForgotten) => {
+                    "rolled back: the sealed token was erased; nothing changed".to_string()
+                }
+                other => format!(
+                    "WARNING: could not erase the unused token envelope ({other:?}); run \
+                     `irlume keyring forget` to clean up. The keyring itself is unchanged"
+                ),
+            };
+            Err(format!(
+                "keyring re-key failed: {e}. {cleanup}. Run the arm as '{user}' inside \
+                 their own graphical session."
+            ))
+        }
+        Err(e) => Err(format!(
+            "keyring re-key failed: {e}. The envelope was left in place (it holds the \
+             keyring's live token); retry as '{user}' inside their own graphical session."
+        )),
+    }
+}
+
+/// Read the user's login password without echo, mirroring the arm prompt's
+/// terminal/pipe split.
+fn read_password(prompt: &str) -> Result<String, String> {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        rpassword::prompt_password(prompt).map_err(|e| format!("could not read password: {e}"))
+    } else {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("could not read password: {e}"))?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
 /// `irlume keyring <arm|status|forget>`: manage the TPM-sealed login password
 /// that lets a face login unlock the GNOME-keyring / KWallet. Talks to `irlumed`
 /// over the socket (the daemon owns the TPM + the root-only sealed store).
@@ -905,13 +1000,39 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             let req = irlume_common::Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
-                password: irlume_common::SecretBytes::new(pw.into_bytes()),
+                password: irlume_common::SecretBytes::new(pw.clone().into_bytes()),
             };
             match daemon_request(&req) {
                 Ok(irlume_common::Response::PasswordSealed) => {
                     println!("[keyring] \u{2705} armed. After a face login, your wallet will unlock automatically.");
                     println!("[keyring] NOTE: if you change your login password, re-run `irlume keyring arm`.");
                     std::process::ExitCode::SUCCESS
+                }
+                // GNOME token arm (#250): the daemon minted and sealed a token;
+                // the login keyring must now be re-keyed to it, which only this
+                // process can do (the control socket is in this session). Until
+                // the re-key lands, the envelope is inert and the keyring still
+                // opens with the password, so a failure here rolls the envelope
+                // back and leaves everything exactly as before the command.
+                Ok(irlume_common::Response::TokenSealed { token, minted }) => {
+                    match finish_token_arm(&user, pw.as_bytes(), token.expose(), minted) {
+                        Ok(()) => {
+                            println!(
+                                "[keyring] \u{2705} armed with a keyring token. Your login keyring \
+                                 is now keyed to a random secret that irlume releases on every \
+                                 login (face, fingerprint, or typed password)."
+                            );
+                            println!(
+                                "[keyring] Your password alone no longer opens the keyring \
+                                 directly; `irlume keyring forget` re-keys it back."
+                            );
+                            std::process::ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("[keyring] {e}");
+                            std::process::ExitCode::FAILURE
+                        }
+                    }
                 }
                 Ok(irlume_common::Response::Error(e)) => {
                     eprintln!("[keyring] arm failed: {e}");
@@ -951,26 +1072,90 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 }
             }
         }
-        Some("forget") => match daemon_request(&irlume_common::Request::ForgetPassword {
-            user: user.clone(),
-        }) {
-            Ok(irlume_common::Response::PasswordForgotten) => {
-                println!("[keyring] '{user}': sealed password erased; keyring unlock disarmed.");
-                std::process::ExitCode::SUCCESS
+        Some("forget") => {
+            // A token disarm must re-key the login keyring BACK to the
+            // password before the envelope goes away: deleting a token
+            // envelope first would strand the keyring on a secret that no
+            // longer exists anywhere. `--force` skips the re-key for the case
+            // where the keyring is already gone (deleted profile, reinstalled
+            // distro) and the stale envelope is all that is left.
+            let force = args.iter().any(|a| a == "--force");
+            let token_armed = matches!(
+                daemon_request(&irlume_common::Request::KeyringInfo { user: user.clone() }),
+                Ok(irlume_common::Response::KeyringInfo {
+                    armed: true,
+                    kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+                    ..
+                })
+            );
+            if token_armed && !force {
+                println!(
+                    "[keyring] '{user}' is armed with a keyring token; re-keying the login \
+                     keyring back to your password first."
+                );
+                let pw = match read_password("Login password: ") {
+                    Ok(p) if !p.is_empty() => p,
+                    Ok(_) => {
+                        eprintln!("[keyring] empty password; aborted (nothing changed).");
+                        return std::process::ExitCode::from(2);
+                    }
+                    Err(e) => {
+                        eprintln!("[keyring] {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+                let token = match daemon_request(&irlume_common::Request::ReleaseTokenForDisarm {
+                    user: user.clone(),
+                    password: irlume_common::SecretBytes::new(pw.clone().into_bytes()),
+                }) {
+                    Ok(irlume_common::Response::PasswordUnsealed { secret, .. }) => secret,
+                    Ok(irlume_common::Response::Error(e)) => {
+                        eprintln!("[keyring] {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                    other => {
+                        eprintln!("[keyring] unexpected response: {other:?}");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                };
+                if let Err(e) = rekey_login_keyring(token.expose(), pw.as_bytes())
+                    .and_then(|()| verify_keyring_credential(pw.as_bytes()))
+                {
+                    eprintln!(
+                        "[keyring] could not re-key the keyring back ({e}); the sealed token \
+                         is UNTOUCHED so nothing is lost. Fix the session (run as '{user}' \
+                         with gnome-keyring running) and retry, or `--force` to delete the \
+                         envelope anyway."
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+                println!("[keyring] login keyring re-keyed back to your password.");
+            } else if token_armed && force {
+                eprintln!(
+                    "[keyring] WARNING: --force on a token arm deletes the only copy of the \
+                     keyring token. If the login keyring still exists and is keyed to it, \
+                     its contents become unreachable."
+                );
             }
-            Ok(irlume_common::Response::Error(e)) => {
-                eprintln!("[keyring] forget failed: {e}");
-                std::process::ExitCode::FAILURE
+            match daemon_request(&irlume_common::Request::ForgetPassword { user: user.clone() }) {
+                Ok(irlume_common::Response::PasswordForgotten) => {
+                    println!("[keyring] '{user}': sealed secret erased; keyring unlock disarmed.");
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(irlume_common::Response::Error(e)) => {
+                    eprintln!("[keyring] forget failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("[keyring] unexpected response: {other:?}");
+                    std::process::ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("[keyring] forget failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
-            Ok(other) => {
-                eprintln!("[keyring] unexpected response: {other:?}");
-                std::process::ExitCode::FAILURE
-            }
-            Err(e) => {
-                eprintln!("[keyring] forget failed: {e}");
-                std::process::ExitCode::FAILURE
-            }
-        },
+        }
         _ => {
             eprintln!("usage: irlume keyring <arm|status|forget> [--user U]");
             std::process::ExitCode::from(2)

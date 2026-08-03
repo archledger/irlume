@@ -493,6 +493,39 @@ pub fn delete(user: &str) -> irlume_common::Result<bool> {
     Ok(existed)
 }
 
+/// Has the one-time IR retag already run for this embedding space?
+///
+/// The retag itself is cheap; ASKING is not. The answer lives inside the
+/// encrypted enrollment, so the daemon used to unseal every user's TPM-sealed
+/// template key at startup just to find nothing to do. On a discrete TPM that
+/// is seconds per user, it happens on every boot, and the TPM serializes, so it
+/// collided with the login it was delaying: a keyring unseal measured 2.70s on a
+/// quiet daemon and 18.97s against that startup (#249).
+///
+/// The marker records the embedding space the sweep completed for. It only ever
+/// SKIPS WORK: a missing, stale or unreadable marker runs the sweep, and no
+/// security decision reads it. Its absence costs a slow startup, never a wrong
+/// answer.
+pub fn retag_done_for(space: &str) -> bool {
+    fs::read_to_string(retag_marker_path())
+        .map(|s| s.trim() == space)
+        .unwrap_or(false)
+}
+
+/// Record that the sweep finished for `space`. Best-effort: failing to write it
+/// costs a repeated sweep next boot, which is the pre-existing behaviour.
+pub fn mark_retag_done(space: &str) {
+    let path = retag_marker_path();
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(&path, format!("{space}\n"));
+}
+
+fn retag_marker_path() -> PathBuf {
+    state_dir().join(".ir-retag-space")
+}
+
 /// Every OS user with an enrollment on this host (the `<user>.json` stems in the
 /// state dir), sorted. For 1:N identify and status reporting. Returns an empty
 /// list if the state dir doesn't exist yet.
@@ -515,6 +548,50 @@ pub fn list_users() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retag marker skips work and answers a question about work only.
+    ///
+    /// It exists because ASKING whether a user needs a retag costs a TPM unseal,
+    /// and doing that per user at startup collided with the login it delayed
+    /// (#249). Its whole contract: it matches only the space it recorded, an
+    /// absent or unreadable marker means "sweep", and a different embedding
+    /// space means "sweep again". Nothing security-relevant may ever read it,
+    /// which is why it lives beside the enrollments rather than inside one.
+    #[test]
+    fn the_retag_marker_only_matches_the_space_it_recorded() {
+        let dir = std::env::temp_dir().join(format!("irlume-retag-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+
+        // Nothing recorded yet: the sweep must run.
+        assert!(
+            !retag_done_for("raw"),
+            "an absent marker must not skip the sweep"
+        );
+
+        mark_retag_done("raw");
+        assert!(
+            retag_done_for("raw"),
+            "the recorded space must be recognised"
+        );
+
+        // An adapter change moves the space, so the sweep is owed again.
+        assert!(
+            !retag_done_for("adapter:deadbeef"),
+            "a different embedding space must run the sweep again"
+        );
+
+        // Garbage on disk is not a match, so it fails towards doing the work.
+        fs::write(dir.join(".ir-retag-space"), b"\x00not a space").unwrap();
+        assert!(
+            !retag_done_for("raw"),
+            "an unreadable or unexpected marker must fall back to sweeping"
+        );
+
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn legacy_format_migrates_to_one_profile() {

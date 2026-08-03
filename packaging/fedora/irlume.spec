@@ -100,6 +100,7 @@ install -Dm0644 %{SOURCE3} %{buildroot}%{_datadir}/%{name}/models/face_detection
 install -Dm0644 %{SOURCE4} %{buildroot}%{_datadir}/%{name}/models/face_landmark.onnx
 install -Dm0644 %{SOURCE5} %{buildroot}%{_datadir}/%{name}/models/blaze_face_short_range.onnx
 install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlumed.service
+install -Dm0644 packaging/systemd/irlumed.socket %{buildroot}%{_unitdir}/irlumed.socket
 # Self-heal wiring watcher: re-applies irlume's greeter PAM lines if a distro
 # update strips them (no-op unless `login enable` was run and the lines went
 # missing). Enabled by preset; harmless when login was never wired.
@@ -123,7 +124,7 @@ install -Dm0644 schemas/machine-api-v1.schema.json %{buildroot}%{_datadir}/%{nam
 %post
 # %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
 # self-heal path unit on first install.
-%systemd_post irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
+%systemd_post irlumed.socket irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
 # Also start it now so `irlume tui` works immediately after `dnf install`
 # (no-op in chroots/containers where systemd isn't running).
 if [ $1 -eq 1 ]; then
@@ -149,7 +150,7 @@ systemctl start irlume-reconcile.service &>/dev/null || :
 # counts installed packages and cannot tell which version is being replaced.
 
 %preun
-%systemd_preun irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
+%systemd_preun irlumed.socket irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
 
 %postun
 %systemd_postun_with_restart irlumed.service
@@ -200,6 +201,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/%{name}/models/*.onnx
 %{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service
+%{_unitdir}/irlumed.socket
 %{_unitdir}/irlumed.service.d/10-ort.conf
 %{_unitdir}/irlume-reconcile.path
 %{_unitdir}/irlume-reconcile.service

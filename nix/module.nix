@@ -195,6 +195,23 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
+    # systemd owns the socket, so it exists from sockets.target onward rather
+    # than only once irlumed has finished loading models. Greeters authenticate
+    # well before that, and a PAM client with nothing to connect to loses the
+    # keyring release silently (#244). The service still starts at boot, so the
+    # first login does not pay for model loading.
+    systemd.sockets.irlumed = {
+      description = "irlume face authentication socket";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = "/run/irlume.sock";
+        # SO_PEERCRED is the authorization boundary; see the daemon's bind site
+        # for why the mode is not a second one.
+        SocketMode = "0666";
+        Accept = false;
+      };
+    };
+
     systemd.services.irlumed = {
       description = "irlume face authentication daemon";
       documentation = [ "https://github.com/archledger/irlume" ];

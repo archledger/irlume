@@ -1,0 +1,29 @@
+# The socket exists before the daemon does.
+#
+# irlumed spends seconds loading models and walking enrollments before it could
+# bind /run/irlume.sock itself, and greeters are ordered after basic.target,
+# well before multi-user.target. Measured on a ThinkPad X13: boot at 02:21:52,
+# the greeter authenticated a fingerprint at 02:22:05, the socket appeared at
+# 02:22:13. pam_irlume had nothing to connect to, its keyring line is optional
+# and swallows failures by design, so the login succeeded with the keyring still
+# locked and nothing in any log (#244).
+#
+# With systemd owning the socket, connect() succeeds from the moment
+# sockets.target is reached and the request waits in the backlog instead of
+# being refused. The service is still started at boot rather than purely on
+# demand, so model loading is not paid by the first login that arrives.
+[Unit]
+Description=irlume face authentication socket
+Documentation=https://github.com/archledger/irlume
+
+[Socket]
+ListenStream=/run/irlume.sock
+# SO_PEERCRED is the authorization boundary; the mode must not pretend to be a
+# second one. Matches what the daemon sets when it binds the socket itself, and
+# the reasoning is at that call site in irlume-daemon/src/main.rs.
+SocketMode=0666
+# One daemon serving many connections, not one instance per connection.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

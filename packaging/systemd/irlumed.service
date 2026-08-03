@@ -4,6 +4,12 @@ Documentation=https://github.com/archledger/irlume
 After=multi-user.target
 
 [Service]
+# Inherit the listening socket from irlumed.socket rather than binding our own,
+# so it exists from sockets.target onward instead of only once models are
+# loaded (#244). Named explicitly rather than relying on the implicit
+# same-name association, because the fallback when the fd does not arrive is to
+# unlink systemd's socket and bind over it, which is silent and wrong.
+Sockets=irlumed.socket
 Type=simple
 ExecStart=/usr/bin/irlumed
 # Packaged FHS layout (all three families install here). onnxruntime is a

@@ -58,6 +58,8 @@ contents:
   # systemd unit + an override pointing ORT at the bundled lib
   - src: ../systemd/irlumed.service
     dst: /usr/lib/systemd/system/irlumed.service
+  - src: ../systemd/irlumed.socket
+    dst: /usr/lib/systemd/system/irlumed.socket
   - src: ../../.deb-staging/10-ort.conf
     dst: /usr/lib/systemd/system/irlumed.service.d/10-ort.conf
   # Self-heal: re-applies irlume's greeter PAM lines if a distro update

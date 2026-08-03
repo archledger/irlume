@@ -102,31 +102,45 @@ fn main() {
     );
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
-    // BIND BEFORE THE SLOW WORK. Startup loads models and then walks every
-    // enrollment to retag legacy IR scans, which touches the TPM per user;
-    // measured 21 seconds from exec to listening on a ThinkPad X13 (#244).
-    // With the bind at the end of that, the socket does not exist while the
-    // greeter is already authenticating, so `connect()` fails and a fingerprint
-    // login's keyring release never happens: pam_irlume's `keyring` line is
-    // `optional` and swallows the failure by design, so the login proceeds and
-    // the user meets a keyring prompt later, with nothing in any log.
+    // PREFER THE SOCKET SYSTEMD ALREADY BOUND, else bind our own.
     //
-    // Binding here makes the socket exist within milliseconds of exec. A client
-    // that connects during startup is queued by the kernel and served when the
-    // accept loop starts, inside the client's 25s request timeout, instead of
-    // being told nobody is listening.
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("irlumed: cannot bind {socket}: {e}");
-            std::process::exit(1);
+    // Startup loads models and walks enrollments before this point could ever be
+    // reached by a self-bind, and greeters are ordered after basic.target, well
+    // before multi-user.target. Measured on a ThinkPad X13: the greeter
+    // authenticated a fingerprint 8 seconds before the socket existed, so
+    // pam_irlume had nothing to connect to and the login proceeded with the
+    // keyring locked and nothing in any log (#244). With irlumed.socket,
+    // systemd owns the socket from sockets.target onward and the request waits
+    // in the backlog instead of being refused.
+    //
+    // Self-binding stays for anyone running the daemon directly (development,
+    // a distro without the socket unit installed, IRLUME_SOCKET pointing
+    // somewhere else in a test).
+    let listener = match inherited_listener() {
+        Some(l) => {
+            eprintln!("irlumed: using the socket systemd bound (socket activation)");
+            l
+        }
+        None => {
+            let _ = std::fs::remove_file(&socket);
+            match UnixListener::bind(&socket) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("irlumed: cannot bind {socket}: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     };
     // The mode goes on with the bind, not at the accept loop: a socket that
     // exists but is 0600 refuses exactly the non-root clients this early bind
     // exists to admit. The reasoning for 0666 is at the accept loop below.
-    set_mode(&socket, DAEMON_SOCKET_MODE);
+    // Only ours to set when we bound it; under socket activation the mode came
+    // from SocketMode= in the unit, and chmod'ing systemd's socket behind its
+    // back would drift from what the unit says.
+    if !socket_activated() {
+        set_mode(&socket, DAEMON_SOCKET_MODE);
+    }
     eprintln!("irlumed: socket ready at {socket}; requests queue while startup finishes");
 
     // The engine is built OFF the startup path, so the socket is not merely
@@ -293,7 +307,24 @@ fn main() {
             // embedding space while it is still the space they were captured under.
             // A later adapter swap/removal then degrades to a clear "re-enroll" for
             // dark unlock instead of silently scoring across embedding spaces.
+            // Skip the whole sweep once it has completed for this embedding
+            // space. Asking a user whether they need a retag costs a TPM unseal,
+            // because the answer is inside the encrypted enrollment, and the TPM
+            // serializes: that startup work collided with the very login it was
+            // delaying, taking a keyring unseal from 2.70s to 18.97s on a
+            // discrete TPM (#249). The marker only skips work; a missing or
+            // stale one just runs the sweep as before.
+            let retag_space = engine.ir_space().to_string();
+            let sweep_needed = !irlume_core::storage::retag_done_for(&retag_space);
+            if !sweep_needed {
+                irlume_common::dlog!(
+                    "startup: IR retag already done for '{retag_space}'; skipping the sweep"
+                );
+            }
             for user in irlume_core::storage::list_users() {
+                if !sweep_needed {
+                    break;
+                }
                 if let Ok(Some(mut enr)) = irlume_core::storage::load(&user) {
                     let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
                     if n > 0 {
@@ -324,6 +355,11 @@ fn main() {
                         );
                     }
                 }
+            }
+            // Recorded only after a completed sweep, so an interrupted startup
+            // retries next boot rather than skipping users it never reached.
+            if sweep_needed {
+                irlume_core::storage::mark_retag_done(&retag_space);
             }
 
             // SO_PEERCRED is the authorization boundary, and the socket mode must not
@@ -1148,6 +1184,50 @@ fn refusal_throttled(uid: u32) -> bool {
 /// reaches the camera worker is a parsed, authorized-shaped request, which is
 /// what lets an authentication overtake a queue of preview work: before this,
 /// a request nobody had read yet was invisible to the daemon.
+/// The listening socket systemd passed us, if we were socket-activated.
+///
+/// Implements the sd_listen_fds protocol directly rather than pulling in
+/// libsystemd: `LISTEN_PID` must name this process (so an fd inherited by a
+/// child is not mistaken for ours) and `LISTEN_FDS` counts descriptors starting
+/// at 3. We ask for exactly one, because the unit lists exactly one
+/// `ListenStream=`.
+fn inherited_listener() -> Option<UnixListener> {
+    use std::os::fd::FromRawFd;
+    const SD_LISTEN_FDS_START: i32 = 3;
+    if !socket_activated() {
+        return None;
+    }
+    let n: i32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if n != 1 {
+        eprintln!("irlumed: LISTEN_FDS={n}, expected exactly 1; binding our own socket instead");
+        return None;
+    }
+    // The environment must not outlive this: a child that inherits it would
+    // believe the descriptors are its own.
+    SOCKET_ACTIVATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::env::remove_var("LISTEN_FDS");
+    std::env::remove_var("LISTEN_PID");
+    // SAFETY: systemd guarantees fd 3 is an open listening socket when
+    // LISTEN_PID names us and LISTEN_FDS is 1, and nothing else in this process
+    // has taken it: this runs before any other socket is opened.
+    Some(unsafe { UnixListener::from_raw_fd(SD_LISTEN_FDS_START) })
+}
+
+/// Whether systemd handed us the socket. Checked separately from taking the fd
+/// because the socket's MODE is systemd's business in that case, and that
+/// question outlives the one call that consumes the descriptor.
+fn socket_activated() -> bool {
+    std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|p| p.parse::<u32>().ok())
+        == Some(std::process::id())
+        || SOCKET_ACTIVATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Latched at the moment the descriptor is taken, because `inherited_listener`
+/// clears `LISTEN_PID` and later callers would otherwise see "not activated".
+static SOCKET_ACTIVATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Release the TPM-sealed login password after another factor has authenticated.
 ///
 /// Free-standing, and deliberately takes no engine: nothing here touches the

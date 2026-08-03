@@ -309,13 +309,32 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
     use std::io::ErrorKind;
     match e.raw_os_error() {
         Some(16) => {
-            // 16 == EBUSY
-            let who = camera_holder(device)
-                .map(|h| format!(", in use by {h}"))
-                .unwrap_or_else(|| ", another app is using it".into());
-            Error::Hardware(format!(
-                "{device}: camera busy{who}. Close that app (e.g. a camera/video/conferencing app) and retry."
-            ))
+            // 16 == EBUSY. The advice has to match what the scan actually
+            // established: telling someone to close an app is useless when the
+            // holder is irlume itself, and worse when the scan could not see
+            // the holder at all (#187 restarted the daemon for days on the
+            // strength of a sentence naming irlumed).
+            Error::Hardware(match camera_holders(device) {
+                Holders::Other(who) => format!(
+                    "{device}: camera busy, in use by {who}. \
+                     Close that app (e.g. a camera/video/conferencing app) and retry."
+                ),
+                Holders::SelfOnly => format!(
+                    "{device}: camera busy, and the only process holding it is irlume itself \
+                     (pid {}). That is an irlume bug, not an app you can close; please report \
+                     it with the output of `irlume doctor`.",
+                    std::process::id()
+                ),
+                Holders::UnknownBlind => format!(
+                    "{device}: camera busy. irlume could not identify the holder, because it \
+                     cannot read every process (see issue #207); `sudo fuser -v {device}` will \
+                     name it. Close that app and retry."
+                ),
+                Holders::None => format!(
+                    "{device}: camera busy, another app is using it. \
+                     Close that app (e.g. a camera/video/conferencing app) and retry."
+                ),
+            })
         }
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
             "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
@@ -329,32 +348,123 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
 /// needs root to see other users' processes (the daemon runs as root). Returns
 /// e.g. "kamoso (pid 2567)", or `None` if it can't tell.
 fn camera_holder(device: &str) -> Option<String> {
-    let dev = std::fs::canonicalize(device).ok()?;
-    for ent in std::fs::read_dir("/proc").ok()?.flatten() {
+    match camera_holders(device) {
+        Holders::Other(who) => Some(who),
+        // Only our own handle, and the scan saw everything: nothing the user
+        // can close, so say what it is.
+        Holders::SelfOnly => Some(format!(
+            "irlume itself (pid {}), which is a bug in irlume rather than another app; \
+             please report it with the output of `irlume doctor`",
+            std::process::id()
+        )),
+        // We cannot see every process (#207), so the holder may be an app whose
+        // /proc entry is unreadable. Measured 2026-08-03: with Chrome streaming
+        // /dev/video0, the scan found only irlume's own fd, because Chrome's fd
+        // directory was not readable. Claiming SelfOnly there would accuse
+        // irlume of a bug on the strength of a blind spot.
+        Holders::UnknownBlind => None,
+        Holders::None => None,
+    }
+}
+
+/// Who holds `device` open, separating another process from this one, and both
+/// from the case where the scan could not see enough to answer.
+enum Holders {
+    /// Some other process has it. The one the user has to close.
+    Other(String),
+    /// Our own handle, on a scan that could read every process. irlume
+    /// competing with itself is a defect, not something the user can act on.
+    SelfOnly,
+    /// Nothing found but the scan was incomplete, or only our own handle was
+    /// found on such a scan. Either way the real holder may be invisible.
+    UnknownBlind,
+    /// Nothing found, on a scan that could read every process.
+    None,
+}
+
+fn camera_holders(device: &str) -> Holders {
+    let Ok(dev) = std::fs::canonicalize(device) else {
+        return Holders::None;
+    };
+    let me = std::process::id().to_string();
+    let mut saw_self = false;
+    // A process whose fd directory we cannot read may be the holder. Tracking
+    // that is what separates "irlume has a bug" from "irlume cannot tell".
+    let mut blind = false;
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return Holders::UnknownBlind;
+    };
+    for ent in procs.flatten() {
         let name = ent.file_name();
         let Some(pid) = name.to_str() else { continue };
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let Ok(fds) = std::fs::read_dir(ent.path().join("fd")) else {
-            continue;
+        let fds = match std::fs::read_dir(ent.path().join("fd")) {
+            Ok(fds) => fds,
+            Err(e) => {
+                // A process that exited between readdir and here is not a blind
+                // spot; a permission refusal is.
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    blind = true;
+                }
+                continue;
+            }
         };
+        // Listing another process's fd directory can succeed while RESOLVING
+        // its entries is refused: the daemon runs without CAP_SYS_PTRACE
+        // (#207), and measured 2026-08-03 that is exactly what happens against
+        // a browser holding the camera. Checking only the read_dir error left
+        // `blind` false, so the scan concluded "nobody but us" while Chrome was
+        // streaming the node.
+        let mut holds = false;
         for fd in fds.flatten() {
-            if std::fs::read_link(fd.path())
-                .map(|t| t == dev)
-                .unwrap_or(false)
-            {
-                let comm = std::fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
-                let comm = comm.trim();
-                return Some(if comm.is_empty() {
-                    format!("pid {pid}")
-                } else {
-                    format!("{comm} (pid {pid})")
-                });
+            match std::fs::read_link(fd.path()) {
+                Ok(t) => {
+                    if t == dev {
+                        holds = true;
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => blind = true,
+                Err(_) => {}
             }
         }
+        if !holds {
+            continue;
+        }
+        if pid == me {
+            // Keep scanning: another process holding the same node is the
+            // answer that helps, and it may sort after us.
+            saw_self = true;
+            continue;
+        }
+        let comm = std::fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
+        let comm = comm.trim();
+        return Holders::Other(if comm.is_empty() {
+            format!("pid {pid}")
+        } else {
+            format!("{comm} (pid {pid})")
+        });
     }
-    None
+    holder_verdict(saw_self, blind)
+}
+
+/// What a scan that found no OTHER holder concluded, as a value.
+///
+/// Separated out because the interesting branch is unreachable in a test: only
+/// a process that can read every `/proc` entry, in practice root, can say the
+/// holder is nobody but itself. The decision is still a function of two
+/// booleans, so it is the decision that gets tested (see #187, where a wrong
+/// answer here cost the reporter days of restarting the daemon).
+fn holder_verdict(saw_self: bool, blind: bool) -> Holders {
+    match (saw_self, blind) {
+        // A blind spot outranks everything: the holder may be a process this
+        // scan could not read, so neither "it is us" nor "nobody" is honest.
+        (_, true) => Holders::UnknownBlind,
+        (true, false) => Holders::SelfOnly,
+        (false, false) => Holders::None,
+    }
 }
 
 /// What a video node is, by its advertised formats.
@@ -3640,24 +3750,90 @@ mod tests {
         );
     }
 
+    /// Holding the node ourselves is reported as OUR defect, not as an app the
+    /// user should go and close.
+    ///
+    /// This test previously asserted the opposite, that the scan names this
+    /// process, and that is exactly what shipped: measured 2026-08-03 with a
+    /// browser streaming /dev/video0, irlume opened the node, `S_FMT` failed
+    /// EBUSY, and the error told the user the camera was "in use by irlumed"
+    /// while the real holder was Chrome. #187 spent days restarting the daemon
+    /// on the strength of that sentence.
+    /// The verdict a scan reaches when it found no other holder. The blind case
+    /// must not resolve to either confident answer: measured 2026-08-03 with
+    /// Chrome streaming /dev/video0, the scan saw only irlume's own fd because
+    /// Chrome's fd directory was unreadable, and reporting that as "only us"
+    /// accuses irlume of a bug on the strength of a blind spot. Before this,
+    /// the same scan reported "in use by irlumed", which is what #187 acted on.
     #[test]
-    fn camera_holder_finds_our_own_open_file() {
-        // Hold a file open ourselves; the /proc scan must name this process.
+    fn a_blind_scan_never_resolves_to_a_confident_holder() {
+        assert!(matches!(holder_verdict(true, false), Holders::SelfOnly));
+        assert!(matches!(holder_verdict(false, false), Holders::None));
+        assert!(matches!(holder_verdict(true, true), Holders::UnknownBlind));
+        assert!(matches!(holder_verdict(false, true), Holders::UnknownBlind));
+    }
+
+    /// What the user is told for each verdict. Only a real other process is
+    /// ever presented as something to close.
+    #[test]
+    fn only_another_process_is_presented_as_closeable() {
         let dir = std::env::temp_dir().join(format!("irlume-cam-holder-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("held");
         std::fs::write(&path, b"x").unwrap();
         let _held = std::fs::File::open(&path).unwrap();
-        let who = camera_holder(path.to_str().unwrap()).expect("holder found");
-        assert!(
-            who.contains(&format!("pid {}", std::process::id())),
-            "unexpected holder: {who}"
-        );
+
+        // This test runs unprivileged, so the scan cannot read every process
+        // and must decline to name anyone rather than blame irlume.
+        let who = camera_holder(path.to_str().unwrap());
+        if let Some(who) = &who {
+            assert!(
+                !who.contains("bug in irlume"),
+                "a scan with blind spots must not accuse irlume: {who}"
+            );
+        }
+
         // Nothing holds a nonexistent path.
         assert_eq!(camera_holder("/dev/irlume-test-missing"), None);
         drop(_held);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another process holding the node wins over our own handle, because that
+    /// is the one the user can act on. Both hold it here, which is the
+    /// real-world case: irlume opens the device, `S_FMT` fails because someone
+    /// else is streaming, and the scan then sees two holders.
+    #[test]
+    fn another_process_outranks_our_own_hold() {
+        let dir = std::env::temp_dir().join(format!("irlume-cam-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("held");
+        std::fs::write(&path, b"x").unwrap();
+
+        // We hold it...
+        let _mine = std::fs::File::open(&path).unwrap();
+        // ...and so does a child that outlives the scan.
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(
+                std::fs::File::open(&path).unwrap(),
+            ))
+            .spawn()
+            .expect("spawn holder");
+
+        let who = camera_holder(path.to_str().unwrap()).expect("holder found");
+        let verdict = format!("holder was: {who}");
+        let _ = other.kill();
+        let _ = other.wait();
+        drop(_mine);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            who.contains(&format!("pid {}", other.id())),
+            "the OTHER process is the actionable holder; {verdict}"
+        );
     }
 
     #[test]

@@ -129,330 +129,357 @@ fn main() {
     set_mode(&socket, DAEMON_SOCKET_MODE);
     eprintln!("irlumed: socket ready at {socket}; requests queue while startup finishes");
 
-    eprintln!("irlumed: loading models (det={det}, model={model})…");
-    verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter));
-    // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
-    // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
-    let (rgb_dev, ir_dev) = irlume_auth::select_pair();
-    // Log what is actually usable, not the raw (possibly fallback) selection;
-    // on camera-less or RGB-only hardware the fixed default pair doesn't exist.
-    {
-        let ok = |d: &str| std::path::Path::new(d).exists();
-        match (ok(&rgb_dev), ok(&ir_dev)) {
-            (true, true) => eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)"),
-            (true, false) => eprintln!(
-                "irlumed: camera rgb={rgb_dev}, no IR node (convenience tier: screen unlock only)"
-            ),
-            (false, _) => eprintln!(
-                "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
-            ),
-        }
-    }
-    // Re-apply the KNOWN emitter control at startup. The emitter is camera
-    // hardware state that resets on a USB/power cycle or a daemon restart, so
-    // without this the first auth after a restart gets a dark IR frame (the
-    // "worked at enroll, failed at the lock screen" case).
+    // The engine is built OFF the startup path, so the socket is not merely
+    // bound early but SERVED early.
     //
-    // This used to fall through to a blind search when IR came back dark, which
-    // is what destroyed a reporter's camera in #159. A daemon start is not
-    // consent to write guessed values to camera firmware, and darkness does not
-    // even imply the emitter is the problem: an unlit room or an empty chair
-    // produces exactly the same measurement. Discovery now happens only when
-    // someone runs `irlume ir-setup` and accepts the warning.
-    if std::path::Path::new(&ir_dev).exists() {
-        match irlume_auth::apply_known_ir_emitter(&ir_dev) {
-            Ok(true) => eprintln!("irlumed: IR emitter ready"),
-            Ok(false) => eprintln!(
-                "irlumed: IR is dark (dark-mode unlock may be unavailable). If this camera needs an \
-                 emitter control irlume does not know, run `sudo irlume ir-setup`."
-            ),
-            Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
-        }
-    }
-    // Opt-in third-party PAD cue (`irlume models`): enabled via settings.conf,
-    // weights fetched by the CLI to the state dir. Unlike the shipped models'
-    // warn-first verification, a third-party file MUST match its catalog pin:
-    // on any mismatch the cue is skipped (the built-in gate alone is the safe
-    // default), never trusted. Env override for sandboxes.
-    let tp_pad: Option<(String, f32, String)> = std::env::var("IRLUME_THIRDPARTY_PAD")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            irlume_common::config::read_kv("settings.conf", irlume_common::thirdparty::SETTINGS_KEY)
-        })
-        .and_then(|name| {
-            let Some(entry) = irlume_common::thirdparty::by_name(name.trim()) else {
-                eprintln!("irlumed: WARNING: third_party_pad='{name}' is not in the catalog; ignoring");
-                return None;
-            };
-            let path = irlume_common::thirdparty::model_path(entry);
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "irlumed: WARNING: third-party PAD '{name}' enabled but {} unreadable ({e}); cue disabled (run `sudo irlume models enable {name}` to re-fetch)",
-                        path.display()
-                    );
-                    return None;
-                }
-            };
-            let digest = irlume_common::thirdparty::sha256_hex(&bytes);
-            if digest != entry.sha256 {
-                eprintln!(
-                    "irlumed: WARNING: third-party PAD '{name}' checksum mismatch (sha256 {digest}); cue DISABLED, refusing to load unpinned weights"
-                );
-                return None;
-            }
-            Some((
-                path.to_string_lossy().into_owned(),
-                entry.threshold,
-                entry.name.to_string(),
-            ))
-        });
-    // Engine factory: (re)loads the models and rebinds devices/adapters. Used
-    // once at startup and again by the camera worker to rebuild the engine after
-    // a caught panic, so a fresh request never runs against ONNX sessions left in
-    // an unproven state by an unwind. It owns its inputs so it can move to the
-    // worker thread, and it is Fn, so startup calls it before that move.
-    let build_engine = move || {
-        irlume_auth::Engine::load(&det, &model)
-            .map(|e| e.with_devices(&rgb_dev, &ir_dev))
-            .and_then(|e| e.with_ir_adapter(&adapter))
-            .and_then(|e| e.with_mesh(&mesh))
-            .and_then(|e| e.with_blaze_rescue(&blaze))
-            .and_then(|e| match &tp_pad {
-                Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
-                None => Ok(e),
-            })
-    };
-    // Bits are published before the socket binds (bind happens after the
-    // models load), so no connection can observe the default EngineBits.
-    let mut engine = match build_engine() {
-        Ok(e) => {
-            eprintln!(
-                "irlumed: IR adapter {}",
-                if e.has_ir_adapter() {
-                    "loaded"
-                } else {
-                    "absent (raw IR)"
-                }
-            );
-            eprintln!(
-                "irlumed: FaceMesh (passive liveness) {}",
-                if e.has_mesh() { "loaded" } else { "absent" }
-            );
-            eprintln!(
-                "irlumed: BlazeFace rescue detector {}",
-                if e.has_blaze_rescue() {
-                    "loaded"
-                } else {
-                    "absent"
-                }
-            );
-            match e.thirdparty_pad_name() {
-                Some(n) => eprintln!(
-                    "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
-                ),
-                // A gap worth naming at every start: the built-in gate accepts
-                // a life-size print of the enrolled face (docs/PAD_SELFTEST.md),
-                // and this cue is the only measured defence against one.
-                None => eprintln!(
-                    "irlumed: third-party PAD cue: none. The built-in gate does NOT stop a \
-                     life-size print of your face; `sudo irlume models enable flir` adds the \
-                     cue that does"
-                ),
-            }
-            e
-        }
-        Err(e) => {
-            eprintln!("irlumed: failed to load models: {e}");
-            std::process::exit(1);
-        }
-    };
-    publish_engine_bits(&engine);
-
-    // One-time inoculation: stamp legacy (untagged) IR scans with the current
-    // embedding space while it is still the space they were captured under.
-    // A later adapter swap/removal then degrades to a clear "re-enroll" for
-    // dark unlock instead of silently scoring across embedding spaces.
-    for user in irlume_core::storage::list_users() {
-        if let Ok(Some(mut enr)) = irlume_core::storage::load(&user) {
-            let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
-            if n > 0 {
-                match irlume_core::storage::save(&enr) {
-                    Ok(()) => eprintln!(
-                        "irlumed: tagged {n} legacy IR scan(s) for '{user}' as '{}'",
-                        engine.ir_space()
-                    ),
-                    Err(e) => eprintln!("irlumed: could not retag IR scans for '{user}': {e}"),
-                }
-            }
-            // Upgrade notice: IR scans enrolled under a now-absent adapter (e.g.
-            // 0.1.x -> 0.2.0, where the research-only IR adapter was removed) are
-            // in a foreign embedding space and cannot match. Bright-light RGB
-            // login still works; dark/dim login needs a re-enroll. Surfaced here
-            // (journal, and `irlume logs`) because the daemon restarts on upgrade.
-            // Only an OUTAGE gets the notice: once the user re-enrolls, the fresh
-            // usable scans coexist with the stale ones (whose RGB templates still
-            // help), and nagging them to re-run the remedy they already ran is
-            // noise on every restart.
-            let stale = enr.stale_ir_scans(engine.ir_space());
-            if stale > 0 && enr.usable_ir_scans(engine.ir_space()) == 0 {
-                eprintln!(
-                    "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
-                     removed IR adapter and no longer match. Bright-light face login still works; \
-                     run `irlume enroll` to capture fresh scans into your existing profile and \
-                     restore dark/dim login."
-                );
-            }
-        }
-    }
-
-    // SO_PEERCRED is the authorization boundary, and the socket mode must not
-    // pretend to be a second one.
-    //
-    // This was `0660 root:irlume` whenever an `irlume` group existed. That gate
-    // blocked every client it was supposed to admit. The group is created by
-    // packaging with no members, and nothing adds any: the KDE lock screen runs
-    // `kscreenlocker_greet` (not setuid) as the user, so its `pam_irlume.so`
-    // got `connect() = EACCES` and face unlock silently fell through to the
-    // password. `irlume detect` exited 10 (partial) as a user and 0 (ready) as
-    // root on the same healthy box. A gate that stops every intended non-root
-    // client is not defence in depth.
-    //
-    // Membership cannot fix it either: supplementary GIDs are process
-    // credentials set at login, so adding a uid to the group does not reach an
-    // already-running desktop (see newgrp(1)).
-    //
-    // Note what the affected surface actually is, because it is not the login
-    // greeters. SDDM authenticates in `sddm-helper`, GDM in
-    // `gdm-session-worker`, LightDM in `lightdm --session-child`, and greetd in
-    // its session worker; all four keep uid 0 through `pam_authenticate` and
-    // drop privileges only when starting the session, so a dedicated `sddm` or
-    // `gdm` account never reached this socket in the first place. The surfaces
-    // that broke are the ones where the user's own process drives PAM: the KDE
-    // lock screen, and the CLI.
-    //
-    // 0666 plus connect-time peer credentials is the ordinary Linux pattern for
-    // this: it is systemd's own documented default for filesystem sockets
-    // (`SocketMode=` in systemd.socket(5)), pcscd ships the same, and the D-Bus
-    // system bus is world-connectable with authorization done in the service.
-    // `SO_PEERCRED` is supplied by the kernel at connect() time and a client
-    // cannot forge it through protocol input (unix(7)). fprintd, the closest
-    // analogue, likewise keeps its endpoint reachable and authorizes per method.
-    //
-    // What this widens is reachability, not authority: every request still
-    // requires peer uid 0 or `target == peer`, root-only operations stay
-    // root-only, requests are bounded to MAX_REQUEST_BYTES with read/write
-    // deadlines, each connection is isolated behind catch_unwind, and camera
-    // work carries a per-uid throttle. On Fedora the SELinux module remains the
-    // mandatory-access layer.
-    eprintln!("irlumed: serving on {socket} (0666; SO_PEERCRED authorizes every request)");
-    if irlume_common::dbglog::on() {
-        eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
-    }
-
-    // Socket watchdog: if our socket file is deleted/replaced out from under us
-    // (a stale-runtime cleanup, a botched reinstall), the bound fd keeps working
-    // but no client can ever connect again: a silent outage. Detect it and exit
-    // so systemd (Restart=on-failure) re-binds a fresh socket. Self-heals what
-    // the Repair tab otherwise needs a manual restart for.
-    {
-        let socket = socket.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            if !std::path::Path::new(&socket).exists() {
-                eprintln!("irlumed: socket {socket} vanished; exiting for a clean re-bind");
-                std::process::exit(1);
-            }
-        });
-    }
-
-    // One worker owns the engine, and every camera operation happens on it, so
-    // nothing changes about V4L2 and ONNX being driven from a single thread.
-    // What changed is that connections are read elsewhere, which is the only way
-    // an authentication can overtake work already queued: a request nobody has
-    // read yet cannot be prioritised.
+    // Loading models and walking every enrollment costs seconds (21 from exec to
+    // serving on a ThinkPad X13), and a greeter authenticating inside that window
+    // used to find nobody listening at all (#244). Doing it here lets `main` fall
+    // straight through to the accept loop below, so early connections are read
+    // and answered rather than piling up in the kernel backlog: keyring release
+    // needs no engine and is served, everything else is told the daemon is
+    // starting and falls through to the password.
+    let engine_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
-    let worker = {
+    {
         let arbiter = std::sync::Arc::clone(&arbiter);
+        let engine_ready = std::sync::Arc::clone(&engine_ready);
         std::thread::Builder::new()
-            .name("irlume-camera".into())
+            .name("irlume-startup".into())
             .spawn(move || {
-                // The engine asks this between whole captures, so a long
-                // enrolment yields the camera to an authentication instead of
-                // making it wait for ten scans.
-                let token = arbiter.cancel_token();
-                // The engine polls this between whole captures, which makes it
-                // the one place that distinguishes a long-but-healthy job from a
-                // capture stuck inside a driver call. The watchdog (#141) reads
-                // the same signal, so both agree on what "still working" means.
-                engine.set_stop_signal(std::sync::Arc::new(move || {
-                    note_worker_progress();
-                    token.stop_requested()
-                }));
-                while let Some(job) = arbiter.take() {
-                    note_worker_progress();
-                    let Queued { req, peer, reply } = job.payload;
-                    // Isolate each request behind catch_unwind. A panic deep in
-                    // frame decode or inference (e.g. a V4L2 driver echoing back
-                    // a 0-dimension or short-buffered frame) must deny THIS one
-                    // request and let PAM fall back to the password, never
-                    // unwind out of the worker and take down all face auth for
-                    // every user.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        dispatch(req, &peer, &mut engine)
-                    }));
-                    // Release the slot before anything else can fail, so a
-                    // panicking request cannot lock its uid out of the camera
-                    // until the daemon restarts.
-                    arbiter.finish(job.class, job.uid);
-                    let resp = match outcome {
-                        Ok(resp) => resp,
-                        Err(_) => {
+            eprintln!("irlumed: loading models (det={det}, model={model})…");
+            verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter));
+            // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
+            // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
+            let (rgb_dev, ir_dev) = irlume_auth::select_pair();
+            // Log what is actually usable, not the raw (possibly fallback) selection;
+            // on camera-less or RGB-only hardware the fixed default pair doesn't exist.
+            {
+                let ok = |d: &str| std::path::Path::new(d).exists();
+                match (ok(&rgb_dev), ok(&ir_dev)) {
+                    (true, true) => eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)"),
+                    (true, false) => eprintln!(
+                        "irlumed: camera rgb={rgb_dev}, no IR node (convenience tier: screen unlock only)"
+                    ),
+                    (false, _) => eprintln!(
+                        "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
+                    ),
+                }
+            }
+            // Re-apply the KNOWN emitter control at startup. The emitter is camera
+            // hardware state that resets on a USB/power cycle or a daemon restart, so
+            // without this the first auth after a restart gets a dark IR frame (the
+            // "worked at enroll, failed at the lock screen" case).
+            //
+            // This used to fall through to a blind search when IR came back dark, which
+            // is what destroyed a reporter's camera in #159. A daemon start is not
+            // consent to write guessed values to camera firmware, and darkness does not
+            // even imply the emitter is the problem: an unlit room or an empty chair
+            // produces exactly the same measurement. Discovery now happens only when
+            // someone runs `irlume ir-setup` and accepts the warning.
+            if std::path::Path::new(&ir_dev).exists() {
+                match irlume_auth::apply_known_ir_emitter(&ir_dev) {
+                    Ok(true) => eprintln!("irlumed: IR emitter ready"),
+                    Ok(false) => eprintln!(
+                        "irlumed: IR is dark (dark-mode unlock may be unavailable). If this camera needs an \
+                         emitter control irlume does not know, run `sudo irlume ir-setup`."
+                    ),
+                    Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
+                }
+            }
+            // Opt-in third-party PAD cue (`irlume models`): enabled via settings.conf,
+            // weights fetched by the CLI to the state dir. Unlike the shipped models'
+            // warn-first verification, a third-party file MUST match its catalog pin:
+            // on any mismatch the cue is skipped (the built-in gate alone is the safe
+            // default), never trusted. Env override for sandboxes.
+            let tp_pad: Option<(String, f32, String)> = std::env::var("IRLUME_THIRDPARTY_PAD")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    irlume_common::config::read_kv("settings.conf", irlume_common::thirdparty::SETTINGS_KEY)
+                })
+                .and_then(|name| {
+                    let Some(entry) = irlume_common::thirdparty::by_name(name.trim()) else {
+                        eprintln!("irlumed: WARNING: third_party_pad='{name}' is not in the catalog; ignoring");
+                        return None;
+                    };
+                    let path = irlume_common::thirdparty::model_path(entry);
+                    let bytes = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
                             eprintln!(
-                                "irlumed: request handler PANICKED; this request was denied \
-                                 (PAM falls back to the password). Rebuilding the engine for a \
-                                 clean state; please report this with the backtrace above."
+                                "irlumed: WARNING: third-party PAD '{name}' enabled but {} unreadable ({e}); cue disabled (run `sudo irlume models enable {name}` to re-fetch)",
+                                path.display()
                             );
-                            // AssertUnwindSafe only silences the compiler, it
-                            // does not prove the ONNX sessions are in a
-                            // supported state after an unwind, so a fresh engine
-                            // removes that doubt. Chosen over exiting and
-                            // letting systemd restart because a reproducible
-                            // panic would become a restart loop that takes the
-                            // login path down entirely. If the rebuild fails,
-                            // the old engine is kept: still better than a dead
-                            // daemon.
-                            match build_engine() {
-                                Ok(fresh) => {
-                                    engine = fresh;
-                                    publish_engine_bits(&engine);
-                                    eprintln!("irlumed: engine rebuilt after panic");
-                                }
-                                Err(e) => eprintln!(
-                                    "irlumed: engine rebuild after panic FAILED ({e}); continuing \
-                                     with the existing engine"
-                                ),
-                            }
-                            Response::Error("request failed".into())
+                            return None;
                         }
                     };
-                    // The client may already be gone; its thread owns that.
-                    let _ = reply.send(resp);
-                    // Back to waiting for work: idle is healthy, and leaving the
-                    // last job's timestamp behind would read as a wedge (#141).
-                    note_worker_idle();
+                    let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+                    if digest != entry.sha256 {
+                        eprintln!(
+                            "irlumed: WARNING: third-party PAD '{name}' checksum mismatch (sha256 {digest}); cue DISABLED, refusing to load unpinned weights"
+                        );
+                        return None;
+                    }
+                    Some((
+                        path.to_string_lossy().into_owned(),
+                        entry.threshold,
+                        entry.name.to_string(),
+                    ))
+                });
+            // Engine factory: (re)loads the models and rebinds devices/adapters. Used
+            // once at startup and again by the camera worker to rebuild the engine after
+            // a caught panic, so a fresh request never runs against ONNX sessions left in
+            // an unproven state by an unwind. It owns its inputs so it can move to the
+            // worker thread, and it is Fn, so startup calls it before that move.
+            let build_engine = move || {
+                irlume_auth::Engine::load(&det, &model)
+                    .map(|e| e.with_devices(&rgb_dev, &ir_dev))
+                    .and_then(|e| e.with_ir_adapter(&adapter))
+                    .and_then(|e| e.with_mesh(&mesh))
+                    .and_then(|e| e.with_blaze_rescue(&blaze))
+                    .and_then(|e| match &tp_pad {
+                        Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
+                        None => Ok(e),
+                    })
+            };
+            // Bits are published before the socket binds (bind happens after the
+            // models load), so no connection can observe the default EngineBits.
+            let mut engine = match build_engine() {
+                Ok(e) => {
+                    eprintln!(
+                        "irlumed: IR adapter {}",
+                        if e.has_ir_adapter() {
+                            "loaded"
+                        } else {
+                            "absent (raw IR)"
+                        }
+                    );
+                    eprintln!(
+                        "irlumed: FaceMesh (passive liveness) {}",
+                        if e.has_mesh() { "loaded" } else { "absent" }
+                    );
+                    eprintln!(
+                        "irlumed: BlazeFace rescue detector {}",
+                        if e.has_blaze_rescue() {
+                            "loaded"
+                        } else {
+                            "absent"
+                        }
+                    );
+                    match e.thirdparty_pad_name() {
+                        Some(n) => eprintln!(
+                            "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
+                        ),
+                        // A gap worth naming at every start: the built-in gate accepts
+                        // a life-size print of the enrolled face (docs/PAD_SELFTEST.md),
+                        // and this cue is the only measured defence against one.
+                        None => eprintln!(
+                            "irlumed: third-party PAD cue: none. The built-in gate does NOT stop a \
+                             life-size print of your face; `sudo irlume models enable flir` adds the \
+                             cue that does"
+                        ),
+                    }
+                    e
                 }
+                Err(e) => {
+                    eprintln!("irlumed: failed to load models: {e}");
+                    std::process::exit(1);
+                }
+            };
+            publish_engine_bits(&engine);
+
+            // One-time inoculation: stamp legacy (untagged) IR scans with the current
+            // embedding space while it is still the space they were captured under.
+            // A later adapter swap/removal then degrades to a clear "re-enroll" for
+            // dark unlock instead of silently scoring across embedding spaces.
+            for user in irlume_core::storage::list_users() {
+                if let Ok(Some(mut enr)) = irlume_core::storage::load(&user) {
+                    let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
+                    if n > 0 {
+                        match irlume_core::storage::save(&enr) {
+                            Ok(()) => eprintln!(
+                                "irlumed: tagged {n} legacy IR scan(s) for '{user}' as '{}'",
+                                engine.ir_space()
+                            ),
+                            Err(e) => eprintln!("irlumed: could not retag IR scans for '{user}': {e}"),
+                        }
+                    }
+                    // Upgrade notice: IR scans enrolled under a now-absent adapter (e.g.
+                    // 0.1.x -> 0.2.0, where the research-only IR adapter was removed) are
+                    // in a foreign embedding space and cannot match. Bright-light RGB
+                    // login still works; dark/dim login needs a re-enroll. Surfaced here
+                    // (journal, and `irlume logs`) because the daemon restarts on upgrade.
+                    // Only an OUTAGE gets the notice: once the user re-enrolls, the fresh
+                    // usable scans coexist with the stale ones (whose RGB templates still
+                    // help), and nagging them to re-run the remedy they already ran is
+                    // noise on every restart.
+                    let stale = enr.stale_ir_scans(engine.ir_space());
+                    if stale > 0 && enr.usable_ir_scans(engine.ir_space()) == 0 {
+                        eprintln!(
+                            "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
+                             removed IR adapter and no longer match. Bright-light face login still works; \
+                             run `irlume enroll` to capture fresh scans into your existing profile and \
+                             restore dark/dim login."
+                        );
+                    }
+                }
+            }
+
+            // SO_PEERCRED is the authorization boundary, and the socket mode must not
+            // pretend to be a second one.
+            //
+            // This was `0660 root:irlume` whenever an `irlume` group existed. That gate
+            // blocked every client it was supposed to admit. The group is created by
+            // packaging with no members, and nothing adds any: the KDE lock screen runs
+            // `kscreenlocker_greet` (not setuid) as the user, so its `pam_irlume.so`
+            // got `connect() = EACCES` and face unlock silently fell through to the
+            // password. `irlume detect` exited 10 (partial) as a user and 0 (ready) as
+            // root on the same healthy box. A gate that stops every intended non-root
+            // client is not defence in depth.
+            //
+            // Membership cannot fix it either: supplementary GIDs are process
+            // credentials set at login, so adding a uid to the group does not reach an
+            // already-running desktop (see newgrp(1)).
+            //
+            // Note what the affected surface actually is, because it is not the login
+            // greeters. SDDM authenticates in `sddm-helper`, GDM in
+            // `gdm-session-worker`, LightDM in `lightdm --session-child`, and greetd in
+            // its session worker; all four keep uid 0 through `pam_authenticate` and
+            // drop privileges only when starting the session, so a dedicated `sddm` or
+            // `gdm` account never reached this socket in the first place. The surfaces
+            // that broke are the ones where the user's own process drives PAM: the KDE
+            // lock screen, and the CLI.
+            //
+            // 0666 plus connect-time peer credentials is the ordinary Linux pattern for
+            // this: it is systemd's own documented default for filesystem sockets
+            // (`SocketMode=` in systemd.socket(5)), pcscd ships the same, and the D-Bus
+            // system bus is world-connectable with authorization done in the service.
+            // `SO_PEERCRED` is supplied by the kernel at connect() time and a client
+            // cannot forge it through protocol input (unix(7)). fprintd, the closest
+            // analogue, likewise keeps its endpoint reachable and authorizes per method.
+            //
+            // What this widens is reachability, not authority: every request still
+            // requires peer uid 0 or `target == peer`, root-only operations stay
+            // root-only, requests are bounded to MAX_REQUEST_BYTES with read/write
+            // deadlines, each connection is isolated behind catch_unwind, and camera
+            // work carries a per-uid throttle. On Fedora the SELinux module remains the
+            // mandatory-access layer.
+            eprintln!("irlumed: serving on {socket} (0666; SO_PEERCRED authorizes every request)");
+            if irlume_common::dbglog::on() {
+                eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
+            }
+
+            // Socket watchdog: if our socket file is deleted/replaced out from under us
+            // (a stale-runtime cleanup, a botched reinstall), the bound fd keeps working
+            // but no client can ever connect again: a silent outage. Detect it and exit
+            // so systemd (Restart=on-failure) re-binds a fresh socket. Self-heals what
+            // the Repair tab otherwise needs a manual restart for.
+            {
+                let socket = socket.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if !std::path::Path::new(&socket).exists() {
+                        eprintln!("irlumed: socket {socket} vanished; exiting for a clean re-bind");
+                        std::process::exit(1);
+                    }
+                });
+            }
+
+            // One worker owns the engine, and every camera operation happens on it, so
+            // nothing changes about V4L2 and ONNX being driven from a single thread.
+            // What changed is that connections are read elsewhere, which is the only way
+            // an authentication can overtake work already queued: a request nobody has
+            // read yet cannot be prioritised.
+            let _worker = {
+                let arbiter = std::sync::Arc::clone(&arbiter);
+                std::thread::Builder::new()
+                    .name("irlume-camera".into())
+                    .spawn(move || {
+                        // The engine asks this between whole captures, so a long
+                        // enrolment yields the camera to an authentication instead of
+                        // making it wait for ten scans.
+                        let token = arbiter.cancel_token();
+                        // The engine polls this between whole captures, which makes it
+                        // the one place that distinguishes a long-but-healthy job from a
+                        // capture stuck inside a driver call. The watchdog (#141) reads
+                        // the same signal, so both agree on what "still working" means.
+                        engine.set_stop_signal(std::sync::Arc::new(move || {
+                            note_worker_progress();
+                            token.stop_requested()
+                        }));
+                        while let Some(job) = arbiter.take() {
+                            note_worker_progress();
+                            let Queued { req, peer, reply } = job.payload;
+                            // Isolate each request behind catch_unwind. A panic deep in
+                            // frame decode or inference (e.g. a V4L2 driver echoing back
+                            // a 0-dimension or short-buffered frame) must deny THIS one
+                            // request and let PAM fall back to the password, never
+                            // unwind out of the worker and take down all face auth for
+                            // every user.
+                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                dispatch(req, &peer, &mut engine)
+                            }));
+                            // Release the slot before anything else can fail, so a
+                            // panicking request cannot lock its uid out of the camera
+                            // until the daemon restarts.
+                            arbiter.finish(job.class, job.uid);
+                            let resp = match outcome {
+                                Ok(resp) => resp,
+                                Err(_) => {
+                                    eprintln!(
+                                        "irlumed: request handler PANICKED; this request was denied \
+                                         (PAM falls back to the password). Rebuilding the engine for a \
+                                         clean state; please report this with the backtrace above."
+                                    );
+                                    // AssertUnwindSafe only silences the compiler, it
+                                    // does not prove the ONNX sessions are in a
+                                    // supported state after an unwind, so a fresh engine
+                                    // removes that doubt. Chosen over exiting and
+                                    // letting systemd restart because a reproducible
+                                    // panic would become a restart loop that takes the
+                                    // login path down entirely. If the rebuild fails,
+                                    // the old engine is kept: still better than a dead
+                                    // daemon.
+                                    match build_engine() {
+                                        Ok(fresh) => {
+                                            engine = fresh;
+                                            publish_engine_bits(&engine);
+                                            eprintln!("irlumed: engine rebuilt after panic");
+                                        }
+                                        Err(e) => eprintln!(
+                                            "irlumed: engine rebuild after panic FAILED ({e}); continuing \
+                                             with the existing engine"
+                                        ),
+                                    }
+                                    Response::Error("request failed".into())
+                                }
+                            };
+                            // The client may already be gone; its thread owns that.
+                            let _ = reply.send(resp);
+                            // Back to waiting for work: idle is healthy, and leaving the
+                            // last job's timestamp behind would read as a wedge (#141).
+                            note_worker_idle();
+                        }
+                    })
+                    .unwrap_or_else(|e| {
+                        // Without the worker nothing can be served, and a daemon that
+                        // accepts connections it can never answer is worse than one that
+                        // exits and lets systemd restart it.
+                        eprintln!("irlumed: could not start the camera worker: {e}");
+                        std::process::exit(1);
+                    })
+            };
+                // Published LAST: until this flips, `serve` answers from the
+                // engine-free path. Release pairs with the Acquire load there,
+                // so a thread that sees `true` also sees the worker it needs.
+                engine_ready.store(true, std::sync::atomic::Ordering::Release);
             })
             .unwrap_or_else(|e| {
-                // Without the worker nothing can be served, and a daemon that
-                // accepts connections it can never answer is worse than one that
-                // exits and lets systemd restart it.
-                eprintln!("irlumed: could not start the camera worker: {e}");
+                eprintln!("irlumed: could not start the startup thread: {e}");
                 std::process::exit(1);
-            })
-    };
+            });
+    }
 
     // A cap on connection threads, so a peer that opens sockets faster than it
     // sends requests cannot exhaust memory. Well above any real client: the
@@ -525,6 +552,7 @@ fn main() {
                     continue;
                 }
                 let arbiter = std::sync::Arc::clone(&arbiter);
+                let engine_ready = std::sync::Arc::clone(&engine_ready);
                 // A connection thread reads, parses and writes; it never touches
                 // the engine, so a panic in it is contained by the thread itself
                 // and the queued job (if any) is still completed and released by
@@ -532,7 +560,7 @@ fn main() {
                 if let Err(e) = std::thread::Builder::new()
                     .name("irlume-conn".into())
                     .spawn(move || {
-                        if let Err(e) = serve(stream, &arbiter) {
+                        if let Err(e) = serve(stream, &arbiter, &engine_ready) {
                             eprintln!("irlumed: connection error: {e}");
                         }
                         live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -546,7 +574,7 @@ fn main() {
         }
     }
     arbiter.close();
-    let _ = worker.join();
+    // The accept loop above only ends if the listener dies; nothing to join.
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1148,92 @@ fn refusal_throttled(uid: u32) -> bool {
 /// reaches the camera worker is a parsed, authorized-shaped request, which is
 /// what lets an authentication overtake a queue of preview work: before this,
 /// a request nobody had read yet was invisible to the daemon.
-fn serve(stream: UnixStream, arbiter: &arbiter::Arbiter<Queued>) -> std::io::Result<()> {
+/// Release the TPM-sealed login password after another factor has authenticated.
+///
+/// Free-standing, and deliberately takes no engine: nothing here touches the
+/// camera, the models or the matcher, only `irlume_core::keyring` and the peer's
+/// credentials. That is what lets the daemon answer it while the engine is still
+/// loading (#244). Every authorization check below is a property of the REQUEST,
+/// never of startup state, so answering early cannot weaken any of them.
+fn unseal_keyring(user: &str, service: Option<&str>, peer: &Peer) -> Response {
+    let user = user.to_string();
+    let service = service.map(str::to_string);
+
+    // Fingerprint keyring unlock. pam_fprintd has ALREADY authenticated
+    // the user in this PAM transaction (pam_irlume `keyring` only runs at
+    // the post-auth landing). The daemon can't re-verify a fingerprint
+    // (fprintd owns the sensor), so the trust is: root peer + a login /
+    // unlock service class. Releases the sealed login password so
+    // pam_gnome_keyring can open the wallet, matching Windows Hello's
+    // functional model. SECURITY (ADR-0003 / THREAT_MODEL): preserves
+    // at-rest protection (a stolen disk still can't unseal; it needs the
+    // live TPM), but a live root attacker in a login context can obtain
+    // it; root stays the trust boundary. For daemon-verified biometric
+    // release resistant to live root, use the face/IR path.
+    if peer.uid != 0 {
+        return Response::Error(format!(
+            "unseal_keyring requires root (peer uid {})",
+            peer.uid
+        ));
+    }
+    if !irlume_core::keyring::has_sealed_password(&user) {
+        return Response::Error(format!(
+            "no sealed password for '{user}': run `irlume keyring arm`"
+        ));
+    }
+    // Only a login / greeter / lock-screen context; never sudo,
+    // elevation, remote, or unknown. Defence-in-depth: a direct caller
+    // can forge the service string (root can call us directly), so this
+    // does not stop a root attacker; it does stop the keyring line being
+    // (mis)wired into a non-login stack from releasing the credential.
+    {
+        use irlume_core::biopolicy::{classify, OperationClass, SessionState};
+        let class = classify(service.as_deref().unwrap_or(""), SessionState::Warm);
+        if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
+            eprintln!(
+                "irlumed: UnsealKeyring refused for service '{}' ({class:?})",
+                service.as_deref().unwrap_or("?")
+            );
+            return Response::Error(format!("keyring unseal not allowed for {class:?}"));
+        }
+    }
+    match irlume_core::keyring::unseal_password(&user) {
+        Ok(secret) => {
+            eprintln!("irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), password unsealed");
+            Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(secret.to_vec()),
+            }
+        }
+        Err(e) => {
+            eprintln!("irlumed: UnsealKeyring: TPM unseal FAILED for '{user}': {e}");
+            Response::Error(e.to_string())
+        }
+    }
+}
+
+/// What the daemon can answer before its engine exists.
+///
+/// Keyring release touches `irlume_core::keyring` and the peer's credentials and
+/// nothing else, so it is served here: that is the difference between a
+/// fingerprint login after a reboot unlocking the keyring and meeting a password
+/// prompt (#244). Every other request is REFUSED rather than queued, so a face
+/// attempt falls through to the password at once instead of waiting out startup,
+/// and no early caller occupies a slot for the length of it.
+fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
+    match req {
+        Request::UnsealKeyring { user, service } => unseal_keyring(&user, service.as_deref(), peer),
+        Request::Ping => Response::Ok("starting".into()),
+        _ => Response::Error(
+            "irlumed is still starting (loading models); retry, or use your password".into(),
+        ),
+    }
+}
+
+fn serve(
+    stream: UnixStream,
+    arbiter: &arbiter::Arbiter<Queued>,
+    engine_ready: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
@@ -1128,6 +1241,10 @@ fn serve(stream: UnixStream, arbiter: &arbiter::Arbiter<Queued>) -> std::io::Res
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
+            // No engine yet means no worker to queue for.
+            if !engine_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return respond(stream, &dispatch_before_engine(req, &peer));
+            }
             let class = arbiter::classify(&req);
             // Status is answered HERE, on the connection's own thread: it is
             // read-only, engine-free, and possibly slow (ListProfiles is a
@@ -2058,58 +2175,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
             do_unseal_password(&user, service.as_deref(), engine)
         }
-        Request::UnsealKeyring { user, service } => {
-            // Fingerprint keyring unlock. pam_fprintd has ALREADY authenticated
-            // the user in this PAM transaction (pam_irlume `keyring` only runs at
-            // the post-auth landing). The daemon can't re-verify a fingerprint
-            // (fprintd owns the sensor), so the trust is: root peer + a login /
-            // unlock service class. Releases the sealed login password so
-            // pam_gnome_keyring can open the wallet, matching Windows Hello's
-            // functional model. SECURITY (ADR-0003 / THREAT_MODEL): preserves
-            // at-rest protection (a stolen disk still can't unseal; it needs the
-            // live TPM), but a live root attacker in a login context can obtain
-            // it; root stays the trust boundary. For daemon-verified biometric
-            // release resistant to live root, use the face/IR path.
-            if peer.uid != 0 {
-                return Response::Error(format!(
-                    "unseal_keyring requires root (peer uid {})",
-                    peer.uid
-                ));
-            }
-            if !irlume_core::keyring::has_sealed_password(&user) {
-                return Response::Error(format!(
-                    "no sealed password for '{user}': run `irlume keyring arm`"
-                ));
-            }
-            // Only a login / greeter / lock-screen context; never sudo,
-            // elevation, remote, or unknown. Defence-in-depth: a direct caller
-            // can forge the service string (root can call us directly), so this
-            // does not stop a root attacker; it does stop the keyring line being
-            // (mis)wired into a non-login stack from releasing the credential.
-            {
-                use irlume_core::biopolicy::{classify, OperationClass, SessionState};
-                let class = classify(service.as_deref().unwrap_or(""), SessionState::Warm);
-                if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
-                    eprintln!(
-                        "irlumed: UnsealKeyring refused for service '{}' ({class:?})",
-                        service.as_deref().unwrap_or("?")
-                    );
-                    return Response::Error(format!("keyring unseal not allowed for {class:?}"));
-                }
-            }
-            match irlume_core::keyring::unseal_password(&user) {
-                Ok(secret) => {
-                    eprintln!("irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), password unsealed");
-                    Response::PasswordUnsealed {
-                        secret: irlume_common::SecretBytes::new(secret.to_vec()),
-                    }
-                }
-                Err(e) => {
-                    eprintln!("irlumed: UnsealKeyring: TPM unseal FAILED for '{user}': {e}");
-                    Response::Error(e.to_string())
-                }
-            }
-        }
+        Request::UnsealKeyring { user, service } => unseal_keyring(&user, service.as_deref(), peer),
         Request::ForgetPassword { user } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to forget password for '{user}'"));
@@ -3099,6 +3165,45 @@ mod tests {
         env_lock()
     }
 
+    /// While the engine loads, a request that needs it is REFUSED, not queued.
+    ///
+    /// Queueing would make a greeter's face attempt wait out model loading (14.26s
+    /// measured on a ThinkPad X13) instead of falling through to the password, and
+    /// an early caller would hold a slot for the length of startup. The refusal has
+    /// to name the cause, because it reaches the user through PAM (#244).
+    #[test]
+    fn a_request_needing_the_engine_is_refused_while_it_loads() {
+        use std::io::{BufRead, BufReader, Write};
+        let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        (&ours)
+            .write_all(
+                format!("{{\"ListProfiles\":{{\"user\":\"{me}\",\"structured_errors\":false}}}}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let a = std::sync::Arc::clone(&arbiter);
+        // The engine has NOT been published yet: exactly the startup window.
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
+
+        let mut line = String::new();
+        BufReader::new(&ours)
+            .read_line(&mut line)
+            .expect("a refusal within the deadline, not a wait for the engine");
+        let resp: Response = serde_json::from_str(line.trim()).unwrap();
+        match resp {
+            Response::Error(e) => assert!(
+                e.contains("still starting"),
+                "the refusal must say why, it reaches the user through PAM: {e}"
+            ),
+            other => panic!("a request needing the engine must be refused, got {other:?}"),
+        }
+    }
+
     /// A Status request the connection thread CANNOT answer from memory must
     /// reach the worker, not be answered with an error.
     ///
@@ -3151,7 +3256,9 @@ mod tests {
             )
             .unwrap();
         let a = std::sync::Arc::clone(&arbiter);
-        std::thread::spawn(move || serve(theirs, &a).unwrap());
+        // These cover the SERVING daemon; the not-ready path has its own test.
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
 
         let mut line = String::new();
         BufReader::new(&ours)
@@ -3192,7 +3299,9 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         (&ours).write_all(b"\"Ping\"\n").unwrap();
         let a = std::sync::Arc::clone(&arbiter);
-        std::thread::spawn(move || serve(theirs, &a).unwrap());
+        // These cover the SERVING daemon; the not-ready path has its own test.
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
 
         let mut line = String::new();
         BufReader::new(&ours).read_line(&mut line).unwrap();
@@ -3255,7 +3364,9 @@ mod tests {
                 .unwrap();
             (&ours).write_all(wire.as_bytes()).unwrap();
             let a = std::sync::Arc::clone(&arbiter);
-            std::thread::spawn(move || serve(theirs, &a).unwrap());
+            // These cover the SERVING daemon; the not-ready path has its own test.
+            let ready = std::sync::atomic::AtomicBool::new(true);
+            std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
             let mut line = String::new();
             BufReader::new(&ours)
                 .read_line(&mut line)
@@ -3501,7 +3612,9 @@ mod tests {
             .write_all(b"{\"PositionSample\":{\"user\":null}}\n")
             .unwrap();
         let a = std::sync::Arc::clone(&arbiter);
-        std::thread::spawn(move || serve(theirs, &a).unwrap());
+        // These cover the SERVING daemon; the not-ready path has its own test.
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
 
         let mut line = String::new();
         BufReader::new(&ours).read_line(&mut line).unwrap();

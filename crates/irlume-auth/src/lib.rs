@@ -2317,7 +2317,6 @@ impl Engine {
         want: usize,
         pitch_neutral: Option<f32>,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
-        let mut out = Vec::new();
         // Hold the cameras open for the whole loop. This is the heaviest repeated
         // capture in the codebase (the budget below is ten assessments per wanted
         // scan), and every one of them otherwise re-opened, re-negotiated,
@@ -2352,16 +2351,42 @@ impl Engine {
         } else {
             None
         };
-        let mut sessions = match &cams {
-            Some((r, i)) => match (r.session(), i.session()) {
-                (Ok(rs), Ok(is)) => Some((rs, is)),
-                _ => None,
-            },
-            None => None,
-        };
-        if sessions.is_none() {
-            irlume_common::dlog!("enroll: capturing per-frame (no held camera session)");
+        // Fast path: hold both streams for the whole loop.
+        if let Some((r, i)) = &cams {
+            if let (Ok(mut rs), Ok(mut is)) = (r.session(), i.session()) {
+                return self.capture_scan_loop(want, pitch_neutral, Some((&mut rs, &mut is)));
+            }
         }
+        // No held session. RELEASE THE DEVICES FIRST. The per-frame path below
+        // re-opens both nodes itself, and `cams` still holds them: on a module
+        // that permits a second open (both of ours do, measured) that is merely
+        // wasteful, but a module that answers EBUSY turns it into enrolment
+        // failing on its first capture and naming irlumed as the holder of its
+        // own camera (#187). Dropping here also MOVES `cams`, so the fallback
+        // below cannot reach the handles even by mistake.
+        drop(cams);
+        irlume_common::dlog!(
+            "enroll: capturing per-frame (no held camera session; released the devices first)"
+        );
+        self.capture_scan_loop(want, pitch_neutral, None)
+    }
+
+    /// The enrolment capture loop, over held streams when `sessions` is given
+    /// and re-opening per frame when it is not.
+    ///
+    /// Split out from [`Self::capture_scans`] so the per-frame path runs with
+    /// the held cameras already dropped: the two capture strategies must never
+    /// have the devices open at the same time (#187).
+    fn capture_scan_loop(
+        &mut self,
+        want: usize,
+        pitch_neutral: Option<f32>,
+        mut sessions: Option<(
+            &mut irlume_camera::RgbSession<'_>,
+            &mut irlume_camera::IrSession<'_>,
+        )>,
+    ) -> irlume_common::Result<Vec<CapturedScan>> {
+        let mut out = Vec::new();
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved) with enough
         // retries that a brief drift near the capture moment doesn't abort enroll.

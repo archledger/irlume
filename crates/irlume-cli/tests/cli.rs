@@ -670,8 +670,13 @@ fn doctor_runs_fully_offline_with_a_source_origin() {
     assert!(out.contains("face_detection_yunet_2023mar.onnx"), "{out}");
     assert!(out.contains("ORT_DYLIB_PATH: (unset)"), "{out}");
     assert!(
-        out.contains("third-party PAD model: none (default"),
+        out.contains("third-party PAD model: none"),
         "empty sandbox config/state must report no third-party model: {out}"
+    );
+    assert!(
+        out.contains("models enable flir") && out.contains("life-size print"),
+        "reporting the cue as absent must also say what its absence costs, or the \
+         line reads as a neutral default: {out}"
     );
     assert!(out.contains("unknown (daemon not reachable"), "{out}");
 }

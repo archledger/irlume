@@ -296,7 +296,16 @@ pub fn doctor_line() -> String {
             );
         }
     }
-    "none (default; see `irlume models`)".into()
+    // Named as a gap rather than a neutral default. The built-in gate does not
+    // stop a life-size print: measured 2026-06-30 and again 2026-08-02, an
+    // angled vinyl print of the enrolled face reads a centre/edge ratio above
+    // the genuine range, so no threshold separates them and the gate accepts
+    // it. This cue denied the same print at p_fake 0.999 and above. A user
+    // reading `doctor` should learn that from the line, not from an issue.
+    "none — RECOMMENDED: `sudo irlume models enable flir`. Without it the \
+     built-in gate is the only anti-spoof layer, and it does not stop a \
+     life-size print of your face (docs/PAD_SELFTEST.md)"
+        .into()
 }
 
 #[cfg(test)]
@@ -323,11 +332,15 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
         std::env::set_var("IRLUME_STATE_DIR", &state);
 
-        // Nothing enabled, nothing on disk.
+        // Nothing enabled, nothing on disk. The line must name the absence AND
+        // what it costs: reported as a bare default it reads as a setting the
+        // user has already made, which is how a machine ends up with no defence
+        // against a printed face and nothing saying so.
+        let none_line = doctor_line();
+        assert!(none_line.starts_with("none"), "got: {none_line}");
         assert!(
-            doctor_line().starts_with("none (default"),
-            "got: {}",
-            doctor_line()
+            none_line.contains("models enable flir") && none_line.contains("life-size print"),
+            "got: {none_line}"
         );
 
         // Weights on disk but no readable enabled key: report the file without

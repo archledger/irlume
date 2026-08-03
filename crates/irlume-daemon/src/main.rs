@@ -226,7 +226,14 @@ fn main() {
                 Some(n) => eprintln!(
                     "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
                 ),
-                None => eprintln!("irlumed: third-party PAD cue: none (default)"),
+                // A gap worth naming at every start: the built-in gate accepts
+                // a life-size print of the enrolled face (docs/PAD_SELFTEST.md),
+                // and this cue is the only measured defence against one.
+                None => eprintln!(
+                    "irlumed: third-party PAD cue: none. The built-in gate does NOT stop a \
+                     life-size print of your face; `sudo irlume models enable flir` adds the \
+                     cue that does"
+                ),
             }
             e
         }

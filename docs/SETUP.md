@@ -407,7 +407,22 @@ with none of these checks ([#179]).
 [#159]: https://github.com/archledger/irlume/issues/159
 [#179]: https://github.com/archledger/irlume/issues/179
 
-## Optional third-party liveness models
+## Third-party liveness models: optional, and recommended
+
+**Enable one if a printed photograph of you should not unlock your machine.**
+The built-in gate does not stop a life-size print. Measured twice on the same
+hardware, on 2026-06-30 and again on 2026-08-02, an angled vinyl print of the
+enrolled user's face produces the same centre-to-edge infrared falloff a real
+face does, so no threshold separates them and the gate accepts the print. The
+`flir` cue denied the same print at `p_fake` 0.999 and above. It is the only
+defence against this attack that has been measured to work, and it is off until
+you turn it on:
+
+```sh
+sudo irlume models enable flir
+```
+
+The rest of this section is why it is opt-in rather than shipped.
 
 irlume's anti-spoof gate is algorithmic by default. `irlume models` lists
 externally-trained models irlume can fetch onto your machine as an extra,

@@ -526,11 +526,12 @@ pub fn is_pcr_changed_race(e: &Error) -> bool {
 /// Release the sealed secret iff the bound policy is satisfied. Dispatches on the
 /// envelope's [`PolicyKind`].
 ///
-/// Retries the whole attempt on the PCR-counter race described in
-/// [`retryable_tpm_err`]. Each try must start a FRESH session: once the TPM has
-/// rejected a policy session for a moved counter, that session stays dead, so
-/// re-running the dispatch (which opens its own session) is the recovery, not
-/// re-issuing the failed command. This is the same gap systemd closed in
+/// Retries the whole attempt on `TPM2_RC_PCR_CHANGED`, the race in which
+/// another process extends a PCR and invalidates our open policy session (see
+/// [`is_pcr_changed_race`]). Each try must start a FRESH session: once the TPM
+/// has rejected a policy session for a moved counter, that session stays dead,
+/// so re-running the dispatch (which opens its own session) is the recovery,
+/// not re-issuing the failed command. This is the same gap systemd closed in
 /// systemd/systemd#35657, where unsealing already retried but the `PolicyPCR`
 /// leg did not.
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {

@@ -779,6 +779,70 @@ mod tests {
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 
+    /// The tier-climb rewrite must carry BOTH the kind and the password wrap.
+    ///
+    /// Seeded at the weakest tier on purpose: sealing normally lands on this
+    /// machine's best tier, so a reseal returns `Unchanged` and the climb
+    /// never runs, which made a mutant that drops the wrap survive the heal
+    /// test above. Losing the wrap here is silent until the PCRs move, and
+    /// then the token is unrecoverable; losing the kind routes 64 bytes of
+    /// token into `PAM_AUTHTOK` on the next login. This is #253's
+    /// `resealing_preserves_the_secret_kind` trap, one field wider.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
+    fn a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let dir = "/tmp/irlume-kr-token-climb";
+        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let pw = b"climb-password";
+        let token = mint_gnome_token();
+        let mut weak = tpm::seal_with_pcrs(token.as_bytes(), &[7]).expect("seal at Tier 3");
+        weak.secret = SecretKind::GnomeKeyringToken;
+        weak.password_wrap = Some(crate::recovery::wrap(pw, token.as_bytes()).unwrap());
+        weak.save(&envelope_path("climb")).expect("arm");
+        assert_eq!(
+            SealedEnvelope::load(&envelope_path("climb"))
+                .unwrap()
+                .policy
+                .strength_rank(),
+            1,
+            "precondition: sealed at Tier 3, or the climb below never runs"
+        );
+
+        assert_eq!(
+            reseal_password("climb", pw, None).unwrap(),
+            Reseal::Upgraded,
+            "expected the tier-climb rewrite; without it this test cannot see whether \
+             that path preserves anything"
+        );
+
+        let env = SealedEnvelope::load(&envelope_path("climb")).unwrap();
+        assert_eq!(
+            env.secret,
+            SecretKind::GnomeKeyringToken,
+            "the climb dropped the secret kind"
+        );
+        let wrap = env
+            .password_wrap
+            .as_ref()
+            .expect("the climb dropped the password wrap: PCR drift would now be fatal");
+        assert_eq!(
+            &*crate::recovery::unwrap(pw, wrap).expect("the carried wrap must still open"),
+            token.as_bytes(),
+            "the carried wrap must hold the same token"
+        );
+        assert_eq!(
+            &*unseal_password("climb").unwrap(),
+            token.as_bytes(),
+            "and the new seal must still hold it too"
+        );
+
+        forget_password("climb").unwrap();
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
     /// A re-arm must hand back the EXISTING token. Minting a fresh one would
     /// overwrite the only copy of the secret the login keyring is currently
     /// keyed to, and the caller's re-key from the password would then be

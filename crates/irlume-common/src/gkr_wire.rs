@@ -201,6 +201,20 @@ mod tests {
             decode_response(&wrong_len).is_err(),
             "declared length must be 8"
         );
+
+        // The case that separates the two checks. Both assertions above are
+        // also caught by the declared-length check alone, so without this one a
+        // decoder that quietly truncated to 8 bytes passed the whole test. A
+        // well-formed 8-byte header followed by extra bytes means the daemon
+        // is speaking a protocol this client does not know; reading the first
+        // 8 and discarding the rest would silently misinterpret it.
+        let mut trailing = 8u32.to_be_bytes().to_vec();
+        trailing.extend_from_slice(&0u32.to_be_bytes()); // a valid OK...
+        trailing.extend_from_slice(b"more"); // ...with unexpected payload
+        assert!(
+            decode_response(&trailing).is_err(),
+            "a valid header with trailing bytes is protocol drift, not an OK"
+        );
     }
 
     /// End-to-end over an in-memory stream: a scripted "daemon" that answers OK

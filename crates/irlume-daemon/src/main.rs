@@ -102,6 +102,33 @@ fn main() {
     );
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
+    // BIND BEFORE THE SLOW WORK. Startup loads models and then walks every
+    // enrollment to retag legacy IR scans, which touches the TPM per user;
+    // measured 21 seconds from exec to listening on a ThinkPad X13 (#244).
+    // With the bind at the end of that, the socket does not exist while the
+    // greeter is already authenticating, so `connect()` fails and a fingerprint
+    // login's keyring release never happens: pam_irlume's `keyring` line is
+    // `optional` and swallows the failure by design, so the login proceeds and
+    // the user meets a keyring prompt later, with nothing in any log.
+    //
+    // Binding here makes the socket exist within milliseconds of exec. A client
+    // that connects during startup is queued by the kernel and served when the
+    // accept loop starts, inside the client's 25s request timeout, instead of
+    // being told nobody is listening.
+    let _ = std::fs::remove_file(&socket);
+    let listener = match UnixListener::bind(&socket) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("irlumed: cannot bind {socket}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The mode goes on with the bind, not at the accept loop: a socket that
+    // exists but is 0600 refuses exactly the non-root clients this early bind
+    // exists to admit. The reasoning for 0666 is at the accept loop below.
+    set_mode(&socket, DAEMON_SOCKET_MODE);
+    eprintln!("irlumed: socket ready at {socket}; requests queue while startup finishes");
+
     eprintln!("irlumed: loading models (det={det}, model={model})…");
     verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter));
     // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
@@ -281,14 +308,6 @@ fn main() {
         }
     }
 
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("irlumed: cannot bind {socket}: {e}");
-            std::process::exit(1);
-        }
-    };
     // SO_PEERCRED is the authorization boundary, and the socket mode must not
     // pretend to be a second one.
     //
@@ -328,8 +347,7 @@ fn main() {
     // deadlines, each connection is isolated behind catch_unwind, and camera
     // work carries a per-uid throttle. On Fedora the SELinux module remains the
     // mandatory-access layer.
-    set_mode(&socket, DAEMON_SOCKET_MODE);
-    eprintln!("irlumed: listening on {socket} (0666; SO_PEERCRED authorizes every request)");
+    eprintln!("irlumed: serving on {socket} (0666; SO_PEERCRED authorizes every request)");
     if irlume_common::dbglog::on() {
         eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
     }

@@ -118,3 +118,81 @@ fn daemon_exits_promptly_on_sigterm() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The socket must exist before the daemon has finished starting up, not after.
+///
+/// Startup loads models and then walks every enrollment, touching the TPM per
+/// user; measured 11 seconds from exec to the old bind on a ThinkPad X13. With
+/// the bind at the end of that, a greeter authenticating during the window gets
+/// `connect()` refused, and a fingerprint login's keyring release never happens.
+/// `pam_irlume`'s `keyring` line is `optional` and swallows the failure by
+/// design, so the user meets a keyring prompt later with nothing in any log
+/// (#244).
+///
+/// The test asserts the ORDER: the socket is connectable well before the daemon
+/// answers its first request. A regression that moves the bind back after the
+/// slow work makes those two times converge, and this fails.
+#[test]
+fn the_socket_is_connectable_before_startup_finishes() {
+    let models = models_dir();
+    let det = models.join("face_detection_yunet_2023mar.onnx");
+    let model = models.join("glintr100.onnx");
+    let Some(ort) = ort_dylib() else {
+        eprintln!("SKIP: no libonnxruntime found");
+        return;
+    };
+    if !det.exists() || !model.exists() {
+        eprintln!("SKIP: models not present (bash scripts/fetch-models.sh)");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("irlumed-early-bind-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let socket = dir.join("irlumed.sock");
+
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_irlumed"))
+        .env("IRLUME_SOCKET", &socket)
+        .env("IRLUME_DET_MODEL", &det)
+        .env("IRLUME_MODEL", &model)
+        .env("IRLUME_MESH_MODEL", models.join("face_landmark.onnx"))
+        .env(
+            "IRLUME_BLAZE_MODEL",
+            models.join("blaze_face_short_range.onnx"),
+        )
+        .env("ORT_DYLIB_PATH", &ort)
+        .env("IRLUME_RGB_DEVICE", "/nonexistent-rgb")
+        .env("IRLUME_IR_DEVICE", "/nonexistent-ir")
+        .spawn()
+        .expect("spawn irlumed");
+
+    // When did a connection first succeed?
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut connectable = None;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("daemon exited during startup: {status}");
+        }
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            connectable = Some(started.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let verdict = connectable.map(|d| d.as_secs_f32());
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let secs = verdict.expect("daemon never became connectable within 30s");
+    // Model loading alone is over a second on every machine measured, so a bind
+    // that still happens after it cannot land this early. Generous enough not to
+    // flake on a loaded CI runner.
+    assert!(
+        secs < 1.0,
+        "the socket took {secs:.2}s to accept a connection, so it is being bound after \
+         startup work again; clients that connect during startup will be refused (#244)"
+    );
+}

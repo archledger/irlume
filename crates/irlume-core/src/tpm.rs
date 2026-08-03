@@ -1516,15 +1516,21 @@ mod tests {
     /// command code shows up as a mismatch rather than as a later unseal
     /// failure nobody can attribute.
     #[test]
-    #[ignore = "requires a real TPM; run as root: cargo test -p irlume-core --lib tpm:: -- --ignored"]
+    #[ignore = "real TPM, run as root and BY NAME so it cannot be lost among the other ignored \
+                TPM tests: sudo <test-binary> software_digests_match --ignored --nocapture"]
     fn software_digests_match_a_trial_session() {
-        let mut ctx = match open_context() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("SKIP: no TPM context ({e})");
-                return;
-            }
-        };
+        // FAILS rather than skips when the TPM is out of reach. This is the only
+        // thing standing behind replacing a TPM computation with arithmetic, and
+        // a test that reports success without observing the hardware it is named
+        // for is worse than no test: it is already `#[ignore]`, so anyone running
+        // it has asked for hardware.
+        let mut ctx = open_context().unwrap_or_else(|e| {
+            panic!(
+                "this test exists to compare software digests against a real TPM, \
+                 and no TPM context could be opened ({e}). Run it as root on a \
+                 machine with a TPM; do not treat this as a skip."
+            )
+        });
 
         // A single-value PolicyPCR, the shape the singles group takes.
         let one = pcr_composite_digest(&[[0x11; 32]]).unwrap();

@@ -206,8 +206,10 @@ pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
 /// A blown frame does not measure a face, and every cue that reads it degrades
 /// together: the centre/edge ratio compresses toward the floor, and the
 /// third-party PAD model's `p_fake` decays out of its deny range and into the
-/// abstain band it was never qualified in, so a flat print stops being denied
-/// by the one cue that reliably denies it (#237).
+/// abstain band, so a flat print stops being denied by the one cue that
+/// reliably denies it (#237). Whether that band was ever exercised with clipped
+/// frames during the model's qualification is not recorded either way; what is
+/// measured is the decay itself.
 ///
 /// 10% sits between two measured populations on the ASUS module, dark room, one
 /// subject: with clip-aware frame selection (#221) every genuine gate frame

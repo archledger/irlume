@@ -141,7 +141,9 @@ demographic-fairness measurements are in [FAIRNESS.md](FAIRNESS.md).
 ## IR capture: strobe and ambient subtraction
 
 The 850 nm emitter strobes rather than holding steady, so `irlumed` captures an
-IR burst and keeps the brightest frame (the lit strobe phase). The frames around
+IR burst and keeps a lit strobe phase: the brightest frame that clips at most 5%
+of its pixels, because a blown frame flattens the liveness cues and blinds the
+PAD model (#221). The frames around
 it are emitter-off exposures holding only ambient IR, and they are not simply
 discarded: with `IRLUME_IR_AMBIENT_SUBTRACT=1` the daemon subtracts the
 off-frame adjacent to the lit one, isolating the emitter's own reflected light.

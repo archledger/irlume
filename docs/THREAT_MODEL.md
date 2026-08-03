@@ -181,7 +181,7 @@ Physically-grounded cues, hard gate (any failure rejects):
 - **Corneal glint**: *supporting only* (standalone-glint liveness was refuted).
 
 *(Explored but not shipped as gates: bright-pupil retro-reflection and active
-IR-strobe response; the capture path picks the brightest strobe frame but no
+IR-strobe response; the capture path picks an unclipped lit strobe frame but no
 strobe-response check is enforced.)*
 
 **Caveat:** a pure hand-crafted gate is unproven at certification-grade

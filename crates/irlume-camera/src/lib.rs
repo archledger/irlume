@@ -158,7 +158,9 @@ pub enum Spectrum {
 /// strobes, `ambient_mean` is the scene's ambient IR level with the emitter off
 /// and `lit_mean - ambient_mean` is the strobe gap; on a steady emitter the two
 /// converge.
-#[derive(Clone, Copy, Debug)]
+// Not Copy: `saturation_frame` owns a frame's worth of pixels, and a silent
+// per-use copy of that is not something a caller should get by accident.
+#[derive(Clone, Debug)]
 pub struct IrCaptureStats {
     pub lit_mean: f32,
     pub ambient_mean: f32,
@@ -183,6 +185,20 @@ pub struct IrCaptureStats {
     /// nominal white at 235, full range at 255) and irlume does not carry that
     /// field, so a clipped face could read as no clipping at all.
     pub white_level: Option<u8>,
+    /// The gate frame's RAW pixels, present only when the returned frame is no
+    /// longer them: ambient subtraction replaces the payload, and a caller
+    /// measuring clipping must not measure the replacement.
+    ///
+    /// Subtraction cannot restore a sample that reached the ceiling, but it
+    /// does move it: a raw 255 minus an ambient 1 is 254, so a face that
+    /// clipped 25% measures 0% afterwards and an exposure guard reading it
+    /// would pass a frame that carries no information (#238 review). The
+    /// camera's own note two screens up already said pixels saturated in the
+    /// lit frame carry no reliable subtracted value; this keeps the evidence
+    /// for the guard that acts on it.
+    ///
+    /// `None` means the returned frame IS the raw gate frame, so measure that.
+    pub saturation_frame: Option<Vec<u8>>,
 }
 
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
@@ -1845,6 +1861,8 @@ impl IrSession<'_> {
         // Both are moot while the flag is unset (the shipped default).
         let subtract = std::env::var("IRLUME_IR_AMBIENT_SUBTRACT").is_ok_and(|v| v.trim() == "1");
         let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
+        // Stays None unless the returned pixels stop being the raw gate frame.
+        let mut saturation_frame: Option<Vec<u8>> = None;
         if subtract {
             // An adjacent frame the camera flagged dark, else the darker
             // neighbour as before. Adjacency still bounds auto-exposure drift
@@ -1863,6 +1881,13 @@ impl IrSession<'_> {
                     // face becomes undetectable. Keep the raw lit frame instead of
                     // handing downstream a blank one.
                     if sub_mean >= SUBTRACT_MIN_RESULT {
+                        // Keep the raw gate frame BEFORE handing back the
+                        // subtracted one: saturation is only measurable in the
+                        // pixels that actually hit the ceiling, and subtraction
+                        // moves every one of them below it. Cloned only on this
+                        // branch, the one where the returned pixels stop being
+                        // the raw ones.
+                        saturation_frame = white_level.map(|_| frames[best_i].clone());
                         best = Some(sub);
                         // The result now carries pixels from BOTH frames.
                         ir_window = ir_window.union(CaptureWindow::at(taken[ai]));
@@ -1977,6 +2002,7 @@ impl IrSession<'_> {
                 captured: ir_window,
             },
             IrCaptureStats {
+                saturation_frame,
                 lit_mean: lit_level as f32,
                 ambient_mean: ambient_level as f32,
                 burst_frames: IR_BURST,

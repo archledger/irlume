@@ -1137,8 +1137,13 @@ impl Engine {
             ir_ambient: ir_stats.ambient_mean,
             // From the IR frame, because the IR cues are measured there.
             face_frac: face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
+            // Measured on the RAW gate frame. `ir.data` is the subtracted image
+            // when ambient subtraction is on, and subtraction drops every
+            // ceiling sample below the ceiling, so a 25%-clipped face would
+            // report 0% and the exposure gate would pass a frame carrying
+            // nothing (#238 review).
             ir_saturated_frac: saturated_frac_of(
-                &ir.data,
+                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
                 ir.width,
                 ir.height,
                 ir_top.as_ref().map(|f| &f.bbox),
@@ -1877,6 +1882,21 @@ impl Engine {
             }
         }
         let a = self.assess()?;
+
+        // An unreadable frame is reported as unreadable BEFORE anything derived
+        // from it is consulted. The eye cue below is computed from the same IR
+        // pixels, so a blown frame that hides the corneal glints would deny with
+        // OtherDeny, which is NOT presence-retryable: the grace window would
+        // stop instead of letting exposure settle, turning a retryable quality
+        // refusal into a terminal one for anybody with require_eyes_open on
+        // (#238 review). Uncertain is the only verdict this promotes; a Spoof
+        // still reaches its own branch below with its own reason.
+        if a.verdict == Verdict::Uncertain {
+            return Ok(Outcome::deny(
+                liveness_deny_kind(a.verdict, &a.reason),
+                format!("liveness {:?}: {}", a.verdict, a.reason),
+            ));
+        }
 
         // Opt-in hard gate: never unlock unless both eyes read open.
         if enr.require_eyes_open && !a.eyes_open {
@@ -3930,6 +3950,35 @@ mod tests {
         assert_eq!(
             saturated_frac_of(&grey, 4, 4, Some(&bbox), Some(255)),
             Some(1.0)
+        );
+    }
+
+    /// Ambient subtraction hides the ceiling it subtracts from, so the exposure
+    /// gate must read the raw gate frame that `IrCaptureStats::saturation_frame`
+    /// preserves. Measuring the returned pixels instead reports a blown face as
+    /// pristine, which is the fail-open the #238 review found: 255 minus an
+    /// ambient 1 is 254, and 254 is not at the ceiling.
+    #[test]
+    fn subtraction_hides_clipping_so_the_gate_reads_the_raw_frame() {
+        let bbox = [0.0f32, 0.0, 4.0, 4.0];
+        // A face region a quarter of which reached the sensor ceiling.
+        let raw: Vec<u8> = [
+            255, 255, 255, 255, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+        ]
+        .into_iter()
+        .collect();
+        let ambient = vec![1u8; 16];
+        let returned = irlume_camera::ir_probe::subtract(&raw, &ambient);
+
+        assert_eq!(
+            saturated_frac_of(&returned, 4, 4, Some(&bbox), Some(255)),
+            Some(0.0),
+            "control: the returned image no longer shows the clipping"
+        );
+        assert_eq!(
+            saturated_frac_of(&raw, 4, 4, Some(&bbox), Some(255)),
+            Some(0.25),
+            "the raw gate frame is where the clipping is still measurable"
         );
     }
 

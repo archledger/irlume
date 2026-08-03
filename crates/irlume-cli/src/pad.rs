@@ -142,8 +142,10 @@ fn capture_once(
         head_pitch_frac,
         ir_ambient: ir_stats.ambient_mean,
         face_frac: irlume_auth::face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
+        // The raw gate frame, for the reason the auth path states: subtraction
+        // hides the very clipping this measures.
         ir_saturated_frac: irlume_auth::saturated_frac_of(
-            &ir.data,
+            ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
             ir.width,
             ir.height,
             ir_top.as_ref().map(|f| &f.bbox),

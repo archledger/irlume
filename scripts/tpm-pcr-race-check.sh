@@ -27,16 +27,43 @@ command -v tpm2_pcrextend >/dev/null || { echo "SKIP: tpm2-tools not installed (
 
 [[ -x "$BIN" ]] || { echo "missing $BIN; cargo build --release -p irlume-core --example pcr_race_probe" >&2; exit 2; }
 
+# Read one counter out of a probe run, or abort.
+#
+# An absent `failures=` line means the probe died before it could report, and
+# defaulting that to 0 prints a full-marks score for a run that never touched
+# the TPM. It did exactly that once: the invoking user was not in the `tss`
+# group, every unseal failed with EACCES, and this script said 12/12.
+counter_or_die() {  # counter_or_die <log> <name>
+    local v
+    v="$(sed -n "s/.*$2=\([0-9]*\).*/\1/p" "$1" | tail -1)"
+    if [[ -z "$v" ]]; then
+        echo "   ABORT: the probe never reported '$2='; it did not complete. Last lines:" >&2
+        tail -4 "$1" >&2
+        exit 4
+    fi
+    printf '%s' "$v"
+}
+
 echo "== guard: nothing irlume seals may bind PCR 16 or 23"
-# Read the PCRs this build would bind rather than trusting the default: a
-# machine with IRLUME_PCRS set could legitimately bind 23, and extending it
-# would then break live seals instead of merely racing them.
-BOUND="$(IRLUME_KEYRING_DIR="$DIR/probe" "$BIN" 0 2>/dev/null | sed -n 's/.*(\(.*\))/\1/p')"
-LIVE_PCRS="$(for f in /var/lib/irlume/keyring/*.json; do
-    [[ -e "$f" ]] || continue
-    python3 -c "import json,sys;print(*json.load(open(sys.argv[1])).get('pcrs',[]))" "$f" 2>/dev/null
-done | tr ' ' '\n' | sort -un | tr '\n' ' ')"
-echo "   PCRs bound by live envelopes: ${LIVE_PCRS:-<none>}"
+# Read the LIVE envelopes, because those are what an extend could break. The
+# directory is root-only, so a non-root run cannot see them; treating that as
+# "no envelopes bind 23" would be a guard that passes precisely when it cannot
+# do its job.
+KEYRING_DIR=/var/lib/irlume/keyring
+if [[ ! -r "$KEYRING_DIR" && -d "$KEYRING_DIR" ]]; then
+    echo "   ABORT: $KEYRING_DIR is not readable by this user, so the guard cannot"
+    echo "   confirm no live seal binds PCR 16/23. Re-run with sudo."
+    exit 2
+fi
+LIVE_PCRS=""
+if [[ -d "$KEYRING_DIR" ]]; then
+    LIVE_PCRS="$(for f in "$KEYRING_DIR"/*.json; do
+        [[ -e "$f" ]] || continue
+        python3 -c "import json,sys;print(*json.load(open(sys.argv[1])).get('pcrs',[]))" "$f" \
+            || { echo "   ABORT: could not parse $f" >&2; exit 2; }
+    done | tr ' ' '\n' | sort -un | tr '\n' ' ')" || exit 2
+fi
+echo "   PCRs bound by live envelopes: ${LIVE_PCRS:-<none armed>}"
 for p in $LIVE_PCRS; do
     if [[ "$p" == "16" || "$p" == "23" ]]; then
         echo "   REFUSING: a live envelope binds PCR $p; extending it would BREAK that seal"
@@ -46,20 +73,23 @@ done
 
 echo "== phase 1: baseline, no interference"
 IRLUME_KEYRING_DIR="$DIR/kr" "$BIN" "$N" >"$DIR/clean.log" 2>&1
-CLEAN_RC=$?
-CLEAN_FAIL="$(sed -n 's/.*failures=\([0-9]*\).*/\1/p' "$DIR/clean.log" | tail -1)"
-echo "   $((N-${CLEAN_FAIL:-0}))/$N unseals succeeded with nothing extending PCRs (rc=$CLEAN_RC)"
+CLEAN_FAIL="$(counter_or_die "$DIR/clean.log" failures)"
+echo "   $((N-CLEAN_FAIL))/$N unseals succeeded with nothing extending PCRs"
+if [[ "$CLEAN_FAIL" -ne 0 ]]; then
+    echo "   ABORT: the baseline already fails, so phase 2 would measure nothing:"
+    grep -E 'failed|ERROR' "$DIR/clean.log" | tail -3
+    exit 1
+fi
 
 echo "== phase 2: extend PCR 23 continuously while unsealing"
 ( while :; do tpm2_pcrextend 23:sha256=$(head -c32 /dev/urandom | sha256sum | cut -d' ' -f1) >/dev/null 2>&1; done ) &
 EXTENDER=$!
 IRLUME_KEYRING_DIR="$DIR/kr" "$BIN" "$N" >"$DIR/race.log" 2>&1
-RACE_FAIL="$(sed -n 's/.*failures=\([0-9]*\).*/\1/p' "$DIR/race.log" | tail -1)"
-RACE_FAIL="${RACE_FAIL:-0}"
-WRONG="$(sed -n 's/.*wrong_bytes=\([0-9]*\).*/\1/p' "$DIR/race.log" | tail -1)"
 kill "$EXTENDER" 2>/dev/null; wait "$EXTENDER" 2>/dev/null
+RACE_FAIL="$(counter_or_die "$DIR/race.log" failures)"
+WRONG="$(counter_or_die "$DIR/race.log" wrong_bytes)"
 echo "   $((N-RACE_FAIL))/$N unseals succeeded while PCR 23 was being extended"
-[[ "${WRONG:-0}" -eq 0 ]] || { echo "   FAIL: ${WRONG} unseal(s) returned the WRONG bytes"; exit 1; }
+[[ "$WRONG" -eq 0 ]] || { echo "   FAIL: ${WRONG} unseal(s) returned the WRONG bytes"; exit 1; }
 
 RETRIED="$(grep -c 'retrying unseal' "$DIR/race.log" 2>/dev/null)"
 echo "   retries logged: ${RETRIED:-0}"
@@ -79,4 +109,4 @@ else
     grep -E 'PCR have changed|pcr-update-counter-moved' "$DIR/race.log" | tail -3
     exit 1
 fi
-[[ "${CLEAN_FAIL:-0}" -eq 0 ]] || { echo "   NOTE: $CLEAN_FAIL baseline failures too; something else is wrong"; exit 1; }
+

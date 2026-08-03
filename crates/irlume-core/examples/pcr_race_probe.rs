@@ -30,7 +30,16 @@ fn main() -> std::process::ExitCode {
         .unwrap_or(20);
 
     let user = "pcr-race-probe";
-    let secret = b"a-secret-that-should-come-back-unchanged";
+    // Generated, not a literal. A literal here is a hard-coded credential as
+    // far as any scanner is concerned, and dismissing that alert forever is
+    // worse than drawing 32 bytes; a fresh secret per run also means a stale
+    // envelope from an earlier run cannot satisfy the readback check below.
+    let secret = &{
+        use rand::Rng;
+        let mut b = [0u8; 32];
+        rand::rng().fill_bytes(&mut b);
+        b
+    };
 
     if let Err(e) = keyring::seal_password(user, secret) {
         eprintln!("seal failed: {e}");
@@ -58,7 +67,7 @@ fn main() -> std::process::ExitCode {
                 // Never just "it returned Ok": a retry that resumed a broken
                 // session could plausibly hand back something else, and an
                 // unseal whose bytes are wrong is worse than one that failed.
-                if got.as_slice() != secret {
+                if got.as_slice() != secret.as_slice() {
                     wrong += 1;
                     eprintln!("round {i}: unsealed the WRONG bytes");
                 }

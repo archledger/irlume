@@ -927,6 +927,7 @@ fn digest_list(digests: &[Digest]) -> Result<DigestList> {
 }
 
 /// A single-value PCR group plus the ordered multi-value PCRs of a super policy.
+#[derive(Clone)]
 struct SuperPcr {
     /// Single-value PCRs, ascending (replayed live as one PolicyPCR at unseal).
     singles: Vec<u32>,
@@ -937,7 +938,58 @@ struct SuperPcr {
 /// Reconstruct systemd's super-PCR policy structure from the prediction, deriving
 /// each multi-value PCR's OR-branch digests via trial replays of the growing
 /// prefix (mirrors `tpm2_calculate_policy_super_pcr`).
+/// Memo for [`build_super_pcr`], keyed on the prediction it was derived from.
+///
+/// Deriving the branch digests costs ONE TRIAL TPM SESSION PER PREDICTED BRANCH,
+/// and the result depends only on the prediction file, never on the request. It
+/// was being recomputed on every unseal: measured 10.88s on a ThinkPad X13
+/// (STMicro discrete TPM, 17 branches) against 0.36s on a Zenbook (firmware TPM,
+/// 4 branches), three runs each within 0.01s. Because `pam_irlume`'s keyring line
+/// runs inside the PAM auth stack, that was 11 seconds of login the user waited
+/// through (#246).
+///
+/// Keyed on the prediction's own content, so `systemd-pcrlock make-policy`
+/// invalidates it by changing the key rather than by anyone remembering to clear
+/// it. In memory only: a persisted cache would need its own argument about what a
+/// tampered entry can do, and this already removes the repeat cost within a
+/// daemon's lifetime.
+static SUPER_PCR_MEMO: std::sync::OnceLock<std::sync::Mutex<Option<(u64, SuperPcr)>>> =
+    std::sync::OnceLock::new();
+
+/// Content key for a prediction: the PCR numbers and their predicted values, in
+/// the order the policy is built from. Hashing the parsed values rather than the
+/// file bytes keeps reformatting from invalidating a still-correct memo.
+fn pcrlock_key(plock: &PcrlockJson) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut entries: Vec<(u32, Vec<String>)> = plock
+        .pcr_values
+        .iter()
+        .map(|e| (e.pcr, e.values.clone()))
+        .collect();
+    entries.sort_by_key(|(pcr, _)| *pcr);
+    entries.hash(&mut h);
+    h.finish()
+}
+
 fn build_super_pcr(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
+    let key = pcrlock_key(plock);
+    let memo = SUPER_PCR_MEMO.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = memo.lock() {
+        if let Some((cached_key, cached)) = guard.as_ref() {
+            if *cached_key == key {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    let built = build_super_pcr_uncached(ctx, plock)?;
+    if let Ok(mut guard) = memo.lock() {
+        *guard = Some((key, built.clone()));
+    }
+    Ok(built)
+}
+
+fn build_super_pcr_uncached(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
     let mut entries: Vec<(u32, Vec<[u8; 32]>)> = plock
         .pcr_values
         .iter()

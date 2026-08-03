@@ -534,34 +534,51 @@ pub fn is_pcr_changed_race(e: &Error) -> bool {
 /// systemd/systemd#35657, where unsealing already retried but the `PolicyPCR`
 /// leg did not.
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
-    let mut attempt = 0;
-    let out = loop {
-        let result = match &env.policy {
-            PolicyKind::PcrLiteral => unseal_literal(env),
-            PolicyKind::Authorized {
-                pubkey_pem,
-                policy_ref,
-            } => unseal_authorized(env, pubkey_pem, policy_ref),
-            PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
-        };
-        match result {
-            Err(e) if is_pcr_changed_race(&e) && attempt < PCR_CHANGED_RETRIES => {
-                attempt += 1;
+    let out = retry_on_pcr_race(PCR_CHANGED_RETRIES, || match &env.policy {
+        PolicyKind::PcrLiteral => unseal_literal(env),
+        PolicyKind::Authorized {
+            pubkey_pem,
+            policy_ref,
+        } => unseal_authorized(env, pubkey_pem, policy_ref),
+        PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
+    })?;
+    // Lock the unsealed secret (login password / template key) against swap and
+    // core dumps for as long as it lives.
+    irlume_common::memlock::lock_slice(&out);
+    Ok(out)
+}
+
+/// Run `attempt` until it stops losing to the PCR-counter race, at most
+/// `limit` extra times.
+///
+/// A separate function taking a closure because the CONDITION cannot be staged:
+/// producing a real `TPM2_RC_PCR_CHANGED` needs another process to extend a
+/// counter-moving PCR at the right microsecond, and the one PCR that is safe to
+/// extend on a live machine (23, the application PCR) is excluded from the
+/// update counter, so it cannot trigger it at all. The loop's BEHAVIOUR is
+/// still a value a test can pin: how many times it re-runs, that it stops, that
+/// it returns the successful result, and that it gives up with the original
+/// error rather than a synthesised one.
+fn retry_on_pcr_race<T, F>(limit: u32, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let mut tries = 0;
+    loop {
+        match attempt() {
+            Err(e) if is_pcr_changed_race(&e) && tries < limit => {
+                tries += 1;
                 // Worth a line: without it a retried unseal is invisible, and
                 // the difference between "this machine races occasionally" and
                 // "this machine races every time" is the whole diagnosis.
                 eprintln!(
                     "irlume: TPM policy session lost to a concurrent PCR extend; \
-                     retrying unseal ({attempt}/{PCR_CHANGED_RETRIES})"
+                     retrying unseal ({tries}/{limit})"
                 );
             }
-            other => break other?,
+            other => return other,
         }
-    };
-    // Lock the unsealed secret (login password / template key) against swap and
-    // core dumps for as long as it lives.
-    irlume_common::memlock::lock_slice(&out);
-    Ok(out)
+    }
 }
 
 /// Unseal a literal-`PolicyPCR` envelope: replay the bound PCRs into a policy
@@ -1490,6 +1507,68 @@ mod tests {
             !is_pcr_mismatch(&raced),
             "the race must not masquerade as drift: {raced}"
         );
+    }
+
+    /// The retry loop's mechanics, with the TPM replaced by a counter.
+    ///
+    /// This is what stands in for a hardware reproduction: 655 verified PCR-23
+    /// extends during live unseals on the ThinkPad produced no race at all,
+    /// because PCR 23 is excluded from the update counter. So the loop is
+    /// pinned here instead, and the response-code mapping is pinned above.
+    #[test]
+    fn the_retry_loop_reruns_the_attempt_and_then_gives_up() {
+        let race = || retryable_tpm_err(tss_esapi::Error::Tss2Error(0x128u32.into()));
+
+        // Fails twice, then succeeds: the caller must see the SUCCESS, and the
+        // attempt must have run exactly three times.
+        let mut calls = 0;
+        let got = retry_on_pcr_race(3, || {
+            calls += 1;
+            if calls < 3 {
+                Err(race())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(got.unwrap(), 3);
+        assert_eq!(calls, 3, "should have re-run twice after two races");
+
+        // Always racing: bounded at limit+1 attempts, and the error that comes
+        // back is the race itself, not something invented by the loop.
+        let mut calls = 0;
+        let err = retry_on_pcr_race(3, || {
+            calls += 1;
+            Err::<(), _>(race())
+        })
+        .expect_err("a permanent race must still fail");
+        assert_eq!(calls, 4, "1 initial + 3 retries, then stop");
+        assert!(
+            is_pcr_changed_race(&err),
+            "the original error survives: {err}"
+        );
+
+        // A non-race error must not be retried even once: retrying a genuine
+        // policy failure would spin and delay the password fallback.
+        let mut calls = 0;
+        let err = retry_on_pcr_race(3, || {
+            calls += 1;
+            Err::<(), _>(Error::Tpm("unseal refused: policy fail".into()))
+        })
+        .expect_err("still an error");
+        assert_eq!(calls, 1, "a non-race error must be returned immediately");
+        assert!(!is_pcr_changed_race(&err));
+
+        // Success first time: exactly one attempt.
+        let mut calls = 0;
+        assert_eq!(
+            retry_on_pcr_race(3, || {
+                calls += 1;
+                Ok::<_, Error>(7)
+            })
+            .unwrap(),
+            7
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

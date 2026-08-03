@@ -184,7 +184,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
     eprintln!(
         "\n[suncal] {faces_found} bursts with a detectable IR face.\n\
-         [suncal] raw center/edge alone (shipped default): {raw_pass}/{faces_found} pass (>=1.03).\n\
+         [suncal] raw center/edge alone (shipped default): {raw_pass}/{faces_found} pass (>={:.2}).\n\
          [suncal] NEW gate (gap>8, amb>=5, sub_mean>=12): +{sub_rescued} rescued, so \
          {}/{faces_found} pass.\n\
          [suncal] 'chose' column = which frame the new gate hands downstream; 'gated' = its verdict.\n\
@@ -196,6 +196,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
          [suncal] This is GENUINE-only data. Before enabling by default, capture flat spoofs\n\
          under the same bright light to confirm subtraction does NOT lift them over the floor,\n\
          and re-enroll with the flag on so the per-user calibrated floor + IR match match.",
+        irlume_liveness::MIN_CENTER_EDGE_RATIO,
         raw_pass + sub_rescued
     );
     ExitCode::SUCCESS

@@ -77,6 +77,38 @@ impl PolicyKind {
     }
 }
 
+/// What the sealed blob actually is.
+///
+/// The two are released to different consumers and are not interchangeable: a
+/// login password goes into `PAM_AUTHTOK` for `pam_gnome_keyring`, a KDE wallet
+/// key goes to `ksecretd` on its startup pipe and would be meaningless as an
+/// `AUTHTOK`. Recording it means a migrated envelope cannot be handed to the
+/// wrong one, which would surface as an unexplained wallet prompt rather than
+/// as an error.
+///
+/// Envelopes written before #250 have no `secret` field and default to
+/// [`SecretKind::LoginPassword`], which is what they hold.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum SecretKind {
+    /// The user's Unix login password.
+    #[default]
+    LoginPassword,
+    /// The 56-byte PBKDF2 key `ksecretd` opens the KDE wallet with. See
+    /// [`crate::kwallet`].
+    KdeWalletKey,
+}
+
+impl SecretKind {
+    /// Human-readable label, shared by `keyring status`, `diag` and the TUI so
+    /// every surface names it the same way.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            SecretKind::LoginPassword => "login password",
+            SecretKind::KdeWalletKey => "KDE wallet key",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PcrValue {
     pub pcr: u32,
@@ -91,6 +123,10 @@ pub struct SealedEnvelope {
     /// defaults to [`PolicyKind::PcrLiteral`].
     #[serde(default)]
     pub policy: PolicyKind,
+    /// What the sealed blob is. Absent in envelopes written before #250 →
+    /// defaults to [`SecretKind::LoginPassword`].
+    #[serde(default)]
+    pub secret: SecretKind,
     /// PCRs replayed via `PolicyPCR` at unseal time.
     pub pcrs: Vec<u32>,
     #[serde(with = "b64")]
@@ -160,6 +196,7 @@ mod tests {
     #[test]
     fn envelope_roundtrips_through_json() {
         let env = SealedEnvelope {
+            secret: SecretKind::LoginPassword,
             version: CURRENT_VERSION,
             policy: PolicyKind::PcrLiteral,
             pcrs: vec![7],
@@ -216,6 +253,7 @@ mod tests {
     fn authorized_variant_serde_roundtrips_and_skips_empty_policy_ref() {
         // Non-empty policy_ref is base64-encoded and survives a round-trip.
         let env = SealedEnvelope {
+            secret: SecretKind::LoginPassword,
             version: CURRENT_VERSION,
             policy: PolicyKind::Authorized {
                 pubkey_pem: "PEM-BODY".into(),
@@ -233,6 +271,7 @@ mod tests {
 
         // Empty policy_ref must be omitted from the JSON and default back to empty.
         let env2 = SealedEnvelope {
+            secret: SecretKind::LoginPassword,
             version: CURRENT_VERSION,
             policy: PolicyKind::Authorized {
                 pubkey_pem: "P".into(),
@@ -268,6 +307,7 @@ mod tests {
         // Nested path forces save() to create the missing parent directory.
         let p = dir.join("sub/sealed.json");
         let env = SealedEnvelope {
+            secret: SecretKind::LoginPassword,
             version: CURRENT_VERSION,
             policy: PolicyKind::PcrlockNv {
                 nv_index: 0x1c00002,

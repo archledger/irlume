@@ -469,6 +469,9 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
             .map_err(tpm_err)?;
 
         Ok(SealedEnvelope {
+            // This layer seals bytes and does not know what they mean; the
+            // keyring layer stamps the real kind before saving.
+            secret: crate::envelope::SecretKind::default(),
             version: crate::envelope::CURRENT_VERSION,
             policy: PolicyKind::PcrLiteral,
             pcrs: pcrs.clone(),
@@ -569,6 +572,9 @@ fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
             .map_err(tpm_err)?;
 
         Ok(SealedEnvelope {
+            // This layer seals bytes and does not know what they mean; the
+            // keyring layer stamps the real kind before saving.
+            secret: crate::envelope::SecretKind::default(),
             version: crate::envelope::CURRENT_VERSION,
             policy: PolicyKind::Authorized {
                 pubkey_pem: pubkey_pem.clone(),
@@ -1129,6 +1135,9 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
             .map_err(tpm_err)?;
 
         Ok(SealedEnvelope {
+            // This layer seals bytes and does not know what they mean; the
+            // keyring layer stamps the real kind before saving.
+            secret: crate::envelope::SecretKind::default(),
             version: crate::envelope::CURRENT_VERSION,
             policy: PolicyKind::PcrlockNv { nv_index },
             pcrs: pcrs.clone(),

@@ -8,6 +8,7 @@ members = [
     "crates/irlume-vision",
     "crates/irlume-liveness",
     "crates/irlume-core",
+    "crates/irlume-kwallet-init",
     "crates/irlume-auth",
     "crates/irlume-fingerprint",
     "crates/irlume-daemon",

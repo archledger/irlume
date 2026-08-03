@@ -29,18 +29,10 @@ use irlume_common::{Error, Result};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-/// Length of the derived key, in bytes.
-///
-/// `KWALLET_PAM_KEYSIZE` in kwallet-pam's `pam_kwallet.c`, and
-/// `PBKDF2_SHA512_KEYSIZE` in kwallet's `src/runtime/ksecretd/main.cpp`, which
-/// reads exactly this many bytes and no more.
-pub const KEY_LEN: usize = 56;
-
-/// Length of the salt file, in bytes. `KWALLET_PAM_SALTSIZE`.
-pub const SALT_LEN: usize = 56;
-
-/// PBKDF2 iteration count. `KWALLET_PAM_ITERATIONS`.
-pub const ITERATIONS: u32 = 50_000;
+// The wire constants live in irlume-common so the handoff helper can use them
+// without this crate's TPM and inference dependencies, and so both sides of the
+// handoff read one definition.
+pub use irlume_common::kwallet_wire::{ITERATIONS, KEY_LEN, SALT_LEN};
 
 /// Path of the salt `pam_kwallet5` derives against, relative to `$HOME`.
 ///
@@ -169,5 +161,44 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn a_missing_salt_is_an_error_rather_than_a_freshly_invented_one() {
+        // pam_kwallet5 creates a missing salt; we must not. No salt means no
+        // wallet, and a key derived against an invented salt opens nothing
+        // while `keyring arm` reports success.
+        let dir = std::env::temp_dir().join(format!("irlume-kwallet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let err = read_salt(&dir).expect_err("a missing salt must not be invented");
+        assert!(
+            !salt_path(&dir).exists(),
+            "read_salt created {} instead of failing",
+            salt_path(&dir).display()
+        );
+        assert!(
+            format!("{err}").contains("Plasma"),
+            "the error should tell the user how to get a wallet, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_salt_file_longer_than_the_derivation_uses_is_truncated_not_hashed_whole() {
+        // pam_kwallet5 reads SALT_LEN bytes and derives over exactly those. If we
+        // hashed a longer file whole we would get a different key from the same
+        // file it used, and the wallet would never open.
+        let dir = std::env::temp_dir().join(format!("irlume-kwallet-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(salt_path(&dir).parent().unwrap()).expect("mkdir");
+        let mut long = vec![0x7u8; SALT_LEN];
+        long.extend_from_slice(b"trailing bytes pam_kwallet5 never reads");
+        std::fs::write(salt_path(&dir), &long).expect("write salt");
+
+        let via_file = derive_for_home(b"pw", &dir).expect("derive");
+        let via_prefix = derive_key(b"pw", &long[..SALT_LEN]).expect("derive");
+        assert_eq!(via_file.to_vec(), via_prefix.to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

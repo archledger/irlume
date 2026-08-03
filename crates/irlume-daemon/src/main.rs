@@ -2297,7 +2297,16 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to reseal password for '{user}'"));
             }
-            match irlume_core::keyring::reseal_password(&user, password.expose()) {
+            // The home directory is where the KDE wallet salt lives; a
+            // login-password envelope ignores it. Resolved via NSS rather than
+            // assumed, so a non-/home account derives against its real salt.
+            let home = match crate::users::home_for_name(&user) {
+                Some(h) => h,
+                None => {
+                    return Response::Error(format!("no home directory for '{user}'"));
+                }
+            };
+            match irlume_core::keyring::reseal_password(&user, password.expose(), &home) {
                 Ok(outcome) => {
                     use irlume_core::keyring::Reseal;
                     if outcome == Reseal::Resealed {

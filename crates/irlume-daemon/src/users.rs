@@ -51,6 +51,40 @@ pub fn name_for_uid(uid: u32) -> Option<String> {
     name.to_str().ok().map(|s| s.to_owned())
 }
 
+/// Resolve a username to its home directory via NSS.
+///
+/// Needed for the KDE wallet path: the wallet salt lives under the user's home,
+/// and the derivation has to read the SAME file `pam_kwallet5` derives against.
+/// Guessing `/home/<name>` would silently derive the wrong key for anyone whose
+/// home is elsewhere, which is exactly the population (LDAP, systemd-homed) the
+/// reentrant NSS lookups here exist to serve.
+pub fn home_for_name(name: &str) -> Option<std::path::PathBuf> {
+    let cname = CString::new(name).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: see `uid_for_name`.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: on success pw_dir points into `buf`, a valid NUL-terminated string.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let s = dir.to_str().ok()?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

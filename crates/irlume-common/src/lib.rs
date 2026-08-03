@@ -1216,3 +1216,36 @@ mod tests {
         }
     }
 }
+
+/// Wire constants for the KDE wallet handoff.
+///
+/// These are shared with software we do not ship (`pam_kwallet5`, `ksecretd`).
+/// They live here rather than in `irlume-core` so the tiny handoff helper can
+/// use them without pulling in the TPM and inference stacks, and so there is a
+/// single definition for both sides to agree on.
+pub mod kwallet_wire {
+    /// Length of the derived key. `KWALLET_PAM_KEYSIZE` in kwallet-pam's
+    /// `pam_kwallet.c`; `PBKDF2_SHA512_KEYSIZE` in kwallet's
+    /// `src/runtime/ksecretd/main.cpp`, whose `waitForHash()` reads exactly
+    /// this many bytes and no more.
+    pub const KEY_LEN: usize = 56;
+
+    /// Length of the salt file. `KWALLET_PAM_SALTSIZE`.
+    pub const SALT_LEN: usize = 56;
+
+    /// PBKDF2 iteration count. `KWALLET_PAM_ITERATIONS`.
+    pub const ITERATIONS: u32 = 50_000;
+
+    /// Basename of the handoff socket inside `XDG_RUNTIME_DIR`.
+    ///
+    /// Deliberately the same name `pam_kwallet5` uses (`socketPrefix` in
+    /// `pam_kwallet.c`), because Plasma's `plasma-kwallet-pam.service` runs
+    /// `env | socat STDIN UNIX-CONNECT:$PAM_KWALLET5_LOGIN` and that is how
+    /// `ksecretd` gets the session environment it blocks waiting for. Using the
+    /// same name and exporting the same variable means Plasma delivers the
+    /// environment to our daemon with no change on its side.
+    pub const SOCKET_NAME: &str = "kwallet5.socket";
+
+    /// The environment variable Plasma's autostart reads.
+    pub const LOGIN_ENV: &str = "PAM_KWALLET5_LOGIN";
+}

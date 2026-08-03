@@ -1,6 +1,11 @@
 # irlumed serves a local Unix socket only; authentication stays opt-in
 # (irlume login enable), so the daemon being up is safe and makes the
 # first-run TUI work immediately after install.
+# Bound at sockets.target so /run/irlume.sock exists before the greeter
+# authenticates. Installing the unit is not enough: [Install] only describes
+# the symlink `systemctl enable` would create, and %systemd_post consults this
+# preset (#244).
+enable irlumed.socket
 enable irlumed.service
 # Watches greeter PAM files and re-applies irlume wiring after a distro update
 # strips it. Self-gates on the login.wired marker, so it stays idle until

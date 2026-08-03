@@ -12,7 +12,8 @@ systemctl daemon-reload 2>/dev/null || true
 # would override a unit the user deliberately disabled; try-restart below picks
 # up the new binary/unit for a running daemon and is a no-op for a stopped one.
 if [ -z "${2:-}" ]; then
-    systemctl enable --now irlumed.service 2>/dev/null || true
+    # The socket first: see packaging/systemd/irlumed.socket (#244).
+    systemctl enable --now irlumed.socket irlumed.service 2>/dev/null || true
     # Watches greeter PAM files and re-applies irlume wiring after a distro
     # update strips it. Self-gates on the login.wired marker, so it stays idle
     # until `irlume login enable` runs.
@@ -33,6 +34,10 @@ if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
     mkdir -p /var/lib/irlume
     systemctl enable --now irlume-reconcile.timer 2>/dev/null || true
     : > /var/lib/irlume/.reconcile-timer-armed
+fi
+# Upgrading from a version without the socket unit.
+if systemctl is-enabled --quiet irlumed.service 2>/dev/null; then
+    systemctl enable --now irlumed.socket 2>/dev/null || true
 fi
 systemctl try-restart irlumed.service 2>/dev/null || true
 cat <<'EOF'

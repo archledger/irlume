@@ -52,6 +52,9 @@ override_dh_auto_install:
 	cp -a ort-prebuilt/lib debian/irlume/opt/irlume/onnxruntime/
 	install -D -m0644 packaging/systemd/irlumed.service \
 		debian/irlume/usr/lib/systemd/system/irlumed.service
+	# Makes /run/irlume.sock exist before the greeter authenticates (#244).
+	install -D -m0644 packaging/systemd/irlumed.socket \
+		debian/irlume/usr/lib/systemd/system/irlumed.socket
 	install -D -m0644 debian/10-ort.conf \
 		debian/irlume/usr/lib/systemd/system/irlumed.service.d/10-ort.conf
 	# Self-heal watcher: re-applies irlume's greeter PAM wiring if pam-auth-update

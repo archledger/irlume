@@ -5,7 +5,7 @@ set -e
 # postinst re-enable it, churns state and would re-enable a unit the user
 # deliberately disabled. On upgrade, postinst's try-restart handles the swap.
 if [ "$1" = remove ]; then
-    systemctl disable --now irlumed.service 2>/dev/null || true
+    systemctl disable --now irlumed.socket irlumed.service 2>/dev/null || true
     systemctl disable --now irlume-reconcile.path 2>/dev/null || true
     systemctl disable --now irlume-reconcile.timer 2>/dev/null || true
     systemctl disable --now irlume-reconcile.service 2>/dev/null || true

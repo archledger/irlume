@@ -326,11 +326,23 @@ fn main() {
                     "startup: IR retag already done for '{retag_space}'; skipping the sweep"
                 );
             }
+            // A user whose load or save failed has NOT been swept, and marking
+            // the space done would retire the migration for them permanently:
+            // the marker is only written when every user was actually handled.
+            let mut all_swept = true;
             for user in irlume_core::storage::list_users() {
                 if !sweep_needed {
                     break;
                 }
-                if let Ok(Some(mut enr)) = irlume_core::storage::load(&user) {
+                let loaded = irlume_core::storage::load(&user);
+                if let Err(ref e) = loaded {
+                    eprintln!(
+                        "irlumed: could not read '{user}' during the IR retag sweep ({e}); \
+                         leaving the sweep owed"
+                    );
+                    all_swept = false;
+                }
+                if let Ok(Some(mut enr)) = loaded {
                     let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
                     if n > 0 {
                         match irlume_core::storage::save(&enr) {
@@ -338,7 +350,12 @@ fn main() {
                                 "irlumed: tagged {n} legacy IR scan(s) for '{user}' as '{}'",
                                 engine.ir_space()
                             ),
-                            Err(e) => eprintln!("irlumed: could not retag IR scans for '{user}': {e}"),
+                            Err(e) => {
+                                eprintln!(
+                                    "irlumed: could not retag IR scans for '{user}': {e}"
+                                );
+                                all_swept = false;
+                            }
                         }
                     }
                     // Upgrade notice: IR scans enrolled under a now-absent adapter (e.g.
@@ -361,10 +378,16 @@ fn main() {
                     }
                 }
             }
-            // Recorded only after a completed sweep, so an interrupted startup
-            // retries next boot rather than skipping users it never reached.
-            if sweep_needed {
+            // Recorded only after a sweep that actually reached every user, so a
+            // TPM error or an unwritable enrollment leaves the migration owed
+            // instead of silently retiring it for that user.
+            if sweep_needed && all_swept {
                 irlume_core::storage::mark_retag_done(&retag_space);
+            } else if sweep_needed {
+                eprintln!(
+                    "irlumed: the IR retag sweep did not complete for every user; \
+                     it will run again next start"
+                );
             }
 
             // SO_PEERCRED is the authorization boundary, and the socket mode must not

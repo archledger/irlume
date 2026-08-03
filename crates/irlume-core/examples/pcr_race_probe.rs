@@ -3,11 +3,17 @@
 
 //! Seal once, then unseal repeatedly, reporting how many unseals failed.
 //!
-//! The harness for `scripts/tpm-pcr-race-check.sh`, which runs this while
-//! hammering PCR 23 so the TPM's global `pcrUpdateCounter` moves underneath an
-//! open policy session. That produces `TPM2_RC_PCR_CHANGED`, the transient
-//! failure a fast post-reboot login hits when systemd extends a PCR during the
-//! unseal, and which was reaching the user as a keyring password prompt.
+//! The harness for `scripts/tpm-pcr-race-swtpm.sh`, which runs this against a
+//! software TPM while extending unbound PCRs, so the global `pcrUpdateCounter`
+//! moves underneath an open policy session. That produces
+//! `TPM2_RC_PCR_CHANGED`, the transient failure a fast post-reboot login hits
+//! when systemd extends a PCR during the unseal, and which was reaching the
+//! user as a keyring password prompt.
+//!
+//! A software TPM rather than real silicon because there is no PCR that is
+//! both safe to extend on a live machine and able to move the counter: PCR 23
+//! is TCG "Application Support", shared with other TPM consumers, so extending
+//! it can invalidate objects irlume cannot enumerate.
 //!
 //! Deliberately an example, not a binary target: it seals to the TPM and must
 //! never ship in a package.

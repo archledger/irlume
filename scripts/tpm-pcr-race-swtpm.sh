@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # Reproduce TPM2_RC_PCR_CHANGED in a software TPM and prove the retry rescues
-# it. This is the reproduction hardware cannot safely give: the only PCRs that
-# are safe to extend on a live machine (16 and 23) are excluded from the PCR
-# update counter, so on real silicon 655 extends of PCR 23 during live unseals
-# produced zero races. In swtpm any PCR may be extended freely.
+# it.
+#
+# Why not on real silicon: there is no PCR that is both safe to extend on a
+# live machine and able to move the counter. PCR 23 is TCG "Application
+# Support" (PC Client Platform Firmware Profile), shared with other TPM
+# consumers, and nothing can enumerate every object or policy that binds it, so
+# extending it risks invalidating seals irlume did not create. It also did not
+# work: 655 verified extends of PCR 23 during live unseals on an STM discrete
+# TPM produced zero races, i.e. that PCR did not move the counter on THAT
+# machine. Do not generalise it. Which PCRs are excluded from the counter is
+# platform-specific and is reported by TPM_PT_PCR_NO_INCREMENT; the TPM 2.0
+# Library spec does not assign the exclusion to 16 or 23 universally.
+#
+# In swtpm any PCR may be extended freely, and nothing else depends on it.
 #
 #   scripts/tpm-pcr-race-swtpm.sh [repo-path]
 #

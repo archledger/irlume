@@ -552,14 +552,12 @@ pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
 /// Run `attempt` until it stops losing to the PCR-counter race, at most
 /// `limit` extra times.
 ///
-/// A separate function taking a closure because the CONDITION cannot be staged:
-/// producing a real `TPM2_RC_PCR_CHANGED` needs another process to extend a
-/// counter-moving PCR at the right microsecond, and the one PCR that is safe to
-/// extend on a live machine (23, the application PCR) is excluded from the
-/// update counter, so it cannot trigger it at all. The loop's BEHAVIOUR is
-/// still a value a test can pin: how many times it re-runs, that it stops, that
-/// it returns the successful result, and that it gives up with the original
-/// error rather than a synthesised one.
+/// A separate function taking a closure because the CONDITION cannot be staged
+/// in a unit test: producing a real `TPM2_RC_PCR_CHANGED` needs another process
+/// to extend a counter-moving PCR at the right microsecond. The loop's
+/// BEHAVIOUR is still a value a test can pin: how many times it re-runs, that
+/// it stops, that it returns the successful result, and that it gives up with
+/// the original error rather than a synthesised one.
 fn retry_on_pcr_race<T, F>(limit: u32, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Result<T>,
@@ -1512,10 +1510,10 @@ mod tests {
 
     /// The retry loop's mechanics, with the TPM replaced by a counter.
     ///
-    /// This is what stands in for a hardware reproduction: 655 verified PCR-23
-    /// extends during live unseals on the ThinkPad produced no race at all,
-    /// because PCR 23 is excluded from the update counter. So the loop is
-    /// pinned here instead, and the response-code mapping is pinned above.
+    /// The loop's behaviour is pinned here and the response-code mapping
+    /// above; `scripts/tpm-pcr-race-swtpm.sh` drives the real error through a
+    /// software TPM, where a PCR that moves the counter can be extended
+    /// without endangering objects belonging to other TPM consumers.
     #[test]
     fn the_retry_loop_reruns_the_attempt_and_then_gives_up() {
         let race = || retryable_tpm_err(tss_esapi::Error::Tss2Error(0x128u32.into()));

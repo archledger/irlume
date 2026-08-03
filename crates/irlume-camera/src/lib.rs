@@ -84,6 +84,7 @@ pub(crate) mod testenv {
 
 use irlume_common::Error;
 use v4l::buffer::Type;
+use v4l::format::Quantization;
 use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::{Device, Format, FourCC};
@@ -1430,10 +1431,24 @@ fn grey16_shift(buf: &[u8]) -> u32 {
 /// The decoded value that means "at or above the sensor's ceiling" for a
 /// negotiated IR format, or `None` when the decode cannot carry that claim.
 /// See [`IrCaptureStats::white_level`] for why only the 8-bit greys qualify.
-pub(crate) fn clipping_white_level(pix: IrPixel) -> Option<u8> {
-    match pix {
-        IrPixel::Grey8 => Some(u8::MAX),
-        IrPixel::Grey16 | IrPixel::Nv12Luma | IrPixel::YuyvLuma => None,
+///
+/// GREY is a luma-only Y' format, so its ceiling depends on the quantization
+/// the driver reports: full range puts white at 255, limited range at 235. A
+/// face entirely at 235 on a limited-range device would otherwise measure as
+/// zero clipping and walk through the exposure gate (#238 review).
+///
+/// `Default` is read as full range, which is what it resolves to on every
+/// module irlume supports: `v4l2-ctl --get-fmt-video` prints
+/// "Quantization: Default (maps to Full Range)" for the ASUS FHD IR pin, the
+/// NexiGo N930W and the Logitech BRIO, all three GREY at sRGB. Answering `None`
+/// there instead would be the cautious-looking choice and would disable the
+/// gate on every camera anyone actually has, which is the failure this exists
+/// to prevent. If a module ever reports limited range, the 235 arm covers it.
+pub(crate) fn clipping_white_level(pix: IrPixel, quantization: Quantization) -> Option<u8> {
+    match (pix, quantization) {
+        (IrPixel::Grey8, Quantization::LimitedRange) => Some(235),
+        (IrPixel::Grey8, Quantization::FullRange | Quantization::Default) => Some(u8::MAX),
+        (IrPixel::Grey16 | IrPixel::Nv12Luma | IrPixel::YuyvLuma, _) => None,
     }
 }
 
@@ -1458,19 +1473,26 @@ fn grey16_to_8_at(buf: &[u8], shift: u32) -> Vec<u8> {
 /// 8-bit formats carry no scale, so they are unaffected.
 pub(crate) struct IrDecoder {
     pix: IrPixel,
+    /// Carried because the GREY ceiling depends on it; see
+    /// [`clipping_white_level`].
+    quantization: Quantization,
     shift: Option<u32>,
 }
 
 impl IrDecoder {
-    pub(crate) fn new(pix: IrPixel) -> Self {
-        Self { pix, shift: None }
+    pub(crate) fn new(pix: IrPixel, quantization: Quantization) -> Self {
+        Self {
+            pix,
+            quantization,
+            shift: None,
+        }
     }
 
     /// See [`clipping_white_level`]: the decoded value that means "at or above
     /// the sensor's ceiling" for this decoder's format, or `None` when the
     /// decode cannot carry that claim.
     pub(crate) fn white_level(&self) -> Option<u8> {
-        clipping_white_level(self.pix)
+        clipping_white_level(self.pix, self.quantization)
     }
 
     pub(crate) fn decode(&mut self, buf: &[u8], w: u32, h: u32) -> Vec<u8> {
@@ -1600,6 +1622,9 @@ pub struct IrCamera {
     device: String,
     dev: Device,
     pix: IrPixel,
+    /// The driver's reported quantization for the negotiated format, which is
+    /// half of what names the clipping ceiling; see [`clipping_white_level`].
+    quantization: Quantization,
     width: u32,
     height: u32,
     card: String,
@@ -1620,6 +1645,7 @@ impl IrCamera {
             device: device.to_string(),
             dev,
             pix,
+            quantization: fmt.quantization,
             width: fmt.width,
             height: fmt.height,
             card,
@@ -1682,7 +1708,7 @@ impl IrCamera {
         Ok(IrSession {
             cam: self,
             stream,
-            dec: IrDecoder::new(self.pix),
+            dec: IrDecoder::new(self.pix, self.quantization),
             lit: mode.lit(),
             _mode: mode,
             meta,
@@ -2119,7 +2145,7 @@ pub mod ir_probe {
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
-        let mut dec = super::IrDecoder::new(pix);
+        let mut dec = super::IrDecoder::new(pix, fmt.quantization);
         let (w, h) = (fmt.width, fmt.height);
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
@@ -2220,7 +2246,7 @@ pub fn capture_ir_streaming<B>(
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
-    let mut dec = IrDecoder::new(pix);
+    let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
@@ -2354,7 +2380,7 @@ pub fn capture_ir_sequence(
     let burst = burst.max(1);
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
-    let mut dec = IrDecoder::new(pix);
+    let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
@@ -2780,7 +2806,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // signal that stops the process.
     let _abort_orderly = ir_emitter::AbortOnSignal::install();
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
-    let mut dec = IrDecoder::new(pix);
+    let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = SafeStream::open(device, &dev)?;
     let fd = dev.handle().fd();
@@ -3307,14 +3333,51 @@ mod tests {
     /// Saying None there is what keeps #221's corpus interpretable.
     #[test]
     fn only_native_8bit_grey_can_claim_a_clipping_ceiling() {
-        assert_eq!(clipping_white_level(IrPixel::Grey8), Some(255));
-        assert_eq!(clipping_white_level(IrPixel::Grey16), None);
-        assert_eq!(clipping_white_level(IrPixel::Nv12Luma), None);
-        assert_eq!(clipping_white_level(IrPixel::YuyvLuma), None);
+        for q in [
+            Quantization::Default,
+            Quantization::FullRange,
+            Quantization::LimitedRange,
+        ] {
+            assert_eq!(clipping_white_level(IrPixel::Grey16, q), None);
+            assert_eq!(clipping_white_level(IrPixel::Nv12Luma, q), None);
+            assert_eq!(clipping_white_level(IrPixel::YuyvLuma, q), None);
+        }
         // And the decoder reports its own format's answer, since that is what
         // the capture actually negotiated.
-        assert_eq!(IrDecoder::new(IrPixel::Grey8).white_level(), Some(255));
-        assert_eq!(IrDecoder::new(IrPixel::Grey16).white_level(), None);
+        assert_eq!(
+            IrDecoder::new(IrPixel::Grey8, Quantization::Default).white_level(),
+            Some(255)
+        );
+        assert_eq!(
+            IrDecoder::new(IrPixel::Grey16, Quantization::Default).white_level(),
+            None
+        );
+    }
+
+    /// GREY's ceiling is where the DRIVER says white is. A limited-range device
+    /// puts it at 235, so a face entirely at 235 is fully clipped there and
+    /// would read as pristine against a hardcoded 255, walking straight through
+    /// the exposure gate (#238 review).
+    ///
+    /// `Default` reads as full range because that is what it resolves to on
+    /// every module irlume supports, measured with `v4l2-ctl --get-fmt-video`
+    /// on the ASUS FHD IR pin, the NexiGo N930W and the Logitech BRIO: all
+    /// three print "Default (maps to Full Range)". Answering None there would
+    /// switch the gate off on every camera anyone has.
+    #[test]
+    fn the_grey_ceiling_follows_the_drivers_quantization() {
+        assert_eq!(
+            clipping_white_level(IrPixel::Grey8, Quantization::LimitedRange),
+            Some(235)
+        );
+        assert_eq!(
+            clipping_white_level(IrPixel::Grey8, Quantization::FullRange),
+            Some(255)
+        );
+        assert_eq!(
+            clipping_white_level(IrPixel::Grey8, Quantization::Default),
+            Some(255)
+        );
     }
 
     /// The reason Grey16 cannot: the shift comes from the frame's OWN maximum,
@@ -3710,7 +3773,7 @@ mod tests {
         let first = words(&[0, 256, 512, 1023]); // 10-bit: shift 2
         let with_hot_pixel = words(&[0, 256, 512, 2047]); // one 11-bit sample
 
-        let mut session = IrDecoder::new(IrPixel::Grey16);
+        let mut session = IrDecoder::new(IrPixel::Grey16, Quantization::Default);
         let a = session.decode(&first, 2, 2);
         let b = session.decode(&with_hot_pixel, 2, 2);
         assert_eq!(a, vec![0, 64, 128, 255]);
@@ -3719,11 +3782,11 @@ mod tests {
 
         // A fresh session re-estimates, so a genuinely deeper feed still maps
         // onto the full range instead of clipping forever.
-        let mut next = IrDecoder::new(IrPixel::Grey16);
+        let mut next = IrDecoder::new(IrPixel::Grey16, Quantization::Default);
         assert_eq!(next.decode(&with_hot_pixel, 2, 2), vec![0, 32, 64, 255]);
 
         // 8-bit formats carry no scale and are untouched by the session state.
-        let mut grey8 = IrDecoder::new(IrPixel::Grey8);
+        let mut grey8 = IrDecoder::new(IrPixel::Grey8, Quantization::Default);
         assert_eq!(grey8.decode(&[9, 9], 1, 2), vec![9, 9]);
     }
 

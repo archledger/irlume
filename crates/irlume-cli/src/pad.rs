@@ -102,8 +102,12 @@ fn capture_once(
         (None, 0.0, 0.5)
     };
 
-    // IR (brightest-of-burst, matches the auth path).
-    let ir = irlume_camera::capture_ir(ir_dev)?;
+    // IR through the same selection the auth path uses, WITH its statistics.
+    // The stats are not decoration: the exposure gate (#237) reads a clipped
+    // fraction that can only be computed from the frame's own ceiling, and a
+    // harness that left it None would qualify a corpus against a gate
+    // configuration authentication never runs.
+    let (ir, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
     let ir_rgb = irlume_camera::grey_to_rgb(&ir.data);
     let iv = irlume_vision::align::RgbView {
         data: &ir_rgb,
@@ -136,6 +140,15 @@ fn capture_once(
         ir_eye_glint,
         head_yaw_asym,
         head_pitch_frac,
+        ir_ambient: ir_stats.ambient_mean,
+        face_frac: irlume_auth::face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
+        ir_saturated_frac: irlume_auth::saturated_frac_of(
+            &ir.data,
+            ir.width,
+            ir.height,
+            ir_top.as_ref().map(|f| &f.bbox),
+            ir_stats.white_level,
+        ),
         ..Default::default()
     };
     let gate = LivenessGate::new();
@@ -252,6 +265,17 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 "ir_brightness".into(),
                 crate::json_f32(s.ir_face_brightness),
             );
+            // The exposure gate's input and its answer. A record that reported
+            // the cues without these could not distinguish a frame the gate
+            // judged from one it refused unread (#237).
+            rec.insert(
+                "ir_saturated_frac".into(),
+                match s.ir_saturated_frac {
+                    Some(f) => crate::json_f32(f),
+                    None => serde_json::Value::Null,
+                },
+            );
+            rec.insert("ir_exposure_ok".into(), cues.ir_exposure_ok.into());
             rec.insert(
                 "ir_center_edge_ratio".into(),
                 crate::json_f32(s.ir_center_edge_ratio),

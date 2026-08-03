@@ -319,21 +319,8 @@ impl LivenessGate {
             );
         }
 
-        // Exposure sanity, before any cue that reads the pixels. A blown face
-        // region is not evidence of anything: the cues below all degrade
-        // together as it clips, so judging one is reading noise (#237).
-        // Uncertain, not Spoof, because the frame failed to measure a face
-        // rather than showing a fake one, and backing off fixes it.
-        cues.ir_exposure_ok = s
-            .ir_saturated_frac
-            .is_none_or(|f| f <= IR_SATURATED_FRAC_MAX);
-        if !cues.ir_exposure_ok {
-            let clipped = s.ir_saturated_frac.unwrap_or(1.0) * 100.0;
-            return (
-                Verdict::Uncertain,
-                cues,
-                format!("IR frame blown out ({clipped:.0}% of the face at the sensor ceiling); move back or dim the light"),
-            );
+        if let Some((verdict, reason)) = exposure_refusal(s, &mut cues) {
+            return (verdict, cues, reason);
         }
 
         // IR skin reflectance: the face region must be brightly lit.
@@ -444,6 +431,9 @@ impl LivenessGate {
             return (Verdict::Uncertain, cues, "no face in IR".into());
         }
         cues.face_in_ir = true;
+        if let Some((verdict, reason)) = exposure_refusal(s, &mut cues) {
+            return (verdict, cues, reason);
+        }
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
             let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
@@ -469,6 +459,39 @@ impl LivenessGate {
             "live (dark/IR-only): IR-reflective, 3D".into(),
         )
     }
+}
+
+/// The exposure refusal, shared by every evaluator that can release credentials.
+///
+/// A blown face region measures nothing: the cues below it degrade together as
+/// clipping rises, so judging any one of them is reading noise (#237). Returns
+/// the refusal to propagate, or `None` when the frame is readable, and records
+/// [`Cues::ir_exposure_ok`] either way.
+///
+/// This lives in one function because it guards two entry points,
+/// [`LivenessGate::evaluate`] and [`LivenessGate::evaluate_ir_only`], and the
+/// first version of #237 gated only the first: the dark-room path kept
+/// accepting the frames the cross-spectrum path had just started refusing.
+/// Adding a third evaluator means calling this, not copying it.
+fn exposure_refusal(s: &Signals, cues: &mut Cues) -> Option<(Verdict, String)> {
+    cues.ir_exposure_ok = s
+        .ir_saturated_frac
+        .is_none_or(|f| f <= IR_SATURATED_FRAC_MAX);
+    if cues.ir_exposure_ok {
+        return None;
+    }
+    // Uncertain, not Spoof: the capture failed to measure a face rather than
+    // showing a fake one, and moving back fixes it. That classification is also
+    // what makes the refusal presence-retryable, so a login's grace window can
+    // absorb it while a single-capture probe reports it.
+    let clipped = s.ir_saturated_frac.unwrap_or(1.0) * 100.0;
+    Some((
+        Verdict::Uncertain,
+        format!(
+            "IR frame blown out ({clipped:.0}% of the face at the sensor ceiling); \
+             move back or dim the light"
+        ),
+    ))
 }
 
 // --- Passive blink liveness (opt-in, ADR-0002) ------------------------------
@@ -1515,26 +1538,36 @@ mod tests {
         }
     }
 
-    /// A blown face region is refused before any cue reads it (#237). The
-    /// signals here are otherwise a textbook live face, so the only thing that
-    /// can move the verdict is the clipped fraction.
+    /// A blown face region is refused before any cue reads it (#237), on EVERY
+    /// evaluator that can release credentials. The signals are otherwise a
+    /// textbook live face, so only the clipped fraction can move the verdict.
+    ///
+    /// Both paths are asserted here because the first version of this change
+    /// gated only `evaluate`, and `evaluate_ir_only` (the dark-room path that
+    /// authenticates when RGB finds nothing) kept returning Live for exactly
+    /// the frames the other path had begun refusing. A test that exercised one
+    /// evaluator could not see that.
     #[test]
-    fn a_blown_ir_face_is_refused_however_live_the_other_cues_look() {
+    fn a_blown_ir_face_is_refused_on_every_credential_releasing_path() {
         let gate = LivenessGate::new();
         for frac in [0.11, 0.25, 0.5, 1.0] {
             let mut s = live_signals();
             s.ir_saturated_frac = Some(frac);
-            let (verdict, cues, reason) = gate.evaluate(&s);
-            assert_eq!(
-                verdict,
-                Verdict::Uncertain,
-                "a frame {frac} clipped measures nothing, so it cannot be judged"
-            );
-            assert!(!cues.ir_exposure_ok);
-            assert!(
-                reason.contains("blown out"),
-                "the reason must name the exposure, not a cue read from it: {reason}"
-            );
+            for (path, (verdict, cues, reason)) in [
+                ("cross-spectrum", gate.evaluate(&s)),
+                ("ir-only", gate.evaluate_ir_only(&s)),
+            ] {
+                assert_eq!(
+                    verdict,
+                    Verdict::Uncertain,
+                    "{path} judged a frame {frac} clipped, which measures nothing"
+                );
+                assert!(!cues.ir_exposure_ok, "{path}");
+                assert!(
+                    reason.contains("blown out"),
+                    "{path}: the reason must name the exposure, not a cue read from it: {reason}"
+                );
+            }
         }
     }
 
@@ -1547,19 +1580,32 @@ mod tests {
         for frac in [None, Some(0.0), Some(0.063), Some(IR_SATURATED_FRAC_MAX)] {
             let mut live = live_signals();
             live.ir_saturated_frac = frac;
-            assert_eq!(
-                gate.evaluate(&live).0,
-                Verdict::Live,
-                "a live face must stay Live at ir_saturated_frac {frac:?}"
-            );
             let mut flat = live_signals();
             flat.ir_saturated_frac = frac;
             flat.ir_center_edge_ratio = 1.0; // flat
-            assert_eq!(
-                gate.evaluate(&flat).0,
-                Verdict::Spoof,
-                "a flat target must still be called a spoof at {frac:?}, not merely refused"
-            );
+            for (path, live_verdict, flat_verdict) in [
+                (
+                    "cross-spectrum",
+                    gate.evaluate(&live).0,
+                    gate.evaluate(&flat).0,
+                ),
+                (
+                    "ir-only",
+                    gate.evaluate_ir_only(&live).0,
+                    gate.evaluate_ir_only(&flat).0,
+                ),
+            ] {
+                assert_eq!(
+                    live_verdict,
+                    Verdict::Live,
+                    "{path}: a live face must stay Live at ir_saturated_frac {frac:?}"
+                );
+                assert_eq!(
+                    flat_verdict,
+                    Verdict::Spoof,
+                    "{path}: a flat target must still be called a spoof at {frac:?}, not merely refused"
+                );
+            }
         }
     }
 

@@ -104,8 +104,8 @@ pub fn derive_for_home(password: &[u8], home: &Path) -> Result<Zeroizing<Vec<u8>
 /// the password string itself, so sealing a wallet key there would leave the
 /// GNOME login keyring locked with nothing to unlock it.
 ///
-/// The conservative direction is [`SecretKind::LoginPassword`], which is the
-/// behaviour before #250, so anything ambiguous resolves to it.
+/// The conservative direction is [`crate::envelope::SecretKind::LoginPassword`],
+/// the behaviour before #250, so anything ambiguous resolves to it.
 pub fn detect_kind(home: &Path) -> crate::envelope::SecretKind {
     use crate::envelope::SecretKind;
     let has_kde = salt_path(home).exists();

@@ -896,9 +896,96 @@ enum PolicyStep {
     Or(Vec<Digest>),
 }
 
+/// `TPM_CC_PolicyPCR`, TCG TPM 2.0 Library Part 2 "Structures", command codes.
+const TPM_CC_POLICY_PCR: u32 = 0x0000_017F;
+/// `TPM_CC_PolicyOR`.
+const TPM_CC_POLICY_OR: u32 = 0x0000_0171;
+/// `TPM_ALG_SHA256`.
+const TPM_ALG_SHA256: u16 = 0x000B;
+
+/// A `TPML_PCR_SELECTION` in the TPM's own wire encoding.
+///
+/// The policy digest is taken over the marshalled structure, so this has to
+/// match the TPM byte for byte: `UINT32 count`, then per selection a
+/// `TPMI_ALG_HASH` (UINT16), a `UINT8 sizeofSelect`, and that many bitmap
+/// bytes, PCR n living in bit n%8 of byte n/8. Part 2 §10.9.7.
+fn marshal_pcr_selection(pcrs: &[u32]) -> Vec<u8> {
+    // Three bytes covers PCRs 0-23, which is every PCR irlume will select; the
+    // TPM reports sizeofSelect=3 for SHA-256 on every part we have measured.
+    let mut bitmap = [0u8; 3];
+    for &p in pcrs {
+        if let Some(byte) = bitmap.get_mut((p / 8) as usize) {
+            *byte |= 1 << (p % 8);
+        }
+    }
+    let mut out = Vec::with_capacity(4 + 2 + 1 + bitmap.len());
+    out.extend_from_slice(&1u32.to_be_bytes()); // one selection: SHA-256
+    out.extend_from_slice(&TPM_ALG_SHA256.to_be_bytes());
+    out.push(bitmap.len() as u8);
+    out.extend_from_slice(&bitmap);
+    out
+}
+
+/// `TPM2_PolicyPCR`'s effect on a policy digest, computed without a TPM.
+///
+/// Part 3 §23.7 eq. 20: `policyDigest_new := H(policyDigest_old ||
+/// TPM_CC_PolicyPCR || pcrs || pcrDigest)`. In a trial session the TPM uses the
+/// supplied `pcrDigest` rather than reading PCRs, which is exactly the case
+/// this replaces, so the two must agree; `super_pcr_matches_a_trial_session`
+/// asserts that against real hardware.
+fn policy_pcr_digest(old: &Digest, pcrs: &[u32], pcr_digest: &Digest) -> Result<Digest> {
+    let mut h = Sha256::new();
+    h.update(old.value());
+    h.update(TPM_CC_POLICY_PCR.to_be_bytes());
+    h.update(marshal_pcr_selection(pcrs));
+    h.update(pcr_digest.value());
+    Digest::try_from(h.finalize().to_vec()).map_err(tpm_err)
+}
+
+/// `TPM2_PolicyOR`'s effect on a policy digest, computed without a TPM.
+///
+/// Part 3 §23.6 NOTE 2: the running digest is RESET to zero first, then
+/// `H(0...0 || TPM_CC_PolicyOR || digests)` where `digests` is the branch
+/// digests concatenated, values only. The reset is why an OR erases whatever
+/// came before it, and why the prefix has to be replayed per branch.
+fn policy_or_digest(branches: &[Digest]) -> Result<Digest> {
+    let mut h = Sha256::new();
+    h.update([0u8; 32]);
+    h.update(TPM_CC_POLICY_OR.to_be_bytes());
+    for b in branches {
+        h.update(b.value());
+    }
+    Digest::try_from(h.finalize().to_vec()).map_err(tpm_err)
+}
+
+/// Replay `steps` in software and return the resulting policy digest.
+///
+/// This is what a trial session was doing, without the TPM. The derivation cost
+/// one trial session per predicted branch, measured at 8.2s on a ThinkPad X13
+/// (17 branches on a discrete TPM), which is why it had to be memoized and then
+/// warmed at startup; in software it is a handful of SHA-256 blocks (#248).
+/// TCG Part 3 §23.19 says PolicyGetDigest ALLOWS the TPM to precompute a
+/// policy, not that it is required, and systemd computes the same values the
+/// same way.
+fn software_replay(steps: &[PolicyStep]) -> Result<Digest> {
+    let mut digest = Digest::try_from(vec![0u8; 32]).map_err(tpm_err)?;
+    for step in steps {
+        digest = match step {
+            PolicyStep::Pcr { sel, digest: pcr } => policy_pcr_digest(&digest, sel, pcr)?,
+            PolicyStep::Or(branches) => policy_or_digest(branches)?,
+        };
+    }
+    Ok(digest)
+}
+
 /// Run `steps` in a fresh trial session and return the resulting policy digest.
-/// Used offline (no live PCRs) to compute the OR-branch digests of the super
-/// policy, each of which is a full prefix replay with one candidate PCR value.
+///
+/// No longer on any hot path: [`software_replay`] computes the same values
+/// without the TPM. Kept because it is the ORACLE that proves it does, in
+/// `software_digests_match_a_trial_session`.
+/// Test-only, so a future edit that puts a trial session back on the hot path
+/// has to say so explicitly.
+#[cfg(test)]
 fn trial_replay(ctx: &mut Context, steps: &[PolicyStep]) -> Result<Digest> {
     with_session(ctx, SessionType::Trial, |ctx, session| {
         let policy = PolicySession::try_from(session).map_err(tpm_err)?;
@@ -938,64 +1025,16 @@ struct SuperPcr {
 /// Reconstruct systemd's super-PCR policy structure from the prediction, deriving
 /// each multi-value PCR's OR-branch digests via trial replays of the growing
 /// prefix (mirrors `tpm2_calculate_policy_super_pcr`).
-/// Memo for [`build_super_pcr`], keyed on the prediction it was derived from.
+/// Reconstruct systemd's super-PCR policy structure from the prediction.
 ///
-/// Deriving the branch digests costs ONE TRIAL TPM SESSION PER PREDICTED BRANCH,
-/// and the result depends only on the prediction file, never on the request. It
-/// was being recomputed on every unseal: measured 10.88s on a ThinkPad X13
-/// (STMicro discrete TPM, 17 branches) against 0.36s on a Zenbook (firmware TPM,
-/// 4 branches), three runs each within 0.01s. Because `pam_irlume`'s keyring line
-/// runs inside the PAM auth stack, that was 11 seconds of login the user waited
-/// through (#246).
-///
-/// Keyed on the prediction's own content, so `systemd-pcrlock make-policy`
-/// invalidates it by changing the key rather than by anyone remembering to clear
-/// it. In memory only: a persisted cache would need its own argument about what a
-/// tampered entry can do, and this already removes the repeat cost within a
-/// daemon's lifetime.
-type PcrlockKey = Vec<(u32, Vec<String>)>;
-
-static SUPER_PCR_MEMO: std::sync::OnceLock<std::sync::Mutex<Option<(PcrlockKey, SuperPcr)>>> =
-    std::sync::OnceLock::new();
-
-/// Identity of a prediction: its PCR numbers and predicted values, sorted into
-/// the order the policy is built from.
-///
-/// The whole prediction is kept and compared, not a hash of it. A 64-bit digest
-/// would have been smaller and the collision odds absurd, but the failure it
-/// admits is handing back digests derived from a DIFFERENT prediction, and this
-/// sits under credential release. A prediction is a handful of PCRs with a few
-/// hex strings each, so exact comparison costs nothing worth trading for that.
-/// Comparing parsed values rather than file bytes keeps reformatting from
-/// invalidating a still-correct memo.
-fn pcrlock_key(plock: &PcrlockJson) -> PcrlockKey {
-    let mut entries: PcrlockKey = plock
-        .pcr_values
-        .iter()
-        .map(|e| (e.pcr, e.values.clone()))
-        .collect();
-    entries.sort_by_key(|(pcr, _)| *pcr);
-    entries
-}
-
-fn build_super_pcr(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
-    let key = pcrlock_key(plock);
-    let memo = SUPER_PCR_MEMO.get_or_init(|| std::sync::Mutex::new(None));
-    if let Ok(guard) = memo.lock() {
-        if let Some((cached_key, cached)) = guard.as_ref() {
-            if cached_key == &key {
-                return Ok(cached.clone());
-            }
-        }
-    }
-    let built = build_super_pcr_uncached(ctx, plock)?;
-    if let Ok(mut guard) = memo.lock() {
-        *guard = Some((key, built.clone()));
-    }
-    Ok(built)
-}
-
-fn build_super_pcr_uncached(ctx: &mut Context, plock: &PcrlockJson) -> Result<SuperPcr> {
+/// Pure: the branch digests are hash recurrences defined by TCG Part 3 (§23.7
+/// for PolicyPCR, §23.6 for PolicyOR), so no TPM is consulted. This used to run
+/// one TRIAL SESSION per predicted branch, measured at 8.2s on a ThinkPad X13
+/// with 17 branches on a discrete TPM, which then needed a memo to survive
+/// repeat unseals and a startup warm-up so the first login did not pay it. Both
+/// of those are deleted with this change (#248); `software_digests_match_a_trial_session`
+/// pins the arithmetic against real hardware.
+fn build_super_pcr(plock: &PcrlockJson) -> Result<SuperPcr> {
     let mut entries: Vec<(u32, Vec<[u8; 32]>)> = plock
         .pcr_values
         .iter()
@@ -1040,7 +1079,7 @@ fn build_super_pcr_uncached(ctx: &mut Context, plock: &PcrlockJson) -> Result<Su
                 sel: vec![*pcr],
                 digest: pcr_composite_digest(&[*val])?,
             });
-            branches.push(trial_replay(ctx, &steps)?);
+            branches.push(software_replay(&steps)?);
         }
         // Advance the prefix past this PCR: PolicyPCR (any branch value; the
         // following PolicyOR collapses them to one digest) then PolicyOR.
@@ -1107,7 +1146,7 @@ fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u
     let plock = read_pcrlock_json()?;
     let mut ctx = open_context()?;
     let nv = nv_index_handle(&mut ctx, nv_index)?;
-    let super_pcr = build_super_pcr(&mut ctx, &plock)?;
+    let super_pcr = build_super_pcr(&plock)?;
 
     with_srk(&mut ctx, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
@@ -1168,36 +1207,6 @@ pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope>
 /// machine has none: `pcrlock.json` absent (the common case), unparseable,
 /// rejected by the empty-policy guard, or carrying no NV index. [`seal`] uses
 /// this to decide whether the Tier 2 rung exists on this machine.
-/// Derive the pcrlock branch digests now, so the first unseal does not.
-///
-/// The derivation costs one trial TPM session per predicted branch, measured at
-/// 8.2s on a ThinkPad X13, and its result depends only on the prediction file
-/// (#246). It is memoized per process, so SOMETHING has to pay for it first.
-/// That used to be the daemon's startup enrollment sweep, by accident: removing
-/// the sweep (#249) moved the cost onto the first login, which measured 10.88s
-/// against 2.71s warm.
-///
-/// Calling this from daemon startup keeps the warm path without unsealing
-/// anyone's enrollment to get it. Best-effort by design: every failure here
-/// means the next real unseal derives them itself, exactly as before.
-///
-/// This is a workaround for computing the digests on the TPM at all. The TCG
-/// spec defines them as plain hash recurrences and systemd computes the same
-/// values in userspace with zero TPM commands (#248); doing that removes this
-/// function's reason to exist.
-pub fn warm_pcrlock_policy_cache() {
-    let Some(_) = pcrlock_provisioned() else {
-        return; // Not sealed under pcrlock; nothing to derive.
-    };
-    let Ok(plock) = read_pcrlock_json() else {
-        return;
-    };
-    let Ok(mut ctx) = open_context() else {
-        return;
-    };
-    let _ = build_super_pcr(&mut ctx, &plock);
-}
-
 pub fn pcrlock_provisioned() -> Option<u32> {
     let plock = read_pcrlock_json().ok()?;
     u32::try_from(plock.nv_index?).ok()
@@ -1246,53 +1255,6 @@ pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The memo's identity guard must distinguish predictions that differ in any
-    /// way the policy is built from, and must ignore ordering, which is why it
-    /// sorts. A guard that collided would serve branch digests derived from a
-    /// DIFFERENT prediction, under credential release; that is the reason it
-    /// compares the prediction itself rather than a hash of it.
-    #[test]
-    fn the_memo_key_separates_predictions_that_differ() {
-        let mk = |json: &str| -> PcrlockKey {
-            pcrlock_key(&serde_json::from_str::<PcrlockJson>(json).expect("fixture parses"))
-        };
-        let base = mk(r#"{"pcrBank":"sha256","pcrValues":[
-            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["bb","cc"]}]}"#);
-
-        // Same content, PCRs listed in the other order: the same policy.
-        let reordered = mk(r#"{"pcrBank":"sha256","pcrValues":[
-            {"pcr":2,"values":["bb","cc"]},{"pcr":7,"values":["aa"]}]}"#);
-        assert_eq!(base, reordered, "listing order must not invalidate a memo");
-
-        // A changed predicted value is a different policy.
-        let changed = mk(r#"{"pcrBank":"sha256","pcrValues":[
-            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["bb","dd"]}]}"#);
-        assert_ne!(base, changed, "a changed prediction must miss the memo");
-
-        // An extra branch on the same PCR is a different policy, and it changes
-        // how many trial replays the derivation performs.
-        let extra = mk(r#"{"pcrBank":"sha256","pcrValues":[
-            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["bb","cc","ee"]}]}"#);
-        assert_ne!(base, extra, "an added branch must miss the memo");
-
-        // A different PCR carrying the same values is a different policy.
-        let moved = mk(r#"{"pcrBank":"sha256","pcrValues":[
-            {"pcr":7,"values":["aa"]},{"pcr":3,"values":["bb","cc"]}]}"#);
-        assert_ne!(
-            base, moved,
-            "the same values on another PCR must miss the memo"
-        );
-
-        // Branch ORDER within a PCR is load-bearing: it is the order the OR
-        // branches are derived and replayed in.
-        let swapped = mk(r#"{"pcrBank":"sha256","pcrValues":[
-            {"pcr":7,"values":["aa"]},{"pcr":2,"values":["cc","bb"]}]}"#);
-        assert_ne!(
-            base, swapped,
-            "branch order feeds the derivation, so it counts"
-        );
-    }
 
     #[test]
     fn srk_identity_match_accepts_ours_rejects_foreign() {
@@ -1543,6 +1505,81 @@ mod tests {
             ctx.execute_with_nullauth_session(|ctx| ctx.nv_undefine_space(Provision::Owner, nv));
         std::env::remove_var("IRLUME_PCRLOCK_JSON");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The software digests must equal what a trial session produces.
+    ///
+    /// This is the oracle for #248: the TPM has been computing these all along,
+    /// so the replacement is only correct if it agrees with the chip on the
+    /// exact policies this machine seals under. Compares step by step over the
+    /// real prediction, so a marshalling error in TPML_PCR_SELECTION or a wrong
+    /// command code shows up as a mismatch rather than as a later unseal
+    /// failure nobody can attribute.
+    #[test]
+    #[ignore = "requires a real TPM; run as root: cargo test -p irlume-core --lib tpm:: -- --ignored"]
+    fn software_digests_match_a_trial_session() {
+        let mut ctx = match open_context() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: no TPM context ({e})");
+                return;
+            }
+        };
+
+        // A single-value PolicyPCR, the shape the singles group takes.
+        let one = pcr_composite_digest(&[[0x11; 32]]).unwrap();
+        let steps = vec![PolicyStep::Pcr {
+            sel: vec![7],
+            digest: one.clone(),
+        }];
+        assert_eq!(
+            software_replay(&steps).unwrap().value(),
+            trial_replay(&mut ctx, &steps).unwrap().value(),
+            "PolicyPCR over one PCR disagrees with the TPM"
+        );
+
+        // Several PCRs in one selection, which is how the singles group is
+        // actually issued, and where a bitmap error would show.
+        let many = pcr_composite_digest(&[[0x22; 32], [0x33; 32], [0x44; 32]]).unwrap();
+        let steps = vec![PolicyStep::Pcr {
+            sel: vec![0, 2, 13, 15],
+            digest: many.clone(),
+        }];
+        assert_eq!(
+            software_replay(&steps).unwrap().value(),
+            trial_replay(&mut ctx, &steps).unwrap().value(),
+            "PolicyPCR over a multi-PCR selection disagrees with the TPM"
+        );
+
+        // PolicyPCR then PolicyOR then PolicyPCR: the OR resets the running
+        // digest, and the prefix continues from the reset value. Getting that
+        // wrong is the error that would silently produce an unusable policy.
+        let branch_a = software_replay(&[PolicyStep::Pcr {
+            sel: vec![5],
+            digest: pcr_composite_digest(&[[0xAA; 32]]).unwrap(),
+        }])
+        .unwrap();
+        let branch_b = software_replay(&[PolicyStep::Pcr {
+            sel: vec![5],
+            digest: pcr_composite_digest(&[[0xBB; 32]]).unwrap(),
+        }])
+        .unwrap();
+        let steps = vec![
+            PolicyStep::Pcr {
+                sel: vec![7],
+                digest: one,
+            },
+            PolicyStep::Or(vec![branch_a, branch_b]),
+            PolicyStep::Pcr {
+                sel: vec![1, 3],
+                digest: many,
+            },
+        ];
+        assert_eq!(
+            software_replay(&steps).unwrap().value(),
+            trial_replay(&mut ctx, &steps).unwrap().value(),
+            "a PolicyPCR/PolicyOR/PolicyPCR chain disagrees with the TPM"
+        );
     }
 
     #[test]

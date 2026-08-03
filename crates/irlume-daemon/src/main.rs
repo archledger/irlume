@@ -314,6 +314,11 @@ fn main() {
             // delaying, taking a keyring unseal from 2.70s to 18.97s on a
             // discrete TPM (#249). The marker only skips work; a missing or
             // stale one just runs the sweep as before.
+            // Derive the pcrlock branch digests before any login needs them.
+            // The sweep below used to warm this by accident; skipping the sweep
+            // moved 8.2s onto the first keyring release (#249, #246).
+            irlume_core::tpm::warm_pcrlock_policy_cache();
+
             let retag_space = engine.ir_space().to_string();
             let sweep_needed = !irlume_core::storage::retag_done_for(&retag_space);
             if !sweep_needed {

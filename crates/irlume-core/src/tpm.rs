@@ -1168,6 +1168,36 @@ pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope>
 /// machine has none: `pcrlock.json` absent (the common case), unparseable,
 /// rejected by the empty-policy guard, or carrying no NV index. [`seal`] uses
 /// this to decide whether the Tier 2 rung exists on this machine.
+/// Derive the pcrlock branch digests now, so the first unseal does not.
+///
+/// The derivation costs one trial TPM session per predicted branch, measured at
+/// 8.2s on a ThinkPad X13, and its result depends only on the prediction file
+/// (#246). It is memoized per process, so SOMETHING has to pay for it first.
+/// That used to be the daemon's startup enrollment sweep, by accident: removing
+/// the sweep (#249) moved the cost onto the first login, which measured 10.88s
+/// against 2.71s warm.
+///
+/// Calling this from daemon startup keeps the warm path without unsealing
+/// anyone's enrollment to get it. Best-effort by design: every failure here
+/// means the next real unseal derives them itself, exactly as before.
+///
+/// This is a workaround for computing the digests on the TPM at all. The TCG
+/// spec defines them as plain hash recurrences and systemd computes the same
+/// values in userspace with zero TPM commands (#248); doing that removes this
+/// function's reason to exist.
+pub fn warm_pcrlock_policy_cache() {
+    let Some(_) = pcrlock_provisioned() else {
+        return; // Not sealed under pcrlock; nothing to derive.
+    };
+    let Ok(plock) = read_pcrlock_json() else {
+        return;
+    };
+    let Ok(mut ctx) = open_context() else {
+        return;
+    };
+    let _ = build_super_pcr(&mut ctx, &plock);
+}
+
 pub fn pcrlock_provisioned() -> Option<u32> {
     let plock = read_pcrlock_json().ok()?;
     u32::try_from(plock.nv_index?).ok()

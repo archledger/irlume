@@ -22,6 +22,7 @@ pub mod crypto;
 pub mod envelope;
 pub mod fusion;
 pub mod keyring;
+pub mod kwallet;
 pub mod pad;
 pub mod pcrsig;
 pub mod policy;

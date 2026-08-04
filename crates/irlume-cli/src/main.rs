@@ -569,6 +569,48 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
             }
         },
     };
+    // --measure-only: capture and print EAR medians without storing anything.
+    // The #173 measurement mode: the stored calibration stays untouched, so a
+    // second state (glasses on, different seat, different light) can be
+    // measured side by side against the one the user actually authenticates
+    // with. `--pose` names what the operator is holding; it is recorded in the
+    // output only, since the daemon cannot know what the face is doing.
+    if args.iter().any(|a| a == "--measure-only") {
+        let pose = flag(args, "--pose").unwrap_or_else(|| "unlabeled".into());
+        println!(
+            "[calibrate] measure-only: {rounds} capture(s), pose '{pose}', nothing stored.\n\
+             [calibrate] hold the pose now; first capture in ~3s, the rest back-to-back."
+        );
+        let mut vals: Vec<f32> = Vec::new();
+        for i in 1..=rounds {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            match daemon_request(&Request::CaptureEarMedian { user: user.clone() }) {
+                Ok(Response::EarMedian(Some(v))) => {
+                    println!("    round {i}: EAR = {v:.4}");
+                    vals.push(v);
+                }
+                Ok(Response::EarMedian(None)) => {
+                    println!("    round {i}: no eye detected (face the camera)");
+                }
+                Ok(Response::Error(e)) => println!("    round {i}: {e}"),
+                Ok(other) => println!("    round {i}: unexpected response: {other:?}"),
+                Err(e) => println!("    round {i}: {e}"),
+            }
+        }
+        if vals.is_empty() {
+            eprintln!("[calibrate] no reading succeeded; nothing to report");
+            return std::process::ExitCode::FAILURE;
+        }
+        vals.sort_by(|a, b| a.total_cmp(b));
+        println!(
+            "[calibrate] pose '{pose}': median EAR {:.4} over {} reading(s) (range {:.4} to {:.4})",
+            vals[vals.len() / 2],
+            vals.len(),
+            vals[0],
+            vals[vals.len() - 1]
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     let interactive = std::io::stdin().is_terminal();
     // Ask BEFORE spending the user's time on captures, not after.
     let already_calibrated = matches!(

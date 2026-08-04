@@ -290,7 +290,7 @@ The current gaps:
   deny-only cue (`flir`) for this, and recommends it**: it refused the same
   print at p_fake 0.941 to 1.000, and still refused at 0.998 to 0.999 when the
   print was enhanced with an infrared-absorbing patch that carries the built-in
-  ratio into the genuine range. That evidence covers one subject and one print
+  ratio from 1.06 to 1.32-1.44 while the built-in gate still says `Live`. That evidence covers one subject and one print
   instrument. irlume does not ship or warrant those weights, because their
   publisher documents neither the training data nor a way to reproduce the
   model, which fails [ADR-0001](docs/adr/0001-liveness-pad-strategy.md); setup

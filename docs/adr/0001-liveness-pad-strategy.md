@@ -115,14 +115,23 @@ Criterion 4 was contributed by issue #4.
 
 Measurement changed the balance. The algorithmic gate contributes nothing
 against the demonstrated print: it returned `Live` for all 24 presentations in
-#235, and again for all six presentations of an enhanced attack on 2026-08-04, a
-black cotton sock over the print's chin that carries the centre/edge ratio from
-1.06 into 1.32-1.44 and so inside the genuine population (1.26-1.49). The same
-enhancement defeats a floor-style implementation of the landmark-relief
-candidate (#25) by making an absorbed chin return an unbounded ratio.
+#235, and again for every presentation of an enhanced attack on 2026-08-04, a
+black cotton patch over the print's chin. That enhancement was measured twice.
 
-The opt-in `flir` cue refused every one of those presentations: p_fake
-0.988-1.000 bare and 0.998-0.999 occluded, against a 0.9 threshold. Across
+With the model disabled, six presentations through `padcapture` carried the
+centre/edge ratio to **1.31-1.53**
+(`docs/pad-results/2026-08-04-occluder-gate.jsonl`), overlapping and exceeding
+the committed genuine population of 1.26-1.49
+(`docs/pad-results/2026-08-02-center-edge-corpus.jsonl`), so no floor that
+accepts those genuine samples rejects this attack. The same material defeats a
+floor-style implementation of the landmark-relief candidate (#25) by making an
+absorbed chin return an unbounded ratio.
+
+With the model enabled, six runs through the daemon's authentication path
+(`docs/pad-results/2026-08-04-flir-vs-occluder.jsonl`) show the native gate
+returning `Live` every time, at 1.06 bare and **1.32-1.44** occluded, while
+`flir` refused all six: p_fake **0.988-1.000** on the two bare runs and
+**0.998-0.999** on the four occluded ones, against a 0.9 threshold. Across
 2026-07-17, 2026-07-27 and 2026-08-04 it has not failed to deny this attack.
 
 So the default posture, where a printed photograph of an enrolled user passes,

@@ -1501,13 +1501,23 @@ fn setup_walks_every_step_noninteractively() {
     // and the keyring arm reads this line as the login password.
     let (code, out, _) = run_stdin(&mut sb.cmd(&["setup", "--user", "tester"]), "pw\n");
     assert_eq!(code, 0);
-    assert!(out.contains("[1/6] Preflight"), "{out}");
+    assert!(out.contains("[1/7] Preflight"), "{out}");
+    // The step exists and, on non-TTY stdin, must NOT have fetched anything:
+    // a default-yes question may only apply to someone who was asked (#274).
+    assert!(out.contains("[3/7] Anti-spoof model"), "{out}");
+    assert!(
+        out.contains("not downloading without an interactive confirmation")
+            || out.contains("needs root to install")
+            || out.contains("already enabled")
+            || out.contains("NO trained print defence"),
+        "non-interactive setup must not fetch third-party weights: {out}"
+    );
     assert!(
         out.contains("enrolled 'Face Profile 1' with 6 scans"),
         "{out}"
     );
     assert!(out.contains("armed"), "{out}");
-    assert!(out.contains("[6/6] PAM login wiring"), "{out}");
+    assert!(out.contains("[7/7] PAM login wiring"), "{out}");
     assert!(out.contains("setup complete"), "{out}");
 }
 

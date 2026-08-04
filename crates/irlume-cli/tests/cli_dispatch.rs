@@ -533,7 +533,7 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
     let (code, out, err) = run_stdin(&mut sb.cmd(&["setup", "--user", "tester"]), "pw\n", "setup");
     assert_eq!(code, 0);
     assert!(out.contains("already enrolled."), "{out}");
-    assert!(out.contains("[6/6] PAM login wiring"), "{out}");
+    assert!(out.contains("[7/7] PAM login wiring"), "{out}");
     assert!(
         err.contains("arm failed"),
         "the SealPassword error must surface: {err}"

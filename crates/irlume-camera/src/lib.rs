@@ -2320,7 +2320,15 @@ impl IrSession<'_> {
                 frames_classified: from_camera,
                 frame_mean: best_mean,
                 frame_stddev: ir_dark::frame_stddev(&frames[best_i]),
-                burst_max_mean: bmax,
+                // The brightest METADATA-LIT frame, never the overall maximum:
+                // ambient light also makes bright frames, and only the
+                // camera's own lit flag ties brightness to the emitter (#268).
+                lit_max_mean: means
+                    .iter()
+                    .zip(&flags)
+                    .filter(|(_, f)| matches!(f, Some(ir_metadata::Illumination::Lit)))
+                    .map(|(m, _)| *m)
+                    .fold(0.0f64, f64::max),
             };
             if let Some(line) = ir_dark::diagnose(&evidence)
                 .and_then(|cause| ir_dark::render(card, best_mean, &cause))

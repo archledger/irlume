@@ -58,14 +58,15 @@ pub struct DarkEvidence {
     pub frame_mean: f64,
     /// Pixel standard deviation of the chosen frame.
     pub frame_stddev: f64,
-    /// Mean of the BRIGHTEST frame in the burst. Inter-frame evidence the
-    /// diagnosis lacked (#264): a strobing emitter interleaves lit and
-    /// ambient frames, so a dark CHOSEN frame beside a bright burst maximum
-    /// means the emitter fired and selection (or clipping demotion, #221)
-    /// landed elsewhere; the BRIO measured lit 54-128 against ambient 0.6-1.7
-    /// with no irlume write at all, while the old evidence read its ambient
-    /// phase as a dead emitter and recommended a firmware write.
-    pub burst_max_mean: f64,
+    /// Mean of the brightest frame the camera's own metadata flagged LIT,
+    /// `0.0` when it classified none. Inter-frame evidence the diagnosis
+    /// lacked (#264): when a metadata-lit frame is BRIGHT while the chosen
+    /// frame is dark, the emitter demonstrably fired and selection demoted
+    /// the lit frame (the #221 clip-aware pick is the one path that chooses
+    /// past the maximum). Brightness of a dark-flagged or unclassified frame
+    /// proves nothing about the emitter, since ambient light reads the same
+    /// (#268 review), so only the metadata-confirmed maximum carries this.
+    pub lit_max_mean: f64,
 }
 
 /// The named cause of a dark IR burst, most specific evidence first.
@@ -109,12 +110,14 @@ pub enum IrDarkCause {
     /// destroyed a reporter's camera (#159). `ir-setup` does the same job
     /// from the camera's own descriptor and its own `GET_DEF` values.
     NoEmitterDriven,
-    /// The chosen frame is dark but the burst holds a bright frame: light
-    /// reached the sensor this capture, so the emitter works (a strobing
-    /// module interleaves lit and ambient phases) and the question is frame
-    /// SELECTION, never the firmware. Advising `ir-setup` here is the #185
-    /// wrong-turn this module exists to end (#264).
-    LitBurstDarkChoice { burst_max_mean: f64 },
+    /// The camera flagged a BRIGHT frame as emitter-lit while the chosen
+    /// frame is dark: metadata and optics agree the emitter fired, and
+    /// selection demoted the lit frame, which the #221 clip-aware pick does
+    /// when it is blown. The question is frame selection, never the firmware;
+    /// advising `ir-setup` here is the #185 wrong-turn this module exists to
+    /// end (#264). Outranks [`IrDarkCause::LitButDark`], whose failed-LED and
+    /// covered-lens possibilities a bright lit frame refutes.
+    LitFrameDemoted { lit_max_mean: f64 },
     /// The control is active, the camera supplies no metadata, and the frame
     /// carries real signal: the evidence cannot separate an emitter the
     /// camera ignored from a subject out of range or a genuinely dark scene.
@@ -152,13 +155,16 @@ pub fn diagnose(e: &DarkEvidence) -> Option<IrDarkCause> {
     if e.privacy_engaged {
         return Some(IrDarkCause::PrivacyEngaged);
     }
-    // Direct optical evidence beats every emitter inference below: a bright
-    // frame ANYWHERE in the burst means light reached the sensor this
-    // capture, so "no active emitter" and "ignored control" are both refuted
-    // regardless of who drove the control or what the metadata says (#264).
-    if e.burst_max_mean >= DARK_MEAN_MAX {
-        return Some(IrDarkCause::LitBurstDarkChoice {
-            burst_max_mean: e.burst_max_mean,
+    // Metadata AND optics agreeing beats the inference arms below: a bright
+    // frame the camera itself flagged emitter-lit refutes "failed LED",
+    // "covered lens", "no active emitter" and "ignored control" at once.
+    // Deliberately NOT keyed on the burst's overall maximum: a bright frame
+    // the camera flagged dark, or did not classify, is what ambient light
+    // looks like, and concluding "the emitter works" from it would suppress
+    // a genuine emitter failure (#268 review).
+    if e.lit_max_mean >= DARK_MEAN_MAX {
+        return Some(IrDarkCause::LitFrameDemoted {
+            lit_max_mean: e.lit_max_mean,
         });
     }
     if e.frames_lit > 0 {
@@ -250,11 +256,12 @@ pub fn render(card: &str, mean: f64, cause: &IrDarkCause) -> Option<String> {
              `sudo irlume ir-setup` to find this camera's emitter control from what it \
              publishes (IRLUME_IR_EMITTER=off silences this)"
         )),
-        IrDarkCause::LitBurstDarkChoice { burst_max_mean } => Some(format!(
-            "[ir] {card:?}: the chosen IR frame is dark (mean {mean:.0}) but the burst \
-             holds a lit frame (mean {burst_max_mean:.0}): the emitter works, likely \
-             strobing, and frame selection landed on a dark phase. Not a firmware \
-             problem; if authentication fails here, report these two numbers"
+        IrDarkCause::LitFrameDemoted { lit_max_mean } => Some(format!(
+            "[ir] {card:?}: the camera flagged a bright frame as emitter-lit (mean \
+             {lit_max_mean:.0}) but the chosen frame is dark (mean {mean:.0}): the \
+             emitter works, and selection demoted the lit frame, most likely for \
+             clipping. Not a firmware problem; if authentication fails here, report \
+             these two numbers"
         )),
         IrDarkCause::Undetermined => Some(format!(
             "[ir] {card:?}: IR is dark (mean {mean:.0}) with the emitter control \
@@ -297,67 +304,72 @@ mod tests {
             frames_classified: 0,
             frame_mean: 20.0,
             frame_stddev: 40.0,
-            // As dark as the chosen frame: a whole-burst-dark baseline, so
-            // each existing arm stays reachable (a bright maximum would route
-            // every case into LitBurstDarkChoice by design).
-            burst_max_mean: 20.0,
+            // No metadata-lit frame: each existing arm stays reachable (a
+            // bright one would route into LitFrameDemoted by design).
+            lit_max_mean: 0.0,
         }
     }
 
-    // The measured BRIO shape (2026-08-04, #264): the strobe interleaves lit
-    // frames (54-128) with ambient ones (0.6-1.7), no irlume write, and the
-    // chosen frame landed dark. The old evidence called this "no active
-    // emitter" and recommended a firmware write for hardware that works.
     #[test]
-    fn a_lit_burst_with_a_dark_choice_names_selection_not_the_emitter() {
-        let brio = DarkEvidence {
+    fn a_bright_metadata_lit_frame_names_selection_not_the_emitter() {
+        // The reachable shape (#268 review): the camera flagged a bright frame
+        // LIT, the #221 clip-aware pick demoted it, and the chosen frame is
+        // dark. Metadata and optics agree the emitter fired, so the failed-LED
+        // and covered-lens uncertainty of LitButDark would be wrong here.
+        let demoted = DarkEvidence {
             frame_mean: 34.0,
-            burst_max_mean: 128.0,
+            frames_lit: 2,
+            frames_classified: 8,
+            lit_max_mean: 128.0,
             ..textured_dark()
         };
         assert_eq!(
-            diagnose(&brio),
-            Some(IrDarkCause::LitBurstDarkChoice {
-                burst_max_mean: 128.0
+            diagnose(&demoted),
+            Some(IrDarkCause::LitFrameDemoted {
+                lit_max_mean: 128.0
             })
         );
-        let line = render("Logitech BRIO", 34.0, &diagnose(&brio).unwrap()).unwrap();
+        let line = render("cam", 34.0, &diagnose(&demoted).unwrap()).unwrap();
         assert!(line.contains("emitter works"), "{line}");
         assert!(
             !line.contains("ir-setup"),
             "must not point at firmware: {line}"
         );
 
-        // Direct optical evidence outranks the metadata arms too: a bright
-        // frame refutes "ignored control" as surely as "no emitter".
+        // The reviewer's conflict scenario: the bright frame was flagged DARK
+        // (means [90, 34, 20], flags [Dark, Lit, Lit]), so the lit maximum is
+        // the dim 34 and the arm must NOT fire; brightness of a dark-flagged
+        // frame is what ambient light looks like, and LitButDark keeps its
+        // honest uncertainty about the emitter.
         assert_eq!(
             diagnose(&DarkEvidence {
-                frames_lit: 3,
-                frames_classified: 8,
-                burst_max_mean: 90.0,
+                frame_mean: 34.0,
+                frames_lit: 2,
+                frames_classified: 3,
+                lit_max_mean: 34.0,
                 ..textured_dark()
             }),
-            Some(IrDarkCause::LitBurstDarkChoice {
-                burst_max_mean: 90.0
+            Some(IrDarkCause::LitButDark {
+                frames_lit: 2,
+                frames_classified: 3
             })
         );
-        // But the shutter still wins: an engaged privacy control explains a
-        // dark choice regardless of what earlier frames held.
+        // The shutter still wins over the agreement arm.
         assert_eq!(
             diagnose(&DarkEvidence {
                 privacy_engaged: true,
-                burst_max_mean: 128.0,
+                frames_lit: 2,
+                frames_classified: 8,
+                lit_max_mean: 128.0,
                 ..textured_dark()
             }),
             Some(IrDarkCause::PrivacyEngaged)
         );
-        // And a burst that is dark END TO END (the BRIO's pre-strobe warm-up
-        // window) keeps the emitter diagnosis: there is no optical evidence
-        // to refute it with.
+        // No metadata at all (the BRIO): the arm cannot fire, and an
+        // end-to-end-dark burst keeps the emitter diagnosis.
         assert_eq!(
             diagnose(&DarkEvidence {
                 frame_mean: 16.0,
-                burst_max_mean: 24.0,
                 ..textured_dark()
             }),
             Some(IrDarkCause::NoEmitterDriven)
@@ -425,8 +437,8 @@ mod tests {
             frames_classified: 8,
             frame_mean: 20.0,
             frame_stddev: 0.0,
-            // A bright maximum too: `off` must silence even the optical arm.
-            burst_max_mean: 128.0,
+            // A bright lit frame too: `off` must silence even the agreement arm.
+            lit_max_mean: 128.0,
         })
         .expect("a dark burst under off still resolves, to a silent cause");
         assert_eq!(off, IrDarkCause::EmitterDisabled);

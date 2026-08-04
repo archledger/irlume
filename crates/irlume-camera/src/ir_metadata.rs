@@ -997,6 +997,19 @@ mod tests {
     }
 
     #[test]
+    fn no_metadata_selects_the_burst_maximum() {
+        // The #268 invariant: with no metadata the clip demotion never
+        // engages, so the chosen frame IS the burst maximum, and a dark
+        // choice beside a brighter unclassified frame cannot reach the
+        // diagnosis band at all.
+        let means = [1.0, 34.0, 128.0, 2.0];
+        let flags = [None, None, None, None];
+        let clipped = [0.0, 0.0, 0.9, 0.0];
+        assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(2));
+        assert_eq!(best_gate_frame(&means, &flags, None), Some(2));
+    }
+
+    #[test]
     fn best_gate_frame_skips_a_clipped_brightest_lit_frame() {
         // The #221 case: the brightest lit frame is blown, a dimmer lit frame
         // is clean, and the gate must read the clean one.

@@ -30,16 +30,14 @@ fn main() -> std::process::ExitCode {
         .unwrap_or(20);
 
     let user = "pcr-race-probe";
-    // Generated, not a literal. A literal here is a hard-coded credential as
-    // far as any scanner is concerned, and dismissing that alert forever is
-    // worse than drawing 32 bytes; a fresh secret per run also means a stale
-    // envelope from an earlier run cannot satisfy the readback check below.
-    let secret = &{
-        use rand::Rng;
-        let mut b = [0u8; 32];
-        rand::rng().fill_bytes(&mut b);
-        b
-    };
+    // Generated, not a literal, and generated without a zeroed buffer in the
+    // way: a literal here reads as a hard-coded credential to a scanner, and
+    // `[0u8; 32]` filled afterwards still leaves the literal in the dataflow
+    // even though nothing ever uses those zeros. A fresh secret per run also
+    // means a stale envelope from an earlier run cannot satisfy the readback
+    // check below.
+    let secret: [u8; 32] = rand::random();
+    let secret = &secret;
 
     if let Err(e) = keyring::seal_password(user, secret) {
         eprintln!("seal failed: {e}");

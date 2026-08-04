@@ -24,6 +24,10 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     match sub {
         None | Some("list") => list(),
         Some("enable") => enable(args.get(2).map(String::as_str)),
+        Some("add") => add(
+            args.get(2).map(String::as_str),
+            args.get(3).map(String::as_str),
+        ),
         Some("disable") => disable(),
         _ => usage(),
     }
@@ -31,9 +35,78 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!("usage: irlume models [list]");
-    eprintln!("       sudo irlume models enable <name>");
+    eprintln!("       sudo irlume models enable <name>          (irlume fetches it)");
+    eprintln!("       sudo irlume models add <name> <path>      (you supply the file)");
     eprintln!("       sudo irlume models disable");
     ExitCode::from(2)
+}
+
+/// Install a model from a file the USER obtained, verified against the pin
+/// irlume measured.
+///
+/// This is the whole point of the two tiers: irlume will not fetch a model
+/// whose licence makes that the user's decision, but it still knows exactly
+/// which artifact it measured. A file that hashes to the catalog's `sha256` is
+/// that artifact and gets its measured threshold; anything else is refused,
+/// because scoring an unknown model against another model's threshold is the
+/// guess this catalog exists to prevent.
+fn add(name: Option<&str>, path: Option<&str>) -> ExitCode {
+    let (Some(name), Some(path)) = (name, path) else {
+        return usage();
+    };
+    let Some(m) = thirdparty::by_name(name) else {
+        eprintln!("[models] '{name}' is not in the catalog; run `irlume models` to list it");
+        return ExitCode::FAILURE;
+    };
+    if !is_root() {
+        eprintln!("[models] needs root: sudo irlume models add {name} {path}");
+        return ExitCode::FAILURE;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[models] cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let digest = thirdparty::sha256_hex(&bytes);
+    if digest != m.sha256 {
+        eprintln!("[models] this file is NOT the artifact irlume measured.");
+        eprintln!("[models]   got      sha256 {digest}");
+        eprintln!("[models]   expected sha256 {}", m.sha256);
+        eprintln!(
+            "[models] refusing: irlume's threshold for '{}' was measured on the expected\n\
+             [models] artifact, and applying it to different weights would be a guess.",
+            m.name
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("Adding third-party model '{}' from {path}", m.name);
+    println!();
+    println!("  license:    {}", m.license);
+    println!("  provenance: {}", m.provenance);
+    println!("  measured:   {}", m.summary);
+    println!("  effect:     adds a DENY-ONLY liveness cue on the lit IR frame; it can");
+    println!("              reject a presentation, it can never approve one the built-in");
+    println!("              gate rejected. False fires cost a retry or the password.");
+    println!();
+    println!("  sha256 matches the artifact irlume measured. Complying with the license");
+    println!("  above, for your use, is your determination and not irlume's.");
+    println!();
+    if !stdin_is_tty() {
+        eprintln!("[models] enabling needs an interactive terminal to confirm the license");
+        return ExitCode::FAILURE;
+    }
+    print!("Enable '{}'? [y/N] ", m.name);
+    let _ = std::io::stdout().flush();
+    let mut yn = String::new();
+    if std::io::stdin().lock().read_line(&mut yn).is_err()
+        || !matches!(yn.trim(), "y" | "Y" | "yes")
+    {
+        println!("[models] cancelled; nothing was changed.");
+        return ExitCode::FAILURE;
+    }
+    install_verified(m, &bytes)
 }
 
 /// The catalog name currently enabled in settings.conf, if any.
@@ -52,8 +125,9 @@ fn file_state(m: &ThirdPartyModel) -> &'static str {
 
 fn list() -> ExitCode {
     let enabled = enabled_name();
-    println!("Third-party models irlume can fetch but does not ship or warrant.");
-    println!("Each entry was measured on real hardware before listing (docs/pad-results/).");
+    println!("Third-party models irlume has MEASURED but does not ship or warrant.");
+    println!("Nothing is listed here that was not measured on real hardware");
+    println!("(docs/pad-results/, docs/THIRD-PARTY-MODELS.md).");
     println!();
     for m in thirdparty::CATALOG {
         let state = if enabled.as_deref() == Some(m.name) {
@@ -69,11 +143,21 @@ fn list() -> ExitCode {
             m.threshold
         );
         println!("    measured:   {}", m.summary);
+        println!(
+            "    obtain:     {}",
+            match m.url {
+                Some(_) => format!("irlume fetches it: sudo irlume models enable {}", m.name),
+                None => format!(
+                    "you supply the file: sudo irlume models add {} <path>",
+                    m.name
+                ),
+            }
+        );
     }
     println!();
     match enabled {
         Some(n) => println!("enabled: {n} · disable with: sudo irlume models disable"),
-        None => println!("none enabled · enable with: sudo irlume models enable <name>"),
+        None => println!("none enabled · see the 'obtain' line above for each model"),
     }
     ExitCode::SUCCESS
 }
@@ -106,6 +190,15 @@ fn enable(name: Option<&str>) -> ExitCode {
         println!("[models] re-fetching and re-verifying anyway.");
     }
 
+    if m.url.is_none() {
+        println!(
+            "[models] '{}' is measured by irlume but not fetched by it: its license makes\n\
+             [models] obtaining the file your decision. See docs/THIRD-PARTY-MODELS.md, then:\n\
+             [models]   sudo irlume models add {} <path-to-{}>",
+            m.name, m.name, m.file
+        );
+        return ExitCode::FAILURE;
+    }
     println!("Enabling third-party model '{}'", m.name);
     println!();
     println!("  license:    {}", m.license);
@@ -157,12 +250,22 @@ pub(crate) fn fetch_and_enable(m: &thirdparty::ThirdPartyModel) -> ExitCode {
         eprintln!("[models] could not create {}: {e}", dir.display());
         return ExitCode::FAILURE;
     }
+    let Some(url) = m.url else {
+        // Reached only if a caller forgets the check at the call site; the
+        // catalog says this model is not irlume's to fetch.
+        eprintln!(
+            "[models] '{}' is not fetchable by irlume; obtain the file yourself, then:\n\
+             [models]   sudo irlume models add {} <path>",
+            m.name, m.name
+        );
+        return ExitCode::FAILURE;
+    };
     let tmp = dir.join(format!(".{}.part", m.file));
     println!("[models] downloading from the publisher's origin ...");
     let status = Command::new("curl")
         .args(["-fSL", "--max-time", "300", "-o"])
         .arg(&tmp)
-        .arg(m.url)
+        .arg(url)
         .status();
     if !matches!(status, Ok(s) if s.success()) {
         let _ = std::fs::remove_file(&tmp);
@@ -189,9 +292,39 @@ pub(crate) fn fetch_and_enable(m: &thirdparty::ThirdPartyModel) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    let _ = std::fs::remove_file(&tmp);
+    install_verified(m, &bytes)
+}
+
+/// Are these the exact weights irlume measured?
+///
+/// A value rather than an inline comparison so the refusal is testable: this
+/// is the only thing standing between a user and a threshold applied to
+/// weights it was never measured on.
+fn pin_matches(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
+    thirdparty::sha256_hex(bytes) == m.sha256
+}
+
+/// Write already-verified `bytes` into place and enable the cue.
+///
+/// The single installer for both tiers. Callers must have checked the sha256
+/// first; this re-states that in one place so a future third caller cannot
+/// install unpinned weights by forgetting the check.
+fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
+    if !pin_matches(m, bytes) {
+        eprintln!(
+            "[models] refusing to install unpinned weights for '{}'",
+            m.name
+        );
+        return ExitCode::FAILURE;
+    }
+    let dir = thirdparty::dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[models] could not create {}: {e}", dir.display());
+        return ExitCode::FAILURE;
+    }
     let path = thirdparty::model_path(m);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = std::fs::write(&path, bytes) {
         eprintln!("[models] could not install {}: {e}", path.display());
         return ExitCode::FAILURE;
     }
@@ -327,6 +460,45 @@ pub fn doctor_line() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bring_your_own_entry_is_never_fetched_and_a_fetchable_one_has_an_origin() {
+        // The tier invariant, asserted over the whole catalog rather than one
+        // entry: irlume must never try to download a model whose licence made
+        // obtaining it the user's decision, and must never leave a fetchable
+        // entry without somewhere to fetch from.
+        for m in thirdparty::CATALOG {
+            if let Some(u) = m.url {
+                assert!(
+                    u.starts_with("https://"),
+                    "{}: origin must be https",
+                    m.name
+                );
+            }
+            // Both tiers carry the pin: it is how irlume knows WHICH model is
+            // loaded rather than trusting the file that appeared in the dir.
+            assert_eq!(m.sha256.len(), 64, "{}: every tier needs a pin", m.name);
+        }
+    }
+
+    #[test]
+    fn install_refuses_bytes_that_do_not_match_the_pin() {
+        // The discriminating case for `models add`: a file that is not the
+        // measured artifact must be refused, because irlume's threshold was
+        // measured on the expected weights and means nothing on others.
+        let m = thirdparty::CATALOG
+            .first()
+            .expect("catalog is non-empty by the invariant above");
+        assert_ne!(
+            thirdparty::sha256_hex(b"not the model"),
+            m.sha256,
+            "the fixture must not collide with the real pin"
+        );
+        assert!(
+            !pin_matches(m, b"not the model"),
+            "unpinned bytes must be refused"
+        );
+    }
     use super::*;
 
     /// doctor_line's classification: enabled name vs catalog membership vs

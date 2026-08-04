@@ -31,8 +31,16 @@ pub struct ThirdPartyModel {
     pub name: &'static str,
     /// On-disk file name under the state subdir.
     pub file: &'static str,
-    /// Direct download URL at the publisher's origin.
-    pub url: &'static str,
+    /// Direct download URL at the publisher's origin, or `None` when irlume
+    /// will not fetch it for you.
+    ///
+    /// `None` is not a lesser tier of evidence: an entry is in this catalog
+    /// only because irlume measured it, and the threshold and pin below carry
+    /// the same weight either way. It means the licence makes fetching the
+    /// user's business rather than irlume's, so the file arrives via
+    /// `irlume models add <name> <path>` and is checked against `sha256`
+    /// exactly as a downloaded one is.
+    pub url: Option<&'static str>,
     /// Pinned sha256 of the artifact; a fetched file that does not match is
     /// deleted, and the daemon refuses to load a file that stops matching.
     pub sha256: &'static str,
@@ -54,7 +62,7 @@ pub struct ThirdPartyModel {
 pub const CATALOG: &[ThirdPartyModel] = &[ThirdPartyModel {
     name: "flir",
     file: "flir.onnx",
-    url: "https://modelscope.cn/api/v1/models/damo/cv_manual_face-liveness_flir/repo?FilePath=model.onnx&Revision=master",
+    url: Some("https://modelscope.cn/api/v1/models/damo/cv_manual_face-liveness_flir/repo?FilePath=model.onnx&Revision=master"),
     sha256: "df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72",
     license: "MIT (Alibaba DAMO, ModelScope model card)",
     provenance: "training data undocumented by the publisher; not reproducible \
@@ -164,11 +172,17 @@ mod tests {
                 m.name
             );
             assert!(m.sha256.chars().all(|c| c.is_ascii_hexdigit()));
-            assert!(
-                m.url.starts_with("https://"),
-                "{}: origin must be https",
-                m.name
-            );
+            // A fetchable entry must name an https origin; a bring-your-own
+            // entry names none, and both must still carry a pin, because the
+            // pin is how irlume knows WHICH model is loaded rather than
+            // trusting whatever file appeared in the directory.
+            if let Some(url) = m.url {
+                assert!(
+                    url.starts_with("https://"),
+                    "{}: origin must be https",
+                    m.name
+                );
+            }
             assert!(m.threshold > 0.0 && m.threshold < 1.0);
             assert!(m.file.ends_with(".onnx"));
             assert!(

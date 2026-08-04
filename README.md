@@ -464,6 +464,7 @@ see [Honest limitations](#-honest-limitations).
 | **Write software that drives irlume** | [`docs/INTEGRATION.md`](docs/INTEGRATION.md) |
 | Look up the versioned **machine API**, field by field | [`docs/MACHINE-API.md`](docs/MACHINE-API.md) |
 | Understand the **architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| Choose a **third-party liveness model** irlume has measured | [`docs/THIRD-PARTY-MODELS.md`](docs/THIRD-PARTY-MODELS.md) |
 | Read the **threat model** and standards mapping | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) · [`docs/STANDARDS.md`](docs/STANDARDS.md) |
 | **Verify the claims** on my own machine | [`docs/VERIFY.md`](docs/VERIFY.md) |
 | **Debug** a login or trace every stage | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) |

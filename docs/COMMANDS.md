@@ -65,6 +65,7 @@ Conventions that apply everywhere:
 | `irlume camera-tune [--rounds N]` | yes | measure whether this camera keeps its brightness while both sensors stream, and store the resulting capture mode in `cameras.conf`; some modules starve their own RGB interface (measured: NexiGo HelloCam N930W keeps 56% of its RGB brightness), and this puts those on one-at-a-time capture |
 | `irlume models [list]` | no | show the opt-in third-party liveness models and their checksum state |
 | `irlume models enable <name>` / `models disable` | yes | fetch and enable one (deny-only, checksum-pinned), or turn it off |
+| `irlume models add <name> <path>` | yes | enable a model whose licence means you obtain the file; verified against the pin irlume measured ([THIRD-PARTY-MODELS.md](THIRD-PARTY-MODELS.md)) |
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, wipe enrolled data unless `--keep-data`, then print the package-removal command |
 

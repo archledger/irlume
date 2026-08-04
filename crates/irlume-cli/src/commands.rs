@@ -1607,7 +1607,14 @@ fn pad_model_offer() -> PadOffer {
             Ok(_) => PadOffer::AlreadyEnabled(name),
         };
     }
-    match irlume_common::thirdparty::CATALOG.first() {
+    // Only a FETCHABLE model can be offered here: setup cannot obtain one whose
+    // licence makes acquiring it the user's decision, and a step that asks a
+    // question it cannot act on is worse than no step. Those are documented in
+    // docs/THIRD-PARTY-MODELS.md and installed with `models add`.
+    match irlume_common::thirdparty::CATALOG
+        .iter()
+        .find(|m| m.url.is_some())
+    {
         Some(m) => PadOffer::Offer(m),
         None => PadOffer::NoCatalog,
     }
@@ -1984,10 +1991,15 @@ mod setup_offer_tests {
         // weights really are present and match their pin, because the daemon
         // silently runs without the cue otherwise (#274 review).
         assert!(
-            !irlume_common::thirdparty::CATALOG.is_empty(),
-            "setup offers CATALOG.first(); an empty catalog makes the step dead"
+            irlume_common::thirdparty::CATALOG
+                .iter()
+                .any(|m| m.url.is_some()),
+            "setup offers the first FETCHABLE entry; with none the step is dead"
         );
-        let first = irlume_common::thirdparty::CATALOG.first().unwrap();
+        let first = irlume_common::thirdparty::CATALOG
+            .iter()
+            .find(|m| m.url.is_some())
+            .unwrap();
         // Everything the step prints before asking for consent must exist, or
         // the user accepts a license and provenance the screen never showed.
         assert!(!first.name.is_empty());
@@ -1998,7 +2010,7 @@ mod setup_offer_tests {
         );
 
         match pad_model_offer() {
-            PadOffer::NoCatalog => panic!("catalog is non-empty but the offer said otherwise"),
+            PadOffer::NoCatalog => panic!("a fetchable entry exists but the offer said otherwise"),
             PadOffer::Offer(m) => assert_eq!(m.name, first.name),
             PadOffer::ConfiguredButBroken(_, why) => {
                 assert!(!why.is_empty(), "a broken state must say why");

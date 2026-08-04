@@ -849,11 +849,30 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
     assert!(ok, "auth + session must both pass: {out}");
 
     let reqs = log.lock().unwrap();
+    // The AUTH phase must still contact nobody: acting on a token there is the
+    // bug that let a typo overwrite a good seal. The SESSION phase now makes
+    // two requests, in this order.
     assert_eq!(
         reqs.len(),
-        1,
-        "exactly one reseal, and none during the auth phase: {reqs:?}"
+        2,
+        "reseal, then the token-delivery query, both in the session phase: {reqs:?}"
     );
+    // A typed-password login releases no token in the auth phase, so there is
+    // no stash for open_session to deliver; without asking the daemon here, a
+    // token-armed account's keyring would never be unlocked by a password
+    // login. `have_password: true` lets the daemon answer a password-armed
+    // user without touching the TPM, so the cost lands only on token users.
+    match &reqs[1] {
+        Request::UnsealKeyring {
+            user,
+            have_password,
+            ..
+        } => {
+            assert_eq!(user, "tester");
+            assert!(have_password, "the session phase holds the typed password");
+        }
+        other => panic!("expected the delivery query second, got {other:?}"),
+    }
     match &reqs[0] {
         Request::ResealPassword { user, password } => {
             assert_eq!(user, "tester");
@@ -868,7 +887,9 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
     drop(reqs);
 
     // A pure face login stashes nothing (blank submit ⇒ empty PAM_AUTHTOK), so
-    // the session half must have nothing to heal with: no daemon contact.
+    // the session half must have nothing to RESEAL. It still asks the daemon
+    // whether a token needs delivering, because a face login that released one
+    // is exactly the case that needs it.
     h.write_service(
         "irlume-reseal-empty",
         &[
@@ -885,9 +906,33 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
         None,
     );
     assert!(ok, "{out}");
+    let reqs = log.lock().unwrap();
     assert_eq!(
-        log.lock().unwrap().len(),
-        1,
-        "an empty stash must never produce a reseal request"
+        reqs.len(),
+        3,
+        "the two from the run above, plus this run's delivery query and no \
+         reseal: {reqs:?}"
     );
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| matches!(r, Request::ResealPassword { .. })
+                && reqs
+                    .iter()
+                    .filter(|x| matches!(x, Request::ResealPassword { .. }))
+                    .count()
+                    > 1),
+        "an empty stash must never produce a SECOND reseal request: {reqs:?}"
+    );
+    match &reqs[2] {
+        // `true` even though nothing was typed: the flag means "a
+        // password-keyed keyring is already served", which by the session
+        // phase it is, and answering it saves the daemon a TPM unseal this
+        // hook would only discard.
+        Request::UnsealKeyring { have_password, .. } => assert!(
+            *have_password,
+            "the session-phase delivery query always reports a served keyring"
+        ),
+        other => panic!("expected only the delivery query, got {other:?}"),
+    }
 }

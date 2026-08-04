@@ -140,6 +140,27 @@ def main(argv):
               f"{ceiling:.3f} reached at exposure {cross:.0f}")
         claims += [f"{a:.3f}", f"{b:+.4f}", f"{cross:.0f}"]
 
+    print("\nink at 850nm: each region as a fraction of its own class's forehead")
+    for label, sel in (("face", faces), ("print", prints_)):
+        fracs = {r: st.median([x[r] / x["forehead"] for x in sel])
+                 for r in ("nose", "cheek", "brow", "socket", "socket_deep", "chin")}
+        print(f"  {label:6} " + "  ".join(f"{k} {v:.3f}" for k, v in fracs.items()))
+        claims += [f"{v:.3f}" for v in fracs.values()]
+
+    print("\nprinted-shadow attack arithmetic")
+    pc = st.median([r["cheek"] for r in prints_])
+    pch = st.median([r["chin"] for r in prints_])
+    pfh = st.median([r["forehead"] for r in prints_])
+    face_floor = min(RATIOS["cheek/chin"](r) for r in faces)
+    need = pc / face_floor
+    ink_floor = min(st.median([x[r] / x["forehead"] for x in prints_])
+                    for r in ("nose", "cheek", "brow", "socket", "socket_deep", "chin"))
+    print(f"  print cheek {pc:.1f}, chin {pch:.1f}, ratio {pc / pch:.3f}; lowest face ratio {face_floor:.3f}")
+    print(f"  chin must fall to {need:.1f} = {need / pfh:.3f} of forehead; ink floor {ink_floor:.3f} "
+          f"-> {'reachable' if need / pfh >= ink_floor else 'NOT reachable'}")
+    claims += [f"{pc:.1f}", f"{pch:.1f}", f"{pc / pch:.3f}", f"{face_floor:.3f}",
+               f"{need:.1f}", f"{need / pfh:.3f}", f"{ink_floor:.3f}"]
+
     print("\nexposure correlation within class (why the socket ratios fail)")
     for name in ("brow/socket_deep", "nose/socket"):
         f = RATIOS[name]

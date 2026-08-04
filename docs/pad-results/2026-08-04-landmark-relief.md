@@ -123,13 +123,48 @@ by brightness alone on this hardware. This is an extrapolation from faces
 measured to 120 and is offered as a bound, not as evidence about saturated
 frames; saturation clips regions unevenly and is measured separately (#221).
 
-## The attack this corpus cannot rule out
+## The printed-shadow attack, measured on this instrument
 
-The cue reads brightness at the chin, and it cannot tell an emitter shadow from
-a printed one. An attacker who prints a source photograph shot with strong
-top-down lighting, or who simply darkens the chin region of the print, raises
-the ratio without changing the geometry. The banner used here is an evenly lit
-studio portrait, so nothing in this corpus tests that.
+The cue reads brightness at the chin and cannot tell an emitter shadow from a
+printed one, so an attacker who darkens the chin region of the print should be
+able to raise the ratio without changing any geometry. That assumes a visibly
+dark print tone also reads dark at 850nm, which is a claim about ink rather
+than about geometry, and the corpus can test it: the banner carries printed
+tones whose real counterparts absorb infrared.
+
+Each region as a fraction of its own class's forehead (medians):
+
+| region | real face | vinyl print |
+|---|---|---|
+| nose | 0.858 | 1.137 |
+| cheek | 0.645 | 0.974 |
+| brow (eyebrow) | 0.728 | 0.961 |
+| socket | 0.454 | 0.711 |
+| socket_deep | 0.424 | 0.721 |
+| chin | 0.192 | 0.625 |
+
+Printed tone barely survives at 850nm on this medium. A real eyebrow reads
+0.728 of forehead because hair absorbs infrared; the printed eyebrow, strongly
+dark to the eye, reads 0.961. The print's entire tonal range compresses into
+0.625-1.137 where the face spans 0.192-1.000.
+
+The attack arithmetic follows. Print medians are cheek 77.8 and chin 50.8, a
+ratio of 1.532. Reaching the lowest face value measured here, 2.580, needs the
+printed chin at 30.2, which is 0.363 of the print's forehead. The darkest tone
+this ink achieves anywhere on the banner is 0.625, and that is already the
+chin, so the source portrait carried some chin shading and still landed far
+short. **On this instrument the printed-shadow attack is not reachable**: the
+ink would have to absorb roughly 1.7 times more infrared than its whole visible
+tonal range delivers.
+
+What that does and does not settle. It is one ink set on one medium, and
+infrared absorption is a pigment property rather than a colour one: carbon
+black absorbs 850nm strongly, so laser toner or a carbon-pigment print could
+reach tones this dye set cannot, and the 2026-06-30 self-test already recorded
+matte paper and glossy vinyl behaving differently. It also says nothing about a
+physical occluder, a dark cloth or an infrared-absorbing patch held over the
+chin, which reproduces the same signal without printing anything. Both remain
+open.
 
 The strobe suggests a defence and this corpus cannot validate it. Sampling the
 same landmarks on the emitter-off frame gives the emitter-only contribution by
@@ -147,7 +182,9 @@ printed shadow is untested and needs a print made to carry one.
 
 ## What would have to be true before a gate
 
-- **A print with a darkened chin**, the cheap attack above, captured and refused.
+- **An infrared-absorbing chin**, whether printed with carbon-based ink or
+  physically occluded. This corpus shows the dye set on this banner cannot
+  reach it; it does not show that no medium can.
 - **More than one subject.** Facial relief is the quantity being measured, and
   jaw shape, beard, and chin prominence vary. One subject cannot establish a
   floor.

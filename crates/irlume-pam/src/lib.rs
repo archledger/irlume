@@ -510,8 +510,7 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
     };
     if let Some(mut sin) = child.stdin.take() {
         if sin.write_all(token.expose()).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_bounded(&mut child);
             return false;
         }
         // EOF tells the helper the token is complete.
@@ -547,13 +546,42 @@ fn reap_by(child: &mut std::process::Child, deadline: Instant) -> Option<std::pr
             Ok(Some(status)) => return Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_bounded(child);
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => return None,
+            Err(_) => {
+                kill_bounded(child);
+                return None;
+            }
+        }
+    }
+}
+
+/// Request the child's termination and reap it if it dies promptly, never
+/// waiting without a bound.
+///
+/// `kill` only queues SIGKILL. A child parked in an uninterruptible kernel
+/// sleep (a wedged filesystem, a dead device) does not die until that sleep
+/// resolves, and `Child::wait` here would block straight through the deadline
+/// this module just enforced, hanging the login the deadline exists to
+/// protect. The short poll reaps the common case, where a killed child exits
+/// within a few scheduler ticks; a child that outlives it is left unreaped
+/// rather than bought with a hung login, and init collects it once the login
+/// process exits.
+fn kill_bounded(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let reap_deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if Instant::now() >= reap_deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -586,8 +614,7 @@ fn read_stdout_bounded(
     use std::os::fd::AsRawFd;
 
     let kill_and_fail = |child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_bounded(child);
         None
     };
     let Some(mut stdout) = child.stdout.take() else {
@@ -794,8 +821,7 @@ fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> bool {
     };
     if let Some(mut sin) = child.stdin.take() {
         if sin.write_all(key).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_bounded(&mut child);
             return false;
         }
         // Dropping the handle closes the pipe; the helper reads a fixed length

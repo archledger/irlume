@@ -198,7 +198,74 @@ mod onnx {
         irlume_common::Error::Hardware(format!("onnx: {e}"))
     }
 
+    /// Where the irlume packages install onnxruntime; the daemon's unit file
+    /// points `ORT_DYLIB_PATH` here, but a CLI run (or anything under sudo,
+    /// which scrubs the variable) arrives without it.
+    const PACKAGED_ORT: &str = "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so";
+
+    /// Resolve the onnxruntime library BEFORE ort touches it.
+    ///
+    /// `load-dynamic`'s failure mode for an unresolvable library is not an
+    /// error: the loader walks its paths and the process then parks forever in
+    /// a futex with no output (straced on 2026-08-04, #266). So this settles
+    /// resolvability first, three ways in order: an explicit `ORT_DYLIB_PATH`
+    /// is verified to exist (a wrong value gets the actionable message, not
+    /// the park); with none set, the packaged copy is used when present, which
+    /// is what lets a bare `irlume` command work at all; failing both, a
+    /// `dlopen` probe asks the real loader, so a distro-managed copy anywhere
+    /// the loader looks (hwcaps subdirectories included) still passes. Only
+    /// when all three fail does this error, naming the fix.
+    fn ensure_ort_resolvable() -> irlume_common::Result<()> {
+        use std::sync::OnceLock;
+        static VERDICT: OnceLock<Result<(), String>> = OnceLock::new();
+        VERDICT
+            .get_or_init(|| {
+                if let Some(p) = std::env::var_os("ORT_DYLIB_PATH") {
+                    let path = std::path::Path::new(&p);
+                    if path.is_file() {
+                        return Ok(());
+                    }
+                    return Err(format!(
+                        "ORT_DYLIB_PATH points at {} which does not exist; the irlume \
+                         packages install it at {PACKAGED_ORT} (sudo drops the variable: \
+                         pass it with `sudo env ORT_DYLIB_PATH=...`)",
+                        path.display()
+                    ));
+                }
+                if std::path::Path::new(PACKAGED_ORT).is_file() {
+                    std::env::set_var("ORT_DYLIB_PATH", PACKAGED_ORT);
+                    return Ok(());
+                }
+                // SAFETY: dlopen/dlclose with a valid NUL-terminated name; the
+                // handle is closed immediately, the probe only asks whether
+                // the loader can resolve the soname ort will ask for.
+                let resolvable = unsafe {
+                    let h = libc::dlopen(
+                        c"libonnxruntime.so".as_ptr(),
+                        libc::RTLD_NOW | libc::RTLD_LOCAL,
+                    );
+                    if h.is_null() {
+                        false
+                    } else {
+                        libc::dlclose(h);
+                        true
+                    }
+                };
+                if resolvable {
+                    return Ok(());
+                }
+                Err(format!(
+                    "libonnxruntime.so was not found (no ORT_DYLIB_PATH, nothing at \
+                     {PACKAGED_ORT}, and the system loader cannot resolve it); install \
+                     the irlume package's onnxruntime or set ORT_DYLIB_PATH"
+                ))
+            })
+            .clone()
+            .map_err(irlume_common::Error::Hardware)
+    }
+
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
+        ensure_ort_resolvable()?;
         #[allow(unused_mut)]
         let mut b = Session::builder().map_err(err)?;
         // Register a hardware execution provider if compiled in (cf. howrs).

@@ -1033,6 +1033,7 @@ version = "0.8.1"
 dependencies = [
  "irlume-camera",
  "irlume-common",
+ "libc",
  "ort",
  "rustfft",
  "thiserror 2.0.19",

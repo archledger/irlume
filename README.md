@@ -279,14 +279,19 @@ Every claim here maps to something you can run on your own machine:
 The current gaps:
 
 - **A printed photograph of an enrolled face passes the built-in gate.** Not
-  occasionally: a flat vinyl print of the enrolled face was accepted in 22 of 24
-  measured presentations, and the cue that should reject it cannot be tuned to.
-  It is a brightness ratio on a 2D infrared sensor, and a life-size print held at
-  an angle produces the same falloff a face does (1.02 to 1.58 over 70 varied
-  presentations, against 1.26 to 1.49 for the live user), so no threshold accepts
-  the user and rejects the print. `sudo irlume models enable flir` adds the
-  trained cue that denied the same print at p_fake 0.999 and above; it is opt-in
-  because of licensing (ADR-0001), not doubt. Passive blink liveness also
+  occasionally: the
+  [2026-06-30 self-test](docs/pad-results/2026-06-30-ir-liveness-selftest.md)
+  accepted a life-size glossy vinyl print of the enrolled face in 69 of 70
+  presentations, and the cue that should reject it cannot be tuned to. It is a
+  brightness ratio on a 2D infrared sensor, and a life-size print held at an
+  angle produces the same falloff a face does (1.02 to 1.58 over those 70
+  presentations, against 1.26 to 1.49 for the live user), so no threshold
+  accepts the user and rejects the print. `sudo irlume models enable flir` adds
+  a trained, deny-only cue that flagged all 6 presentations of the same print
+  that reached it, at p_fake 0.941 to 1.000; that evidence covers one subject
+  and one print instrument. It is opt-in because its publisher documents
+  neither the training data nor a way to reproduce the model, which fails
+  [ADR-0001](docs/adr/0001-liveness-pad-strategy.md). Passive blink liveness also
   **doesn't cover glasses-wearers** (IR lens reflections hide the eyelid). Every
   miss falls **safely to the password**. See
   [ADR-0002](docs/adr/0002-challenge-response-liveness.md) and the
@@ -440,8 +445,10 @@ is the trade: the challenge closes a spoof gap the default single-frame gate
 cannot, at about four times the latency.
 
 It is off by default. Turn it on with `irlume profiles challenge on` if you
-want the extra deterrent, or leave it off for the ~2.5-second login; the
-default IR-structure gate already rejects photos, screens, and video replays.
+want the extra deterrent, or leave it off for the ~2.5-second login. The
+default IR-structure gate rejected the tested screens, video replays, and
+matte-paper photos, but a glossy vinyl print of the enrolled face passed it;
+see [Honest limitations](#-honest-limitations).
 </details>
 
 ## 📚 Documentation
@@ -469,10 +476,12 @@ plus a fingerprint; Arch is validated for packaging and the CLI/daemon on a
 camera-less testbed. Packaged for all three families (Copr · AUR · PPA).
 Interfaces may still shift before 1.0.
 
-- ✅ **Presentation attacks tested and denied** on a NexiGo N930W: printed photo
-  (including in direct sunlight), laptop screen, phone screen at full brightness,
-  and a video replay with real head motion. All rejected at the infrared stage;
-  a physical 3D mask is not yet tested ([contributions welcome](#-contributing--license)).
+- ⚠️ **Presentation attacks tested** on a NexiGo N930W: laptop screen, phone
+  screen at full brightness, a video replay with real head motion, and a
+  matte-paper photo (including in direct sunlight) were rejected at the infrared
+  stage. A life-size glossy vinyl print of the enrolled face passed the built-in
+  gate; see [Honest limitations](#-honest-limitations). A physical 3D mask is
+  not yet tested ([contributions welcome](#-contributing--license)).
 - ✅ **TPM sealing picks the strongest tier the machine supports** (signed-PCR →
   pcrlock → literal PCR-7) and round-trip-verifies it before trusting it, so a
   policy that cannot unseal on this boot never holds the secret.

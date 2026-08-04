@@ -3390,6 +3390,87 @@ fn doctor_run(
         dout!(report, "  ⚠ {}: {cause}", paths.join(", "));
     }
 
+    // --- stream vs the Windows Hello minimums (#223) -----------------------
+    // A line, not a gate: an under-spec stream still authenticates, but the
+    // cue set was designed around the published Hello envelope, and a smaller
+    // face means fewer pixels behind the centre/edge ratio while a lower rate
+    // means fewer usable frames per burst. Saying so is what the user can act
+    // on; refusing would break cameras that work fine.
+    {
+        let (rgb_node, ir_node) = irlume_camera::select_pair();
+        let checks: [(
+            &str,
+            &str,
+            irlume_camera::Role,
+            &str,
+            &irlume_camera::StreamMinimum,
+        ); 2] = [
+            (
+                "ir-stream-hello-minimum",
+                "IR",
+                irlume_camera::Role::Ir,
+                &ir_node,
+                &irlume_camera::HELLO_IR_MIN,
+            ),
+            (
+                "rgb-stream-hello-minimum",
+                "RGB",
+                irlume_camera::Role::Rgb,
+                &rgb_node,
+                &irlume_camera::HELLO_RGB_MIN,
+            ),
+        ];
+        for (id, label, role, node, min) in checks {
+            // A spectrum with no node is simply not reported on, like a
+            // missing PAM surface in the fingerprint coverage table.
+            if !std::path::Path::new(node).exists() {
+                continue;
+            }
+            let floor = format!("{}x{}@{}fps", min.width, min.height, min.fps);
+            match irlume_camera::negotiated_stream(node, role) {
+                Ok(spec) => {
+                    let rate = match spec.fps {
+                        Some(fps) => format!("@{fps:.0}fps"),
+                        None => String::new(),
+                    };
+                    let shown = format!("{}x{}{rate} {}", spec.width, spec.height, spec.fourcc);
+                    match spec.meets(min) {
+                        Some(true) => {
+                            dout!(
+                                report,
+                                "[doctor] {label} stream: {shown} ✓ (Windows Hello minimum {floor})"
+                            );
+                            report.check_detail(id, State::Pass, &shown);
+                        }
+                        Some(false) => {
+                            dout!(
+                                report,
+                                "[doctor] {label} stream: {shown} ⚠ below the Windows Hello \
+                                 minimum {floor} irlume's cues were designed around; captures \
+                                 work, but expect weaker liveness margins on this module"
+                            );
+                            report.check_detail(id, State::Warn, &shown);
+                        }
+                        None => {
+                            dout!(
+                                report,
+                                "[doctor] {label} stream: {shown}; dimensions meet the Windows \
+                                 Hello minimum {floor}, the driver reports no frame rate"
+                            );
+                            report.check_detail(id, State::Info, &shown);
+                        }
+                    }
+                }
+                // Could not negotiate is "could not look" (the camera may be
+                // mid-capture by the daemon), never silence and never a warn.
+                Err(e) => {
+                    dout!(report, "[doctor] {label} stream: not readable now ({e})");
+                    report.check_detail(id, State::Unknown, e.to_string());
+                }
+            }
+        }
+    }
+
     // --- models / runtime --------------------------------------------------
     dout!(report, "[doctor] models:");
     if commands::daemon_models_loaded() == Some(true) {

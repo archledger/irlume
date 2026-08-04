@@ -1206,14 +1206,6 @@ impl RgbCamera {
             )));
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-        // Best-effort backlight/low-light correction: tell auto-exposure to
-        // expose for the face, not a bright window behind it. Harmless if
-        // unsupported (NexiGo N930W needs this; verified mean 49→124 + face
-        // detected).
-        let _ = dev.set_control(v4l::control::Control {
-            id: V4L2_CID_BACKLIGHT_COMPENSATION,
-            value: v4l::control::Value::Integer(2),
-        });
         // Pick an uncompressed format the camera actually offers. Some webcams
         // advertise RGB only as MJPEG (or NV12) and reject YUYV; classify()
         // still labels them usable, so without this negotiation they would
@@ -1242,12 +1234,110 @@ impl RgbCamera {
     /// stream until it is dropped, so keep it exactly as long as the burst of
     /// captures that needs it and no longer.
     pub fn session(&self) -> irlume_common::Result<RgbSession<'_>> {
+        // Best-effort backlight/low-light correction: tell auto-exposure to
+        // expose for the face, not a bright window behind it. Harmless if
+        // unsupported (NexiGo N930W needs this; verified mean 49→124 + face
+        // detected). Written here rather than in `open` so that opening for a
+        // read-only purpose (doctor's stream report) changes nothing on the
+        // camera; AE settles during this session's warm-up either way, and the
+        // write is idempotent across repeated sessions.
+        let _ = self.dev.set_control(v4l::control::Control {
+            id: V4L2_CID_BACKLIGHT_COMPENSATION,
+            value: v4l::control::Value::Integer(2),
+        });
         let stream = SafeStream::open(&self.device, &self.dev)?;
         Ok(RgbSession {
             cam: self,
             stream,
             warmed: false,
         })
+    }
+
+    /// The stream this open camera negotiated. See [`negotiated_stream`].
+    pub fn spec(&self) -> StreamSpec {
+        StreamSpec {
+            width: self.width,
+            height: self.height,
+            fourcc: fourcc_str(&self.chosen),
+            fps: driver_fps(&self.dev),
+        }
+    }
+}
+
+/// The negotiated stream of a camera, for the doctor report (#223).
+#[derive(Clone, Debug)]
+pub struct StreamSpec {
+    pub width: u32,
+    pub height: u32,
+    /// The negotiated pixel format's fourcc, e.g. "GREY" or "YUYV".
+    pub fourcc: String,
+    /// Frames per second from the driver's reported capture interval. `None`
+    /// when the driver does not report one; irlume never sets a rate, so this
+    /// is the default the stream would actually run at.
+    pub fps: Option<f64>,
+}
+
+/// A published stream floor to compare a [`StreamSpec`] against.
+pub struct StreamMinimum {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
+
+/// Windows Hello's published stream minimums, the envelope irlume's cue set
+/// was designed around. Microsoft's UVC camera implementation guide
+/// (learn.microsoft.com, "UVC camera implementation guide"): "Windows Hello
+/// has a minimum requirement of 480x480@7.5fps for the RGB stream and
+/// 340x340@15fps for the IR stream."
+pub const HELLO_IR_MIN: StreamMinimum = StreamMinimum {
+    width: 340,
+    height: 340,
+    fps: 15.0,
+};
+pub const HELLO_RGB_MIN: StreamMinimum = StreamMinimum {
+    width: 480,
+    height: 480,
+    fps: 7.5,
+};
+
+impl StreamSpec {
+    /// Whether this stream meets `min`. `Some(false)` when a dimension or a
+    /// reported rate is below it; `None` when the dimensions meet it but the
+    /// driver reports no rate, which is "cannot say", not "meets": collapsing
+    /// an unobserved rate into a pass would make the one unreadable driver
+    /// look like the one that cleared the bar.
+    pub fn meets(&self, min: &StreamMinimum) -> Option<bool> {
+        if self.width < min.width || self.height < min.height {
+            return Some(false);
+        }
+        self.fps.map(|fps| fps >= min.fps)
+    }
+}
+
+/// The driver's reported capture rate for `dev`, from VIDIOC_G_PARM. The
+/// interval is time-per-frame, so the rate is its inverse; a zero on either
+/// side of the fraction means the driver reports nothing usable.
+fn driver_fps(dev: &Device) -> Option<f64> {
+    let p = Capture::params(dev).ok()?;
+    let (num, den) = (p.interval.numerator, p.interval.denominator);
+    if num == 0 || den == 0 {
+        return None;
+    }
+    Some(f64::from(den) / f64::from(num))
+}
+
+/// What the capture path would negotiate on `device`, without streaming: the
+/// same verify + privacy + format walk as [`RgbCamera::open`] /
+/// [`IrCamera::open`], no buffers allocated, capture LED off. Reusing the real
+/// open is the point: a parallel reimplementation here could drift from what
+/// capture actually does, and this feeds a report people act on (#223).
+pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<StreamSpec> {
+    match role {
+        Role::Rgb => Ok(RgbCamera::open(device)?.spec()),
+        Role::Ir => Ok(IrCamera::open(device)?.spec()),
+        _ => Err(Error::Hardware(format!(
+            "{device}: no stream to negotiate for this role"
+        ))),
     }
 }
 
@@ -1746,6 +1836,9 @@ pub struct IrCamera {
     /// The driver's reported quantization for the negotiated format, which is
     /// half of what names the clipping ceiling; see [`clipping_white_level`].
     quantization: Quantization,
+    /// The negotiated fourcc, kept for [`Self::spec`]: `pix` names how the
+    /// bytes decode, not which of several fourccs mapped to it.
+    fourcc: String,
     width: u32,
     height: u32,
     card: String,
@@ -1767,10 +1860,21 @@ impl IrCamera {
             dev,
             pix,
             quantization: fmt.quantization,
+            fourcc: fourcc_str(&fmt.fourcc.repr),
             width: fmt.width,
             height: fmt.height,
             card,
         })
+    }
+
+    /// The stream this open camera negotiated. See [`negotiated_stream`].
+    pub fn spec(&self) -> StreamSpec {
+        StreamSpec {
+            width: self.width,
+            height: self.height,
+            fourcc: self.fourcc.clone(),
+            fps: driver_fps(&self.dev),
+        }
     }
 
     /// Start streaming and fire the emitter.
@@ -3138,6 +3242,34 @@ fn warm_up_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_minimum_verdicts_cover_all_three_outcomes() {
+        let spec = |w, h, fps| StreamSpec {
+            width: w,
+            height: h,
+            fourcc: "GREY".into(),
+            fps,
+        };
+        // The measured ASUS module shape: comfortably above the IR floor.
+        assert_eq!(spec(640, 400, Some(30.0)).meets(&HELLO_IR_MIN), Some(true));
+        // At the floor exactly is meeting it, not below it.
+        assert_eq!(spec(340, 340, Some(15.0)).meets(&HELLO_IR_MIN), Some(true));
+        // ONE dimension below fails, even with plenty of rate; 640x240 has
+        // fewer face pixels than the envelope no matter its width.
+        assert_eq!(spec(640, 240, Some(30.0)).meets(&HELLO_IR_MIN), Some(false));
+        // A reported rate below the floor fails.
+        assert_eq!(spec(640, 400, Some(10.0)).meets(&HELLO_IR_MIN), Some(false));
+        // Dimensions meet, rate unreported: cannot say, which must stay
+        // distinct from a pass (an unobserved rate is not an adequate one).
+        assert_eq!(spec(640, 400, None).meets(&HELLO_IR_MIN), None);
+        // Dimensions below with rate ALSO unreported is still a definite
+        // below, not an unknown: the dimensions alone decide it.
+        assert_eq!(spec(320, 240, None).meets(&HELLO_IR_MIN), Some(false));
+        // The RGB floor has a fractional rate; just below it fails.
+        assert_eq!(spec(640, 480, Some(7.0)).meets(&HELLO_RGB_MIN), Some(false));
+        assert_eq!(spec(640, 480, Some(7.5)).meets(&HELLO_RGB_MIN), Some(true));
+    }
 
     fn unreadable(at: FailedAt, errno: Option<i32>, holder: Option<&str>) -> Unreadable {
         Unreadable {

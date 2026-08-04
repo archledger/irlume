@@ -206,6 +206,8 @@ reused for a different meaning. The registry as of this contract:
 | `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
 | `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths |
+| `ir-stream-hello-minimum` | the negotiated IR stream compared with the published Windows Hello IR minimum (340x340@15fps). `info` when no IR node is selected or the dimensions meet it with no reported rate; `unknown` when the node cannot be negotiated right now |
+| `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
 | `ort-dylib-path` | which ONNX runtime library will be loaded |
 | `third-party-pad-model` | optional third-party presentation-attack weights, if installed |

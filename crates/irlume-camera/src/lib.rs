@@ -1315,30 +1315,104 @@ impl StreamSpec {
 }
 
 /// The driver's reported capture rate for `dev`, from VIDIOC_G_PARM. The
-/// interval is time-per-frame, so the rate is its inverse; a zero on either
-/// side of the fraction means the driver reports nothing usable.
+/// interval is time-per-frame, so the rate is its inverse.
 fn driver_fps(dev: &Device) -> Option<f64> {
-    let p = Capture::params(dev).ok()?;
-    let (num, den) = (p.interval.numerator, p.interval.denominator);
-    if num == 0 || den == 0 {
-        return None;
-    }
-    Some(f64::from(den) / f64::from(num))
+    fps_from_params(Capture::params(dev).ok()?)
 }
 
-/// What the capture path would negotiate on `device`, without streaming: the
-/// same verify + privacy + format walk as [`RgbCamera::open`] /
-/// [`IrCamera::open`], no buffers allocated, capture LED off. Reusing the real
-/// open is the point: a parallel reimplementation here could drift from what
-/// capture actually does, and this feeds a report people act on (#223).
-pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<StreamSpec> {
-    match role {
-        Role::Rgb => Ok(RgbCamera::open(device)?.spec()),
-        Role::Ir => Ok(IrCamera::open(device)?.spec()),
-        _ => Err(Error::Hardware(format!(
-            "{device}: no stream to negotiate for this role"
-        ))),
+/// [`driver_fps`]'s conversion, split out so the capability rule is testable
+/// without hardware. V4L2 specifies that `timeperframe` is meaningful only
+/// when the driver sets `V4L2_CAP_TIMEPERFRAME`; without the flag the fields
+/// are whatever the driver left in the struct, and reading a plausible-looking
+/// `1/30` there would let an unestablished rate publish as a pass. A zero on
+/// either side of the fraction is equally unusable.
+fn fps_from_params(p: v4l::video::capture::Parameters) -> Option<f64> {
+    if !p
+        .capabilities
+        .contains(v4l::parameters::Capabilities::TIME_PER_FRAME)
+    {
+        return None;
     }
+    let (num, den) = (p.interval.numerator, p.interval.denominator);
+    (num != 0 && den != 0).then(|| f64::from(den) / f64::from(num))
+}
+
+/// `VIDIOC_TRY_FMT`: what `VIDIOC_S_FMT` would negotiate, without changing
+/// driver state. The kernel specifies TRY_FMT as S_FMT's stateless twin (same
+/// adjustment logic, no hardware preparation), which is what lets the doctor
+/// report read a camera without mutating it. The pinned v4l crate exposes only
+/// `set_format`, so this is the same raw-ioctl shape as the VIDIOC_ENUM_FMT
+/// probe above.
+fn try_format(dev: &Device, fmt: &Format) -> std::io::Result<Format> {
+    let mut wire: v4l::v4l_sys::v4l2_format = unsafe { std::mem::zeroed() };
+    wire.type_ = v4l::buffer::Type::VideoCapture as u32;
+    wire.fmt.pix = (*fmt).into();
+    // SAFETY: `dev` owns the fd for the length of this call, and `wire` is a
+    // correctly sized v4l2_format with the pix union arm initialized, which is
+    // what VIDIOC_TRY_FMT reads and writes.
+    let rc = unsafe {
+        libc::ioctl(
+            dev.handle().fd(),
+            v4l::v4l2::vidioc::VIDIOC_TRY_FMT,
+            &mut wire as *mut _ as *mut libc::c_void,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Format::from(unsafe { wire.fmt.pix }))
+}
+
+/// What the capture path would negotiate on `device`, observed read-only: the
+/// same verify + privacy checks and the same candidate walks as
+/// [`RgbCamera::open`] / [`IrCamera::open`], applied through `VIDIOC_TRY_FMT`
+/// instead of `VIDIOC_S_FMT`, so nothing on the camera changes. No buffers,
+/// no streaming, LED off. The candidate selection is shared with the real
+/// open paths rather than reimplemented, so this report cannot drift from
+/// what capture actually asks for (#223).
+pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<StreamSpec> {
+    verify_pinned(device)?;
+    if privacy_engaged(device) {
+        return Err(Error::Hardware(format!(
+            "{device}: hardware privacy switch is ON"
+        )));
+    }
+    let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    let (fmt, fourcc) = match role {
+        Role::Rgb => {
+            let chosen = negotiate_rgb_format(device, &dev)?;
+            let fmt = try_format(&dev, &Format::new(RGB_W, RGB_H, FourCC::new(&chosen)))
+                .map_err(|e| map_io(device, e))?;
+            // Mirror open()'s echo check: a driver that answers with a
+            // different fourcc would fail capture, so it must not report as a
+            // negotiated stream here.
+            if fmt.fourcc.repr != chosen {
+                return Err(Error::Hardware(format!(
+                    "{device}: driver gave {}, expected {}",
+                    fourcc_str(&fmt.fourcc.repr),
+                    fourcc_str(&chosen)
+                )));
+            }
+            let cc = fourcc_str(&fmt.fourcc.repr);
+            (fmt, cc)
+        }
+        Role::Ir => {
+            let (fmt, _pix) = negotiate_ir_format_via(device, &dev, try_format)?;
+            let cc = fourcc_str(&fmt.fourcc.repr);
+            (fmt, cc)
+        }
+        _ => {
+            return Err(Error::Hardware(format!(
+                "{device}: no stream to negotiate for this role"
+            )))
+        }
+    };
+    Ok(StreamSpec {
+        width: fmt.width,
+        height: fmt.height,
+        fourcc,
+        fps: driver_fps(&dev),
+    })
 }
 
 /// A running RGB stream. Every capture after the first skips the warm-up.
@@ -1585,6 +1659,19 @@ const IR_CANDIDATES: [(&[u8; 4], IrPixel); 8] = [
 /// walk [`IR_CANDIDATES`] against what the driver advertises, accept the first
 /// one the driver echoes back, and fail with a message naming what it offers.
 fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(Format, IrPixel)> {
+    negotiate_ir_format_via(device, dev, Capture::set_format)
+}
+
+/// The IR candidate walk with the format ioctl injected: capture applies it
+/// through `VIDIOC_S_FMT` ([`negotiate_ir_format`]) while the doctor's
+/// read-only probe applies the SAME walk through `VIDIOC_TRY_FMT`
+/// ([`negotiated_stream`]). One walk, two ioctls, so the probe cannot drift
+/// from what capture negotiates.
+fn negotiate_ir_format_via(
+    device: &str,
+    dev: &Device,
+    apply: impl Fn(&Device, &Format) -> std::io::Result<Format>,
+) -> irlume_common::Result<(Format, IrPixel)> {
     let offered: Vec<[u8; 4]> = Capture::enum_formats(dev)
         .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
         .unwrap_or_default();
@@ -1595,7 +1682,7 @@ fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(For
             continue;
         }
         let fmt = Format::new(IR_W, IR_H, FourCC::new(cc));
-        let fmt = Capture::set_format(dev, &fmt).map_err(|e| map_io(device, e))?;
+        let fmt = apply(dev, &fmt).map_err(|e| map_io(device, e))?;
         if &fmt.fourcc.repr == cc {
             return Ok((fmt, pix));
         }
@@ -3242,6 +3329,23 @@ fn warm_up_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rate_without_the_timeperframe_capability_is_unknown() {
+        // V4L2 defines timeperframe as meaningful only under
+        // V4L2_CAP_TIMEPERFRAME; without the flag the fraction is residue, and
+        // a plausible 1/30 there must not publish as an established rate.
+        let mut p = v4l::video::capture::Parameters::with_fps(30);
+        p.capabilities = v4l::parameters::Capabilities::from(0);
+        assert_eq!(fps_from_params(p), None);
+        // With the flag the same fraction is a real 30fps.
+        p.capabilities = v4l::parameters::Capabilities::TIME_PER_FRAME;
+        assert_eq!(fps_from_params(p), Some(30.0));
+        // A zero numerator or denominator is unusable even when capable.
+        let mut z = v4l::video::capture::Parameters::new(v4l::Fraction::new(0, 30));
+        z.capabilities = v4l::parameters::Capabilities::TIME_PER_FRAME;
+        assert_eq!(fps_from_params(z), None);
+    }
 
     #[test]
     fn hello_minimum_verdicts_cover_all_three_outcomes() {

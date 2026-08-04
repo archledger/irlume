@@ -3153,6 +3153,96 @@ fn doctor(args: &[String]) -> std::process::ExitCode {
     doctor_run(&mut report, args)
 }
 
+/// The negotiated streams against the Windows Hello minimums (#223).
+///
+/// A line, not a gate: an under-spec stream still authenticates, but a smaller
+/// face means fewer pixels behind the centre/edge ratio while a lower rate
+/// means fewer usable frames per burst. Saying so is what the user can act on;
+/// refusing would break cameras that work fine.
+///
+/// Both check ids are ALWAYS emitted, whatever this machine has: the machine
+/// API's contract is that a check never disappears because it had nothing to
+/// say, so an absent node reports Info rather than vanishing. Split from
+/// `doctor_run` so a test can drive it against chosen paths; the camera nodes
+/// come from `select_pair` at the call site.
+fn stream_minimum_checks(report: &mut crate::doctor_report::Report, rgb_node: &str, ir_node: &str) {
+    use crate::doctor_report::State;
+    let checks: [(
+        &str,
+        &str,
+        irlume_camera::Role,
+        &str,
+        &irlume_camera::StreamMinimum,
+    ); 2] = [
+        (
+            "ir-stream-hello-minimum",
+            "IR",
+            irlume_camera::Role::Ir,
+            ir_node,
+            &irlume_camera::HELLO_IR_MIN,
+        ),
+        (
+            "rgb-stream-hello-minimum",
+            "RGB",
+            irlume_camera::Role::Rgb,
+            rgb_node,
+            &irlume_camera::HELLO_RGB_MIN,
+        ),
+    ];
+    for (id, label, role, node, min) in checks {
+        if !std::path::Path::new(node).exists() {
+            dout!(report, "[doctor] {label} stream: no selected node");
+            report.check_detail(id, State::Info, "no selected node");
+            continue;
+        }
+        let floor = format!("{}x{}@{}fps", min.width, min.height, min.fps);
+        match irlume_camera::negotiated_stream(node, role) {
+            Ok(spec) => {
+                // Two decimals, because the floor itself is fractional
+                // (7.5fps) and a 14.9 rounded to 15 would print a value that
+                // contradicts the verdict beside it.
+                let rate = match spec.fps {
+                    Some(fps) => format!("@{fps:.2}fps"),
+                    None => String::new(),
+                };
+                let shown = format!("{}x{}{rate} {}", spec.width, spec.height, spec.fourcc);
+                match spec.meets(min) {
+                    Some(true) => {
+                        dout!(
+                            report,
+                            "[doctor] {label} stream: {shown} ✓ (Windows Hello minimum {floor})"
+                        );
+                        report.check_detail(id, State::Pass, &shown);
+                    }
+                    Some(false) => {
+                        dout!(
+                            report,
+                            "[doctor] {label} stream: {shown} ⚠ below the published Windows \
+                             Hello minimum {floor}; captures work, but expect weaker liveness \
+                             margins on this module"
+                        );
+                        report.check_detail(id, State::Warn, &shown);
+                    }
+                    None => {
+                        dout!(
+                            report,
+                            "[doctor] {label} stream: {shown}; dimensions meet the Windows \
+                             Hello minimum {floor}, the driver reports no frame rate"
+                        );
+                        report.check_detail(id, State::Info, &shown);
+                    }
+                }
+            }
+            // Could not negotiate is "could not look" (the camera may be
+            // mid-capture by the daemon), never silence and never a warn.
+            Err(e) => {
+                dout!(report, "[doctor] {label} stream: not readable now ({e})");
+                report.check_detail(id, State::Unknown, e.to_string());
+            }
+        }
+    }
+}
+
 /// One pass over the machine. Prints the human report or stays silent and
 /// records, depending on `report`.
 /// `args` carries `--user`, which doctor reports on in eight per-user lines.
@@ -3391,84 +3481,9 @@ fn doctor_run(
     }
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------
-    // A line, not a gate: an under-spec stream still authenticates, but the
-    // cue set was designed around the published Hello envelope, and a smaller
-    // face means fewer pixels behind the centre/edge ratio while a lower rate
-    // means fewer usable frames per burst. Saying so is what the user can act
-    // on; refusing would break cameras that work fine.
     {
         let (rgb_node, ir_node) = irlume_camera::select_pair();
-        let checks: [(
-            &str,
-            &str,
-            irlume_camera::Role,
-            &str,
-            &irlume_camera::StreamMinimum,
-        ); 2] = [
-            (
-                "ir-stream-hello-minimum",
-                "IR",
-                irlume_camera::Role::Ir,
-                &ir_node,
-                &irlume_camera::HELLO_IR_MIN,
-            ),
-            (
-                "rgb-stream-hello-minimum",
-                "RGB",
-                irlume_camera::Role::Rgb,
-                &rgb_node,
-                &irlume_camera::HELLO_RGB_MIN,
-            ),
-        ];
-        for (id, label, role, node, min) in checks {
-            // A spectrum with no node is simply not reported on, like a
-            // missing PAM surface in the fingerprint coverage table.
-            if !std::path::Path::new(node).exists() {
-                continue;
-            }
-            let floor = format!("{}x{}@{}fps", min.width, min.height, min.fps);
-            match irlume_camera::negotiated_stream(node, role) {
-                Ok(spec) => {
-                    let rate = match spec.fps {
-                        Some(fps) => format!("@{fps:.0}fps"),
-                        None => String::new(),
-                    };
-                    let shown = format!("{}x{}{rate} {}", spec.width, spec.height, spec.fourcc);
-                    match spec.meets(min) {
-                        Some(true) => {
-                            dout!(
-                                report,
-                                "[doctor] {label} stream: {shown} ✓ (Windows Hello minimum {floor})"
-                            );
-                            report.check_detail(id, State::Pass, &shown);
-                        }
-                        Some(false) => {
-                            dout!(
-                                report,
-                                "[doctor] {label} stream: {shown} ⚠ below the Windows Hello \
-                                 minimum {floor} irlume's cues were designed around; captures \
-                                 work, but expect weaker liveness margins on this module"
-                            );
-                            report.check_detail(id, State::Warn, &shown);
-                        }
-                        None => {
-                            dout!(
-                                report,
-                                "[doctor] {label} stream: {shown}; dimensions meet the Windows \
-                                 Hello minimum {floor}, the driver reports no frame rate"
-                            );
-                            report.check_detail(id, State::Info, &shown);
-                        }
-                    }
-                }
-                // Could not negotiate is "could not look" (the camera may be
-                // mid-capture by the daemon), never silence and never a warn.
-                Err(e) => {
-                    dout!(report, "[doctor] {label} stream: not readable now ({e})");
-                    report.check_detail(id, State::Unknown, e.to_string());
-                }
-            }
-        }
+        stream_minimum_checks(report, &rgb_node, &ir_node);
     }
 
     // --- models / runtime --------------------------------------------------
@@ -4063,6 +4078,28 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn stream_minimum_checks_emit_both_ids_even_with_no_nodes() {
+        // The machine API's completeness contract: a check never disappears
+        // because it had nothing to say. A machine with no camera at all must
+        // still carry both stream ids, as Info, or a consumer cannot tell an
+        // older engine from a camera-less machine.
+        let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Collect);
+        stream_minimum_checks(
+            &mut report,
+            "/dev/irlume-test-no-such-rgb",
+            "/dev/irlume-test-no-such-ir",
+        );
+        let checks = report.into_checks();
+        for id in ["ir-stream-hello-minimum", "rgb-stream-hello-minimum"] {
+            assert_eq!(
+                checks.iter().filter(|c| c.id == id).count(),
+                1,
+                "{id} must appear exactly once"
+            );
+        }
     }
 
     #[test]

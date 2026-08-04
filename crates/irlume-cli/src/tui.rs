@@ -2918,11 +2918,19 @@ impl App {
                 // would delete the keyring's live credential. That flow needs
                 // a password prompt and the control socket, so route it to the
                 // CLI rather than duplicating it in TUI state.
-                if self.keyring_kind == Some(irlume_common::KeyringSecretKind::GnomeKeyringToken) {
+                // Anything other than a confirmed non-token refuses here.
+                // `None` means an older daemon or an envelope it could not
+                // parse, and erasing a token envelope on that reading leaves
+                // the login keyring encrypted under a secret nothing can
+                // reproduce. The CLI has the re-key flow and the --force
+                // escape; this screen has neither, so it defers.
+                if self.keyring_kind != Some(irlume_common::KeyringSecretKind::LoginPassword)
+                    && self.keyring_kind != Some(irlume_common::KeyringSecretKind::KdeWalletKey)
+                {
                     self.log(
                         '!',
-                        "this arm is a keyring token; run `irlume keyring forget` in a \
-                         terminal (it re-keys the keyring back to your password first)",
+                        "cannot confirm this is safe to erase from here; run `irlume keyring \
+                         forget` in a terminal (it re-keys a token back to your password first)",
                     );
                     return;
                 }
@@ -6945,6 +6953,20 @@ mod tests {
             _ => panic!("expected the reseal password prompt"),
         }
         app.input = None;
+
+        // An unidentified arm must NOT offer the plain erase: `None` is what an
+        // older daemon reports and what an unparseable envelope reports, and
+        // erasing a GNOME keyring token on that reading leaves the login
+        // keyring encrypted under a secret nothing can reproduce.
+        app.keyring_kind = None;
+        app.on_key(KeyCode::Char('f'));
+        assert!(
+            app.confirm.is_none(),
+            "an unknown keyring kind must not reach the erase confirm"
+        );
+
+        // A confirmed password arm is safe to erase from here.
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
         app.on_key(KeyCode::Char('f'));
         match &app.confirm {
             Some((q, _, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {

@@ -54,12 +54,28 @@ pub fn run(args: &[String]) -> ExitCode {
     // disarmed from their own session; this is a data-loss guard, so there is
     // deliberately no flag to bypass it (`irlume keyring forget --force` per
     // user is the explicit, per-user override).
-    let token_users: Vec<String> = irlume_core::storage::list_users()
-        .into_iter()
-        .filter(|u| {
-            irlume_core::keyring::sealed_kind(u)
-                == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)
-        })
+    // Enumerate ENVELOPES, not enrolled users: `keyring arm` needs no
+    // enrollment, so a user can hold a sealed token and never appear in
+    // `storage::list_users()`. And an envelope this cannot READ is not an
+    // envelope that holds no token; the enumerator errors rather than skipping,
+    // because guessing here erases the only copy of the secret a login keyring
+    // is encrypted under.
+    let sealed = match irlume_core::keyring::list_sealed_kinds() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[uninstall] refusing: could not read the sealed-envelope store ({e}). \
+                 One of these may hold a GNOME keyring token, and deleting it would \
+                 leave that keyring encrypted under a secret nothing can reproduce. \
+                 Fix the store (or move it aside deliberately) and re-run."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let token_users: Vec<&str> = sealed
+        .iter()
+        .filter(|(_, kind)| *kind == irlume_core::envelope::SecretKind::GnomeKeyringToken)
+        .map(|(u, _)| u.as_str())
         .collect();
     if !token_users.is_empty() {
         eprintln!(

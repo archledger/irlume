@@ -517,7 +517,39 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
         // EOF tells the helper the token is complete.
         drop(sin);
     }
-    matches!(child.wait(), Ok(status) if status.success())
+    // Bounded, because this is the PAM session phase and the login blocks on
+    // it. The helper has its own deadlines on the socket, but a wedged or
+    // stopped child would otherwise hang the login here; the helper's own
+    // ceiling plus a margin is the budget, and a child still running past it
+    // is killed rather than waited on.
+    wait_bounded(&mut child, HELPER_BUDGET)
+}
+
+/// Ceiling on the unlock helper: its own socket deadlines are 10s, so this is
+/// that plus room to start and exit.
+const HELPER_BUDGET: Duration = Duration::from_secs(15);
+
+/// Reap `child`, giving up (and killing it) after `budget`.
+///
+/// `Child::wait` has no timeout, and polling `try_wait` is the only way to put
+/// a ceiling on it without another thread. The poll interval is coarse on
+/// purpose: this runs once per login and the common case exits immediately.
+fn wait_bounded(child: &mut std::process::Child, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// One verify attempt (sudo / in-session unlock): no password released.

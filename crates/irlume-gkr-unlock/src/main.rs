@@ -26,7 +26,7 @@
 use irlume_common::gkr_wire::{self, ControlResult, Op};
 use std::ffi::CString;
 use std::io::Read;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -106,13 +106,7 @@ fn run(user: &str) -> Result<(), String> {
     drop_privileges(&pw)?;
 
     let sock = gkr_wire::control_socket_path(&runtime_dir);
-    let mut stream = UnixStream::connect(&sock).map_err(|e| {
-        format!(
-            "connect {}: {e} (no gnome-keyring-daemon control socket; is \
-             gnome-keyring installed and socket-activated?)",
-            sock.display()
-        )
-    })?;
+    let mut stream = connect_with_deadline(&sock)?;
     // The daemon applies NO timeout of its own to a control connection
     // (`gkd-control-server.c` drives the fd from the main loop with no timer),
     // and the socket may be a systemd listener whose daemon is still starting.
@@ -142,7 +136,106 @@ fn run(user: &str) -> Result<(), String> {
     }
 }
 
-/// The login keyring file, under the home NSS reports.
+/// Connect to the control socket without ever blocking past [`IO_TIMEOUT`].
+///
+/// `UnixStream::connect` creates a BLOCKING socket and completes the connection
+/// before any timeout can be installed, so setting read and write deadlines
+/// afterwards leaves the connect itself unbounded. That matters here: a full
+/// listen backlog, or a socket-activated unit whose service is wedged, blocks
+/// the PAM session phase, which blocks the login.
+fn connect_with_deadline(sock: &std::path::Path) -> Result<UnixStream, String> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = sock.as_os_str().as_bytes();
+    if bytes.len() >= std::mem::size_of_val(&addr.sun_path) {
+        return Err(format!("socket path too long: {}", sock.display()));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *b as libc::c_char;
+    }
+
+    // SAFETY: a fresh socket, wrapped in an owning UnixStream before any
+    // fallible step so it cannot leak.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("socket: {}", std::io::Error::last_os_error()));
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+
+    // SAFETY: addr is fully initialised above; the length is its real size.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(format!(
+                "connect {}: {e} (no gnome-keyring-daemon control socket; is \
+                 gnome-keyring installed and socket-activated?)",
+                sock.display()
+            ));
+        }
+        // In progress: wait for writability, bounded.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one descriptor this scope owns.
+        let n = unsafe { libc::poll(&mut pfd, 1, IO_TIMEOUT.as_millis() as libc::c_int) };
+        if n == 0 {
+            return Err(format!(
+                "connect {} timed out after {:?}",
+                sock.display(),
+                IO_TIMEOUT
+            ));
+        }
+        if n < 0 {
+            return Err(format!("poll: {}", std::io::Error::last_os_error()));
+        }
+        // Poll reports readiness, not success; the error is in SO_ERROR.
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: reading a fixed-size option into a matching local.
+        unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if err != 0 {
+            return Err(format!(
+                "connect {}: {}",
+                sock.display(),
+                std::io::Error::from_raw_os_error(err)
+            ));
+        }
+    }
+
+    // Back to blocking, now that the read and write deadlines below apply.
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("clearing non-blocking: {e}"))?;
+    let _ = stream.as_raw_fd();
+    Ok(stream)
+}
+
+/// The login keyring file, under the home NSS reports./// The login keyring file, under the home NSS reports.
 ///
 /// `$HOME` is deliberately not consulted: this may run as root with the login
 /// stack's environment, where `$HOME` is root's or unset.

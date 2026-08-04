@@ -1112,6 +1112,17 @@ fn keyring_success_paths_with_a_live_daemon() {
         Request::SealPassword { .. } => Response::PasswordSealed,
         Request::HasSealedPassword { .. } => Response::HasPassword(true),
         Request::ForgetPassword { .. } => Response::PasswordForgotten,
+        // `forget` asks what is armed before erasing it, and refuses when it
+        // cannot tell: erasing a GNOME keyring token leaves the login keyring
+        // encrypted under a secret nothing can reproduce. This user has a
+        // password armed, which is safe to erase directly.
+        Request::KeyringInfo { .. } => Response::KeyringInfo {
+            armed: true,
+            policy: None,
+            pcrs: Vec::new(),
+            drifted: None,
+            kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
+        },
         _ => Response::Error("unexpected request".into()),
     });
 

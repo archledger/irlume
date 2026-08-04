@@ -206,6 +206,47 @@ pub fn sealed_kind(user: &str) -> Option<SecretKind> {
         .map(|e| e.secret)
 }
 
+/// Every sealed envelope on this machine, as `(user, kind)`.
+///
+/// Enumerates the ENVELOPE directory, not enrolled users: `keyring arm` does
+/// not require an enrollment, so a user can hold a sealed token and never
+/// appear in `storage::list_users()`.
+///
+/// Any unreadable or malformed envelope is an ERROR, never a skipped entry. A
+/// destructive caller cannot assume the kind of an envelope it could not read,
+/// and the difference between "no token here" and "could not tell" is the
+/// difference between a safe teardown and erasing the only copy of the secret
+/// a login keyring is encrypted under.
+pub fn list_sealed_kinds() -> Result<Vec<(String, SecretKind)>> {
+    let dir = keyring_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        // A machine that never armed anything has no directory, which is a
+        // real answer: nothing is sealed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(format!("read {}: {e}", dir.display()))),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Io(format!("read {}: {e}", dir.display())))?;
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let user = path
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .ok_or_else(|| {
+                Error::Protocol(format!("unreadable envelope name: {}", path.display()))
+            })?
+            .to_string();
+        let env = SealedEnvelope::load(&path)?;
+        out.push((user, env.secret));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 /// A released secret together with what it is.
 pub struct Unsealed {
     pub secret: Zeroizing<Vec<u8>>,

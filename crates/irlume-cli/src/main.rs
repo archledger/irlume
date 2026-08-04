@@ -1080,14 +1080,41 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             // where the keyring is already gone (deleted profile, reinstalled
             // distro) and the stale envelope is all that is left.
             let force = args.iter().any(|a| a == "--force");
-            let token_armed = matches!(
-                daemon_request(&irlume_common::Request::KeyringInfo { user: user.clone() }),
-                Ok(irlume_common::Response::KeyringInfo {
-                    armed: true,
-                    kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
-                    ..
-                })
-            );
+            // Three outcomes, not two. "Armed with something we could not
+            // identify" must not collapse into "not a token": a daemon from
+            // before #250 answers `kind: None`, an unreadable envelope answers
+            // an error, and deleting a token envelope on either reading leaves
+            // the login keyring encrypted under a secret nothing can
+            // reproduce. Unknown therefore refuses and names `--force`.
+            let (token_armed, unknown) =
+                match daemon_request(&irlume_common::Request::KeyringInfo { user: user.clone() }) {
+                    Ok(irlume_common::Response::KeyringInfo { armed: false, .. }) => (false, false),
+                    Ok(irlume_common::Response::KeyringInfo { kind: Some(k), .. }) => (
+                        k == irlume_common::KeyringSecretKind::GnomeKeyringToken,
+                        false,
+                    ),
+                    // Armed, and the daemon could not say what with: an older
+                    // daemon, or an envelope it failed to parse. This is the
+                    // dangerous reading, so refuse.
+                    Ok(irlume_common::Response::KeyringInfo { kind: None, .. }) => (false, true),
+                    // No usable answer at all (daemon down, refused, older
+                    // protocol). Not "armed with something unknown": fall
+                    // through and let the erase attempt below report the real
+                    // failure, rather than blaming an envelope nobody saw.
+                    _ => (false, false),
+                };
+            if unknown && !force {
+                eprintln!(
+                    "[keyring] cannot tell what '{user}' has armed, so refusing to erase it: \
+                     if it is a GNOME keyring token, deleting it leaves the login keyring \
+                     encrypted under a secret nothing can reproduce."
+                );
+                eprintln!(
+                    "[keyring] Update irlumed (an older one does not report the kind), or \
+                     pass --force if you are certain the keyring no longer matters."
+                );
+                return std::process::ExitCode::FAILURE;
+            }
             if token_armed && !force {
                 println!(
                     "[keyring] '{user}' is armed with a keyring token; re-keying the login \

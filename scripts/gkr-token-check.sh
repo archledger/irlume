@@ -54,7 +54,7 @@ bad()  { echo "  FAIL  $*"; FAIL=$((FAIL+1)); }
 note() { echo "  --    $*"; }
 
 cleanup() {
-    pkill -u "$(id -u)" -f "gnome-keyring-daemon.*$BASE" 2>/dev/null
+    [[ -n "${GKR_PID:-}" ]] && kill "$GKR_PID" 2>/dev/null
     [[ -n "${DBUS_PID:-}" ]] && kill "$DBUS_PID" 2>/dev/null
     rm -rf "$BASE"
 }
@@ -90,24 +90,39 @@ print({0: "OK", 1: "DENIED", 2: "FAILED", 3: "NO_DAEMON"}.get(res, f"UNKNOWN{res
 PY
 }
 
+# --foreground so the PID is OURS, not a daemonised grandchild. The previous
+# version ran the daemon detached and reaped it with
+# `pkill -u <uid> -f gnome-keyring-daemon`, which matches EVERY daemon that
+# user owns, including the one running their actual desktop session. That
+# contradicted this script's own header and did kill real session daemons.
+# Nothing here may select a process by name.
+GKR_PID=""
+
 start_daemon() {  # start_daemon; leaves the daemon running, control socket ready
-    gnome-keyring-daemon --start --components=secrets,pkcs11 >"$BASE/env.$$" 2>/dev/null &
+    gnome-keyring-daemon --foreground --components=secrets,pkcs11 \
+        >"$BASE/gkr.log" 2>&1 &
+    GKR_PID=$!
     for _ in $(seq 1 50); do
         [[ -S "$XDG_RUNTIME_DIR/keyring/control" ]] && return 0
+        # A daemon that died leaves no socket; do not spin the full timeout.
+        kill -0 "$GKR_PID" 2>/dev/null || return 1
         sleep 0.1
     done
     return 1
 }
 
 kill_daemon() {
-    pkill -u "$(id -u)" -f "gnome-keyring-daemon" 2>/dev/null
-    # Wait for the socket to actually go: a surviving daemon keeps the
-    # collection unlocked in memory and would report success for a secret it
-    # never accepted.
+    # Only the PID we started. A surviving daemon keeps the collection
+    # unlocked in memory and would report success for a secret it never
+    # accepted, so wait for it to actually go.
+    [[ -n "$GKR_PID" ]] || return 0
+    kill "$GKR_PID" 2>/dev/null
     for _ in $(seq 1 50); do
-        pgrep -u "$(id -u)" -f "gnome-keyring-daemon" >/dev/null || break
+        kill -0 "$GKR_PID" 2>/dev/null || break
         sleep 0.1
     done
+    wait "$GKR_PID" 2>/dev/null
+    GKR_PID=""
     rm -f "$XDG_RUNTIME_DIR/keyring/control"
 }
 
@@ -232,7 +247,7 @@ r="$(ctl 2 "$PASSWORD" "$PASSWORD")"
 
 # ------------------------------------------------------------------- step 6
 echo "[6] $CYCLES unlock cycles leak no daemons"
-before="$(pgrep -u "$(id -u)" -cf gnome-keyring-daemon)"
+before="$(pgrep -u "$(id -u)" -cf "gnome-keyring-daemon.*--foreground")"
 cycles_run=0
 for _ in $(seq 1 "$CYCLES"); do
     kill_daemon
@@ -241,7 +256,7 @@ for _ in $(seq 1 "$CYCLES"); do
         "$HELPER" "$(id -un)" >/dev/null 2>&1 || bad "cycle unlock failed"
     cycles_run=$((cycles_run+1))
 done
-after="$(pgrep -u "$(id -u)" -cf gnome-keyring-daemon)"
+after="$(pgrep -u "$(id -u)" -cf "gnome-keyring-daemon.*--foreground")"
 if [[ "$cycles_run" -eq "$CYCLES" ]]; then
     [[ "$after" -le "$before" ]] && ok "$cycles_run cycles, daemon count $before -> $after" \
                                  || bad "daemon count grew: $before -> $after"

@@ -556,10 +556,19 @@ mod tests {
         // The control: the same call with MATCHING bytes must install, which
         // is what proves the refusal above came from the pin and not from an
         // unwritable directory.
+        // Precomputed rather than Box::leak'd into a &'static str: leaking to
+        // satisfy a lifetime is a real leak, and LeakSanitizer is right to
+        // report it. The constant is asserted against the hasher below, so a
+        // change to either is caught rather than silently diverging.
         let good = b"the measured artifact";
+        const GOOD_SHA: &str = "b9a5820dd4ae8eb1eb7025b3b9b1351d9ff90e658e0c1d22a027e55be4f6f48e";
+        assert_eq!(
+            thirdparty::sha256_hex(good),
+            GOOD_SHA,
+            "the fixture's precomputed digest no longer matches the hasher"
+        );
         let mut ok = m;
-        let digest = thirdparty::sha256_hex(good);
-        ok.sha256 = Box::leak(digest.into_boxed_str());
+        ok.sha256 = GOOD_SHA;
         let accepted = place_verified(&ok, good);
         let written = thirdparty::model_path(&ok).exists();
 

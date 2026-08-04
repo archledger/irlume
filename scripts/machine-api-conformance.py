@@ -156,13 +156,16 @@ def strict_schema(schema):
     engine update the contract permits. This variant is for the engine's own CI,
     where a property nobody documented is worth seeing before it ships.
     """
-    # Never close a subschema reached through `if`, `then`, `else` or `not`.
-    # Those describe a condition or a fragment, not a whole object: closing the
-    # `if` in {"if": {"properties": {"ok": {"const": true}}}} would make the
-    # condition false for every real document, and closing a `then` that names
-    # one property would reject the rest of the envelope. Shapes worth closing
+    # Never close a subschema reached through `if`, `then`, `else`, `not` or
+    # `contains`. Those describe a condition or a fragment, not a whole object:
+    # closing the `if` in {"if": {"properties": {"ok": {"const": true}}}} would
+    # make the condition false for every real document, closing a `then` that
+    # names one property would reject the rest of the envelope, and closing a
+    # `contains` selector ("at least one stage is `pad`") would demand an array
+    # item with ONLY that property, which no real item is — models.list's
+    # required-stages constraints failed exactly that way. Shapes worth closing
     # all live in $defs and are reached directly.
-    conditional_keys = {"if", "then", "else", "not"}
+    conditional_keys = {"if", "then", "else", "not", "contains"}
 
     def close(node, closable):
         if isinstance(node, dict):

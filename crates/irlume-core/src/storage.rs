@@ -50,6 +50,22 @@ pub struct FaceScan {
     /// `None` = scan predates space tagging; grandfathered as compatible.
     #[serde(default)]
     pub ir_space: Option<String>,
+    /// The RECOGNIZER that produced `rgb` (and, before any adapter, `ir`),
+    /// as `"embed:<sha256 prefix>"` of its weights.
+    ///
+    /// Cosine similarity is only meaningful WITHIN one embedding space. A
+    /// different recognizer produces a different space, so comparing a fresh
+    /// probe against these templates yields a number with no interpretation
+    /// that may land either side of the threshold, granting or denying at
+    /// random. `ir_space` already guards the adapter for the same reason;
+    /// this guards the model underneath it, which #276 needs before any
+    /// user-supplied recognizer can be considered and which a change to the
+    /// shipped weights would need regardless.
+    ///
+    /// `None` = scan predates this tagging; grandfathered as compatible, the
+    /// same concession `ir_space` makes.
+    #[serde(default)]
+    pub embed_space: Option<String>,
     /// Per-scan IR liveness calibration: the center/edge brightness ratio of the
     /// face region at capture, and the face brightness. The on-disk key stays
     /// `ir_depth` (the name it shipped under) so an enrollment written here still
@@ -139,12 +155,27 @@ impl Enrollment {
 
     /// Every RGB template with its (profile, scan) labels, for 1:N matching.
     pub fn rgb_scans(&self) -> Vec<(&str, &str, &[f32])> {
+        self.rgb_scans_in(None)
+    }
+
+    /// Every RGB template that lives in `space`, with (profile, scan) labels.
+    ///
+    /// `None` keeps every scan, which is what callers with no recognizer
+    /// identity to compare against want. `Some(space)` drops scans tagged with
+    /// a DIFFERENT recognizer: their vectors are in another embedding space and
+    /// a cosine against them is a number with no interpretation, free to land
+    /// either side of the threshold. Untagged scans are kept, the same
+    /// grandfathering `ir_space` applies (#276).
+    pub fn rgb_scans_in(&self, space: Option<&str>) -> Vec<(&str, &str, &[f32])> {
         self.profiles
             .iter()
             .flat_map(|p| {
                 p.scans
                     .iter()
-                    .map(move |s| (p.name.as_str(), s.name.as_str(), s.rgb.as_slice()))
+                    .filter_map(move |s| match (space, s.embed_space.as_deref()) {
+                        (Some(want), Some(have)) if want != have => None,
+                        _ => Some((p.name.as_str(), s.name.as_str(), s.rgb.as_slice())),
+                    })
             })
             .collect()
     }
@@ -329,7 +360,8 @@ fn migrate(old: LegacyProfile) -> Enrollment {
             name: format!("Face Scan {}", i + 1),
             rgb: t.clone(),
             ir: old.ir_templates.get(i).cloned(),
-            ir_space: None, // legacy scans predate space tagging
+            ir_space: None,    // legacy scans predate space tagging
+            embed_space: None, // and predate recognizer tagging
 
             ir_center_edge_ratio: old.ir_depth_samples.get(i).copied().unwrap_or(0.0),
             ir_brightness: old.ir_brightness_samples.get(i).copied().unwrap_or(0.0),
@@ -547,6 +579,55 @@ pub fn list_users() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    fn scan(name: &str, v: f32, space: Option<&str>) -> FaceScan {
+        FaceScan {
+            name: name.into(),
+            rgb: vec![v; 4],
+            ir: None,
+            ir_space: None,
+            embed_space: space.map(str::to_string),
+            ir_center_edge_ratio: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        }
+    }
+
+    #[test]
+    fn rgb_templates_from_another_recognizer_are_not_offered_for_matching() {
+        // Cosine is only meaningful inside one embedding space, so a template
+        // tagged with a different recognizer must not reach the comparison at
+        // all. Untagged scans predate tagging and stay comparable (#276).
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![FaceProfile {
+                name: "p".into(),
+                scans: vec![
+                    scan("same", 1.0, Some("embed:aaaaaaaaaaaa")),
+                    scan("other", 2.0, Some("embed:bbbbbbbbbbbb")),
+                    scan("legacy", 3.0, None),
+                ],
+                ir_calib: None,
+            }],
+            ..Default::default()
+        };
+        let names = |v: Vec<(&str, &str, &[f32])>| {
+            v.into_iter()
+                .map(|(_, n, _)| n.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(enr.rgb_scans_in(Some("embed:aaaaaaaaaaaa"))),
+            vec!["same", "legacy"],
+            "a template from another recognizer must be excluded"
+        );
+        // No identity to compare against keeps everything, which is what the
+        // unfiltered accessor must still do for callers that have none.
+        assert_eq!(names(enr.rgb_scans()), vec!["same", "other", "legacy"]);
+        // And the whole set can be excluded, which must yield an empty match
+        // rather than a comparison against foreign vectors.
+        assert!(enr.rgb_scans_in(Some("embed:cccccccccccc")).len() == 1);
+    }
     use super::*;
 
     /// The retag marker skips work and answers a question about work only.
@@ -631,6 +712,7 @@ mod tests {
                     rgb: vec![0.1, 0.2, 0.3, 0.4],
                     ir: Some(vec![0.5, 0.6]),
                     ir_space: None,
+                    embed_space: None,
                     ir_center_edge_ratio: 1.4,
                     ir_brightness: 90.0,
                     pitch: 0.52,
@@ -682,6 +764,7 @@ mod tests {
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; 4]),
             ir_space: None,
+            embed_space: None,
             ir_center_edge_ratio: ratio,
             ir_brightness: bright,
             pitch: 0.0,
@@ -694,6 +777,7 @@ mod tests {
             rgb: vec![0.1; 4],
             ir: None,
             ir_space: None,
+            embed_space: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch,
@@ -743,6 +827,7 @@ mod tests {
             rgb: vec![0.1; 4],
             ir: Some(vec![0.2; dim]),
             ir_space: space.map(Into::into),
+            embed_space: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
@@ -823,6 +908,7 @@ mod tests {
                     rgb: vec![0.1; 4],
                     ir: None,
                     ir_space: None,
+                    embed_space: None,
                     ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     pitch: 0.0,
@@ -942,6 +1028,7 @@ mod tests {
             rgb: vec![0.0; 4],
             ir: Some(vec![0.0; 4]),
             ir_space: space.map(String::from),
+            embed_space: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,

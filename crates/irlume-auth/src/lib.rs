@@ -35,6 +35,10 @@ pub struct Engine {
     /// Stored on every new scan and matched against at verify, so an adapter
     /// swap/removal degrades to "re-enroll" instead of scoring across spaces.
     ir_space: String,
+    /// The recognizer's own embedding space, `"embed:<sha256 prefix>"` of its
+    /// weights. Stamped onto every scan enrolled and required to match at
+    /// verification: cosine scores are only meaningful inside one space.
+    embed_space: String,
     /// Optional MediaPipe FaceMesh: dense landmarks for the passive EAR blink
     /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
     /// the opt-in passive-liveness gate (it can't run without landmarks).
@@ -528,11 +532,22 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
+        // Identify the recognizer by its weights, not its path: a file swapped
+        // in place under the same name is a different embedding space and must
+        // not silently score against templates from the old one.
+        let embed_space = match std::fs::read(model_path) {
+            Ok(b) => format!("embed:{}", &irlume_common::thirdparty::sha256_hex(&b)[..12]),
+            // Unreadable here means Embedder::load_from_file below will fail
+            // too; keep a value that can never equal a real tag rather than
+            // one that compares equal to everything.
+            Err(_) => "embed:unknown".into(),
+        };
         Ok(Self {
             det: Detector::load_from_file(det_path)?,
             emb: Embedder::load_from_file(model_path)?,
             ir_adapter: None,
             ir_space: "raw".into(),
+            embed_space,
             mesh: None,
             blaze: None,
             tp_pad: None,
@@ -618,6 +633,24 @@ impl Engine {
     /// The IR embedding space this engine produces and matches in.
     pub fn ir_space(&self) -> &str {
         &self.ir_space
+    }
+
+    /// The recognizer embedding space this engine produces and matches in.
+    pub fn embed_space(&self) -> &str {
+        &self.embed_space
+    }
+
+    /// Is this scan comparable with embeddings this engine produces?
+    ///
+    /// A scan tagged with a different recognizer is not: its vector lives in
+    /// another space and a cosine against it means nothing. `None` is
+    /// grandfathered, the same concession `ir_space` makes for scans enrolled
+    /// before tagging existed.
+    pub fn scan_is_comparable(&self, s: &irlume_core::storage::FaceScan) -> bool {
+        match &s.embed_space {
+            Some(sp) => sp == &self.embed_space,
+            None => true,
+        }
     }
 
     /// Dimensionality of the IR embeddings this engine emits. The recognizer
@@ -2005,7 +2038,7 @@ impl Engine {
                     ));
                 }
             }
-            let scans = enr.rgb_scans();
+            let scans = enr.rgb_scans_in(Some(&self.embed_space));
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = best(&probe, &scans);
             irlume_common::dlog!(
@@ -2273,7 +2306,7 @@ impl Engine {
             let Some(enr) = irlume_core::storage::load(&user)? else {
                 continue;
             };
-            let scans = enr.rgb_scans();
+            let scans = enr.rgb_scans_in(Some(&self.embed_space));
             if scans.is_empty() {
                 continue;
             }
@@ -2573,6 +2606,7 @@ impl Engine {
                     rgb: s.rgb,
                     ir: s.ir,
                     ir_space,
+                    embed_space: Some(self.embed_space.clone()),
                     ir_center_edge_ratio: s.center_edge_ratio,
                     ir_brightness: s.brightness,
                     pitch: s.pitch,
@@ -2607,6 +2641,7 @@ impl Engine {
                 rgb: s.rgb,
                 ir: s.ir,
                 ir_space,
+                embed_space: Some(self.embed_space.clone()),
                 ir_center_edge_ratio: s.center_edge_ratio,
                 ir_brightness: s.brightness,
                 pitch: s.pitch,
@@ -2705,6 +2740,7 @@ impl Engine {
             rgb: captured.rgb,
             ir: captured.ir,
             ir_space,
+            embed_space: Some(self.embed_space.clone()),
             ir_center_edge_ratio: captured.center_edge_ratio,
             ir_brightness: captured.brightness,
             pitch: captured.pitch,
@@ -3334,6 +3370,7 @@ mod tests {
                 rgb: rgb.clone(),
                 ir: Some(ir.clone()),
                 ir_space: Some("raw".into()),
+                embed_space: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -3526,6 +3563,7 @@ mod tests {
             rgb: v,
             ir: None,
             ir_space: None,
+            embed_space: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
@@ -3665,6 +3703,7 @@ mod tests {
         let ir_scan = |v: Vec<f32>, space: Option<&str>| FaceScan {
             ir: Some(vec![0.5; 3]),
             ir_space: space.map(String::from),
+            embed_space: None,
             ..scan(v)
         };
         let enr_with = |scans: Vec<FaceScan>| {
@@ -3851,6 +3890,7 @@ mod tests {
                 rgb: vec![0.0; 4],
                 ir: Some(v.to_vec()),
                 ir_space: Some("raw".into()),
+                embed_space: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -4437,6 +4477,7 @@ mod engine_tests {
             rgb: unit512(seed),
             ir: ir.then(|| unit512(seed + 100)),
             ir_space: space.map(String::from),
+            embed_space: None,
             ir_center_edge_ratio: 1.3,
             ir_brightness: 90.0,
             pitch: 0.5,

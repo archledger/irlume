@@ -1928,13 +1928,15 @@ fn valid_profiles_list_args(args: &[String]) -> bool {
 
 /// `irlume models list --json`: per-pipeline-stage model report (#276).
 ///
-/// Which model each stage runs and where it came from (shipped or an env
-/// override), whether the stage is open to third-party models, and for the
-/// open PAD stage the catalog with each entry's tier (fetched by irlume vs
-/// user-supplied) and weight state. Needs no daemon: it reports what the
-/// daemon WOULD load, from the same resolution order the daemon's unit file
-/// uses, which is exactly what a consumer debugging "which model is active"
-/// needs when the daemon will not start.
+/// Each stage's model CANDIDATE — the file this process's search order lands
+/// on, with its origin and whether it opened as a regular file — plus whether
+/// the stage is open to third-party models, and for the open PAD stage the
+/// catalog with each entry's tier (fetched by irlume vs user-supplied) and
+/// weight state. Needs no daemon, so it still answers when the daemon will
+/// not start. It deliberately does not say "active": the daemon's service
+/// unit (or an administrator's drop-in) sets its own environment, which this
+/// process cannot observe, so an authoritative loaded-model report can only
+/// ever come from the daemon itself.
 pub fn models_list(args: &[String]) -> ExitCode {
     const COMMAND: &str = "models.list";
     let contract = match negotiate(args) {
@@ -1968,24 +1970,25 @@ fn models_list_data() -> Value {
     let stages = crate::models::stage_statuses()
         .into_iter()
         .map(|s| {
-            let active = match (s.file, &s.resolved) {
+            let candidate = match (s.file, &s.resolved) {
                 (None, _) => json!({ "origin": "built-in" }),
-                (Some(file), Some((path, origin))) => json!({
+                (Some(file), Some(c)) => json!({
                     "file": file,
-                    "present": true,
-                    "origin": origin,
-                    "path": path.display().to_string(),
+                    "observed": true,
+                    "readable": c.readable,
+                    "origin": c.origin,
+                    "path": c.path.display().to_string(),
                 }),
                 (Some(file), None) => json!({
                     "file": file,
-                    "present": false,
+                    "observed": false,
                 }),
             };
             let mut stage = json!({
                 "stage": s.stage,
                 "open": s.open,
                 "required": s.required,
-                "active": active,
+                "candidate": candidate,
             });
             if s.open {
                 stage["third_party"] = third_party_data();
@@ -1999,17 +2002,21 @@ fn models_list_data() -> Value {
 /// The third-party tier of the one open stage: what is enabled, and the
 /// catalog with weight states.
 ///
-/// `enabled.known` is honest about observability, like `login_manager.known`:
-/// settings.conf is root-only, so an unprivileged caller that read no name has
-/// NOT established that nothing is enabled, and a consumer must not render
-/// "known": false as "disabled".
+/// `enabled.known` is honest about observability, like `login_manager.known`,
+/// and it is keyed on WHAT THE READ ESTABLISHED, not on who asked. A missing
+/// file or key is genuine observed absence (the config directory is world-
+/// readable), so `known: true, name: null` — from any caller. A read that
+/// FAILED (EACCES on the root-only file for an unprivileged caller, a wrong
+/// SELinux label even for root) established nothing, so `known: false`; a
+/// consumer must not render that as "disabled".
 fn third_party_data() -> Value {
+    use irlume_common::config::KvObservation;
     use irlume_common::thirdparty::{self, WeightState};
-    let name = crate::models::enabled_name();
-    let enabled = match (&name, crate::is_root()) {
-        (Some(n), _) => json!({ "known": true, "name": n }),
-        (None, true) => json!({ "known": true, "name": null }),
-        (None, false) => json!({ "known": false }),
+    let enabled = match irlume_common::config::observe_kv("settings.conf", thirdparty::SETTINGS_KEY)
+    {
+        KvObservation::Value(name) => json!({ "known": true, "name": name }),
+        KvObservation::Absent => json!({ "known": true, "name": null }),
+        KvObservation::Unknown(_) => json!({ "known": false }),
     };
     let catalog = thirdparty::CATALOG
         .iter()
@@ -2207,7 +2214,7 @@ mod tests {
             }
         }
         let pad = &stages[3];
-        assert_eq!(pad["active"]["origin"], "built-in");
+        assert_eq!(pad["candidate"]["origin"], "built-in");
         // Sandboxed empty state dir: no weights anywhere.
         for entry in pad["third_party"]["catalog"].as_array().unwrap() {
             assert_eq!(entry["weights"], "absent");
@@ -2220,25 +2227,36 @@ mod tests {
 
     #[test]
     fn models_list_enabled_state_is_honest_about_observability() {
-        // settings.conf is root-only. An unprivileged caller that read no name
-        // has NOT established that nothing is enabled, so the payload must say
-        // known:false rather than name:null, and a readable name flips it to
-        // known:true. Root reads authoritatively: known is always true there.
+        // `enabled.known` is keyed on what the READ established, not on who
+        // asked: a missing file is observed absence (known:true, name:null), a
+        // readable key names the model, and a read that FAILS establishes
+        // nothing (known:false, which a consumer must not render as
+        // "disabled"). The failure case is produced deterministically by
+        // pointing the config dir at a regular file, so opening
+        // `<file>/settings.conf` fails with ENOTDIR for root and non-root
+        // alike — the review's counterexample was a root-side SELinux denial
+        // being reported as authoritative absence.
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("irlume-mle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&root);
         let cfg = root.join("cfg");
         std::fs::create_dir_all(&cfg).unwrap();
         let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
         std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
 
-        // No settings.conf at all.
+        // No settings.conf at all: observed absence.
         let absent = third_party_data();
         // A readable enabled key.
         std::fs::write(cfg.join("settings.conf"), "third_party_pad=flir\n").unwrap();
         let named = third_party_data();
+        // A failing read: the config dir is a regular file.
+        let notdir = root.join("not-a-dir");
+        std::fs::write(&notdir, b"not a directory").unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &notdir);
+        let unreadable = third_party_data();
 
         match old_cfg {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
@@ -2246,15 +2264,13 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
 
-        assert_eq!(named["enabled"]["known"], true);
-        assert_eq!(named["enabled"]["name"], "flir");
-        if crate::is_root() {
-            // Root reads the absent file authoritatively: nothing is enabled.
-            assert_eq!(absent["enabled"], json!({"known": true, "name": null}));
-        } else {
-            // Unprivileged with nothing readable: unknown, never "disabled".
-            assert_eq!(absent["enabled"], json!({"known": false}));
-        }
+        assert_eq!(absent["enabled"], json!({"known": true, "name": null}));
+        assert_eq!(named["enabled"], json!({"known": true, "name": "flir"}));
+        assert_eq!(
+            unreadable["enabled"],
+            json!({"known": false}),
+            "a failed read must never be reported as observed absence"
+        );
     }
 
     /// Collect the events a closure emits, by capturing what the stream would

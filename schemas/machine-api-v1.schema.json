@@ -780,11 +780,66 @@
       ],
       "properties": {
         "stages": {
-          "description": "The pipeline stages in order. The list may grow within the contract; a consumer must key on `stage`, not on position or count.",
+          "description": "The pipeline stages in order. The list may grow within the contract; a consumer must key on `stage`, not on position or count, and must ignore stage names it does not know.",
           "type": "array",
+          "minItems": 4,
           "items": {
             "$ref": "#/$defs/modelStage"
-          }
+          },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "stage": {
+                    "const": "detection"
+                  }
+                },
+                "required": [
+                  "stage"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "stage": {
+                    "const": "landmarks"
+                  }
+                },
+                "required": [
+                  "stage"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "stage": {
+                    "const": "recognition"
+                  }
+                },
+                "required": [
+                  "stage"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "stage": {
+                    "const": "pad"
+                  }
+                },
+                "required": [
+                  "stage"
+                ]
+              }
+            }
+          ]
         }
       }
     },
@@ -794,11 +849,11 @@
         "stage",
         "open",
         "required",
-        "active"
+        "candidate"
       ],
       "properties": {
         "stage": {
-          "description": "Stage name. Stable public API.",
+          "description": "Stage name. Stable public API; the set may grow within the contract, so it is deliberately not a closed enum \u2014 unknown names must be ignored, and the four current stages are guaranteed present by `modelsListData`.",
           "type": "string",
           "examples": [
             "detection",
@@ -808,98 +863,160 @@
           ]
         },
         "open": {
-          "description": "Whether this stage accepts third-party models today (#276 opens stages one at a time).",
+          "description": "Whether this stage accepts third-party models today (#276 opens stages one at a time). `third_party` is present exactly when this is true.",
           "type": "boolean"
         },
         "required": {
           "description": "Whether the daemon refuses to start without this stage's model file.",
           "type": "boolean"
         },
-        "active": {
-          "type": "object",
-          "properties": {
-            "origin": {
-              "description": "Where the active model comes from: `shipped`, `env-override`, or `built-in` for a stage whose implementation is code rather than a swappable file. Absent when the file was not found.",
-              "type": "string",
-              "examples": [
-                "shipped",
-                "env-override",
-                "built-in"
-              ]
-            },
-            "file": {
-              "type": "string"
-            },
-            "present": {
-              "type": "boolean"
-            },
-            "path": {
-              "description": "Local filesystem path the resolution landed on. Diagnostic; not stable across machines or packagings.",
-              "type": "string"
-            }
-          }
+        "candidate": {
+          "$ref": "#/$defs/modelCandidate"
         },
         "third_party": {
-          "description": "Present only on an open stage.",
-          "type": "object",
-          "required": [
-            "enabled",
-            "catalog"
-          ],
-          "properties": {
-            "enabled": {
-              "description": "Which catalog entry is enabled. `known` is honest about observability: the setting is root-only, so an unprivileged caller that read no name has NOT established that nothing is enabled, and `known: false` must not be rendered as disabled.",
-              "type": "object",
-              "required": [
-                "known"
-              ],
-              "properties": {
-                "known": {
-                  "type": "boolean"
-                },
-                "name": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
+          "$ref": "#/$defs/modelThirdParty"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "open": {
+                "const": true
               }
             },
-            "catalog": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": [
-                  "name",
-                  "stage",
-                  "tier",
-                  "weights"
-                ],
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  },
-                  "stage": {
-                    "type": "string"
-                  },
-                  "tier": {
-                    "description": "`fetched`: irlume downloads the weights from the publisher's origin. `user-supplied`: the license makes obtaining the file the user's business (`irlume models add`). Both tiers are pinned and measured identically.",
-                    "type": "string",
-                    "enum": [
-                      "fetched",
-                      "user-supplied"
-                    ]
-                  },
-                  "weights": {
-                    "description": "State of the weights file on disk against its catalog pin.",
-                    "type": "string",
-                    "enum": [
-                      "checksum-ok",
-                      "checksum-mismatch",
-                      "absent"
-                    ]
-                  }
-                }
+            "required": [
+              "open"
+            ]
+          },
+          "then": {
+            "required": [
+              "third_party"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "third_party"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "modelCandidate": {
+      "description": "The model file this CLI process's search order lands on \u2014 a candidate, not a claim about the daemon, whose service unit (or an administrator's drop-in) sets its own environment that a shell invocation cannot observe. An authoritative loaded-model report can only come from the daemon.",
+      "type": "object",
+      "properties": {
+        "origin": {
+          "description": "`caller-env`: the calling process's env var chose the path. `shipped`: a packaged or repo location. `built-in`: the stage's implementation is code, not a swappable file. Absent when nothing was found.",
+          "type": "string",
+          "examples": [
+            "shipped",
+            "caller-env",
+            "built-in"
+          ]
+        },
+        "file": {
+          "type": "string"
+        },
+        "observed": {
+          "description": "Whether the search found any filesystem entity for this stage.",
+          "type": "boolean"
+        },
+        "readable": {
+          "description": "Whether the candidate opened as a regular file, established the way the daemon's loader establishes it. `observed: true` with `readable: false` (a directory at the path, an unreadable file) means the daemon's load of this candidate would fail.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Local filesystem path the resolution landed on. Diagnostic; not stable across machines or packagings.",
+          "type": "string"
+        }
+      }
+    },
+    "modelEnabled": {
+      "description": "Which catalog entry is enabled, keyed on what the read ESTABLISHED: a value names the model; observed absence (missing file or key \u2014 the config directory is world-readable) is `known: true, name: null`; a FAILED read established nothing and is `known: false`, which must not be rendered as disabled.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "known": {
+              "const": false
+            }
+          },
+          "required": [
+            "known"
+          ],
+          "not": {
+            "required": [
+              "name"
+            ]
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "known": {
+              "const": true
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "known",
+            "name"
+          ]
+        }
+      ]
+    },
+    "modelThirdParty": {
+      "description": "Present only on an open stage.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "catalog"
+      ],
+      "properties": {
+        "enabled": {
+          "$ref": "#/$defs/modelEnabled"
+        },
+        "catalog": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "stage",
+              "tier",
+              "weights"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "stage": {
+                "type": "string"
+              },
+              "tier": {
+                "description": "`fetched`: irlume downloads the weights from the publisher's origin. `user-supplied`: the license makes obtaining the file the user's business (`irlume models add`). Both tiers are pinned and measured identically.",
+                "type": "string",
+                "enum": [
+                  "fetched",
+                  "user-supplied"
+                ]
+              },
+              "weights": {
+                "description": "State of the weights file on disk against its catalog pin.",
+                "type": "string",
+                "enum": [
+                  "checksum-ok",
+                  "checksum-mismatch",
+                  "absent"
+                ]
               }
             }
           }

@@ -3597,10 +3597,15 @@ fn doctor_run(
         }
     );
     // --- pipeline stages (#276) -----------------------------------------
-    // Which model each stage would run and where it came from, stage by
-    // stage, so "what is my machine actually running" has one answer. The
-    // PAD stage is the third-party line below; its built-in gate is code.
-    dout!(report, "[doctor] pipeline stages:");
+    // Each stage's model CANDIDATE from this process's search order. A
+    // candidate, not a claim about the daemon: the service unit (or a
+    // drop-in) sets the daemon's own environment, which this shell cannot
+    // observe. The PAD stage is the third-party line below; its built-in
+    // gate is code.
+    dout!(
+        report,
+        "[doctor] pipeline stages (candidate per this shell's search order):"
+    );
     for s in models::stage_statuses() {
         let Some(file) = s.file else { continue };
         let id = match s.stage {
@@ -3610,7 +3615,22 @@ fn doctor_run(
             other => unreachable!("file-backed stage without a check id: {other}"),
         };
         let (state, line) = match &s.resolved {
-            Some((p, origin)) => (State::Pass, format!("{file} — {origin} ({})", p.display())),
+            Some(c) if c.readable => (
+                State::Pass,
+                format!("{file} — {} ({})", c.origin, c.path.display()),
+            ),
+            // Present but not readable as a regular file: the daemon's
+            // fs::read of this same candidate would fail, so this is at
+            // least as bad as absent and must not report Pass.
+            Some(c) => (
+                if s.required { State::Fail } else { State::Warn },
+                format!(
+                    "{file} — {} ({}) exists but is NOT readable as a model file; \
+                     the daemon's load of it would fail",
+                    c.origin,
+                    c.path.display()
+                ),
+            ),
             None if s.required => (
                 State::Fail,
                 format!("{file} — NOT FOUND; the daemon cannot start without it"),

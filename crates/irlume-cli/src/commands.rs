@@ -1056,33 +1056,57 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// why `doctor`/`deps` must NOT probe cwd-relative `models/` alone; a user runs
 /// them from their home dir, where that path never resolves.
 pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::PathBuf> {
-    resolve_model_origin(filename, env_var).map(|(p, _)| p)
+    resolve_model_candidate(filename, env_var)
+        .filter(|c| c.readable)
+        .map(|c| c.path)
 }
 
-/// [`resolve_model`], also naming WHERE the winning path came from:
-/// `"env-override"` when the daemon env var chose it, `"shipped"` for the
-/// packaged and repo locations. One function holds the search order so the
-/// per-stage report cannot disagree with the required-models check about
-/// which file the daemon would load.
-pub(crate) fn resolve_model_origin(
-    filename: &str,
-    env_var: &str,
-) -> Option<(std::path::PathBuf, &'static str)> {
-    if let Some(p) = std::env::var_os(env_var) {
-        let p = std::path::PathBuf::from(p);
-        if p.exists() {
-            return Some((p, "env-override"));
-        }
-    }
-    for base in [
+/// The model file this process's search order lands on, for one stage.
+///
+/// A CANDIDATE, not a claim about the daemon: the daemon's service unit (and
+/// any drop-in an administrator added) sets its own environment, which a shell
+/// invocation of the CLI cannot observe. This is the same search order the
+/// packaged configuration uses, so on a stock install the answer coincides
+/// with what the daemon loads; the reporting layers say "candidate" and mean
+/// it.
+pub(crate) struct ModelCandidate {
+    pub path: std::path::PathBuf,
+    /// `"caller-env"` when this process's env var chose the path, `"shipped"`
+    /// for the packaged/repo locations.
+    pub origin: &'static str,
+    /// Whether the candidate OPENED as a regular file. `Path::exists()` would
+    /// accept a directory or an unreadable file that the daemon's actual
+    /// `fs::read` would refuse, so presence is established the way the loader
+    /// establishes it.
+    pub readable: bool,
+}
+
+pub(crate) fn resolve_model_candidate(filename: &str, env_var: &str) -> Option<ModelCandidate> {
+    let env = std::env::var_os(env_var)
+        .map(|p| (std::path::PathBuf::from(p), "caller-env"))
+        .into_iter();
+    let bases = [
         "/usr/share/irlume/models",
         "/usr/lib/irlume/models",
         "models",
-    ] {
-        let p = std::path::Path::new(base).join(filename);
-        if p.exists() {
-            return Some((p, "shipped"));
-        }
+    ]
+    .into_iter()
+    .map(|base| (std::path::Path::new(base).join(filename), "shipped"));
+    for (path, origin) in env.chain(bases) {
+        let readable = match std::fs::File::open(&path) {
+            // open() succeeds on a directory; the loader's fs::read would not.
+            Ok(f) => f.metadata().map(|m| m.is_file()).unwrap_or(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Present but unreadable: this IS the path the search selects, so
+            // report it with readable=false rather than falling through to a
+            // later candidate the daemon would never reach.
+            Err(_) => false,
+        };
+        return Some(ModelCandidate {
+            path,
+            origin,
+            readable,
+        });
     }
     None
 }

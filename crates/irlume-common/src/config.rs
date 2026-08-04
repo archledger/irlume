@@ -23,34 +23,29 @@ pub fn config_path(file: &str) -> PathBuf {
     config_root().join(file)
 }
 
-/// Read a single key from a `key=value` file. Returns the trimmed value, or
-/// `None` if the file is missing, the key is absent, or the value is empty.
-pub fn read_kv(file: &str, key: &str) -> Option<String> {
+/// What one read of a config key established. `Absent` and `Unknown` are
+/// different facts: a missing file or key was OBSERVED to hold nothing, while
+/// an unreadable file established nothing at all, and a caller that reports
+/// state to others must not present the second as the first.
+pub enum KvObservation {
+    /// The key is present with this (trimmed, non-empty) value.
+    Value(String),
+    /// The file, the key, or a non-empty value is genuinely not there.
+    Absent,
+    /// The file could not be read, so nothing was established.
+    Unknown(std::io::Error),
+}
+
+/// Read a single key from a `key=value` file, classifying the outcome.
+///
+/// Does not log; [`read_kv`] wraps this with the warning policy most callers
+/// want.
+pub fn observe_kv(file: &str, key: &str) -> KvObservation {
     let path = config_path(file);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        // A present-but-unreadable config (classically a wrong SELinux label)
-        // must NOT be ignored silently for the *daemon*: that sends it to
-        // auto-detect and it can bind the wrong device. Make it loud (daemon
-        // stderr ⇒ journald). But these files are deliberately root-only (0600),
-        // so an *unprivileged* CLI caller hitting Permission denied is expected,
-        // not a fault; the root daemon reads them fine. Warning there just
-        // alarms new users into needlessly loosening permissions. So: stay loud
-        // for root and for non-permission errors; stay quiet for the expected
-        // EACCES an ordinary user gets.
-        Err(e) => {
-            let unprivileged_eacces =
-                e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0;
-            if !unprivileged_eacces {
-                eprintln!(
-                    "irlume: WARNING: config {p} exists but is unreadable ({e}); key '{key}' \
-                     ignored; check permissions / SELinux label (try: restorecon -v {p})",
-                    p = path.display(),
-                );
-            }
-            return None;
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KvObservation::Absent,
+        Err(e) => return KvObservation::Unknown(e),
     };
     for line in text.lines() {
         let line = line.trim();
@@ -61,12 +56,47 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
             if k.trim() == key {
                 let v = v.trim();
                 if !v.is_empty() {
-                    return Some(v.to_string());
+                    return KvObservation::Value(v.to_string());
                 }
             }
         }
     }
-    None
+    KvObservation::Absent
+}
+
+/// Read a single key from a `key=value` file. Returns the trimmed value, or
+/// `None` if the file is missing, the key is absent, or the value is empty.
+///
+/// `None` collapses "absent" and "unreadable"; a caller for whom that
+/// difference matters (anything that REPORTS the state rather than just
+/// falling back on a default) must use [`observe_kv`].
+pub fn read_kv(file: &str, key: &str) -> Option<String> {
+    match observe_kv(file, key) {
+        KvObservation::Value(v) => Some(v),
+        KvObservation::Absent => None,
+        // A present-but-unreadable config (classically a wrong SELinux label)
+        // must NOT be ignored silently for the *daemon*: that sends it to
+        // auto-detect and it can bind the wrong device. Make it loud (daemon
+        // stderr ⇒ journald). But these files are deliberately root-only (0600),
+        // so an *unprivileged* CLI caller hitting Permission denied is expected,
+        // not a fault; the root daemon reads them fine. Warning there just
+        // alarms new users into needlessly loosening permissions. So: stay loud
+        // for root and for non-permission errors; stay quiet for the expected
+        // EACCES an ordinary user gets.
+        KvObservation::Unknown(e) => {
+            let unprivileged_eacces =
+                e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0;
+            if !unprivileged_eacces {
+                let p = config_path(file);
+                eprintln!(
+                    "irlume: WARNING: config {p} exists but is unreadable ({e}); key '{key}' \
+                     ignored; check permissions / SELinux label (try: restorecon -v {p})",
+                    p = p.display(),
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Insert or update `key=value`, preserving every other line (including

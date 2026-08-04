@@ -499,9 +499,10 @@ pub(crate) struct StageStatus {
     /// The shipped model file this stage runs, `None` for the PAD stage whose
     /// built-in gate is code, not a swappable file.
     pub file: Option<&'static str>,
-    /// Resolved path and its origin (`"shipped"` / `"env-override"`); `None`
-    /// when the file was not found anywhere the daemon looks.
-    pub resolved: Option<(std::path::PathBuf, &'static str)>,
+    /// The candidate this process's search order lands on (see
+    /// [`crate::commands::ModelCandidate`] for why it is a candidate and not
+    /// a claim about the daemon); `None` when nothing was found.
+    pub resolved: Option<crate::commands::ModelCandidate>,
     /// Whether the daemon refuses to start without this file.
     pub required: bool,
 }
@@ -534,7 +535,7 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
             stage: stage.as_str(),
             open: stage.open(),
             file: Some(file),
-            resolved: crate::commands::resolve_model_origin(file, env),
+            resolved: crate::commands::resolve_model_candidate(file, env),
             required,
         })
         .collect();
@@ -658,15 +659,15 @@ mod tests {
         let accepted = place_verified(&open, bytes);
         let written = thirdparty::model_path(&open).exists();
 
-        match (old_cfg, old_state) {
-            (Some(c), Some(st)) => {
-                std::env::set_var("IRLUME_CONFIG_DIR", c);
-                std::env::set_var("IRLUME_STATE_DIR", st);
-            }
-            _ => {
-                std::env::remove_var("IRLUME_CONFIG_DIR");
-                std::env::remove_var("IRLUME_STATE_DIR");
-            }
+        // Restored independently: a paired match would drop whichever var
+        // existed alone before the test.
+        match old_cfg {
+            Some(c) => std::env::set_var("IRLUME_CONFIG_DIR", c),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(st) => std::env::set_var("IRLUME_STATE_DIR", st),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
         }
         let _ = std::fs::remove_dir_all(&root);
 
@@ -684,10 +685,12 @@ mod tests {
     }
 
     #[test]
-    fn stage_statuses_resolve_with_an_honest_origin() {
-        // The env var the daemon honors must label the resolution
-        // "env-override", and its absence must fall to the shipped search;
-        // the per-stage report keys the origin column off this.
+    fn stage_statuses_resolve_a_candidate_with_honest_origin_and_readability() {
+        // The candidate resolver must label a caller-env path as such, must
+        // establish readability the way the loader does (a DIRECTORY at the
+        // env path "exists" but cannot be read as a model), and must fall to
+        // the shipped search when the env var is unset. The per-stage report
+        // keys its origin and readable columns off this.
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -699,12 +702,21 @@ mod tests {
         let old = std::env::var_os("IRLUME_DET_MODEL");
         std::env::set_var("IRLUME_DET_MODEL", &file);
 
-        let with_env = crate::commands::resolve_model_origin(
+        let with_env = crate::commands::resolve_model_candidate(
+            "face_detection_yunet_2023mar.onnx",
+            "IRLUME_DET_MODEL",
+        );
+        // A directory at the env path: Path::exists() would call this present;
+        // the daemon's fs::read would refuse it, so readable must be false and
+        // the search must NOT fall through to a candidate the daemon would
+        // never reach.
+        std::env::set_var("IRLUME_DET_MODEL", &dir);
+        let env_is_dir = crate::commands::resolve_model_candidate(
             "face_detection_yunet_2023mar.onnx",
             "IRLUME_DET_MODEL",
         );
         std::env::remove_var("IRLUME_DET_MODEL");
-        let without_env = crate::commands::resolve_model_origin(
+        let without_env = crate::commands::resolve_model_candidate(
             "face_detection_yunet_2023mar.onnx",
             "IRLUME_DET_MODEL",
         );
@@ -714,12 +726,19 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_eq!(with_env, Some((file, "env-override")));
+        let with_env = with_env.expect("env candidate");
+        assert_eq!(with_env.path, file);
+        assert_eq!(with_env.origin, "caller-env");
+        assert!(with_env.readable);
+        let env_is_dir = env_is_dir.expect("dir candidate");
+        assert_eq!(env_is_dir.path, dir);
+        assert_eq!(env_is_dir.origin, "caller-env");
+        assert!(!env_is_dir.readable, "a directory is not a readable model");
         // Without the env var the answer depends on whether this machine has
-        // the packaged or repo models; when it resolves, it must not claim an
-        // override that was not set.
-        if let Some((_, origin)) = without_env {
-            assert_eq!(origin, "shipped");
+        // the packaged or repo models; when it resolves, it must not claim a
+        // caller override that was not set.
+        if let Some(c) = without_env {
+            assert_eq!(c.origin, "shipped");
         }
         // The four stages, in pipeline order, exactly one open (pad).
         let stages = stage_statuses();
@@ -792,15 +811,15 @@ mod tests {
         let accepted = place_verified(&ok, good);
         let written = thirdparty::model_path(&ok).exists();
 
-        match (old_cfg, old_state) {
-            (Some(c), Some(st)) => {
-                std::env::set_var("IRLUME_CONFIG_DIR", c);
-                std::env::set_var("IRLUME_STATE_DIR", st);
-            }
-            _ => {
-                std::env::remove_var("IRLUME_CONFIG_DIR");
-                std::env::remove_var("IRLUME_STATE_DIR");
-            }
+        // Restored independently: a paired match would drop whichever var
+        // existed alone before the test.
+        match old_cfg {
+            Some(c) => std::env::set_var("IRLUME_CONFIG_DIR", c),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(st) => std::env::set_var("IRLUME_STATE_DIR", st),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
         }
         let _ = std::fs::remove_dir_all(&root);
 

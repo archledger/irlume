@@ -324,24 +324,35 @@ identifiers: they may contain anything the user typed.
 
 Capability: `models-list-json`.
 
-The pipeline stages in order, each with the model it runs and where that model
-came from (`shipped`, `env-override`, or `built-in` for the PAD stage's gate,
-which is code rather than a swappable file), whether the daemon requires the
-file to start, and whether the stage is open to third-party models. Stages
-open one at a time because their failure modes differ; the PAD stage is the
-only open one today, and it carries a `third_party` object with the enabled
-entry and the measured catalog, including each entry's tier (`fetched` by
-irlume, or `user-supplied` when the license makes obtaining the file the
-user's business) and the weight file's state against its pin.
+The pipeline stages in order, each with its model **candidate**: the file this
+CLI process's search order lands on, its origin (`shipped`, `caller-env` when
+the calling process's environment chose the path, or `built-in` for the PAD
+stage's gate, which is code rather than a swappable file), and whether it
+opened as a regular file (`readable`). It is a candidate and not a claim about
+the daemon, because the daemon's service unit — or an administrator's drop-in —
+sets the daemon's own environment, which a shell invocation cannot observe. On
+a stock install the candidate coincides with what the daemon loads; an
+authoritative loaded-model report can only ever come from the daemon itself.
+`observed: true` with `readable: false` (a directory at the path, an
+unreadable file) means the daemon's load of that same candidate would fail.
 
-The command needs no daemon: it reports what the daemon would load, from the
-same resolution order the packaged unit file uses, so it still answers when
-the daemon will not start.
+Each stage also reports whether the daemon requires the file to start and
+whether the stage is open to third-party models. Stages open one at a time
+because their failure modes differ; the PAD stage is the only open one today,
+and it carries a `third_party` object with the enabled entry and the measured
+catalog, including each entry's tier (`fetched` by irlume, or `user-supplied`
+when the license makes obtaining the file the user's business) and the weight
+file's state against its pin.
 
-`third_party.enabled.known` is honest about observability. The enabling
-setting is root-only; an unprivileged caller that read no name has not
-established that nothing is enabled, and a consumer must not render
-`"known": false` as disabled.
+The command needs no daemon, so it still answers when the daemon will not
+start.
+
+`third_party.enabled.known` is keyed on what the read established, not on who
+asked. Observed absence (no config file or key; the config directory is
+world-readable) is `known: true, name: null` from any caller. A read that
+failed — the root-only file denied to an unprivileged caller, or a wrong
+SELinux label denying even root — established nothing and is `known: false`,
+which a consumer must not render as disabled.
 
 ### Error codes
 

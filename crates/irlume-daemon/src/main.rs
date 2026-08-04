@@ -2113,12 +2113,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             // at all" (#192, the BRIO's EINVAL on concurrent
                             // RGB open).
                             let mut msg = if report.concurrent_impossible() {
+                                // Observed counts, not the requested round
+                                // count: a sequential arm can complete fewer
+                                // rounds than were asked for, and "measured
+                                // fine" must not overstate its evidence.
                                 format!(
                                     "capture mode {} for this camera: it cannot stream RGB and IR \
-                                     at once (all {} concurrent attempts errored; {rounds} \
-                                     sequential rounds measured fine)",
+                                     at once (all {} concurrent attempts errored; {} sequential \
+                                     round(s) completed, {} errored; a trailing one-at-a-time \
+                                     control confirmed the camera still answers)",
                                     mode.as_str(),
                                     report.concurrent.failed,
+                                    report.sequential.rounds,
+                                    report.sequential.failed,
                                 )
                             } else {
                                 format!(

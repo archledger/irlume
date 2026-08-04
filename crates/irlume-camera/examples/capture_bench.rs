@@ -113,6 +113,18 @@ fn main() {
     // camera-tune` would make from the same measurement, run through the shared
     // implementation so the tool and the example cannot drift apart.
     match irlume_camera::measure_contention(&rgb_dev2, &ir_dev, rounds.min(6)) {
+        Ok(report) if report.concurrent_impossible() => {
+            // Same rule as the daemon: an arm that never streamed has no
+            // retention to print, and "keeps 0%" would read as dimming.
+            println!(
+                "\nRecommendation: {} capture for this camera\n  \
+             it cannot stream RGB and IR at once (all {} concurrent attempts \
+             errored; {} sequential round(s) completed)",
+                report.recommended_mode().as_str(),
+                report.concurrent.failed,
+                report.sequential.rounds,
+            );
+        }
         Ok(report) => {
             println!(
                 "\nRecommendation: {} capture for this camera\n  \

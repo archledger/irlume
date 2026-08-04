@@ -3013,37 +3013,62 @@ pub fn measure_contention_with_progress(
 ) -> irlume_common::Result<ContentionReport> {
     verify_pinned(rgb_dev)?;
     verify_pinned(ir_dev)?;
+    measure_contention_impl(
+        || capture_rgb_denoised(rgb_dev),
+        || capture_ir_with_stats(ir_dev),
+        rounds,
+        progress,
+    )
+}
+
+/// [`measure_contention_with_progress`] over injected captures, so the
+/// decisions below are testable without a camera (a panicking capture, an
+/// arm that always errors, a trailing control that fails).
+fn measure_contention_impl<R, I>(
+    rgb_cap: R,
+    ir_cap: I,
+    rounds: usize,
+    progress: &dyn Fn(),
+) -> irlume_common::Result<ContentionReport>
+where
+    R: Fn() -> irlume_common::Result<Frame>,
+    I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)> + Sync,
+{
     let rounds = rounds.max(1);
     let mut report = ContentionReport::default();
 
     for _ in 0..rounds {
         progress();
         let t0 = std::time::Instant::now();
-        let rgb = capture_rgb_denoised(rgb_dev);
-        let ir = capture_ir_with_stats(ir_dev);
+        let rgb = rgb_cap();
+        let ir = ir_cap();
         accumulate(&mut report.sequential, &rgb, &ir, t0.elapsed());
     }
     for _ in 0..rounds {
         progress();
         let t0 = std::time::Instant::now();
+        // A capture that returns Err is a measured failed round. A capture
+        // that PANICS is not a measurement of anything: counting it as a
+        // failed round would let a software defect that only trips off the
+        // main thread masquerade as "this camera cannot stream both nodes"
+        // and be persisted as durable policy, so a panic aborts the whole
+        // probe instead (#263 review).
         let (rgb, ir) = std::thread::scope(|s| {
-            let ir_t = s.spawn(|| capture_ir_with_stats(ir_dev));
-            let rgb = capture_rgb_denoised(rgb_dev);
-            (
-                rgb,
-                ir_t.join()
-                    .unwrap_or_else(|_| Err(Error::Hardware("IR probe thread panicked".into()))),
-            )
-        });
+            let ir_t = s.spawn(|| ir_cap());
+            let rgb = rgb_cap();
+            match ir_t.join() {
+                Ok(ir) => Ok((rgb, ir)),
+                Err(_) => Err(Error::Hardware(
+                    "capture-mode probe: the IR capture worker panicked; this is \
+                     a software defect, not a camera measurement"
+                        .into(),
+                )),
+            }
+        })?;
         accumulate(&mut report.concurrent, &rgb, &ir, t0.elapsed());
     }
     // Only a dead SEQUENTIAL arm is a failed probe: one capture at a time is
-    // the mode every camera must manage, so nothing was learned. A concurrent
-    // arm that never completes a round IS a measurement, and the strongest one
-    // this probe can make: the camera cannot stream both nodes at once, and
-    // the report's zero concurrent retention answers `recommended_mode` and
-    // `conclusive` with Sequential (#192; the BRIO fails every concurrent
-    // round with EINVAL on the RGB open while its IR sibling streams).
+    // the mode every camera must manage, so nothing was learned.
     if report.sequential.rounds == 0 {
         return Err(Error::Hardware(format!(
             "capture-mode probe: no sequential round completed on this camera \
@@ -3051,6 +3076,34 @@ pub fn measure_contention_with_progress(
              is failing, so nothing was measured",
             report.sequential.failed
         )));
+    }
+    // A concurrent arm that never completes a round IS a measurement, and the
+    // strongest one this probe can make — the camera cannot stream both nodes
+    // at once (#192; the BRIO fails every concurrent round with EINVAL on the
+    // RGB open while its IR sibling streams) — but only if the camera is
+    // still ANSWERING. The baseline ran before the concurrent phase, so on
+    // its own it cannot rule out a camera that was unplugged, reset, or
+    // stopped answering mid-probe; a trailing one-at-a-time control closes
+    // that window (#263 review). One extra capture pair, only in the
+    // all-error case.
+    if report.concurrent.rounds == 0 {
+        progress();
+        if let Err(e) = rgb_cap() {
+            return Err(Error::Hardware(format!(
+                "capture-mode probe: all {rounds} concurrent attempts errored, \
+                 and the trailing sequential RGB control then failed too ({e}); \
+                 the camera stopped answering, so nothing about concurrency was \
+                 measured"
+            )));
+        }
+        if let Err(e) = ir_cap() {
+            return Err(Error::Hardware(format!(
+                "capture-mode probe: all {rounds} concurrent attempts errored, \
+                 and the trailing sequential IR control then failed too ({e}); \
+                 the camera stopped answering, so nothing about concurrency was \
+                 measured"
+            )));
+        }
     }
     Ok(report)
 }
@@ -3663,6 +3716,99 @@ mod tests {
             concurrent: PairSample::default(),
         };
         assert!(!unattempted.concurrent_impossible());
+    }
+
+    fn stats(lit: f32) -> IrCaptureStats {
+        IrCaptureStats {
+            lit_mean: lit,
+            ambient_mean: 1.0,
+            burst_frames: 8,
+            camera_classified_frames: 0,
+            white_level: None,
+            saturation_frame: None,
+        }
+    }
+
+    #[test]
+    fn a_panicking_capture_aborts_the_probe_instead_of_becoming_a_verdict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Sequential IR captures succeed; every concurrent one PANICS. Counting
+        // those as failed rounds would persist "this camera cannot stream both
+        // nodes" over a software defect (#263 review); the probe must abort.
+        let ir_calls = AtomicUsize::new(0);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the test log clean
+        let got = measure_contention_impl(
+            || Ok(frame(&[100; 4])),
+            || {
+                if ir_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    panic!("injected defect");
+                }
+                Ok((frame(&[10; 4]), stats(50.0)))
+            },
+            2,
+            &|| {},
+        );
+        std::panic::set_hook(prev);
+        let err = got.expect_err("a panic must abort the probe, never report");
+        assert!(err.to_string().contains("panicked"), "{err}");
+    }
+
+    #[test]
+    fn an_all_error_concurrent_arm_needs_the_trailing_control_to_pass() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The BRIO shape, injected: sequential rounds fine, every concurrent
+        // RGB open errors, and the trailing control finds the camera still
+        // answering — a real contention verdict.
+        let rgb_calls = AtomicUsize::new(0);
+        let report = measure_contention_impl(
+            || {
+                let n = rgb_calls.fetch_add(1, Ordering::SeqCst);
+                // Calls 0-1: sequential. 2-3: concurrent (error). 4: control.
+                if (2..4).contains(&n) {
+                    Err(Error::Hardware(
+                        "EINVAL while the IR sibling streams".into(),
+                    ))
+                } else {
+                    Ok(frame(&[100; 4]))
+                }
+            },
+            || Ok((frame(&[10; 4]), stats(50.0))),
+            2,
+            &|| {},
+        )
+        .expect("an answering camera with an impossible concurrent arm is a verdict");
+        assert!(report.concurrent_impossible());
+        assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
+        assert_eq!(
+            rgb_calls.load(Ordering::SeqCst),
+            5,
+            "the trailing control must actually run"
+        );
+    }
+
+    #[test]
+    fn a_camera_that_stops_answering_fails_the_probe_not_the_verdict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Sequential rounds fine, then the camera dies: every later capture
+        // errors, including the trailing control. That proves the camera
+        // stopped answering, not that concurrency fails, and must not persist
+        // a capability verdict (#263 review).
+        let rgb_calls = AtomicUsize::new(0);
+        let got = measure_contention_impl(
+            || {
+                if rgb_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    Err(Error::Hardware("ENODEV".into()))
+                } else {
+                    Ok(frame(&[100; 4]))
+                }
+            },
+            || Ok((frame(&[10; 4]), stats(50.0))),
+            2,
+            &|| {},
+        );
+        let err = got.expect_err("a dead camera is a failed probe");
+        assert!(err.to_string().contains("trailing"), "{err}");
     }
 
     #[test]

@@ -110,3 +110,50 @@ is acceptable when all four criteria hold:
    recognition model, but a candidate still owes an explicit assessment.
 
 Criterion 4 was contributed by issue #4.
+
+## Update (2026-08-04): the model is offered during setup, and still not shipped
+
+Measurement changed the balance. The algorithmic gate contributes nothing
+against the demonstrated print: it returned `Live` for all 24 presentations in
+#235, and again for all six presentations of an enhanced attack on 2026-08-04, a
+black cotton sock over the print's chin that carries the centre/edge ratio from
+1.06 into 1.32-1.44 and so inside the genuine population (1.26-1.49). The same
+enhancement defeats a floor-style implementation of the landmark-relief
+candidate (#25) by making an absorbed chin return an unbounded ratio.
+
+The opt-in `flir` cue refused every one of those presentations: p_fake
+0.988-1.000 bare and 0.998-0.999 occluded, against a 0.9 threshold. Across
+2026-07-17, 2026-07-27 and 2026-08-04 it has not failed to deny this attack.
+
+So the default posture, where a printed photograph of an enrolled user passes,
+is no longer defensible when a cue that stops it is one command away and most
+users will never run that command.
+
+**Decision.** `irlume setup` offers the model as a numbered step, with the
+license and provenance on screen and the answer defaulting to yes. Declining is
+one keystroke and the consequence is stated.
+
+**What deliberately did not change:**
+
+- The weights are **not** shipped in irlume's packages. Distributing weights
+  whose training data the publisher does not document is the criterion-2 problem
+  restated as a redistribution problem, and it is the same thing that blocks
+  commercial use of the model stack.
+- Nothing is fetched without consent. The daemon does not download on first
+  start; setup asks, and `models enable` keeps its stricter type-the-name gate
+  for anyone reaching that command without context.
+- The cue stays **deny-only**. It can refuse a presentation the built-in gate
+  accepted; it can never approve one the built-in gate rejected.
+- `flir` still fails criteria 2 and 3, and irlume still does not warrant it.
+  Offering a model is not certifying it, and the four criteria remain the bar
+  for anything irlume would ship rather than fetch.
+
+**The cost, stated plainly.** The operating window is narrow and thinly
+measured: the highest genuine score recorded is 0.702 and the lowest attack
+score 0.941, both from one subject on one camera, with the threshold at 0.9.
+Genuine-side failures are mapped rather than absent, in dim strobe frames and
+direct sun, and a blown frame drops p_fake into an abstain band (#237). More
+users now inherit that false-rejection risk; every such failure falls back to
+the password, which is why the trade is acceptable, and widening the evidence
+beyond one subject remains the thing that would justify shipping rather than
+offering.

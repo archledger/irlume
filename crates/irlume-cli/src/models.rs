@@ -135,6 +135,23 @@ fn enable(name: Option<&str>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    fetch_and_enable(m)
+}
+
+/// Download, checksum-verify and enable `m`, restarting the daemon.
+///
+/// Split out of [`enable`] so `irlume setup` can offer the model without
+/// duplicating the download or, worse, reimplementing the pin check: the
+/// catalog's sha256 is the only thing standing between a user and unpinned
+/// third-party weights, so exactly one code path may install them.
+///
+/// The CONSENT is the caller's to obtain, and the two callers ask differently
+/// on purpose. `models enable` makes the user type the model name, because
+/// someone reaching for that command may not have read anything. Setup shows
+/// the same license and provenance and accepts a default-yes answer, because
+/// it has just told them a printed photograph defeats the built-in gate and
+/// the decision is in front of them.
+pub(crate) fn fetch_and_enable(m: &thirdparty::ThirdPartyModel) -> ExitCode {
     let dir = thirdparty::dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("[models] could not create {}: {e}", dir.display());

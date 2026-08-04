@@ -199,11 +199,22 @@ reflects 850 nm (defeating `face_in_ir`) and a large flat print mimics the
 brightness-ratio cue (banner center/edge 1.02–1.58 *overlaps and exceeds* genuine
 1.37–1.40, so no threshold separates them). Screen replays and matte-paper prints
 were still fully rejected. This is a demonstrated instance of the accepted
-IR-approximating-spoof residual risk. The mitigation, **passive-blink
-challenge-response** (a static print cannot blink), is implemented and
-validated ([ADR-0002](adr/0002-challenge-response-liveness.md); measured APCER
-0% / BPCER 0%) but ships **opt-in and off by default**, so the default posture
-still carries this gap until a user enables the blink challenge.
+IR-approximating-spoof residual risk.
+
+Two mitigations exist and neither is automatic. The **passive-blink
+challenge-response** (a static print cannot blink) is implemented and validated
+([ADR-0002](adr/0002-challenge-response-liveness.md); measured APCER 0% / BPCER
+0%) and ships opt-in. The **trained `flir` cue** has refused this print in every
+measured session, including one enhanced with an infrared-absorbing patch that
+carries the centre/edge ratio into the genuine range while the built-in gate
+still returns `Live`; since 2026-08-04 `irlume setup` offers it as a recommended
+step with the license and provenance on screen
+([ADR-0001](adr/0001-liveness-pad-strategy.md)), though the weights are neither
+shipped nor fetched without consent. Measurements:
+[docs/pad-results/](pad-results/).
+
+A user who declines both, or who never runs setup, still carries this gap in
+full.
 Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/2026-06-30-ir-liveness-selftest.md).
 
 ## Storage

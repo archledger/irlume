@@ -1406,7 +1406,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("=== irlume setup for '{user}' ===\n");
 
     // 1. Preflight.
-    println!("[1/6] Preflight");
+    println!("[1/7] Preflight");
     if !daemon_up() {
         eprintln!("  daemon not reachable; start it first: sudo systemctl enable --now irlumed");
         return ExitCode::FAILURE;
@@ -1417,7 +1417,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("  cameras: rgb={rgb} ir={ir}");
 
     // 2. Enroll (reset if already enrolled and the user wants a clean start).
-    println!("\n[2/6] Face enrollment");
+    println!("\n[2/7] Face enrollment");
     let enrolled = matches!(
         daemon_request(&Request::ListProfiles {
             user: user.clone(),
@@ -1436,8 +1436,46 @@ pub fn setup(args: &[String]) -> ExitCode {
         run_enroll(&user, false);
     }
 
-    // 3. Keyring arm.
-    println!("\n[3/6] Keyring unlock (face login opens your wallet)");
+    // 3. The print defence, offered here because the user has just enrolled the
+    // face a printed photograph of it can currently impersonate. Default yes:
+    // on the measurements this is the only cue that has ever refused that
+    // attack, so the user should have to decline it rather than discover it.
+    // The license and provenance are shown either way; irlume does not warrant
+    // these weights and says so before fetching them (ADR-0001).
+    println!("\n[3/7] Anti-spoof model (recommended)");
+    match pad_model_offer() {
+        PadOffer::AlreadyEnabled(name) => println!("  '{name}' already enabled {OK}"),
+        PadOffer::NoCatalog => println!("  no third-party model in the catalog; skipping"),
+        PadOffer::Offer(m) => {
+            println!("  A printed photograph of your face passes irlume's built-in liveness");
+            println!(
+                "  gate. The '{}' model denied that attack in every measured attempt",
+                m.name
+            );
+            println!("  (docs/pad-results/); it is deny-only and can never approve a face");
+            println!("  the built-in gate rejected.");
+            println!();
+            println!("  license:    {}", m.license);
+            println!("  provenance: {}", m.provenance);
+            println!("  irlume does not distribute these weights; they download from the");
+            println!("  publisher's origin and complying with the license is on you.");
+            println!();
+            if !crate::is_root() {
+                println!(
+                    "  needs root to install; run: sudo irlume models enable {}",
+                    m.name
+                );
+            } else if yes_no("  Download and enable it?", /* default_yes: */ true) {
+                crate::models::fetch_and_enable(m);
+            } else {
+                println!("  skipped; a printed photo will pass the built-in gate.");
+                println!("  enable later with: sudo irlume models enable {}", m.name);
+            }
+        }
+    }
+
+    // 4. Keyring arm.
+    println!("\n[4/7] Keyring unlock (face login opens your wallet)");
     if yes_no(
         "  Arm keyring unlock now (you'll enter your login password)?",
         /* default_yes: */ true,
@@ -1463,7 +1501,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
 
     // 4. Recovery passphrase + template encryption.
-    println!("\n[4/6] Recovery passphrase (encrypts templates; backstop for TPM/firmware changes)");
+    println!("\n[5/7] Recovery passphrase (encrypts templates; backstop for TPM/firmware changes)");
     if yes_no(
         "  Set a recovery passphrase now?",
         /* default_yes: */ true,
@@ -1472,7 +1510,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
 
     // 5. Fingerprint.
-    println!("\n[5/6] Fingerprint (optional companion factor)");
+    println!("\n[6/7] Fingerprint (optional companion factor)");
     match irlume_fingerprint::device_name() {
         Some(n) => {
             println!("  reader '{n}' present; manage with `irlume fingerprint add` / `enable`")
@@ -1481,7 +1519,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
 
     // 6. Login wiring.
-    println!("\n[6/6] PAM login wiring");
+    println!("\n[7/7] PAM login wiring");
     println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
     println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
     println!("  once wired: at the greeter/lock, leave the password empty and press Enter");
@@ -1520,6 +1558,29 @@ fn run_enroll(user: &str, reset: bool) {
 }
 
 /// Minimal y/N prompt (default applied on empty input or a non-tty).
+/// What `setup` should do about the third-party PAD cue on this machine.
+///
+/// A value rather than a branch so the decision is testable: setup itself
+/// needs root, a daemon and a camera, and this is the part with cases.
+enum PadOffer {
+    /// One is already enabled; say so and change nothing.
+    AlreadyEnabled(String),
+    /// The catalog is empty, so there is nothing to offer.
+    NoCatalog,
+    /// Offer this model.
+    Offer(&'static irlume_common::thirdparty::ThirdPartyModel),
+}
+
+fn pad_model_offer() -> PadOffer {
+    if let Some(name) = crate::models::enabled_name() {
+        return PadOffer::AlreadyEnabled(name);
+    }
+    match irlume_common::thirdparty::CATALOG.first() {
+        Some(m) => PadOffer::Offer(m),
+        None => PadOffer::NoCatalog,
+    }
+}
+
 fn yes_no(q: &str, default_yes: bool) -> bool {
     use std::io::{IsTerminal, Write};
     // No terminal takes the documented default. That is deliberate and covered
@@ -1875,5 +1936,32 @@ mod origin_tests {
             !src.contains(&pacman_u),
             "no pacman local-file install of a downloaded asset"
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_offer_tests {
+    use super::{pad_model_offer, PadOffer};
+
+    #[test]
+    fn the_setup_offer_names_a_catalog_model_when_none_is_enabled() {
+        // The step offers CATALOG.first(); an empty catalog would make it dead
+        // code that prints a heading and does nothing.
+        assert!(
+            !irlume_common::thirdparty::CATALOG.is_empty(),
+            "setup offers CATALOG.first(); an empty catalog makes the step dead"
+        );
+        let m = irlume_common::thirdparty::CATALOG.first().unwrap();
+        // Everything the step prints before asking for consent must exist, or
+        // the user is asked to accept a license and provenance never shown.
+        assert!(!m.name.is_empty());
+        assert!(!m.license.is_empty(), "the offer prints the license");
+        assert!(!m.provenance.is_empty(), "the offer prints the provenance");
+        match pad_model_offer() {
+            PadOffer::Offer(o) => assert_eq!(o.name, m.name),
+            // A machine with one already enabled correctly steps aside.
+            PadOffer::AlreadyEnabled(_) => {}
+            PadOffer::NoCatalog => panic!("catalog is non-empty but the offer said otherwise"),
+        }
     }
 }

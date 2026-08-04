@@ -286,12 +286,16 @@ The current gaps:
   brightness ratio on a 2D infrared sensor, and a life-size print held at an
   angle produces the same falloff a face does (1.02 to 1.58 over those 70
   presentations, against 1.26 to 1.49 for the live user), so no threshold
-  accepts the user and rejects the print. `sudo irlume models enable flir` adds
-  a trained, deny-only cue that flagged all 6 presentations of the same print
-  that reached it, at p_fake 0.941 to 1.000; that evidence covers one subject
-  and one print instrument. It is opt-in because its publisher documents
-  neither the training data nor a way to reproduce the model, which fails
-  [ADR-0001](docs/adr/0001-liveness-pad-strategy.md). Passive blink liveness also
+  accepts the user and rejects the print. **`irlume setup` offers a trained,
+  deny-only cue (`flir`) for this, and recommends it**: it refused the same
+  print at p_fake 0.941 to 1.000, and still refused at 0.998 to 0.999 when the
+  print was enhanced with an infrared-absorbing patch that carries the built-in
+  ratio into the genuine range. That evidence covers one subject and one print
+  instrument. irlume does not ship or warrant those weights, because their
+  publisher documents neither the training data nor a way to reproduce the
+  model, which fails [ADR-0001](docs/adr/0001-liveness-pad-strategy.md); setup
+  shows the license and provenance before fetching anything, and
+  `sudo irlume models enable flir` does the same later. Passive blink liveness also
   **doesn't cover glasses-wearers** (IR lens reflections hide the eyelid). Every
   miss falls **safely to the password**. See
   [ADR-0002](docs/adr/0002-challenge-response-liveness.md) and the

@@ -179,9 +179,14 @@ signal without printing anything and needs no new instrument at all.
   a second attack image or by physical occlusion, captured and refused. The
   banner carries no controlled tone scale, so nothing here establishes the
   minimum response its ink and medium can reach.
-- **More than one subject.** Facial relief is the quantity being measured, and
-  jaw shape, beard, and chin prominence vary. One subject cannot establish a
-  floor.
+- **More than one subject, and at least one clean-shaven.** The sole subject
+  here has a full beard covering the chin and jaw, established by rendering the
+  frames (see [the ambient report](2026-08-04-ambient.md)), so every chin
+  reading above is beard rather than skin. Real hair absorbs 850nm and printed
+  hair does not, the same effect this corpus measures at the eyebrow (0.728
+  against 0.961), so the cue may be separating real hair from printed hair
+  rather than relief from flatness. Those explanations differ exactly where it
+  matters: on a face without facial hair.
 - **Head pitch.** Every face frame here is frontal within the existing gate's
   bounds; looking up or down changes chin illumination directly, and no sample
   varies it deliberately.

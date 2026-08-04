@@ -51,7 +51,8 @@ pub struct FaceScan {
     #[serde(default)]
     pub ir_space: Option<String>,
     /// The RECOGNIZER that produced `rgb` (and, before any adapter, `ir`),
-    /// as `"embed:<sha256 prefix>"` of its weights.
+    /// as `"embed:<sha256>"` of its weights (full digest: this tag exists to
+    /// resist an adversarial model, and a truncated hash halves per character).
     ///
     /// Cosine similarity is only meaningful WITHIN one embedding space. A
     /// different recognizer produces a different space, so comparing a fresh
@@ -62,8 +63,12 @@ pub struct FaceScan {
     /// user-supplied recognizer can be considered and which a change to the
     /// shipped weights would need regardless.
     ///
-    /// `None` = scan predates this tagging; grandfathered as compatible, the
-    /// same concession `ir_space` makes.
+    /// `None` = scan predates this tagging, which means exactly one recognizer
+    /// can have produced it: the historically shipped one. Compatibility is
+    /// decided by [`recognizer_space_matches`], which accepts `None` only when
+    /// the running recognizer IS [`LEGACY_RECOGNIZER_SPACE`] — not the blanket
+    /// grandfathering `ir_space` applies, because a template handed to an
+    /// arbitrary future model is the hole this field closes.
     #[serde(default)]
     pub embed_space: Option<String>,
     /// Per-scan IR liveness calibration: the center/edge brightness ratio of the
@@ -136,6 +141,30 @@ pub struct Enrollment {
     pub closure_calibration: Option<(f32, f32)>,
 }
 
+/// The one recognizer irlume ever shipped before templates recorded their
+/// producer: `glintr100.onnx` (AuraFace), as `"embed:<sha256>"` of its weights,
+/// pinned in `models/SHA256SUMS`. Every scan that deserializes with
+/// `embed_space: None` was produced by it, because no other recognizer existed
+/// when those scans were written.
+pub const LEGACY_RECOGNIZER_SPACE: &str =
+    "embed:a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60";
+
+/// Is a template tagged `have` comparable with embeddings from the recognizer
+/// whose space is `want`?
+///
+/// Cosine similarity is only meaningful inside one embedding space, so a
+/// mismatch means the comparison must not happen at all. An untagged template
+/// (`None`) is comparable ONLY when the running recognizer is the historical
+/// shipped one: grandfathering it into any space would hand every pre-tagging
+/// enrollment to whatever model is loaded, which is the exact hole the tag
+/// exists to close.
+pub fn recognizer_space_matches(have: Option<&str>, want: &str) -> bool {
+    match have {
+        Some(have) => have == want,
+        None => want == LEGACY_RECOGNIZER_SPACE,
+    }
+}
+
 impl Enrollment {
     pub fn new(user: &str) -> Self {
         Self {
@@ -153,29 +182,40 @@ impl Enrollment {
         self.profiles.iter().map(|p| p.scans.len()).sum()
     }
 
-    /// Every RGB template with its (profile, scan) labels, for 1:N matching.
-    pub fn rgb_scans(&self) -> Vec<(&str, &str, &[f32])> {
-        self.rgb_scans_in(None)
-    }
-
-    /// Every RGB template that lives in `space`, with (profile, scan) labels.
+    /// Every RGB template with its (profile, scan) labels, unfiltered.
     ///
-    /// `None` keeps every scan, which is what callers with no recognizer
-    /// identity to compare against want. `Some(space)` drops scans tagged with
-    /// a DIFFERENT recognizer: their vectors are in another embedding space and
-    /// a cosine against them is a number with no interpretation, free to land
-    /// either side of the threshold. Untagged scans are kept, the same
-    /// grandfathering `ir_space` applies (#276).
-    pub fn rgb_scans_in(&self, space: Option<&str>) -> Vec<(&str, &str, &[f32])> {
+    /// Diagnostic/export callers only. Anything that COMPARES vectors must go
+    /// through [`Self::rgb_scans_in`]: this accessor returns templates from
+    /// every embedding space, and a cosine across spaces is meaningless.
+    pub fn rgb_scans(&self) -> Vec<(&str, &str, &[f32])> {
         self.profiles
             .iter()
             .flat_map(|p| {
                 p.scans
                     .iter()
-                    .filter_map(move |s| match (space, s.embed_space.as_deref()) {
-                        (Some(want), Some(have)) if want != have => None,
-                        _ => Some((p.name.as_str(), s.name.as_str(), s.rgb.as_slice())),
-                    })
+                    .map(move |s| (p.name.as_str(), s.name.as_str(), s.rgb.as_slice()))
+            })
+            .collect()
+    }
+
+    /// Every RGB template that lives in `space`, with (profile, scan) labels.
+    ///
+    /// Drops scans from a DIFFERENT recognizer: their vectors are in another
+    /// embedding space and a cosine against them is a number with no
+    /// interpretation, free to land either side of the threshold. Untagged
+    /// scans are compatible only with [`LEGACY_RECOGNIZER_SPACE`], the one
+    /// recognizer that can have produced them (#276).
+    pub fn rgb_scans_in(&self, space: &str) -> Vec<(&str, &str, &[f32])> {
+        self.profiles
+            .iter()
+            .flat_map(|p| {
+                p.scans.iter().filter_map(move |s| {
+                    recognizer_space_matches(s.embed_space.as_deref(), space).then_some((
+                        p.name.as_str(),
+                        s.name.as_str(),
+                        s.rgb.as_slice(),
+                    ))
+                })
             })
             .collect()
     }
@@ -597,7 +637,8 @@ mod tests {
     fn rgb_templates_from_another_recognizer_are_not_offered_for_matching() {
         // Cosine is only meaningful inside one embedding space, so a template
         // tagged with a different recognizer must not reach the comparison at
-        // all. Untagged scans predate tagging and stay comparable (#276).
+        // all, and an untagged scan is comparable only with the one recognizer
+        // that can have produced it (#276).
         let enr = Enrollment {
             user: "u".into(),
             profiles: vec![FaceProfile {
@@ -617,16 +658,37 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            names(enr.rgb_scans_in(Some("embed:aaaaaaaaaaaa"))),
-            vec!["same", "legacy"],
-            "a template from another recognizer must be excluded"
+            names(enr.rgb_scans_in("embed:aaaaaaaaaaaa")),
+            vec!["same"],
+            "a foreign tag and an untagged scan must both be excluded \
+             under a non-legacy recognizer"
         );
-        // No identity to compare against keeps everything, which is what the
-        // unfiltered accessor must still do for callers that have none.
+        assert_eq!(
+            names(enr.rgb_scans_in(LEGACY_RECOGNIZER_SPACE)),
+            vec!["legacy"],
+            "an untagged scan is comparable only with the legacy recognizer"
+        );
+        // The unfiltered accessor is for diagnostics and keeps everything.
         assert_eq!(names(enr.rgb_scans()), vec!["same", "other", "legacy"]);
-        // And the whole set can be excluded, which must yield an empty match
-        // rather than a comparison against foreign vectors.
-        assert!(enr.rgb_scans_in(Some("embed:cccccccccccc")).len() == 1);
+        // A recognizer nothing was enrolled under gets NO templates: matching
+        // must come up empty rather than score across spaces.
+        assert!(enr.rgb_scans_in("embed:cccccccccccc").is_empty());
+    }
+
+    #[test]
+    fn recognizer_space_matching_pins_the_legacy_concession() {
+        // Tagged scans compare by equality.
+        assert!(recognizer_space_matches(Some("embed:aa"), "embed:aa"));
+        assert!(!recognizer_space_matches(Some("embed:aa"), "embed:bb"));
+        // Untagged scans belong to the one recognizer that predates tagging,
+        // and to nothing else: `None` under an arbitrary model would hand every
+        // pre-tagging enrollment to whatever weights are loaded.
+        assert!(recognizer_space_matches(None, LEGACY_RECOGNIZER_SPACE));
+        assert!(!recognizer_space_matches(None, "embed:aa"));
+        // The pinned digest is the full 64-hex sha256 of glintr100.onnx from
+        // models/SHA256SUMS; a truncated pin would weaken every comparison
+        // above.
+        assert_eq!(LEGACY_RECOGNIZER_SPACE.len(), "embed:".len() + 64);
     }
     use super::*;
 

@@ -431,6 +431,7 @@ struct IrMatch {
 /// template carries no best-of-N FAR inflation).
 fn ir_match_in(
     space: &str,
+    embed_space: &str,
     adapter_loaded: bool,
     enr: &irlume_core::storage::Enrollment,
     probe: &[f32],
@@ -446,6 +447,17 @@ fn ir_match_in(
             .scans
             .iter()
             .filter_map(|s| {
+                // The RECOGNIZER produces the raw IR embedding, so a template
+                // from another recognizer is in a foreign space regardless of
+                // its adapter tag. This matcher feeds fusion, IR fallback, the
+                // calibrated centroid, and dark IR-only auth — all of them
+                // grant, so all of them get the same filter RGB matching has.
+                if !irlume_core::storage::recognizer_space_matches(
+                    s.embed_space.as_deref(),
+                    embed_space,
+                ) {
+                    return None;
+                }
                 let ir = s.ir.as_ref()?;
                 if ir.len() != probe.len() {
                     return None;
@@ -534,17 +546,20 @@ impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         // Identify the recognizer by its weights, not its path: a file swapped
         // in place under the same name is a different embedding space and must
-        // not silently score against templates from the old one.
-        let embed_space = match std::fs::read(model_path) {
-            Ok(b) => format!("embed:{}", &irlume_common::thirdparty::sha256_hex(&b)[..12]),
-            // Unreadable here means Embedder::load_from_file below will fail
-            // too; keep a value that can never equal a real tag rather than
-            // one that compares equal to everything.
-            Err(_) => "embed:unknown".into(),
-        };
+        // not silently score against templates from the old one. Read the file
+        // ONCE and build the session from those same bytes — hashing one read
+        // and loading another would let a mid-startup file swap run weights the
+        // tag does not describe. Full digest: the tag resists an adversarial
+        // model, and truncation halves its strength per dropped character.
+        let model_bytes = std::fs::read(model_path)
+            .map_err(|e| irlume_common::Error::Io(format!("{model_path}: {e}")))?;
+        let embed_space = format!(
+            "embed:{}",
+            irlume_common::thirdparty::sha256_hex(&model_bytes)
+        );
         Ok(Self {
             det: Detector::load_from_file(det_path)?,
-            emb: Embedder::load_from_file(model_path)?,
+            emb: Embedder::load_from_memory(&model_bytes)?,
             ir_adapter: None,
             ir_space: "raw".into(),
             embed_space,
@@ -617,10 +632,14 @@ impl Engine {
     /// file is absent this is a no-op (raw IR embeddings are used).
     pub fn with_ir_adapter(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
-            self.ir_adapter = Some(Adapter::load_from_file(path)?);
+            // One read feeds both the digest and the session, so the tag always
+            // describes the weights that are running (same reasoning as the
+            // recognizer in `load`). The 12-hex prefix is the format existing
+            // enrollments carry in `ir_space`; changing it would orphan them.
             let bytes = std::fs::read(path)
                 .map_err(|e| irlume_common::Error::Io(format!("{path}: {e}")))?;
             let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+            self.ir_adapter = Some(Adapter::load_from_memory(&bytes)?);
             self.ir_space = format!("adapter:{}", &digest[..12]);
         }
         Ok(self)
@@ -638,19 +657,6 @@ impl Engine {
     /// The recognizer embedding space this engine produces and matches in.
     pub fn embed_space(&self) -> &str {
         &self.embed_space
-    }
-
-    /// Is this scan comparable with embeddings this engine produces?
-    ///
-    /// A scan tagged with a different recognizer is not: its vector lives in
-    /// another space and a cosine against it means nothing. `None` is
-    /// grandfathered, the same concession `ir_space` makes for scans enrolled
-    /// before tagging existed.
-    pub fn scan_is_comparable(&self, s: &irlume_core::storage::FaceScan) -> bool {
-        match &s.embed_space {
-            Some(sp) => sp == &self.embed_space,
-            None => true,
-        }
     }
 
     /// Dimensionality of the IR embeddings this engine emits. The recognizer
@@ -672,6 +678,14 @@ impl Engine {
         let dim = self.ir_dim();
         let (mut ir_rows, mut rgb_rows) = (Vec::new(), Vec::new());
         for s in &prof.scans {
+            // A pair from another recognizer would fit one calibration across
+            // incompatible embedding spaces; skip it like matching does.
+            if !irlume_core::storage::recognizer_space_matches(
+                s.embed_space.as_deref(),
+                &self.embed_space,
+            ) {
+                continue;
+            }
             let Some(ir) = &s.ir else { continue };
             if ir.len() != dim || s.rgb.len() != dim {
                 continue;
@@ -695,7 +709,13 @@ impl Engine {
     /// Method wrapper over [`ir_match_in`], bound to the engine's space and
     /// adapter state.
     fn ir_match(&self, enr: &irlume_core::storage::Enrollment, probe: &[f32]) -> IrMatch {
-        ir_match_in(&self.ir_space, self.ir_adapter.is_some(), enr, probe)
+        ir_match_in(
+            &self.ir_space,
+            &self.embed_space,
+            self.ir_adapter.is_some(),
+            enr,
+            probe,
+        )
     }
 
     /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
@@ -2038,7 +2058,7 @@ impl Engine {
                     ));
                 }
             }
-            let scans = enr.rgb_scans_in(Some(&self.embed_space));
+            let scans = enr.rgb_scans_in(&self.embed_space);
             let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
             let (score, who) = best(&probe, &scans);
             irlume_common::dlog!(
@@ -2306,7 +2326,7 @@ impl Engine {
             let Some(enr) = irlume_core::storage::load(&user)? else {
                 continue;
             };
-            let scans = enr.rgb_scans_in(Some(&self.embed_space));
+            let scans = enr.rgb_scans_in(&self.embed_space);
             if scans.is_empty() {
                 continue;
             }
@@ -2549,7 +2569,7 @@ impl Engine {
                     "no live scan captured; check lighting and framing".into(),
                 )
             })?;
-        let goal = match enroll_merge_target(&enr, &[probe.rgb.as_slice()])? {
+        let goal = match enroll_merge_target(&enr, &[probe.rgb.as_slice()], &self.embed_space)? {
             Some(target) => {
                 let have = enr
                     .profiles
@@ -2581,7 +2601,7 @@ impl Engine {
         // drifting into frame after the probe, and a borderline probe that only
         // crosses the identity threshold on a later scan.
         let rgbs: Vec<&[f32]> = captured.iter().map(|s| s.rgb.as_slice()).collect();
-        if let Some(target) = enroll_merge_target(&enr, &rgbs)? {
+        if let Some(target) = enroll_merge_target(&enr, &rgbs, &self.embed_space)? {
             // The face already owns a profile: merge the capture into it.
             let idx = enr
                 .profiles
@@ -2717,7 +2737,9 @@ impl Engine {
                 )
             })?;
         // Anti-mixing: reject a scan whose face belongs to a different profile.
-        if let Some((other, score)) = colliding_profile(&enr, &captured.rgb, Some(profile_name)) {
+        if let Some((other, score)) =
+            colliding_profile(&enr, &captured.rgb, Some(profile_name), &self.embed_space)
+        {
             let cnt = enr
                 .profiles
                 .iter()
@@ -2991,10 +3013,11 @@ pub enum EnrollOutcome {
 fn enroll_merge_target(
     enr: &irlume_core::storage::Enrollment,
     captured_rgb: &[&[f32]],
+    embed_space: &str,
 ) -> irlume_common::Result<Option<String>> {
     let mut hit: Option<String> = None;
     for rgb in captured_rgb {
-        let Some((other, _score)) = colliding_profile(enr, rgb, None) else {
+        let Some((other, _score)) = colliding_profile(enr, rgb, None, embed_space) else {
             continue;
         };
         match &hit {
@@ -3019,6 +3042,7 @@ fn colliding_profile(
     enr: &irlume_core::storage::Enrollment,
     probe: &[f32],
     exclude: Option<&str>,
+    embed_space: &str,
 ) -> Option<(String, f32)> {
     let mut best: Option<(String, f32)> = None;
     for p in &enr.profiles {
@@ -3026,6 +3050,16 @@ fn colliding_profile(
             continue;
         }
         for s in &p.scans {
+            // A template from another recognizer is in a foreign embedding
+            // space; a cosine against it could merge a stranger's scans into
+            // this profile or reject a legitimate add-scan, so it does not
+            // get compared at all.
+            if !irlume_core::storage::recognizer_space_matches(
+                s.embed_space.as_deref(),
+                embed_space,
+            ) {
+                continue;
+            }
             let c = align::cosine(probe, &s.rgb);
             if c >= irlume_core::RGB_MATCH_THRESHOLD && best.as_ref().is_none_or(|b| c > b.1) {
                 best = Some((p.name.clone(), c));
@@ -3324,7 +3358,7 @@ pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
+    use irlume_core::storage::{Enrollment, FaceProfile, FaceScan, LEGACY_RECOGNIZER_SPACE};
 
     /// Serializes access to process-wide env vars (`IRLUME_GRACE_MS`,
     /// `IRLUME_STATE_DIR`, `IRLUME_METHOD_CONF`, ...) across this binary's
@@ -3393,7 +3427,7 @@ mod tests {
         let (prof, probe) = calibrated_profile(16);
         let mut enr = Enrollment::new("u");
         enr.profiles.push(prof);
-        let raw = ir_match_in("raw", false, &enr, &probe);
+        let raw = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
         assert_eq!(raw.n_templates, 5);
         let (cs, who) = raw.centroid.as_ref().expect("centroid expected");
         assert_eq!(who, "p");
@@ -3405,7 +3439,7 @@ mod tests {
         assert!(raw.best > 0.8, "calibrated best degraded: {}", raw.best);
         assert!(*cs > 0.8, "centroid degraded: {cs}");
         // With the adapter loaded the calibration must be ignored entirely.
-        let with_adapter = ir_match_in("raw", true, &enr, &probe);
+        let with_adapter = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, true, &enr, &probe);
         assert!(with_adapter.centroid.is_none());
         assert!(with_adapter.best.is_finite());
     }
@@ -3552,9 +3586,46 @@ mod tests {
         }
         let mut enr = Enrollment::new("u");
         enr.profiles.push(prof);
-        let m = ir_match_in("raw", false, &enr, &probe);
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
         assert_eq!(m.n_templates, 0);
         assert!(m.centroid.is_none());
+    }
+
+    #[test]
+    fn ir_match_skips_templates_from_another_recognizer() {
+        // The recognizer produces the raw IR embedding, so its identity gates
+        // IR matching exactly like RGB matching: a foreign tag is excluded, a
+        // matching tag scores, and an untagged scan belongs to the legacy
+        // recognizer only. This matcher feeds fusion, IR fallback, the
+        // calibrated centroid, and dark IR-only auth, so the one filter covers
+        // all four grant paths.
+        let (prof, probe) = calibrated_profile(16);
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+
+        // Untagged (legacy) templates: comparable ONLY under the legacy space.
+        let m = ir_match_in("raw", "embed:not-the-legacy-model", false, &enr, &probe);
+        assert_eq!(
+            m.n_templates, 0,
+            "untagged scans must not reach a foreign recognizer"
+        );
+        assert!(m.centroid.is_none());
+        assert_eq!(m.best, f32::NEG_INFINITY);
+
+        // Tagged templates: comparable exactly under their own space.
+        for s in &mut enr.profiles[0].scans {
+            s.embed_space = Some("embed:model-b".into());
+        }
+        let m = ir_match_in("raw", "embed:model-b", false, &enr, &probe);
+        assert_eq!(
+            m.n_templates, 5,
+            "same-recognizer templates must still score"
+        );
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
+        assert_eq!(
+            m.n_templates, 0,
+            "tagged scans must not reach the legacy recognizer"
+        );
     }
 
     fn scan(v: Vec<f32>) -> FaceScan {
@@ -3686,13 +3757,57 @@ mod tests {
         };
         // Adding face1 under Face Profile 2 -> flagged as belonging to Profile 1.
         assert_eq!(
-            colliding_profile(&enr, &face1, Some("Face Profile 2")).map(|(n, _)| n),
+            colliding_profile(
+                &enr,
+                &face1,
+                Some("Face Profile 2"),
+                LEGACY_RECOGNIZER_SPACE
+            )
+            .map(|(n, _)| n),
             Some("Face Profile 1".to_string())
         );
         // A novel face collides with nothing.
-        assert!(colliding_profile(&enr, &[0.0, 0.0, 1.0], None).is_none());
+        assert!(colliding_profile(&enr, &[0.0, 0.0, 1.0], None, LEGACY_RECOGNIZER_SPACE).is_none());
         // Same face into its OWN profile (excluded) is fine; that's improving it.
-        assert!(colliding_profile(&enr, &face1, Some("Face Profile 1")).is_none());
+        assert!(colliding_profile(
+            &enr,
+            &face1,
+            Some("Face Profile 1"),
+            LEGACY_RECOGNIZER_SPACE
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn collision_never_compares_across_recognizer_spaces() {
+        // A template from another recognizer must not decide enrollment
+        // dispositions, even when its raw vector is IDENTICAL to the probe:
+        // a foreign-space cosine could merge a stranger into an unrelated
+        // profile or reject a legitimate add-scan.
+        let face = vec![1.0, 0.0, 0.0];
+        let mut foreign = scan(face.clone());
+        foreign.embed_space = Some("embed:model-b".into());
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![FaceProfile {
+                ir_calib: None,
+                name: "P1".into(),
+                scans: vec![foreign],
+            }],
+            ..Default::default()
+        };
+        // Under any OTHER recognizer the identical vector is invisible...
+        assert!(colliding_profile(&enr, &face, None, LEGACY_RECOGNIZER_SPACE).is_none());
+        assert_eq!(
+            enroll_merge_target(&enr, &[&face], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            None
+        );
+        // ...and under its own recognizer it collides as it always did (the
+        // positive control that proves the filter, not the vector, decided).
+        assert_eq!(
+            colliding_profile(&enr, &face, None, "embed:model-b").map(|(n, _)| n),
+            Some("P1".to_string())
+        );
     }
 
     #[test]
@@ -3718,18 +3833,21 @@ mod tests {
 
         // Novel face: no collision, create the new profile.
         let enr = enr_with(vec![ir_scan(face1.clone(), Some("raw"))]);
-        assert_eq!(enroll_merge_target(&enr, &[&novel]).unwrap(), None);
+        assert_eq!(
+            enroll_merge_target(&enr, &[&novel], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            None
+        );
 
         // Same face merges into its profile regardless of IR-template state:
         // healthy current-space templates...
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1]).unwrap(),
+            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
             Some("P1".into())
         );
         // ...untagged legacy templates...
         let enr = enr_with(vec![ir_scan(face1.clone(), None)]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1]).unwrap(),
+            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
             Some("P1".into())
         );
         // ...templates stranded by an adapter removal (the 0.2.0 upgrade case)...
@@ -3738,13 +3856,13 @@ mod tests {
             ir_scan(face1.clone(), Some("adapter:deadbeef0123")),
         ]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1]).unwrap(),
+            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
             Some("P1".into())
         );
         // ...or a profile that never had IR scans at all.
         let enr = enr_with(vec![scan(face1.clone())]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1]).unwrap(),
+            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
             Some("P1".into())
         );
 
@@ -3755,7 +3873,8 @@ mod tests {
             name: "P2".into(),
             scans: vec![ir_scan(face2.clone(), Some("adapter:deadbeef0123"))],
         });
-        let err = enroll_merge_target(&enr, &[&face1, &face2]).unwrap_err();
+        let err =
+            enroll_merge_target(&enr, &[&face1, &face2], LEGACY_RECOGNIZER_SPACE).unwrap_err();
         assert!(err.to_string().contains("two different profiles"));
     }
 
@@ -3855,12 +3974,15 @@ mod tests {
         enr.profiles.push(prof);
         // A probe of a different width matches nothing (adapter-contract change).
         let short_probe = vec![0.5f32; 8];
-        let m = ir_match_in("raw", false, &enr, &short_probe);
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &short_probe);
         assert_eq!(m.n_templates, 0);
         assert!(m.centroid.is_none());
         assert_eq!(m.best, f32::NEG_INFINITY);
         // The right width still matches.
-        assert_eq!(ir_match_in("raw", false, &enr, &probe).n_templates, 5);
+        assert_eq!(
+            ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe).n_templates,
+            5
+        );
     }
 
     #[test]
@@ -3872,7 +3994,7 @@ mod tests {
         let mut enr = Enrollment::new("u");
         enr.profiles.push(prof);
         for space in ["raw", "adapter:deadbeef0123"] {
-            let m = ir_match_in(space, false, &enr, &probe);
+            let m = ir_match_in(space, LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
             assert_eq!(m.n_templates, 5, "untagged templates must match in {space}");
         }
     }
@@ -3899,7 +4021,7 @@ mod tests {
         let mut enr = Enrollment::new("u");
         enr.profiles.push(mk_prof("A", &a));
         enr.profiles.push(mk_prof("B", &b));
-        let m = ir_match_in("raw", false, &enr, &b);
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &b);
         assert_eq!(m.n_templates, 2);
         assert_eq!(m.best_who, "B");
         assert!((m.best - 1.0).abs() < 1e-5);
@@ -4504,6 +4626,17 @@ mod engine_tests {
         let bytes = std::fs::read(model_path("blaze_face_short_range.onnx")).unwrap();
         let digest = irlume_common::thirdparty::sha256_hex(&bytes);
         assert_eq!(s.adapter_space, format!("adapter:{}", &digest[..12]));
+        // The engine loaded the shipped glintr100.onnx, so its embedding space
+        // must BE the pinned legacy space: this ties Engine::load's full-digest
+        // tag, models/SHA256SUMS, and LEGACY_RECOGNIZER_SPACE together. If this
+        // fails after a deliberate recognizer change, mint a NEW space rather
+        // than repointing the legacy constant — untagged templates were made by
+        // the old model, and the constant exists to say exactly that.
+        assert_eq!(
+            e.embed_space(),
+            irlume_core::storage::LEGACY_RECOGNIZER_SPACE,
+            "shipped recognizer no longer matches the pinned legacy space"
+        );
     }
 
     #[test]
@@ -4553,6 +4686,20 @@ mod engine_tests {
         };
         s.engine.refit_profile_calib(&mut foreign);
         assert!(foreign.ir_calib.is_none());
+        // Templates from another RECOGNIZER are skipped too: fitting across
+        // embedding spaces would produce a calibration describing neither.
+        let mut foreign_rec = FaceProfile {
+            name: "foreign-rec".into(),
+            ir_calib: None,
+            scans: (0..5)
+                .map(|i| FaceScan {
+                    embed_space: Some("embed:model-b".into()),
+                    ..scan512(i, true, Some("raw"))
+                })
+                .collect(),
+        };
+        s.engine.refit_profile_calib(&mut foreign_rec);
+        assert!(foreign_rec.ir_calib.is_none());
         // With a global adapter loaded, refit is a no-op: an existing
         // calibration is left untouched and none is fitted.
         let adapter = Adapter::load_from_file(&model_path("blaze_face_short_range.onnx")).unwrap();

@@ -448,11 +448,15 @@ mod onnx {
     }
 
     impl Adapter {
+        pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            Ok(Self {
+                session: build(model)?,
+            })
+        }
+
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-            Ok(Self {
-                session: build(&bytes)?,
-            })
+            Self::load_from_memory(&bytes)
         }
 
         /// Adapt one IR embedding -> adapted vector (already L2-normalized).

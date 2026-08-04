@@ -576,7 +576,7 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
     // with. `--pose` names what the operator is holding; it is recorded in the
     // output only, since the daemon cannot know what the face is doing.
     if args.iter().any(|a| a == "--measure-only") {
-        let pose = flag(args, "--pose").unwrap_or_else(|| "unlabeled".into());
+        let pose = flag(args, "--pose").unwrap_or("unlabeled");
         println!(
             "[calibrate] measure-only: {rounds} capture(s), pose '{pose}', nothing stored.\n\
              [calibrate] hold the pose now; first capture in ~3s, the rest back-to-back."

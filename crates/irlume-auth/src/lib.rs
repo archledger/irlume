@@ -271,6 +271,33 @@ fn consent_gesture_enabled() -> bool {
     !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
 }
 
+/// The consent verdict once the watch's stream has ended: what the in-loop
+/// cadence already found, or a gesture visible only on the COMPLETE take.
+///
+/// The in-loop check runs every `CHECK_EVERY` poses, so a take whose length is
+/// not a multiple of it ends with unevaluated trailing poses, and a gesture
+/// completing in exactly those frames was refused with whole-take evidence
+/// that passes every gate (measured 2026-08-04, #101: two 20-pose windows at
+/// pitch_range 0.077-0.085 against the 0.075 floor, last in-loop check at
+/// pose 18; one cost a real trial its release). A pure function rather than
+/// inline in `consent_watch`, because this boolean directly satisfies the
+/// consent gate for credential release and a test must be able to fail if the
+/// completed-take evaluation is removed.
+fn completed_consent_take_hit(
+    hit_in_loop: bool,
+    allow_nod: bool,
+    poses: &[irlume_liveness::PoseSample],
+    ears: &[irlume_liveness::EarSample],
+    closure_cal: Option<&irlume_liveness::ClosureCalibration>,
+) -> bool {
+    hit_in_loop
+        || (allow_nod && irlume_liveness::detect_nod(poses) == irlume_liveness::HeadGesture::Nod)
+        || closure_cal.is_some_and(|cal| {
+            irlume_liveness::detect_deliberate_closure(ears, cal)
+                == irlume_liveness::BlinkResult::Blinked
+        })
+}
+
 // The consent-gesture mode is defined in irlume_common::config so the PAM module
 // can name the SAME gesture it tells the user to perform; see `ConsentGesture`.
 use irlume_common::config::{consent_gesture_mode, ConsentGesture};
@@ -1558,13 +1585,8 @@ impl Engine {
         // a real trial its release. One evaluation of the COMPLETE series
         // closes the boundary at zero capture cost.
         let hit_in_loop = hit == Some(true);
-        let hit = hit_in_loop
-            || (allow_nod
-                && irlume_liveness::detect_nod(&poses) == irlume_liveness::HeadGesture::Nod)
-            || closure_cal.as_ref().is_some_and(|cal| {
-                irlume_liveness::detect_deliberate_closure(&ears, cal)
-                    == irlume_liveness::BlinkResult::Blinked
-            });
+        let hit =
+            completed_consent_take_hit(hit_in_loop, allow_nod, &poses, &ears, closure_cal.as_ref());
         if hit && !hit_in_loop {
             // Observable in the journal so a hardware replay can show THIS
             // path fired, not just that a trial released.
@@ -5167,5 +5189,66 @@ mod engine_tests {
         );
 
         teardown_sandbox(&dir);
+    }
+
+    /// A pose series shaped like the measured #101 boundary: flat until the
+    /// last in-loop check point, with the nod completing in the trailing
+    /// frames the cadence never evaluates.
+    fn boundary_poses() -> Vec<irlume_liveness::PoseSample> {
+        [0.5f32; 18]
+            .into_iter()
+            .chain([0.6, 0.4])
+            .enumerate()
+            .map(|(idx, pitch)| irlume_liveness::PoseSample {
+                idx,
+                pitch_frac: Some(pitch),
+                yaw_signed: Some(0.0),
+                bri: 60.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completed_take_catches_a_nod_in_the_trailing_frames() {
+        let poses = boundary_poses();
+        // The premise first: the prefix the last in-loop check saw must NOT
+        // read as a nod, or this test is not about the boundary at all.
+        assert_ne!(
+            irlume_liveness::detect_nod(&poses[..18]),
+            irlume_liveness::HeadGesture::Nod,
+            "the 18-pose prefix must be flat"
+        );
+        // The full take carries the gesture, and the completed-take evaluation
+        // must find it even though no in-loop check fired.
+        assert!(completed_consent_take_hit(false, true, &poses, &[], None));
+        // Removing the completed-take evaluation reduces the decision to
+        // hit_in_loop, which is false here: that is the observation that
+        // fails if the fix is reverted.
+    }
+
+    #[test]
+    fn completed_take_respects_the_gesture_inputs() {
+        let poses = boundary_poses();
+        // With the nod disallowed and no closure calibration, the same series
+        // must NOT satisfy the gate: the final evaluation widens coverage of
+        // the take, never the set of accepted gestures.
+        assert!(!completed_consent_take_hit(false, false, &poses, &[], None));
+        // An in-loop hit stands on its own, whatever the series holds.
+        assert!(completed_consent_take_hit(true, false, &[], &[], None));
+    }
+
+    #[test]
+    fn completed_take_stays_quiet_on_a_still_series() {
+        // A flat take (today's still windows read pitch_range 0.012-0.029
+        // against the 0.075 floor) must not fire through the new path either.
+        let poses: Vec<_> = (0..20)
+            .map(|idx| irlume_liveness::PoseSample {
+                idx,
+                pitch_frac: Some(0.5 + (idx % 2) as f32 * 0.01),
+                yaw_signed: Some(0.0),
+                bri: 60.0,
+            })
+            .collect();
+        assert!(!completed_consent_take_hit(false, true, &poses, &[], None));
     }
 }

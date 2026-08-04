@@ -496,6 +496,20 @@ const PCR_CHANGED_MARKER: &str = "pcr-update-counter-moved";
 /// machine whose PCRs are genuinely churning.
 const PCR_CHANGED_RETRIES: u32 = 3;
 
+/// Ceiling on the time the retries may add, checked before starting another
+/// attempt.
+///
+/// A count alone is the wrong bound here, because an unseal is not a fixed
+/// cost: it is ~0.2s on an fTPM but ~2.7s on a discrete TPM replaying 8 bound
+/// PCRs, so three retries is half a second on one machine and eight seconds on
+/// another. This code runs inside the PAM auth stack, where the login BLOCKS on
+/// it, and an 11-second login is the exact regression #246 existed to remove.
+/// Whichever bound is reached first wins, so a slow TPM spends at most one more
+/// attempt past this and a fast one still gets all three.
+///
+/// Exhausting the budget costs a keyring password prompt, not a failed login.
+const PCR_CHANGED_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Turn a TPM failure into an [`Error`], tagging the one response code that is
 /// worth retrying.
 ///
@@ -535,14 +549,18 @@ pub fn is_pcr_changed_race(e: &Error) -> bool {
 /// systemd/systemd#35657, where unsealing already retried but the `PolicyPCR`
 /// leg did not.
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
-    let out = retry_on_pcr_race(PCR_CHANGED_RETRIES, || match &env.policy {
-        PolicyKind::PcrLiteral => unseal_literal(env),
-        PolicyKind::Authorized {
-            pubkey_pem,
-            policy_ref,
-        } => unseal_authorized(env, pubkey_pem, policy_ref),
-        PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
-    })?;
+    let out = retry_on_pcr_race(
+        PCR_CHANGED_RETRIES,
+        PCR_CHANGED_RETRY_BUDGET,
+        || match &env.policy {
+            PolicyKind::PcrLiteral => unseal_literal(env),
+            PolicyKind::Authorized {
+                pubkey_pem,
+                policy_ref,
+            } => unseal_authorized(env, pubkey_pem, policy_ref),
+            PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
+        },
+    )?;
     // Lock the unsealed secret (login password / template key) against swap and
     // core dumps for as long as it lives.
     irlume_common::memlock::lock_slice(&out);
@@ -550,22 +568,28 @@ pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Run `attempt` until it stops losing to the PCR-counter race, at most
-/// `limit` extra times.
+/// `limit` extra times and never starting one past `budget`.
+///
+/// Both bounds, because they guard different things: `limit` stops a machine
+/// whose PCRs churn constantly from looping, and `budget` stops a slow TPM from
+/// turning three retries into an eight-second login. Whichever is reached first
+/// ends it.
 ///
 /// A separate function taking a closure because the CONDITION cannot be staged
 /// in a unit test: producing a real `TPM2_RC_PCR_CHANGED` needs another process
 /// to extend a counter-moving PCR at the right microsecond. The loop's
 /// BEHAVIOUR is still a value a test can pin: how many times it re-runs, that
-/// it stops, that it returns the successful result, and that it gives up with
-/// the original error rather than a synthesised one.
-fn retry_on_pcr_race<T, F>(limit: u32, mut attempt: F) -> Result<T>
+/// it stops on either bound, that it returns the successful result, and that it
+/// gives up with the original error rather than a synthesised one.
+fn retry_on_pcr_race<T, F>(limit: u32, budget: std::time::Duration, mut attempt: F) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
+    let start = std::time::Instant::now();
     let mut tries = 0;
     loop {
         match attempt() {
-            Err(e) if is_pcr_changed_race(&e) && tries < limit => {
+            Err(e) if is_pcr_changed_race(&e) && tries < limit && start.elapsed() < budget => {
                 tries += 1;
                 // Worth a line: without it a retried unseal is invisible, and
                 // the difference between "this machine races occasionally" and
@@ -1517,11 +1541,17 @@ mod tests {
     #[test]
     fn the_retry_loop_reruns_the_attempt_and_then_gives_up() {
         let race = || retryable_tpm_err(tss_esapi::Error::Tss2Error(0x128u32.into()));
+        // Ample for four instant closure calls, so the COUNT is what stops
+        // the loop here and the budget gets its own test below. Deliberately
+        // seconds and not hours: with the count bound removed the always-race
+        // case below spins until the budget expires, and an hour-long budget
+        // turns that from a fast assertion failure into a hung test run.
+        const AMPLE: std::time::Duration = std::time::Duration::from_secs(2);
 
         // Fails twice, then succeeds: the caller must see the SUCCESS, and the
         // attempt must have run exactly three times.
         let mut calls = 0;
-        let got = retry_on_pcr_race(3, || {
+        let got = retry_on_pcr_race(3, AMPLE, || {
             calls += 1;
             if calls < 3 {
                 Err(race())
@@ -1535,7 +1565,7 @@ mod tests {
         // Always racing: bounded at limit+1 attempts, and the error that comes
         // back is the race itself, not something invented by the loop.
         let mut calls = 0;
-        let err = retry_on_pcr_race(3, || {
+        let err = retry_on_pcr_race(3, AMPLE, || {
             calls += 1;
             Err::<(), _>(race())
         })
@@ -1549,7 +1579,7 @@ mod tests {
         // A non-race error must not be retried even once: retrying a genuine
         // policy failure would spin and delay the password fallback.
         let mut calls = 0;
-        let err = retry_on_pcr_race(3, || {
+        let err = retry_on_pcr_race(3, AMPLE, || {
             calls += 1;
             Err::<(), _>(Error::Tpm("unseal refused: policy fail".into()))
         })
@@ -1560,7 +1590,7 @@ mod tests {
         // Success first time: exactly one attempt.
         let mut calls = 0;
         assert_eq!(
-            retry_on_pcr_race(3, || {
+            retry_on_pcr_race(3, AMPLE, || {
                 calls += 1;
                 Ok::<_, Error>(7)
             })
@@ -1568,6 +1598,41 @@ mod tests {
             7
         );
         assert_eq!(calls, 1);
+    }
+
+    /// The time bound, which is the one that matters on a discrete TPM: three
+    /// retries there is roughly eight seconds, and this runs inside the PAM
+    /// auth stack where the login blocks on it.
+    ///
+    /// A zero budget is the observable edge: the first failure is already past
+    /// it, so no retry may start even though the count allows three.
+    #[test]
+    fn the_retry_loop_stops_when_the_time_budget_is_spent() {
+        let race = || retryable_tpm_err(tss_esapi::Error::Tss2Error(0x128u32.into()));
+
+        let mut calls = 0;
+        let err = retry_on_pcr_race(3, std::time::Duration::ZERO, || {
+            calls += 1;
+            Err::<(), _>(race())
+        })
+        .expect_err("still an error");
+        assert_eq!(
+            calls, 1,
+            "a spent budget must stop the loop even with retries left"
+        );
+        assert!(is_pcr_changed_race(&err), "the original error survives");
+
+        // And the budget must not truncate a run that is inside it: with room
+        // to spare the count is what stops it.
+        let mut calls = 0;
+        let _ = retry_on_pcr_race(2, std::time::Duration::from_secs(3600), || {
+            calls += 1;
+            Err::<(), _>(race())
+        });
+        assert_eq!(
+            calls, 3,
+            "1 initial + 2 retries while well inside the budget"
+        );
     }
 
     #[test]

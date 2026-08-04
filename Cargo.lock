@@ -1021,6 +1021,7 @@ name = "irlume-pam"
 version = "0.8.1"
 dependencies = [
  "irlume-common",
+ "libc",
  "pamsm",
  "serde_json",
  "zeroize",

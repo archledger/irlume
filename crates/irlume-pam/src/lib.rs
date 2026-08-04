@@ -525,30 +525,126 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
     wait_bounded(&mut child, HELPER_BUDGET)
 }
 
-/// Ceiling on the unlock helper: its own socket deadlines are 10s, so this is
-/// that plus room to start and exit.
+/// Ceiling on the keyring helpers. The GNOME unlock helper's own socket
+/// deadlines are 10s, so this is that plus room to start and exit; the KDE
+/// helper forks and execs the wallet daemon and normally exits in
+/// milliseconds, so the same ceiling is generous there.
 const HELPER_BUDGET: Duration = Duration::from_secs(15);
 
 /// Reap `child`, giving up (and killing it) after `budget`.
+fn wait_bounded(child: &mut std::process::Child, budget: Duration) -> bool {
+    reap_by(child, Instant::now() + budget).is_some_and(|status| status.success())
+}
+
+/// Reap `child`, giving up (and killing it) at `deadline`.
 ///
 /// `Child::wait` has no timeout, and polling `try_wait` is the only way to put
 /// a ceiling on it without another thread. The poll interval is coarse on
 /// purpose: this runs once per login and the common case exits immediately.
-fn wait_bounded(child: &mut std::process::Child, budget: Duration) -> bool {
-    let deadline = Instant::now() + budget;
+fn reap_by(child: &mut std::process::Child, deadline: Instant) -> Option<std::process::ExitStatus> {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return false;
+                    return None;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(_) => return false,
+            Err(_) => return None,
         }
+    }
+}
+
+/// Cap on what the kwallet helper may print. Its whole output is one socket
+/// path, far below this; a helper past the cap is misbehaving and gets killed
+/// rather than read further.
+const HELPER_STDOUT_MAX: usize = 4096;
+
+/// Read `child`'s stdout to completion while reaping it, giving up (and
+/// killing it) after `budget`.
+///
+/// `wait_with_output` would be unbounded twice over: the wait has no deadline,
+/// and the read returns only when every holder of the pipe's write end has
+/// closed it. One holder is outside our control: the helper points the wallet
+/// daemon's stdio at /dev/null before exec, but if its open of /dev/null
+/// fails, the daemon inherits the pipe and outlives the login. So the deadline
+/// has to sit on the read itself: a non-blocking pipe polled alongside
+/// `try_wait`, which also stops trusting the helper to ever exit.
+///
+/// `None` means the deadline expired, the output cap was hit, or the pipe
+/// broke; the child is killed in every such case so nothing is left holding
+/// the login open. `Some` carries the exit status and whatever stdout the
+/// child produced.
+fn read_stdout_bounded(
+    child: &mut std::process::Child,
+    budget: Duration,
+) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let kill_and_fail = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return kill_and_fail(child);
+    };
+    let fd = stdout.as_raw_fd();
+    // SAFETY: fcntl on an fd this process owns; F_GETFL/F_SETFL touch no memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return kill_and_fail(child);
+    }
+
+    let deadline = Instant::now() + budget;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 256];
+    let mut exited = None;
+    loop {
+        match stdout.read(&mut chunk) {
+            // EOF: every write end is closed, nothing more can arrive.
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&chunk[..n]);
+                if out.len() > HELPER_STDOUT_MAX {
+                    return kill_and_fail(child);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if exited.is_some() {
+                    // The child is gone and the pipe is drained. Anything it
+                    // wrote landed before it exited and was read above; only a
+                    // leaked write end could still delay the EOF, and waiting
+                    // for that would hang until the wallet daemon dies. What is
+                    // in hand is everything the helper said.
+                    break;
+                }
+                match child.try_wait() {
+                    // Exited between the read and now: go around once more to
+                    // drain what it wrote just before exiting.
+                    Ok(Some(status)) => exited = Some(status),
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            return kill_and_fail(child);
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => return kill_and_fail(child),
+                }
+            }
+            Err(_) => return kill_and_fail(child),
+        }
+    }
+    match exited {
+        Some(status) => Some((status, out)),
+        // EOF arrived before the exit was observed: the helper is on its way
+        // out, so reap it under what remains of the budget.
+        None => reap_by(child, deadline).map(|status| (status, out)),
     }
 }
 
@@ -706,14 +802,17 @@ fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> bool {
         // and would otherwise sit waiting for more.
         drop(sin);
     }
-    let out = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(_) => return false,
+    // Bounded, for the same reason as the GNOME helper above: this is the PAM
+    // session phase and the login blocks on it. `wait_with_output` would wait
+    // and read without a ceiling, and the read is the riskier half here, so
+    // both carry the deadline (#257).
+    let Some((status, stdout)) = read_stdout_bounded(&mut child, HELPER_BUDGET) else {
+        return false;
     };
-    if !out.status.success() {
+    if !status.success() {
         return false;
     }
-    let sock = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let sock = String::from_utf8_lossy(&stdout).trim().to_string();
     if sock.is_empty() {
         return false;
     }
@@ -799,5 +898,87 @@ mod tests {
         let got = firewall(|| panic!("boom"));
         std::panic::set_hook(prev);
         assert_eq!(got, PamError::IGNORE);
+    }
+
+    /// Spawn `sh -c script` with stdout piped, the way the kwallet helper is
+    /// spawned.
+    fn sh(script: &str) -> std::process::Child {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sh")
+    }
+
+    #[test]
+    fn bounded_read_returns_the_helpers_output_and_status() {
+        let mut child = sh("printf '/run/user/1000/kwallet5.socket\\n'");
+        let (status, out) =
+            read_stdout_bounded(&mut child, Duration::from_secs(10)).expect("child exited");
+        assert!(status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out).trim(),
+            "/run/user/1000/kwallet5.socket"
+        );
+    }
+
+    #[test]
+    fn bounded_read_reports_a_nonzero_exit() {
+        let mut child = sh("exit 3");
+        let (status, _) =
+            read_stdout_bounded(&mut child, Duration::from_secs(10)).expect("child exited");
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn a_wedged_helper_is_killed_at_the_deadline() {
+        // The wedge #257 describes: a child that produces nothing and never
+        // exits. The old `wait_with_output` would sit here for the life of the
+        // child, holding the login open.
+        let started = Instant::now();
+        let mut child = sh("sleep 30");
+        let got = read_stdout_bounded(&mut child, Duration::from_millis(300));
+        assert!(got.is_none(), "a wedged child must read as failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not bound the wait: {:?}",
+            started.elapsed()
+        );
+        // Killed and reaped, not abandoned: a leftover child would hold the
+        // stdin pipe (and the key on it) alive.
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn a_leaked_write_end_does_not_hold_the_login_after_exit() {
+        // The helper's grandchild (the exec'd wallet daemon) inherits our pipe
+        // when the helper's /dev/null redirect fails. Reading to EOF would then
+        // block until the daemon dies; the bounded read must return with what
+        // the helper printed once the helper itself is gone.
+        let started = Instant::now();
+        let mut child = sh("printf 'sockpath\\n'; sleep 30 & exit 0");
+        let (status, out) =
+            read_stdout_bounded(&mut child, Duration::from_secs(10)).expect("helper exited");
+        assert!(status.success());
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "sockpath");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited on the leaked write end: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_helper_spewing_output_is_killed_at_the_cap() {
+        // `yes` never exits and never stops writing, so neither the deadline
+        // branch nor EOF would end this; only the output cap can.
+        let started = Instant::now();
+        let mut child = sh("yes x");
+        let got = read_stdout_bounded(&mut child, Duration::from_secs(10));
+        assert!(got.is_none(), "output past the cap must read as failure");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
     }
 }

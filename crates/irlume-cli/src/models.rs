@@ -311,27 +311,7 @@ fn pin_matches(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
 /// first; this re-states that in one place so a future third caller cannot
 /// install unpinned weights by forgetting the check.
 fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
-    if !pin_matches(m, bytes) {
-        eprintln!(
-            "[models] refusing to install unpinned weights for '{}'",
-            m.name
-        );
-        return ExitCode::FAILURE;
-    }
-    let dir = thirdparty::dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("[models] could not create {}: {e}", dir.display());
-        return ExitCode::FAILURE;
-    }
-    let path = thirdparty::model_path(m);
-    if let Err(e) = std::fs::write(&path, bytes) {
-        eprintln!("[models] could not install {}: {e}", path.display());
-        return ExitCode::FAILURE;
-    }
-    if let Err(e) =
-        irlume_common::config::write_kv("settings.conf", thirdparty::SETTINGS_KEY, m.name)
-    {
-        eprintln!("[models] weights installed but settings.conf update failed: {e}");
+    if !place_verified(m, bytes) {
         return ExitCode::FAILURE;
     }
     restart_daemon();
@@ -341,6 +321,43 @@ fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
     );
     println!("[models] check with: irlume doctor · disable with: sudo irlume models disable");
     ExitCode::SUCCESS
+}
+
+/// The disk half of an install: verify the pin, place the weights atomically,
+/// record the choice. Split from the daemon restart so a test can exercise the
+/// pin against a real writable directory without restarting a service, which
+/// is what a test of the refusal needs: refusing because the directory is
+/// unwritable proves nothing about the pin.
+fn place_verified(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
+    if !pin_matches(m, bytes) {
+        eprintln!(
+            "[models] refusing to install unpinned weights for '{}'",
+            m.name
+        );
+        return false;
+    }
+    let dir = thirdparty::dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[models] could not create {}: {e}", dir.display());
+        return false;
+    }
+    let path = thirdparty::model_path(m);
+    // Atomic replace, never a truncating write. settings.conf keeps naming
+    // this model, so a half-written file is not a failed update: it is a
+    // checksum mismatch the daemon answers by running WITHOUT the cue, and
+    // the built-in gate that remains accepts the print attack. A rename
+    // either publishes the whole artifact or leaves the previous one intact.
+    if let Err(e) = irlume_common::write_atomic_mode(&path, bytes, 0o644) {
+        eprintln!("[models] could not install {}: {e}", path.display());
+        return false;
+    }
+    if let Err(e) =
+        irlume_common::config::write_kv("settings.conf", thirdparty::SETTINGS_KEY, m.name)
+    {
+        eprintln!("[models] weights installed but settings.conf update failed: {e}");
+        return false;
+    }
+    true
 }
 
 fn disable() -> ExitCode {
@@ -461,12 +478,24 @@ pub fn doctor_line() -> String {
 #[cfg(test)]
 mod tests {
 
+    /// A synthetic bring-your-own entry. The catalog has no such model yet, so
+    /// the tier the code must handle would otherwise be untested until one is
+    /// measured, which is exactly when a regression would be discovered.
+    fn byo_fixture() -> ThirdPartyModel {
+        ThirdPartyModel {
+            name: "fixture-byo",
+            file: "fixture-byo.onnx",
+            url: None,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            license: "fixture",
+            provenance: "fixture",
+            threshold: 0.9,
+            summary: "fixture",
+        }
+    }
+
     #[test]
-    fn a_bring_your_own_entry_is_never_fetched_and_a_fetchable_one_has_an_origin() {
-        // The tier invariant, asserted over the whole catalog rather than one
-        // entry: irlume must never try to download a model whose licence made
-        // obtaining it the user's decision, and must never leave a fetchable
-        // entry without somewhere to fetch from.
+    fn every_catalog_entry_carries_a_pin_and_only_fetchable_ones_carry_an_origin() {
         for m in thirdparty::CATALOG {
             if let Some(u) = m.url {
                 assert!(
@@ -475,29 +504,87 @@ mod tests {
                     m.name
                 );
             }
-            // Both tiers carry the pin: it is how irlume knows WHICH model is
-            // loaded rather than trusting the file that appeared in the dir.
+            // Both tiers: the pin is how irlume knows WHICH model is loaded
+            // rather than trusting the file that appeared in the directory.
             assert_eq!(m.sha256.len(), 64, "{}: every tier needs a pin", m.name);
         }
+        // And the bring-your-own tier itself, which no catalog entry exercises
+        // today: it must be pinned like any other and must have no origin.
+        let byo = byo_fixture();
+        assert!(byo.url.is_none());
+        assert_eq!(byo.sha256.len(), 64);
     }
 
     #[test]
-    fn install_refuses_bytes_that_do_not_match_the_pin() {
-        // The discriminating case for `models add`: a file that is not the
-        // measured artifact must be refused, because irlume's threshold was
-        // measured on the expected weights and means nothing on others.
-        let m = thirdparty::CATALOG
-            .first()
-            .expect("catalog is non-empty by the invariant above");
-        assert_ne!(
-            thirdparty::sha256_hex(b"not the model"),
-            m.sha256,
-            "the fixture must not collide with the real pin"
+    fn fetching_a_bring_your_own_model_is_refused_before_any_download() {
+        // The tier's whole point: irlume must not download a model whose
+        // licence made obtaining it the user's decision. `fetch_and_enable`
+        // guards this even though the call sites check first, because a
+        // future caller will not.
+        let byo = byo_fixture();
+        assert!(
+            !matches!(fetch_and_enable(&byo), c if format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)),
+            "a urlless model must never reach the downloader"
+        );
+    }
+
+    #[test]
+    fn the_installer_refuses_bytes_that_do_not_match_the_pin() {
+        // Sandboxed state dir, so the WRITE would genuinely succeed and the
+        // pin is the only thing that can refuse. Without this the test passes
+        // for the wrong reason: an unprivileged process cannot write to the
+        // real state dir, so it returns FAILURE whether the guard exists or
+        // not, and a mutant deleting the guard survives.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        let m = byo_fixture();
+        let path = thirdparty::model_path(&m);
+        assert!(!pin_matches(&m, b"not the model"));
+        let refused = place_verified(&m, b"not the model");
+        let nothing_written = !path.exists();
+        // The control: the same call with MATCHING bytes must install, which
+        // is what proves the refusal above came from the pin and not from an
+        // unwritable directory.
+        let good = b"the measured artifact";
+        let mut ok = m;
+        let digest = thirdparty::sha256_hex(good);
+        ok.sha256 = Box::leak(digest.into_boxed_str());
+        let accepted = place_verified(&ok, good);
+        let written = thirdparty::model_path(&ok).exists();
+
+        match (old_cfg, old_state) {
+            (Some(c), Some(st)) => {
+                std::env::set_var("IRLUME_CONFIG_DIR", c);
+                std::env::set_var("IRLUME_STATE_DIR", st);
+            }
+            _ => {
+                std::env::remove_var("IRLUME_CONFIG_DIR");
+                std::env::remove_var("IRLUME_STATE_DIR");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!refused, "unpinned bytes must not install");
+        assert!(
+            nothing_written,
+            "a refused install must leave nothing behind"
         );
         assert!(
-            !pin_matches(m, b"not the model"),
-            "unpinned bytes must be refused"
+            accepted,
+            "matching bytes must install, or the refusal above proves nothing"
         );
+        assert!(written, "the control install must actually reach disk");
     }
     use super::*;
 

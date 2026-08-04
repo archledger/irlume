@@ -1449,7 +1449,15 @@ pub fn setup(args: &[String]) -> ExitCode {
         PadOffer::ConfiguredButBroken(name, why) => {
             println!("  '{name}' is configured but the daemon will not load it ({why}),");
             println!("  so this machine has NO trained print defence right now.");
-            println!("  repair with: sudo irlume models enable {name}");
+            // The repair differs by tier: irlume can re-fetch one it fetches,
+            // and can only ask for the file again for one it does not.
+            match irlume_common::thirdparty::by_name(&name).and_then(|m| m.url) {
+                Some(_) => println!("  repair with: sudo irlume models enable {name}"),
+                None => println!(
+                    "  repair with: sudo irlume models add {name} <path>  \
+                     (docs/THIRD-PARTY-MODELS.md)"
+                ),
+            }
         }
         PadOffer::Offer(m) => {
             println!("  A printed photograph of your face passes irlume's built-in liveness");

@@ -2107,14 +2107,29 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     let mode = report.recommended_mode();
                     match irlume_auth::store_capture_mode(&rgb_dev, mode) {
                         Ok(()) => {
-                            let mut msg = format!(
-                                "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
-                                 and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
-                                mode.as_str(),
-                                report.retained_rgb() * 100.0,
-                                report.retained_ir() * 100.0,
-                                report.saved_ms(),
-                            );
+                            // An arm that never streamed has no retention to
+                            // report; percentages from its empty samples would
+                            // read as dimming when the finding is "cannot run
+                            // at all" (#192, the BRIO's EINVAL on concurrent
+                            // RGB open).
+                            let mut msg = if report.concurrent_impossible() {
+                                format!(
+                                    "capture mode {} for this camera: it cannot stream RGB and IR \
+                                     at once (all {} concurrent attempts errored; {rounds} \
+                                     sequential rounds measured fine)",
+                                    mode.as_str(),
+                                    report.concurrent.failed,
+                                )
+                            } else {
+                                format!(
+                                    "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
+                                     and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
+                                    mode.as_str(),
+                                    report.retained_rgb() * 100.0,
+                                    report.retained_ir() * 100.0,
+                                    report.saved_ms(),
+                                )
+                            };
                             // Say so rather than letting a dark room read as a
                             // clean bill of health.
                             if !report.conclusive() {

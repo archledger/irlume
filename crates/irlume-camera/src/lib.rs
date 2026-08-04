@@ -2850,6 +2850,12 @@ pub struct PairSample {
     pub ir_mean: f32,
     pub total_ms: f32,
     pub rounds: usize,
+    /// Attempted rounds in which a capture ERRORED rather than measured. A
+    /// completed round tells how much brightness survives; a failed one tells
+    /// that the arm cannot run at all, and on some hardware that is the whole
+    /// answer: the BRIO's RGB open returns EINVAL whenever its IR sibling is
+    /// streaming, so its concurrent arm fails every attempt (#192).
+    pub failed: usize,
 }
 
 /// What the probe measured about capturing both sensors at once.
@@ -2907,10 +2913,25 @@ impl ContentionReport {
     /// 122% and 126% across runs, which is not the camera gaining signal from
     /// contention; it is arithmetic on noise.
     pub fn conclusive(&self) -> bool {
+        // A concurrent arm that cannot run at all is definitive in any light:
+        // the failure is an errored open, not a brightness reading, so the
+        // dark-room caveat below does not apply to it.
+        if self.concurrent_impossible() {
+            return true;
+        }
         if self.retained_ir() < CONCURRENT_SIGNAL_FLOOR {
             return true;
         }
         self.sequential.rgb_mean >= CONCLUSIVE_SCENE_BRIGHTNESS
+    }
+
+    /// True when the concurrent arm never completed a round because its
+    /// captures ERRORED: this camera cannot stream both nodes at once, which
+    /// decides the mode by itself. Reported separately so callers do not
+    /// render the arm's empty samples as "retained 0% of brightness", which
+    /// reads as dimming when nothing streamed at all (#192).
+    pub fn concurrent_impossible(&self) -> bool {
+        self.concurrent.rounds == 0 && self.concurrent.failed > 0
     }
 
     /// Share of the sequential RGB brightness the concurrent path kept. 1.0 when
@@ -2927,6 +2948,13 @@ impl ContentionReport {
     /// The mode this camera should use. Pure, so the decision is testable
     /// without hardware.
     pub fn recommended_mode(&self) -> CaptureMode {
+        // Explicit rather than left to the retention arithmetic: with zero
+        // concurrent rounds the retained() guards happen to produce Sequential
+        // today, but "cannot run" deciding the mode must not depend on what a
+        // division does with empty samples.
+        if self.concurrent_impossible() {
+            return CaptureMode::Sequential;
+        }
         if self.retained_rgb() < CONCURRENT_SIGNAL_FLOOR
             || self.retained_ir() < CONCURRENT_SIGNAL_FLOOR
         {
@@ -3009,10 +3037,20 @@ pub fn measure_contention_with_progress(
         });
         accumulate(&mut report.concurrent, &rgb, &ir, t0.elapsed());
     }
-    if report.sequential.rounds == 0 || report.concurrent.rounds == 0 {
-        return Err(Error::Hardware(
-            "capture-mode probe: no round completed on this camera pair".into(),
-        ));
+    // Only a dead SEQUENTIAL arm is a failed probe: one capture at a time is
+    // the mode every camera must manage, so nothing was learned. A concurrent
+    // arm that never completes a round IS a measurement, and the strongest one
+    // this probe can make: the camera cannot stream both nodes at once, and
+    // the report's zero concurrent retention answers `recommended_mode` and
+    // `conclusive` with Sequential (#192; the BRIO fails every concurrent
+    // round with EINVAL on the RGB open while its IR sibling streams).
+    if report.sequential.rounds == 0 {
+        return Err(Error::Hardware(format!(
+            "capture-mode probe: no sequential round completed on this camera \
+             pair ({} of {rounds} attempts errored); even one-at-a-time capture \
+             is failing, so nothing was measured",
+            report.sequential.failed
+        )));
     }
     Ok(report)
 }
@@ -3037,6 +3075,7 @@ fn accumulate(
     elapsed: std::time::Duration,
 ) {
     let (Ok(rgb), Ok((_, ir_stats))) = (rgb, ir) else {
+        into.failed += 1;
         return;
     };
     let n = into.rounds as f32;
@@ -3527,12 +3566,14 @@ mod tests {
                 ir_mean: seq_ir,
                 total_ms: 3595.0,
                 rounds: 20,
+                failed: 0,
             },
             concurrent: PairSample {
                 rgb_mean: con_rgb,
                 ir_mean: con_ir,
                 total_ms: 2194.0,
                 rounds: 20,
+                failed: 0,
             },
         };
 
@@ -3586,6 +3627,42 @@ mod tests {
             CaptureMode::Sequential
         );
         assert!(ir_loss_in_the_dark.conclusive());
+    }
+
+    // The BRIO shape, measured 2026-08-04 on archhost: every concurrent
+    // attempt errors (RGB open returns EINVAL while the IR sibling streams),
+    // sequential rounds measure fine. An arm that cannot run is a definitive
+    // Sequential in any light, and must not read as a failed probe (#192).
+    #[test]
+    fn a_concurrent_arm_that_only_errors_decides_sequential_conclusively() {
+        let brio = ContentionReport {
+            sequential: PairSample {
+                rgb_mean: 16.0, // dark room; the verdict must not need light
+                ir_mean: 58.0,
+                total_ms: 2200.0,
+                rounds: 6,
+                failed: 0,
+            },
+            concurrent: PairSample {
+                rounds: 0,
+                failed: 6,
+                ..Default::default()
+            },
+        };
+        assert!(brio.concurrent_impossible());
+        assert_eq!(brio.recommended_mode(), CaptureMode::Sequential);
+        assert!(
+            brio.conclusive(),
+            "an errored arm is definitive in the dark"
+        );
+
+        // The guard discriminates: zero rounds with zero failures is the
+        // nothing-attempted shape, not the cannot-run shape.
+        let unattempted = ContentionReport {
+            sequential: brio.sequential,
+            concurrent: PairSample::default(),
+        };
+        assert!(!unattempted.concurrent_impossible());
     }
 
     #[test]

@@ -89,28 +89,38 @@ def main(argv):
 
     print(f"corpus: {len(rows)} frames ({len(faces)} face, {len(prints_)} print)")
     print("\nexposure (face-region mean) by set")
-    for key in [("2026-08-02", FACE), ("2026-08-04", {"face_dim"}),
-                ("2026-08-02", None), ("2026-08-04", {"banner_curved"})]:
-        sess, conds = key
-        sel = [r for r in rows if r["session"] == sess and
-               ((r["condition"] in conds) if conds else r["condition"] not in FACE)]
+    corpus_rows = [
+        ("face, 2026-08-02", "2026-08-02", FACE - {"face_dim"}, "glasses, no glasses (two sittings)"),
+        ("face, 2026-08-04", "2026-08-04", {"face_dim"}, "room lit, subject dimmer than the print"),
+        ("vinyl banner, 2026-08-02", "2026-08-02", {"banner_flat", "banner_tilted", "banner_close"},
+         "flat, tilted (x2), held closer (x2)"),
+        ("vinyl banner, 2026-08-04", "2026-08-04", {"banner_curved"}, "hand-curved toward the camera"),
+    ]
+    corpus_table = ["| set | n | face-region mean | conditions |", "|---|---|---|---|"]
+    for label, sess, conds, note in corpus_rows:
+        sel = [r for r in rows if r["session"] == sess and r["condition"] in conds]
         lo, hi = rng([r["face_mean"] for r in sel])
-        label = f"{sess} {'face' if conds and 'face' in next(iter(conds)) else 'print'}"
-        print(f"  {label:20} n={len(sel):3}  {lo:.1f}-{hi:.1f}")
-        claims += [f"{lo:.1f}-{hi:.1f}"]
+        corpus_table.append(f"| {label} | {len(sel)} | {lo:.1f}-{hi:.1f} | {note} |")
+        print(f"  {label:26} n={len(sel):3}  {lo:.1f}-{hi:.1f}")
+    blocks.append(("corpus table", "\n".join(corpus_table)))
 
     print("\nratios: face vs print across both sessions")
+    ratio_table = [
+        f"| ratio | face ({len(faces)} frames) | print ({len(prints_)} frames) | verdict |",
+        "|---|---|---|---|",
+    ]
     for name, f in RATIOS.items():
         fa = [f(r) for r in faces]
         pr = [f(r) for r in prints_]
         flo, fhi = rng(fa)
         plo, phi = rng(pr)
         sep = flo - phi if flo > phi else (plo - fhi if plo > fhi else None)
-        verdict = f"separated by {sep:.3f}" if sep else "OVERLAP"
+        verdict = f"separated by {sep:.3f}" if sep else "overlaps"
+        ratio_table.append(
+            f"| {name.replace('/', ' / ')} | {flo:.3f}-{fhi:.3f} | {plo:.3f}-{phi:.3f} | {verdict} |"
+        )
         print(f"  {name:18} face {flo:.3f}-{fhi:.3f}  print {plo:.3f}-{phi:.3f}  {verdict}")
-        claims += [f"{flo:.3f}-{fhi:.3f}", f"{plo:.3f}-{phi:.3f}"]
-        if sep:
-            claims.append(f"{sep:.3f}")
+    blocks.append(("ratio table", "\n".join(ratio_table)))
 
     print("\nregion medians (the mechanism, before any ratio)")
     for label, sel in (("face", faces), ("print", prints_)):
@@ -156,19 +166,30 @@ def main(argv):
         print(f"  {label:16} face {f:.3f}  print {p_:.3f}")
     blocks.append(("ink reflectance table", "\n".join(ink_table)))
 
-    print("\nprinted-shadow attack arithmetic")
+    # Rendered as a block for the same reason the ink table is: the first
+    # version of this check kept the arithmetic as loose substrings, so
+    # editing the prose 0.625 to 0.425 passed (the table still carried 0.625),
+    # and the 1.7 multiplier was never checked at all because it was never
+    # added to `claims`. A figure that appears twice cannot be guarded by
+    # asking whether it appears once.
     pc = st.median([r["cheek"] for r in prints_])
     pch = st.median([r["chin"] for r in prints_])
     pfh = st.median([r["forehead"] for r in prints_])
     face_floor = min(RATIOS["cheek/chin"](r) for r in faces)
     need = pc / face_floor
-    ink_floor = min(st.median([x[r] / x["forehead"] for x in prints_])
-                    for r in ("nose", "cheek", "brow", "socket", "socket_deep", "chin"))
-    print(f"  print cheek {pc:.1f}, chin {pch:.1f}, ratio {pc / pch:.3f}; lowest face ratio {face_floor:.3f}")
-    print(f"  chin must fall to {need:.1f} = {need / pfh:.3f} of forehead; ink floor {ink_floor:.3f} "
-          f"-> {'reachable' if need / pfh >= ink_floor else 'NOT reachable'}")
-    claims += [f"{pc:.1f}", f"{pch:.1f}", f"{pc / pch:.3f}", f"{face_floor:.3f}",
-               f"{need:.1f}", f"{need / pfh:.3f}", f"{ink_floor:.3f}"]
+    arith = [
+        "| quantity | value |",
+        "|---|---|",
+        f"| print cheek median | {pc:.1f} |",
+        f"| print chin median | {pch:.1f} |",
+        f"| print cheek/chin | {pc / pch:.3f} |",
+        f"| lowest captured face cheek/chin | {face_floor:.3f} |",
+        f"| required print chin | {need:.1f} |",
+        f"| required chin / print forehead | {need / pfh:.3f} |",
+    ]
+    print("\nprinted-shadow arithmetic")
+    print("\n".join("  " + r for r in arith))
+    blocks.append(("printed-shadow arithmetic table", "\n".join(arith)))
 
     print("\nexposure correlation within class (why the socket ratios fail)")
     for name in ("brow/socket_deep", "nose/socket"):

@@ -42,6 +42,17 @@ pub mod uvc_descriptor;
 /// `EnvGuard` restores the PREVIOUS value rather than unsetting: unsetting is
 /// not restoring, and a test that leaves `IRLUME_STATE_DIR` cleared changes what
 /// the next one resolves.
+///
+/// It also serialises tests that SPAWN PROCESSES, which is not obvious from the
+/// name and is the cause of #251. `fork` copies the file descriptor table, and
+/// an `flock` belongs to the open file description, so a child briefly holds
+/// every lock its parent held at the moment of the fork. `O_CLOEXEC` closes the
+/// inherited copy at `exec`, not at `fork`, so `Command::spawn` leaves a window
+/// in which an unrelated test's lock is held by a child that knows nothing
+/// about it. A test that then releases its lock and immediately re-takes it
+/// gets `Busy` from a lock nothing appears to hold, which is why `/proc/locks`
+/// looks empty a moment later. `flock_is_inherited_across_fork` pins the
+/// mechanism.
 #[cfg(test)]
 pub(crate) mod testenv {
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3806,6 +3817,13 @@ mod tests {
     /// else is streaming, and the scan then sees two holders.
     #[test]
     fn another_process_outranks_our_own_hold() {
+        // Held for the SPAWN, not for any environment variable: the fork below
+        // copies this process's whole fd table, so between fork and exec the
+        // child holds every flock any concurrently-running test has open. That
+        // made an unrelated stream-lock test see `Busy` from a lock nothing
+        // held (#251). The crate lock is the only serialisation point that
+        // covers process-global state, and the fd table is process-global.
+        let _guard = crate::testenv::env_lock();
         let dir = std::env::temp_dir().join(format!("irlume-cam-two-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

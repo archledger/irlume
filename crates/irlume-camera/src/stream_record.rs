@@ -884,6 +884,62 @@ mod tests {
     /// A retirement that fails spends nothing (review round 11): the
     /// increment rolls back with the state, and only the successful
     /// pre-write publication carries it to disk.
+    /// The mechanism behind #251, pinned so the crate lock's spawn duty is
+    /// provable rather than folklore.
+    ///
+    /// `flock` belongs to the open file description, and `fork` copies the fd
+    /// table, so a child holds every lock its parent held at the moment of the
+    /// fork. `O_CLOEXEC` closes that copy at `exec`, NOT at `fork`, so every
+    /// `Command::spawn` anywhere in the process leaves a window in which an
+    /// unrelated lock is held by a child that knows nothing about it. The
+    /// symptom is a `Busy` from a lock that `/proc/locks` shows nobody holding
+    /// a moment later, and it only appears under enough CPU contention to
+    /// stretch fork-to-exec: CI runners, and this laptop only when pinned to
+    /// two cores.
+    ///
+    /// Production is not exposed the same way: `irlumed` holds this lock across
+    /// a control write and does not spawn children inside that window. If it
+    /// ever does, a second irlume would be refused the camera for as long as
+    /// the fork-to-exec gap lasts.
+    #[test]
+    fn flock_is_inherited_across_fork_until_exec() {
+        let _guard = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-fork-flock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = crate::testenv::EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let id = identity();
+
+        let lock = acquire(&id).expect("the lock is free");
+        // SAFETY: the child only sleeps and _exits, both async-signal-safe,
+        // which is the constraint fork() imposes on a threaded process.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Holds the INHERITED descriptor open without exec'ing, which is
+            // the window Command::spawn opens and closes too fast to observe.
+            // The sleep is for DETERMINISM, not correctness: without it the
+            // parent usually still wins the race, so its absence does not
+            // falsify the assertion below.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            unsafe { libc::_exit(0) };
+        }
+
+        drop(lock); // this process lets go; the child has not.
+        assert!(
+            matches!(acquire(&id), Err(AcquireError::Busy)),
+            "a forked child must still hold the inherited lock; if this ever              stops being true the crate lock no longer needs to cover spawning"
+        );
+
+        let mut status = 0;
+        // SAFETY: reaping the child we just forked.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(
+            acquire(&id).is_ok(),
+            "once the last holder of the description is gone the lock is free"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_failed_retirement_spends_no_attempt() {
         let _guard = crate::testenv::env_lock();

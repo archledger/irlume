@@ -52,6 +52,7 @@ EXPECTED = {
     "doctor.json": "ok",
     "login-status.json": "ok",
     "profiles-list.json": "ok",
+    "models-list.json": "ok",
     "error-daemon-unavailable.json": "daemon-unavailable",
     "error-unsupported-contract.json": "unsupported-contract",
     "error-usage-error.json": "usage-error",
@@ -103,6 +104,7 @@ def main():
         ("doctor.json", ["doctor", "--json"], None, None),
         ("login-status.json", ["login", "status", "--json"], None, None),
         ("profiles-list.json", ["profiles", "list", "--json"], None, redact_profiles),
+        ("models-list.json", ["models", "list", "--json"], None, None),
         (
             "error-daemon-unavailable.json",
             ["profiles", "list", "--json"],

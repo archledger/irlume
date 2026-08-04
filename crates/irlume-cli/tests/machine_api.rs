@@ -31,7 +31,8 @@ fn version_json_is_one_machine_document() {
             "login-status-json",
             "auth-test-events",
             "login-plan-json",
-            "login-transactions"
+            "login-transactions",
+            "models-list-json"
         ])
     );
 }

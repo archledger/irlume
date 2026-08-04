@@ -217,6 +217,17 @@ fn main() {
                         eprintln!("irlumed: WARNING: third_party_pad='{name}' is not in the catalog; ignoring");
                         return None;
                     };
+                    // The settings key names a PAD cue; wiring any other stage
+                    // here would run, say, a recognizer as an anti-spoof score.
+                    // The installer refuses closed stages too, but this key is
+                    // root-editable text, so the daemon checks what it loads.
+                    if entry.stage != irlume_common::thirdparty::Stage::Pad {
+                        eprintln!(
+                            "irlumed: WARNING: third_party_pad='{name}' is a {} model, not a PAD cue; ignoring",
+                            entry.stage.as_str()
+                        );
+                        return None;
+                    }
                     let path = irlume_common::thirdparty::model_path(entry);
                     let bytes = match std::fs::read(&path) {
                         Ok(b) => b,

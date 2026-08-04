@@ -209,6 +209,9 @@ reused for a different meaning. The registry as of this contract:
 | `ir-stream-hello-minimum` | the negotiated IR stream compared with the published Windows Hello IR minimum (340x340@15fps). `info` when no IR node is selected or the dimensions meet it with no reported rate; `unknown` when the node cannot be negotiated right now |
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
+| `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
+| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: mesh-dependent gates (passive blink liveness, consent gesture) are disabled |
+| `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
 | `ort-dylib-path` | which ONNX runtime library will be loaded |
 | `third-party-pad-model` | optional third-party presentation-attack weights, if installed |
 | `fingerprint-reader` | whether a fingerprint reader was found |
@@ -316,6 +319,29 @@ store before a later capability can expose them.
 
 Display names are chosen by the user, so treat them as user text rather than
 identifiers: they may contain anything the user typed.
+
+### `irlume models list --json`
+
+Capability: `models-list-json`.
+
+The pipeline stages in order, each with the model it runs and where that model
+came from (`shipped`, `env-override`, or `built-in` for the PAD stage's gate,
+which is code rather than a swappable file), whether the daemon requires the
+file to start, and whether the stage is open to third-party models. Stages
+open one at a time because their failure modes differ; the PAD stage is the
+only open one today, and it carries a `third_party` object with the enabled
+entry and the measured catalog, including each entry's tier (`fetched` by
+irlume, or `user-supplied` when the license makes obtaining the file the
+user's business) and the weight file's state against its pin.
+
+The command needs no daemon: it reports what the daemon would load, from the
+same resolution order the packaged unit file uses, so it still answers when
+the daemon will not start.
+
+`third_party.enabled.known` is honest about observability. The enabling
+setting is root-only; an unprivileged caller that read no name has not
+established that nothing is enabled, and a consumer must not render
+`"known": false` as disabled.
 
 ### Error codes
 

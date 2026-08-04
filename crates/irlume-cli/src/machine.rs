@@ -36,6 +36,7 @@ const CAPABILITIES: &[&str] = &[
     "auth-test-events",
     "login-plan-json",
     "login-transactions",
+    "models-list-json",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -1925,6 +1926,109 @@ fn valid_profiles_list_args(args: &[String]) -> bool {
     saw_json
 }
 
+/// `irlume models list --json`: per-pipeline-stage model report (#276).
+///
+/// Which model each stage runs and where it came from (shipped or an env
+/// override), whether the stage is open to third-party models, and for the
+/// open PAD stage the catalog with each entry's tier (fetched by irlume vs
+/// user-supplied) and weight state. Needs no daemon: it reports what the
+/// daemon WOULD load, from the same resolution order the daemon's unit file
+/// uses, which is exactly what a consumer debugging "which model is active"
+/// needs when the daemon will not start.
+pub fn models_list(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "models.list";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    if without_contract(args) != ["models", "list", "--json"] {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    emit(
+        &success(COMMAND, models_list_data(), contract),
+        ExitCode::SUCCESS,
+    )
+}
+
+fn models_list_data() -> Value {
+    let stages = crate::models::stage_statuses()
+        .into_iter()
+        .map(|s| {
+            let active = match (s.file, &s.resolved) {
+                (None, _) => json!({ "origin": "built-in" }),
+                (Some(file), Some((path, origin))) => json!({
+                    "file": file,
+                    "present": true,
+                    "origin": origin,
+                    "path": path.display().to_string(),
+                }),
+                (Some(file), None) => json!({
+                    "file": file,
+                    "present": false,
+                }),
+            };
+            let mut stage = json!({
+                "stage": s.stage,
+                "open": s.open,
+                "required": s.required,
+                "active": active,
+            });
+            if s.open {
+                stage["third_party"] = third_party_data();
+            }
+            stage
+        })
+        .collect::<Vec<_>>();
+    json!({ "stages": stages })
+}
+
+/// The third-party tier of the one open stage: what is enabled, and the
+/// catalog with weight states.
+///
+/// `enabled.known` is honest about observability, like `login_manager.known`:
+/// settings.conf is root-only, so an unprivileged caller that read no name has
+/// NOT established that nothing is enabled, and a consumer must not render
+/// "known": false as "disabled".
+fn third_party_data() -> Value {
+    use irlume_common::thirdparty::{self, WeightState};
+    let name = crate::models::enabled_name();
+    let enabled = match (&name, crate::is_root()) {
+        (Some(n), _) => json!({ "known": true, "name": n }),
+        (None, true) => json!({ "known": true, "name": null }),
+        (None, false) => json!({ "known": false }),
+    };
+    let catalog = thirdparty::CATALOG
+        .iter()
+        .map(|m| {
+            json!({
+                "name": m.name,
+                "stage": m.stage.as_str(),
+                "tier": if m.url.is_some() { "fetched" } else { "user-supplied" },
+                "weights": match thirdparty::weight_state(m) {
+                    WeightState::ChecksumOk => "checksum-ok",
+                    WeightState::ChecksumMismatch => "checksum-mismatch",
+                    WeightState::Absent => "absent",
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "enabled": enabled, "catalog": catalog })
+}
+
 fn profiles_data(
     profiles: Vec<ProfileSummary>,
     require_eyes_open: bool,
@@ -2050,10 +2154,107 @@ mod tests {
                 "login-status-json",
                 "auth-test-events",
                 "login-plan-json",
-                "login-transactions"
+                "login-transactions",
+                "models-list-json"
             ])
         );
         assert!(document.get("error").is_none());
+    }
+
+    #[test]
+    fn models_list_reports_every_stage_and_only_open_stages_carry_third_party() {
+        // Sandboxed state dir so the weight states are this test's, not the
+        // machine's. The config dir is NOT sandboxed here; `enabled.known`
+        // honesty under an unreadable config is asserted separately below.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = std::env::temp_dir().join(format!("irlume-mls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        let data = models_list_data();
+
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&state);
+
+        let stages = data["stages"].as_array().expect("stages array");
+        let names: Vec<&str> = stages
+            .iter()
+            .map(|s| s["stage"].as_str().expect("stage name"))
+            .collect();
+        assert_eq!(names, ["detection", "landmarks", "recognition", "pad"]);
+        for s in stages {
+            let open = s["open"].as_bool().expect("open flag");
+            // third_party appears exactly on open stages: a consumer keys the
+            // tier UI off its presence, so a closed stage carrying one (or an
+            // open stage missing one) is a contract break, not a nicety.
+            assert_eq!(
+                s.get("third_party").is_some(),
+                open,
+                "stage {}: third_party must accompany open exactly",
+                s["stage"]
+            );
+            match s["stage"].as_str().unwrap() {
+                "detection" | "recognition" => assert_eq!(s["required"], true),
+                "landmarks" | "pad" => assert_eq!(s["required"], false),
+                other => panic!("unexpected stage {other}"),
+            }
+        }
+        let pad = &stages[3];
+        assert_eq!(pad["active"]["origin"], "built-in");
+        // Sandboxed empty state dir: no weights anywhere.
+        for entry in pad["third_party"]["catalog"].as_array().unwrap() {
+            assert_eq!(entry["weights"], "absent");
+            assert!(matches!(
+                entry["tier"].as_str().unwrap(),
+                "fetched" | "user-supplied"
+            ));
+        }
+    }
+
+    #[test]
+    fn models_list_enabled_state_is_honest_about_observability() {
+        // settings.conf is root-only. An unprivileged caller that read no name
+        // has NOT established that nothing is enabled, so the payload must say
+        // known:false rather than name:null, and a readable name flips it to
+        // known:true. Root reads authoritatively: known is always true there.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-mle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cfg = root.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+
+        // No settings.conf at all.
+        let absent = third_party_data();
+        // A readable enabled key.
+        std::fs::write(cfg.join("settings.conf"), "third_party_pad=flir\n").unwrap();
+        let named = third_party_data();
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(named["enabled"]["known"], true);
+        assert_eq!(named["enabled"]["name"], "flir");
+        if crate::is_root() {
+            // Root reads the absent file authoritatively: nothing is enabled.
+            assert_eq!(absent["enabled"], json!({"known": true, "name": null}));
+        } else {
+            // Unprivileged with nothing readable: unknown, never "disabled".
+            assert_eq!(absent["enabled"], json!({"known": false}));
+        }
     }
 
     /// Collect the events a closure emits, by capturing what the stream would

@@ -14,14 +14,67 @@
 //! deletes the weights, so "no unwarranted bits at rest" stays checkable.
 //!
 //! A catalog entry is added only after the model is measured on real hardware
-//! against the published attack species (see docs/pad-results/); the daemon
-//! wires any entry here as a DENY-ONLY cue: it may reject a presentation, it
-//! can never approve one the built-in gate rejected.
+//! against the published attack species (see docs/pad-results/). Every entry
+//! names its pipeline [`Stage`], and only an OPEN stage can be installed or
+//! wired; the one open stage today is PAD, whose entries the daemon wires as a
+//! DENY-ONLY cue: it may reject a presentation, it can never approve one the
+//! built-in gate rejected.
 
 use std::path::{Path, PathBuf};
 
 /// `settings.conf` key naming the enabled model (absent/empty = disabled).
 pub const SETTINGS_KEY: &str = "third_party_pad";
+
+/// The pipeline stage a catalog model plugs into.
+///
+/// Stages are opened to third-party models one at a time (#276), because their
+/// failure modes are not equal. A bad PAD model can only false-deny: it is
+/// wired deny-only, and every false fire falls back to the password. A bad
+/// recognizer authenticates strangers while the legitimate user's own logins
+/// keep working, so nothing surfaces the problem; detection and landmarks sit
+/// between (most failures deny safely, but bad landmarks feed confident wrong
+/// numbers into the liveness cues). The named-but-closed variants exist so the
+/// catalog, the CLI, and the reporting all speak the same stage vocabulary
+/// before those stages open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Face detection. Not open to third-party models.
+    Detection,
+    /// Dense landmarks (mesh). Not open: the mesh feeds the liveness cues, and
+    /// bad landmarks produce confident numbers from the wrong pixels rather
+    /// than an error.
+    Landmarks,
+    /// The recognizer/embedder. Not open, and gated harder than the wiring:
+    /// a recognition threshold is a false-accept rate over a population, which
+    /// one subject on two cameras cannot measure (#276 carries the protocol
+    /// question that must be answered first).
+    Recognition,
+    /// Presentation-attack detection (liveness). The only open stage: entries
+    /// are wired as a DENY-ONLY cue, so the worst a bad model does is cost
+    /// retries or the password.
+    Pad,
+}
+
+impl Stage {
+    /// Stable lowercase name, used in CLI output and the machine API.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Stage::Detection => "detection",
+            Stage::Landmarks => "landmarks",
+            Stage::Recognition => "recognition",
+            Stage::Pad => "pad",
+        }
+    }
+
+    /// Whether irlume can wire a third-party model at this stage today.
+    ///
+    /// The installer refuses to place weights for a closed stage and the
+    /// daemon refuses to wire them, so adding a catalog entry can never outrun
+    /// the safety analysis that opens its stage.
+    pub const fn open(self) -> bool {
+        matches!(self, Stage::Pad)
+    }
+}
 
 /// Subdirectory of the state dir holding fetched third-party weights.
 pub const SUBDIR: &str = "models-thirdparty";
@@ -29,6 +82,11 @@ pub const SUBDIR: &str = "models-thirdparty";
 pub struct ThirdPartyModel {
     /// Catalog name, what the user types to enable (`irlume models enable X`).
     pub name: &'static str,
+    /// The pipeline stage this model plugs into. Only entries whose stage is
+    /// [`Stage::open`] can be installed or wired; the field exists on every
+    /// entry so a future measured-but-not-yet-wirable model can be documented
+    /// in the catalog without becoming loadable by accident.
+    pub stage: Stage,
     /// On-disk file name under the state subdir.
     pub file: &'static str,
     /// Direct download URL at the publisher's origin, or `None` when irlume
@@ -61,6 +119,7 @@ pub struct ThirdPartyModel {
 /// Every entry here has a measurement document in docs/pad-results/.
 pub const CATALOG: &[ThirdPartyModel] = &[ThirdPartyModel {
     name: "flir",
+    stage: Stage::Pad,
     file: "flir.onnx",
     url: Some("https://modelscope.cn/api/v1/models/damo/cv_manual_face-liveness_flir/repo?FilePath=model.onnx&Revision=master"),
     sha256: "df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72",
@@ -185,6 +244,15 @@ mod tests {
             }
             assert!(m.threshold > 0.0 && m.threshold < 1.0);
             assert!(m.file.ends_with(".onnx"));
+            // Nothing forbids a closed-stage entry in the catalog (that is the
+            // point of the field), but today every entry is PAD; when that
+            // stops being true, delete this assertion and keep the installer
+            // and daemon refusals it documents.
+            assert!(
+                m.stage.open(),
+                "{}: a closed-stage entry landed; verify the install/wire refusals cover it",
+                m.name
+            );
             assert!(
                 m.summary.contains("docs/pad-results/"),
                 "{}: summary must cite the measurement doc",
@@ -197,6 +265,26 @@ mod tests {
     fn lookup_by_name() {
         assert!(by_name("flir").is_some());
         assert!(by_name("nope").is_none());
+    }
+
+    #[test]
+    fn only_the_pad_stage_is_open() {
+        // The stage gate for #276: PAD is deny-only and open; the grant-capable
+        // and cue-feeding stages are named but closed. Opening one is a
+        // deliberate act that must change this test alongside the wiring.
+        assert!(Stage::Pad.open());
+        for closed in [Stage::Detection, Stage::Landmarks, Stage::Recognition] {
+            assert!(!closed.open(), "{} must stay closed", closed.as_str());
+        }
+        // as_str is machine-API vocabulary: lowercase, stable.
+        for s in [
+            Stage::Detection,
+            Stage::Landmarks,
+            Stage::Recognition,
+            Stage::Pad,
+        ] {
+            assert!(s.as_str().chars().all(|c| c.is_ascii_lowercase()));
+        }
     }
 
     #[test]

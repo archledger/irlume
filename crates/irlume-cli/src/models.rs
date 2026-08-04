@@ -58,6 +58,18 @@ fn add(name: Option<&str>, path: Option<&str>) -> ExitCode {
         eprintln!("[models] '{name}' is not in the catalog; run `irlume models` to list it");
         return ExitCode::FAILURE;
     };
+    // Refused again at the installer choke point; this early copy exists so
+    // the user learns before reading a file that the answer is no.
+    if !m.stage.open() {
+        eprintln!(
+            "[models] '{}' is a {} model, and the {} stage is not open to third-party \
+             models yet (#276); nothing was changed",
+            m.name,
+            m.stage.as_str(),
+            m.stage.as_str()
+        );
+        return ExitCode::FAILURE;
+    }
     if !is_root() {
         eprintln!("[models] needs root: sudo irlume models add {name} {path}");
         return ExitCode::FAILURE;
@@ -139,6 +151,15 @@ fn list() -> ExitCode {
         println!("    license:    {}", m.license);
         println!("    provenance: {}", m.provenance);
         println!(
+            "    stage:      {}{}",
+            m.stage.as_str(),
+            if m.stage.open() {
+                ""
+            } else {
+                " (NOT OPEN to third-party models yet, #276)"
+            }
+        );
+        println!(
             "    role:       deny-only liveness cue, threshold {}",
             m.threshold
         );
@@ -170,6 +191,17 @@ fn enable(name: Option<&str>) -> ExitCode {
         eprintln!("[models] '{name}' is not in the catalog; run `irlume models` to list it");
         return ExitCode::FAILURE;
     };
+    // Refused again at the installer choke point; early copy for the message.
+    if !m.stage.open() {
+        eprintln!(
+            "[models] '{}' is a {} model, and the {} stage is not open to third-party \
+             models yet (#276); nothing was changed",
+            m.name,
+            m.stage.as_str(),
+            m.stage.as_str()
+        );
+        return ExitCode::FAILURE;
+    }
     if !is_root() {
         eprintln!("[models] needs root: sudo irlume models enable {name}");
         return ExitCode::FAILURE;
@@ -329,6 +361,20 @@ fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
 /// is what a test of the refusal needs: refusing because the directory is
 /// unwritable proves nothing about the pin.
 fn place_verified(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
+    // The stage gate (#276): stages open to third-party models one at a time,
+    // and this is the choke point every install goes through, so a catalog
+    // entry for a stage whose wiring does not exist yet cannot be placed on
+    // disk no matter which command reached here.
+    if !m.stage.open() {
+        eprintln!(
+            "[models] '{}' is a {} model, and the {} stage is not open to \
+             third-party models yet (#276); nothing was installed",
+            m.name,
+            m.stage.as_str(),
+            m.stage.as_str()
+        );
+        return false;
+    }
     if !pin_matches(m, bytes) {
         eprintln!(
             "[models] refusing to install unpinned weights for '{}'",
@@ -442,6 +488,66 @@ pub(crate) fn tui_state() -> TuiState {
     TuiState::None
 }
 
+/// One pipeline stage's model status: what would run, where it came from, and
+/// whether the stage is open to third-party models. One builder serves the
+/// human doctor and the machine API so the two cannot disagree (#276).
+pub(crate) struct StageStatus {
+    /// Stage name, machine-API vocabulary ([`irlume_common::thirdparty::Stage::as_str`]).
+    pub stage: &'static str,
+    /// Whether the stage accepts third-party models today.
+    pub open: bool,
+    /// The shipped model file this stage runs, `None` for the PAD stage whose
+    /// built-in gate is code, not a swappable file.
+    pub file: Option<&'static str>,
+    /// Resolved path and its origin (`"shipped"` / `"env-override"`); `None`
+    /// when the file was not found anywhere the daemon looks.
+    pub resolved: Option<(std::path::PathBuf, &'static str)>,
+    /// Whether the daemon refuses to start without this file.
+    pub required: bool,
+}
+
+/// The pipeline stages in order, with what each would load.
+///
+/// The blaze rescue detector and the IR adapter are deliberately absent: they
+/// are auxiliaries of the detection and recognition stages, not stages of
+/// their own, and the BYO plan (#276) opens stages, not files.
+pub(crate) fn stage_statuses() -> Vec<StageStatus> {
+    use irlume_common::thirdparty::Stage;
+    let shipped = [
+        (
+            Stage::Detection,
+            "face_detection_yunet_2023mar.onnx",
+            "IRLUME_DET_MODEL",
+            true,
+        ),
+        (
+            Stage::Landmarks,
+            "face_landmark.onnx",
+            "IRLUME_MESH_MODEL",
+            false,
+        ),
+        (Stage::Recognition, "glintr100.onnx", "IRLUME_MODEL", true),
+    ];
+    let mut out: Vec<StageStatus> = shipped
+        .into_iter()
+        .map(|(stage, file, env, required)| StageStatus {
+            stage: stage.as_str(),
+            open: stage.open(),
+            file: Some(file),
+            resolved: crate::commands::resolve_model_origin(file, env),
+            required,
+        })
+        .collect();
+    out.push(StageStatus {
+        stage: Stage::Pad.as_str(),
+        open: Stage::Pad.open(),
+        file: None,
+        resolved: None,
+        required: false,
+    });
+    out
+}
+
 pub fn doctor_line() -> String {
     if let Some(name) = enabled_name() {
         return match thirdparty::by_name(&name) {
@@ -484,6 +590,7 @@ mod tests {
     fn byo_fixture() -> ThirdPartyModel {
         ThirdPartyModel {
             name: "fixture-byo",
+            stage: irlume_common::thirdparty::Stage::Pad,
             file: "fixture-byo.onnx",
             url: None,
             sha256: "0000000000000000000000000000000000000000000000000000000000000000",
@@ -513,6 +620,119 @@ mod tests {
         let byo = byo_fixture();
         assert!(byo.url.is_none());
         assert_eq!(byo.sha256.len(), 64);
+    }
+
+    #[test]
+    fn the_installer_refuses_a_closed_stage_even_with_a_matching_pin() {
+        // The stage gate (#276): a catalog entry for a stage whose wiring does
+        // not exist must not be installable, however correct its bytes. Runs
+        // in a sandboxed state dir so the refusal can only come from the gate,
+        // and the same bytes install under an OPEN stage as the control that
+        // proves which check refused.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        let bytes = b"the measured artifact";
+        const SHA: &str = "b9a5820dd4ae8eb1eb7025b3b9b1351d9ff90e658e0c1d22a027e55be4f6f48e";
+        assert_eq!(thirdparty::sha256_hex(bytes), SHA);
+        let mut closed = byo_fixture();
+        closed.name = "fixture-closed";
+        closed.file = "fixture-closed.onnx";
+        closed.stage = irlume_common::thirdparty::Stage::Recognition;
+        closed.sha256 = SHA;
+        let refused = place_verified(&closed, bytes);
+        let nothing_written = !thirdparty::model_path(&closed).exists();
+
+        let mut open = closed;
+        open.stage = irlume_common::thirdparty::Stage::Pad;
+        let accepted = place_verified(&open, bytes);
+        let written = thirdparty::model_path(&open).exists();
+
+        match (old_cfg, old_state) {
+            (Some(c), Some(st)) => {
+                std::env::set_var("IRLUME_CONFIG_DIR", c);
+                std::env::set_var("IRLUME_STATE_DIR", st);
+            }
+            _ => {
+                std::env::remove_var("IRLUME_CONFIG_DIR");
+                std::env::remove_var("IRLUME_STATE_DIR");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!refused, "a closed-stage entry must not install");
+        assert!(
+            nothing_written,
+            "a refused closed-stage install must leave nothing behind"
+        );
+        assert!(
+            accepted,
+            "the same bytes must install under an open stage, or the refusal \
+             above proves nothing about the stage gate"
+        );
+        assert!(written, "the open-stage control must actually reach disk");
+    }
+
+    #[test]
+    fn stage_statuses_resolve_with_an_honest_origin() {
+        // The env var the daemon honors must label the resolution
+        // "env-override", and its absence must fall to the shipped search;
+        // the per-stage report keys the origin column off this.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("det-override.onnx");
+        std::fs::write(&file, b"weights").unwrap();
+        let old = std::env::var_os("IRLUME_DET_MODEL");
+        std::env::set_var("IRLUME_DET_MODEL", &file);
+
+        let with_env = crate::commands::resolve_model_origin(
+            "face_detection_yunet_2023mar.onnx",
+            "IRLUME_DET_MODEL",
+        );
+        std::env::remove_var("IRLUME_DET_MODEL");
+        let without_env = crate::commands::resolve_model_origin(
+            "face_detection_yunet_2023mar.onnx",
+            "IRLUME_DET_MODEL",
+        );
+
+        if let Some(v) = old {
+            std::env::set_var("IRLUME_DET_MODEL", v);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(with_env, Some((file, "env-override")));
+        // Without the env var the answer depends on whether this machine has
+        // the packaged or repo models; when it resolves, it must not claim an
+        // override that was not set.
+        if let Some((_, origin)) = without_env {
+            assert_eq!(origin, "shipped");
+        }
+        // The four stages, in pipeline order, exactly one open (pad).
+        let stages = stage_statuses();
+        let names: Vec<&str> = stages.iter().map(|s| s.stage).collect();
+        assert_eq!(names, ["detection", "landmarks", "recognition", "pad"]);
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|s| s.open)
+                .map(|s| s.stage)
+                .collect::<Vec<_>>(),
+            ["pad"]
+        );
     }
 
     #[test]

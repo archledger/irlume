@@ -182,6 +182,29 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "command": {
+            "const": "models.list"
+          }
+        },
+        "required": [
+          "ok",
+          "command"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/modelsListData"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -747,6 +770,139 @@
             "no-match"
           ],
           "description": "Derived from granted and live, never from daemon prose."
+        }
+      }
+    },
+    "modelsListData": {
+      "type": "object",
+      "required": [
+        "stages"
+      ],
+      "properties": {
+        "stages": {
+          "description": "The pipeline stages in order. The list may grow within the contract; a consumer must key on `stage`, not on position or count.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelStage"
+          }
+        }
+      }
+    },
+    "modelStage": {
+      "type": "object",
+      "required": [
+        "stage",
+        "open",
+        "required",
+        "active"
+      ],
+      "properties": {
+        "stage": {
+          "description": "Stage name. Stable public API.",
+          "type": "string",
+          "examples": [
+            "detection",
+            "landmarks",
+            "recognition",
+            "pad"
+          ]
+        },
+        "open": {
+          "description": "Whether this stage accepts third-party models today (#276 opens stages one at a time).",
+          "type": "boolean"
+        },
+        "required": {
+          "description": "Whether the daemon refuses to start without this stage's model file.",
+          "type": "boolean"
+        },
+        "active": {
+          "type": "object",
+          "properties": {
+            "origin": {
+              "description": "Where the active model comes from: `shipped`, `env-override`, or `built-in` for a stage whose implementation is code rather than a swappable file. Absent when the file was not found.",
+              "type": "string",
+              "examples": [
+                "shipped",
+                "env-override",
+                "built-in"
+              ]
+            },
+            "file": {
+              "type": "string"
+            },
+            "present": {
+              "type": "boolean"
+            },
+            "path": {
+              "description": "Local filesystem path the resolution landed on. Diagnostic; not stable across machines or packagings.",
+              "type": "string"
+            }
+          }
+        },
+        "third_party": {
+          "description": "Present only on an open stage.",
+          "type": "object",
+          "required": [
+            "enabled",
+            "catalog"
+          ],
+          "properties": {
+            "enabled": {
+              "description": "Which catalog entry is enabled. `known` is honest about observability: the setting is root-only, so an unprivileged caller that read no name has NOT established that nothing is enabled, and `known: false` must not be rendered as disabled.",
+              "type": "object",
+              "required": [
+                "known"
+              ],
+              "properties": {
+                "known": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "catalog": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "stage",
+                  "tier",
+                  "weights"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "stage": {
+                    "type": "string"
+                  },
+                  "tier": {
+                    "description": "`fetched`: irlume downloads the weights from the publisher's origin. `user-supplied`: the license makes obtaining the file the user's business (`irlume models add`). Both tiers are pinned and measured identically.",
+                    "type": "string",
+                    "enum": [
+                      "fetched",
+                      "user-supplied"
+                    ]
+                  },
+                  "weights": {
+                    "description": "State of the weights file on disk against its catalog pin.",
+                    "type": "string",
+                    "enum": [
+                      "checksum-ok",
+                      "checksum-mismatch",
+                      "absent"
+                    ]
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

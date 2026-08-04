@@ -1056,10 +1056,22 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// why `doctor`/`deps` must NOT probe cwd-relative `models/` alone; a user runs
 /// them from their home dir, where that path never resolves.
 pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::PathBuf> {
+    resolve_model_origin(filename, env_var).map(|(p, _)| p)
+}
+
+/// [`resolve_model`], also naming WHERE the winning path came from:
+/// `"env-override"` when the daemon env var chose it, `"shipped"` for the
+/// packaged and repo locations. One function holds the search order so the
+/// per-stage report cannot disagree with the required-models check about
+/// which file the daemon would load.
+pub(crate) fn resolve_model_origin(
+    filename: &str,
+    env_var: &str,
+) -> Option<(std::path::PathBuf, &'static str)> {
     if let Some(p) = std::env::var_os(env_var) {
         let p = std::path::PathBuf::from(p);
         if p.exists() {
-            return Some(p);
+            return Some((p, "env-override"));
         }
     }
     for base in [
@@ -1069,7 +1081,7 @@ pub(crate) fn resolve_model(filename: &str, env_var: &str) -> Option<std::path::
     ] {
         let p = std::path::Path::new(base).join(filename);
         if p.exists() {
-            return Some(p);
+            return Some((p, "shipped"));
         }
     }
     None

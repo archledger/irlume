@@ -159,6 +159,13 @@ fn main() -> std::process::ExitCode {
         (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test(&args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
+        // Presence-matched like `profiles list --json`: a contract flag before
+        // the subcommand must not displace it into the human handler.
+        (Some("models"), _)
+            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
+        {
+            machine::models_list(&args)
+        }
         (Some("models"), sub) => models::run(sub, &args),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
         (Some("credential-release-challenge"), sub) => {
@@ -3588,6 +3595,37 @@ fn doctor_run(
         } else {
             ort
         }
+    );
+    // --- pipeline stages (#276) -----------------------------------------
+    // Which model each stage would run and where it came from, stage by
+    // stage, so "what is my machine actually running" has one answer. The
+    // PAD stage is the third-party line below; its built-in gate is code.
+    dout!(report, "[doctor] pipeline stages:");
+    for s in models::stage_statuses() {
+        let Some(file) = s.file else { continue };
+        let id = match s.stage {
+            "detection" => "stage-detection-model",
+            "landmarks" => "stage-landmarks-model",
+            "recognition" => "stage-recognition-model",
+            other => unreachable!("file-backed stage without a check id: {other}"),
+        };
+        let (state, line) = match &s.resolved {
+            Some((p, origin)) => (State::Pass, format!("{file} — {origin} ({})", p.display())),
+            None if s.required => (
+                State::Fail,
+                format!("{file} — NOT FOUND; the daemon cannot start without it"),
+            ),
+            None => (
+                State::Warn,
+                format!("{file} — not found; mesh-dependent gates (passive blink liveness, consent gesture) are disabled"),
+            ),
+        };
+        dout!(report, "  {}: {line}", s.stage);
+        report.check_detail(id, state, line);
+    }
+    dout!(
+        report,
+        "  (third-party models: the pad stage only today, #276; `irlume models` lists them)"
     );
     dout!(
         report,

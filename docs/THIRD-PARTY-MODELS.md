@@ -21,6 +21,22 @@ Two things follow from that, and they are the reason this page exists:
   licences that make obtaining them the user's decision. Those are still
   measured, still pinned, still supported; you supply the file.
 
+## Pipeline stages open one at a time
+
+Every catalog entry names the pipeline stage it plugs into, and only an open
+stage can be installed or wired. Liveness (PAD) is the only open stage,
+because its wiring is deny-only: a bad model there can cost retries or the
+password, never grant. The other stages are named but closed, for reasons
+issue #276 carries in full: a bad recognizer authenticates strangers while
+the legitimate user's logins keep working, so nothing surfaces the problem,
+and a recognition threshold is a false-accept rate over a population that
+this project's one-subject hardware cannot measure. `irlume models` refuses
+to install an entry for a closed stage, and the daemon refuses to wire one.
+
+`irlume doctor` shows what every stage is running today, and
+`irlume models list --json` is the machine-readable version
+([MACHINE-API.md](MACHINE-API.md)).
+
 ## How to read an entry
 
 Run `irlume models` for the live version of this table. Each entry states:
@@ -29,6 +45,7 @@ Run `irlume models` for the live version of this table. Each entry states:
 |---|---|
 | `license` | the publisher's licence for the weights, as published |
 | `provenance` | whether the training data and pipeline are documented, and so whether the model could ever meet [ADR-0001](adr/0001-liveness-pad-strategy.md) |
+| `stage` | which pipeline stage the model plugs into, and whether that stage is open |
 | `threshold` | the decision point irlume **measured**, never the publisher's default |
 | `measured` | the one-line result, pointing at the full document in `pad-results/` |
 | `obtain` | whether irlume fetches it, or you supply the file |

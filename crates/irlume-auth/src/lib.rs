@@ -1549,6 +1549,32 @@ impl Engine {
         if let Some(e) = err {
             return Err(e);
         }
+        // The in-loop check runs every CHECK_EVERY poses, so a take whose
+        // length is not a multiple of it ends with unevaluated trailing poses,
+        // and a gesture completing in exactly those frames is refused with
+        // whole-take evidence that passes every gate. Measured 2026-08-04
+        // (#101): two 20-pose windows printed pitch_range 0.077-0.085 against
+        // the 0.075 floor after their last check ran at pose 18, and one cost
+        // a real trial its release. One evaluation of the COMPLETE series
+        // closes the boundary at zero capture cost.
+        let hit_in_loop = hit == Some(true);
+        let hit = hit_in_loop
+            || (allow_nod
+                && irlume_liveness::detect_nod(&poses) == irlume_liveness::HeadGesture::Nod)
+            || closure_cal.as_ref().is_some_and(|cal| {
+                irlume_liveness::detect_deliberate_closure(&ears, cal)
+                    == irlume_liveness::BlinkResult::Blinked
+            });
+        if hit && !hit_in_loop {
+            // Observable in the journal so a hardware replay can show THIS
+            // path fired, not just that a trial released.
+            irlume_common::dlog!(
+                "consent: gesture found on the completed take ({} poses; the \
+                 in-loop cadence had last checked at pose {})",
+                poses.len(),
+                (poses.len() / CHECK_EVERY) * CHECK_EVERY,
+            );
+        }
         // A gesture that never arrives is otherwise silent: the caller waits out
         // its deadline and denies, which reads the same whether the user did
         // nothing or nodded in a way the detector did not count. Say which.
@@ -1589,7 +1615,7 @@ impl Engine {
                 "consent: {} in {} frames; nod evidence: usable_pitch_frames={} (need {}) \
                  pitch_range={:.3} (need {:.3}) yaw_range={:.2} (max {:.2}) crossings={} (need {}) \
                  mean_step={:.4} (recorded for #101, gates nothing)",
-                if hit == Some(true) {
+                if hit {
                     "GESTURE ACCEPTED"
                 } else {
                     "no gesture"
@@ -1606,7 +1632,7 @@ impl Engine {
                 ev.mean_step,
             );
         }
-        Ok(hit == Some(true))
+        Ok(hit)
     }
 
     /// Apply whatever gate the purpose and the enrollment ask for on top of the

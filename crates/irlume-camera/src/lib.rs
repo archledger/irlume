@@ -3054,7 +3054,7 @@ where
         // and be persisted as durable policy, so a panic aborts the whole
         // probe instead (#263 review).
         let (rgb, ir) = std::thread::scope(|s| {
-            let ir_t = s.spawn(|| ir_cap());
+            let ir_t = s.spawn(&ir_cap);
             let rgb = rgb_cap();
             match ir_t.join() {
                 Ok(ir) => Ok((rgb, ir)),

@@ -2935,7 +2935,7 @@ impl App {
                     return;
                 }
                 self.confirm = Some((
-                    "Erase the TPM-sealed login password?".into(),
+                    "Erase the TPM-sealed keyring secret?".into(),
                     "Erase",
                     ConfirmAct::Daemon(Request::ForgetPassword {
                         user: self.user.clone(),
@@ -4272,6 +4272,26 @@ impl App {
             section("TPM keyring unlock"),
             Line::from(vec![Span::raw("  state    "), status]),
         ];
+        // WHAT is sealed, not just whether something is. A GNOME token means
+        // this user's password no longer opens that keyring on its own, which
+        // is not a thing to leave them to discover at a prompt.
+        if armed {
+            use irlume_common::KeyringSecretKind as K;
+            let (what, note) = match self.keyring_kind {
+                Some(K::LoginPassword) => ("login password", ""),
+                Some(K::KdeWalletKey) => ("KDE wallet key", " (a typed password still opens it)"),
+                Some(K::GnomeKeyringToken) => (
+                    "GNOME keyring token",
+                    " (your password alone no longer opens it; [f] re-keys back)",
+                ),
+                None => ("unreported by this daemon", ""),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  sealed   "),
+                Span::raw(what.to_string()),
+                Span::styled(note.to_string(), Style::new().dim()),
+            ]));
+        }
         if self.keyring_drift == Some(true) {
             lines.push(Line::from(vec![
                 Span::raw("  PCRs     "),
@@ -4306,20 +4326,20 @@ impl App {
         // The unlock trigger depends on this box's hardware.
         if self.caps.ir_pair {
             lines.push(Line::from(Span::styled(
-                "  At a face login the daemon unseals your password and hands it to",
+                "  At a face login the daemon unseals that secret and delivers it,",
                 Style::new().dim(),
             )));
             lines.push(Line::from(Span::styled(
-                "  pam_kwallet/gnome-keyring, so your wallet opens with no prompt.",
+                "  so your wallet opens with no prompt.",
                 Style::new().dim(),
             )));
         } else if self.fp_present {
             lines.push(Line::from(Span::styled(
-                "  At a fingerprint login the daemon unseals your password (ADR-0003)",
+                "  At a fingerprint login the daemon unseals that secret (ADR-0003)",
                 Style::new().dim(),
             )));
             lines.push(Line::from(Span::styled(
-                "  and hands it to gnome-keyring, so your wallet opens with no prompt.",
+                "  and delivers it, so your wallet opens with no prompt.",
                 Style::new().dim(),
             )));
         }
@@ -5381,7 +5401,7 @@ fn map_confirm(resp: Response) -> (bool, String) {
         Response::Ok(m) => (true, m),
         Response::PasswordForgotten => (
             true,
-            "sealed login password erased; keyring unlock disarmed".into(),
+            "sealed keyring secret erased; keyring unlock disarmed".into(),
         ),
         Response::Error(e) => (false, e),
         o => (false, format!("unexpected: {o:?}")),

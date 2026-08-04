@@ -174,7 +174,7 @@ irlume's headline feature is Windows-Hello-style keyring unlock: log in with you
 face and your GNOME-keyring / KWallet is already open. When you submit an empty
 password field, `pam_irlume.so` (in `unseal` mode) asks the daemon to
 `UnsealPassword`. The daemon runs the same pipeline and, **only on a live
-match**, TPM-unseals your login password and hands it back; `pam_irlume` sets it
+match**, TPM-unseals the sealed secret and hands it back; `pam_irlume` sets it
 as `PAM_AUTHTOK`, so a downstream `pam_gnome_keyring` / `pam_kwallet` opens the
 wallet with the same credential a typed password would have supplied. Anything
 short of a live match returns `PAM_IGNORE` and the stack falls through to the

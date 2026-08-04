@@ -1,7 +1,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.8.0
+Version:        0.8.1
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -220,6 +220,17 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Aug 04 2026 archledger <archledger236@gmail.com> - 0.8.1-1
+- A printed photograph of an enrolled face passes the built-in liveness gate; the cue cannot be repaired by tuning it, and the mitigation is `irlume models enable flir` (advisory, #235)
+- A blown infrared frame is refused rather than judged, so clipping no longer silences the PAD cue (#237)
+- Burst selection prefers a lit frame that is not clipped, which is how ordinary captures reached that regime (#221)
+- The sealed envelope no longer holds the login password: the KWallet key on KDE, a random re-keyed token on GNOME (#250)
+- A fingerprint login after a reboot no longer meets a keyring prompt; systemd owns the socket and the per-boot sweep is gone (#244, #249)
+- Keyring unseal latency drops from 10.88s to 2.71s on a discrete TPM; the policy digests are computed in software (#246, #248)
+- A retryable TPM PCR-counter race no longer surfaces as a keyring prompt on a fast login
+- irlume no longer names itself as the application holding its own camera, and enrolment stops opening one camera twice (#187)
+- A status read can no longer make a login wait (#212)
+
 * Sun Aug 02 2026 archledger <archledger236@gmail.com> - 0.8.0-1
 - Emitter write honours the Windows exclusive-control model; consumer scan reports its blind spot (#169, #207)
 - fingerprint enable and status print per-surface coverage; the fingerprint-only gate parses PAM rule fields (#155)

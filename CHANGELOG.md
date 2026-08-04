@@ -5,45 +5,155 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-04
+
+### Security
+
+- **A printed photograph of an enrolled face can pass the built-in liveness
+  gate.** On a default installation the cross-spectrum gate is the only
+  barrier, and it accepted a flat vinyl print of the enrolled face in 22 of 24
+  measured presentations. The falloff cue that is supposed to reject it is a
+  brightness ratio on a 2D infrared sensor, and a life-size print held at an
+  angle produces the same falloff a face does: measured 1.02 to 1.58 over 70
+  varied presentations on 2026-06-30 and 1.02 to 1.51 again on 2026-08-02,
+  against 1.26 to 1.49 for the live user. The print's range extends above the
+  genuine range, so no floor value accepts the user and rejects the print, and
+  the cue cannot be repaired by tuning it. This release fixes the two
+  amplifiers below rather than the attack. The mitigation is
+  `sudo irlume models enable flir`, which denied the same print at `p_fake`
+  0.999 and above. See the advisory for the full measurements and for what to
+  do if a photograph of you should not open your machine.
+
+- **A blown infrared frame is refused rather than judged.** A face region at
+  the sensor ceiling measures nothing, and irlume was reading cues off it
+  anyway. Against the same print, the optional PAD cue's `p_fake` decays with
+  clipping: 1.000 at 0.3% of the face clipped, 0.998 at 5.3%, 0.963 at 8.8%,
+  0.749 at 24.8% where it falls into its abstain band and says nothing, and
+  below 0.13 at 42.7%. Past roughly 13% the print faced only cues it already
+  cleared and was declared Live, so clipping silenced the one cue that denies
+  it. The gate now refuses above 10% clipped, on both credential-releasing
+  evaluators through one shared function, with the verdict Uncertain so a
+  login's grace window retries rather than terminating. Clipping is measured
+  on the raw gate frame, because ambient subtraction hides it. Closes #237.
+
+- **Burst selection prefers a lit frame that is not clipped.** The brightest
+  frame of a warming burst is the most likely to clip, and auto-exposure
+  produced that clipping by itself on the first capture after a daemon restart
+  at close range, which is how ordinary captures reached the regime above.
+  Selection now prefers the brightest camera-flagged-lit frame clipping at
+  most 5%, falling back to the least clipped lit frame; the no-metadata and
+  unknown-ceiling paths keep the old brightest scan. Hardware A/B on the ASUS
+  module: the gate frame clips 0.2 to 2.7% instead of 78.8%, ratios 1.50 to
+  1.64 instead of 1.11, and the same print was denied 6 of 6. Closes #221.
+
+- **The sealed envelope no longer holds the user's login password.** Releasing
+  it for keyring unlock meant a leaked envelope was a root escalation, which
+  is the mode Microsoft names "convenience PIN" and disrecommends. What is
+  sealed now depends on the backend, and both leave the password out of it.
+  On KDE, the 56-byte PBKDF2 key `ksecretd` opens the wallet with, which the
+  wallet is already keyed to, so nothing is re-keyed and a typed password
+  still opens it. On GNOME, whose credential is the string PAM hands it and so
+  has no derived intermediate, a 32-byte random token that `keyring arm`
+  re-keys the login keyring to through gnome-keyring's own control socket. A
+  leaked envelope now yields a secret that opens one keyring and nothing else.
+  Closes #250.
+
+  Existing armed users are untouched until they re-arm. On GNOME, note that
+  after re-arming the password alone no longer opens that keyring, since
+  irlume releases the token on every login; `irlume keyring forget` re-keys it
+  back. Because a random token cannot be re-derived, the envelope carries a
+  second copy wrapped under an Argon2id key from the login password, so a
+  broken TPM seal is recoverable. `irlume uninstall` refuses while any user is
+  token-armed, rather than deleting the only copy.
+
 ### Added
 
-- **The clipped fraction of the IR face is recorded with the liveness cues.**
-  A saturated centre cannot read brighter than a saturated rim, so a blown
-  exposure compresses the centre/edge ratio toward 1 the way strong ambient IR
-  does, and irlume guards only the ambient end. Two recorded corpora show the
-  case is reachable: in both, the session's first capture read about 235 mean
-  with a ratio of 1.06 and 1.12, against a 1.03 spoof floor and 1.19 to 1.42
-  for every later capture. `ir_saturated_frac` now rides in `Signals` and the
-  cross-spectrum debug line so #221 can be answered from ordinary output; it
-  gates nothing, and neither the ratio floor nor the warm-up length changes
-  until there is evidence from real authentications. The reading is absent,
-  not zero, when it cannot be taken: no IR face, or a negotiated format whose
-  decode cannot say where its ceiling is (the Y16 family is rescaled by a
-  shift taken from each frame's own maximum, and the YUV ceilings depend on a
-  quantization irlume does not carry), so the corpus never mixes "no clipping"
-  with "not measurable".
-
-- **Seating distance is recorded with the liveness cues.** `face_frac` (face
-  width as a fraction of frame width, the same quantity the framing guide
-  judges distance by) now rides in `Signals` and both liveness debug lines.
-  It gates nothing. Several existing cues are absolute thresholds on
-  quantities that may move across the guide's accepted 0.12 to 0.55 band, and
-  #174 asks which ones actually do before any of them is retuned; recording
-  the distance signal alongside them makes that answerable from ordinary
-  `IRLUME_LOG=debug` output rather than a special capture campaign.
+- **The clipped fraction and the seating distance are recorded with the
+  liveness cues.** `ir_saturated_frac` and `face_frac` ride in `Signals` and
+  the liveness debug lines. The clipped fraction now also gates, as above;
+  the distance signal gates nothing, and exists because several cues are
+  absolute thresholds on quantities that may move across the framing guide's
+  accepted 0.12 to 0.55 band, which #174 asks about before any of them is
+  retuned. Both readings are absent rather than zero when they cannot be
+  taken, so a corpus never mixes "no clipping" with "not measurable".
 
 ### Fixed
+
+- **A fingerprint login after a reboot could meet a keyring prompt.** irlumed
+  bound its own socket and was ordered after `multi-user.target` while
+  greeters are ordered after `basic.target`: on a ThinkPad X13 the greeter
+  authenticated a fingerprint eight seconds before the socket existed. The
+  keyring line is optional and swallows failures by design, so the login
+  succeeded, nothing was logged, and the prompt arrived later with nothing
+  naming why. systemd now owns the socket, the per-boot enrollment sweep runs
+  once per embedding space rather than every boot (asking whether a user needs
+  a retag costs a TPM unseal, and the TPM serializes, so that work collided
+  with the login it delayed), and the three parts are inseparable. Closes #244
+  and #249.
+
+- **A keyring unseal no longer costs seconds of login latency.** The pcrlock
+  branch digests were derived with one trial TPM session per predicted branch,
+  and this runs inside the PAM auth stack where the login waits on it. They
+  are now computed in software, which TCG Part 3 defines as hash recurrences
+  and which systemd computes the same way. Same-session A/B on a ThinkPad X13,
+  swapping only the binary: 10.88s to 2.71s, and the Zenbook 0.36s to 0.20s.
+  The memo and startup warm-up that existed to pay for the old cost are
+  deleted with it. Closes #246 and #248.
+
+- **A fast login after a reboot could meet a keyring prompt from a retryable
+  TPM error.** `TPM2_PolicyPCR` records the TPM's global PCR update counter in
+  the policy session, and any process extending any PCR invalidates it,
+  whether or not that PCR is one irlume binds. systemd extends PCR 11 at each
+  boot phase and PCR 15 when a user session starts, the second fired by the
+  very login being served, so logging in promptly raced a measurement the
+  login itself caused. The error says nothing about whether the policy is
+  satisfiable, and it was treated as fatal. The unseal now retries, bounded by
+  count and by time so a slow TPM cannot turn retries into a slow login.
+  systemd closed the same gap in systemd/systemd#35657.
+
+- **irlume no longer names itself as the application holding its own camera.**
+  The `/proc` scan returned the first process holding the node, and irlume had
+  just opened the device itself before `S_FMT` failed with EBUSY, so its own
+  pid sorted first and the message read "camera busy, in use by irlumed". The
+  scan now skips its own pid, and when nothing else is found it distinguishes
+  three outcomes: name the application to close, admit the scan was blind
+  without `CAP_SYS_PTRACE` and point at `fuser`, or report an irlume bug.
+
+- **Enrolment no longer opens one camera twice.** The capture loop holds both
+  cameras open, because re-opening per frame costs 1115ms of every attempt.
+  When a session could not be started, the per-frame fallback re-opened both
+  nodes while the held handles were still alive. Modules that permit a second
+  open hide this; one that answers EBUSY makes it fatal. The fallback now runs
+  after the handles are dropped, and the drop moves them, so a regression is a
+  compile error. Both this and the message above are what #187 reported.
 
 - **A status read can no longer make a login wait.** Every request used to
   execute on the single engine worker, so a `ListProfiles` (a TPM unseal of
   the template key, measured at 10.8 seconds on one laptop's TPM) made a
-  concurrently arriving authentication wait behind it: a Ping issued during
-  a listing measured 10.4 seconds. Read-only status requests (Ping, Health,
-  HasSealedPassword, KeyringInfo, RecoveryStatus, ListProfiles) now answer
-  on the connection's own thread, never entering the worker queue; Health
-  reads an engine snapshot published before the socket binds. Mutating
-  requests stay serialized on the worker, and the per-request authorization
-  gates moved with the code unchanged. Closes #212.
+  concurrently arriving authentication wait behind it: a Ping issued during a
+  listing measured 10.4 seconds. Read-only status requests now answer on the
+  connection's own thread, never entering the worker queue. Mutating requests
+  stay serialized on the worker, and the per-request authorization gates moved
+  with the code unchanged. Closes #212.
+
+### Changed
+
+- **The centre/edge floor stays at 1.03, and the corpus says why.** An
+  84-presentation corpus suggested it could rise to 1.25 and separate a flat
+  print from a live face. Every attack presentation in it was held square to
+  the camera; the same banner angled reaches 1.51, four of twenty passed the
+  proposed floor, and a floor blocking those would reject all 58 genuine
+  captures. The corpus now keeps the varied-angle species and a
+  `PAD_SELFTEST` line so the next person does not rediscover it, and `suncal`
+  formats the constant rather than a hardcoded 1.03 that contradicted its own
+  counts. No behaviour change.
+
+- **The absence of the third-party PAD cue is named as a gap, not a default.**
+  `doctor`, the daemon banner and SETUP.md reported it neutrally, which reads
+  as a choice the user already made. All three now say that the built-in gate
+  does not stop a printed face and give the command that closes it. The cue
+  stays opt-in because the reason it is not shipped is licensing (ADR-0001),
+  not doubt about whether it works.
 
 ## [0.8.0] - 2026-08-02
 
@@ -1836,6 +1946,8 @@ is always the fallback: no lockout, ever.
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
 [Unreleased]: https://github.com/archledger/irlume/compare/v0.7.2...HEAD
+[0.8.1]: https://github.com/archledger/irlume/releases/tag/v0.8.1
+[0.8.0]: https://github.com/archledger/irlume/releases/tag/v0.8.0
 [0.7.2]: https://github.com/archledger/irlume/releases/tag/v0.7.2
 [0.7.1]: https://github.com/archledger/irlume/releases/tag/v0.7.1
 [0.7.0]: https://github.com/archledger/irlume/releases/tag/v0.7.0

@@ -223,7 +223,7 @@ on the current boot by construction. Never store a recoverable face image;
 decrypted template plaintext and keys are zeroized.
 
 **Fingerprint keyring unlock** ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md))
-releases the sealed login password on *root peer + login-service-class*, without
+releases the sealed secret on *root peer + login-service-class*, without
 a daemon-verified biometric: the fingerprint (`pam_fprintd`) authenticated
 first. At-rest protection is preserved (a stolen disk can't unseal). Residual,
 accepted: a **live root attacker** in a login context can obtain the password.

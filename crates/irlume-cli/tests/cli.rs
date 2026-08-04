@@ -1428,7 +1428,7 @@ fn reseal_rebinds_when_armed_and_refuses_when_not() {
     serve(&sock(&sb2), |_| Response::HasPassword(false));
     let (code, _, err) = run(&mut sb2.cmd(&["reseal", "--user", "tester"]));
     assert_eq!(code, 2, "nothing sealed = usage-class refusal");
-    assert!(err.contains("has no sealed password"), "{err}");
+    assert!(err.contains("has no sealed secret"), "{err}");
     assert!(
         err.contains("keyring arm"),
         "must name the setup command: {err}"

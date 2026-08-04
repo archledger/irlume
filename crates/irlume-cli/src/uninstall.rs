@@ -98,7 +98,7 @@ pub fn run(args: &[String]) -> ExitCode {
         println!("  3. keep your enrolled faces and sealed secrets (--keep-data)");
     } else {
         println!("  3. disarm the keyring seal, then delete every enrolled face,");
-        println!("     sealed password, third-party model, and config file");
+        println!("     sealed secret, third-party model, and config file");
     }
     println!("  4. remove irlume itself (the package, or the installed files)");
     println!();

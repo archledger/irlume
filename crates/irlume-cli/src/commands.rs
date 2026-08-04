@@ -1314,7 +1314,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
     // Only meaningful if already armed (we never auto-arm from here).
     match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
         Ok(Response::HasPassword(false)) => {
-            eprintln!("[reseal] '{user}' has no sealed password; nothing to re-bind. Run `irlume keyring arm` to set one up.");
+            eprintln!("[reseal] '{user}' has no sealed secret; nothing to re-bind. Run `irlume keyring arm` to set one up.");
             return ExitCode::from(2);
         }
         Ok(Response::HasPassword(true)) => {}
@@ -1341,7 +1341,7 @@ pub fn reseal(args: &[String]) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    println!("[reseal] Re-binding '{user}'s sealed password to the current TPM/PCR state.");
+    println!("[reseal] Re-binding '{user}'s sealed secret to the current TPM/PCR state.");
     let Some(pw) = prompt_login_password() else {
         return ExitCode::from(2);
     };
@@ -1571,8 +1571,9 @@ ENROLLMENT & AUTH
                         (sudo; the head nod is the default and needs no calibration)
 
 KEYRING / TPM
-  keyring <arm|status|forget>     TPM-sealed login password for wallet unlock
-  reseal                re-bind the sealed password to current PCRs (after a
+  keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet
+                        (forget takes --force to erase without re-keying back)
+  reseal                re-bind the sealed secret to current PCRs (after a
                         firmware/kernel update); safe, re-enters the password
   recovery <status|setup|restore|forget>   recovery passphrase + encryption
   diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)

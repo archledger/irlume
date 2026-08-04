@@ -958,7 +958,10 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
         Some("arm") => {
             println!(
                 "[keyring] Arming face-driven keyring unlock for '{user}'.\n\
-                 Enter this user's LOGIN password (it will be sealed in the TPM, never stored in plaintext)."
+                 Enter this user's LOGIN password. Depending on the wallet you run, what \
+                 gets sealed is the password itself, the key your KDE wallet is already \
+                 opened with, or a fresh random token this re-keys your GNOME keyring to. \
+                 Nothing is stored in plaintext either way."
             );
             // No-echo prompt on a real terminal; fall back to a plain stdin line
             // when piped (scripts / tests), where /dev/tty isn't available.
@@ -1049,8 +1052,50 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             }
         }
         Some("status") => {
-            match daemon_request(&irlume_common::Request::HasSealedPassword { user: user.clone() })
-            {
+            // Ask for the detail first. WHAT is armed now changes what the
+            // user can expect from their own password: a GNOME token means
+            // their password no longer opens that keyring, which is not
+            // something to leave them to discover.
+            match daemon_request(&irlume_common::Request::KeyringInfo { user: user.clone() }) {
+                Ok(irlume_common::Response::KeyringInfo {
+                    armed: true, kind, ..
+                }) => {
+                    use irlume_common::KeyringSecretKind as K;
+                    match kind {
+                        Some(K::LoginPassword) => println!(
+                            "[keyring] '{user}': ARMED \u{2705} (login password). A face or \
+                             fingerprint login releases it so your wallet unlocks."
+                        ),
+                        Some(K::KdeWalletKey) => println!(
+                            "[keyring] '{user}': ARMED \u{2705} (KDE wallet key). The sealed \
+                             secret is the key ksecretd opens the wallet with, not your \
+                             password; a typed password still opens it too."
+                        ),
+                        Some(K::GnomeKeyringToken) => {
+                            println!(
+                                "[keyring] '{user}': ARMED \u{2705} (GNOME keyring token). Your \
+                                 login keyring is keyed to a random secret irlume releases on \
+                                 every login."
+                            );
+                            println!(
+                                "[keyring] Your password alone no longer opens that keyring; \
+                                 `irlume keyring forget` re-keys it back."
+                            );
+                        }
+                        // An older daemon does not report the kind.
+                        None => println!(
+                            "[keyring] '{user}': ARMED \u{2705} (this irlumed does not report \
+                             what kind)"
+                        ),
+                    }
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(irlume_common::Response::KeyringInfo { armed: false, .. }) => {
+                    println!("[keyring] '{user}': keyring unlock is not armed");
+                    std::process::ExitCode::SUCCESS
+                }
+                // A daemon predating KeyringInfo answers with an error; the
+                // armed bit is still worth reporting.
                 Ok(irlume_common::Response::HasPassword(armed)) => {
                     println!(
                         "[keyring] '{user}': keyring unlock is {}",
@@ -1184,7 +1229,16 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             }
         }
         _ => {
-            eprintln!("usage: irlume keyring <arm|status|forget> [--user U]");
+            eprintln!(
+                "usage: irlume keyring <arm|status|forget> [--user U]\n\n\
+                 \x20 arm      seal a secret so a login opens your wallet; what is\n\
+                 \x20          sealed depends on the wallet you run\n\
+                 \x20 status   whether a secret is armed, and which kind\n\
+                 \x20 forget   erase it. A GNOME keyring token is re-keyed back to\n\
+                 \x20          your password first, which needs that password;\n\
+                 \x20          --force skips the re-key and leaves such a keyring\n\
+                 \x20          unreachable"
+            );
             std::process::ExitCode::from(2)
         }
     }

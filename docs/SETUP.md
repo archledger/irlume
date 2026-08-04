@@ -216,7 +216,7 @@ stack carries `pam_fprintd.so` (that is what `irlume fingerprint enable` wires,
 via authselect on Fedora or pam-auth-update on Debian), inside the same
 `plasmalogin` transaction. A fingerprint provides no password, so irlume's
 `keyring` line, wired into the greeter whenever a reader is present, releases
-the TPM-sealed login password at the post-auth landing, and `pam_kwallet5.so`
+the TPM-sealed secret at the post-auth landing, and `pam_kwallet5.so`
 below it opens the wallet: a cold-boot fingerprint login unlocks KWallet with
 no prompt, same as face. The lock screen needs none of this: a warm unlock
 meets a wallet the login already opened.
@@ -260,7 +260,7 @@ a consumer to read the released password. `login enable` supplies both:
 
 ```
 auth        substack      fingerprint-auth
-auth       optional       pam_irlume.so keyring          ← releases the sealed password
+auth       optional       pam_irlume.so keyring          ← releases the sealed secret
 -auth      optional       pam_gnome_keyring.so           ← reads and stashes it
 ...
 -session   optional       pam_gnome_keyring.so auto_start  ← unlocks, starts the daemon
@@ -487,7 +487,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_RGB_MOIRE_MAX` | per-camera ceiling for the screen-replay moiré cue | 28 |
 | `IRLUME_IR_AMBIENT_SUBTRACT` | `1` enables experimental lit-minus-ambient IR subtraction; changes the IR frames the matcher sees, so re-enroll after toggling (see [ARCHITECTURE.md](ARCHITECTURE.md)) | off |
 | `IRLUME_TCTI` | TPM transport | `device:/dev/tpmrm0` |
-| `IRLUME_PCRS` | comma-separated PCR list the sealed password binds to | `7` |
+| `IRLUME_PCRS` | comma-separated PCR list the sealed secret binds to | `7` |
 | `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user | `0x81010002` |
 | `IRLUME_METHOD_CONF` | alternate path for the method file | `/etc/irlume/method` |
 

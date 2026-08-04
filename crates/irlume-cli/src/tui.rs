@@ -4282,7 +4282,10 @@ impl App {
                 Some(K::KdeWalletKey) => ("KDE wallet key", " (a typed password still opens it)"),
                 Some(K::GnomeKeyringToken) => (
                     "GNOME keyring token",
-                    " (your password alone no longer opens it; [f] re-keys back)",
+                    // NOT "[f] re-keys back": [f] refuses for this kind and
+                    // sends the user to the CLI, which is where the re-key
+                    // and its password prompt live.
+                    " (your password alone no longer opens it; `irlume keyring forget` re-keys back)",
                 ),
                 None => ("unreported by this daemon", ""),
             };

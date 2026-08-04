@@ -1,9 +1,23 @@
 # Landmark-anchored IR relief: what separates a face from a print, and what only looks like it does
 
 Measurement for [#25](https://github.com/archledger/irlume/issues/25). One camera
-(ASUS FHD built-in IR pin, GREY8 640x400), one subject, two sessions, two print
-presentations. **No gate code follows from this yet**; the closing section says
-what would have to be measured first.
+(ASUS FHD built-in IR pin, GREY8 640x400), one subject, two sessions, six print
+presentations across four geometries. **No gate code follows from this yet**;
+the closing section says what would have to be measured first.
+
+Every table below is regenerated from the committed corpus beside this file:
+
+```sh
+python3 scripts/analyze-landmark-relief.py \
+  docs/pad-results/2026-08-04-landmark-relief.jsonl \
+  --check docs/pad-results/2026-08-04-landmark-relief.md
+```
+
+The corpus is one record per detected frame carrying the region brightness
+means, not images: the raw infrared frames are of the operator's face and are
+kept out of the repository like every other PAD capture. `--check` exits
+nonzero if any count, range, median, coefficient or separation in this document
+stops matching the data.
 
 ## Corpus
 
@@ -32,7 +46,7 @@ byte-identically, 18 of 18, with the same detection count.
 
 ## Two candidates survive matched exposure; two do not
 
-| ratio | face (both sessions) | print (both presentations) | verdict |
+| ratio | face (177 frames) | print (285 frames) | verdict |
 |---|---|---|---|
 | cheek / chin | 2.580-3.532 | 1.295-1.610 | separated by 0.971 |
 | forehead / chin | 3.910-6.266 | 1.286-1.785 | separated by 2.126 |
@@ -62,11 +76,19 @@ The mechanism is visible in the regions before any ratio is taken (medians):
 | face | 122.8 | 193.5 | 38.2 | 0.302 |
 | print | 77.8 | 83.0 | 50.8 | 0.655 |
 
-On a face the chin is angled away from a near-coaxial emitter and shadowed by
-the jaw, so it returns a third of what the cheek does. On a sheet every region
-is coplanar and the only variation is the mild 1/r² gradient, so the chin
-returns two thirds. The ratio is a geometry measurement, and the dim-face
-control is what licenses calling it that rather than a brightness measurement.
+These medians are consistent with a geometric-shadow hypothesis: this subject's
+chin returned a third of the cheek's response, where this printed portrait's
+returned two thirds, which is what a surface angled away from a near-coaxial
+emitter and shadowed by the jaw would do against a coplanar sheet.
+
+Matching the exposure ranges removes the earlier between-class brightness
+separation, and that is all it removes. It does not isolate geometry from this
+subject's skin, facial hair, or pigmentation, from the source photograph's own
+lighting and tones, from the banner's ink and coating, or from head pitch. The
+experiment establishes a candidate ratio worth testing, not that the ratio
+measures relief; the darkened-chin attack below is the same point stated as an
+attack, and multiple subjects and print materials are what would separate these
+explanations.
 
 The attacker's degrees of freedom against the global centre/edge ratio do not
 transfer. Per condition:
@@ -91,9 +113,10 @@ approaches the face. Curving, which raised the print's global ratio from
 Both surviving ratios fall as the face brightens, so the failure direction is a
 very bright face. Fitting the face data and extending it to the print's ceiling:
 
-- `cheek/chin` = 3.480 − 0.0030 × exposure, reaching the print's 1.610 at
+- `cheek/chin` = 3.480 `-0.0030`*exposure, reaching the print's 1.610 at
   exposure **627**
-- `forehead/chin` = 6.466 − 0.0146 × exposure, reaching 1.785 at exposure **320**
+- `forehead/chin` = 6.466 `-0.0146`*exposure, reaching 1.785 at exposure
+  **320**
 
 Both crossings sit beyond 255, the 8-bit sensor ceiling, so neither is reachable
 by brightness alone on this hardware. This is an extrapolation from faces

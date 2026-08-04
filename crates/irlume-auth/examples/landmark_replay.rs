@@ -83,7 +83,16 @@ fn read_pgm(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), String> {
             .map_err(|_| format!("{}: bad header number", path.display()))?;
         fields.push(n);
     }
-    // Exactly one whitespace byte separates the header from the pixels.
+    // The spec says EXACTLY ONE whitespace byte separates the header from the
+    // raster. Checked rather than skipped: consuming a non-whitespace byte
+    // would silently shift every pixel by one and produce landmark samples
+    // from the wrong place.
+    if !raw.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+        return Err(format!(
+            "{}: header is not followed by a whitespace byte",
+            path.display()
+        ));
+    }
     i += 1;
     let (w, h, maxval) = (fields[0], fields[1], fields[2]);
     if maxval != 255 {
@@ -100,85 +109,195 @@ fn read_pgm(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), String> {
             )
         })?
         .to_vec();
+    // Trailing bytes mean the file is not the single-frame PGM this assumes;
+    // a concatenated or padded file would otherwise read as a valid frame.
+    // One trailing newline is tolerated because writers commonly add one.
+    let trailing = &raw[i + want..];
+    if !trailing.is_empty() && trailing != b"\n" {
+        return Err(format!(
+            "{}: {} unexpected bytes after the raster",
+            path.display(),
+            trailing.len()
+        ));
+    }
     Ok((w as u32, h as u32, pixels))
 }
 
-fn main() {
+/// The capture number in `frameNN.pgm`.
+///
+/// Lexicographic path order is not capture order once a corpus passes 99
+/// frames (`frame100` sorts before `frame11`), and enumerating the sorted list
+/// renumbers frames whenever the sequence has a gap. Both silently re-label
+/// results, and the lit/ambient pairing in the relief analysis is done by
+/// frame NUMBER, so a re-label pairs a frame with the wrong neighbour (#270
+/// review).
+fn frame_number(path: &std::path::Path) -> Result<usize, String> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("{}: non-UTF-8 frame name", path.display()))?;
+    let digits = stem
+        .strip_prefix("frame")
+        .ok_or_else(|| format!("{}: expected frameNN.pgm", path.display()))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{}: expected frameNN.pgm", path.display()));
+    }
+    digits
+        .parse()
+        .map_err(|_| format!("{}: frame number is too large", path.display()))
+}
+
+/// Every `frameNN.pgm` in `dir`, in CAPTURE order, or an error.
+///
+/// `read_dir` yields per-entry results and its order is filesystem-dependent;
+/// flattening the iterator would drop an unreadable entry with no trace, which
+/// is the silent-incompleteness this tool exists to avoid.
+fn collect_pgms(dir: &std::path::Path) -> Result<Vec<(usize, std::path::PathBuf)>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("read {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read an entry in {}: {e}", dir.display()))?;
+    let mut pgms = entries
+        .into_iter()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "pgm"))
+        .map(|p| frame_number(&p).map(|n| (n, p)))
+        .collect::<Result<Vec<_>, _>>()?;
+    pgms.sort_by_key(|(n, _)| *n);
+    for w in pgms.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(format!(
+                "duplicate frame number {}: {} and {}",
+                w[0].0,
+                w[0].1.display(),
+                w[1].1.display()
+            ));
+        }
+    }
+    if pgms.is_empty() {
+        return Err(format!("{}: no .pgm frames", dir.display()));
+    }
+    Ok(pgms)
+}
+
+fn main() -> std::process::ExitCode {
     let mut a = std::env::args().skip(1);
     let usage = "usage: landmark_replay <det.onnx> <mesh.onnx> <pgm_dir> [out_dir]";
     let det_path = a.next().expect(usage);
     let mesh_path = a.next().expect(usage);
-    let dir = a.next().expect(usage);
-    let out = a.next().unwrap_or_else(|| dir.clone());
+    let dir = std::path::PathBuf::from(a.next().expect(usage));
+    let out = a
+        .next()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.clone());
 
-    let mut det = Detector::load_from_file(&det_path).expect("load detector");
-    let mut mesh = FaceMesh::load_from_file(&mesh_path).expect("load mesh");
-    std::fs::create_dir_all(&out).expect("create out dir");
+    if let Err(e) = run(&det_path, &mesh_path, &dir, &out) {
+        eprintln!("landmark_replay: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
+}
 
-    // Sorted, so frameNN order is capture order rather than readdir order.
-    let mut pgms: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read {dir}: {e}"))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "pgm"))
-        .collect();
-    pgms.sort();
-    if pgms.is_empty() {
-        eprintln!("{dir}: no .pgm frames");
-        std::process::exit(2);
+/// Replay every frame, or fail without writing a partial corpus.
+///
+/// Inputs are read and validated BEFORE any output exists: a corpus silently
+/// missing frames is indistinguishable from a condition that produced fewer
+/// detections, and an analysis job seeing exit 0 would treat the short set as
+/// complete. A frame that fails to parse is a hard error, not a skip.
+fn run(
+    det_path: &str,
+    mesh_path: &str,
+    dir: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    let pgms = collect_pgms(dir)?;
+    // Read every frame first, so a truncated one aborts before the run looks
+    // like it produced a complete corpus.
+    let frames = pgms
+        .iter()
+        .map(|(n, p)| read_pgm(p).map(|f| (*n, f)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    std::fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    // Refuse to mix with an existing corpus: stale CSVs from an earlier run
+    // survive a re-run that detects fewer frames, and an analysis enumerating
+    // CSVs would then read a landmark result the new index does not list. In
+    // place over a landmark_dump corpus this forces a fresh directory, which
+    // is also what makes the byte-comparison parity check meaningful.
+    let stale = std::fs::read_dir(out)
+        .map_err(|e| format!("read {}: {e}", out.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read an entry in {}: {e}", out.display()))?
+        .into_iter()
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".landmarks.csv") || n == "index.txt")
+        });
+    if stale {
+        return Err(format!(
+            "{} already holds replay output; pass a fresh out_dir",
+            out.display()
+        ));
     }
 
-    let mut index = std::fs::File::create(format!("{out}/index.txt")).expect("index");
-    let (mut detected, mut failed) = (0usize, 0usize);
-    for (i, path) in pgms.iter().enumerate() {
-        let (w, h, data) = match read_pgm(path) {
-            Ok(v) => v,
-            Err(e) => {
-                // A frame that cannot be read is reported, never skipped
-                // silently: a corpus quietly missing frames reads as a
-                // condition that produced fewer detections.
-                eprintln!("skipping {e}");
-                failed += 1;
-                continue;
-            }
-        };
-        let mean = irlume_camera::ir_probe::mean(&data);
-        let grey_rgb = irlume_camera::grey_to_rgb(&data);
+    let mut det = Detector::load_from_file(det_path).map_err(|e| format!("load detector: {e}"))?;
+    let mut mesh = FaceMesh::load_from_file(mesh_path).map_err(|e| format!("load mesh: {e}"))?;
+
+    let index_path = out.join("index.txt");
+    let mut index =
+        std::fs::File::create(&index_path).map_err(|e| format!("{}: {e}", index_path.display()))?;
+    let mut detected = 0usize;
+    for (n, (w, h, data)) in &frames {
+        let mean = irlume_camera::ir_probe::mean(data);
+        let grey_rgb = irlume_camera::grey_to_rgb(data);
         let view = align::RgbView {
             data: &grey_rgb,
-            width: w,
-            height: h,
+            width: *w,
+            height: *h,
         };
         let top = det
             .detect(&view)
-            .expect("detect")
+            .map_err(|e| format!("detect frame {n}: {e}"))?
             .into_iter()
             .max_by(|a, b| a.score.total_cmp(&b.score));
+        // The CAPTURE number, never the loop position: a gap in the sequence
+        // would otherwise re-label every later frame.
         match top {
             Some(t) => {
-                let lm = mesh.landmarks(&view, &t.bbox, 0.25).expect("mesh");
-                let mut csv = std::fs::File::create(format!("{out}/frame{i:02}.landmarks.csv"))
-                    .expect("csv file");
-                writeln!(csv, "idx,x,y,brightness").unwrap();
-                for (k, &(x, y)) in lm.iter().enumerate() {
-                    let bri = patch_mean(&data, w, h, x, y);
-                    writeln!(csv, "{k},{x},{y},{bri:.2}").unwrap();
-                }
+                let lm = mesh
+                    .landmarks(&view, &t.bbox, 0.25)
+                    .map_err(|e| format!("mesh frame {n}: {e}"))?;
+                let csv_path = out.join(format!("frame{n:02}.landmarks.csv"));
+                let mut csv = std::fs::File::create(&csv_path)
+                    .map_err(|e| format!("{}: {e}", csv_path.display()))?;
+                let mut w_csv = || -> std::io::Result<()> {
+                    writeln!(csv, "idx,x,y,brightness")?;
+                    for (k, &(x, y)) in lm.iter().enumerate() {
+                        let bri = patch_mean(data, *w, *h, x, y);
+                        writeln!(csv, "{k},{x},{y},{bri:.2}")?;
+                    }
+                    Ok(())
+                };
+                w_csv().map_err(|e| format!("{}: {e}", csv_path.display()))?;
                 writeln!(
                     index,
-                    "{i:02} {mean:.1} - {:.2} {:.0},{:.0},{:.0},{:.0}",
+                    "{n:02} {mean:.1} - {:.2} {:.0},{:.0},{:.0},{:.0}",
                     t.score, t.bbox[0], t.bbox[1], t.bbox[2], t.bbox[3]
                 )
-                .unwrap();
+                .map_err(|e| format!("{}: {e}", index_path.display()))?;
                 detected += 1;
             }
             // Timing is a capture-time-only fact, so the ms column that
             // `landmark_dump` fills is '-' here rather than invented.
-            None => writeln!(index, "{i:02} {mean:.1} - - -").unwrap(),
+            None => writeln!(index, "{n:02} {mean:.1} - - -")
+                .map_err(|e| format!("{}: {e}", index_path.display()))?,
         }
     }
     println!(
-        "{out}: {} frames read ({failed} unreadable), face+mesh in {detected}",
-        pgms.len() - failed
+        "{}: {} frames read, face+mesh in {detected}",
+        out.display(),
+        frames.len()
     );
+    Ok(())
 }

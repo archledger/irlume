@@ -85,6 +85,7 @@ def main(argv):
     faces = [r for r in rows if r["condition"] in FACE]
     prints_ = [r for r in rows if r["condition"] not in FACE]
     claims = []
+    blocks = []
 
     print(f"corpus: {len(rows)} frames ({len(faces)} face, {len(prints_)} print)")
     print("\nexposure (face-region mean) by set")
@@ -141,11 +142,19 @@ def main(argv):
         claims += [f"{a:.3f}", f"{b:+.4f}", f"{cross:.0f}"]
 
     print("\nink at 850nm: each region as a fraction of its own class's forehead")
-    for label, sel in (("face", faces), ("print", prints_)):
-        fracs = {r: st.median([x[r] / x["forehead"] for x in sel])
-                 for r in ("nose", "cheek", "brow", "socket", "socket_deep", "chin")}
-        print(f"  {label:6} " + "  ".join(f"{k} {v:.3f}" for k, v in fracs.items()))
-        claims += [f"{v:.3f}" for v in fracs.values()]
+    # Rendered verbatim and matched as a BLOCK, not as loose values: a figure
+    # that also appears in the surrounding prose would otherwise mask an edit
+    # to the table cell, which is how the first version of this check passed a
+    # tampered table.
+    ink_rows = {"nose": "nose", "cheek": "cheek", "brow": "brow (eyebrow)",
+                "socket": "socket", "socket_deep": "socket_deep", "chin": "chin"}
+    ink_table = ["| region | real face | vinyl print |", "|---|---|---|"]
+    for key, label in ink_rows.items():
+        f = st.median([x[key] / x["forehead"] for x in faces])
+        p_ = st.median([x[key] / x["forehead"] for x in prints_])
+        ink_table.append(f"| {label} | {f:.3f} | {p_:.3f} |")
+        print(f"  {label:16} face {f:.3f}  print {p_:.3f}")
+    blocks.append(("ink reflectance table", "\n".join(ink_table)))
 
     print("\nprinted-shadow attack arithmetic")
     pc = st.median([r["cheek"] for r in prints_])
@@ -171,12 +180,18 @@ def main(argv):
     if "--check" in argv:
         report = open(argv[argv.index("--check") + 1]).read()
         missing = [c for c in claims if c not in report]
-        if missing:
-            print(f"\nCHECK FAILED: {len(missing)} computed value(s) absent from the report:")
+        bad_blocks = [name for name, text in blocks if text not in report]
+        if missing or bad_blocks:
+            print("\nCHECK FAILED")
             for m in sorted(set(missing)):
-                print(f"  {m}")
+                print(f"  value absent from the report: {m}")
+            for name, text in blocks:
+                if text in report:
+                    continue
+                print(f"  {name} does not match the data; expected:\n{text}")
             return 1
-        print(f"\nCHECK OK: all {len(set(claims))} distinct computed values appear in the report")
+        print(f"\nCHECK OK: {len(set(claims))} distinct values and {len(blocks)} "
+              f"rendered block(s) match the report")
     return 0
 
 

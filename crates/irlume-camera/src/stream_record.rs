@@ -884,25 +884,62 @@ mod tests {
     /// A retirement that fails spends nothing (review round 11): the
     /// increment rolls back with the state, and only the successful
     /// pre-write publication carries it to disk.
-    /// The mechanism behind #251, pinned so the crate lock's spawn duty is
-    /// provable rather than folklore.
+    /// The fact that bounds #251's window to fork-to-exec rather than the
+    /// child's whole lifetime.
+    ///
+    /// `flock` locks survive `execve` when the descriptor stays open, so the
+    /// inherited lock is released at the child's `exec` ONLY because the
+    /// descriptor is close-on-exec. Rust's `OpenOptions` sets that today; if a
+    /// future change opened this file through a path that does not, a spawned
+    /// `sleep 30` would hold the camera lock for thirty seconds and
+    /// `flock_is_inherited_across_fork_until_child_exit` would still pass.
+    /// Asserted on the flag directly rather than through an exec, because the
+    /// flag IS the property and an exec test would only sample it.
+    #[test]
+    fn the_stream_lock_descriptor_is_close_on_exec() {
+        use std::os::unix::io::AsRawFd as _;
+        let _guard = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cloexec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = crate::testenv::EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        let lock = acquire(&identity()).expect("the lock is free");
+        // SAFETY: querying flags on a descriptor this scope owns.
+        let flags = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert!(
+            flags & libc::FD_CLOEXEC != 0,
+            "the stream lock descriptor must be close-on-exec, or a spawned \
+             child keeps this camera's lock for its whole life"
+        );
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mechanism behind #251: a forked child retains the inherited locked
+    /// open file description after the parent releases its own descriptor.
     ///
     /// `flock` belongs to the open file description, and `fork` copies the fd
     /// table, so a child holds every lock its parent held at the moment of the
-    /// fork. `O_CLOEXEC` closes that copy at `exec`, NOT at `fork`, so every
-    /// `Command::spawn` anywhere in the process leaves a window in which an
-    /// unrelated lock is held by a child that knows nothing about it. The
-    /// symptom is a `Busy` from a lock that `/proc/locks` shows nobody holding
-    /// a moment later, and it only appears under enough CPU contention to
-    /// stretch fork-to-exec: CI runners, and this laptop only when pinned to
-    /// two cores.
+    /// fork. That is what let one test's `Command::spawn` hold another test's
+    /// lock: the symptom is a `Busy` from a lock that `/proc/locks` shows
+    /// nobody holding a moment later, and it only appears under enough CPU
+    /// contention to stretch fork-to-exec: CI runners, and this laptop only
+    /// when pinned to two cores.
+    ///
+    /// What bounds that window to fork-to-exec rather than the child's whole
+    /// life is the descriptor being close-on-exec, a SEPARATE fact asserted by
+    /// `the_stream_lock_descriptor_is_close_on_exec`. `flock` locks survive
+    /// `execve` when the descriptor stays open, so without that flag a spawned
+    /// `sleep 30` would hold the camera for thirty seconds and this test would
+    /// still pass.
     ///
     /// Production is not exposed the same way: `irlumed` holds this lock across
     /// a control write and does not spawn children inside that window. If it
     /// ever does, a second irlume would be refused the camera for as long as
     /// the fork-to-exec gap lasts.
     #[test]
-    fn flock_is_inherited_across_fork_until_exec() {
+    fn flock_is_inherited_across_fork_until_child_exit() {
         let _guard = crate::testenv::env_lock();
         let dir = std::env::temp_dir().join(format!("irlume-fork-flock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -910,8 +947,12 @@ mod tests {
         let id = identity();
 
         let lock = acquire(&id).expect("the lock is free");
-        // SAFETY: the child only sleeps and _exits, both async-signal-safe,
-        // which is the constraint fork() imposes on a threaded process.
+        // SAFETY: after fork in a threaded process the child may call only
+        // async-signal-safe functions until execve. `sleep(3)` and `_exit(2)`
+        // are on that list; Rust's `std::thread::sleep` is NOT and carries no
+        // post-fork contract, so it must not be used here however similar it
+        // looks. It was, until review: the comment claimed a guarantee the
+        // call did not have.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
@@ -920,8 +961,10 @@ mod tests {
             // The sleep is for DETERMINISM, not correctness: without it the
             // parent usually still wins the race, so its absence does not
             // falsify the assertion below.
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            unsafe { libc::_exit(0) };
+            unsafe {
+                libc::sleep(1);
+                libc::_exit(0);
+            }
         }
 
         drop(lock); // this process lets go; the child has not.

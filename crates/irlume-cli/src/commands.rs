@@ -1569,6 +1569,10 @@ ENROLLMENT & AUTH
   calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
                         prompts; captures N rounds (default 3) and stores the median
                         (sudo; the head nod is the default and needs no calibration)
+  calibrate-closure --measure-only [--rounds N] [--pose LABEL]
+                        print labelled EAR readings and their median WITHOUT
+                        replacing the stored calibration (sudo; for comparing
+                        states such as glasses on/off before re-calibrating)
 
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet

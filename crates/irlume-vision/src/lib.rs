@@ -198,67 +198,135 @@ mod onnx {
         irlume_common::Error::Hardware(format!("onnx: {e}"))
     }
 
-    /// Where the irlume packages install onnxruntime; the daemon's unit file
-    /// points `ORT_DYLIB_PATH` here, but a CLI run (or anything under sudo,
-    /// which scrubs the variable) arrives without it.
-    const PACKAGED_ORT: &str = "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so";
+    /// Where the irlume packages install onnxruntime: Fedora/Copr first,
+    /// then the Debian/Ubuntu universal .deb and PPA layout (their systemd
+    /// override hands the path to the daemon only, so a bare CLI run needs
+    /// this list; packaging/README.md records both).
+    const PACKAGED_ORTS: &[&str] = &[
+        "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+        "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
+    ];
 
-    /// Resolve the onnxruntime library BEFORE ort touches it.
+    /// The candidate the resolver would load, pure over its inputs so the
+    /// selection is testable without touching the process environment: an
+    /// explicit non-empty `ORT_DYLIB_PATH` wins, else the first packaged copy
+    /// present. `None` means "ask the system loader". An EMPTY variable reads
+    /// as unset, matching pinned ort's own treatment of it (#269 review).
+    fn configured_ort(
+        explicit: Option<&std::ffi::OsStr>,
+        is_file: impl Fn(&std::path::Path) -> bool,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(value) = explicit.filter(|value| !value.is_empty()) {
+            return Some(value.into());
+        }
+        PACKAGED_ORTS
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| is_file(path))
+    }
+
+    /// Prove `name` (a path or a bare soname) is a loadable library exporting
+    /// `OrtGetApiBase`, with the loader's own words when it is not.
+    ///
+    /// This CANNOT be delegated to `ort::init_from`: measured on 2026-08-04,
+    /// a load failure inside ort parks the process in a futex exactly like
+    /// the lazy path does (straced with `ORT_DYLIB_PATH=/etc/hostname`: the
+    /// file opens, dlopen rejects it, then FUTEX_WAIT forever, no output), so
+    /// the probe has to establish loadability first with its own dlopen. The
+    /// handle is closed again; `ort` reopens the same name at first session
+    /// build, and dlopen's reference counting makes that cheap. The window
+    /// between probe and load is real but cosmetic: a file swapped in that
+    /// gap fails INSIDE ort, which is the pre-existing behaviour for every
+    /// failure, and reaching it now requires racing the swap.
+    fn probe_loadable(name: &std::ffi::CStr) -> Result<(), String> {
+        // SAFETY: dlopen/dlerror/dlsym/dlclose with valid NUL-terminated
+        // strings; the handle is non-null when dlsym runs and closed once.
+        unsafe {
+            let handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if handle.is_null() {
+                let why = libc::dlerror();
+                let why = if why.is_null() {
+                    "dlopen failed with no message".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(why).to_string_lossy().into_owned()
+                };
+                return Err(why);
+            }
+            let sym = libc::dlsym(handle, c"OrtGetApiBase".as_ptr());
+            libc::dlclose(handle);
+            if sym.is_null() {
+                return Err(
+                    "the library loads but exports no OrtGetApiBase; it is not an \
+                     ONNX Runtime"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    /// Probe, then hand the SAME name to pinned ort, which retains the handle
+    /// in its own global and applies its api-24 version floor. A version-floor
+    /// rejection inside ort is the one failure class the probe cannot
+    /// pre-empt; whether it errors or parks there is untested, since no
+    /// pre-1.24 library was on hand.
+    fn load_ort(path: &std::path::Path) -> Result<(), String> {
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| format!("{} contains a NUL byte", path.display()))?;
+        probe_loadable(&name)
+            .map_err(|why| format!("cannot load ONNX Runtime from {}: {why}", path.display()))?;
+        ort::init_from(path).map(|_| ()).map_err(|e| {
+            format!(
+                "cannot initialize ONNX Runtime from {}: {e}",
+                path.display()
+            )
+        })
+    }
+
+    /// Settle the onnxruntime library BEFORE ort's lazy default path can park
+    /// on it.
     ///
     /// `load-dynamic`'s failure mode for an unresolvable library is not an
-    /// error: the loader walks its paths and the process then parks forever in
-    /// a futex with no output (straced on 2026-08-04, #266). So this settles
-    /// resolvability first, three ways in order: an explicit `ORT_DYLIB_PATH`
-    /// is verified to exist (a wrong value gets the actionable message, not
-    /// the park); with none set, the packaged copy is used when present, which
-    /// is what lets a bare `irlume` command work at all; failing both, a
-    /// `dlopen` probe asks the real loader, so a distro-managed copy anywhere
-    /// the loader looks (hwcaps subdirectories included) still passes. Only
-    /// when all three fail does this error, naming the fix.
+    /// error: the loader walks its paths and the process parks forever in a
+    /// futex with no output (straced on 2026-08-04, #266; sudo scrubbing
+    /// `ORT_DYLIB_PATH` is the easy trigger, and the CLI's model commands hit
+    /// it where the daemon's unit file does not). Loading explicitly through
+    /// [`load_ort`] turns every failure into an error naming the fix. The
+    /// environment is never written: mutating it here would be unsound once
+    /// any other thread exists, and this crate's constructors are public API
+    /// with no single-threaded guarantee.
     fn ensure_ort_resolvable() -> irlume_common::Result<()> {
         use std::sync::OnceLock;
         static VERDICT: OnceLock<Result<(), String>> = OnceLock::new();
         VERDICT
             .get_or_init(|| {
-                if let Some(p) = std::env::var_os("ORT_DYLIB_PATH") {
-                    let path = std::path::Path::new(&p);
-                    if path.is_file() {
-                        return Ok(());
+                let explicit = std::env::var_os("ORT_DYLIB_PATH");
+                if let Some(path) = configured_ort(explicit.as_deref(), |p| p.is_file()) {
+                    // An explicit path that is not a file gets the actionable
+                    // message rather than a load error about a missing file.
+                    if !path.is_file() {
+                        return Err(format!(
+                            "ORT_DYLIB_PATH points at {} which does not exist; the \
+                             irlume packages install it at {} (Fedora) or {} \
+                             (Debian/Ubuntu); sudo drops the variable, pass it with \
+                             `sudo env ORT_DYLIB_PATH=...`",
+                            path.display(),
+                            PACKAGED_ORTS[0],
+                            PACKAGED_ORTS[1]
+                        ));
                     }
-                    return Err(format!(
-                        "ORT_DYLIB_PATH points at {} which does not exist; the irlume \
-                         packages install it at {PACKAGED_ORT} (sudo drops the variable: \
-                         pass it with `sudo env ORT_DYLIB_PATH=...`)",
-                        path.display()
-                    ));
+                    return load_ort(&path);
                 }
-                if std::path::Path::new(PACKAGED_ORT).is_file() {
-                    std::env::set_var("ORT_DYLIB_PATH", PACKAGED_ORT);
-                    return Ok(());
-                }
-                // SAFETY: dlopen/dlclose with a valid NUL-terminated name; the
-                // handle is closed immediately, the probe only asks whether
-                // the loader can resolve the soname ort will ask for.
-                let resolvable = unsafe {
-                    let h = libc::dlopen(
-                        c"libonnxruntime.so".as_ptr(),
-                        libc::RTLD_NOW | libc::RTLD_LOCAL,
-                    );
-                    if h.is_null() {
-                        false
-                    } else {
-                        libc::dlclose(h);
-                        true
-                    }
-                };
-                if resolvable {
-                    return Ok(());
-                }
-                Err(format!(
-                    "libonnxruntime.so was not found (no ORT_DYLIB_PATH, nothing at \
-                     {PACKAGED_ORT}, and the system loader cannot resolve it); install \
-                     the irlume package's onnxruntime or set ORT_DYLIB_PATH"
-                ))
+                // No explicit path, no packaged copy: ask the system loader,
+                // through ort so acceptance and retention still apply.
+                load_ort(std::path::Path::new("libonnxruntime.so")).map_err(|system_error| {
+                    format!(
+                        "libonnxruntime.so was not loadable (no ORT_DYLIB_PATH, nothing \
+                         at {} or {}, and the system loader failed: {system_error}); \
+                         install the irlume package's onnxruntime or set ORT_DYLIB_PATH",
+                        PACKAGED_ORTS[0], PACKAGED_ORTS[1]
+                    )
+                })
             })
             .clone()
             .map_err(irlume_common::Error::Hardware)
@@ -872,6 +940,46 @@ mod onnx {
             passed,
             format!("cosine(same chip, twice) = {cos:.6} (want ~1.0)"),
         )
+    }
+
+    #[cfg(test)]
+    mod resolver_tests {
+        use super::*;
+        use std::ffi::OsStr;
+        use std::path::{Path, PathBuf};
+
+        #[test]
+        fn an_empty_environment_variable_reads_as_unset() {
+            // Pinned ort treats ORT_DYLIB_PATH="" as unset; treating it as an
+            // explicit path would error on a configuration ort itself accepts.
+            assert_eq!(configured_ort(Some(OsStr::new("")), |_| false), None);
+        }
+
+        #[test]
+        fn an_explicit_path_wins_even_over_a_present_package() {
+            assert_eq!(
+                configured_ort(Some(OsStr::new("/custom/libonnxruntime.so")), |_| true),
+                Some(PathBuf::from("/custom/libonnxruntime.so"))
+            );
+        }
+
+        #[test]
+        fn each_package_layout_is_found() {
+            // Fedora/Copr and the Debian/Ubuntu /opt layout (#269 review: the
+            // first version knew only Fedora's path, so a bare CLI run on a
+            // .deb install errored with the library installed).
+            for packaged in PACKAGED_ORTS {
+                assert_eq!(
+                    configured_ort(None, |p| p == Path::new(packaged)),
+                    Some(PathBuf::from(*packaged))
+                );
+            }
+        }
+
+        #[test]
+        fn nothing_found_defers_to_the_system_loader() {
+            assert_eq!(configured_ort(None, |_| false), None);
+        }
     }
 }
 

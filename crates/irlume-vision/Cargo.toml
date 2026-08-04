@@ -18,7 +18,7 @@ coreml = ["ort/coreml"]
 tensorrt = ["ort/tensorrt"]
 
 [dependencies]
-libc.workspace = true   # dlopen probe: is libonnxruntime resolvable, BEFORE ort parks on a missing one (#266)
+libc.workspace = true   # dlopen/dlsym probe: prove a library is loadable ort BEFORE ort can park on it (#266)
 irlume-common.workspace = true
 irlume-camera.workspace = true
 thiserror.workspace = true

@@ -232,15 +232,18 @@ mod onnx {
     /// a load failure inside ort parks the process in a futex exactly like
     /// the lazy path does (straced with `ORT_DYLIB_PATH=/etc/hostname`: the
     /// file opens, dlopen rejects it, then FUTEX_WAIT forever, no output), so
-    /// the probe has to establish loadability first with its own dlopen. The
-    /// handle is closed again; `ort` reopens the same name at first session
-    /// build, and dlopen's reference counting makes that cheap. The window
-    /// between probe and load is real but cosmetic: a file swapped in that
-    /// gap fails INSIDE ort, which is the pre-existing behaviour for every
-    /// failure, and reaching it now requires racing the swap.
+    /// the probe has to establish loadability first with its own dlopen. On
+    /// success the handle is KEPT for the life of the process, deliberately:
+    /// `ort` then reopens the same name (dlopen reference counting makes that
+    /// cheap), the probed object and the used object cannot diverge, and
+    /// unloading is what LeakSanitizer rightly complains about, since dlclose
+    /// on a C++ runtime orphans the allocations its static initializers made
+    /// (measured in CI: 80 bytes in 2 allocations from libonnxruntime's init
+    /// under dlopen).
     fn probe_loadable(name: &std::ffi::CStr) -> Result<(), String> {
         // SAFETY: dlopen/dlerror/dlsym/dlclose with valid NUL-terminated
-        // strings; the handle is non-null when dlsym runs and closed once.
+        // strings; the handle is non-null when dlsym runs, retained on
+        // success, and closed on the one failure past it.
         unsafe {
             let handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
             if handle.is_null() {
@@ -253,8 +256,12 @@ mod onnx {
                 return Err(why);
             }
             let sym = libc::dlsym(handle, c"OrtGetApiBase".as_ptr());
-            libc::dlclose(handle);
             if sym.is_null() {
+                // The one place dlclose is right: a foreign library that will
+                // not be used again. A future test exercising this path under
+                // LeakSanitizer will see that library's own initializer
+                // allocations; that is this close, not a defect in the probe.
+                libc::dlclose(handle);
                 return Err(
                     "the library loads but exports no OrtGetApiBase; it is not an \
                      ONNX Runtime"

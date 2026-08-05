@@ -1,0 +1,149 @@
+{
+ "derivation": "docs/recognition-results/data/derive-floor-aggregates.py against the raw session directory",
+ "instrument": "irlume calcapture (production TTA embedding path), irlume b8313f4",
+ "runs": {
+  "aura-brio-desk": {
+   "host": "HP-ArchLinuxGaming",
+   "model_sha256": "a7933ea53301",
+   "pairwise_genuine": {
+    "max": 0.9308,
+    "mean": 0.8491,
+    "min": 0.7618,
+    "n": 300,
+    "p5": 0.7903
+   },
+   "rgb_brightness_range": [
+    42.9,
+    77.3
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 25
+  },
+  "aura-lamp": {
+   "host": "UX5406S-Fedora",
+   "model_sha256": "a7933ea53301",
+   "pairwise_genuine": {
+    "max": 0.9729,
+    "mean": 0.5598,
+    "min": 0.0443,
+    "n": 300,
+    "p5": 0.084
+   },
+   "rgb_brightness_range": [
+    49.5,
+    195.3
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 25
+  },
+  "aura-lamp-redo": {
+   "host": "UX5406S-Fedora",
+   "model_sha256": "a7933ea53301",
+   "pairwise_genuine": {
+    "max": 0.9467,
+    "mean": 0.8583,
+    "min": 0.6919,
+    "n": 300,
+    "p5": 0.7553
+   },
+   "rgb_brightness_range": [
+    43.5,
+    58.3
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 25
+  },
+  "buffalo-brio-desk": {
+   "host": "HP-ArchLinuxGaming",
+   "model_sha256": "4c06341c33c2",
+   "pairwise_genuine": {
+    "max": 0.9213,
+    "mean": 0.8627,
+    "min": 0.7926,
+    "n": 300,
+    "p5": 0.8115
+   },
+   "rgb_brightness_range": [
+    41.7,
+    52.4
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 25
+  },
+  "buffalo-desk": {
+   "host": "UX5406S-Fedora",
+   "model_sha256": "4c06341c33c2",
+   "pairwise_genuine": {
+    "max": 0.9626,
+    "mean": 0.8855,
+    "min": 0.7443,
+    "n": 300,
+    "p5": 0.776
+   },
+   "rgb_brightness_range": [
+    48.3,
+    67.6
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 25
+  },
+  "buffalo-dim": {
+   "host": "UX5406S-Fedora",
+   "model_sha256": "4c06341c33c2",
+   "rgb_brightness_range": null,
+   "samples_captured": 25,
+   "samples_with_rgb_face": 0
+  },
+  "buffalo-lamp": {
+   "best_of_n_vs_desk": {
+    "clear_055": 25,
+    "clear_060": 24,
+    "max": 0.7075,
+    "median": 0.6519,
+    "min": 0.5531,
+    "n": 25
+   },
+   "host": "UX5406S-Fedora",
+   "model_sha256": "4c06341c33c2",
+   "pairwise_genuine": {
+    "max": 0.9736,
+    "mean": 0.8854,
+    "min": 0.6848,
+    "n": 300,
+    "p5": 0.7322
+   },
+   "rgb_brightness_range": [
+    127.3,
+    137.6
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 25
+  },
+  "buffalo-screenglow": {
+   "best_of_n_vs_desk": {
+    "clear_055": 5,
+    "clear_060": 4,
+    "max": 0.686,
+    "median": 0.5921,
+    "min": 0.2639,
+    "n": 9
+   },
+   "host": "UX5406S-Fedora",
+   "model_sha256": "4c06341c33c2",
+   "pairwise_genuine": {
+    "max": 0.9357,
+    "mean": 0.6627,
+    "min": 0.3586,
+    "n": 36,
+    "p5": 0.3836
+   },
+   "rgb_brightness_range": [
+    18.4,
+    32.2
+   ],
+   "samples_captured": 25,
+   "samples_with_rgb_face": 9
+  }
+ },
+ "what": "Derived aggregates of the live genuine-floor calcapture sessions. The raw jsonl records carry face embeddings (biometric templates) and are deliberately NOT committed; these aggregates carry counts, brightness ranges and cosine-distribution statistics only."
+}

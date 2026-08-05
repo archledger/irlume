@@ -1,0 +1,65 @@
+{
+ "artifact": {
+  "container": {
+   "file": "buffalo_l.zip",
+   "origin": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+   "origin_fetched": "2026-08-04",
+   "sha256": "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f"
+  },
+  "file": "w600k_r50.onnx",
+  "sha256": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43"
+ },
+ "commit_measured_at": "b8313f4",
+ "far_legs": {
+  "commands": [
+   "IRLUME_DEV=1 irlume irbench --dir <lfw> --det models/face_detection_yunet_2023mar.onnx --model <MODEL> --lfw --max-persons 999999",
+   "IRLUME_DEV=1 irlume irbench --dir <fairface>/<Group> --det models/face_detection_yunet_2023mar.onnx --model <MODEL> --impostor-only",
+   "IRLUME_DEV=1 irlume irbench --dir <sfhq-part1>/images/images --det models/face_detection_yunet_2023mar.onnx --model <MODEL> --impostor-only --max-images 15000"
+  ],
+  "cross_machine_check": "the LFW control leg also ran on the Zenbook and printed identical summary lines",
+  "datasets": {
+   "fairface": {
+    "groups": [
+     "Black",
+     "East_Asian",
+     "Indian",
+     "Latino_Hispanic",
+     "Middle_Eastern",
+     "Southeast_Asian",
+     "White"
+    ],
+    "split": "validation"
+   },
+   "lfw": {
+    "identity_grouped": true,
+    "images": 13233,
+    "persons": 5749
+   },
+   "sfhq": {
+    "source": "kaggle selfishgene/synthetic-faces-high-quality-sfhq-part-1",
+    "subset": "images/images, lexicographic sort, first 15000"
+   }
+  },
+  "model_values": {
+   "buffalo": "w600k_r50.onnx (sha256 above)",
+   "control": "models/glintr100.onnx (the shipped recognizer)"
+  },
+  "outputs": "docs/recognition-results/data/*.txt (aggregate distributions only; irbench emits no per-image data)",
+  "runner": "archhost (AMD Ryzen 7 5700G), irlume target/release build at b8313f4"
+ },
+ "frr_leg": {
+  "anchors": "each session includes a shipped-model control run; documented live floor for comparison: min 0.71 / mean 0.85",
+  "cameras": {
+   "brio": "--rgb /dev/video4 --ir /dev/video6 on archhost",
+   "zenbook": "built-in IR camera, defaults"
+  },
+  "instrument": "IRLUME_DEV=1 irlume calcapture --user <u> --det <yunet> --model <MODEL> --out <run>.jsonl --n 25 --tag <condition> (12-sample discarded warm-up first, so auto-exposure settles)",
+  "outputs": "docs/recognition-results/data/floor-aggregates.json, derived by derive-floor-aggregates.py; raw jsonl holds biometric embeddings and is not committed"
+ },
+ "result": {
+  "rejected": {
+   "0.60": "cross-lighting production-shaped minimum measured 0.553"
+  },
+  "threshold": 0.55
+ }
+}

@@ -1,0 +1,11 @@
+[irbench] 5749 persons, 13233 images; embedding (YuNet→align→AuraFace)…
+[irbench] embedded 13233 faces (0 images had no detectable face)
+[genuine ] n=242257  min -0.236  mean 0.656  median 0.687
+[impostor] n=87307271  mean 0.013  p99 0.148  p99.9 0.209  max 1.000
+  thr 0.40: FAR 0.00005  FRR 0.0442
+  thr 0.45: FAR 0.00005  FRR 0.0466
+  thr 0.50: FAR 0.00005  FRR 0.0543
+  thr 0.55: FAR 0.00004  FRR 0.0788
+  thr 0.60: FAR 0.00003  FRR 0.1492
+[EER] ~0.039 at threshold 0.110
+[FAR≤1e-4] threshold 0.300 -> FRR 0.0430 (reject rate for genuine at NIST-grade FAR)

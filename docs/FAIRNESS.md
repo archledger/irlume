@@ -48,13 +48,26 @@ bounds the residual either way.
 
 ## Recognizer trade-off: AuraFace vs buffalo_l
 
-A stronger recognizer narrows the gap. **buffalo_l** (InsightFace, Glint360K) on
-the identical protocol cut the spread to ≈ 4.5× and halved the worst-group FAR;
-it is both fairer and more accurate. **We do not use it.** buffalo_l is trained
-on MS-Celeb-1M / Glint360K (web-scraped, non-consensual, research-/non-commercial
-license). Bundling it would break irlume's clean Bill of Materials and the GPL's
-promise of downstream commercial freedom (see `docs/ARCHITECTURE.md` and the
-model-licensing notes). We accept a fairness/accuracy cost to stay legally clean.
+A stronger recognizer narrows the gap. **buffalo_l** (InsightFace; its
+recognizer is an IResNet-50 trained on WebFace600K, per the InsightFace model
+zoo) on the identical protocol at this document's 0.50 measurement point cut
+the spread to ≈ 4.5× and roughly halved the worst-group FAR (5.63×10⁻⁴
+against 1.042×10⁻³); it is both fairer and more accurate. The 2026-08-05
+split-source re-run (docs/recognition-results/2026-08-05-buffalo-l.md)
+reproduced this document's AuraFace figures exactly and measured, at
+buffalo_l's enabled 0.55 operating point, a spread of ≈ 3.9× against ≈ 6.1×
+for AuraFace with worst-group FAR near parity — parity by construction, since
+that operating point was chosen to match the shipped FAR posture. The
+worst-served group shifts to Middle Eastern under buffalo_l.
+
+**We do not ship it.** WebFace600K is web-scraped without subject consent and
+the weights are licensed for non-commercial research only. Bundling it would
+break irlume's clean Bill of Materials and the GPL's promise of downstream
+commercial freedom (see `docs/ARCHITECTURE.md` and the model-licensing
+notes). We accept a fairness/accuracy cost to stay legally clean. Since
+2026-08-05 a user may bring it themselves: the measured `buffalo` catalog
+entry (docs/THIRD-PARTY-MODELS.md) pins the artifact and its threshold, and
+irlume still distributes nothing.
 
 The gap is therefore **partly recognizer quality** (a better-trained model helps)
 and **partly intrinsic** to recognizers trained on demographically-skewed data.

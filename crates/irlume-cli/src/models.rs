@@ -386,12 +386,22 @@ fn install_verified(m: &ThirdPartyModel, bytes: &[u8]) -> ExitCode {
     if !place_verified(m, bytes) {
         return ExitCode::FAILURE;
     }
-    restart_daemon();
+    if let Err(e) = restart_daemon() {
+        eprintln!("[models] settings were updated, but the daemon was NOT restarted: {e}");
+        eprintln!(
+            "[models] the running daemon still uses the previous model; do not enroll or \
+             authenticate until `sudo systemctl restart irlumed.service` succeeds"
+        );
+        return ExitCode::FAILURE;
+    }
     println!(
         "[models] '{}' enabled (sha256 verified) and the daemon restarted.",
         m.name
     );
-    println!("[models] check with: irlume doctor · disable with: sudo irlume models disable");
+    println!(
+        "[models] check with: irlume models · disable with: sudo irlume models disable {}",
+        m.name
+    );
     ExitCode::SUCCESS
 }
 
@@ -493,15 +503,25 @@ fn disable(name: Option<&str>) -> ExitCode {
         println!("[models] cancelled; nothing was changed.");
         return ExitCode::FAILURE;
     }
-    match std::fs::remove_file(thirdparty::model_path(m)) {
-        Ok(()) | Err(_) => {} // absent is fine; the goal is "not on disk"
+    let path = thirdparty::model_path(m);
+    if let Err(e) = remove_weights(&path) {
+        eprintln!("[models] {e}; settings were not changed");
+        return ExitCode::FAILURE;
     }
     let _ = std::fs::remove_dir(thirdparty::dir()); // only if now empty
     if let Err(e) = irlume_common::config::write_kv("settings.conf", key, "") {
         eprintln!("[models] weights deleted but settings.conf update failed: {e}");
         return ExitCode::FAILURE;
     }
-    restart_daemon();
+    if let Err(e) = restart_daemon() {
+        eprintln!("[models] settings were updated, but the daemon was NOT restarted: {e}");
+        eprintln!(
+            "[models] the running daemon still uses '{}' until \
+             `sudo systemctl restart irlumed.service` succeeds",
+            m.name
+        );
+        return ExitCode::FAILURE;
+    }
     println!(
         "[models] '{}' disabled: weights deleted, daemon back on the shipped stack.",
         m.name
@@ -509,11 +529,43 @@ fn disable(name: Option<&str>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn restart_daemon() {
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
-    let _ = Command::new("systemctl")
+/// Restart the daemon so it picks up the changed selection, REPORTING failure.
+///
+/// Swallowing a failed restart here let the command claim a model change the
+/// running daemon had not made — and the enable path invites re-enrollment,
+/// which against the OLD recognizer writes templates the new one will refuse.
+fn restart_daemon() -> Result<(), String> {
+    let reload = Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()
+        .map_err(|e| format!("could not execute systemctl daemon-reload: {e}"))?;
+    if !reload.success() {
+        return Err(format!(
+            "systemctl daemon-reload failed with status {reload}"
+        ));
+    }
+    let restart = Command::new("systemctl")
         .args(["try-restart", "irlumed.service"])
-        .status();
+        .status()
+        .map_err(|e| format!("could not execute systemctl try-restart: {e}"))?;
+    if !restart.success() {
+        return Err(format!(
+            "systemctl try-restart irlumed.service failed with status {restart}"
+        ));
+    }
+    Ok(())
+}
+
+/// Delete a weights file, where only GENUINE ABSENCE counts as success:
+/// any other error means the non-commercial weights are still on disk, and
+/// clearing the selection while claiming "deleted" would break the module's
+/// no-unwarranted-bits invariant precisely when the filesystem misbehaves.
+fn remove_weights(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not delete {}: {e}", path.display())),
+    }
 }
 
 fn stdin_is_tty() -> bool {
@@ -625,6 +677,26 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
 }
 
 pub fn doctor_line() -> String {
+    // Every enabled stage, not just PAD: with the recognition stage open, a
+    // doctor line saying "none" while a recognizer is selected would be the
+    // primary human diagnostic lying about authentication policy.
+    let enabled = enabled_entries();
+    if enabled.len() > 1
+        || matches!(enabled.first(), Some((m, _)) if m.stage != irlume_common::thirdparty::Stage::Pad)
+    {
+        return enabled
+            .iter()
+            .map(|(m, _)| {
+                format!(
+                    "{} enabled ({} stage; {})",
+                    m.name,
+                    m.stage.as_str(),
+                    file_state(m)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
     if let Some(name) = enabled_name() {
         return match thirdparty::by_name(&name) {
             Some(m) => format!("{name} enabled ({}; deny-only cue)", file_state(m)),
@@ -826,6 +898,103 @@ mod tests {
                 .map(|s| s.stage)
                 .collect::<Vec<_>>(),
             ["recognition", "pad"]
+        );
+    }
+
+    #[test]
+    fn a_failed_daemon_restart_is_reported_not_swallowed() {
+        // The enable path invites re-enrollment after a model change; a
+        // swallowed restart failure means those templates are written by the
+        // OLD recognizer and refused by the new one. The command must report
+        // the failure, so both callers refuse to claim activation.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-sysd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+
+        let fake = |code: i32| {
+            std::fs::write(dir.join("systemctl"), format!("#!/bin/sh\nexit {code}\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("systemctl"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        };
+        fake(1);
+        std::env::set_var("PATH", &dir);
+        let failed = restart_daemon();
+        fake(0);
+        let succeeded = restart_daemon();
+        std::env::set_var("PATH", &old_path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = failed.expect_err("a nonzero systemctl must be reported");
+        assert!(err.contains("daemon-reload failed"), "got: {err}");
+        succeeded.expect("a zero systemctl must succeed");
+    }
+
+    #[test]
+    fn weight_deletion_refuses_anything_but_genuine_absence() {
+        let root = std::env::temp_dir().join(format!("irlume-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A real file deletes.
+        let f = root.join("w.onnx");
+        std::fs::write(&f, b"bytes").unwrap();
+        remove_weights(&f).expect("a real file must delete");
+        assert!(!f.exists());
+        // Genuine absence is success (the goal is "not on disk").
+        remove_weights(&f).expect("absence must count as deleted");
+        // A directory at the path is NOT absence: the bytes (or something
+        // else) are still there, and claiming deletion would be false.
+        let d = root.join("dir.onnx");
+        std::fs::create_dir(&d).unwrap();
+        let err = remove_weights(&d).expect_err("a directory must refuse");
+        assert!(err.contains("could not delete"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn doctor_line_reports_a_recognition_selection() {
+        // The primary human diagnostic must not say "none" while a
+        // recognizer is selected: that is authentication policy, not a cue.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-docrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let line = doctor_line();
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            line.contains("buffalo enabled (recognition stage"),
+            "got: {line}"
         );
     }
 

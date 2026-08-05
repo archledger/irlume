@@ -1,0 +1,11 @@
+[farbench] 1415 images; embedding (YuNet→align→AuraFace)…
+[farbench]   948/1000 embedded (52 no-face)…
+[farbench] embedded 1341 faces (74 images had no detectable face)
+[impostor] pairs=898470  mean 0.044  p99 0.247  p99.9 0.347  p99.99 0.643  max 0.934
+[FAR sweep]
+  thr 0.40: FAR 0.000440  (1 in 2275)
+  thr 0.45: FAR 0.000293  (1 in 3416)
+  thr 0.50: FAR 0.000219  (1 in 4561)
+  thr 0.55: FAR 0.000174  (1 in 5759)
+  thr 0.60: FAR 0.000138  (1 in 7246)
+[FAR≤1e-4] threshold 0.645  (RGB auth threshold 0.50 → FAR 0.000219)

@@ -109,10 +109,11 @@ measured 2026-08-05 under the split-source threshold protocol
 ([full record](recognition-results/2026-08-05-buffalo-l.md)).
 
 - **Measured:** LFW EER 3.9% against the shipped recognizer's 4.2% on the
-  identical pipeline; demographic FAR spread 4.5x against 10x — but the
-  worst-served group shifts to Middle Eastern, which reads slightly worse than
-  under the shipped model. Live genuine floors 0.685 to 0.793 across two
-  cameras, anchored by shipped-model control runs.
+  identical pipeline. At the enabled 0.55 threshold the demographic FAR
+  spread is 3.9x against the shipped model's 6.1x, with the two worst groups
+  at parity — and the worst-served group shifts to Middle Eastern, which
+  reads slightly worse than under the shipped model. Live genuine floors
+  0.685 to 0.793 across two cameras, anchored by shipped-model control runs.
 - **Threshold:** 0.55. Worst demographic group's FAR there matches the shipped
   stack's worst group at its own operating point. 0.60 was rejected: its
   cross-lighting margin measured zero.

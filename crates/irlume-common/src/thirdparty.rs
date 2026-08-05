@@ -16,9 +16,12 @@
 //! A catalog entry is added only after the model is measured on real hardware
 //! against the published attack species (see docs/pad-results/). Every entry
 //! names its pipeline [`Stage`], and only an OPEN stage can be installed or
-//! wired; the one open stage today is PAD, whose entries the daemon wires as a
-//! DENY-ONLY cue: it may reject a presentation, it can never approve one the
-//! built-in gate rejected.
+//! wired. Two stages are open: PAD, whose entries the daemon wires as a
+//! DENY-ONLY cue (it may reject a presentation, never approve one the
+//! built-in gate rejected; measurements in docs/pad-results/), and
+//! RECOGNITION, whose entries replace the RGB matcher at their measured
+//! threshold with every IR matching path disabled (measurements in
+//! docs/recognition-results/).
 
 use std::path::{Path, PathBuf};
 
@@ -94,14 +97,15 @@ pub enum Stage {
     /// bad landmarks produce confident numbers from the wrong pixels rather
     /// than an error.
     Landmarks,
-    /// The recognizer/embedder. Not open, and gated harder than the wiring:
-    /// a recognition threshold is a false-accept rate over a population, which
-    /// one subject on two cameras cannot measure (#276 carries the protocol
-    /// question that must be answered first).
+    /// The recognizer/embedder. Open only for entries with a measured,
+    /// artifact-specific RGB threshold under the split-source protocol
+    /// (#276): population FAR from public datasets replayed through irlume's
+    /// own pipeline, live genuine floors on this project's cameras. A
+    /// third-party recognizer runs RGB-only; every IR matching path is
+    /// disabled because no entry carries IR-side measurements.
     Recognition,
-    /// Presentation-attack detection (liveness). The only open stage: entries
-    /// are wired as a DENY-ONLY cue, so the worst a bad model does is cost
-    /// retries or the password.
+    /// Presentation-attack detection (liveness). Open for deny-only cues, so
+    /// the worst a bad model does is cost retries or the password.
     Pad,
 }
 
@@ -234,10 +238,11 @@ ThirdPartyModel {
     // the floor sessions; do not lower it without re-running the FAR legs.
     threshold: 0.55,
     summary: "replacement RGB recognizer; measured 2026-08-05: LFW EER 3.9% vs \
-              shipped 4.2%, demographic spread 4.5x vs 10x but the worst-served \
-              group SHIFTS to Middle Eastern; RGB-only (IR matching, fusion and \
-              dark login disabled: unmeasured for this model) \
-              (docs/recognition-results/2026-08-05-buffalo-l.md)",
+              shipped 4.2%; at the 0.55 operating point the demographic spread \
+              is 3.9x vs the shipped 6.1x with worst-group FAR at parity, and \
+              the worst-served group SHIFTS to Middle Eastern; RGB-only (IR \
+              matching, fusion and dark login disabled: unmeasured for this \
+              model) (docs/recognition-results/2026-08-05-buffalo-l.md)",
 }];
 
 /// Highest P(fake) a genuine face was measured at during qualification

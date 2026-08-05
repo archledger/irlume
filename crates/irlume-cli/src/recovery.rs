@@ -33,14 +33,21 @@ fn status(user: &str) -> ExitCode {
             encrypted,
             recovery_set,
             tpm_present,
+            key_present,
         }) => {
             println!("[recovery] '{user}':");
             println!(
                 "  templates encrypted : {}",
-                if encrypted {
-                    "yes ✓ (template key sealed in the TPM)"
-                } else {
-                    "no (plaintext at rest)"
+                match (encrypted, key_present) {
+                    (true, true) => "yes ✓ (template key sealed in the TPM)",
+                    // The one state the old bool could not say. Naming it
+                    // matters more than any other line here: the templates are
+                    // safe from a stolen disk and unreadable by their owner, and
+                    // neither `recovery setup` nor a reseal brings them back.
+                    (true, false) =>
+                        "yes, but the TEMPLATE KEY IS GONE: this enrollment \
+                         cannot be opened. Re-enroll to use face login again.",
+                    (false, _) => "no (plaintext at rest)",
                 }
             );
             println!(

@@ -1906,9 +1906,13 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 return Some(Response::Error(format!("not authorized to query '{user}'")));
             }
             Response::RecoveryStatus {
-                encrypted: irlume_core::template_key::has_key(user),
+                // The store's own shape, not the key's presence: those differ
+                // exactly when the key is gone, and that case has to be
+                // reportable rather than collapsed into "plaintext".
+                encrypted: irlume_core::storage::store_is_encrypted(user).unwrap_or(false),
                 recovery_set: irlume_core::template_key::has_recovery(user),
                 tpm_present: irlume_core::template_key::tpm_available(),
+                key_present: irlume_core::template_key::has_key(user),
             }
         }
         Request::ListProfiles {

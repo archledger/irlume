@@ -94,6 +94,10 @@ pub const PACKAGED_ORT_PATHS: &[&str] = &[
     "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
 ];
 
+fn default_true() -> bool {
+    true
+}
+
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";
 
@@ -904,9 +908,16 @@ pub enum Response {
     /// (`RecoveryStatus`): whether templates are encrypted (a sealed key exists)
     /// and whether a recovery passphrase is set.
     RecoveryStatus {
+        /// Whether the STORE is encrypted at rest, from its own on-disk shape.
         encrypted: bool,
         recovery_set: bool,
         tpm_present: bool,
+        /// Whether the template key that opens an encrypted store still exists.
+        /// False with `encrypted` true means the enrollment cannot be opened by
+        /// anything, which no other field can express. Defaults to true so a
+        /// pre-0.9.0 daemon, which never sends it, does not read as key-missing.
+        #[serde(default = "default_true")]
+        key_present: bool,
     },
 }
 

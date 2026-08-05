@@ -612,6 +612,25 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
 }
 
+/// Whether the on-disk store for `user` is encrypted, or `None` when there is
+/// no store at all.
+///
+/// Read from the file's own `enc` envelope, NOT from whether a template key
+/// exists. Those two answers disagree in exactly one state, and it is the state
+/// the user most needs told about: an encrypted store whose key has been lost.
+/// Reporting that as "plaintext at rest" both understates the privacy posture
+/// and hides the data loss, and it points the user at `recovery setup` when the
+/// only remaining move is to re-enroll.
+pub fn store_is_encrypted(user: &str) -> Option<bool> {
+    let path = profile_path(user);
+    let data = fs::read(&path).ok()?;
+    Some(
+        serde_json::from_slice::<serde_json::Value>(&data)
+            .map(|v| v.get("enc").is_some())
+            .unwrap_or(false),
+    )
+}
+
 pub fn delete(user: &str) -> irlume_common::Result<bool> {
     let path = profile_path(user);
     let existed = path.exists();

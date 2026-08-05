@@ -791,6 +791,7 @@ impl LightState {
             encrypted,
             recovery_set,
             tpm_present,
+            key_present,
         }) = crate::daemon_poll(&Request::RecoveryStatus {
             user: user.to_string(),
         }) {

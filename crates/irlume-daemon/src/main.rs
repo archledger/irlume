@@ -2288,14 +2288,23 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             }
         }
-        Request::AddScan { user, profile } => {
+        Request::AddScan {
+            user,
+            profile,
+            scans,
+        } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to modify '{user}'"));
             }
-            match engine.add_scan(&user, &profile) {
-                Ok((scan, total)) => {
-                    Response::Ok(format!("added '{scan}' to '{profile}' ({total} scans)"))
-                }
+            match engine.add_scan(&user, &profile, scans.unwrap_or(1)) {
+                Ok((added, total)) => Response::Ok(format!(
+                    "added {} to '{profile}' ({total} scans for the loaded recognizer)",
+                    added
+                        .iter()
+                        .map(|s| format!("'{s}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -3495,6 +3504,7 @@ mod tests {
             Request::AddScan {
                 user: u(),
                 profile: "p".into(),
+                scans: None,
             },
             Request::SetRequireEyesOpen {
                 user: u(),
@@ -3909,6 +3919,7 @@ mod tests {
             Request::AddScan {
                 user: u(),
                 profile: "p".into(),
+                scans: None,
             },
             Request::DeleteProfile {
                 user: u(),
@@ -5413,6 +5424,7 @@ mod tests {
             Request::AddScan {
                 user: "ghost".into(),
                 profile: "Face Profile 1".into(),
+                scans: None,
             },
             &peer(0),
             &mut e,
@@ -5429,6 +5441,7 @@ mod tests {
             Request::AddScan {
                 user: "carol".into(),
                 profile: "Face Profile 1".into(),
+                scans: None,
             },
             &peer(0),
             &mut e,

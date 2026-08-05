@@ -5645,6 +5645,7 @@ fn enroll_worker(
                 Request::AddScan {
                     user: user.clone(),
                     profile: profile.clone(),
+                    scans: None,
                 }
             };
             match crate::daemon_request(&req) {

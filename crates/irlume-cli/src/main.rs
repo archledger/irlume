@@ -323,10 +323,22 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
-                eprintln!("[profiles] adding a scan to '{p}'; stay in frame…");
+                let scans = flag(args, "--scans").and_then(|s| s.parse::<usize>().ok());
+                match scans {
+                    Some(n) if n > 1 => eprintln!(
+                        "[profiles] adding {n} scans to '{p}'; stay in frame, vary your pose slightly…"
+                    ),
+                    _ => eprintln!("[profiles] adding a scan to '{p}'; stay in frame…"),
+                }
+                eprintln!(
+                    "[profiles] scans are recorded for the recognizer the daemon has loaded; \
+                     this is also how a profile gains templates for a second model without \
+                     re-enrolling as a new person."
+                );
                 Request::AddScan {
                     user,
                     profile: p.into(),
+                    scans,
                 }
             }
             None => return usage_profiles(),
@@ -881,7 +893,8 @@ fn usage_profiles() -> std::process::ExitCode {
     eprintln!(
         "usage: irlume profiles [--user U] <subcommand>\n  \
         (no sub) | list                         list profiles + scans\n  \
-        add-scan --profile P                    add a scan to P (improve recognition)\n  \
+        add-scan --profile P [--scans N]         add scans to P (improve recognition, or\n  \
+                                                add templates for a second model)\n  \
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
         eyes-open <on|off>                      require eyes open to unlock\n  \

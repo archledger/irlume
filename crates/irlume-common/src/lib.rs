@@ -366,7 +366,14 @@ pub enum Request {
     /// "root or self", which never matched the dispatch gate.)
     SetCameras { rgb: String, ir: String },
     /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
-    AddScan { user: String, profile: String },
+    AddScan {
+        user: String,
+        profile: String,
+        /// How many scans to capture. Absent (an older CLI) means one, the
+        /// behaviour this request always had.
+        #[serde(default)]
+        scans: Option<usize>,
+    },
     /// List enrolled profiles + their scans for `user`.
     ListProfiles {
         user: String,

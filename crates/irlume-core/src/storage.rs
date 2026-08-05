@@ -114,6 +114,21 @@ pub struct FaceProfile {
 }
 
 impl FaceProfile {
+    /// How many of this profile's scans belong to `space`.
+    ///
+    /// The scan limit is counted per recognizer, not per profile, because the
+    /// limit exists to bound false-accept inflation from taking the best of N
+    /// templates, and a comparison only ever ranges over one embedding space
+    /// (#288). Ten scans under each of two recognizers is two independent
+    /// best-of-ten operations, and a profile full of one model's scans must
+    /// still be able to hold another's.
+    pub fn scans_in(&self, space: &str) -> usize {
+        self.scans
+            .iter()
+            .filter(|s| recognizer_space_matches(s.embed_space.as_deref(), space))
+            .count()
+    }
+
     /// This profile's calibration for `space`, or `None`.
     ///
     /// Falls back to the legacy single slot for the shipped recognizer, so a
@@ -719,6 +734,32 @@ mod tests {
         // A recognizer nothing was enrolled under gets NO templates: matching
         // must come up empty rather than score across spaces.
         assert!(enr.rgb_scans_in("embed:cccccccccccc").is_empty());
+    }
+
+    #[test]
+    fn scans_are_counted_per_recognizer() {
+        // #288: the scan limit bounds best-of-N false-accept inflation, and a
+        // comparison only ranges over one space, so a profile full of one
+        // model's scans must still be able to hold another's.
+        let p = FaceProfile {
+            name: "p".into(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+            scans: vec![
+                scan("a", 1.0, Some("embed:model-a")),
+                scan("b", 2.0, Some("embed:model-a")),
+                scan("c", 3.0, Some("embed:model-b")),
+                scan("legacy", 4.0, None),
+            ],
+        };
+        assert_eq!(p.scans_in("embed:model-a"), 2);
+        assert_eq!(p.scans_in("embed:model-b"), 1);
+        // Untagged scans belong to the shipped recognizer, the same rule
+        // matching applies, so they count there and nowhere else.
+        assert_eq!(p.scans_in(LEGACY_RECOGNIZER_SPACE), 1);
+        assert_eq!(p.scans_in("embed:model-c"), 0);
+        // And the total is not the per-recognizer count.
+        assert_eq!(p.scans.len(), 4);
     }
 
     #[test]

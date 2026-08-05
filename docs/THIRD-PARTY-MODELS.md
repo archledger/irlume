@@ -24,14 +24,27 @@ Two things follow from that, and they are the reason this page exists:
 ## Pipeline stages open one at a time
 
 Every catalog entry names the pipeline stage it plugs into, and only an open
-stage can be installed or wired. Liveness (PAD) is the only open stage,
-because its wiring is deny-only: a bad model there can cost retries or the
-password, never grant. The other stages are named but closed, for reasons
-issue #276 carries in full: a bad recognizer authenticates strangers while
-the legitimate user's logins keep working, so nothing surfaces the problem,
-and a recognition threshold is a false-accept rate over a population that
-this project's one-subject hardware cannot measure. `irlume models` refuses
-to install an entry for a closed stage, and the daemon refuses to wire one.
+stage can be installed or wired. Two stages are open:
+
+- **Liveness (PAD)**, opened first because its wiring is deny-only: a bad
+  model there can cost retries or the password, never grant.
+- **Recognition**, opened 2026-08-05 under the split-source threshold
+  protocol recorded on issue #276: the false-accept side measured on public
+  datasets replayed through irlume's own pipeline, the false-reject side on
+  this project's cameras, the threshold set from where those populations were
+  observed. A third-party recognizer runs RGB matching only — IR matching,
+  fusion, and dark login are disabled because no entry carries IR-side
+  measurements — and templates enrolled under a different recognizer never
+  match (each is tagged with the digest of the weights that produced it), so
+  enabling one means re-enrolling. If the daemon cannot honour an enabled
+  recognizer selection (missing file, failed pin), it refuses to start and
+  logins fall back to the password; it never silently substitutes another
+  recognizer.
+
+Detection and landmarks are named but closed: bad landmarks feed confident
+wrong numbers into the liveness cues rather than erroring. `irlume models`
+refuses to install an entry for a closed stage, and the daemon refuses to
+wire one.
 
 `irlume doctor` shows what every stage is running today, and
 `irlume models list --json` is the machine-readable version
@@ -83,17 +96,39 @@ sudo irlume models enable flir
 
 ### Bring-your-own entries
 
-None yet. When a model whose licence prevents irlume from fetching it has been
-measured, it appears here with its pin, its threshold and its `pad-results`
-document, and is installed with:
+A bring-your-own model is one whose licence makes obtaining the file your
+decision, not irlume's. It is measured and pinned exactly like a fetched one;
+irlume verifies your file against the published sha256 before enabling it, and
+a non-matching file is refused: that file is not the artifact the threshold was
+measured on.
+
+### `buffalo` — you supply the file (recognition stage)
+
+The InsightFace `buffalo_l` recognizer (`w600k_r50.onnx`, WebFace600K-trained),
+measured 2026-08-05 under the split-source threshold protocol
+([full record](recognition-results/2026-08-05-buffalo-l.md)).
+
+- **Measured:** LFW EER 3.9% against the shipped recognizer's 4.2% on the
+  identical pipeline; demographic FAR spread 4.5x against 10x — but the
+  worst-served group shifts to Middle Eastern, which reads slightly worse than
+  under the shipped model. Live genuine floors 0.685 to 0.793 across two
+  cameras, anchored by shipped-model control runs.
+- **Threshold:** 0.55. Worst demographic group's FAR there matches the shipped
+  stack's worst group at its own operating point. 0.60 was rejected: its
+  cross-lighting margin measured zero.
+- **What enabling it does:** replaces the recognizer for RGB matching. IR
+  matching, fusion, and dark login are disabled (unmeasured for this model),
+  and templates enrolled under the shipped recognizer will not match —
+  re-enroll after enabling, and again after disabling.
+- **Provenance:** WebFace600K is scraped web imagery without subject consent,
+  and the licence is non-commercial research only. Both fail ADR-0001 for
+  shipping, which is why this entry is bring-your-own.
 
 ```sh
-sudo irlume models add <name> /path/to/weights.onnx
+# extract w600k_r50.onnx from the publisher's official buffalo_l.zip
+# (github.com/deepinsight/insightface, release v0.7), then:
+sudo irlume models add buffalo /path/to/w600k_r50.onnx
 ```
-
-irlume verifies your file against the published sha256 before enabling it. If it
-does not match, it is refused: that file is not the artifact the threshold was
-measured on.
 
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.

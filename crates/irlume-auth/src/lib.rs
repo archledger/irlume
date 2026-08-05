@@ -4562,7 +4562,15 @@ mod tests {
 #[cfg(test)]
 mod thirdparty_cue_tests {
     use super::{thirdparty_abstains, thirdparty_downgrades};
-    use irlume_common::thirdparty::{CATALOG, MEASURED_GENUINE_CEILING};
+    use irlume_common::thirdparty::{Stage, CATALOG, MEASURED_GENUINE_CEILING};
+
+    /// The PAD entries only: these invariants are about P(fake) scores, and a
+    /// recognition entry's threshold is a cosine in a different unit entirely.
+    /// Sweeping the whole catalog here silently asserted PAD semantics onto
+    /// the first recognition entry.
+    fn pad_entries() -> impl Iterator<Item = &'static irlume_common::thirdparty::ThirdPartyModel> {
+        CATALOG.iter().filter(|m| m.stage == Stage::Pad)
+    }
     use irlume_liveness::Verdict;
 
     #[test]
@@ -4579,7 +4587,9 @@ mod thirdparty_cue_tests {
         // the vinyl-print attack at 0.998-1.0000. A threshold inside that empty
         // band denies on scores neither class was ever observed at, which is how
         // a live face lost its keyring at 0.702 on 2026-07-27.
-        for m in CATALOG {
+        let mut seen = 0;
+        for m in pad_entries() {
+            seen += 1;
             assert!(
                 m.threshold > MEASURED_GENUINE_CEILING,
                 "{}: threshold {} is at or below the measured genuine ceiling {}",
@@ -4594,6 +4604,7 @@ mod thirdparty_cue_tests {
                 m.threshold
             );
         }
+        assert!(seen > 0, "no PAD entries swept; the loop proved nothing");
     }
 
     #[test]
@@ -4604,7 +4615,9 @@ mod thirdparty_cue_tests {
         // so raising this threshold for a feeling of safety would drop a real
         // detection. The window is 0.702 (highest genuine) to 0.941.
         const MEASURED_ATTACK_FLOOR: f32 = 0.941;
-        for m in CATALOG {
+        let mut seen = 0;
+        for m in pad_entries() {
+            seen += 1;
             assert!(
                 m.threshold < MEASURED_ATTACK_FLOOR,
                 "{}: threshold {} is at or above the lowest score a real attack \
@@ -4613,6 +4626,7 @@ mod thirdparty_cue_tests {
                 m.threshold
             );
         }
+        assert!(seen > 0, "no PAD entries swept; the loop proved nothing");
     }
 
     #[test]

@@ -1991,7 +1991,7 @@ fn models_list_data() -> Value {
                 "candidate": candidate,
             });
             if s.open {
-                stage["third_party"] = third_party_data();
+                stage["third_party"] = third_party_data(s.stage_kind);
             }
             stage
         })
@@ -2009,17 +2009,23 @@ fn models_list_data() -> Value {
 /// FAILED (EACCES on the root-only file for an unprivileged caller, a wrong
 /// SELinux label even for root) established nothing, so `known: false`; a
 /// consumer must not render that as "disabled".
-fn third_party_data() -> Value {
+fn third_party_data(stage: irlume_common::thirdparty::Stage) -> Value {
     use irlume_common::config::KvObservation;
     use irlume_common::thirdparty::{self, WeightState};
-    let enabled = match irlume_common::config::observe_kv("settings.conf", thirdparty::SETTINGS_KEY)
-    {
+    // THIS stage's key and THIS stage's catalog entries: with two stages
+    // open, the pad object naming a recognizer (or listing its entries)
+    // would make "what is enabled where" unanswerable from the payload.
+    let enabled = match irlume_common::config::observe_kv(
+        "settings.conf",
+        thirdparty::settings_key_for(stage),
+    ) {
         KvObservation::Value(name) => json!({ "known": true, "name": name }),
         KvObservation::Absent => json!({ "known": true, "name": null }),
         KvObservation::Unknown(_) => json!({ "known": false }),
     };
     let catalog = thirdparty::CATALOG
         .iter()
+        .filter(|m| m.stage == stage)
         .map(|m| {
             json!({
                 "name": m.name,
@@ -2223,6 +2229,21 @@ mod tests {
                 "fetched" | "user-supplied"
             ));
         }
+        // Each open stage's third_party lists ONLY its own entries: pad's
+        // object naming a recognizer would make "what is enabled where"
+        // unanswerable from the payload.
+        let names = |st: &serde_json::Value| {
+            st["third_party"]["catalog"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["stage"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(pad).iter().all(|s| s == "pad"));
+        let recognition = &stages[2];
+        let rec_names = names(recognition);
+        assert!(!rec_names.is_empty() && rec_names.iter().all(|s| s == "recognition"));
     }
 
     #[test]
@@ -2248,15 +2269,21 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
 
         // No settings.conf at all: observed absence.
-        let absent = third_party_data();
-        // A readable enabled key.
-        std::fs::write(cfg.join("settings.conf"), "third_party_pad=flir\n").unwrap();
-        let named = third_party_data();
+        let absent = third_party_data(irlume_common::thirdparty::Stage::Pad);
+        // A readable enabled key — and the OTHER stage's key alongside it, so
+        // the per-stage read is proven to consult its own key, not the pad one.
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_pad=flir\nthird_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let named = third_party_data(irlume_common::thirdparty::Stage::Pad);
+        let named_rec = third_party_data(irlume_common::thirdparty::Stage::Recognition);
         // A failing read: the config dir is a regular file.
         let notdir = root.join("not-a-dir");
         std::fs::write(&notdir, b"not a directory").unwrap();
         std::env::set_var("IRLUME_CONFIG_DIR", &notdir);
-        let unreadable = third_party_data();
+        let unreadable = third_party_data(irlume_common::thirdparty::Stage::Pad);
 
         match old_cfg {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
@@ -2266,6 +2293,11 @@ mod tests {
 
         assert_eq!(absent["enabled"], json!({"known": true, "name": null}));
         assert_eq!(named["enabled"], json!({"known": true, "name": "flir"}));
+        assert_eq!(
+            named_rec["enabled"],
+            json!({"known": true, "name": "buffalo"}),
+            "the recognition stage must read its own key"
+        );
         assert_eq!(
             unreadable["enabled"],
             json!({"known": false}),

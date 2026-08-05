@@ -1748,7 +1748,7 @@ SYSTEM INTEGRATION
                         camera picker runs this for you)
   camera-tune [--rounds N]        measure whether this camera can stream RGB and
                         IR at once without dimming, and store the answer (sudo)
-  models [enable|disable]         opt-in third-party liveness models: measured,
+  models [enable|disable]         opt-in third-party models (liveness cue, replacement recognizer): measured,
                         checksum-pinned, deny-only; fetched, never shipped
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)

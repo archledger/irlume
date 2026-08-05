@@ -224,7 +224,7 @@ enum Suspend {
     /// friction is the point of the models policy, so the TUI hosts it in the
     /// cooked terminal instead of bypassing it.
     ModelsEnable(String),
-    ModelsDisable,
+    ModelsDisable(String),
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
@@ -2416,12 +2416,12 @@ impl App {
                 &["irlume", "fingerprint", "reset"],
             ),
             Suspend::ModelsEnable(name) => self.sudo_step(
-                "enable a third-party liveness model (license confirm follows)",
+                "enable a third-party model (license confirm follows)",
                 &["irlume", "models", "enable", &name],
             ),
-            Suspend::ModelsDisable => self.sudo_step(
+            Suspend::ModelsDisable(name) => self.sudo_step(
                 "disable the third-party model",
-                &["irlume", "models", "disable"],
+                &["irlume", "models", "disable", &name],
             ),
             Suspend::Update => {
                 crate::commands::update(&none);
@@ -3137,28 +3137,52 @@ impl App {
             // confirm in the cooked terminal: that friction is the policy,
             // the TUI hosts it rather than bypassing it.
             (SC_SETTINGS, KeyCode::Char('m')) => {
-                use irlume_common::thirdparty::{weight_state, WeightState, CATALOG};
-                let installed = CATALOG
+                use irlume_common::thirdparty::{weight_state, Stage, WeightState, CATALOG};
+                let installed: Vec<_> = CATALOG
                     .iter()
-                    .find(|m| matches!(weight_state(m), WeightState::ChecksumOk));
-                match installed {
-                    Some(m) => {
+                    .filter(|m| matches!(weight_state(m), WeightState::ChecksumOk))
+                    .collect();
+                match installed.as_slice() {
+                    // Exactly one installed model: the toggle is unambiguous.
+                    [m] => {
                         self.confirm = Some((
                             format!(
-                                "Disable third-party model '{}'? (its weights are deleted)",
+                                "Disable third-party {} model '{}'? (its weights are deleted)",
+                                m.stage.as_str(),
                                 m.name
                             ),
                             "Disable",
-                            ConfirmAct::Sus(Suspend::ModelsDisable),
+                            ConfirmAct::Sus(Suspend::ModelsDisable(m.name.to_string())),
                         ));
                     }
-                    None => match CATALOG.first() {
-                        Some(m) => {
-                            self.log('→', format!("sudo irlume models enable {}: the license + provenance confirm runs in the terminal", m.name));
-                            self.suspend = Some(Suspend::ModelsEnable(m.name.to_string()));
+                    // Several installed (different stages): a single toggle
+                    // key must not guess which authentication policy to
+                    // remove; name them and point at the explicit command.
+                    [_, ..] => {
+                        for m in &installed {
+                            self.log(
+                                '·',
+                                format!(
+                                    "installed: {} ({} stage) — disable with: sudo irlume models disable {}",
+                                    m.name,
+                                    m.stage.as_str(),
+                                    m.name
+                                ),
+                            );
                         }
-                        None => self.log('·', "no third-party models in the catalog"),
-                    },
+                    }
+                    [] => {
+                        // Nothing installed: offer the PAD recommendation, the
+                        // same one doctor makes (the built-in gate does not
+                        // stop a print).
+                        match CATALOG.iter().find(|m| m.stage == Stage::Pad) {
+                            Some(m) => {
+                                self.log('→', format!("sudo irlume models enable {}: the license + provenance confirm runs in the terminal", m.name));
+                                self.suspend = Some(Suspend::ModelsEnable(m.name.to_string()));
+                            }
+                            None => self.log('·', "no third-party models in the catalog"),
+                        }
+                    }
                 }
             }
             // Daemon debug logging toggle; deny scores land in the journal

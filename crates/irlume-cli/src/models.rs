@@ -579,8 +579,9 @@ fn stdin_is_tty() -> bool {
 /// Condensed third-party-model state for a TUI status row, so it can show a
 /// ●/○ icon like the other Settings sections instead of a bare text blob.
 pub(crate) enum TuiState {
-    /// A catalog model is enabled in settings.conf; carries its name and the
-    /// weight health (checksum ok / mismatch).
+    /// One or more catalog models are enabled in settings.conf; carries a
+    /// display name (joined when several stages are enabled at once) and the
+    /// weight health per entry (checksum ok / mismatch).
     Enabled { name: String, detail: String },
     /// Weights are installed but the enabled flag is root-only and we are not
     /// root, so we can report presence but not the on/off state.
@@ -590,12 +591,38 @@ pub(crate) enum TuiState {
 }
 
 pub(crate) fn tui_state() -> TuiState {
-    if let Some(name) = enabled_name() {
-        let detail = match thirdparty::by_name(&name) {
-            Some(m) => format!("deny-only cue · {}", file_state(m)),
-            None => "set in settings.conf but NOT in the catalog (daemon ignores it)".into(),
-        };
+    // Every enabled stage, not just PAD: a recognizer selection is
+    // authentication policy, and a settings row reading "none" while one is
+    // enabled would be the TUI lying about it (#280 follow-up).
+    let enabled = enabled_entries();
+    if !enabled.is_empty() {
+        let name = enabled
+            .iter()
+            .map(|(m, _)| m.name)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let detail = enabled
+            .iter()
+            .map(|(m, _)| format!("{} stage · {}", m.stage.as_str(), file_state(m)))
+            .collect::<Vec<_>>()
+            .join(" · ");
         return TuiState::Enabled { name, detail };
+    }
+    // An enabled name that is not in the catalog (daemon ignores it) still
+    // deserves the Enabled row so the mismatch is visible.
+    for key in [
+        thirdparty::SETTINGS_KEY,
+        thirdparty::RECOGNIZER_SETTINGS_KEY,
+    ] {
+        if let Some(name) = enabled_name_for(key) {
+            if thirdparty::by_name(&name).is_none() {
+                return TuiState::Enabled {
+                    name,
+                    detail: "set in settings.conf but NOT in the catalog (daemon ignores it)"
+                        .into(),
+                };
+            }
+        }
     }
     if !is_root() {
         if let Some(m) = thirdparty::CATALOG
@@ -1048,6 +1075,65 @@ mod tests {
         assert!(got.contains(&("flir", thirdparty::SETTINGS_KEY)));
         assert!(got.contains(&("buffalo", thirdparty::RECOGNIZER_SETTINGS_KEY)));
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn tui_state_reports_every_enabled_stage() {
+        // The settings row must not read "none" (or PAD-only) while a
+        // recognizer is enabled: that is authentication policy on display.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("irlume-tuist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let rec_only = tui_state();
+        std::fs::write(
+            cfg.join("settings.conf"),
+            "third_party_pad=flir\nthird_party_recognizer=buffalo\n",
+        )
+        .unwrap();
+        let both = tui_state();
+
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        match rec_only {
+            TuiState::Enabled { name, detail } => {
+                assert_eq!(name, "buffalo");
+                assert!(detail.contains("recognition stage"), "got: {detail}");
+            }
+            _ => panic!("a recognizer-only selection must show as Enabled"),
+        }
+        match both {
+            TuiState::Enabled { name, detail } => {
+                assert_eq!(name, "flir + buffalo");
+                assert!(
+                    detail.contains("pad stage") && detail.contains("recognition stage"),
+                    "got: {detail}"
+                );
+            }
+            _ => panic!("two enabled stages must both show"),
+        }
     }
 
     #[test]

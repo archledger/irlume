@@ -572,6 +572,25 @@ fn ir_selection_available(ir_exists: bool, forced_off: bool) -> bool {
     ir_exists && !forced_off
 }
 
+/// Should a top-level Uncertain verdict deny before either matching path?
+///
+/// Yes for every Uncertain EXCEPT the dark-login shape: no RGB embedding
+/// while an IR embedding exists. The cross-spectrum gate cannot say Live
+/// without an RGB face, so that shape always arrives as Uncertain, and
+/// short-circuiting it made the dark IR-only path unreachable in the exact
+/// condition it exists for (#284; observed live 2026-08-05: rgb faces=0, ir
+/// faces=1 at 0.92, emitter lit, denied "no face in RGB"). The dark branch
+/// re-derives its own verdict via evaluate_ir_only, so nothing is granted on
+/// the strength of the Uncertain that fell through.
+fn uncertain_short_circuits(
+    verdict: Verdict,
+    has_rgb_embedding: bool,
+    has_ir_embedding: bool,
+) -> bool {
+    let dark_login_shape = has_ir_embedding && !has_rgb_embedding;
+    verdict == Verdict::Uncertain && !dark_login_shape
+}
+
 /// Highest-scoring detection: the face every pipeline stage keys on when a
 /// frame holds more than one.
 fn top_detection(faces: &[Detection]) -> Option<&Detection> {
@@ -2110,7 +2129,18 @@ impl Engine {
         // refusal into a terminal one for anybody with require_eyes_open on
         // (#238 review). Uncertain is the only verdict this promotes; a Spoof
         // still reaches its own branch below with its own reason.
-        if a.verdict == Verdict::Uncertain {
+        //
+        // ONE Uncertain shape falls through (#284): no RGB face while an IR
+        // face exists. The cross-spectrum gate reports Uncertain there because
+        // it needs both spectra, but that situation is exactly the dark
+        // IR-only path's entry condition, and #238's blanket early return made
+        // Windows-Hello-style dark login unreachable in the condition it was
+        // written for. Falling through loses no gating: the RGB branch is
+        // skipped (no embedding), and the dark branch derives its own verdict
+        // via evaluate_ir_only, which shares the exposure refusal, so an
+        // unreadable IR frame in the dark is still refused there — with the
+        // dark path's own retryability kinds.
+        if uncertain_short_circuits(a.verdict, a.embedding.is_some(), a.ir_embedding.is_some()) {
             return Ok(Outcome::deny(
                 liveness_deny_kind(a.verdict, &a.reason),
                 format!("liveness {:?}: {}", a.verdict, a.reason),
@@ -3723,6 +3753,25 @@ mod tests {
             false,
         );
         assert_retryable(&Outcome::grant(0.9, "match: p (rgb)"), false);
+    }
+
+    #[test]
+    fn uncertain_short_circuit_spares_only_the_dark_login_shape() {
+        use irlume_liveness::Verdict;
+        // Every Uncertain shape short-circuits (deny before the matching
+        // paths, presence-retryable) EXCEPT no-RGB-face-with-IR-face, which
+        // is dark login's entry condition (#284):
+        // RGB face present (blown/unreadable frame, the #238 case): deny.
+        assert!(uncertain_short_circuits(Verdict::Uncertain, true, true));
+        assert!(uncertain_short_circuits(Verdict::Uncertain, true, false));
+        // No face in either spectrum: deny ("present your face").
+        assert!(uncertain_short_circuits(Verdict::Uncertain, false, false));
+        // The dark-login shape falls through to the dark branch, which
+        // derives its own verdict via evaluate_ir_only.
+        assert!(!uncertain_short_circuits(Verdict::Uncertain, false, true));
+        // Non-Uncertain verdicts never take this path at all.
+        assert!(!uncertain_short_circuits(Verdict::Live, false, true));
+        assert!(!uncertain_short_circuits(Verdict::Spoof, true, true));
     }
 
     #[test]

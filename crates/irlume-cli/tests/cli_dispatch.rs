@@ -725,7 +725,10 @@ fn unexpected_responses_for_keyring_and_recovery_writes() {
         (&["keyring", "forget", "--user", "tester"], ""),
         // Must clear the 12-character floor, or the CLI refuses it before the
         // daemon is asked and this case stops testing the response handling.
-        (&["recovery", "setup", "--user", "tester"], "correct horse battery\n"),
+        (
+            &["recovery", "setup", "--user", "tester"],
+            "correct horse battery\n",
+        ),
         (&["recovery", "restore", "--user", "tester"], "pass\n"),
         (&["recovery", "forget", "--user", "tester"], ""),
     ];

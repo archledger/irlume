@@ -21,17 +21,19 @@
 //! so the checked buffer and the loaded buffer can never diverge (the same
 //! one-buffer rule as `Engine::load_with_recognizer_bytes`).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use edgefirst_tflite::{Delegate, Interpreter, Library, Model};
+use edgefirst_tflite::{Delegate, Interpreter, Library, Model, TensorType};
 
 /// Explicit runtime override for the TFLite C library path.
 pub const TFLITE_LIB_ENV: &str = "IRLUME_TFLITE_LIB";
 
-/// Packaged/system locations probed in order when the env override is
-/// absent. First the bundled copy (every packaging lane installs it here,
-/// like the bundled onnxruntime), then the distro-conventional locations.
+/// Locations probed in order when the env override is absent. First the
+/// path where irlume's packages WILL install the bundled copy once the
+/// #295 packaging lane lands (none does yet), then the distro-conventional
+/// locations an operator might install a system copy to.
 pub const PACKAGED_TFLITE_LIBS: &[&str] = &[
     "/usr/share/irlume/tflite/libtensorflowlite_c.so",
     "/usr/lib64/libtensorflowlite_c.so",
@@ -43,17 +45,52 @@ pub const PACKAGED_TFLITE_LIBS: &[&str] = &[
 /// surface needs to say so usefully.
 #[derive(Debug, thiserror::Error)]
 pub enum TfliteUnavailable {
+    /// The override was set to something this module refuses to hand to the
+    /// dynamic loader. Distinct from a load failure: the fix is the value,
+    /// not the library.
+    #[error("IRLUME_TFLITE_LIB={path:?}: {reason}")]
+    OverrideInvalid { path: PathBuf, reason: String },
     /// The explicit override was set but did not load. Named separately
     /// because the fix ("your IRLUME_TFLITE_LIB points at a bad library")
     /// differs from "install the runtime".
-    #[error("IRLUME_TFLITE_LIB={path}: {source}")]
+    #[error("IRLUME_TFLITE_LIB={path:?}: {source}")]
     OverrideFailed {
-        path: String,
+        path: PathBuf,
         source: edgefirst_tflite::Error,
     },
-    /// No override, and no candidate path held a loadable library.
-    #[error("no TFLite runtime: none of {tried:?} loaded (install the irlume tflite runtime package, or set IRLUME_TFLITE_LIB)")]
-    NotFound { tried: Vec<PathBuf> },
+    /// No override, and no packaged candidate loaded. Each attempt keeps its
+    /// own cause: "does not exist" and "exists but failed to load" send an
+    /// operator to different fixes, and collapsing them cost exactly that
+    /// distinction in the first cut (#296 review).
+    #[error("no TFLite runtime: attempts: {attempts:?} (install the irlume tflite runtime package, or set IRLUME_TFLITE_LIB)")]
+    NotFound { attempts: Vec<(PathBuf, String)> },
+}
+
+/// Is the override effectively unset? Whitespace-only counts as unset (the
+/// ort resolver's rule for ORT_DYLIB_PATH=""), but a NON-UTF-8 value does
+/// not: `env::var().ok()` would collapse it to "unset" and fall through to
+/// a packaged library even though the operator set an override (#296
+/// review), so the value is inspected losslessly.
+fn override_is_unset(value: &OsStr) -> bool {
+    value.to_string_lossy().trim().is_empty()
+}
+
+/// The override as a path the dynamic loader will treat as a FILE.
+///
+/// A value without a slash is not a filename to dlopen(3), it is a search
+/// request through LD_LIBRARY_PATH and the loader cache, which is exactly
+/// the "library the daemon did not choose" this module exists to refuse.
+/// Requiring an absolute path closes that reading entirely.
+fn explicit_library_path(value: &OsStr) -> Result<PathBuf, TfliteUnavailable> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(TfliteUnavailable::OverrideInvalid {
+            path,
+            reason: "must be an absolute path (a bare name would be a dynamic-loader search)"
+                .into(),
+        });
+    }
+    Ok(path)
 }
 
 /// The candidate paths the resolver will try, in order, as a VALUE: the
@@ -88,27 +125,30 @@ pub fn tflite_runtime() -> Result<&'static Library, TfliteUnavailable> {
     if let Some(lib) = LIB.get() {
         return Ok(lib);
     }
-    let env = std::env::var(TFLITE_LIB_ENV).ok();
-    if let Some(path) = env.as_deref().filter(|p| !p.trim().is_empty()) {
-        let lib = Library::from_path(path).map_err(|source| TfliteUnavailable::OverrideFailed {
-            path: path.into(),
-            source,
-        })?;
-        return Ok(LIB.get_or_init(|| lib));
-    }
-    let tried = tflite_lib_candidates(None, |p| p.exists());
-    for p in &tried {
-        if let Ok(lib) = Library::from_path(p) {
+    if let Some(value) = std::env::var_os(TFLITE_LIB_ENV) {
+        if !override_is_unset(&value) {
+            let path = explicit_library_path(&value)?;
+            let lib =
+                Library::from_path(&path).map_err(|source| TfliteUnavailable::OverrideFailed {
+                    path: path.clone(),
+                    source,
+                })?;
             return Ok(LIB.get_or_init(|| lib));
         }
     }
-    Err(TfliteUnavailable::NotFound {
-        tried: if tried.is_empty() {
-            PACKAGED_TFLITE_LIBS.iter().map(PathBuf::from).collect()
-        } else {
-            tried
-        },
-    })
+    let mut attempts = Vec::new();
+    for raw in PACKAGED_TFLITE_LIBS {
+        let path = PathBuf::from(raw);
+        if !path.exists() {
+            attempts.push((path, "does not exist".into()));
+            continue;
+        }
+        match Library::from_path(&path) {
+            Ok(lib) => return Ok(LIB.get_or_init(|| lib)),
+            Err(e) => attempts.push((path, e.to_string())),
+        }
+    }
+    Err(TfliteUnavailable::NotFound { attempts })
 }
 
 /// One loaded, allocation-ready `.tflite` model with a single input tensor.
@@ -131,14 +171,29 @@ pub struct TfliteSession {
 }
 
 impl TfliteSession {
-    /// Build a session from model BYTES the caller has already verified
-    /// against a pin. Takes bytes, not a path, so the digest that was
-    /// checked and the model that runs are the same buffer.
+    /// Build a session from model bytes, verifying them against
+    /// `expected_sha256` HERE, before anything parses them. The pin is
+    /// enforced at this boundary rather than trusted to callers, because a
+    /// constructor named "pinned" that does not check is a promise only its
+    /// call sites keep (#296 review), and one forgetful stage-2 caller
+    /// would run an unverified model. Same one-buffer rule as
+    /// `Engine::load_with_recognizer_bytes`: the digest and the loaded
+    /// model can never diverge because they are the same bytes.
     ///
     /// `threads` caps CPU threads for the interpreter; XNNPACK is applied
     /// explicitly (the C API does not auto-apply it), so inference speed
     /// does not depend on how the shared library was built.
-    pub fn from_pinned_bytes(bytes: &[u8], threads: i32) -> irlume_common::Result<Self> {
+    pub fn from_pinned_bytes(
+        bytes: &[u8],
+        expected_sha256: &str,
+        threads: i32,
+    ) -> irlume_common::Result<Self> {
+        let actual = irlume_common::thirdparty::sha256_hex(bytes);
+        if actual != expected_sha256 {
+            return Err(err_str(format!(
+                "model sha256 mismatch: expected {expected_sha256}, got {actual}"
+            )));
+        }
         let lib = tflite_runtime().map_err(err)?;
         let model = Model::from_bytes(lib, bytes.to_vec()).map_err(err)?;
         let xnnpack = Delegate::xnnpack(lib, threads).map_err(err)?;
@@ -155,12 +210,28 @@ impl TfliteSession {
         })
     }
 
-    /// Shape of the single input tensor.
+    /// Shape of the single Float32 input tensor.
+    ///
+    /// Exactly one input, and it must be Float32: the crate's typed slice
+    /// views check only that `T` FITS the buffer, so an f32 view of an
+    /// Int64 tensor would silently write half of each element and read
+    /// garbage as numbers (#296 review). A model with a different contract
+    /// is refused by name, not reinterpreted.
     pub fn input_shape(&self) -> irlume_common::Result<Vec<usize>> {
         let inputs = self.interp.inputs().map_err(err)?;
-        let t = inputs
-            .first()
-            .ok_or_else(|| err_str("model has no input tensor"))?;
+        if inputs.len() != 1 {
+            return Err(err_str(format!(
+                "model has {} inputs; exactly one is required",
+                inputs.len()
+            )));
+        }
+        let t = &inputs[0];
+        if t.tensor_type() != TensorType::Float32 {
+            return Err(err_str(format!(
+                "input tensor must be Float32, got {:?}",
+                t.tensor_type()
+            )));
+        }
         t.shape().map_err(err)
     }
 
@@ -168,6 +239,10 @@ impl TfliteSession {
     /// as `(shape, data)`. The input length must match the input shape's
     /// element count; refusing here beats a silent partial write.
     pub fn run_f32(&mut self, input: &[f32]) -> irlume_common::Result<Vec<(Vec<usize>, Vec<f32>)>> {
+        // input_shape() carries the single-input + Float32 contract checks;
+        // running them here too keeps run_f32 safe for a caller that never
+        // asked for the shape.
+        let _ = self.input_shape()?;
         {
             let mut inputs = self.interp.inputs_mut().map_err(err)?;
             let t = inputs
@@ -186,6 +261,12 @@ impl TfliteSession {
         let outputs = self.interp.outputs().map_err(err)?;
         let mut out = Vec::with_capacity(outputs.len());
         for t in &outputs {
+            if t.tensor_type() != TensorType::Float32 {
+                return Err(err_str(format!(
+                    "output tensor must be Float32, got {:?}",
+                    t.tensor_type()
+                )));
+            }
             out.push((
                 t.shape().map_err(err)?,
                 t.as_slice::<f32>().map_err(err)?.to_vec(),
@@ -246,7 +327,8 @@ mod tests {
             FULL_RANGE_SHA256,
             "{model_path}: not the pinned full-range artifact"
         );
-        let mut s = TfliteSession::from_pinned_bytes(&bytes, 2).expect("session");
+        let mut s =
+            TfliteSession::from_pinned_bytes(&bytes, FULL_RANGE_SHA256, 2).expect("session");
         let shape = s.input_shape().expect("input shape");
         assert_eq!(shape, vec![1, 192, 192, 3], "measured contract (#295)");
         let out = s.run_f32(&vec![0.0f32; 192 * 192 * 3]).expect("invoke");
@@ -259,6 +341,40 @@ mod tests {
         );
         // A wrong-length input is refused before any write.
         assert!(s.run_f32(&[0.0f32; 7]).is_err());
+    }
+
+    #[test]
+    fn a_wrong_pin_is_refused_before_anything_parses_the_bytes() {
+        // The digest check precedes the runtime load, so this refusal is
+        // testable on machines with no TFLite library at all, and a caller
+        // cannot reach the parser with unverified bytes.
+        let Err(e) = TfliteSession::from_pinned_bytes(b"not a model", "0".repeat(64).as_str(), 1)
+        else {
+            panic!("wrong pin must refuse");
+        };
+        assert!(e.to_string().contains("sha256 mismatch"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_override_is_not_collapsed_to_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        // env::var().ok() read a non-UTF-8 override as ABSENT, which fell
+        // through to a packaged library the operator did not choose (#296
+        // review); the lossless reading keeps the override in force.
+        let value = OsStr::from_bytes(b"/tmp/lib-\xff.so");
+        assert!(!override_is_unset(value));
+        assert!(explicit_library_path(value).is_ok());
+    }
+
+    #[test]
+    fn a_relative_override_is_refused_as_a_loader_search() {
+        // dlopen(3) treats a no-slash name as a search through
+        // LD_LIBRARY_PATH and the loader cache: a library the daemon did
+        // not choose. The override must name a file absolutely.
+        let e = explicit_library_path(OsStr::new("libtensorflowlite_c.so")).unwrap_err();
+        assert!(e.to_string().contains("absolute path"), "{e}");
+        assert!(explicit_library_path(OsStr::new("/usr/lib64/libtensorflowlite_c.so")).is_ok());
     }
 
     #[test]

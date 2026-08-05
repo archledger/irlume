@@ -25,12 +25,13 @@ unused-allowed-license = "allow"
 
 # webpki-roots carries the Mozilla CA store under CDLA-Permissive-2.0 (a
 # permissive data license). It reaches the tree only as a BUILD-dependency of
-# edgefirst-tflite-sys via ureq, whose code path runs solely under that
-# crate's `vendored` feature, which irlume keeps OFF: nothing of it is built,
-# linked, or shipped. Scoped to the one crate rather than allowing the
-# license globally, so a future RUNTIME dependency under CDLA still trips
-# this check and gets its own decision. (Upstream gating of ureq behind the
-# vendored feature would remove the need; noted on irlume #295.)
+# edgefirst-tflite-sys via ureq: Cargo COMPILES it into that crate's build
+# script regardless, but its code path runs solely under the `vendored`
+# feature irlume keeps OFF, and nothing of it links into any shipped binary.
+# Scoped to the one crate rather than allowing the license globally, so a
+# future RUNTIME dependency under CDLA still trips this check and gets its
+# own decision. (Upstream gating of ureq behind the vendored feature would
+# remove the need; noted on irlume #295.)
 [[licenses.exceptions]]
 name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]

@@ -44,6 +44,17 @@ echo "${ORT_SHA256}  $STAGE/ort.tgz" | sha256sum -c - \
 mkdir -p "$STAGE/onnxruntime"
 tar -xzf "$STAGE/ort.tgz" -C "$STAGE/onnxruntime" --strip-components=1
 
+# Bundle the TFLite C runtime (#295): irlume's own pinned build, because
+# Google publishes no prebuilt Linux C-API artifact at stable URLs.
+TFLITE_VER="v2.19.0"
+TFLITE_SHA256="04282fce406ac3408478f5559e96b0ac225046f89ffde6a85d1f1bef41554867"
+curl -fsSL -o "$STAGE/tflite.tgz" \
+  "https://github.com/archledger/irlume/releases/download/tflite-runtime-v2.19.0/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz"
+echo "$TFLITE_SHA256  $STAGE/tflite.tgz" | sha256sum -c - \
+  || { echo "tflite runtime tarball failed sha256 check; refusing to bundle."; exit 1; }
+mkdir -p "$STAGE/tflite"
+tar -xzf "$STAGE/tflite.tgz" -C "$STAGE/tflite" --strip-components=1
+
 # Unit override pointing ORT_DYLIB_PATH at the bundled lib.
 cat > "$STAGE/10-ort.conf" <<EOF
 [Service]

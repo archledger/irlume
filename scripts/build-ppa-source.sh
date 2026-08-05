@@ -63,6 +63,15 @@ mkdir -p "$TREE/ort-prebuilt"
 tar -xzf "$ORT_TGZ" -C "$TREE/ort-prebuilt" --strip-components=1
 rm -rf "$TREE/ort-prebuilt/include"   # headers unused (load-dynamic)
 
+echo "==> bundling tflite runtime v2.19.0"
+TFLITE_TGZ="$BUILDROOT/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz"
+[ -f "$TFLITE_TGZ" ] || curl -fsSL -o "$TFLITE_TGZ" \
+    "https://github.com/archledger/irlume/releases/download/tflite-runtime-v2.19.0/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz"
+echo "04282fce406ac3408478f5559e96b0ac225046f89ffde6a85d1f1bef41554867  $TFLITE_TGZ" | sha256sum -c - \
+    || { echo "tflite runtime tarball failed sha256 check; refusing to bundle."; exit 1; }
+mkdir -p "$TREE/tflite-prebuilt"
+tar -xzf "$TFLITE_TGZ" -C "$TREE/tflite-prebuilt" --strip-components=1
+
 echo "==> vendoring crates"
 cd "$TREE"
 mkdir -p .cargo

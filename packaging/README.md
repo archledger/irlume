@@ -53,6 +53,20 @@ the weights, so a running system needs no download.
   Debian 12+ and Ubuntu 22.04+ and refuses cleanly on anything older. Update
   path: a `.deb` from GitHub Releases via `irlume update`.
 
+## TFLite C runtime (native .tflite models, #295)
+
+Google publishes no prebuilt Linux x86_64 C-API artifact at stable URLs, so
+irlume builds `libtensorflowlite_c.so` from a pinned tensorflow tag
+(`scripts/build-tflite-runtime.sh`, currently v2.19.0) and publishes the
+tarball with signed checksums on the `tflite-runtime-<tag>` GitHub release.
+Every lane bundles it at `/usr/share/irlume/tflite/`, the first path the
+daemon's resolver probes, so unlike onnxruntime no environment drop-in is
+needed; a missing library is a recoverable "runtime not installed" answer,
+never a startup failure. Fedora: Source6 in the spec. Arch: an extra pinned
+source in the PKGBUILD (no usable system package exists). Debian/nfpm and
+the PPA orig tarball: fetched + sha256-checked by their build scripts. Nix:
+not yet wired; a flake user sets IRLUME_TFLITE_LIB.
+
 ## onnxruntime ≥ 1.24 (the api-24 pin)
 
 - Fedora: bundled in the RPM (Source1 tarball → `/usr/share/irlume/onnxruntime`,

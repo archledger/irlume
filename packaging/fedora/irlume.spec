@@ -1,3 +1,4 @@
+%global tflite_ver v2.19.0
 %global ort_ver 1.24.4
 
 Name:           irlume
@@ -23,6 +24,13 @@ Source5:        %{url}/releases/download/models-v1/blaze_face_short_range.onnx
 # unbundling when the floor is met across our chroots. Packit/Copr fetch
 # remote sources (net-on).
 Source1:        https://github.com/microsoft/onnxruntime/releases/download/v%{ort_ver}/onnxruntime-linux-x64-%{ort_ver}.tgz
+# Bundled TFLite C runtime (Apache-2.0), for native .tflite models (#295).
+# Google publishes no prebuilt Linux C-API artifact at stable URLs, so irlume
+# builds its own from the pinned tensorflow tag (scripts/build-tflite-runtime.sh)
+# and publishes it on the tflite-runtime-* release; the daemon dlopens it from
+# %%{_datadir}/%%{name}/tflite (the first path its resolver probes), so no env
+# drop-in is needed. Update the digest together with tflite_ver.
+Source6:        %{url}/releases/download/tflite-runtime-%{tflite_ver}/libtensorflowlite_c-%{tflite_ver}-linux-x64.tar.gz
 
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -76,6 +84,9 @@ echo '3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747  %{SOURCE
 # Unpack the bundled onnxruntime (Source1) next to the source tree; installed
 # below into %{_datadir}/%{name}/onnxruntime.
 tar -xzf %{SOURCE1}
+# Same verify-then-unpack for the bundled TFLite C runtime (Source6).
+echo '04282fce406ac3408478f5559e96b0ac225046f89ffde6a85d1f1bef41554867  %{SOURCE6}' | sha256sum -c -
+tar -xzf %{SOURCE6}
 # Verify the release-hosted model weights (Source2-5) the same way: they load in
 # the privileged daemon, and Copr fetches remote sources without a lookaside
 # checksum. Keep these in sync with models/SHA256SUMS.
@@ -116,6 +127,12 @@ install -Dm0644 packaging/systemd/irlume-reconcile.timer %{buildroot}%{_unitdir}
 # to preserve the .so version symlinks).
 install -d %{buildroot}%{_datadir}/%{name}/onnxruntime/lib
 cp -a onnxruntime-linux-x64-%{ort_ver}/lib/libonnxruntime.so* %{buildroot}%{_datadir}/%{name}/onnxruntime/lib/
+# Bundled TFLite C runtime; the daemon's resolver probes this path first, so
+# unlike onnxruntime it needs no environment drop-in.
+install -d %{buildroot}%{_datadir}/%{name}/tflite
+install -m0755 libtensorflowlite_c-%{tflite_ver}-linux-x64/lib/libtensorflowlite_c.so %{buildroot}%{_datadir}/%{name}/tflite/libtensorflowlite_c.so
+install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/LICENSE.tensorflow %{buildroot}%{_datadir}/%{name}/tflite/LICENSE.tensorflow
+install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/PROVENANCE %{buildroot}%{_datadir}/%{name}/tflite/PROVENANCE
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
 # Preset: the daemon is enabled on install (see %%post); it only serves a local
@@ -204,6 +221,8 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %dir %{_datadir}/%{name}/models
 %dir %{_datadir}/%{name}/onnxruntime
 %dir %{_datadir}/%{name}/onnxruntime/lib
+%dir %{_datadir}/%{name}/tflite
+%{_datadir}/%{name}/tflite/*
 %dir %{_datadir}/%{name}/schemas
 %{_datadir}/%{name}/schemas/*.json
 %{_datadir}/%{name}/models/*.onnx

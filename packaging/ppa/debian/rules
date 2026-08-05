@@ -56,6 +56,12 @@ override_dh_auto_install:
 		debian/irlume/usr/share/irlume/schemas/machine-api-v1.schema.json
 	mkdir -p debian/irlume/opt/irlume/onnxruntime
 	cp -a ort-prebuilt/lib debian/irlume/opt/irlume/onnxruntime/
+	# Bundled TFLite C runtime (#295): installed at the resolver's first
+	# probed path, so no environment wiring is needed.
+	install -d debian/irlume/usr/share/irlume/tflite
+	install -m0755 tflite-prebuilt/lib/libtensorflowlite_c.so debian/irlume/usr/share/irlume/tflite/
+	install -m0644 tflite-prebuilt/LICENSE.tensorflow debian/irlume/usr/share/irlume/tflite/
+	install -m0644 tflite-prebuilt/PROVENANCE debian/irlume/usr/share/irlume/tflite/
 	install -D -m0644 packaging/systemd/irlumed.service \
 		debian/irlume/usr/lib/systemd/system/irlumed.service
 	# Makes /run/irlume.sock exist before the greeter authenticates (#244).

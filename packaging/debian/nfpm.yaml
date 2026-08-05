@@ -62,6 +62,15 @@ contents:
   # Bundled onnxruntime (>=1.24) staged by build-deb.sh
   - src: ../../.deb-staging/onnxruntime/lib/
     dst: /opt/irlume/onnxruntime/lib/
+  # Bundled TFLite C runtime staged by build-deb.sh (#295); the daemon's
+  # resolver probes /usr/share/irlume/tflite, so it ships at the probed path
+  # rather than /opt.
+  - src: ../../.deb-staging/tflite/lib/libtensorflowlite_c.so
+    dst: /usr/share/irlume/tflite/libtensorflowlite_c.so
+  - src: ../../.deb-staging/tflite/LICENSE.tensorflow
+    dst: /usr/share/irlume/tflite/LICENSE.tensorflow
+  - src: ../../.deb-staging/tflite/PROVENANCE
+    dst: /usr/share/irlume/tflite/PROVENANCE
   # systemd unit + an override pointing ORT at the bundled lib
   - src: ../systemd/irlumed.service
     dst: /usr/lib/systemd/system/irlumed.service

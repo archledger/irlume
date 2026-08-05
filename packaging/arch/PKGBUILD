@@ -24,12 +24,17 @@ source=("git+https://github.com/archledger/irlume.git#tag=v${pkgver}"
         "glintr100.onnx::https://github.com/archledger/irlume/releases/download/models-v1/glintr100.onnx"
         "face_detection_yunet_2023mar.onnx::https://github.com/archledger/irlume/releases/download/models-v1/face_detection_yunet_2023mar.onnx"
         "face_landmark.onnx::https://github.com/archledger/irlume/releases/download/models-v1/face_landmark.onnx"
-        "blaze_face_short_range.onnx::https://github.com/archledger/irlume/releases/download/models-v1/blaze_face_short_range.onnx")
+        "blaze_face_short_range.onnx::https://github.com/archledger/irlume/releases/download/models-v1/blaze_face_short_range.onnx"
+        # TFLite C runtime (#295): no current Arch/AUR system package exists
+        # (AUR libtensorflow-lite is 2.4-era), so the pinned irlume-built
+        # artifact bundles at the daemon resolver's first probed path.
+        "libtensorflowlite_c-v2.19.0-linux-x64.tar.gz::https://github.com/archledger/irlume/releases/download/tflite-runtime-v2.19.0/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz")
 sha256sums=('SKIP'
             'a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60'
             '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
             '821683be088447839638f79d64268bd501bdb72e5d9e262ec981c7e252956caf'
-            'c5453678015f6289c1d77bda88a8ba9c87574f01de1a05ba1909b9a7e08b237b')
+            'c5453678015f6289c1d77bda88a8ba9c87574f01de1a05ba1909b9a7e08b237b'
+            '04282fce406ac3408478f5559e96b0ac225046f89ffde6a85d1f1bef41554867')
 install=irlume.install
 
 prepare() {
@@ -59,6 +64,12 @@ package() {
     for m in glintr100 face_detection_yunet_2023mar face_landmark blaze_face_short_range; do
         install -Dm0644 "models/$m.onnx" "$pkgdir/usr/share/irlume/models/$m.onnx"
     done
+    install -Dm0755 "$srcdir/libtensorflowlite_c-v2.19.0-linux-x64/lib/libtensorflowlite_c.so" \
+        "$pkgdir/usr/share/irlume/tflite/libtensorflowlite_c.so"
+    install -Dm0644 "$srcdir/libtensorflowlite_c-v2.19.0-linux-x64/LICENSE.tensorflow" \
+        "$pkgdir/usr/share/irlume/tflite/LICENSE.tensorflow"
+    install -Dm0644 "$srcdir/libtensorflowlite_c-v2.19.0-linux-x64/PROVENANCE" \
+        "$pkgdir/usr/share/irlume/tflite/PROVENANCE"
     install -Dm0644 packaging/systemd/irlumed.service "$pkgdir/usr/lib/systemd/system/irlumed.service"
     install -Dm0644 packaging/systemd/irlumed.socket "$pkgdir/usr/lib/systemd/system/irlumed.socket"
     # Self-heal: re-applies irlume's greeter PAM lines if a distro update strips

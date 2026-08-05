@@ -19,6 +19,8 @@ pub mod align;
 pub mod detect;
 pub mod light;
 pub mod moire;
+#[cfg(feature = "tflite")]
+pub mod tflite;
 
 /// 5 facial landmarks (left eye, right eye, nose, left mouth, right mouth),
 /// in pixel coordinates of the source frame. Output by the detector.

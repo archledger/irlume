@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["onnx"]
+default = ["onnx", "tflite"]
 # ONNX inference (AuraFace embedder, YuNet detector). Off => align/cosine only.
 onnx = ["dep:ort"]
+# Native TFLite/LiteRT runtime (#295): runs pinned .tflite artifacts
+# unconverted via a dlopen'd libtensorflowlite_c; absence is a recoverable
+# runtime answer, not a build requirement, so the feature costs nothing on
+# systems without the library.
+tflite = ["dep:edgefirst-tflite"]
 # Hardware-acceleration execution providers, selected at compile time (cf. howrs).
 # Default build = CPU. The heavy math runs inside ONNX Runtime, already SIMD +
 # multi-threaded; these pick the EP. Our own glue loops vectorize via target-cpu
@@ -23,4 +28,8 @@ irlume-common.workspace = true
 irlume-camera.workspace = true
 thiserror.workspace = true
 ort = { workspace = true, optional = true }
+# Pinned EXACTLY: the 0.9.0 sources were audited (loader + discovery) before
+# adoption, and the audit covers only those bytes. default-features = false
+# drops zip/flatbuffers pulls irlume does not use.
+edgefirst-tflite = { version = "=0.9.0", optional = true, default-features = false }
 rustfft.workspace = true

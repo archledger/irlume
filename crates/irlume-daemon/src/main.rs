@@ -135,6 +135,47 @@ fn resolve_thirdparty_recognizer() -> Option<(Vec<u8>, f32, String)> {
         })
 }
 
+/// The explicit third-party DETECTOR selection, same contract and same
+/// fail-closed rule as the recognizer above: an invalid selection refuses to
+/// start (PAM reads an absent daemon as password fallback), a valid one
+/// returns the VERIFIED bytes plus the entry's measured threshold and name.
+/// The wiring target is the RESCUE slot only; YuNet stays primary.
+fn resolve_thirdparty_detector() -> Option<(Vec<u8>, f32, String)> {
+    irlume_common::config::read_kv(
+        "settings.conf",
+        irlume_common::thirdparty::DETECTOR_SETTINGS_KEY,
+    )
+    .filter(|v| !v.trim().is_empty())
+    .map(|name| {
+        let name = name.trim().to_string();
+        let entry = irlume_common::thirdparty::detector_override(
+            irlume_common::thirdparty::by_name(&name),
+        )
+        .unwrap_or_else(|why| {
+            eprintln!(
+                "irlumed: third_party_detector='{name}' refused ({why:?}); refusing to start so face auth falls back to the password"
+            );
+            std::process::exit(1);
+        });
+        let path = irlume_common::thirdparty::model_path(entry);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            eprintln!(
+                "irlumed: third-party detector '{name}' selected but {} unreadable ({e}); refusing to start so face auth falls back to the password",
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+        if digest != entry.sha256 {
+            eprintln!(
+                "irlumed: third-party detector '{name}' checksum mismatch (sha256 {digest}); refusing to start so face auth falls back to the password"
+            );
+            std::process::exit(1);
+        }
+        (bytes, entry.threshold, entry.name.to_string())
+    })
+}
+
 fn main() {
     // FIRST, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
@@ -320,6 +361,7 @@ fn main() {
             // gate refuses until Stage::Recognition opens, so today an
             // explicit selection always refuses.
             let tp_rec: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_recognizer();
+            let tp_det: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_detector();
             // Engine factory: (re)loads the models and rebinds devices/adapters. Used
             // once at startup and again by the camera worker to rebuild the engine after
             // a caught panic, so a fresh request never runs against ONNX sessions left in
@@ -342,7 +384,15 @@ fn main() {
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
                     .and_then(|e| e.with_mesh(&mesh))
-                    .and_then(|e| e.with_blaze_rescue(&blaze))
+                    .and_then(|e| match &tp_det {
+                        Some((bytes, thr, name)) => {
+                            eprintln!(
+                                "irlumed: third-party detector '{name}' loaded into the RESCUE slot (threshold {thr}; YuNet stays primary)"
+                            );
+                            e.with_full_range_rescue(bytes, *thr, name)
+                        }
+                        None => e.with_blaze_rescue(&blaze),
+                    })
                     .and_then(|e| match &tp_pad {
                         Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
                         None => Ok(e),
@@ -364,12 +414,17 @@ fn main() {
                         "irlumed: FaceMesh (passive liveness) {}",
                         if e.has_mesh() { "loaded" } else { "absent" }
                     );
+                    // Name the occupant: since #295 the rescue slot holds
+                    // either the shipped short-range model or an enabled
+                    // third-party one, and a line that always says
+                    // "BlazeFace" is the stale-claim shape reviewers keep
+                    // finding.
                     eprintln!(
-                        "irlumed: BlazeFace rescue detector {}",
-                        if e.has_blaze_rescue() {
-                            "loaded"
-                        } else {
-                            "absent"
+                        "irlumed: rescue detector {}",
+                        match (e.has_blaze_rescue(), e.thirdparty_detector_name()) {
+                            (_, Some(name)) => format!("'{name}' (third-party, full-range)"),
+                            (true, None) => "BlazeFace short-range (shipped)".to_string(),
+                            (false, None) => "absent".to_string(),
                         }
                     );
                     match e.thirdparty_pad_name() {

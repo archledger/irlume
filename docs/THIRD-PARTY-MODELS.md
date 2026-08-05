@@ -131,6 +131,39 @@ measured 2026-08-05 under the split-source threshold protocol
 sudo irlume models add buffalo /path/to/w600k_r50.onnx
 ```
 
+### `fullrange`: irlume fetches it (detection stage)
+
+Google's MediaPipe full-range BlazeFace, running its published `.tflite`
+byte-for-byte on the bundled TFLite runtime, no conversion anywhere (#295).
+Enabling it replaces the RESCUE detector only: YuNet stays primary, and the
+rescue runs when YuNet finds no face, so this entry's worst failure is a
+missed rescue, a denial.
+
+- **Measured:** 100% detection on every segment of the two-camera stage-3
+  corpus through Google's own runtime, including all far-IR frames the
+  shipped short-range rescue misses at 0%; irlume's decoder holds 0.9354
+  mean IoU parity against that runtime over the same frames
+  ([bench](pad-results/2026-08-05-stage3-live-detection-bench.md),
+  [parity CSVs](pad-results/2026-08-05-blaze-full-parity-official.csv)).
+- **Threshold:** 0.55, measured through irlume's own pipeline over a
+  512-frame two-camera corpus, scored with the floor dropped to 0.01 so the
+  sub-threshold distribution is visible
+  ([per-frame scores](pad-results/2026-08-05-fullrange-threshold-scores.csv)).
+  Empty-scene frames decide it: 128 of them reach 0.5293 (near-black IR,
+  the model reading sensor noise), so the shipped rescue's 0.5 would admit
+  one. Genuine detection is flat from 0.45 to 0.6, so the choice costs
+  nothing on the genuine side, and 0.55 keeps 0.02 of margin.
+- **What enabling it does:** the daemon loads the pinned `.tflite` through
+  the bundled TFLite runtime at startup and refuses to start if that runtime
+  is missing or the pin does not match; `models disable fullrange` returns
+  the shipped rescue. Detection stores no enrollment data, so enabling or
+  disabling it never touches templates.
+- **Provenance:** the model card (read 2026-08-05) licenses the weights
+  Apache-2.0 and states consented first-party training data, in-scope to
+  5 meters. It would pass ADR-0001 for shipping; it is a catalog entry
+  rather than a shipped default because the shipped cascade already covers
+  the login envelope and this model earns its seat at distance.
+
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.
 

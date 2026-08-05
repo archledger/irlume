@@ -63,7 +63,7 @@ pub struct Engine {
     /// finds no face (saturated outdoor backgrounds; 2026-07-15 bench: 96.9%
     /// vs YuNet's 76.9% on the sunlight walking bursts). Needs `mesh` to
     /// refine its coarse box into alignment landmarks.
-    blaze: Option<irlume_vision::BlazeRescue>,
+    blaze: Option<Rescue>,
     /// Optional third-party PAD cue (opt-in via `irlume models`, catalog in
     /// `irlume_common::thirdparty`): (classifier, threshold, catalog name).
     /// Consulted DENY-ONLY on the lit IR strobe frame; it may downgrade a
@@ -94,6 +94,34 @@ pub struct Engine {
     /// never mid-inference: stopping an operation is a scheduling decision, not
     /// a way to abandon a device or a session.
     stop_requested: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+/// The rescue-slot detector (cascade stage 2): the shipped short-range
+/// BlazeFace on ONNX, or an enabled third-party full-range BlazeFace running
+/// its published .tflite unconverted on the bundled TFLite runtime (#295).
+/// One slot, one enum: a second Option field would be the two-sources-of-
+/// truth shape behind #281 and #285. The full-range variant carries its
+/// catalog entry's measured threshold rather than the shipped constant,
+/// because an operating point travels with the artifact it was measured on.
+enum Rescue {
+    ShortRange(irlume_vision::BlazeRescue),
+    FullRange {
+        det: irlume_vision::blaze_full::FullRangeBlaze,
+        threshold: f32,
+        name: String,
+    },
+}
+
+impl Rescue {
+    fn detect_top(
+        &mut self,
+        view: &align::RgbView<'_>,
+    ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
+        match self {
+            Rescue::ShortRange(b) => b.detect_top(view),
+            Rescue::FullRange { det, threshold, .. } => det.detect_top_at(view, *threshold),
+        }
+    }
 }
 
 /// Assurance tier of this engine, derived from the available camera hardware.
@@ -878,14 +906,45 @@ impl Engine {
     /// Load the BlazeFace short-range rescue detector (improves detection on
     /// saturated outdoor frames). No-op if the file is absent.
     pub fn with_blaze_rescue(mut self, path: &str) -> irlume_common::Result<Self> {
+        // Shipped short-range rescue (ONNX).
         if std::path::Path::new(path).exists() {
-            self.blaze = Some(irlume_vision::BlazeRescue::load_from_file(path)?);
+            self.blaze = Some(Rescue::ShortRange(
+                irlume_vision::BlazeRescue::load_from_file(path)?,
+            ));
         }
+        Ok(self)
+    }
+
+    /// Wire an enabled third-party FULL-RANGE detector into the rescue slot
+    /// (#295): takes the VERIFIED bytes (the daemon checked the catalog pin;
+    /// the session constructor re-checks the same buffer), the entry's
+    /// measured operating threshold, and its catalog name for reporting.
+    /// Replaces whatever rescue was loaded: one slot, one occupant.
+    pub fn with_full_range_rescue(
+        mut self,
+        bytes: &[u8],
+        threshold: f32,
+        name: &str,
+    ) -> irlume_common::Result<Self> {
+        self.blaze = Some(Rescue::FullRange {
+            det: irlume_vision::blaze_full::FullRangeBlaze::from_pinned_bytes(bytes)?,
+            threshold,
+            name: name.to_string(),
+        });
         Ok(self)
     }
 
     pub fn has_blaze_rescue(&self) -> bool {
         self.blaze.is_some()
+    }
+
+    /// The enabled third-party detector's catalog name, or None when the
+    /// rescue slot holds the shipped short-range model (or nothing).
+    pub fn thirdparty_detector_name(&self) -> Option<&str> {
+        match &self.blaze {
+            Some(Rescue::FullRange { name, .. }) => Some(name),
+            _ => None,
+        }
     }
 
     /// Load an opt-in third-party PAD classifier (deny-only cue on the lit IR
@@ -926,6 +985,8 @@ impl Engine {
         let blaze = self.blaze.as_mut()?;
         let mesh = self.mesh.as_mut()?;
         let (bbox, score) = blaze.detect_top(view).ok().flatten()?;
+        // (both rescue variants return the same coarse-box contract; the
+        // mesh refine below is what turns either into alignment landmarks)
         let lm = mesh.landmarks(view, &bbox, 0.25).ok()?;
         if lm.len() < irlume_vision::MESH_N {
             return None;

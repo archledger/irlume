@@ -130,6 +130,18 @@ impl FullRangeBlaze {
         &mut self,
         frame: &align::RgbView,
     ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
+        self.detect_top_at(frame, FULL_RANGE_SCORE_THRESHOLD)
+    }
+
+    /// [`Self::detect_top`] at an explicit floor. Exists for MEASUREMENT:
+    /// setting an operating threshold needs the sub-floor score
+    /// distribution (what an empty room scores), which the default floor
+    /// hides by design.
+    pub fn detect_top_at(
+        &mut self,
+        frame: &align::RgbView,
+        floor: f32,
+    ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
         let side = frame.width.max(frame.height) as f32;
         let n = FULL_RANGE_INPUT;
         let mut data = vec![0.0f32; n * n * 3];
@@ -164,10 +176,8 @@ impl FullRangeBlaze {
                 "full-range blaze: unexpected output tensors".into(),
             ));
         };
-        Ok(
-            decode_full_range_best(reg, cls, &self.anchors, FULL_RANGE_SCORE_THRESHOLD)
-                .map(|(b, s)| ([b[0] * side, b[1] * side, b[2] * side, b[3] * side], s)),
-        )
+        Ok(decode_full_range_best(reg, cls, &self.anchors, floor)
+            .map(|(b, s)| ([b[0] * side, b[1] * side, b[2] * side, b[3] * side], s)))
     }
 }
 

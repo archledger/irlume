@@ -15,7 +15,9 @@
 //! survived (#298 review).
 //!
 //! Usage: cargo run --release -p irlume-auth --example blaze_full_parity -- \
-//!   <blaze_face_full_range.tflite> <corpus_root>... > rust.csv
+//!   [--floor F] <blaze_face_full_range.tflite> <corpus_root>... > rust.csv
+//!   (--floor overrides the decoder's 0.6 default; threshold MEASUREMENT
+//!   needs the sub-floor score distribution, especially on empty scenes)
 //!   (IRLUME_TFLITE_LIB must point at libtensorflowlite_c.so)
 
 use irlume_vision::align::RgbView;
@@ -62,10 +64,15 @@ fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut floor = irlume_vision::blaze_full::FULL_RANGE_SCORE_THRESHOLD;
+    if args.first().map(String::as_str) == Some("--floor") {
+        args.remove(0);
+        floor = args.remove(0).parse().expect("--floor takes a number");
+    }
     let (model_path, roots) = args
         .split_first()
-        .expect("usage: blaze_full_parity <blaze_face_full_range.tflite> <corpus_root>...");
+        .expect("usage: blaze_full_parity [--floor F] <model.tflite> <corpus_root>...");
     assert!(!roots.is_empty(), "at least one corpus root is required");
     let bytes = std::fs::read(model_path).expect("read model");
     let mut det = FullRangeBlaze::from_pinned_bytes(&bytes).expect("full-range blaze");
@@ -106,7 +113,7 @@ fn main() {
                         height: h,
                     };
                     let top = det
-                        .detect_top(&view)
+                        .detect_top_at(&view, floor)
                         .unwrap_or_else(|e| panic!("{}: inference: {e}", f.display()));
                     let name = format!("{sub}/{}", f.file_name().unwrap().to_string_lossy());
                     emitted += 1;

@@ -12,8 +12,8 @@
 #   3. Copy the UNSIGNED source artifacts out for host signing.
 #
 # The build is NOT signed here (the container never sees the GPG key) and the
-# result is NOT byte-reproducible against a native Ubuntu build — gzip/cargo
-# vendor differ between environments — so upload from ONE route per release.
+# result is NOT byte-reproducible against a native Ubuntu build (gzip/cargo
+# vendor differ between environments), so upload from ONE route per release.
 #
 # After this, on the host (where the release key lives):
 #   debsign -k <fpr> <out>/irlume_<ver>-0ppa1~<series>1_source.changes   # your passphrase

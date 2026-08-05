@@ -38,7 +38,7 @@ the weights, so a running system needs no download.
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled
   onnxruntime, real model weights; LP builders have no network). Update path:
   plain `apt upgrade`. **The lane ends at "binary published", not at "upload
-  accepted"** — `dput` reports only that Launchpad took the upload, and the
+  accepted"**: `dput` reports only that Launchpad took the upload, and the
   build and binary publication after it are both silent. Finish with
   `python3 scripts/verify-ppa-publish.py`, which polls Launchpad and exits
   non-zero unless a binary is actually installable. 0.6.1 was accepted, failed

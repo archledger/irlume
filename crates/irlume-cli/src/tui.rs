@@ -374,6 +374,10 @@ struct RecoveryInfo {
     encrypted: bool,
     recovery_set: bool,
     tpm_present: bool,
+    /// Whether the key that opens an encrypted store still exists. Encrypted
+    /// with no key means the enrollment cannot be opened by anything, which
+    /// `encrypted` alone cannot say.
+    key_present: bool,
 }
 
 /// Messages streamed from the guided-enroll worker to the UI.
@@ -797,6 +801,7 @@ impl LightState {
         }) {
             out.recovery = Some(RecoveryInfo {
                 encrypted,
+                key_present,
                 recovery_set,
                 tpm_present,
             });
@@ -4478,9 +4483,16 @@ impl App {
         // on a TPM machine, one Tab away from the Keyring tab saying "TPM
         // ● present"; a failed read establishes nothing (docs/MACHINE-API.md).
         let enc = match self.recovery {
-            Some(r) if r.encrypted => Span::styled(
+            Some(r) if r.encrypted && r.key_present => Span::styled(
                 "● encrypted",
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+            ),
+            // Encrypted with the key gone: safe from a stolen disk and
+            // unreadable by its owner. Neither a reseal nor a recovery
+            // passphrase brings it back, so say re-enroll and say it loudly.
+            Some(r) if r.encrypted => Span::styled(
+                "✗ encrypted, TEMPLATE KEY MISSING (re-enroll)",
+                Style::new().fg(th().err).add_modifier(Modifier::BOLD),
             ),
             Some(_) => Span::styled("○ plaintext at rest", Style::new().dim()),
             None => Span::styled("◐ unknown (daemon unreachable)", Style::new().fg(th().warn)),
@@ -8558,6 +8570,7 @@ mod tests {
         // No TPM: plaintext + the recovery-N/A line.
         app.recovery = Some(RecoveryInfo {
             encrypted: false,
+            key_present: false,
             recovery_set: false,
             tpm_present: false,
         });
@@ -8567,6 +8580,7 @@ mod tests {
         // Encrypted without a backstop: the warning line.
         app.recovery = Some(RecoveryInfo {
             encrypted: true,
+            key_present: true,
             recovery_set: false,
             tpm_present: true,
         });
@@ -8577,6 +8591,7 @@ mod tests {
         // Fully set: both badges green, no warning.
         app.recovery = Some(RecoveryInfo {
             encrypted: true,
+            key_present: true,
             recovery_set: true,
             tpm_present: true,
         });
@@ -9348,6 +9363,30 @@ mod tests {
         assert!(
             row_with(&text, "recovery pass").contains("◐ unknown"),
             "{text}"
+        );
+    }
+
+    /// The store is encrypted and its key is gone, which is what a lost
+    /// template key looks like from the panel. Rendering that as "encrypted"
+    /// hides that the enrollment can no longer be opened by anything.
+    #[test]
+    fn recovery_screen_names_an_encrypted_store_whose_key_is_gone() {
+        let mut app = test_app();
+        app.screen = SC_RECOVERY;
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: false,
+            recovery_set: false,
+            tpm_present: true,
+        });
+        let text = draw_text(&app);
+        assert!(
+            text.contains("TEMPLATE KEY MISSING"),
+            "an orphaned store must be named, not shown as healthy: {text}"
+        );
+        assert!(
+            !text.contains("● encrypted"),
+            "it must not read as a clean encrypted state: {text}"
         );
     }
 

@@ -47,13 +47,23 @@ tar -xzf "$STAGE/ort.tgz" -C "$STAGE/onnxruntime" --strip-components=1
 # Bundle the TFLite C runtime (#295): irlume's own pinned build, because
 # Google publishes no prebuilt Linux C-API artifact at stable URLs.
 TFLITE_VER="v2.19.0"
-TFLITE_SHA256="04282fce406ac3408478f5559e96b0ac225046f89ffde6a85d1f1bef41554867"
+TFLITE_SHA256="dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311"
 curl -fsSL -o "$STAGE/tflite.tgz" \
   "https://github.com/archledger/irlume/releases/download/tflite-runtime-v2.19.0/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz"
 echo "$TFLITE_SHA256  $STAGE/tflite.tgz" | sha256sum -c - \
   || { echo "tflite runtime tarball failed sha256 check; refusing to bundle."; exit 1; }
 mkdir -p "$STAGE/tflite"
 tar -xzf "$STAGE/tflite.tgz" -C "$STAGE/tflite" --strip-components=1
+# The bundled runtime must respect the package's own declared floor: the
+# first published build (made on a current Fedora) needed GLIBC_2.43 and
+# could not load on the very systems this package declares (#297 review).
+TFLITE_SO="$STAGE/tflite/lib/libtensorflowlite_c.so"
+tflite_glibc=$(objdump -T "$TFLITE_SO" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n1)
+tflite_glibcxx=$(objdump -T "$TFLITE_SO" | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -Vu | tail -n1)
+[ "$(printf '%s\n%s\n' "$tflite_glibc" "2.35" | sort -V | tail -n1)" = "2.35" ] \
+  || { echo "tflite runtime needs GLIBC_$tflite_glibc > declared 2.35 floor; refusing."; exit 1; }
+[ "$(printf '%s\n%s\n' "$tflite_glibcxx" "3.4.30" | sort -V | tail -n1)" = "3.4.30" ] \
+  || { echo "tflite runtime needs GLIBCXX_$tflite_glibcxx > GCC-12-era floor; refusing."; exit 1; }
 
 # Unit override pointing ORT_DYLIB_PATH at the bundled lib.
 cat > "$STAGE/10-ort.conf" <<EOF

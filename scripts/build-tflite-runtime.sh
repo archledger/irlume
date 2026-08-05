@@ -28,6 +28,17 @@ set -euo pipefail
 # the runtime and the edgefirst-tflite binding version range move together
 # (0.9.0 states TFLite 2.14+).
 TF_TAG="v2.19.0"
+# The COMMIT the tag must resolve to: `git describe` only proves a name, and
+# a hostile or stale mirror can attach the name to any commit (#297 review).
+TF_COMMIT="e36baa302922ea3c7131b302c2996bd2051ee5c4"
+# Symbol-version ceilings for the universal .deb's floor (Ubuntu 22.04 /
+# Debian 12: glibc 2.35, GCC-12-era libstdc++). The first published build,
+# made on a current Fedora, demanded GLIBC_2.43/GLIBCXX_3.4.32 and could not
+# load on the systems the package declares (#297 review). Build inside
+# scripts/build-tflite-runtime-container.sh; these guards refuse any output
+# that exceeds the floor regardless of where it was built.
+GLIBC_MAX="2.35"
+GLIBCXX_MAX="3.4.30"
 
 WORK="${1:-$(pwd)/tflite-runtime-build}"
 SRC="$WORK/tensorflow"
@@ -38,9 +49,9 @@ mkdir -p "$WORK"
 if [ ! -d "$SRC/.git" ]; then
     git clone --depth 1 --branch "$TF_TAG" https://github.com/tensorflow/tensorflow.git "$SRC"
 fi
-ACTUAL_TAG=$(git -C "$SRC" describe --tags)
-if [ "$ACTUAL_TAG" != "$TF_TAG" ]; then
-    echo "refusing: checkout is $ACTUAL_TAG, not $TF_TAG" >&2
+ACTUAL=$(git -C "$SRC" rev-parse HEAD)
+if [ "$ACTUAL" != "$TF_COMMIT" ]; then
+    echo "refusing: checkout is $ACTUAL, expected $TF_COMMIT ($TF_TAG)" >&2
     exit 1
 fi
 
@@ -54,6 +65,19 @@ cmake -S "$SRC/tensorflow/lite/c" -B "$BUILD" \
 cmake --build "$BUILD" -j "$(nproc)"
 
 test -f "$BUILD/libtensorflowlite_c.so"
+
+max_symbol_version() {
+    # Highest versioned-symbol requirement with the given prefix.
+    objdump -T "$2" | grep -o "${1}_[0-9][0-9.]*" | sed "s/^${1}_//" | sort -Vu | tail -n1
+}
+require_at_most() {
+    if [ "$(printf '%s\n%s\n' "$2" "$3" | sort -V | tail -n1)" != "$3" ]; then
+        echo "refusing: $1 floor $2 exceeds supported maximum $3" >&2
+        exit 1
+    fi
+}
+require_at_most GLIBC "$(max_symbol_version GLIBC "$BUILD/libtensorflowlite_c.so")" "$GLIBC_MAX"
+require_at_most GLIBCXX "$(max_symbol_version GLIBCXX "$BUILD/libtensorflowlite_c.so")" "$GLIBCXX_MAX"
 mkdir -p "$OUT/lib"
 cp "$BUILD/libtensorflowlite_c.so" "$OUT/lib/"
 # The licenses ride with the binary: the runtime is Apache-2.0 and the

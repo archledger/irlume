@@ -108,6 +108,7 @@ APPARMOR_PROFILES=(
   packaging/apparmor/usr.local.bin.irlumed
 )
 APPARMOR_RUNTIME_RULES=(
+  "/usr/share/irlume/tflite/libtensorflowlite_c.so mr,"
   "/dev/ r,"
   "/run/lock/irlume-emitter-*.lock rwk,"
   "/var/lib/irlume/ir-emitter-stream/*.lock rwk,"

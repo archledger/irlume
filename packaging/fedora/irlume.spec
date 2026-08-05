@@ -85,7 +85,7 @@ echo '3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747  %{SOURCE
 # below into %{_datadir}/%{name}/onnxruntime.
 tar -xzf %{SOURCE1}
 # Same verify-then-unpack for the bundled TFLite C runtime (Source6).
-echo '04282fce406ac3408478f5559e96b0ac225046f89ffde6a85d1f1bef41554867  %{SOURCE6}' | sha256sum -c -
+echo 'dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311  %{SOURCE6}' | sha256sum -c -
 tar -xzf %{SOURCE6}
 # Verify the release-hosted model weights (Source2-5) the same way: they load in
 # the privileged daemon, and Copr fetches remote sources without a lookaside

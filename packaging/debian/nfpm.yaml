@@ -26,6 +26,9 @@ depends:
   # installing binaries that die at runtime with a GLIBC version error.
   # build-deb.sh asserts the binaries' real floor stays within this declaration.
   - libc6 (>= 2.35)
+  # The bundled TFLite runtime is C++; its GLIBCXX floor is asserted by
+  # build-deb.sh against the GCC-12-era baseline of the declared systems.
+  - libstdc++6
   - libpam0g
   - libtss2-esys-3.0.2-0 | libtss2-esys-3.0.2-0t64
   # tctildr is the TCTI loader the binary links directly; it is NOT pulled in

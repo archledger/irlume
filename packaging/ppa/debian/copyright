@@ -7,6 +7,13 @@ Files: *
 Copyright: 2026 archledger
 License: GPL-3.0+
 
+Files: tflite-prebuilt/*
+Copyright: 2014-2026 The TensorFlow Authors
+License: Apache-2.0
+Comment: TensorFlow Lite C runtime built from TensorFlow v2.19.0,
+ commit e36baa302922ea3c7131b302c2996bd2051ee5c4, by
+ scripts/build-tflite-runtime.sh. https://github.com/tensorflow/tensorflow
+
 Files: models/glintr100.onnx
 Copyright: fal.ai (AuraFace)
 License: Apache-2.0

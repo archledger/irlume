@@ -45,6 +45,13 @@ profile irlumed /usr/local/bin/irlumed {
   /opt/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
   /opt/onnxruntime-*/lib/libonnxruntime*.so* mr,
   /usr/share/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
+  # TFLite C runtime bundled by every FHS packaging lane (#295): dlopen needs
+  # read + executable-map, and a missing rule silently kills native .tflite
+  # detection on every AppArmor-enforcing install (#297 review).
+  /usr/share/irlume/tflite/libtensorflowlite_c.so mr,
+  # TFLite C runtime bundled by every FHS packaging lane (#295): dlopen needs
+  # read + executable-map, and a missing rule silently kills native .tflite
+  # detection on every AppArmor-enforcing install (#297 review).
 
   # Models: packaged location or a hand-installed repo checkout.
   /usr/share/irlume/models/*.onnx r,

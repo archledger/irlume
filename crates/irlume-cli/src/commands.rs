@@ -730,15 +730,21 @@ pub fn status(args: &[String]) -> ExitCode {
     if let Ok(Response::RecoveryStatus {
         encrypted,
         recovery_set,
+        key_present,
         ..
     }) = daemon_request(&Request::RecoveryStatus { user: user.clone() })
     {
         println!(
             "  templates     : {}",
-            if encrypted {
-                format!("encrypted at rest {OK}")
-            } else {
-                format!("plaintext {WARN} (run `irlume recovery setup`)")
+            match (encrypted, key_present) {
+                (true, true) => format!("encrypted at rest {OK}"),
+                // Reporting this as plaintext both understates the posture and
+                // hides that the enrollment is gone.
+                (true, false) => format!(
+                    "encrypted, but the TEMPLATE KEY IS MISSING {WARN} \
+                     (unreadable; re-enroll)"
+                ),
+                (false, _) => format!("plaintext {WARN} (run `irlume recovery setup`)"),
             }
         );
         println!(

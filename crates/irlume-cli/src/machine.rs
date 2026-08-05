@@ -398,10 +398,19 @@ pub fn status(args: &[String]) -> ExitCode {
         Ok(Response::RecoveryStatus {
             encrypted,
             recovery_set,
+            key_present,
             ..
         }) => (
+            // `templates` stays the documented STRING with its two values, so a
+            // contract 1 consumer is unaffected. The orphaned case rides along
+            // on `recovery.key_present`, an ADDED field, which contract 1
+            // permits; a new enum value in `templates` would not be.
             json!(if encrypted { "encrypted" } else { "plaintext" }),
-            json!({ "known": true, "passphrase_set": recovery_set }),
+            json!({
+                "known": true,
+                "passphrase_set": recovery_set,
+                "key_present": key_present,
+            }),
         ),
         _ => (json!("unknown"), json!({ "known": false })),
     };

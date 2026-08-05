@@ -1241,6 +1241,41 @@ fn keyring_success_paths_with_a_live_daemon() {
     assert_eq!(sealed.1, b"hunter2");
 }
 
+/// An encrypted store whose template key is gone is the one state the old
+/// `encrypted` bool could not express, because it was computed FROM the key's
+/// presence. It reported "plaintext at rest", which understates the posture and
+/// hides that the enrollment can no longer be opened by anything, then pointed
+/// the user at `recovery setup`. It happened for real on 2026-08-05 when a
+/// sandboxed root command deleted the live key directory.
+#[test]
+fn an_encrypted_store_with_no_key_says_so_instead_of_plaintext() {
+    let sb = Sandbox::new("orphanedkey");
+    serve(&sock(&sb), |req| match req {
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (code, out, _) = run(&mut sb.cmd(&["recovery", "status", "--user", "tester"]));
+    assert_eq!(code, 0);
+    assert!(
+        !out.contains("plaintext at rest"),
+        "an encrypted store must never be called plaintext: {out}"
+    );
+    assert!(
+        out.contains("TEMPLATE KEY IS GONE"),
+        "the user must be told the enrollment cannot be opened: {out}"
+    );
+    assert!(
+        out.contains("Re-enroll"),
+        "and told the only remaining move: {out}"
+    );
+}
+
 #[test]
 fn recovery_success_paths_with_a_live_daemon() {
     let sb = Sandbox::new("recoveryok");
@@ -1249,6 +1284,7 @@ fn recovery_success_paths_with_a_live_daemon() {
             encrypted: true,
             recovery_set: false,
             tpm_present: true,
+            key_present: true,
         },
         Request::RecoverySetup { .. } => Response::Ok("recovery passphrase set".into()),
         Request::RecoveryRestore { .. } => Response::Ok("template key restored".into()),
@@ -1508,6 +1544,7 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             encrypted: true,
             recovery_set: true,
             tpm_present: true,
+            key_present: true,
         },
         _ => Response::Error("unexpected request".into()),
     });

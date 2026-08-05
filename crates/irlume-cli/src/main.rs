@@ -3899,15 +3899,16 @@ fn doctor_run(
         Ok(irlume_common::Response::RecoveryStatus {
             encrypted,
             recovery_set,
+            key_present,
             ..
         }) => {
             dout!(
                 report,
                 "[doctor] templates ({user}): {} · recovery passphrase {}",
-                if encrypted {
-                    "ENCRYPTED ✓"
-                } else {
-                    "plaintext at rest"
+                match (encrypted, key_present) {
+                    (true, true) => "ENCRYPTED ✓",
+                    (true, false) => "ENCRYPTED but the TEMPLATE KEY IS MISSING (unreadable)",
+                    (false, _) => "plaintext at rest",
                 },
                 if recovery_set {
                     "SET ✓"

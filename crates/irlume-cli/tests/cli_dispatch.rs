@@ -233,6 +233,7 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
             encrypted: false,
             recovery_set: false,
             tpm_present: true,
+            key_present: false,
         },
         _ => Response::Error("unexpected request".into()),
     });

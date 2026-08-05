@@ -580,9 +580,12 @@ mod onnx {
         ///
         /// Errors when the box is not a meaningful face region
         /// ([`mesh_box_valid`]) or the model's output fails the geometric
-        /// plausibility check ([`mesh_output_plausible`]). Every caller
-        /// already treats a mesh error as "no landmarks", which is the
-        /// fail-closed answer for the cues these feed.
+        /// plausibility check ([`mesh_output_plausible`]). A refusal must
+        /// reach the cues as ABSENT landmarks, never abort a capture window:
+        /// the EAR pipelines consume it through [`mesh_min_ear`], and the
+        /// alignment refine through `.ok()`. A new caller that `?`s this
+        /// error re-creates the #293 defect (one refused frame costing the
+        /// whole consent watch).
         pub fn landmarks(
             &mut self,
             frame: &align::RgbView,
@@ -656,6 +659,27 @@ mod onnx {
         Ok(out)
     }
 
+    /// The smaller of the two eye-aspect-ratios from a mesh run, or `None`
+    /// when the mesh refuses the detector box or its own output.
+    ///
+    /// `None` is a MISSING OBSERVATION, the per-frame fail-closed answer for
+    /// the EAR pipelines (`EarSample.ear = None`): the bounded capture window
+    /// continues and the stream consumers deny on absent eyes. The callers
+    /// used to propagate a mesh error with `?`, which was dormant while the
+    /// mesh could only fail on runtime errors; the validity refusals made it
+    /// live, so one refused frame aborted an entire consent watch instead of
+    /// costing one observation (#293 review). Returning `Option` here removes
+    /// the operator: a caller cannot re-introduce the abort without
+    /// reimplementing the mesh call.
+    pub fn mesh_min_ear(
+        mesh: &mut FaceMesh,
+        frame: &align::RgbView,
+        bbox: &[f32; 4],
+    ) -> Option<f32> {
+        let lm = mesh.landmarks(frame, bbox, 0.25).ok()?;
+        Some(eye_ear(&lm, &EAR_LEFT).min(eye_ear(&lm, &EAR_RIGHT)))
+    }
+
     /// Is `bbox` a face region the mesh can meaningfully run on?
     ///
     /// These are validity bounds (is the request geometrically a region at
@@ -725,17 +749,26 @@ mod onnx {
                 lm.len()
             ));
         }
-        let (mut xa, mut ya, mut xb, mut yb) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for &(x, y) in lm {
-            xa = xa.min(x);
-            ya = ya.min(y);
-            xb = xb.max(x);
-            yb = yb.max(y);
-        }
-        // A real face spans a visible fraction of the crop the detector put
-        // it in; 2px catches only outright collapse, deliberately loose so
-        // this never rejects a genuine small face.
-        if xb - xa < 2.0 || yb - ya < 2.0 {
+        // Collapse is judged on the CENTRAL 80% span, not the extrema: with
+        // min/max, one stray point vouches for 477 stuck ones, and "a stuck
+        // output head plus one corrupt value" is a realistic combination of
+        // the pathologies this gate exists for (#293 review). Requiring the
+        // bulk of the points to spread keeps a single outlier from carrying
+        // the check. The 2px floor is unchanged: validity, not a tuned
+        // threshold, and far below any genuine face (the shipped mesh spans
+        // >100px on a face-sized crop).
+        let central_span = |mut v: Vec<f32>| -> f32 {
+            v.sort_by(f32::total_cmp);
+            let lo = v.len() / 10;
+            let hi = v.len().saturating_sub(1 + lo);
+            if hi <= lo {
+                return 0.0;
+            }
+            v[hi] - v[lo]
+        };
+        let xs: Vec<f32> = lm.iter().map(|&(x, _)| x).collect();
+        let ys: Vec<f32> = lm.iter().map(|&(_, y)| y).collect();
+        if central_span(xs) < 2.0 || central_span(ys) < 2.0 {
             return Err("landmarks collapsed to a point".into());
         }
         Ok(())
@@ -1178,6 +1211,13 @@ mod onnx {
                 reason(&vec![(100.0, 100.0); 468]),
                 "landmarks collapsed to a point"
             );
+            // One stray point must not vouch for 467 stuck ones: extrema-based
+            // extent accepted exactly this (#293 review), which is a stuck
+            // output head plus one corrupt value, and lets a model supply
+            // arbitrary values at the few indices the cues read.
+            let mut one_outlier = vec![(100.0, 100.0); 468];
+            one_outlier[0] = (103.0, 103.0);
+            assert_eq!(reason(&one_outlier), "landmarks collapsed to a point");
             // Most points far outside the sampled square: the model is not
             // honoring its own input space.
             let outside: Vec<(f32, f32)> = (0..468)
@@ -1268,9 +1308,9 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    eye_ear, mesh_box_valid, mesh_output_plausible, selftest_alignment_identity, Adapter,
-    BlazeRescue, Detector, Embedder, FaceMesh, PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT,
-    MESH_INPUT, MESH_N, MESH_N_IRIS,
+    eye_ear, mesh_box_valid, mesh_min_ear, mesh_output_plausible, selftest_alignment_identity,
+    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT,
+    EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Model-backed pipeline tests: run the REAL shipped ONNX models (fetched to
@@ -1496,13 +1536,49 @@ mod model_tests {
         // Determinism: same crop, same points.
         let again = m.landmarks(&view, &bbox, 0.25).expect("landmarks again");
         assert_eq!(lm, again);
+        // Headroom over the collapse gate's 2px central-span floor: even on a
+        // faceless gradient the real mesh spreads its central 80% far above
+        // it, so the validity bound cannot cost a genuine capture.
+        let mut xs: Vec<f32> = lm.iter().map(|&(x, _)| x).collect();
+        xs.sort_by(f32::total_cmp);
+        let span = xs[xs.len() - 1 - xs.len() / 10] - xs[xs.len() / 10];
+        assert!(span > 20.0, "central x-span {span} too close to the floor");
+    }
+
+    #[test]
+    fn a_refused_box_is_a_missing_ear_observation_not_an_error() {
+        // The EAR pipelines consume mesh refusals through `mesh_min_ear`,
+        // which has no error to propagate: one refused frame is one missing
+        // observation, never a lost capture window (#293 review found the
+        // old `?` callers turning the new refusals into authentication-stack
+        // errors).
+        let mut m = facemesh();
+        let (w, h) = (256u32, 256u32);
+        let frame = gradient_frame(w, h);
+        let view = align::RgbView {
+            data: &frame,
+            width: w,
+            height: h,
+        };
+        assert_eq!(mesh_min_ear(&mut m, &view, &[f32::NAN; 4]), None);
+        assert_eq!(
+            mesh_min_ear(&mut m, &view, &[-900.0, -900.0, -700.0, -700.0]),
+            None
+        );
+        // A nominal box still measures: Some, and finite.
+        let ear = mesh_min_ear(&mut m, &view, &[64.0, 64.0, 192.0, 192.0]);
+        assert!(matches!(ear, Some(e) if e.is_finite()), "{ear:?}");
     }
 
     #[test]
     fn facemesh_refuses_garbage_detector_boxes_through_the_real_model() {
-        // The pure gates have their own unit tests; this pins the WIRING, so
-        // a refactor that drops the calls from `landmarks()` fails here even
-        // though the gate functions still pass alone.
+        // The pure gates have their own unit tests; this pins the BOX-gate
+        // WIRING, so a refactor that drops that call from `landmarks()`
+        // fails here even though the gate functions still pass alone. (The
+        // OUTPUT gate's wiring is not pinned by a model test: the real mesh
+        // never emits implausible output. It is structural instead: the
+        // check lives inside `map_checked_mesh_output`, the only mapping
+        // implementation, so skipping it means reimplementing the mapping.)
         let mut m = facemesh();
         let (w, h) = (256u32, 256u32);
         let frame = gradient_frame(w, h);

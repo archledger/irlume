@@ -1540,16 +1540,18 @@ impl Engine {
             let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
             let faces = self.det.detect(&view)?;
             if let Some(t) = top_detection(&faces) {
-                let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
-                let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
-                let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-                ear = Some(l.min(r));
                 cx = (t.bbox[0] + t.bbox[2]) * 0.5;
                 cy = (t.bbox[1] + t.bbox[3]) * 0.5;
                 fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
-                // Corneal specular contrast from the IR frame at the eye
-                // landmarks (the second liveness cue: collapses on a real blink).
-                contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                // A mesh refusal is one MISSING observation (ear stays None),
+                // never an abort: `?` here turned a single refused frame into
+                // the loss of the whole capture window.
+                if let Some(e) = irlume_vision::mesh_min_ear(mesh, &view, &t.bbox) {
+                    ear = Some(e);
+                    // Corneal specular contrast from the IR frame at the eye
+                    // landmarks (the second liveness cue: collapses on a real blink).
+                    contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
+                }
             }
             out.push(irlume_liveness::EarSample {
                 idx: i,
@@ -1629,11 +1631,13 @@ impl Engine {
             cy = (t.bbox[1] + t.bbox[3]) * 0.5;
             fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
             if let Some(mesh) = self.mesh.as_mut() {
-                let lm = mesh.landmarks(&view, &t.bbox, 0.25)?;
-                let l = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT);
-                let r = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT);
-                ear = Some(l.min(r));
-                contrast = eye_glint_contrast(&frame.data, frame.width, frame.height, &t.landmarks);
+                // Same missing-observation rule as capture_ear_samples: a
+                // refused frame costs one EAR reading, not the consent watch.
+                if let Some(e) = irlume_vision::mesh_min_ear(mesh, &view, &t.bbox) {
+                    ear = Some(e);
+                    contrast =
+                        eye_glint_contrast(&frame.data, frame.width, frame.height, &t.landmarks);
+                }
             }
         }
         Ok((
@@ -3560,13 +3564,18 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return 0.0;
     }
+    // NaN saturates to (0,0) at the casts below, and a landmark set with ONE
+    // unplaceable eye is a set the producer got wrong, not half a
+    // measurement: score 0.0 for the whole set rather than letting the valid
+    // eye vouch for it (#293 review; skipping per eye left that hole).
+    if !landmarks[0..2]
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+    {
+        return 0.0;
+    }
     let mut peak = 0u8;
     for &(ex, ey) in &landmarks[0..2] {
-        // NaN saturates to (0,0) at the casts below; skip an eye we cannot
-        // place instead of scoring whatever sits in the frame corner.
-        if !ex.is_finite() || !ey.is_finite() {
-            continue;
-        }
         let r = GLINT_SEARCH_RADIUS_PX;
         for dy in -r..=r {
             for dx in -r..=r {
@@ -3594,16 +3603,20 @@ pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return 0.0;
     }
+    // Whole-set rule, same as eye_glint: one unplaceable eye means the set's
+    // producer got it wrong, and `.max()` over the two eyes would let the
+    // valid one vouch for it (#293 review).
+    if !landmarks[0..2]
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+    {
+        return 0.0;
+    }
     let iod = ((landmarks[1].0 - landmarks[0].0).powi(2)
         + (landmarks[1].1 - landmarks[0].1).powi(2))
     .sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     let at = |(ex, ey): (f32, f32)| -> f32 {
-        // Same NaN-saturates-to-(0,0) trap as eye_glint: an eye we cannot
-        // place contributes no contrast rather than the corner's.
-        if !ex.is_finite() || !ey.is_finite() {
-            return 0.0;
-        }
         let (cx, cy) = (ex as i32, ey as i32);
         let (mut peak, mut sum, mut cnt) = (0u8, 0u64, 0u64);
         for dy in -r..=r {
@@ -4897,15 +4910,23 @@ mod tests {
         assert_eq!(eye_glint(&grey, 64, 48, &nan), 0.0);
         assert_eq!(eye_glint_contrast(&grey, 64, 48, &nan), 0.0);
         assert!(!both_eyes_open(&grey, 64, 48, &nan));
-        // One placeable eye is still not both eyes.
-        let one: Landmarks5 = [
-            (20.0, 20.0),
-            (f32::NAN, 20.0),
-            (32.0, 30.0),
-            (26.0, 40.0),
-            (38.0, 40.0),
-        ];
-        assert!(!both_eyes_open(&grey, 64, 48, &one));
+        // One placeable eye is still not both eyes, and the glint helpers
+        // score the whole set 0.0 rather than letting the valid eye vouch
+        // for a set whose producer emitted a non-finite point (#293 review:
+        // per-eye skipping let a bright valid eye carry the score). The
+        // placeable eye sits ON a bright disk so the unguarded value is
+        // provably nonzero.
+        let (mut bright, lm) = ir_frame_with_glints(true, true);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                bright[(y * 64 + x) as usize] = 60;
+            }
+        }
+        bright[0] = 255;
+        let one: Landmarks5 = [lm[0], (f32::NAN, 20.0), lm[2], lm[3], lm[4]];
+        assert!(!both_eyes_open(&bright, 64, 48, &one));
+        assert_eq!(eye_glint(&bright, 64, 48, &one), 0.0);
+        assert_eq!(eye_glint_contrast(&bright, 64, 48, &one), 0.0);
     }
 
     #[test]

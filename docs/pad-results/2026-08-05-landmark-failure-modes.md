@@ -121,6 +121,30 @@ refused.
 
 All other rows are unchanged from the before tables.
 
+## Review round (#293)
+
+The Codex round found the first cut's own claims wanting, and each fix is in
+the same change:
+
+- **The claim "every caller already treats a mesh error as no landmarks" was
+  false.** Two production callers (`capture_ear_samples`,
+  `frame_to_consent_samples`) propagated the error with `?`, dormant while
+  the mesh could only fail on runtime errors; the new refusals made it live,
+  so one refused frame aborted the whole capture window instead of costing
+  one observation. The EAR pipelines now consume refusals through
+  `mesh_min_ear`, which returns an `Option` and so has no error for a caller
+  to propagate.
+- **The collapse gate judged extrema, so one stray point vouched for 477
+  stuck ones.** It now judges the central 80% span; the real mesh's central
+  span on even a faceless crop measures far above the 2px floor (asserted in
+  the model-backed test).
+- **The glint helpers skipped a non-finite eye per-eye**, letting a bright
+  valid eye carry the score for a set whose producer emitted garbage; both
+  now score the whole set 0.0.
+- The model-backed wiring test pins the BOX gate only; the output gate's
+  wiring is structural (the check lives inside the only mapping
+  implementation), stated where the first cut overclaimed.
+
 ## What this does not establish
 
 - Nothing here measures a real third-party detector or landmarker; it

@@ -2190,6 +2190,65 @@ mod tests {
     }
 
     #[test]
+    fn profiles_report_each_recognizer_and_mark_only_the_loaded_one_live() {
+        // #288: a profile can hold several recognizers' templates and only
+        // the loaded one's can match, so a consumer needs to know WHICH.
+        // Marking every recognizer live would tell it the opposite.
+        use irlume_common::ProfileSummary;
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("embed:model-a".to_string(), 7usize);
+        counts.insert("embed:model-b".to_string(), 3usize);
+        let data = profiles_data(
+            vec![ProfileSummary {
+                name: "P".into(),
+                scans: vec!["s1".into()],
+                scans_by_recognizer: counts,
+                live_recognizer: Some("embed:model-b".into()),
+            }],
+            false,
+            false,
+        );
+        let recs = data["profiles"][0]["recognizers"].as_array().unwrap();
+        assert_eq!(recs.len(), 2);
+        let by_space = |space: &str| {
+            recs.iter()
+                .find(|r| r["space"] == space)
+                .unwrap_or_else(|| panic!("missing {space}"))
+        };
+        assert_eq!(by_space("embed:model-a")["scans"], 7);
+        assert_eq!(
+            by_space("embed:model-a")["live"],
+            false,
+            "a recognizer that is not loaded must not read as live"
+        );
+        assert_eq!(by_space("embed:model-b")["scans"], 3);
+        assert_eq!(by_space("embed:model-b")["live"], true);
+        // Exactly one entry may be live.
+        assert_eq!(
+            recs.iter().filter(|r| r["live"] == true).count(),
+            1,
+            "only the loaded recognizer is live"
+        );
+
+        // An older daemon reports neither field: no recognizers array
+        // entries, and nothing claimed live.
+        let data = profiles_data(
+            vec![ProfileSummary {
+                name: "P".into(),
+                scans: vec!["s1".into()],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
+            }],
+            false,
+            false,
+        );
+        assert!(data["profiles"][0]["recognizers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn models_list_reports_every_stage_and_only_open_stages_carry_third_party() {
         // Sandboxed state dir so the weight states are this test's, not the
         // machine's. The config dir is NOT sandboxed here; `enabled.known`

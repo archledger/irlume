@@ -76,6 +76,25 @@ fn central_span(mut v: Vec<f32>) -> f32 {
     }
 }
 
+/// Refuse to run on anything but the SHIPPED artifact for `name`: the bench's
+/// claims say "the shipped X", and nothing else binds a CSV to model bytes
+/// (a banked legacy mesh loads just as happily). Prints the digest so the
+/// measurement doc can record it (#294 review).
+fn require_shipped(path: &str, name: &str) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read model {path}: {e}"));
+    let actual = irlume_common::thirdparty::sha256_hex(&bytes);
+    let expected = include_str!("../../../models/SHA256SUMS")
+        .lines()
+        .find_map(|l| {
+            let mut f = l.split_whitespace();
+            let digest = f.next()?;
+            (f.next()? == name).then(|| digest.to_owned())
+        })
+        .unwrap_or_else(|| panic!("{name}: missing from models/SHA256SUMS"));
+    assert_eq!(actual, expected, "{path}: bytes are not the shipped {name}");
+    actual
+}
+
 fn fmt(v: Option<f32>) -> String {
     v.map(|x| format!("{x:.4}")).unwrap_or_default()
 }
@@ -86,6 +105,18 @@ fn main() {
         eprintln!("usage: detect_bench <det.onnx> <blaze.onnx> <mesh.onnx> <corpus_root>");
         std::process::exit(2);
     };
+    eprintln!(
+        "yunet_sha256={}",
+        require_shipped(det_p, "face_detection_yunet_2023mar.onnx")
+    );
+    eprintln!(
+        "blaze_sha256={}",
+        require_shipped(blaze_p, "blaze_face_short_range.onnx")
+    );
+    eprintln!(
+        "mesh_sha256={}",
+        require_shipped(mesh_p, "face_landmark.onnx")
+    );
     let mut det = Detector::load_from_file(det_p).expect("yunet");
     let mut blaze = BlazeRescue::load_from_file(blaze_p).expect("blaze");
     let mut mesh = FaceMesh::load_from_file(mesh_p).expect("mesh");
@@ -136,20 +167,31 @@ fn main() {
                 width: w,
                 height: h,
             };
-            let dets = det.detect(&view).unwrap_or_default();
+            // An inference ERROR is not a miss: collapsing them let a
+            // runtime failure masquerade as "the model saw no face" (#294
+            // review). Detector execution errors abort the run; a mesh error
+            // is an intended measurement (refusal) and is logged instead.
+            let dets = det
+                .detect(&view)
+                .unwrap_or_else(|e| panic!("{seg_name}/{name}: YuNet inference failed: {e}"));
             let top = dets.iter().max_by(|a, b| a.score.total_cmp(&b.score));
             let (mut mesh_ok, mut ear_l, mut ear_r, mut span_x, mut span_y) =
                 (false, None, None, None, None);
             if let Some(t) = top {
-                if let Ok(lm) = mesh.landmarks(&view, &t.bbox, 0.25) {
-                    mesh_ok = true;
-                    ear_l = Some(irlume_vision::eye_ear(&lm, &EAR_LEFT));
-                    ear_r = Some(irlume_vision::eye_ear(&lm, &EAR_RIGHT));
-                    span_x = Some(central_span(lm.iter().map(|&(x, _)| x).collect()));
-                    span_y = Some(central_span(lm.iter().map(|&(_, y)| y).collect()));
+                match mesh.landmarks(&view, &t.bbox, 0.25) {
+                    Ok(lm) => {
+                        mesh_ok = true;
+                        ear_l = Some(irlume_vision::eye_ear(&lm, &EAR_LEFT));
+                        ear_r = Some(irlume_vision::eye_ear(&lm, &EAR_RIGHT));
+                        span_x = Some(central_span(lm.iter().map(|&(x, _)| x).collect()));
+                        span_y = Some(central_span(lm.iter().map(|&(_, y)| y).collect()));
+                    }
+                    Err(e) => eprintln!("{seg_name}/{name}: mesh refused or failed: {e}"),
                 }
             }
-            let bl = blaze.detect_top(&view).ok().flatten();
+            let bl = blaze
+                .detect_top(&view)
+                .unwrap_or_else(|e| panic!("{seg_name}/{name}: BlazeFace inference failed: {e}"));
             let kind = if name.starts_with("rgb") { "rgb" } else { "ir" };
             println!(
                 "{seg_name},{kind},{name},{},{},{},{},{},{},{},{},{},{},{mean:.1}",

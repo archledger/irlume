@@ -83,6 +83,58 @@ fn models_to_verify<'a>(shipped: [&'a str; 4], adapter: &'a str) -> Vec<&'a str>
     v
 }
 
+/// Resolve the opt-in third-party RECOGNIZER selection (#276 stage 4), or EXIT.
+///
+/// The failure policy is the opposite of the PAD cue's fall-back-to-nothing:
+/// an explicit `third_party_recognizer` selection is an authentication-policy
+/// choice, and silently substituting the shipped recognizer would run a
+/// DIFFERENT grant-capable decision system against the templates the operator
+/// kept. Any invalid explicit selection refuses to start; PAM treats an
+/// unavailable daemon as password fallback, so fail-closed means "password",
+/// never lockout. `None` = nothing selected, use the shipped default. The
+/// returned VERIFIED BYTES are what the engine must load: re-reading the path
+/// later (or at a post-panic rebuild) would let a swap pair new weights with
+/// the threshold measured for the old ones.
+fn resolve_thirdparty_recognizer() -> Option<(Vec<u8>, f32, String)> {
+    std::env::var("IRLUME_THIRDPARTY_RECOGNIZER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            irlume_common::config::read_kv(
+                "settings.conf",
+                irlume_common::thirdparty::RECOGNIZER_SETTINGS_KEY,
+            )
+        })
+        .map(|name| {
+            let name = name.trim().to_string();
+            let entry = irlume_common::thirdparty::recognizer_override(
+                irlume_common::thirdparty::by_name(&name),
+            )
+            .unwrap_or_else(|why| {
+                eprintln!(
+                    "irlumed: third_party_recognizer='{name}' refused ({why:?}); refusing to start so face auth falls back to the password"
+                );
+                std::process::exit(1);
+            });
+            let path = irlume_common::thirdparty::model_path(entry);
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                eprintln!(
+                    "irlumed: third-party recognizer '{name}' selected but {} unreadable ({e}); refusing to start so face auth falls back to the password",
+                    path.display()
+                );
+                std::process::exit(1);
+            });
+            let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+            if digest != entry.sha256 {
+                eprintln!(
+                    "irlumed: third-party recognizer '{name}' checksum mismatch (sha256 {digest}); refusing to start so face auth falls back to the password"
+                );
+                std::process::exit(1);
+            }
+            (bytes, entry.threshold, entry.name.to_string())
+        })
+}
+
 fn main() {
     // FIRST, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
@@ -254,77 +306,39 @@ fn main() {
                 });
             // Opt-in third-party RECOGNIZER (#276 stage 4). Same trust chain
             // as the PAD cue — catalog entry, stage check, pinned checksum —
-            // but a failure here falls back to the SHIPPED recognizer rather
-            // than to "no cue": a daemon with no recognizer at all cannot
-            // authenticate anything, and the shipped stack is the measured
-            // default. The stage gate refuses until Stage::Recognition opens,
-            // so today this resolves to None on every machine.
-            let tp_rec: Option<(String, f32, String)> = std::env::var("IRLUME_THIRDPARTY_RECOGNIZER")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .or_else(|| {
-                    irlume_common::config::read_kv(
-                        "settings.conf",
-                        irlume_common::thirdparty::RECOGNIZER_SETTINGS_KEY,
-                    )
-                })
-                .and_then(|name| {
-                    let name = name.trim().to_string();
-                    let entry = match irlume_common::thirdparty::recognizer_override(
-                        irlume_common::thirdparty::by_name(&name),
-                    ) {
-                        Ok(e) => e,
-                        Err(why) => {
-                            eprintln!(
-                                "irlumed: WARNING: third_party_recognizer='{name}' refused ({why:?}); using the shipped recognizer"
-                            );
-                            return None;
-                        }
-                    };
-                    let path = irlume_common::thirdparty::model_path(entry);
-                    let bytes = match std::fs::read(&path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!(
-                                "irlumed: WARNING: third-party recognizer '{name}' enabled but {} unreadable ({e}); using the shipped recognizer",
-                                path.display()
-                            );
-                            return None;
-                        }
-                    };
-                    let digest = irlume_common::thirdparty::sha256_hex(&bytes);
-                    if digest != entry.sha256 {
-                        eprintln!(
-                            "irlumed: WARNING: third-party recognizer '{name}' checksum mismatch (sha256 {digest}); refusing unpinned weights, using the shipped recognizer"
-                        );
-                        return None;
-                    }
-                    Some((
-                        path.to_string_lossy().into_owned(),
-                        entry.threshold,
-                        entry.name.to_string(),
-                    ))
-                });
+            // but the failure policy is the opposite of the cue's: an explicit
+            // third_party_recognizer selection is an authentication-policy
+            // choice, and silently substituting the shipped recognizer would
+            // run a DIFFERENT grant-capable decision system against the
+            // templates the operator kept. Any invalid selection refuses to
+            // start; PAM treats an unavailable daemon as password fallback, so
+            // fail-closed here means "password", never lockout. Absence of
+            // the setting selects the shipped default as always. The VERIFIED
+            // BYTES are retained and handed to the engine: re-reading the path
+            // at load (or at a post-panic rebuild) would let a swap pair new
+            // weights with the threshold measured for the old ones. The stage
+            // gate refuses until Stage::Recognition opens, so today an
+            // explicit selection always refuses.
+            let tp_rec: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_recognizer();
             // Engine factory: (re)loads the models and rebinds devices/adapters. Used
             // once at startup and again by the camera worker to rebuild the engine after
             // a caught panic, so a fresh request never runs against ONNX sessions left in
             // an unproven state by an unwind. It owns its inputs so it can move to the
             // worker thread, and it is Fn, so startup calls it before that move.
             let build_engine = move || {
-                let (rec_model, rec_override) = match &tp_rec {
-                    Some((path, thr, name)) => (path.as_str(), Some((*thr, name.as_str()))),
-                    None => (model.as_str(), None),
-                };
-                irlume_auth::Engine::load(&det, rec_model)
-                    .map(|e| match rec_override {
-                        Some((thr, name)) => {
+                match &tp_rec {
+                    // The RETAINED verified bytes, not the path: a post-panic
+                    // rebuild must run exactly the artifact the pin check saw.
+                    Some((bytes, thr, name)) => {
+                        irlume_auth::Engine::load_with_recognizer_bytes(&det, bytes).map(|e| {
                             eprintln!(
                                 "irlumed: third-party recognizer '{name}' loaded (threshold {thr}; IR matching disabled — unmeasured for this model)"
                             );
-                            e.with_thirdparty_recognizer(thr)
-                        }
-                        None => e,
-                    })
+                            e.with_thirdparty_recognizer(*thr)
+                        })
+                    }
+                    None => irlume_auth::Engine::load(&det, &model),
+                }
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
                     .and_then(|e| e.with_mesh(&mesh))
@@ -3226,6 +3240,54 @@ mod tests {
         assert_eq!(v.len(), 5);
         assert_eq!(v[4], ap);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An invalid explicit third_party_recognizer selection must REFUSE TO
+    // START, never silently substitute the shipped recognizer: that would run
+    // a different grant-capable decision system than the operator selected
+    // (#279 review). resolve_thirdparty_recognizer exits the process, so
+    // re-exec this test binary as the child that makes the call.
+    #[test]
+    fn recognizer_selection_failures_refuse_to_start() {
+        if std::env::var("IRLUME_TEST_RECOGNIZER_CHILD").is_ok() {
+            // Child: resolution of the env-selected name must exit(1) inside
+            // this call for both an unknown name and a wrong-stage name.
+            let _ = resolve_thirdparty_recognizer();
+            return; // reaching this line means the selection was NOT refused
+        }
+        let exe = std::env::current_exe().unwrap();
+        let run = |selection: &str| {
+            std::process::Command::new(&exe)
+                .args([
+                    "tests::recognizer_selection_failures_refuse_to_start",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("IRLUME_TEST_RECOGNIZER_CHILD", "1")
+                .env("IRLUME_THIRDPARTY_RECOGNIZER", selection)
+                .output()
+                .unwrap()
+        };
+        // Not in the catalog at all.
+        let out = run("ghost");
+        assert!(!out.status.success(), "an unknown selection must refuse");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("refused (NotInCatalog)") && err.contains("falls back to the password"),
+            "stderr was: {err}"
+        );
+        // In the catalog, but a PAD model: naming it as THE recognizer is
+        // nonsense the daemon must refuse, not reinterpret.
+        let out = run("flir");
+        assert!(!out.status.success(), "a wrong-stage selection must refuse");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("refused (WrongStage(\"pad\"))"),
+            "stderr was: {err}"
+        );
+        // StageClosed is unreachable until a Recognition entry exists in the
+        // catalog; the decision itself is pinned in irlume-common's tests.
     }
 
     // Regression: 834c71e (companion guard). Excluding the optional adapter

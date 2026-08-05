@@ -818,7 +818,7 @@ fn logs_option_errors_never_run_journalctl() {
     );
 
     let (code, out, err) = run(&mut sb.cmd_with_fakes(&["logs", "--bogus"]));
-    assert_eq!(code, 1);
+    assert_eq!(code, 2);
     assert!(err.contains("unknown option '--bogus'"), "{err}");
     assert!(
         !out.contains("JOURNALCTL RAN"),

@@ -156,14 +156,24 @@ impl Stage {
     /// protocol and the stage-4 wiring (#276, #279) — its entries run
     /// RGB-only, with IR matching, fusion, and dark login disabled because no
     /// entry carries IR-side measurements.
-    /// Detection opened 2026-08-05 (#295 stage 3): full-range BlazeFace
-    /// measured through irlume's own pipeline over a 512-frame two-camera
-    /// corpus (genuine minimum score 0.6038 across seven conditions
-    /// including true dark; 128 empty-scene frames scored NOTHING above
-    /// 0.01), wired into the RESCUE slot only, so a bad entry's worst case
-    /// is a missed rescue, a denial.
+    /// Detection STAYS CLOSED, and the 2026-08-05 measurement is why the
+    /// reason is now specific rather than absent. That corpus (512 frames,
+    /// docs/pad-results/2026-08-05-fullrange-threshold.md) established an
+    /// operating point for full-range BlazeFace: at 0.55, 61 of 291
+    /// exposure-usable genuine frames fall below threshold and the highest
+    /// empty-scene score is 0.5293, 0.0207 under it.
+    ///
+    /// It does NOT establish authentication safety, because the rescue slot
+    /// is GRANT-CAPABLE: `rescue_detect` fills `rgb_top` when YuNet finds
+    /// nothing, and that box is aligned, embedded, matched, and can reach a
+    /// grant (#299 review corrected the opposite claim). A detector that
+    /// accepts presentations YuNet declines therefore widens the path the
+    /// daemon already warns about, that the built-in gate does not stop a
+    /// life-size print without the opt-in PAD cue. Opening this stage needs
+    /// an end-to-end corpus of prints, screens, and other faces measured on
+    /// frames where YuNet returns nothing.
     pub const fn open(self) -> bool {
-        matches!(self, Stage::Pad | Stage::Recognition | Stage::Detection)
+        matches!(self, Stage::Pad | Stage::Recognition)
     }
 }
 
@@ -276,41 +286,6 @@ ThirdPartyModel {
               the worst-served group SHIFTS to Middle Eastern; RGB-only (IR \
               matching, fusion and dark login disabled: unmeasured for this \
               model) (docs/recognition-results/2026-08-05-buffalo-l.md)",
-},
-ThirdPartyModel {
-    name: "fullrange",
-    stage: Stage::Detection,
-    // Google's published artifact, run UNCONVERTED on the native TFLite
-    // runtime (#295): the pin is the sha256 of the .tflite itself from the
-    // versioned /float16/1/ URL.
-    file: "blaze_face_full_range.tflite",
-    url: Some(
-        "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite",
-    ),
-    sha256: "3698b18f063835bc609069ef052228fbe86d9c9a6dc8dcb7c7c2d69aed2b181b",
-    license: "Apache-2.0 (model card, read 2026-08-05)",
-    provenance: "Google MediaPipe full-range BlazeFace; card states consented \
-                 first-party training data, in-scope to 5m; replaces the \
-                 RESCUE detector slot only (YuNet stays primary), so its \
-                 worst failure is a missed rescue, a denial",
-    // 0.55, measured 2026-08-05 through irlume's own pipeline over a
-    // 512-frame two-camera corpus scored with the floor dropped to 0.01
-    // (docs/pad-results/2026-08-05-fullrange-threshold-scores.csv). The
-    // deciding population is the 128 EMPTY-SCENE frames: they reach 0.5293
-    // (near-black IR, the model reading noise), so the shipped rescue's own
-    // 0.5 would admit one of them. 0.53 upward admits none, and genuine
-    // detection is FLAT from 0.45 to 0.6 (61 of 291 usable genuine frames
-    // miss at every one of them: those frames score ~0.10, a non-detection,
-    // not a threshold effect), so the choice costs nothing on the genuine
-    // side. 0.55 takes the midpoint of that flat region, leaving 0.02 over
-    // the highest empty-scene score.
-    threshold: 0.55,
-    summary: "replacement RESCUE detector; measured 2026-08-05: 100% detection \
-              on every corpus segment both cameras including all far-IR frames \
-              the short-range rescue misses at 0%; runs the published .tflite \
-              unconverted on the bundled TFLite runtime \
-              (docs/pad-results/2026-08-05-stage3-live-detection-bench.md, \
-              2026-08-05-blaze-full-parity-*.csv)",
 }];
 
 /// Highest P(fake) a genuine face was measured at during qualification
@@ -453,8 +428,30 @@ mod tests {
             detector_override(pad).unwrap_err(),
             RecognizerRefusal::WrongStage("pad")
         );
-        let det = by_name("fullrange");
-        assert_eq!(detector_override(det).unwrap().name, "fullrange");
+        // No catalog entry has the detection stage while it is closed, so
+        // the open-stage arm is exercised with a fixture: the wiring is
+        // dormant, not absent, and this pins the refusal that keeps it so.
+        let mut fixture = ThirdPartyModel {
+            name: "fixture-det",
+            stage: Stage::Detection,
+            file: "fixture-det.tflite",
+            url: None,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            license: "fixture",
+            provenance: "fixture",
+            threshold: 0.55,
+            summary: "fixture",
+        };
+        assert_eq!(
+            detector_override(Some(&fixture)).unwrap_err(),
+            RecognizerRefusal::StageClosed,
+            "a detection entry must be refused while the stage is closed"
+        );
+        fixture.stage = Stage::Pad;
+        assert_eq!(
+            detector_override(Some(&fixture)).unwrap_err(),
+            RecognizerRefusal::WrongStage("pad")
+        );
     }
 
     #[test]
@@ -510,21 +507,20 @@ mod tests {
     }
 
     #[test]
-    fn open_stages_are_pad_recognition_and_detection() {
+    fn open_stages_are_pad_and_recognition_only() {
         // The stage gate for #276/#295: PAD opened first (deny-only),
-        // recognition 2026-08-05 with the measured split-source protocol,
-        // detection later the same day with the two-population corpus
-        // measurement and rescue-slot-only wiring. Landmarks stays closed:
-        // the mesh feeds the liveness cues and no candidate exists. Opening
-        // a stage is a deliberate act that must change this test alongside
-        // the wiring.
+        // recognition 2026-08-05 with the measured split-source protocol.
+        // DETECTION STAYS CLOSED even though its candidate is measured and
+        // its wiring exists: the rescue slot feeds the grant path, so an
+        // operating-point corpus of genuine and empty frames is not the
+        // evidence that stage needs (#299 review). Landmarks stays closed
+        // for the cue-feeding reason. Opening a stage is a deliberate act
+        // that must change this test alongside the wiring.
         assert!(Stage::Pad.open());
         assert!(Stage::Recognition.open());
-        assert!(Stage::Detection.open());
-        assert!(
-            !Stage::Landmarks.open(),
-            "landmarks must stay closed until a measured candidate exists"
-        );
+        for closed in [Stage::Detection, Stage::Landmarks] {
+            assert!(!closed.open(), "{} must stay closed", closed.as_str());
+        }
         // as_str is machine-API vocabulary: lowercase, stable.
         for s in [
             Stage::Detection,

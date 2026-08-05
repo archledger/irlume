@@ -744,6 +744,13 @@ pub enum Response {
         /// daemon predating the field).
         #[serde(default)]
         third_party_recognizer: Option<String>,
+        /// Name of the loaded third-party DETECTOR occupying the rescue slot,
+        /// if any (#295). Same authority argument as the fields above: a
+        /// non-root TUI cannot read the root-only settings file, and without
+        /// this it cannot tell which detector the daemon is running.
+        /// `None` = the shipped short-range rescue (or an older daemon).
+        #[serde(default)]
+        third_party_detector: Option<String>,
         /// The daemon's OWN AppArmor confinement, read from its /proc/self/attr
         /// at request time: e.g. `irlumed (enforce)`, `irlumed (complain)`, or
         /// `unconfined`. `None` when AppArmor is not enabled on this boot (or an

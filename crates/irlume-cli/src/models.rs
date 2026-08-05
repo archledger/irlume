@@ -1039,7 +1039,7 @@ mod tests {
                 .filter(|s| s.open)
                 .map(|s| s.stage)
                 .collect::<Vec<_>>(),
-            ["detection", "recognition", "pad"]
+            ["recognition", "pad"]
         );
     }
 
@@ -1157,10 +1157,15 @@ mod tests {
         // must say deny-only; a recognizer must say it REPLACES matching, that
         // the IR side is off, and that re-enrollment is needed. Wrong text
         // here is wrong consent.
-        let det = thirdparty::by_name("fullrange").unwrap();
-        let dl = role_line(det);
+        // Detection has no catalog entry while the stage is closed (#299),
+        // so its consent text is pinned with a fixture: the wiring is
+        // dormant, and the text must be right the day an entry lands.
+        let mut det = byo_fixture();
+        det.stage = irlume_common::thirdparty::Stage::Detection;
+        det.threshold = 0.55;
+        let dl = role_line(&det);
         assert!(
-            dl.contains("RESCUE") && dl.contains("YuNet stays primary") && dl.contains("0.5"),
+            dl.contains("RESCUE") && dl.contains("YuNet stays primary") && dl.contains("0.55"),
             "detection consent text must state the rescue-only seat: {dl}"
         );
         let pad = thirdparty::by_name("flir").unwrap();

@@ -131,38 +131,28 @@ measured 2026-08-05 under the split-source threshold protocol
 sudo irlume models add buffalo /path/to/w600k_r50.onnx
 ```
 
-### `fullrange`: irlume fetches it (detection stage)
+### full-range BlazeFace: measured, not yet enableable (detection stage)
 
-Google's MediaPipe full-range BlazeFace, running its published `.tflite`
-byte-for-byte on the bundled TFLite runtime, no conversion anywhere (#295).
-Enabling it replaces the RESCUE detector only: YuNet stays primary, and the
-rescue runs when YuNet finds no face, so this entry's worst failure is a
-missed rescue, a denial.
+Google's MediaPipe full-range BlazeFace is measured and its runtime support
+is shipped, but it is **not a catalog entry yet** and the detection stage
+remains closed, so it cannot be enabled.
 
 - **Measured:** 100% detection on every segment of the two-camera stage-3
   corpus through Google's own runtime, including all far-IR frames the
   shipped short-range rescue misses at 0%; irlume's decoder holds 0.9354
-  mean IoU parity against that runtime over the same frames
-  ([bench](pad-results/2026-08-05-stage3-live-detection-bench.md),
-  [parity CSVs](pad-results/2026-08-05-blaze-full-parity-official.csv)).
-- **Threshold:** 0.55, measured through irlume's own pipeline over a
-  512-frame two-camera corpus, scored with the floor dropped to 0.01 so the
-  sub-threshold distribution is visible
-  ([per-frame scores](pad-results/2026-08-05-fullrange-threshold-scores.csv)).
-  Empty-scene frames decide it: 128 of them reach 0.5293 (near-black IR,
-  the model reading sensor noise), so the shipped rescue's 0.5 would admit
-  one. Genuine detection is flat from 0.45 to 0.6, so the choice costs
-  nothing on the genuine side, and 0.55 keeps 0.02 of margin.
-- **What enabling it does:** the daemon loads the pinned `.tflite` through
-  the bundled TFLite runtime at startup and refuses to start if that runtime
-  is missing or the pin does not match; `models disable fullrange` returns
-  the shipped rescue. Detection stores no enrollment data, so enabling or
-  disabling it never touches templates.
+  mean IoU parity against that runtime
+  ([bench](pad-results/2026-08-05-stage3-live-detection-bench.md)). Its
+  operating point measured through irlume's pipeline is 0.55
+  ([threshold record](pad-results/2026-08-05-fullrange-threshold.md)).
+- **Why it is not enableable:** the slot it would occupy, the detection
+  rescue, feeds the grant path: a box it supplies where YuNet found nothing
+  is aligned, matched, and can authenticate. The measurement covers genuine
+  frames and empty rooms, not prints, screens, or other faces on the frames
+  where the rescue actually fires. Until that evidence exists, opening the
+  stage would rest on the wrong corpus.
 - **Provenance:** the model card (read 2026-08-05) licenses the weights
   Apache-2.0 and states consented first-party training data, in-scope to
-  5 meters. It would pass ADR-0001 for shipping; it is a catalog entry
-  rather than a shipped default because the shipped cascade already covers
-  the login envelope and this model earns its seat at distance.
+  5 meters.
 
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.

@@ -1650,6 +1650,7 @@ struct EngineBits {
     adapter: bool,
     third_party_pad: Option<String>,
     third_party_recognizer: Option<String>,
+    third_party_detector: Option<String>,
 }
 
 fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
@@ -1667,6 +1668,7 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
         adapter: engine.has_ir_adapter(),
         third_party_pad: engine.thirdparty_pad_name().map(String::from),
         third_party_recognizer: engine.thirdparty_recognizer_name().map(String::from),
+        third_party_detector: engine.thirdparty_detector_name().map(String::from),
     });
 }
 
@@ -1868,6 +1870,7 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 // real on/off state (settings.conf is root-only).
                 third_party_pad: bits.third_party_pad.clone(),
                 third_party_recognizer: bits.third_party_recognizer.clone(),
+                third_party_detector: bits.third_party_detector.clone(),
                 apparmor: apparmor_confinement(),
             }
         }
@@ -4186,6 +4189,7 @@ mod tests {
             adapter: true,
             third_party_pad: Some("flir".into()),
             third_party_recognizer: None,
+            third_party_detector: None,
         });
         let peer = Peer {
             uid: 0,

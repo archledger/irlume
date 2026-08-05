@@ -358,6 +358,9 @@ struct HealthInfo {
     third_party_pad: Option<String>,
     /// Loaded third-party recognizer name, same authority argument.
     third_party_recognizer: Option<String>,
+    /// The third-party DETECTOR the daemon has in its rescue slot (#295),
+    /// or None for the shipped short-range rescue.
+    third_party_detector: Option<String>,
     /// The daemon's real AppArmor confinement label ("irlumed (enforce)",
     /// "unconfined", ...), or None when AppArmor is off or the daemon predates
     /// the field. Authoritative: the on-disk profile can exist while the daemon
@@ -730,6 +733,7 @@ impl LightState {
                 version,
                 third_party_pad,
                 third_party_recognizer,
+                third_party_detector,
                 apparmor,
             }) => Some(HealthInfo {
                 tier,
@@ -740,6 +744,7 @@ impl LightState {
                 version,
                 third_party_pad,
                 third_party_recognizer,
+                third_party_detector,
                 apparmor,
             }),
             _ => None, // older daemon / daemon down → Repair falls back to local probes
@@ -4014,6 +4019,9 @@ impl App {
                                 h.third_party_recognizer
                                     .as_ref()
                                     .map(|n| format!("{n} (recognition stage, loaded)")),
+                                h.third_party_detector
+                                    .as_ref()
+                                    .map(|n| format!("{n} (detection stage, loaded)")),
                             ]
                         })
                         .flatten()
@@ -6481,6 +6489,7 @@ mod tests {
             version: "test".into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         });
         let start = std::time::Instant::now();
@@ -8341,6 +8350,7 @@ mod tests {
             version: "1.0".into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         });
         let text = draw_text(&app);
@@ -8394,10 +8404,25 @@ mod tests {
             version: "test".into(),
             third_party_pad: Some("flir".into()),
             third_party_recognizer: Some("buffalo".into()),
+            // A loaded DETECTOR must be visible too: the daemon is the only
+            // authority on it (settings.conf is root-only), and a TUI that
+            // cannot show it cannot verify what is running (#299 review).
+            third_party_detector: Some("fullrange".into()),
             apparmor: None,
         });
         let text = draw_text(&app);
         assert!(text.contains("flir (pad stage, loaded)"), "{text}");
+        // The detector assertion renders WIDE on purpose: three loaded
+        // entries overflow the 120-column default, and three is synthetic
+        // while the detection stage is closed. The point under test is that
+        // the daemon-reported detector reaches the row at all.
+        let mut wide = Terminal::new(TestBackend::new(220, 40)).unwrap();
+        wide.draw(|f| app.draw(f)).unwrap();
+        let wide_text = rendered(&wide);
+        assert!(
+            wide_text.contains("fullrange (detection stage, loaded)"),
+            "a loaded detector must be reported: {wide_text}"
+        );
         assert!(
             text.contains("buffalo (recognition stage, loaded)"),
             "{text}"
@@ -8421,6 +8446,7 @@ mod tests {
             version: "test".into(),
             third_party_pad: Some("flir".into()),
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         });
         let text = draw_text(&app);
@@ -8751,6 +8777,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         });
         app.run_checks();
@@ -8806,6 +8833,7 @@ mod tests {
             version: "0.0.1-old".into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         });
         app.challenge = true;

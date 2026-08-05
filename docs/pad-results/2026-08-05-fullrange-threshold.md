@@ -1,7 +1,10 @@
 # Full-range BlazeFace operating threshold, measured through irlume, 2026-08-05
 
-Stage 3 of #295: the measurement that sets the `fullrange` catalog entry's
-threshold and decides whether the detection stage opens. The #294 bench
+Stage 3 of #295: the measurement that sets full-range BlazeFace's operating
+point. It was written to decide whether the detection stage opens; the #299
+review established that it CANNOT, and the reason is recorded below rather
+than buried, because the measurement itself is sound and the gap is in what
+it covers. The #294 bench
 measured this model through Google's runtime; this measures it through
 irlume's own decoder and preprocessing, which is what will actually run,
 and against a population #294 never captured: the empty scene.
@@ -41,7 +44,8 @@ and against a population #294 never captured: the empty scene.
 | 0.60 | 61 / 291 | 0 / 128 |
 | 0.65 | 65 / 291 | 0 / 128 |
 
-**0.55 is enabled.** The empty-scene population decides it: 0.5, the shipped
+**0.55 is the measured operating point** (not enabled anywhere: the stage is
+closed, see below). The empty-scene population decides it: 0.5, the shipped
 short-range rescue's own operating point, admits a false detection on a
 near-black IR frame. Everything from 0.53 up admits none. The genuine side
 is FLAT across that whole range (60 to 61 misses at every candidate from
@@ -57,11 +61,13 @@ costs nothing genuine, and 0.55 sits in the middle of the flat region with
    A detection threshold for this model cannot be inherited from the
    short-range one, which is what makes this measurement load-bearing rather
    than a formality.
-2. **A false detection here is not an authentication event.** The rescue slot
-   feeds a coarse box into the FaceMesh refine, alignment, recognition, and
-   the liveness gates; an empty-room box cannot match a template, and the
-   #293 geometry gates already refuse implausible boxes. The threshold trades
-   wasted pipeline work against missed rescues, not access.
+2. **A false detection on an EMPTY room costs work, not access, but that
+   does not generalise.** An empty-room box matches no template, and the
+   #293 geometry gates refuse implausible boxes. A box supplied for a PRINT
+   or a screen is a different matter entirely: it feeds the same alignment,
+   recognition, and liveness path a genuine face does, which is why this
+   corpus cannot authorise opening the stage (see below). The first draft of
+   this document generalised from the empty-room case and was wrong.
 3. **True-dark detection is uneven per frame, and the corpus says so.** In
    the Zenbook dim segment the emitter strobe produced frames the model
    scored 0.85 and frames it scored 0.10, alternating within one burst.
@@ -72,16 +78,37 @@ costs nothing genuine, and 0.55 sits in the middle of the flat region with
    ranges by segment run 0.526 (nexigo sweep, pose extreme) to 0.964, with
    every other segment's minimum at 0.60 or above.
 
+## Why this does not open the detection stage
+
+The rescue slot is GRANT-CAPABLE. `rescue_detect` fills `rgb_top` when YuNet
+returns nothing, and that box is aligned, embedded, matched against enrolled
+templates, and can reach a grant; the PR that carried this measurement
+claimed the opposite ("worst case is a missed rescue"), and the #299 review
+corrected it from the control flow. The daemon already warns that the
+built-in liveness gate does not stop a life-size print of the enrolled face
+unless the opt-in PAD cue is enabled, so a detector that accepts
+presentations YuNet declines widens exactly that path.
+
+This corpus contains empty rooms. It contains no prints, no screens, no
+masks, and no other people. It therefore measures detector hallucination
+and availability, which is what an operating point needs, and says nothing
+about false grants, which is what opening a grant-capable stage needs.
+**Detection stays closed**, the decoder and the daemon wiring stay in the
+tree dormant behind the stage gate, and the remaining work is an end-to-end
+corpus measured specifically on frames where YuNet returns no detection:
+prints and screens of the enrolled face, other faces, and genuine users,
+carried through to the authentication outcome.
+
 ## What this does not establish
 
 - One subject, two cameras, one session per condition. Nothing here is a
   population false-accept rate, and none is claimed: the negative population
   is empty rooms, not other people's faces, because the question for a
   detector is "does it invent a face", not "whose face is it".
-- No per-attempt rates, only per-frame. The daemon's own behaviour under the
-  wired entry was validated separately (a live enable/disable run on this
-  hardware); throughput, latency, and dark-rescue attempt rates are
-  unmeasured.
+- No per-attempt rates, only per-frame. The daemon's own load/refuse
+  behaviour under a wired entry was validated on this hardware before the
+  stage was closed again; throughput, latency, and dark-rescue attempt rates
+  are unmeasured.
 - The degenerate-exposure frames were excluded from the false-reject side by
   a mean-brightness rule (8 to 235), stated here so the exclusion is
   auditable; including them raises the miss count to 153 of 384 and does not

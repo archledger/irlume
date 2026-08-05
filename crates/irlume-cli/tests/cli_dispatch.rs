@@ -521,6 +521,7 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -560,6 +561,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -599,6 +601,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
             third_party_recognizer: None,
+            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {

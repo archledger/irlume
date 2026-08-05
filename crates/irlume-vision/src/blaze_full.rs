@@ -77,7 +77,11 @@ pub fn decode_full_range_best(
     let mut best: Option<([f32; 4], f32)> = None;
     for (i, &logit) in cls.iter().enumerate() {
         let score = 1.0 / (1.0 + (-logit.clamp(-100.0, 100.0)).exp());
-        if score < floor || best.is_some_and(|(_, s)| score <= s) {
+        // `NaN < floor` is FALSE, so a NaN logit sails through a plain floor
+        // comparison and can leave the function returning a NaN score as a
+        // "detection" (#298 review). Non-finite scores are refused like
+        // non-finite boxes.
+        if !score.is_finite() || score < floor || best.is_some_and(|(_, s)| score <= s) {
             continue;
         }
         let r = reg.get(i * 16..i * 16 + 16)?;
@@ -227,6 +231,21 @@ mod tests {
             decode_full_range_best(&reg, &cls, &anchors, 0.6).expect("finite runner-up wins");
         assert!((score - 0.8808).abs() < 1e-3, "{score}");
         assert!(bbox.iter().all(|v| v.is_finite()));
+        // A NaN LOGIT alone must be no detection at all, and must not mask
+        // a finite runner-up (NaN survives the clamp and the sigmoid).
+        let mut cls = vec![-100.0f32; 2304];
+        cls[5] = f32::NAN;
+        let reg = vec![0.0f32; 2304 * 16];
+        assert!(decode_full_range_best(&reg, &cls, &anchors, 0.6).is_none());
+        let mut cls = vec![-100.0f32; 2304];
+        cls[5] = f32::NAN;
+        cls[9] = 2.0;
+        let mut reg = vec![0.0f32; 2304 * 16];
+        reg[9 * 16 + 2] = 24.0;
+        reg[9 * 16 + 3] = 24.0;
+        let (_, score) =
+            decode_full_range_best(&reg, &cls, &anchors, 0.6).expect("finite candidate wins");
+        assert!(score.is_finite());
         // The sigmoid clip keeps an extreme logit from overflowing.
         let mut cls = vec![-100.0f32; 2304];
         cls[3] = 1e30;

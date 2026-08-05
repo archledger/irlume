@@ -42,16 +42,16 @@ def read_pnm(path):
     return rgb, arr.mean()
 
 
-def detector(model_path):
+def detector(model_path, floor):
     opts = vision.FaceDetectorOptions(
         base_options=mp_python.BaseOptions(model_asset_path=model_path),
-        min_detection_confidence=0.5,
+        min_detection_confidence=floor,
     )
     return vision.FaceDetector.create_from_options(opts)
 
 
-def main(short_p, full_p, roots):
-    dets = {"short": detector(short_p), "full": detector(full_p)}
+def main(short_p, full_p, roots, floor):
+    dets = {"short": detector(short_p, floor), "full": detector(full_p, floor)}
     w = csv.writer(sys.stdout)
     w.writerow(["camera", "segment", "kind", "frame", "model", "n", "score", "mean",
                 "x1", "y1", "x2", "y2"])
@@ -83,4 +83,12 @@ def main(short_p, full_p, roots):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3:])
+    # --floor N: detection confidence floor. 0.5 is the general-bench default
+    # (the #294 record was produced at 0.5); PARITY runs use 0.6 so both
+    # instruments share the decoder's operating floor (#298 review).
+    argv = sys.argv[1:]
+    floor = 0.5
+    if argv and argv[0] == "--floor":
+        floor = float(argv[1])
+        argv = argv[2:]
+    main(argv[0], argv[1], argv[2:], floor)

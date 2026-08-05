@@ -536,8 +536,11 @@ would change something nobody was shown. The supplied id is never trusted as
 input, only compared. On success it returns a `transaction_id`.
 
 A partial apply is reported as a failure and still records its transaction, so
-the surfaces that did change can be rolled back. The id is written to standard
-error in that case, because an error document carries no `data`.
+the surfaces that did change can be rolled back. The id travels IN THE
+DOCUMENT in that case, as a top-level `transaction_id` beside `failed`, not on
+standard error: machine mode promises stdout carries the answer and stderr
+stays empty, and a caller recovering from a half-changed login stack needs the
+id from the same place it reads everything else.
 
 **verify** answers whether the machine is still as that transaction left it,
 per surface: `as-applied`, `changed-since-apply`, or `unreadable`. It also
@@ -562,7 +565,9 @@ rejected rather than sanitised, because the id becomes a filename.
 Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
 `not-authorized` (apply and `rollback --apply` need root, checked before
 anything is written rather than left to a write failing partway),
-`unconfirmed-transaction`, `unsupported-record`, `operation-failed`.
+`unconfirmed-transaction`, `unsupported-record`, `unmanaged-path` (a record
+names a file irlume does not manage, so rollback refuses to touch it),
+`operation-failed`.
 
 A surface's `.pre-irlume` backup is part of the surface. The plan id covers it,
 so a backup that changes between `plan` and `apply` makes the plan stale: wiring

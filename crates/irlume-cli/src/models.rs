@@ -155,7 +155,10 @@ pub(crate) fn recognizer_space_for(name: &str) -> Result<String, String> {
     }
     if let Some(hex) = name.strip_prefix("embed:") {
         if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(name.to_string());
+            // Lowercased: stored tags are lowercase `sha256_hex` output and
+            // the daemon compares case-sensitively, so uppercase input could
+            // only ever match nothing.
+            return Ok(format!("embed:{}", hex.to_ascii_lowercase()));
         }
         return Err(format!(
             "'{name}' is not a recognizer space tag (embed: followed by 64 hex digits)"
@@ -846,6 +849,11 @@ mod tests {
         // how a recognizer the catalog no longer carries stays forgettable.
         let raw = format!("embed:{}", "a".repeat(64));
         assert_eq!(super::recognizer_space_for(&raw).unwrap(), raw);
+        // Uppercase hex normalizes: stored tags are lowercase `sha256_hex`
+        // output and the daemon compares case-sensitively, so passing the
+        // case through could only ever match nothing (Codex, #292).
+        let upper = format!("embed:{}", "A".repeat(64));
+        assert_eq!(super::recognizer_space_for(&upper).unwrap(), raw);
         let e = super::recognizer_space_for("embed:nothex").unwrap_err();
         assert!(e.contains("64 hex"), "{e}");
         let e = super::recognizer_space_for(other.name).unwrap_err();

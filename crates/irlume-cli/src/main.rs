@@ -327,6 +327,18 @@ fn shell_single_quote(value: &str) -> String {
 /// to-3 face profiles and their scans via the daemon.
 fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
+    // A supplied `--user` must carry a real username. `user_arg` falls back
+    // to SUDO_USER/$USER when the flag is ABSENT, which is right for the bare
+    // commands, but a dangling `--user` inheriting that fallback would point
+    // a destructive subcommand (forget-model, delete) at the invoking user's
+    // own enrollment. Checked here, not in `user_arg`: the fallback semantics
+    // of an absent flag belong to every caller, this omission does not.
+    if args.iter().any(|a| a == "--user")
+        && !matches!(flag(args, "--user"), Some(u) if !u.is_empty() && !u.starts_with("--"))
+    {
+        eprintln!("[profiles] --user requires a username");
+        return std::process::ExitCode::from(2);
+    }
     let user = user_arg(args);
     let req = match sub {
         None | Some("list") => Request::ListProfiles {

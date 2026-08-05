@@ -709,7 +709,8 @@ struct LightState {
 
 impl LightState {
     /// Verbatim the reads `refresh_light` used to make inline, EXCEPT that
-    /// camera enumeration is now conditional: see [`enumerate_cameras_now`].
+    /// it no longer enumerates cameras at all: the daemon answers Health for
+    /// capabilities and ListCameras for the picker (#187).
     fn gather(user: &str, prev_armed: Option<bool>) -> Self {
         let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
         // Classifying a node OPENS it. While the daemon is reachable it may

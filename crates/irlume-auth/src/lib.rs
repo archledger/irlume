@@ -637,6 +637,16 @@ impl Engine {
     pub fn with_devices(mut self, rgb: &str, ir: &str) -> Self {
         self.rgb_dev = rgb.into();
         self.ir_dev = ir.into();
+        // The caller's selection is the truth about IR availability (#281).
+        // Engine::load's one-shot capabilities() probe can lose a startup race
+        // against the emitter setup holding the IR node, and then the engine
+        // sits in convenience tier for its whole life while the daemon logs
+        // secure tier from ITS selection. The daemon already defines "usable"
+        // as the selected path existing (its tier log uses exactly that), so
+        // the engine adopts the same definition when devices are handed to it;
+        // the NO_IR test sentinel is a nonexistent path and keeps reading as
+        // unavailable.
+        self.ir_available = std::path::Path::new(ir).exists();
         self
     }
 
@@ -655,6 +665,10 @@ impl Engine {
     pub fn set_devices(&mut self, rgb: &str, ir: &str) {
         self.rgb_dev = rgb.into();
         self.ir_dev = ir.into();
+        // Same rule as with_devices: the selection carries IR availability, so
+        // a runtime camera switch to (or from) an IR-less pair retiers the
+        // engine instead of trusting the load-time snapshot (#281).
+        self.ir_available = std::path::Path::new(ir).exists();
     }
 
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the
@@ -4858,6 +4872,37 @@ mod engine_tests {
         assert_eq!(s.engine.rgb_device(), "/dev/irlume-test-alt-rgb");
         assert_eq!(s.engine.ir_device(), "/dev/irlume-test-alt-ir");
         s.engine.set_devices(NO_RGB, NO_IR); // restore the shared baseline
+    }
+
+    #[test]
+    fn device_selection_carries_ir_availability() {
+        // #281: the engine's one-shot capabilities() probe at load can lose a
+        // startup race against the emitter setup holding the IR node, leaving
+        // the engine in convenience tier while the daemon (whose selection
+        // FOUND the pair) logs secure tier. The caller's selection is the
+        // truth: a selected IR path that exists retiers the engine Secure, a
+        // nonexistent one (the test sentinel, or an IR-less box's fallback
+        // default) reads Convenience. /dev/null stands in for "an existing
+        // node" — the rule is exists(), the daemon's own definition of usable.
+        let _g = env_guard();
+        let mut s = shared();
+        s.engine.set_devices(NO_RGB, "/dev/null");
+        assert!(s.engine.ir_available(), "an existing IR path must retier");
+        assert_eq!(s.engine.tier(), Tier::Secure);
+        s.engine.set_devices(NO_RGB, NO_IR);
+        assert!(!s.engine.ir_available(), "a nonexistent IR path must not");
+        assert_eq!(s.engine.tier(), Tier::Convenience);
+        // The builder path applies the same rule.
+        drop(s);
+        let e = Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("engine load")
+        .with_devices(NO_RGB, "/dev/null");
+        assert!(e.ir_available());
+        let e = e.with_devices(NO_RGB, NO_IR);
+        assert!(!e.ir_available());
     }
 
     #[test]

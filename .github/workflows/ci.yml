@@ -420,6 +420,22 @@ jobs:
       - name: packaging parity (units in every lane, versions agree)
         run: ./scripts/check-packaging-parity.sh
 
+      # Nothing validated the AppArmor profiles until 0.9.0, and they are the
+      # only confinement on the Debian/Ubuntu lane. A profile that fails to
+      # parse does not confine, and the two bugs this release fixed (a missing
+      # pcrlock rule that broke every Tier 2 unseal, and a granted-vs-denied
+      # capability) both live in these files. The runner ships apparmor_parser;
+      # -Q parses and exits without loading, so no privileges are needed.
+      - name: apparmor profiles parse
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y apparmor
+          for f in packaging/apparmor/*; do
+            echo "checking $f"
+            apparmor_parser -Q "$f"
+          done
+
       # The guard that stops a zero-match test filter from reporting success is
       # itself a parser, so it gets the same treatment it enforces: prove it can
       # still tell a real run from an empty one. Fixtures only, no Rust build.

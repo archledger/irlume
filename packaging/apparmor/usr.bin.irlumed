@@ -133,4 +133,12 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # Reading another user's state dir as the root daemon.
   capability dac_override,
   capability dac_read_search,
+  # The camera-consumer scan (#207) walks /proc to name whatever else holds a
+  # video node, and reading another user's /proc/<pid>/fd asks for sys_ptrace.
+  # DENY it rather than grant it: the capability would let irlumed inspect any
+  # process on the machine, which is far more than a diagnostic message is
+  # worth, and the scan already degrades to "could not inspect every process"
+  # and proceeds. An explicit deny also stops AppArmor auditing the refusal,
+  # which was filling the audit log with about 30 entries per boot.
+  deny capability sys_ptrace,
 }

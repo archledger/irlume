@@ -25,16 +25,23 @@ use irlume_common::{Error, Result};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
+// The fallback goes through `state_dir()`, NOT the bare `STATE_DIR`
+// constant, so one `IRLUME_STATE_DIR` moves the whole sandbox together.
+// When these two resolved to the literal while the profile store honored
+// the override, a sandboxed ROOT run reached back into live state: on
+// 2026-08-05 a sandboxed `profiles forget-model` emptied the real
+// /var/lib/irlume/template-keys and /var/lib/irlume/recovery, leaving an
+// encrypted enrollment whose key no longer existed anywhere.
 fn key_dir() -> PathBuf {
     std::env::var("IRLUME_TEMPLATE_KEY_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(irlume_common::STATE_DIR).join("template-keys"))
+        .unwrap_or_else(|_| irlume_common::state_dir().join("template-keys"))
 }
 
 fn recovery_dir() -> PathBuf {
     std::env::var("IRLUME_RECOVERY_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(irlume_common::STATE_DIR).join("recovery"))
+        .unwrap_or_else(|_| irlume_common::state_dir().join("recovery"))
 }
 
 pub fn key_path(user: &str) -> PathBuf {
@@ -188,6 +195,41 @@ fn set_0600(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
+
+    /// A sandboxed run must not reach live cryptographic state. `IRLUME_STATE_DIR`
+    /// moved the profile store but not these two directories, so a sandboxed ROOT
+    /// `profiles forget-model` deleted the real template keys and recovery
+    /// envelopes on 2026-08-05, leaving an encrypted enrollment nothing could
+    /// open. Both fallbacks must land under the override.
+    #[test]
+    fn sandbox_override_contains_key_and_recovery_dirs() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let sandbox = crate::test_tmp_dir("sandbox-containment");
+        // The per-directory overrides outrank IRLUME_STATE_DIR, so clear them or
+        // this test passes for the wrong reason.
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::env::remove_var("IRLUME_RECOVERY_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &sandbox);
+
+        let key = key_path("someuser");
+        let rec = recovery_path("someuser");
+
+        std::env::remove_var("IRLUME_STATE_DIR");
+
+        assert!(
+            key.starts_with(&sandbox),
+            "template key escaped the sandbox: {}",
+            key.display()
+        );
+        assert!(
+            rec.starts_with(&sandbox),
+            "recovery envelope escaped the sandbox: {}",
+            rec.display()
+        );
+        assert!(!key.starts_with(irlume_common::STATE_DIR));
+        assert!(!rec.starts_with(irlume_common::STATE_DIR));
+    }
+
     use super::*;
     // The override env vars are process-global; the crate-wide lock stops
     // cross-module races too (keyring tests mutate their own override).

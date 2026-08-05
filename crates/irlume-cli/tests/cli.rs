@@ -583,7 +583,7 @@ fn recovery_usage_and_daemon_failures() {
 
     let (code, _, err) = run_stdin(
         &mut sb.cmd(&["recovery", "setup", "--user", "tester"]),
-        "passphrase\n",
+        "correct horse battery\n",
     );
     assert_eq!(code, 1);
     assert!(err.contains("setup failed"), "{err}");
@@ -1283,6 +1283,37 @@ fn recovery_success_paths_with_a_live_daemon() {
     assert!(out.contains("recovery envelope erased"), "{out}");
 }
 
+/// The recovery passphrase is the only barrier on the template-key envelope
+/// against someone holding the disk, and the strength floor used to live inside
+/// the interactive branch. `irlume recovery setup </dev/null` therefore wrapped
+/// the key under an EMPTY passphrase and reported success. Both piped rejections
+/// must happen in the CLI, before any request reaches the daemon.
+#[test]
+fn recovery_setup_enforces_the_strength_floor_on_the_piped_path() {
+    let sb = Sandbox::new("recoveryfloor");
+    // A daemon that would happily accept whatever arrives, so a passing test
+    // means the CLI stopped it rather than the socket being dead.
+    let log = serve(&sock(&sb), |_| Response::Ok("recovery set".into()));
+
+    for (piped, want) in [("", "empty passphrase"), ("short\n", "too short")] {
+        let (code, _, err) = run_stdin(
+            &mut sb.cmd(&["recovery", "setup", "--user", "tester"]),
+            piped,
+        );
+        assert_eq!(code, 2, "must exit 2 on a refused passphrase: {err}");
+        assert!(err.contains(want), "expected {want:?} in: {err}");
+        assert!(
+            err.contains("nothing set"),
+            "the user must be told no envelope was written: {err}"
+        );
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a refused passphrase must not reach the daemon: {:?}",
+        log.lock().unwrap()
+    );
+}
+
 #[test]
 fn recovery_setup_error_names_the_enroll_first_remedy() {
     let sb = Sandbox::new("recoveryerr");
@@ -1291,7 +1322,7 @@ fn recovery_setup_error_names_the_enroll_first_remedy() {
     });
     let (code, _, err) = run_stdin(
         &mut sb.cmd(&["recovery", "setup", "--user", "tester"]),
-        "pass\n",
+        "correct horse battery\n",
     );
     assert_eq!(code, 1);
     assert!(err.contains("setup failed: no template key"), "{err}");
@@ -1363,6 +1394,7 @@ fn enroll_reports_a_new_profile_and_forwards_the_flags() {
         created: true,
         added: 3,
         total: 3,
+        room: 27,
         added_scans: vec!["Scan 1".into(), "Scan 2".into(), "Scan 3".into()],
     });
     let (code, out, _) = run(&mut sb.cmd(&[
@@ -1396,6 +1428,7 @@ fn enroll_merge_points_at_add_scan() {
         created: false,
         added: 2,
         total: 8,
+        room: 22,
         added_scans: vec!["Scan 7".into(), "Scan 8".into()],
     });
     let (code, out, _) = run(&mut sb.cmd(&["enroll", "--user", "tester"]));
@@ -1574,6 +1607,7 @@ fn setup_walks_every_step_noninteractively() {
             created: true,
             added: 6,
             total: 6,
+            room: 24,
             added_scans: Vec::new(),
         },
         Request::SealPassword { .. } => Response::PasswordSealed,

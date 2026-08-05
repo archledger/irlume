@@ -137,6 +137,17 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Every stage, in pipeline order. Callers that report on the stage set must
+    /// iterate this rather than spelling stages out, or they go stale the moment
+    /// one opens (doctor claimed "the pad stage only today" through the release
+    /// that opened recognition).
+    pub const ALL: [Stage; 4] = [
+        Stage::Detection,
+        Stage::Landmarks,
+        Stage::Recognition,
+        Stage::Pad,
+    ];
+
     /// Stable lowercase name, used in CLI output and the machine API.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -303,10 +314,7 @@ pub fn by_name(name: &str) -> Option<&'static ThirdPartyModel> {
 /// Directory for fetched third-party weights: `$IRLUME_STATE_DIR` (sandbox
 /// override) else `/var/lib/irlume`, plus [`SUBDIR`].
 pub fn dir() -> PathBuf {
-    let root = std::env::var_os("IRLUME_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(crate::STATE_DIR));
-    root.join(SUBDIR)
+    crate::state_dir().join(SUBDIR)
 }
 
 /// On-disk path for a catalog entry.

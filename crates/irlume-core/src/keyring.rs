@@ -21,10 +21,12 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 /// Root-only directory for sealed-password envelopes.
+// See the template-key note: the fallback must honor `IRLUME_STATE_DIR`, or a
+// sandboxed root `keyring forget` deletes the live armed seal.
 fn keyring_dir() -> PathBuf {
     std::env::var("IRLUME_KEYRING_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(irlume_common::STATE_DIR).join("keyring"))
+        .unwrap_or_else(|_| irlume_common::state_dir().join("keyring"))
 }
 
 pub fn envelope_path(user: &str) -> PathBuf {
@@ -515,6 +517,25 @@ pub fn forget_password(user: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The armed seal is live cryptographic state; a sandboxed root `keyring
+    /// forget` must delete the sandbox copy, never `/var/lib/irlume/keyring`.
+    #[test]
+    fn sandbox_override_contains_keyring_dir() {
+        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let sandbox = crate::test_tmp_dir("sandbox-containment-kr");
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &sandbox);
+        let env = envelope_path("someuser");
+        std::env::remove_var("IRLUME_STATE_DIR");
+        assert!(
+            env.starts_with(&sandbox),
+            "keyring envelope escaped the sandbox: {}",
+            env.display()
+        );
+        assert!(!env.starts_with(irlume_common::STATE_DIR));
+    }
+
     use super::*;
 
     #[test]

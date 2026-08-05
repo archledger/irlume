@@ -407,7 +407,7 @@ with none of these checks ([#179]).
 [#159]: https://github.com/archledger/irlume/issues/159
 [#179]: https://github.com/archledger/irlume/issues/179
 
-## Third-party liveness models: optional, and recommended
+## Third-party models: optional, and recommended
 
 **Enable one if a printed photograph of you should not unlock your machine.**
 The built-in gate does not stop a life-size print. Measured twice on the same
@@ -425,23 +425,35 @@ sudo irlume models enable flir
 The rest of this section is why it is opt-in rather than shipped.
 
 irlume's anti-spoof gate is algorithmic by default. `irlume models` lists
-externally-trained models irlume can fetch onto your machine as an extra,
-deny-only liveness cue: one that can reject a presentation but can never
-approve one the built-in gate rejected. These models carry a real license on
-their weights but fail the shipped-stack provenance bar (ADR-0001), so irlume
-does not ship or mirror them; enabling downloads them once from the publisher,
-pinned by checksum, after you confirm the license and provenance on screen.
-Each catalog entry was measured on real hardware first
+externally-trained models, and what enabling one does depends on the pipeline
+stage its entry names. A PAD entry is an extra, deny-only liveness cue: it can
+reject a presentation but can never approve one the built-in gate rejected. A
+recognition entry is not deny-only: enabling it replaces the shipped
+recognizer for RGB matching at the threshold irlume measured, and it turns off
+IR matching, fusion, and dark login, which are unmeasured for that model. How
+you obtain the file is also per entry. `flir` is fetched once from the
+publisher by irlume, pinned by checksum, after you confirm the license and
+provenance on screen; `buffalo` you supply yourself with `sudo irlume models
+add buffalo <path>`, because its licence makes obtaining it your decision.
+Either way, these models carry a real license on their weights but fail the
+shipped-stack provenance bar (ADR-0001), so irlume does not ship or mirror
+them, and each catalog entry was measured on real hardware first
 ([docs/pad-results/](pad-results/)).
 
 ```sh
 irlume models                     # what exists, what it measured, what's enabled
 sudo irlume models enable flir    # fetch + verify + enable (typed confirmation)
-sudo irlume models disable        # delete the weights, back to the shipped stack
+sudo irlume models disable [name] # delete the weights, back to the shipped stack
 ```
 
-`irlume doctor` names the enabled model; the daemon refuses weights whose
-checksum stops matching and falls back to the built-in gate alone.
+A bare `models disable` works while one model is enabled; with more than one
+enabled it errors and asks you to name which.
+
+`irlume doctor` names the enabled models. A refusal costs different things per
+stage: a PAD model whose checksum stops matching has its weights refused, and
+the daemon falls back to the built-in gate alone; a selected recognizer that
+is refused (missing file, failed checksum) stops the daemon from starting at
+all, so face auth falls back to the password.
 
 ---
 
@@ -459,7 +471,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=0` opts OUT of the gesture required before your keyring password is released (default: required); `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in model; `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge on\|off`; `sudo irlume models enable/disable` |
+| `/etc/irlume/settings.conf` | `credential_release_challenge=0` opts OUT of the gesture required before your keyring password is released (default: required); `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in PAD model; `third_party_recognizer=<name>` names an enabled opt-in recognizer (`models add buffalo` writes it); `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge on\|off`; `sudo irlume models enable/add/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |

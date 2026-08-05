@@ -38,7 +38,7 @@ Conventions that apply everywhere:
 | `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user; the deliberate counterpart to `models disable`, which deletes weights but keeps templates. `<model>` is `shipped`, a catalog name, or an `embed:<sha256>` tag as `profiles list` prints it. A profile left with no scans is deleted with them |
 | `irlume profiles eyes-open <on\|off>` | require eyes open to unlock |
 | `irlume profiles challenge <on\|off>` | opt-in passive blink liveness |
-| `sudo irlume calibrate-closure [--rounds N] [--force]` | teach the eye-closure consent gesture for app prompts. Captures eyes-open/closed EAR over N rounds (default 3) and stores the median, because a single capture varies enough to leave the threshold sitting on top of your own closures; it then reports how many of your readings the result would actually accept. Replacing an existing calibration asks first, and `--force` is required to do it with no terminal. The head nod is the default and needs no calibration |
+| `sudo irlume calibrate-closure [--rounds N] [--force] [--measure-only [--pose L]]` | teach the eye-closure consent gesture for app prompts. Captures eyes-open/closed EAR over N rounds (default 3) and stores the median, because a single capture varies enough to leave the threshold sitting on top of your own closures; it then reports how many of your readings the result would actually accept. Replacing an existing calibration asks first, and `--force` is required to do it with no terminal. `--measure-only` prints the EAR readings and stores nothing, and `--pose L` labels what you are holding in that data (e.g. `glasses-on-open`). The head nod is the default and needs no calibration |
 | `irlume identify` | 1:N "who is this?"; as root it checks all users, otherwise scoped to you |
 
 ## Keyring, TPM, and recovery
@@ -65,7 +65,7 @@ Conventions that apply everywhere:
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume camera-tune [--rounds N]` | yes | measure whether this camera keeps its brightness while both sensors stream, and store the resulting capture mode in `cameras.conf`; some modules starve their own RGB interface (measured: NexiGo HelloCam N930W keeps 56% of its RGB brightness), and this puts those on one-at-a-time capture |
 | `irlume models [list]` | no | show the opt-in third-party models (stage, tier, checksum state); `models list --json` is the [machine API](MACHINE-API.md) per-stage report |
-| `irlume models enable <name>` / `models disable` | yes | fetch and enable one (deny-only, checksum-pinned), or turn it off |
+| `irlume models enable <name>` / `models disable [name]` | yes | fetch and enable one (checksum-pinned; a PAD entry is a deny-only cue, a recognition entry replaces the RGB matcher at its measured threshold), or turn one off; a bare `disable` errors when more than one model is enabled |
 | `irlume models add <name> <path>` | yes | enable a model whose licence means you obtain the file; verified against the pin irlume measured ([THIRD-PARTY-MODELS.md](THIRD-PARTY-MODELS.md)) |
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, wipe enrolled data unless `--keep-data`, then print the package-removal command |
@@ -77,7 +77,7 @@ bypass the daemon. Not needed for normal use.
 
 `capture`, `eval`, `irbench`, `genuine`, `calcapture`, `normprobe`,
 `liveness`, `meshprobe`, `selftest align`, `padcapture`, `padreport`,
-`verify`, `enrolldev`, `suncal`
+`verify`, `enrolldev`, `suncal`, `blinkcap`
 
 Each prints its own usage line when run without arguments. `padcapture` /
 `padreport` are the presentation-attack self-test pair documented in

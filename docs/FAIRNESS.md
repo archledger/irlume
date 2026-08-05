@@ -56,8 +56,9 @@ against 1.042×10⁻³); it is both fairer and more accurate. The 2026-08-05
 split-source re-run (docs/recognition-results/2026-08-05-buffalo-l.md)
 reproduced this document's AuraFace figures exactly and measured, at
 buffalo_l's enabled 0.55 operating point, a spread of ≈ 3.9× against ≈ 6.1×
-for AuraFace with worst-group FAR near parity — parity by construction, since
-that operating point was chosen to match the shipped FAR posture. The
+for AuraFace with worst-group FAR near parity, which is parity by
+construction since that operating point was chosen to match the shipped FAR
+posture. The
 worst-served group shifts to Middle Eastern under buffalo_l.
 
 **We do not ship it.** WebFace600K is web-scraped without subject consent and

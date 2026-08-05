@@ -338,7 +338,7 @@ CLI process's search order lands on, its origin (`shipped`, `caller-env` when
 the calling process's environment chose the path, or `built-in` for the PAD
 stage's gate, which is code rather than a swappable file), and whether it
 opened as a regular file (`readable`). It is a candidate and not a claim about
-the daemon, because the daemon's service unit — or an administrator's drop-in —
+the daemon, because the daemon's service unit (or an administrator's drop-in)
 sets the daemon's own environment, which a shell invocation cannot observe. On
 a stock install the candidate coincides with what the daemon loads; an
 authoritative loaded-model report can only ever come from the daemon itself.
@@ -347,11 +347,11 @@ unreadable file) means the daemon's load of that same candidate would fail.
 
 Each stage also reports whether the daemon requires the file to start and
 whether the stage is open to third-party models. Stages open one at a time
-because their failure modes differ; the PAD stage is the only open one today,
-and it carries a `third_party` object with the enabled entry and the measured
-catalog, including each entry's tier (`fetched` by irlume, or `user-supplied`
-when the license makes obtaining the file the user's business) and the weight
-file's state against its pin.
+because their failure modes differ; PAD and recognition are the open ones
+today, and each open stage carries a `third_party` object with the enabled
+entry and its own measured catalog, including each entry's tier (`fetched` by
+irlume, or `user-supplied` when the license makes obtaining the file the
+user's business) and the weight file's state against its pin.
 
 The command needs no daemon, so it still answers when the daemon will not
 start.
@@ -359,8 +359,8 @@ start.
 `third_party.enabled.known` is keyed on what the read established, not on who
 asked. Observed absence (no config file or key; the config directory is
 world-readable) is `known: true, name: null` from any caller. A read that
-failed — the root-only file denied to an unprivileged caller, or a wrong
-SELinux label denying even root — established nothing and is `known: false`,
+failed (the root-only file denied to an unprivileged caller, or a wrong
+SELinux label denying even root) established nothing and is `known: false`,
 which a consumer must not render as disabled.
 
 ### Error codes
@@ -576,7 +576,7 @@ the next enable rather than sitting inert.
 A rollback that stops partway records which surfaces it put back, durably, as it
 goes. Re-running it resumes: those surfaces are skipped rather than re-checked,
 because a restored file deliberately no longer matches the digest apply left and
-checking it would refuse the whole record — which used to leave the operator
+checking it would refuse the whole record, which used to leave the operator
 rebuilding the rest from the JSON by hand. `verify` reports them as
 `already_restored` and excludes them from `rollback_available`, so drift caused
 by irlume's own restore is not reported as somebody's edit.
@@ -599,8 +599,8 @@ an engine will not do is act on the parts of a newer record it recognises: the
 fields would parse and look reasonable while meaning something else, and a
 record is the recovery path for a machine's login stack.
 
-Every irlume path that changes PAM — `login apply`, `login rollback --apply`,
-the human `login enable`/`disable`, and the self-heal reconcile — holds one
+Every irlume path that changes PAM (`login apply`, `login rollback --apply`,
+the human `login enable`/`disable`, and the self-heal reconcile) holds one
 exclusive lock for the whole operation, so a consumer's transaction cannot
 interleave with another irlume process. The lock does not cover package managers
 or an administrator with an editor, which is why each surface is re-checked

@@ -1,12 +1,9 @@
-# Third-party liveness models irlume has measured
+# Third-party models irlume has measured
 
-irlume's built-in liveness gate does not stop a printed photograph of an
-enrolled face. That is measured, not suspected: the gate returned `Live` for all
-24 presentations of a vinyl print in issue #235, and again for an enhanced
-version of the same attack, so a trained cue is currently the only thing that
-refuses it. See [the PAD results](pad-results/) for every number behind that.
-
-This page lists the models irlume can use for that job. **Everything here was
+This page lists the externally-trained models irlume can run in its two open
+pipeline stages: liveness (PAD) cues that can deny a presentation the built-in
+gate accepted, and a recognizer that replaces the shipped one for RGB matching
+at a measured threshold. **Everything here was
 measured on real hardware by this project before it was listed.** Nothing is
 listed because a publisher claims it works, and a model irlume has not measured
 is not supported, whatever its benchmarks say elsewhere.
@@ -32,9 +29,9 @@ stage can be installed or wired. Two stages are open:
   protocol recorded on issue #276: the false-accept side measured on public
   datasets replayed through irlume's own pipeline, the false-reject side on
   this project's cameras, the threshold set from where those populations were
-  observed. A third-party recognizer runs RGB matching only — IR matching,
+  observed. A third-party recognizer runs RGB matching only: IR matching,
   fusion, and dark login are disabled because no entry carries IR-side
-  measurements — and templates enrolled under a different recognizer never
+  measurements, and templates enrolled under a different recognizer never
   match (each is tagged with the digest of the weights that produced it), so
   enabling one means re-enrolling. If the daemon cannot honour an enabled
   recognizer selection (missing file, failed pin), it refuses to start and
@@ -71,7 +68,14 @@ the two populations were actually seen to sit on its own hardware.
 
 ## The models
 
-### `flir` — irlume fetches it
+The case for the PAD entries is that irlume's built-in liveness gate does not
+stop a printed photograph of an enrolled face. That is measured, not
+suspected: the gate returned `Live` for all 24 presentations of a vinyl print
+in issue #235, and again for an enhanced version of the same attack, so a
+trained cue is currently the only thing that refuses it. See
+[the PAD results](pad-results/) for every number behind that.
+
+### `flir`: irlume fetches it
 
 An infrared anti-spoof cue from Alibaba DAMO, published on ModelScope under MIT.
 
@@ -102,7 +106,7 @@ irlume verifies your file against the published sha256 before enabling it, and
 a non-matching file is refused: that file is not the artifact the threshold was
 measured on.
 
-### `buffalo` — you supply the file (recognition stage)
+### `buffalo`: you supply the file (recognition stage)
 
 The InsightFace `buffalo_l` recognizer (`w600k_r50.onnx`, WebFace600K-trained),
 measured 2026-08-05 under the split-source threshold protocol
@@ -111,7 +115,7 @@ measured 2026-08-05 under the split-source threshold protocol
 - **Measured:** LFW EER 3.9% against the shipped recognizer's 4.2% on the
   identical pipeline. At the enabled 0.55 threshold the demographic FAR
   spread is 3.9x against the shipped model's 6.1x, with the two worst groups
-  at parity — and the worst-served group shifts to Middle Eastern, which
+  at parity, and the worst-served group shifts to Middle Eastern, which
   reads slightly worse than under the shipped model. Live genuine floors
   0.685 to 0.793 across two cameras, anchored by shipped-model control runs.
 - **Threshold:** 0.55. Worst demographic group's FAR there matches the shipped
@@ -119,7 +123,7 @@ measured 2026-08-05 under the split-source threshold protocol
   cross-lighting margin measured zero.
 - **What enabling it does:** replaces the recognizer for RGB matching. IR
   matching, fusion, and dark login are disabled (unmeasured for this model),
-  and templates enrolled under the shipped recognizer will not match —
+  and templates enrolled under the shipped recognizer will not match;
   re-enroll after enabling, and again after disabling.
 - **Provenance:** WebFace600K is scraped web imagery without subject consent,
   and the licence is non-commercial research only. Both fail ADR-0001 for
@@ -161,11 +165,15 @@ irlume prints the licence before enabling anything and distributes no weights.
 
 - **Models irlume has not measured.** Publishing "this probably works" is how a
   page like this becomes a recommendation engine for untested weights.
-- **Any model as a default.** These cues are deny-only: they can refuse a
+- **Any model as a default.** The PAD entries are deny-only: they can refuse a
   presentation the built-in gate accepted, never approve one it rejected. That
   is what makes them safe to add, and it is also why a broken one degrades
   quietly rather than loudly, so `irlume doctor` reports which model is active
-  and whether its weights still match their pin.
+  and whether its weights still match their pin. The recognition entry grants,
+  and its case for staying opt-in is different: enabling it replaces the
+  matcher on the grant path and turns off IR matching, fusion, and dark login,
+  so it runs only at a threshold irlume measured, never at a number the
+  publisher shipped.
 
 ## Adding a model to this page
 

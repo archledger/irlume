@@ -30,9 +30,10 @@ irlume status --json --contract 1
 Call `irlume version --json` once at startup:
 
 ```json
-{ "contract_version": 1, "engine_version": "0.7.0", "command": "version", "ok": true,
+{ "contract_version": 1, "engine_version": "0.8.1", "command": "version", "ok": true,
   "data": { "capabilities": ["version-json", "profiles-list-json", "status-json",
-                             "doctor-json", "login-status-json"],
+                             "doctor-json", "login-status-json", "auth-test-events",
+                             "login-plan-json", "login-transactions", "models-list-json"],
             "contract_versions": { "min": 1, "max": 1 },
             "limits": { "max_profiles": 3 } } }
 ```
@@ -59,9 +60,12 @@ behaviour. The version string is not.
 
 ## What contract 1 offers
 
-Five read-only commands. All are safe to call at any time; none of them enroll,
-wire PAM, write to the system, or capture an image. Camera facts come from
-enumerating device nodes, not from opening a stream.
+Nine capabilities. Seven of them only read: they never enroll, wire PAM, write
+to the system, or capture an image, and the camera facts in `status --json`
+come from enumerating device nodes, not from opening a stream. The other two
+are the exceptions a consumer should know before invoking them: `auth test
+--events=jsonl` opens the camera for a live capture, and `login apply` (with
+`login rollback --apply`) rewrites the PAM stack.
 
 | Command | Capability | Answers |
 |---|---|---|
@@ -70,6 +74,10 @@ enumerating device nodes, not from opening a stream.
 | `irlume doctor --json` | `doctor-json` | every readiness check as an id and a state |
 | `irlume profiles list --json [--user U]` | `profiles-list-json` | profile and scan display names, per-user liveness flags |
 | `irlume login status --json` | `login-status-json` | which PAM surfaces carry face auth |
+| `irlume models list --json` | `models-list-json` | every pipeline stage's model candidate, and the third-party state of the open stages |
+| `irlume auth test --events=jsonl` | `auth-test-events` | does the caller's live face match its own enrolment, as a stream of events; captures from the camera, releases nothing |
+| `irlume login plan --action A --json` | `login-plan-json` | what `login enable` or `disable` would change, without changing anything |
+| `irlume login apply` / `verify` / `rollback` | `login-transactions` | carry out, check, and undo a planned PAM change; `apply` and `rollback --apply` write to the system and need root, `verify` only reads |
 
 Three rules run through all of them:
 
@@ -90,11 +98,15 @@ typed. Key off `id`, `state`, and the booleans.
 
 ## What contract 1 does not offer, and what to do instead
 
-- **No mutation.** There is no machine command that enrolls, deletes, wires PAM,
-  or changes configuration. Privileged actions run through the human CLI, where
-  the user sees what is being changed. Launch it, or tell the user the command.
-- **No event stream.** Poll `status --json` when your window is visible. Nothing
-  in contract 1 pushes.
+- **One mutation, and only that one.** `login apply` and `login rollback
+  --apply` (capability `login-transactions`) rewrite the PAM stack, and only
+  after re-deriving a plan the consumer displayed. No machine command enrolls,
+  deletes a profile, or changes any other configuration; those actions run
+  through the human CLI, where the user sees what is being changed. Launch it,
+  or tell the user the command.
+- **No push.** `auth test --events=jsonl` streams events, but only to the
+  invocation that asked for them; nothing in contract 1 pushes state changes
+  to an idle consumer. Poll `status --json` when your window is visible.
 - **No cancellation.** Terminating the process is the cancellation mechanism for
   this contract version.
 - **No D-Bus service and no client library.** The CLI plus JSON keeps a frontend

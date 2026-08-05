@@ -151,6 +151,16 @@ sha256 (not Git LFS), `nix build github:archledger/irlume` gets the real weights
 with no smudge-filter caveat and no LFS bandwidth cost. The daemon still refuses
 to start on a truncated model when `IRLUME_MODELS_STRICT=1` is set.
 
+## Native .tflite models need `IRLUME_TFLITE_LIB`
+
+The FHS packages (Fedora, Arch, Debian, PPA) bundle the TFLite C runtime,
+`libtensorflowlite_c.so`, at `/usr/share/irlume/tflite/`, the first path the
+daemon's resolver probes. The Nix package does not bundle it yet, so to run
+native `.tflite` models set `IRLUME_TFLITE_LIB` to the library's path in the
+daemon's environment (`systemd.services.irlumed.environment`). Without it,
+`.tflite` support reports "runtime not installed" and everything else keeps
+working; a missing runtime is never a startup failure.
+
 ## What was validated
 
 Every row below was exercised on a NixOS VM: log in or unlock with a face, then

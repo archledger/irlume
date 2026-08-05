@@ -188,6 +188,16 @@ impl RgbView<'_> {
 /// 112x112x3 interleaved chip in **RGB** order (u8). Deterministic for fixed
 /// inputs (the property the Phase-1 identity gate relies on).
 pub fn align_to_arcface(frame: &RgbView, src: &Landmarks5) -> irlume_common::Result<Vec<u8>> {
+    // A NaN landmark slides through the least-squares fit as a NaN transform
+    // that the pivoted solve does not always reject, and the sampler then
+    // returns an all-black chip as Ok (measured in
+    // examples/landmark_failure_probe.rs). An alignment from coordinates that
+    // do not exist is the same refusal as a degenerate one.
+    if !src.iter().all(|&(x, y)| x.is_finite() && y.is_finite()) {
+        return Err(irlume_common::Error::Protocol(
+            "degenerate landmark geometry".into(),
+        ));
+    }
     let inv = estimate_similarity(src, &ARCFACE_REF_112)
         .and_then(|t| t.invert())
         .ok_or_else(|| irlume_common::Error::Protocol("degenerate landmark geometry".into()))?;
@@ -316,6 +326,34 @@ mod tests {
         assert_eq!(cosine(&a, &b), -1.0);
         assert_eq!(cosine(&b, &a), -1.0);
         assert_eq!(cosine(&a, &[]), -1.0);
+    }
+
+    #[test]
+    fn nan_landmarks_are_refused_not_aligned_into_a_black_chip() {
+        // Before the finite guard, NaN geometry slid through the similarity
+        // fit into a NaN transform and the sampler returned an all-black chip
+        // as Ok (measured in examples/landmark_failure_probe.rs); the
+        // embedder then embeds a chip that came from no face at all.
+        let data = vec![90u8; 64 * 48 * 3];
+        let view = RgbView {
+            data: &data,
+            width: 64,
+            height: 48,
+        };
+        let nan: Landmarks5 = [(f32::NAN, f32::NAN); 5];
+        assert!(align_to_arcface(&view, &nan).is_err());
+        let mut one = [
+            (20.0, 20.0),
+            (44.0, 20.0),
+            (32.0, 32.0),
+            (24.0, 42.0),
+            (40.0, 42.0),
+        ];
+        one[3] = (24.0, f32::NAN);
+        assert!(align_to_arcface(&view, &one).is_err());
+        // The same five points finite: aligns fine.
+        one[3] = (24.0, 42.0);
+        assert!(align_to_arcface(&view, &one).is_ok());
     }
 
     #[test]

@@ -3336,6 +3336,17 @@ pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return false;
     }
+    // A NaN eye coordinate saturates to pixel (0,0) at the cast below, so a
+    // broken landmark source would have this gate reading the frame corner as
+    // an open eye (measured in examples/landmark_failure_probe.rs: a corner
+    // hotspot answered `true`). Eyes we cannot place are eyes we cannot
+    // verify: fail closed.
+    if !lm[0..2]
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+    {
+        return false;
+    }
     let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     eye_open_at(grey, w, h, lm[0], r) && eye_open_at(grey, w, h, lm[1], r)
@@ -3551,6 +3562,11 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     }
     let mut peak = 0u8;
     for &(ex, ey) in &landmarks[0..2] {
+        // NaN saturates to (0,0) at the casts below; skip an eye we cannot
+        // place instead of scoring whatever sits in the frame corner.
+        if !ex.is_finite() || !ey.is_finite() {
+            continue;
+        }
         let r = GLINT_SEARCH_RADIUS_PX;
         for dy in -r..=r {
             for dx in -r..=r {
@@ -3583,6 +3599,11 @@ pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -
     .sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
     let at = |(ex, ey): (f32, f32)| -> f32 {
+        // Same NaN-saturates-to-(0,0) trap as eye_glint: an eye we cannot
+        // place contributes no contrast rather than the corner's.
+        if !ex.is_finite() || !ey.is_finite() {
+            return 0.0;
+        }
         let (cx, cy) = (ex as i32, ey as i32);
         let (mut peak, mut sum, mut cnt) = (0u8, 0u64, 0u64);
         for dy in -r..=r {
@@ -4852,6 +4873,39 @@ mod tests {
         // Landmarks fully outside the frame: nothing sampled, peak 0.
         let far: Landmarks5 = [(-500.0, -500.0); 5];
         assert_eq!(eye_glint(&grey, 64, 48, &far), 0.0);
+    }
+
+    #[test]
+    fn nan_landmarks_never_read_the_frame_corner_as_an_eye() {
+        // Rust's saturating float→int cast turns NaN into 0, so before the
+        // finite guards a NaN eye sampled pixel (0,0). With a bright corner
+        // (emitter bloom is a realistic stand-in) the probe measured
+        // eye_glint=255 and both_eyes_open=TRUE from landmarks that do not
+        // exist. All three cues must fail closed instead.
+        let (mut grey, _) = ir_frame_with_glints(false, false);
+        // A SPIKE over darker neighbors, not a uniform block: the contrast
+        // cue is peak minus local mean, so a uniform corner reads 0.0 with or
+        // without the guard and the assertion below would not discriminate
+        // (the mutant that removes the guard survived exactly that way).
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                grey[(y * 64 + x) as usize] = 60;
+            }
+        }
+        grey[0] = 255;
+        let nan: Landmarks5 = [(f32::NAN, f32::NAN); 5];
+        assert_eq!(eye_glint(&grey, 64, 48, &nan), 0.0);
+        assert_eq!(eye_glint_contrast(&grey, 64, 48, &nan), 0.0);
+        assert!(!both_eyes_open(&grey, 64, 48, &nan));
+        // One placeable eye is still not both eyes.
+        let one: Landmarks5 = [
+            (20.0, 20.0),
+            (f32::NAN, 20.0),
+            (32.0, 30.0),
+            (26.0, 40.0),
+            (38.0, 40.0),
+        ];
+        assert!(!both_eyes_open(&grey, 64, 48, &one));
     }
 
     #[test]

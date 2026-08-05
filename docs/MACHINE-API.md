@@ -320,6 +320,15 @@ store before a later capability can expose them.
 Display names are chosen by the user, so treat them as user text rather than
 identifiers: they may contain anything the user typed.
 
+Each profile also carries `recognizers`: how many of its scans belong to each
+recognizer, and which recognizer the daemon has loaded. A profile can hold
+templates from several recognizers at once, since a scan records the model
+that produced it, and only the loaded recognizer's templates can match. The
+flat `scans` list therefore cannot answer whether a profile is usable right
+now; the entry whose `live` is true can. None is live when the loaded
+recognizer has no templates in that profile, which is what an operator sees
+after switching models before re-adding scans.
+
 ### `irlume models list --json`
 
 Capability: `models-list-json`.

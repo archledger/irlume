@@ -412,6 +412,34 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                 );
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
+                    // Per-recognizer breakdown when a profile holds more than
+                    // one model's templates, or when the loaded recognizer is
+                    // not the one those templates belong to. Only the loaded
+                    // recognizer's scans can match, so a bare total would let
+                    // a profile look usable when none of it is (#288).
+                    let live = p.live_recognizer.as_deref();
+                    let live_count = live
+                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
+                        .unwrap_or(0);
+                    let show_breakdown = p.scans_by_recognizer.len() > 1
+                        || (live.is_some() && live_count != p.scans.len());
+                    if show_breakdown {
+                        for (space, count) in &p.scans_by_recognizer {
+                            let marker = if live == Some(space.as_str()) {
+                                "live"
+                            } else {
+                                "not loaded"
+                            };
+                            println!("      {count} scans · recognizer {space} ({marker})");
+                        }
+                        if live_count == 0 {
+                            println!(
+                                "      none of these match the loaded recognizer; add scans \
+                                 with `irlume profiles add-scan --profile '{}'`",
+                                p.name
+                            );
+                        }
+                    }
                     for s in &p.scans {
                         println!("      - {s}");
                     }

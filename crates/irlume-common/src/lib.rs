@@ -606,6 +606,17 @@ pub enum OperationErrorCode {
 pub struct ProfileSummary {
     pub name: String,
     pub scans: Vec<String>,
+    /// Per-recognizer scan counts, keyed by embedding space (#288). A profile
+    /// can hold templates from several recognizers at once, and only those
+    /// belonging to the loaded one can match, so "how many scans" has no
+    /// single answer worth reporting on its own. Empty from a daemon that
+    /// predates this field.
+    #[serde(default)]
+    pub scans_by_recognizer: std::collections::BTreeMap<String, usize>,
+    /// The recognizer space the daemon has loaded, so a consumer can say
+    /// which of the above are live right now. `None` from an older daemon.
+    #[serde(default)]
+    pub live_recognizer: Option<String>,
 }
 
 /// Framing-guide sample for guided enrollment; no raw image, safe to poll. The

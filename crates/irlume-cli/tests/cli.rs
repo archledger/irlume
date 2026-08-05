@@ -1256,6 +1256,8 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
             profiles: vec![ProfileSummary {
                 name: "Face Profile 1".into(),
                 scans: vec!["Scan 1".into(), "Glasses".into()],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
             }],
             require_eyes_open: true,
             require_challenge: false,
@@ -1399,6 +1401,8 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             profiles: vec![ProfileSummary {
                 name: "Face Profile 1".into(),
                 scans: vec!["Scan 1".into(), "Scan 2".into()],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
             }],
             require_eyes_open: false,
             require_challenge: true,

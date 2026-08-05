@@ -2057,7 +2057,22 @@ fn profiles_data(
                 "display_name": profile.name,
                 "scans": profile.scans.into_iter().map(|name| {
                     json!({ "display_name": name })
-                }).collect::<Vec<_>>()
+                }).collect::<Vec<_>>(),
+                // Per-recognizer counts, and which recognizer is loaded, so a
+                // consumer can say which templates are live right now (#288).
+                // A profile can hold several recognizers' templates, and only
+                // the loaded one's can match; "scans" alone cannot say that.
+                "recognizers": profile
+                    .scans_by_recognizer
+                    .into_iter()
+                    .map(|(space, count)| {
+                        json!({
+                            "space": space,
+                            "scans": count,
+                            "live": profile.live_recognizer.as_deref() == Some(space.as_str()),
+                        })
+                    })
+                    .collect::<Vec<_>>()
             })
         })
         .collect::<Vec<_>>();
@@ -2854,6 +2869,8 @@ mod tests {
             vec![ProfileSummary {
                 name: "Face Profile 1".into(),
                 scans: vec!["Scan 1".into()],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
             }],
             true,
             false,

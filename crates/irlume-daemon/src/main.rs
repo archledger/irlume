@@ -1640,15 +1640,31 @@ fn enrollment_summaries(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn summarize_enrollment(enr: Option<&irlume_core::storage::Enrollment>) -> EnrollmentSummary {
+fn summarize_enrollment(
+    enr: Option<&irlume_core::storage::Enrollment>,
+    live_recognizer: &str,
+) -> EnrollmentSummary {
     match enr {
         Some(enr) => EnrollmentSummary {
             profiles: enr
                 .profiles
                 .iter()
-                .map(|p| irlume_common::ProfileSummary {
-                    name: p.name.clone(),
-                    scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                .map(|p| {
+                    let mut scans_by_recognizer = std::collections::BTreeMap::new();
+                    for s in &p.scans {
+                        // Untagged scans belong to the recognizer that
+                        // predates tagging, the same rule matching applies.
+                        let space = s.embed_space.clone().unwrap_or_else(|| {
+                            irlume_core::storage::LEGACY_RECOGNIZER_SPACE.to_string()
+                        });
+                        *scans_by_recognizer.entry(space).or_insert(0) += 1;
+                    }
+                    irlume_common::ProfileSummary {
+                        name: p.name.clone(),
+                        scans: p.scans.iter().map(|s| s.name.clone()).collect(),
+                        scans_by_recognizer,
+                        live_recognizer: Some(live_recognizer.to_string()),
+                    }
                 })
                 .collect(),
             require_eyes_open: enr.require_eyes_open,
@@ -1945,7 +1961,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     // re-sealed the template key, which is exactly why the
                     // load lives HERE on the worker and not on a connection
                     // thread.
-                    let sum = summarize_enrollment(enr.as_ref());
+                    let sum = summarize_enrollment(enr.as_ref(), engine.embed_space());
                     publish_enrollment_summary(&user, sum.clone());
                     Response::Enrollment {
                         profiles: sum.profiles,
@@ -3341,6 +3357,54 @@ mod tests {
     // test can pin: Merged maps to Enrolled with created:false and the exact
     // appended scan names (the undo handle), New to created:true.
     #[test]
+    fn the_enrollment_summary_counts_scans_per_recognizer() {
+        // #288: a profile can hold several recognizers' templates and only
+        // the loaded one's can match, so the summary carries the per-space
+        // counts and which space is live. A bare total would let a profile
+        // look usable when none of its scans belong to the loaded model.
+        use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
+        let scan = |name: &str, space: Option<&str>| FaceScan {
+            name: name.into(),
+            rgb: vec![0.0; 4],
+            ir: None,
+            ir_space: None,
+            embed_space: space.map(str::to_string),
+            ir_center_edge_ratio: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        };
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![FaceProfile {
+                name: "P".into(),
+                ir_calib: None,
+                ir_calibs: Default::default(),
+                scans: vec![
+                    scan("a", Some("embed:model-a")),
+                    scan("b", Some("embed:model-a")),
+                    scan("c", Some("embed:model-b")),
+                    // Untagged: belongs to the recognizer that predates
+                    // tagging, the same rule matching applies.
+                    scan("legacy", None),
+                ],
+            }],
+            ..Default::default()
+        };
+        let sum = summarize_enrollment(Some(&enr), "embed:model-b");
+        let p = &sum.profiles[0];
+        assert_eq!(p.scans.len(), 4, "the flat list is unchanged");
+        assert_eq!(p.scans_by_recognizer.get("embed:model-a"), Some(&2));
+        assert_eq!(p.scans_by_recognizer.get("embed:model-b"), Some(&1));
+        assert_eq!(
+            p.scans_by_recognizer
+                .get(irlume_core::storage::LEGACY_RECOGNIZER_SPACE),
+            Some(&1),
+            "untagged scans count under the recognizer that predates tagging"
+        );
+        assert_eq!(p.live_recognizer.as_deref(), Some("embed:model-b"));
+    }
+
+    #[test]
     fn enroll_merge_reports_created_false_with_the_added_scans() {
         let merged = enroll_response(irlume_auth::EnrollOutcome::Merged {
             name: "Face Profile 1".into(),
@@ -3667,6 +3731,8 @@ mod tests {
                             profiles: vec![irlume_common::ProfileSummary {
                                 name: "FromWorker".into(),
                                 scans: vec!["s1".into()],
+                                scans_by_recognizer: Default::default(),
+                                live_recognizer: None,
                             }],
                             require_eyes_open: false,
                             require_challenge: false,
@@ -3875,6 +3941,8 @@ mod tests {
                 profiles: vec![irlume_common::ProfileSummary {
                     name: "Alice".into(),
                     scans: vec!["s1".into()],
+                    scans_by_recognizer: Default::default(),
+                    live_recognizer: None,
                 }],
                 require_eyes_open: true,
                 require_challenge: false,
@@ -5062,6 +5130,8 @@ mod tests {
                 profiles: vec![irlume_common::ProfileSummary {
                     name: "Profile From A Dead Sandbox".into(),
                     scans: vec!["Face Scan 9".into()],
+                    scans_by_recognizer: Default::default(),
+                    live_recognizer: None,
                 }],
                 require_eyes_open: false,
                 require_challenge: false,

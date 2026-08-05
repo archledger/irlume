@@ -506,6 +506,32 @@
                     }
                   }
                 }
+              },
+              "recognizers": {
+                "description": "Per-recognizer scan counts for this profile, and which recognizer the daemon has loaded. A profile can hold templates from several recognizers at once, and only the loaded one's can match, so the flat `scans` list alone cannot say which templates are usable. Absent from an engine that predates per-recognizer reporting.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "space",
+                    "scans",
+                    "live"
+                  ],
+                  "properties": {
+                    "space": {
+                      "description": "The recognizer's embedding space: `embed:` followed by the sha256 of its weights. Opaque; compare for equality, do not parse.",
+                      "type": "string"
+                    },
+                    "scans": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "live": {
+                      "description": "Whether this is the recognizer the daemon currently has loaded. Exactly one entry can be live, and none is live when the loaded recognizer has no templates in this profile.",
+                      "type": "boolean"
+                    }
+                  }
+                }
               }
             }
           }

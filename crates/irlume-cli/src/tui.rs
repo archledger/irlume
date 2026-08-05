@@ -5907,6 +5907,8 @@ mod tests {
         ProfileSummary {
             name: name.into(),
             scans: scans.iter().map(|s| s.to_string()).collect(),
+            scans_by_recognizer: Default::default(),
+            live_recognizer: None,
         }
     }
 
@@ -6195,6 +6197,8 @@ mod tests {
             .map(|i| ProfileSummary {
                 name: format!("p{i}"),
                 scans: Vec::new(),
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
             })
             .collect();
         app.begin_enroll();

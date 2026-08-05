@@ -2927,32 +2927,28 @@ impl Engine {
             ));
         }
         // Anti-mixing: reject scans whose face belongs to a different profile.
-        // Checked on every capture, not just the first, so a second person
-        // stepping in partway through is caught (the enroll path checks the
-        // whole capture for the same reason).
-        for c in &captured {
-            if let Some((other, score)) = colliding_profile(
-                &enr,
-                &c.rgb,
-                Some(profile_name),
-                &self.embed_space,
-                self.rgb_threshold,
-            ) {
-                let cnt = enr
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == other)
-                    .map_or(0, |p| p.scans_in(&self.embed_space));
-                let hint = if cnt < MAX_SCANS_PER_PROFILE {
-                    format!("if you want this face, add the scan to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE})")
-                } else {
-                    format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
-                };
-                return Err(irlume_common::Error::Protocol(format!(
-                    "the scanned face belongs to '{other}' (match {score:.2}), not '{profile_name}'; {hint}. \
-                     Scans of different faces can't be mixed in one profile."
-                )));
-            }
+        let rgbs: Vec<&[f32]> = captured.iter().map(|c| c.rgb.as_slice()).collect();
+        if let Some((other, score)) = foreign_owner_in_capture(
+            &enr,
+            &rgbs,
+            profile_name,
+            &self.embed_space,
+            self.rgb_threshold,
+        ) {
+            let cnt = enr
+                .profiles
+                .iter()
+                .find(|p| p.name == other)
+                .map_or(0, |p| p.scans_in(&self.embed_space));
+            let hint = if cnt < MAX_SCANS_PER_PROFILE {
+                format!("if you want this face, add the scan to '{other}' (it has {cnt}/{MAX_SCANS_PER_PROFILE})")
+            } else {
+                format!("'{other}' is already at the max {MAX_SCANS_PER_PROFILE} scans")
+            };
+            return Err(irlume_common::Error::Protocol(format!(
+                "the scanned face belongs to '{other}' (match {score:.2}), not '{profile_name}'; {hint}. \
+                 Scans of different faces can't be mixed in one profile."
+            )));
         }
         let mut added = Vec::with_capacity(captured.len());
         for c in captured {
@@ -3237,6 +3233,25 @@ fn enroll_merge_target(
         }
     }
     Ok(hit)
+}
+
+/// The first captured scan whose face belongs to a DIFFERENT profile, if any.
+///
+/// Every capture is checked, not just the first, so a second person stepping
+/// into frame partway through an add-scan session is caught; the enroll path
+/// checks its whole capture for the same reason. Extracted as a value because
+/// the loop it guards sits behind a camera, so this is the only shape a test
+/// can observe.
+fn foreign_owner_in_capture(
+    enr: &irlume_core::storage::Enrollment,
+    captured_rgb: &[&[f32]],
+    exclude: &str,
+    embed_space: &str,
+    threshold: f32,
+) -> Option<(String, f32)> {
+    captured_rgb
+        .iter()
+        .find_map(|rgb| colliding_profile(enr, rgb, Some(exclude), embed_space, threshold))
 }
 
 /// Best-matching OTHER profile for `probe` (excluding `exclude`), if it reaches
@@ -4046,6 +4061,69 @@ mod tests {
             irlume_core::RGB_MATCH_THRESHOLD
         )
         .is_none());
+    }
+
+    #[test]
+    fn every_capture_is_checked_for_a_foreign_owner_not_only_the_first() {
+        // A second person stepping into frame partway through an add-scan
+        // session must be caught. The loop sits behind a camera, so the
+        // decision is the testable shape: a capture whose FIRST scan is clean
+        // and whose second belongs to another profile must still refuse.
+        let mine = unit(vec![1.0, 0.0, 0.0]);
+        let theirs = unit(vec![0.0, 1.0, 0.0]);
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![
+                FaceProfile {
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                    name: "Mine".into(),
+                    scans: vec![scan(mine.clone())],
+                },
+                FaceProfile {
+                    ir_calib: None,
+                    ir_calibs: Default::default(),
+                    name: "Theirs".into(),
+                    scans: vec![scan(theirs.clone())],
+                },
+            ],
+            ..Default::default()
+        };
+        let thr = irlume_core::RGB_MATCH_THRESHOLD;
+        // All mine: nothing to refuse.
+        assert!(foreign_owner_in_capture(
+            &enr,
+            &[&mine, &mine],
+            "Mine",
+            LEGACY_RECOGNIZER_SPACE,
+            thr
+        )
+        .is_none());
+        // The intruder arrives on the SECOND capture: checking only the first
+        // would miss it.
+        assert_eq!(
+            foreign_owner_in_capture(
+                &enr,
+                &[&mine, &theirs],
+                "Mine",
+                LEGACY_RECOGNIZER_SPACE,
+                thr
+            )
+            .map(|(n, _)| n),
+            Some("Theirs".to_string())
+        );
+        // And on the first, the case that always worked.
+        assert_eq!(
+            foreign_owner_in_capture(
+                &enr,
+                &[&theirs, &mine],
+                "Mine",
+                LEGACY_RECOGNIZER_SPACE,
+                thr
+            )
+            .map(|(n, _)| n),
+            Some("Theirs".to_string())
+        );
     }
 
     #[test]

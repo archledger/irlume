@@ -2924,16 +2924,8 @@ impl Engine {
         }
         let want = count.clamp(1, room);
         let captured = self.capture_scans(want, enr.pitch_neutral())?;
-        // capture_scans is best-effort and may return fewer than asked. A
-        // partial save would report success while leaving the recognizer
-        // under-enrolled, so refuse before anything is written, exactly as
-        // enrollment does.
-        if captured.len() < want {
-            return Err(irlume_common::Error::Protocol(format!(
-                "only {} live scans captured (need {want}); nothing was saved, check \
-                 lighting and framing",
-                captured.len()
-            )));
+        if let Some(why) = short_capture_refusal(captured.len(), want) {
+            return Err(irlume_common::Error::Protocol(why));
         }
         // Anti-mixing: reject scans whose face belongs to a different profile.
         let rgbs: Vec<&[f32]> = captured.iter().map(|c| c.rgb.as_slice()).collect();
@@ -3242,6 +3234,22 @@ fn enroll_merge_target(
         }
     }
     Ok(hit)
+}
+
+/// Why a capture that came back short must be refused, or `None` when it is
+/// complete.
+///
+/// `capture_scans` is best-effort and may return fewer scans than asked for.
+/// A partial save would report success while leaving the recognizer
+/// under-enrolled, so the refusal happens before anything is written, exactly
+/// as enrollment does. A value because the capture it guards sits behind a
+/// camera, so this is the only shape a test can observe.
+fn short_capture_refusal(got: usize, want: usize) -> Option<String> {
+    (got < want).then(|| {
+        format!(
+            "only {got} live scans captured (need {want}); nothing was saved, check              lighting and framing"
+        )
+    })
 }
 
 /// How many more scans this profile may hold for `space`.
@@ -4082,6 +4090,27 @@ mod tests {
             irlume_core::RGB_MATCH_THRESHOLD
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_short_capture_is_refused_before_anything_is_saved() {
+        // capture_scans is best-effort, so a request for ten that yields one
+        // must refuse rather than save a partial set and report success
+        // (#290 review). The capture sits behind a camera, so the decision is
+        // the observable shape.
+        assert!(short_capture_refusal(3, 3).is_none());
+        assert!(short_capture_refusal(1, 1).is_none());
+        let why = short_capture_refusal(1, 10).expect("a short capture must refuse");
+        assert!(
+            why.contains("only 1 live scans captured (need 10)"),
+            "{why}"
+        );
+        assert!(
+            why.contains("nothing was saved"),
+            "the refusal must say the enrollment is unchanged: {why}"
+        );
+        // Zero is short too, which is the case that always refused.
+        assert!(short_capture_refusal(0, 1).is_some());
     }
 
     #[test]

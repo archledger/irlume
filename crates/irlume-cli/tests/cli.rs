@@ -410,7 +410,8 @@ fn add_scan_rejects_a_non_positive_or_unparseable_count() {
     // daemon running, a request attempt would exit 1.
     let sb = Sandbox::new("addscanbad");
     for bad in ["0", "-1", "abc", ""] {
-        let (code, _, err) = run(&mut sb.cmd(&["profiles", "add-scan", "--profile", "P", "--scans", bad]));
+        let (code, _, err) =
+            run(&mut sb.cmd(&["profiles", "add-scan", "--profile", "P", "--scans", bad]));
         assert_eq!(code, 2, "--scans {bad:?} must be a usage error: {err}");
         assert!(
             err.contains("--scans must be a positive integer"),
@@ -418,7 +419,8 @@ fn add_scan_rejects_a_non_positive_or_unparseable_count() {
         );
     }
     // A valid count parses and reaches the (dead) socket instead.
-    let (code, _, err) = run(&mut sb.cmd(&["profiles", "add-scan", "--profile", "P", "--scans", "5"]));
+    let (code, _, err) =
+        run(&mut sb.cmd(&["profiles", "add-scan", "--profile", "P", "--scans", "5"]));
     assert_eq!(code, 1, "a valid count must build a request: {err}");
     assert!(err.contains("adding 5 scans"), "{err}");
 }

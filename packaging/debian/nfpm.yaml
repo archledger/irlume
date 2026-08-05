@@ -78,7 +78,7 @@ contents:
     dst: /usr/lib/systemd/system/irlume-reconcile.service
   - src: ../systemd/irlume-reconcile.timer
     dst: /usr/lib/systemd/system/irlume-reconcile.timer
-  # AppArmor profile (ships in complain mode; see the profile header)
+  # AppArmor profile (enforces by default; see the profile header)
   - src: ../apparmor/usr.bin.irlumed
     dst: /etc/apparmor.d/usr.bin.irlumed
   - src: ../../LICENSE

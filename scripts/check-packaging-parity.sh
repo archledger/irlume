@@ -101,6 +101,28 @@ for derived in packaging/ppa/build-ppa-container.sh nix/package.nix; do
 done
 
 echo
+echo
+echo "== AppArmor runtime rules in both executable-path variants =="
+APPARMOR_PROFILES=(
+  packaging/apparmor/usr.bin.irlumed
+  packaging/apparmor/usr.local.bin.irlumed
+)
+APPARMOR_RUNTIME_RULES=(
+  "/dev/ r,"
+  "/run/lock/irlume-emitter-*.lock rwk,"
+  "/var/lib/irlume/ir-emitter-stream/*.lock rwk,"
+)
+for profile in "${APPARMOR_PROFILES[@]}"; do
+  for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do
+    if grep -Fqx "  $rule" "$profile"; then
+      printf '  ok    %-48s %s\n' "$rule" "$profile"
+    else
+      printf '  MISS  %-48s %s\n' "$rule" "$profile"
+      fail=1
+    fi
+  done
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "packaging parity: FAILED"
   exit 1

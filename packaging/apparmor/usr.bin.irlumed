@@ -70,11 +70,13 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
 
   # The emitter undo-journal's per-camera lock (flock over the whole
   # check/act window; emitter_journal.rs). Lives under /run/lock because a
-  # lock's lifetime is a boot. 'k' is the flock permission; without these
-  # rules the daemon refuses to drive the IR emitter and logs the #283
+  # lock's lifetime is a boot. 'k' is the flock permission; without this
+  # rule the daemon refuses to drive the IR emitter and logs the #283
   # warning on every start. The profile's 2026-07-09 soak predates the
-  # journal (0.8.x), which is how the gap shipped.
-  /run/lock/ rw,
+  # journal (0.8.x), which is how the gap shipped. No rule on the /run/lock
+  # directory itself: creation is authorized on the new file's pathname, the
+  # recorded denials named only the file path, and enumerate/modify authority
+  # over every service's lock is nothing this daemon needs.
   /run/lock/irlume-emitter-*.lock rwk,
 
   # The per-stream emitter bookkeeping lock is a flock too, and it lives

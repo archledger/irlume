@@ -9,7 +9,7 @@
 # so enforce is fail-safe; still soak new hardware/derivatives in complain
 # before trusting enforce there (drop in `flags=(complain)` below to do so).
 #
-# Reload:  apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed
+# Reload:  apparmor_parser -r /etc/apparmor.d/usr.local.bin.irlumed
 # Complain (per-box soak):  add `flags=(complain)` to the profile line + reload.
 
 abi <abi/4.0>,
@@ -52,6 +52,9 @@ profile irlumed /usr/local/bin/irlumed {
 
   # Cameras: capture nodes + the sysfs identity walk of the anti-injection
   # camera pinning (canonicalized device path, USB ids, privacy switch).
+  # /dev/ readdir is the discovery walk; without it capabilities() sees no
+  # cameras inside the daemon while sysfs selection works (#281/#283).
+  /dev/ r,
   /dev/video[0-9]* rw,
   /sys/class/video4linux/ r,
   /sys/class/video4linux/** r,
@@ -61,6 +64,12 @@ profile irlumed /usr/local/bin/irlumed {
   /run/irlume.sock rw,
 
   # TPM (template-key sealing, keyring unlock).
+  # Emitter locks: the undo-journal per-camera flock under /run/lock, and
+  # the per-stream bookkeeping flock, whose 'k' the state-dir ** rule does
+  # not grant (#283).
+  /run/lock/irlume-emitter-*.lock rwk,
+  /var/lib/irlume/ir-emitter-stream/*.lock rwk,
+
   /dev/tpmrm[0-9] rw,
   /dev/tpm[0-9] rw,
 

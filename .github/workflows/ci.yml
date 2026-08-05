@@ -424,8 +424,10 @@ jobs:
       # only confinement on the Debian/Ubuntu lane. A profile that fails to
       # parse does not confine, and the two bugs this release fixed (a missing
       # pcrlock rule that broke every Tier 2 unseal, and a granted-vs-denied
-      # capability) both live in these files. The runner ships apparmor_parser;
-      # -Q parses and exits without loading, so no privileges are needed.
+      # capability) both live in these files. -Q parses without loading into the
+      # kernel and -K skips the policy cache, which together let this run
+      # unprivileged: -Q alone still writes /var/cache/apparmor and dies on
+      # permission, which is how the first version of this step failed.
       - name: apparmor profiles parse
         run: |
           set -euo pipefail
@@ -433,7 +435,7 @@ jobs:
           sudo apt-get -qq install -y apparmor
           for f in packaging/apparmor/*; do
             echo "checking $f"
-            apparmor_parser -Q "$f"
+            apparmor_parser -QK "$f"
           done
 
       # The guard that stops a zero-match test filter from reporting success is

@@ -5284,12 +5284,31 @@ mod engine_tests {
             Some(shipped_pairs),
             "the other recognizer's calibration must survive the refit"
         );
-        // And the matcher picks by space: the shipped engine must not see
-        // model B's calibration.
+        // Both recognizers must remain fully usable: their own templates
+        // score AND their own calibration runs. n_templates alone proves
+        // only the space filter, since it is counted before the calibration
+        // lookup; the calibrated-centroid protocol running is what shows the
+        // keyed calibration actually reached the matcher (#289 review).
         let mut enr = Enrollment::new("u");
         enr.profiles.push(prof);
-        let m = ir_match_in("raw", other, false, &enr, &unit512(0));
-        assert_eq!(m.n_templates, 5, "only model B's templates score under B");
+        let model_b = ir_match_in("raw", other, false, &enr, &unit512(0));
+        assert_eq!(
+            model_b.n_templates, 5,
+            "only model B's templates score under B"
+        );
+        assert!(
+            model_b.centroid.is_some(),
+            "model B's keyed calibration must run the calibrated-centroid protocol"
+        );
+        let shipped_match = ir_match_in("raw", &shipped, false, &enr, &unit512(0));
+        assert_eq!(
+            shipped_match.n_templates, 5,
+            "only the shipped recognizer's templates score after switching back"
+        );
+        assert!(
+            shipped_match.centroid.is_some(),
+            "the shipped recognizer's preserved calibration must still apply"
+        );
     }
 
     #[test]

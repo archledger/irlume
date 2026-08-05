@@ -5,6 +5,237 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-05
+
+### Security
+
+- **A sandboxed run could delete live template keys, and it did.** The
+  `IRLUME_STATE_DIR` override that the model tooling and the project's own
+  testing procedure set moved the profile store, but the template-key,
+  recovery-envelope, and keyring-seal directories were built from the bare
+  path constant and ignored it. A sandboxed root command therefore reached
+  through into `/var/lib/irlume`: on 2026-08-05 a sandboxed
+  `profiles forget-model` emptied the real `template-keys/` and `recovery/`
+  on a test machine, leaving an encrypted enrollment whose key existed
+  nowhere, which no recovery path can open. All three directories now resolve
+  through the override-aware accessor, and a test walks every crate to fail
+  the build if a new state path is built from the constant again.
+
+- **`recovery setup` accepted an empty passphrase when stdin was a pipe.**
+  The 12-character floor and the confirmation prompt were both inside the
+  interactive branch, so `irlume recovery setup </dev/null` wrapped the
+  template key under an empty passphrase and reported success. That
+  passphrase is the only barrier on the recovery envelope against someone
+  holding the disk. The floor now applies to both paths; only the
+  confirmation, which needs a second read, remains terminal-only.
+
+### Added
+
+- **A profile can hold templates for more than one recognizer, and the
+  tooling manages that state.** Every scan records the model that produced
+  it, the scan limit counts per recognizer rather than per profile, and
+  `irlume profiles add-scan --profile P --scans N` captures a second model's
+  templates in one session, refusing a short capture before anything is
+  written. `profiles list` prints the per-recognizer breakdown when it says
+  something the total does not, and names the add-scan command when none of
+  a profile's scans belong to the loaded recognizer. `irlume profiles
+  forget-model <model>` removes one recognizer's scans, and the calibrations
+  fitted from them, from every profile of a user: the deliberate counterpart
+  to `models disable`, which deletes weights and keeps templates so
+  re-enabling needs no re-enrollment. A profile left with no scans is
+  deleted with them. The machine API gains a per-profile `recognizers`
+  array. Closes #288.
+
+- **The recognition stage opens to a measured third-party model, starting
+  with buffalo_l.** `sudo irlume models add buffalo <path>` installs
+  InsightFace's `w600k_r50.onnx`, which irlume does not fetch because
+  obtaining it is the user's licensing decision; the file is verified
+  against the sha256 irlume measured and anything else is refused. Enabling
+  it REPLACES the shipped recognizer for RGB matching at its measured 0.55
+  threshold; IR matching, fusion, and dark login turn off because they are
+  unmeasured for this model, and existing profiles need scans for it before
+  it can match. An invalid selection in `settings.conf` stops the daemon
+  from starting rather than silently substituting the shipped model, and
+  PAM treats the unavailable daemon as password fallback. The measured
+  basis is committed: LFW EER 3.9% against the shipped 4.2% through
+  irlume's own pipeline, demographic spread 3.9x against 6.1x at the
+  enabled threshold, live genuine floors on two cameras
+  (docs/recognition-results/2026-08-05-buffalo-l.md).
+
+- **Every catalog entry names its pipeline stage, and doctor reports each
+  stage.** Only the PAD and recognition stages accept third-party entries;
+  detection and landmarks refuse them at the models commands, the
+  installer, and the daemon's settings wiring, because their failure modes
+  are not equally safe. `irlume doctor` gains a pipeline-stages section and
+  `irlume models list --json` is a new machine-API capability
+  (`models-list-json`) reporting each stage's candidate model, tier, and
+  weight state. `models disable [name]` clears exactly the selected entry.
+  docs/THIRD-PARTY-MODELS.md documents what irlume measured, the threshold
+  it measured, and why a publisher's default is never used.
+
+- **A native TFLite runtime, bundled on every FHS lane, behind a stage
+  gate that stays closed.** irlume builds `libtensorflowlite_c.so` from
+  the pinned tensorflow v2.19.0 commit (Google publishes no prebuilt Linux
+  C-API artifact at stable URLs), publishes it with signed checksums, and
+  all four packaged lanes install it at `/usr/share/irlume/tflite/`, the
+  first path the daemon's resolver probes; `IRLUME_TFLITE_LIB` overrides,
+  absence is a recoverable answer, and Nix does not bundle it (a flake user
+  sets the variable). On it runs a full-range BlazeFace decoder,
+  parity-gated against the official runtime (mean IoU 0.9354 over 320
+  frames) with an operating point of 0.55 measured through irlume's own
+  pipeline, where an empty room on near-black IR reaches 0.5293, refuting
+  the publisher's 0.5 floor. The detection stage does NOT open: the rescue
+  slot is grant-capable and the end-to-end false-grant corpus does not
+  exist yet, so the wiring lands dormant and the daemon and TUI report the
+  loaded detector.
+
+- **Setup offers the anti-spoof model as a recommended numbered step.**
+  Default yes on a terminal, with the license and provenance on screen; a
+  non-TTY run declines, because an unattended install must not fetch
+  third-party weights unseen. The built-in gate accepts the measured print
+  attack, so the step names the one command that closes it.
+
+- **Doctor reports the negotiated camera streams against the Windows Hello
+  minimums.** IR 340x340 at 15fps, RGB 480x480 at 7.5fps, probed through
+  `VIDIOC_TRY_FMT` so doctor changes nothing on the camera; an unreported
+  frame rate reads as cannot-say rather than a pass. Closes #223.
+
+- **`calibrate-closure --measure-only` takes EAR readings without
+  storing.** N rounds under an operator-supplied `--pose` label, reduced by
+  the same median the calibration path stores, for measuring eye-closure
+  distributions against one stored calibration. Part of #173.
+
+- **The dark-frame diagnosis gains an inter-frame arm.** A bright frame the
+  camera's own metadata flags emitter-lit vouches for the emitter and
+  outranks the failed-LED guess; a bright frame flagged dark is what
+  ambient light looks like and stays quiet. Part of #264.
+
+### Fixed
+
+- **The AppArmor profile blocked every Tier 2 TPM unseal.** The profile
+  granted the two signed-policy artifacts but not
+  `/var/lib/systemd/pcrlock.json`, which is the pcrlock tier's policy input,
+  so on an AppArmor-enforcing install the keyring stopped opening at login
+  and the error text sent the user to re-run `systemd-pcrlock make-policy`,
+  which cannot help. Measured on a ThinkPad where 16 denials accumulated
+  over two days without a single visible cause. Both attachment variants
+  carry the rule and the packaging-parity script fails on a deleted line.
+
+- **The TUI and CLI answered "off" to questions they could not read.** With
+  the daemon unreachable the Profiles, Welcome, Repair, and Done screens
+  reported "no profiles", "keyring not armed", and "templates plaintext at
+  rest" for a machine whose templates are encrypted and enrolled, which
+  invites a user to re-enroll over working data; the Recovery tab reported a
+  security downgrade that had not happened. Unprivileged `models list`,
+  `biopolicy status`, and `status` reported root-only settings as definitely
+  off, so a user whose anti-spoof model was enabled read "none enabled".
+  An unanswered question now renders as unknown everywhere, distinct from a
+  definite no, which is what the machine API already did.
+
+- **`irlume enroll --scans abc` captured at the default count.** The parse
+  failure was swallowed and the enrollment proceeded, firing a biometric
+  capture the user did not ask for. The rule was already written into
+  `profiles add-scan`, which exits 2 on the same input; both now share one
+  parser so they cannot drift apart again.
+
+- **The TUI opened camera nodes behind the daemon's back.** Classifying a
+  video node means opening it, and the TUI did that on every background
+  refresh, including while the daemon was streaming the same nodes for an
+  enrollment. Most UVC modules permit the second open and the collision is
+  invisible; a module that answers EBUSY fails the enrollment, with nothing
+  in the logs naming the cause. While the daemon runs it is now the only
+  authority on cameras and answers over the socket. Measured with strace:
+  1144 opens of `/dev/video*` in 16 seconds before, zero after. Closes #187.
+
+- **Templates carry the recognizer that produced them, and every comparison
+  filters by it.** Cosine similarity means nothing across embedding spaces:
+  before the tag, changing the model compared fresh probes against vectors
+  from a different space, free to land either side of the threshold as a
+  silent grant or denial. Scans written before this release match only the
+  shipped recognizer.
+
+- **Calibrations are keyed by recognizer.** One slot per profile meant
+  adding scans under model B replaced model A's calibration, and switching
+  back applied B's numbers to A's templates. The on-disk shape is additive
+  in both directions, so an enrollment written before this change keeps its
+  calibration and an older irlume still finds the shipped model's value.
+
+- **Dark login was unreachable.** The 0.8.0 exposure short-circuit (#238)
+  denied every Uncertain verdict, including "no face in RGB" with an IR
+  face present, which is the dark IR-only path's entry condition. The
+  short-circuit now keys on the structural shape, and nothing is granted on
+  the Uncertain that falls through: the dark branch derives its own verdict
+  with the same exposure refusal. Six dark-room attempts on hardware
+  granted at 0.816 to 0.888 against the 0.600 threshold. Closes #284.
+
+- **Garbage landmark geometry abstains instead of scoring.** A NaN landmark
+  saturated to pixel (0,0), so the eyes-open gate answered true from a
+  bright frame corner, eye_glint scored 255 from landmarks that do not
+  exist, and alignment returned an all-black chip as Ok. Detector output,
+  the mesh's input and output, the glint cues, and alignment now refuse
+  non-finite or implausible geometry with named reasons; the new gates
+  refused none of 196 genuine detected frames in the live bench.
+
+- **The engine derives IR availability from the device selection, not a
+  one-shot load-time probe.** The probe could lose /dev enumeration to the
+  platform's MAC policy or to the emitter setup holding the node, leaving
+  the engine on convenience-tier policy while the daemon logged secure
+  tier. `IRLUME_FORCE_NO_IR=1` still outranks the selection. Closes #281.
+
+- **The AppArmor profile grants what the 0.8.x daemon does.** The emitter
+  undo-journal lock in /run/lock, /dev directory enumeration, and the
+  per-stream flock all postdate the 0.7 soak the profile was written
+  against; every start logged refusal warnings. Both attachment variants
+  now carry the rules (the /usr/local/bin variant claimed parity and had
+  none of them), and the parity script fails on a deleted line. Closes
+  #283.
+
+- **A wedged kwallet helper can no longer hold a login.** The helper's
+  stdout is read on a non-blocking pipe under the 15-second budget with a
+  4096-byte cap, and every kill-then-wait is bounded at 200ms, so neither
+  a stuck helper nor a leaked pipe write end blocks the PAM session phase.
+  Closes #257.
+
+- **`--fingerprint-only` requires a PAM surface that reaches
+  pam_fprintd.** A package can ship a service file nothing invokes, so the
+  old existence check could leave face down while every real prompt stayed
+  password-only. Recording the method now requires a tracked surface whose
+  stack reaches an active `pam_fprintd.so` line, modelling the one
+  guaranteed exit (`requisite pam_deny.so`). Closes #234.
+
+- **An all-error concurrent arm is a Sequential verdict.** camera-tune
+  required both arms to complete a round, so a camera whose concurrent
+  captures only error (the BRIO's EINVAL) reported nothing and the
+  strongest evidence the probe can produce was discarded. The verdict
+  stands only when a trailing one-at-a-time control proves the camera is
+  still answering. The probe half of #192.
+
+- **The consent gesture is judged on the completed take.** The in-loop
+  check ran every six poses and never evaluated the finished series, so a
+  nod completing in the trailing poses was refused with evidence that
+  passes every gate. Hardware replay: nod releases 7 of 8 against the
+  prior session's 6 of 8, stills 0 of 5, and zero false accepts over 17
+  refused windows. Part of #101.
+
+- **An unresolvable onnxruntime is an error, not a silent hang.** ort's
+  load-dynamic failure parks the process in a futex with no output. The
+  resolver now probes loadability with its own dlopen and an
+  `OrtGetApiBase` check first, reports failures in the loader's own words
+  in about 60 milliseconds, and keeps the successful handle for the life
+  of the process. Closes #266.
+
+### Changed
+
+- **The relief and occluder record for the print attack is committed, and
+  it is why setup now offers the model.** An infrared-absorbing cotton
+  occluder moves the print past every committed genuine sample on the
+  centre/edge cue, a window collapses the raw relief ratio below the face
+  band (the emitter-off differential restores it), and no native cue
+  survives both; the opt-in flir cue denies the same presentations at
+  p_fake 0.988 to 1.000. The corpora, the `landmark_replay` offline
+  instrument, and checkers that fail on an edited figure are in
+  docs/pad-results/.
+
 ## [0.8.1] - 2026-08-04
 
 ### Security
@@ -1945,7 +2176,8 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/archledger/irlume/releases/tag/v0.9.0
 [0.8.1]: https://github.com/archledger/irlume/releases/tag/v0.8.1
 [0.8.0]: https://github.com/archledger/irlume/releases/tag/v0.8.0
 [0.7.2]: https://github.com/archledger/irlume/releases/tag/v0.7.2

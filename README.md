@@ -73,7 +73,7 @@ Enrollment on IR hardware offers to enable it. See [Honest limitations](#-honest
 
 ## 📦 Install
 
-> **v0.8.1.** Works end-to-end on real hardware across all three families,
+> **v0.9.0.** Works end-to-end on real hardware across all three families,
 > including face-approved app prompts (Bitwarden). Not certified (no iBeta lab
 > pass), and a printed photograph of an enrolled face passes the built-in
 > liveness gate: see [Honest limitations](#-honest-limitations) before you wire
@@ -464,7 +464,7 @@ see [Honest limitations](#-honest-limitations).
 | **Write software that drives irlume** | [`docs/INTEGRATION.md`](docs/INTEGRATION.md) |
 | Look up the versioned **machine API**, field by field | [`docs/MACHINE-API.md`](docs/MACHINE-API.md) |
 | Understand the **architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
-| Choose a **third-party liveness model** irlume has measured | [`docs/THIRD-PARTY-MODELS.md`](docs/THIRD-PARTY-MODELS.md) |
+| Choose a **third-party model** irlume has measured | [`docs/THIRD-PARTY-MODELS.md`](docs/THIRD-PARTY-MODELS.md) |
 | Read the **threat model** and standards mapping | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) · [`docs/STANDARDS.md`](docs/STANDARDS.md) |
 | **Verify the claims** on my own machine | [`docs/VERIFY.md`](docs/VERIFY.md) |
 | **Debug** a login or trace every stage | [`docs/DEBUGGING.md`](docs/DEBUGGING.md) |
@@ -474,7 +474,7 @@ see [Honest limitations](#-honest-limitations).
 
 ## 🛠️ Status
 
-**v0.8.1: working and validated on real hardware.** Fedora runs the full IR
+**v0.9.0: working and validated on real hardware.** Fedora runs the full IR
 Secure tier end to end, including face-approved app prompts (Bitwarden biometric
 unlock via polkit, verified live); Ubuntu / Pop!_OS runs the RGB Convenience tier
 plus a fingerprint; Arch is validated for packaging and the CLI/daemon on a
@@ -496,7 +496,7 @@ Interfaces may still shift before 1.0.
   [developer guide](docs/DEVELOPMENT.md); CI runs fmt / clippy / build / test on
   every push and PR.
 
-The per-release detail (0.1.x through 0.8.1) lives in [`CHANGELOG.md`](CHANGELOG.md).
+The per-release detail (0.1.x through 0.9.0) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## 🙏 Credits
 

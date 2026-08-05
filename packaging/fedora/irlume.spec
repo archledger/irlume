@@ -2,7 +2,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.8.1
+Version:        0.9.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -239,6 +239,19 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Wed Aug 05 2026 archledger <archledger236@gmail.com> - 0.9.0-1
+- A sandboxed run could delete live template keys and recovery envelopes, because those paths ignored IRLUME_STATE_DIR; all state paths now honor the override
+- recovery setup accepted an empty passphrase when stdin was a pipe; the 12-character floor now applies to both paths
+- The AppArmor profile blocked every Tier 2 TPM unseal by omitting /var/lib/systemd/pcrlock.json, so the keyring stopped opening at login
+- The TUI and CLI reported "off"/"none" for state they could not read; an unanswered question now renders as unknown
+- The TUI no longer opens camera nodes while the daemon streams them, which failed enrollment on strict UVC modules (#187)
+- A profile can hold templates for more than one recognizer; profiles add-scan and profiles forget-model manage that state (#288)
+- The recognition stage opens to measured third-party models, starting with buffalo_l (#276)
+- Every catalog entry names its pipeline stage; detection and landmarks stay closed
+- A native TFLite runtime ships at /usr/share/irlume/tflite/ behind a stage gate that stays closed
+- Dark login was unreachable since 0.8.0 and works again (#284)
+- Garbage landmark geometry abstains instead of scoring confident wrong numbers
+- enroll --scans with a non-numeric value is a usage error, not a default-count capture
 * Tue Aug 04 2026 archledger <archledger236@gmail.com> - 0.8.1-1
 - A printed photograph of an enrolled face passes the built-in liveness gate; the cue cannot be repaired by tuning it, and the mitigation is `irlume models enable flir` (advisory, #235)
 - A blown infrared frame is refused rather than judged, so clipping no longer silences the PAD cue (#237)

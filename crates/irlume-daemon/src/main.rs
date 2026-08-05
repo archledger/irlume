@@ -252,13 +252,79 @@ fn main() {
                         entry.name.to_string(),
                     ))
                 });
+            // Opt-in third-party RECOGNIZER (#276 stage 4). Same trust chain
+            // as the PAD cue — catalog entry, stage check, pinned checksum —
+            // but a failure here falls back to the SHIPPED recognizer rather
+            // than to "no cue": a daemon with no recognizer at all cannot
+            // authenticate anything, and the shipped stack is the measured
+            // default. The stage gate refuses until Stage::Recognition opens,
+            // so today this resolves to None on every machine.
+            let tp_rec: Option<(String, f32, String)> = std::env::var("IRLUME_THIRDPARTY_RECOGNIZER")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    irlume_common::config::read_kv(
+                        "settings.conf",
+                        irlume_common::thirdparty::RECOGNIZER_SETTINGS_KEY,
+                    )
+                })
+                .and_then(|name| {
+                    let name = name.trim().to_string();
+                    let entry = match irlume_common::thirdparty::recognizer_override(
+                        irlume_common::thirdparty::by_name(&name),
+                    ) {
+                        Ok(e) => e,
+                        Err(why) => {
+                            eprintln!(
+                                "irlumed: WARNING: third_party_recognizer='{name}' refused ({why:?}); using the shipped recognizer"
+                            );
+                            return None;
+                        }
+                    };
+                    let path = irlume_common::thirdparty::model_path(entry);
+                    let bytes = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!(
+                                "irlumed: WARNING: third-party recognizer '{name}' enabled but {} unreadable ({e}); using the shipped recognizer",
+                                path.display()
+                            );
+                            return None;
+                        }
+                    };
+                    let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+                    if digest != entry.sha256 {
+                        eprintln!(
+                            "irlumed: WARNING: third-party recognizer '{name}' checksum mismatch (sha256 {digest}); refusing unpinned weights, using the shipped recognizer"
+                        );
+                        return None;
+                    }
+                    Some((
+                        path.to_string_lossy().into_owned(),
+                        entry.threshold,
+                        entry.name.to_string(),
+                    ))
+                });
             // Engine factory: (re)loads the models and rebinds devices/adapters. Used
             // once at startup and again by the camera worker to rebuild the engine after
             // a caught panic, so a fresh request never runs against ONNX sessions left in
             // an unproven state by an unwind. It owns its inputs so it can move to the
             // worker thread, and it is Fn, so startup calls it before that move.
             let build_engine = move || {
-                irlume_auth::Engine::load(&det, &model)
+                let (rec_model, rec_override) = match &tp_rec {
+                    Some((path, thr, name)) => (path.as_str(), Some((*thr, name.as_str()))),
+                    None => (model.as_str(), None),
+                };
+                irlume_auth::Engine::load(&det, rec_model)
+                    .map(|e| match rec_override {
+                        Some((thr, name)) => {
+                            eprintln!(
+                                "irlumed: third-party recognizer '{name}' loaded (threshold {thr}; IR matching disabled — unmeasured for this model)"
+                            );
+                            e.with_thirdparty_recognizer(thr)
+                        }
+                        None => e,
+                    })
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
                     .and_then(|e| e.with_mesh(&mesh))

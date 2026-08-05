@@ -22,8 +22,58 @@
 
 use std::path::{Path, PathBuf};
 
-/// `settings.conf` key naming the enabled model (absent/empty = disabled).
+/// `settings.conf` key naming the enabled PAD model (absent/empty = disabled).
 pub const SETTINGS_KEY: &str = "third_party_pad";
+
+/// `settings.conf` key naming the enabled third-party RECOGNIZER (absent/empty
+/// = the shipped recognizer). Separate keys per stage: one key naming entries
+/// of two different stages would make "what is enabled" ambiguous the day two
+/// stages are open at once.
+pub const RECOGNIZER_SETTINGS_KEY: &str = "third_party_recognizer";
+
+/// The stage-appropriate settings key for a catalog entry.
+pub const fn settings_key_for(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Pad => SETTINGS_KEY,
+        Stage::Recognition => RECOGNIZER_SETTINGS_KEY,
+        // No key exists for stages with no wiring; the installer refuses
+        // closed stages long before this matters, and giving them a real key
+        // here would silently enable whatever wiring later reads it.
+        Stage::Detection | Stage::Landmarks => "third_party_unwired",
+    }
+}
+
+/// Why a settings value cannot be used as the third-party recognizer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecognizerRefusal {
+    /// The name is not in the catalog.
+    NotInCatalog,
+    /// The entry exists but is not a recognition-stage model.
+    WrongStage(&'static str),
+    /// The recognition stage is not open to third-party models.
+    StageClosed,
+}
+
+/// Decide whether a catalog lookup result may be wired as THE recognizer.
+///
+/// Pure so the refusals are testable with fixture entries; the daemon composes
+/// this with [`by_name`], the pin check, and the file read. The stage-open
+/// check is here rather than trusted to the installer because the settings key
+/// is root-editable text the installer never saw.
+pub fn recognizer_override(
+    entry: Option<&ThirdPartyModel>,
+) -> Result<&ThirdPartyModel, RecognizerRefusal> {
+    let Some(entry) = entry else {
+        return Err(RecognizerRefusal::NotInCatalog);
+    };
+    if entry.stage != Stage::Recognition {
+        return Err(RecognizerRefusal::WrongStage(entry.stage.as_str()));
+    }
+    if !Stage::Recognition.open() {
+        return Err(RecognizerRefusal::StageClosed);
+    }
+    Ok(entry)
+}
 
 /// The pipeline stage a catalog model plugs into.
 ///
@@ -79,6 +129,7 @@ impl Stage {
 /// Subdirectory of the state dir holding fetched third-party weights.
 pub const SUBDIR: &str = "models-thirdparty";
 
+#[derive(Debug)]
 pub struct ThirdPartyModel {
     /// Catalog name, what the user types to enable (`irlume models enable X`).
     pub name: &'static str,
@@ -265,6 +316,57 @@ mod tests {
     fn lookup_by_name() {
         assert!(by_name("flir").is_some());
         assert!(by_name("nope").is_none());
+    }
+
+    #[test]
+    fn recognizer_override_refuses_everything_but_an_open_recognition_entry() {
+        let fixture = |stage: Stage| ThirdPartyModel {
+            name: "fixture",
+            stage,
+            file: "fixture.onnx",
+            url: None,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            license: "fixture",
+            provenance: "fixture",
+            threshold: 0.6,
+            summary: "fixture",
+        };
+        // Unknown name.
+        assert_eq!(
+            recognizer_override(None).unwrap_err(),
+            RecognizerRefusal::NotInCatalog
+        );
+        // A PAD entry must never be wired as the recognizer, whatever the
+        // settings key says: it is a different kind of model entirely.
+        let pad = fixture(Stage::Pad);
+        assert_eq!(
+            recognizer_override(Some(&pad)).unwrap_err(),
+            RecognizerRefusal::WrongStage("pad")
+        );
+        // A recognition entry is refused while the stage is closed. When
+        // stage 4 opens (Stage::Recognition.open() flips), this arm changes to
+        // Ok — that flip and this test must land in the same commit as the
+        // first measured entry.
+        let rec = fixture(Stage::Recognition);
+        assert_eq!(
+            recognizer_override(Some(&rec)).unwrap_err(),
+            RecognizerRefusal::StageClosed
+        );
+    }
+
+    #[test]
+    fn settings_keys_are_per_stage_and_distinct() {
+        assert_eq!(settings_key_for(Stage::Pad), SETTINGS_KEY);
+        assert_eq!(
+            settings_key_for(Stage::Recognition),
+            RECOGNIZER_SETTINGS_KEY
+        );
+        assert_ne!(SETTINGS_KEY, RECOGNIZER_SETTINGS_KEY);
+        // Unwired stages get a key nothing reads, not one of the real ones.
+        for s in [Stage::Detection, Stage::Landmarks] {
+            assert_ne!(settings_key_for(s), SETTINGS_KEY);
+            assert_ne!(settings_key_for(s), RECOGNIZER_SETTINGS_KEY);
+        }
     }
 
     #[test]

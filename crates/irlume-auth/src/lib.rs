@@ -39,6 +39,18 @@ pub struct Engine {
     /// weights. Stamped onto every scan enrolled and required to match at
     /// verification: cosine scores are only meaningful inside one space.
     embed_space: String,
+    /// The RGB match threshold for THIS recognizer. The shipped constant for
+    /// the shipped model; a third-party recognizer brings its own measured
+    /// value (#276), because a threshold is a property of one model's cosine
+    /// scale and applying another model's number to it is a guess.
+    rgb_threshold: f32,
+    /// Whether IR matching (fusion, IR fallback, calibrated centroid, dark
+    /// IR-only auth) may run. False under a third-party recognizer: the IR
+    /// thresholds and the fusion Platt calibration are measurements of the
+    /// SHIPPED model's cosine scale, and no catalog entry carries IR-side
+    /// measurements yet. RGB-only matching stays; the dark path refuses with
+    /// its own reason and falls back to the password.
+    ir_matching: bool,
     /// Optional MediaPipe FaceMesh: dense landmarks for the passive EAR blink
     /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
     /// the opt-in passive-liveness gate (it can't run without landmarks).
@@ -563,6 +575,8 @@ impl Engine {
             ir_adapter: None,
             ir_space: "raw".into(),
             embed_space,
+            rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
+            ir_matching: true,
             mesh: None,
             blaze: None,
             tp_pad: None,
@@ -659,6 +673,29 @@ impl Engine {
         &self.embed_space
     }
 
+    /// Configure this engine for a THIRD-PARTY recognizer (#276 stage 4): the
+    /// entry's measured RGB threshold replaces the shipped constant, and IR
+    /// matching is disabled wholesale — fusion, IR fallback, the calibrated
+    /// centroid, and dark IR-only auth are all measurements of the shipped
+    /// model's cosine scale (thresholds and Platt calibration alike), and no
+    /// catalog entry carries IR-side measurements. The liveness gate is
+    /// unaffected: it reads pixels, not embeddings. Dark logins refuse with
+    /// their own reason and fall back to the password.
+    pub fn with_thirdparty_recognizer(mut self, rgb_threshold: f32) -> Self {
+        self.rgb_threshold = rgb_threshold;
+        self.ir_matching = false;
+        self
+    }
+
+    /// The RGB grant threshold for a comparison against `n_templates`
+    /// templates: this recognizer's measured base, scaled for best-of-N FAR
+    /// inflation. The ONE place both RGB match paths get their bar, so a
+    /// third-party recognizer's threshold cannot reach one path and miss the
+    /// other.
+    fn rgb_grant_threshold(&self, n_templates: usize) -> f32 {
+        irlume_core::scaled_threshold(self.rgb_threshold, n_templates)
+    }
+
     /// Dimensionality of the IR embeddings this engine emits. The recognizer
     /// emits 512-D and the deployed adapter contract is 512→512; an adapter
     /// with a different output width must change this too (the per-scan dim
@@ -673,6 +710,12 @@ impl Engine {
     /// `None` (matching then behaves exactly as before the feature).
     fn refit_profile_calib(&self, prof: &mut irlume_core::storage::FaceProfile) {
         if self.ir_adapter.is_some() {
+            return;
+        }
+        // A third-party recognizer's IR matching never runs, so fitting a
+        // calibration over its embeddings would only produce an artifact that
+        // LOOKS like dark support exists.
+        if !self.ir_matching {
             return;
         }
         let dim = self.ir_dim();
@@ -709,6 +752,19 @@ impl Engine {
     /// Method wrapper over [`ir_match_in`], bound to the engine's space and
     /// adapter state.
     fn ir_match(&self, enr: &irlume_core::storage::Enrollment, probe: &[f32]) -> IrMatch {
+        // The choke point for the third-party-recognizer policy: with IR
+        // matching disabled, no caller — present or future — can score an IR
+        // template, because every IR grant path funnels through here. The
+        // call sites additionally check `ir_matching` where a specific
+        // refusal reason is owed to the user (the dark path).
+        if !self.ir_matching {
+            return IrMatch {
+                best: f32::NEG_INFINITY,
+                best_who: String::new(),
+                n_templates: 0,
+                centroid: None,
+            };
+        }
         ir_match_in(
             &self.ir_space,
             &self.embed_space,
@@ -2059,7 +2115,7 @@ impl Engine {
                 }
             }
             let scans = enr.rgb_scans_in(&self.embed_space);
-            let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
+            let thr = self.rgb_grant_threshold(scans.len());
             let (score, who) = best(&probe, &scans);
             irlume_common::dlog!(
                 "match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')",
@@ -2079,7 +2135,10 @@ impl Engine {
             // grant while FMR stays bounded (an impostor must fool BOTH at once). The
             // cross-spectrum liveness gate + per-user IR floor already passed above.
             // This is the bright→RGB / dark→IR / dim→FUSE story.
-            if let Some(ir_probe) = &a.ir_embedding {
+            // With a third-party recognizer the whole IR side is unmeasured
+            // (thresholds AND the fusion Platt calibration are shipped-model
+            // measurements), so a marginal RGB miss ends here: password.
+            if let Some(ir_probe) = a.ir_embedding.as_ref().filter(|_| self.ir_matching) {
                 let m = self.ir_match(&enr, ir_probe);
                 if m.n_templates > 0 {
                     let (ir_score, ir_who) = (m.best, m.best_who.clone());
@@ -2148,6 +2207,18 @@ impl Engine {
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
         // recognition (Windows-Hello-style dark operation) across all profiles.
         if let Some(probe) = a.ir_embedding {
+            // Fail-closed, with the real reason: dark unlock is an IR MATCH,
+            // and no third-party recognizer has a measured IR threshold. A
+            // generic "no match" here would send the user debugging their
+            // enrollment instead of reading the actual limitation.
+            if !self.ir_matching {
+                return Ok(Outcome::deny(
+                    OutcomeKind::OtherDeny,
+                    "dark unlock unavailable with a third-party recognizer (its IR \
+                     matching is unmeasured); use the password, or switch back to \
+                     the shipped recognizer",
+                ));
+            }
             let m = self.ir_match(&enr, &probe);
             if m.n_templates == 0 {
                 let reason = if enr.ir_scans().is_empty() {
@@ -2330,7 +2401,7 @@ impl Engine {
             if scans.is_empty() {
                 continue;
             }
-            let thr = irlume_core::scaled_threshold(irlume_core::RGB_MATCH_THRESHOLD, scans.len());
+            let thr = self.rgb_grant_threshold(scans.len());
             let (score, who) = scans
                 .iter()
                 .map(|(prof, _scan, t)| (align::cosine(&probe, t), *prof))
@@ -2569,7 +2640,12 @@ impl Engine {
                     "no live scan captured; check lighting and framing".into(),
                 )
             })?;
-        let goal = match enroll_merge_target(&enr, &[probe.rgb.as_slice()], &self.embed_space)? {
+        let goal = match enroll_merge_target(
+            &enr,
+            &[probe.rgb.as_slice()],
+            &self.embed_space,
+            self.rgb_threshold,
+        )? {
             Some(target) => {
                 let have = enr
                     .profiles
@@ -2601,7 +2677,9 @@ impl Engine {
         // drifting into frame after the probe, and a borderline probe that only
         // crosses the identity threshold on a later scan.
         let rgbs: Vec<&[f32]> = captured.iter().map(|s| s.rgb.as_slice()).collect();
-        if let Some(target) = enroll_merge_target(&enr, &rgbs, &self.embed_space)? {
+        if let Some(target) =
+            enroll_merge_target(&enr, &rgbs, &self.embed_space, self.rgb_threshold)?
+        {
             // The face already owns a profile: merge the capture into it.
             let idx = enr
                 .profiles
@@ -2737,9 +2815,13 @@ impl Engine {
                 )
             })?;
         // Anti-mixing: reject a scan whose face belongs to a different profile.
-        if let Some((other, score)) =
-            colliding_profile(&enr, &captured.rgb, Some(profile_name), &self.embed_space)
-        {
+        if let Some((other, score)) = colliding_profile(
+            &enr,
+            &captured.rgb,
+            Some(profile_name),
+            &self.embed_space,
+            self.rgb_threshold,
+        ) {
             let cnt = enr
                 .profiles
                 .iter()
@@ -3014,10 +3096,12 @@ fn enroll_merge_target(
     enr: &irlume_core::storage::Enrollment,
     captured_rgb: &[&[f32]],
     embed_space: &str,
+    threshold: f32,
 ) -> irlume_common::Result<Option<String>> {
     let mut hit: Option<String> = None;
     for rgb in captured_rgb {
-        let Some((other, _score)) = colliding_profile(enr, rgb, None, embed_space) else {
+        let Some((other, _score)) = colliding_profile(enr, rgb, None, embed_space, threshold)
+        else {
             continue;
         };
         match &hit {
@@ -3043,6 +3127,7 @@ fn colliding_profile(
     probe: &[f32],
     exclude: Option<&str>,
     embed_space: &str,
+    threshold: f32,
 ) -> Option<(String, f32)> {
     let mut best: Option<(String, f32)> = None;
     for p in &enr.profiles {
@@ -3061,7 +3146,7 @@ fn colliding_profile(
                 continue;
             }
             let c = align::cosine(probe, &s.rgb);
-            if c >= irlume_core::RGB_MATCH_THRESHOLD && best.as_ref().is_none_or(|b| c > b.1) {
+            if c >= threshold && best.as_ref().is_none_or(|b| c > b.1) {
                 best = Some((p.name.clone(), c));
             }
         }
@@ -3761,21 +3846,62 @@ mod tests {
                 &enr,
                 &face1,
                 Some("Face Profile 2"),
-                LEGACY_RECOGNIZER_SPACE
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
             )
             .map(|(n, _)| n),
             Some("Face Profile 1".to_string())
         );
         // A novel face collides with nothing.
-        assert!(colliding_profile(&enr, &[0.0, 0.0, 1.0], None, LEGACY_RECOGNIZER_SPACE).is_none());
+        assert!(colliding_profile(
+            &enr,
+            &[0.0, 0.0, 1.0],
+            None,
+            LEGACY_RECOGNIZER_SPACE,
+            irlume_core::RGB_MATCH_THRESHOLD
+        )
+        .is_none());
         // Same face into its OWN profile (excluded) is fine; that's improving it.
         assert!(colliding_profile(
             &enr,
             &face1,
             Some("Face Profile 1"),
-            LEGACY_RECOGNIZER_SPACE
+            LEGACY_RECOGNIZER_SPACE,
+            irlume_core::RGB_MATCH_THRESHOLD
         )
         .is_none());
+    }
+
+    #[test]
+    fn collision_uses_the_engines_threshold_not_the_shipped_constant() {
+        // A third-party recognizer brings its own measured threshold, and the
+        // enrollment anti-mixing decision must use it: a pair that counts as
+        // "same person" on the shipped scale may be strangers on another
+        // model's scale. cos(a,b) here is ~0.6: a collision at the shipped
+        // 0.55, not a collision at a stricter 0.8.
+        // Exact by construction: cos(a,b) = 0.65 for unit a=[1,0,0] and
+        // b=[0.65, sqrt(1-0.65^2), 0].
+        let a = unit(vec![1.0, 0.0, 0.0]);
+        let b = unit(vec![0.65, (1.0f32 - 0.65 * 0.65).sqrt(), 0.0]);
+        let c = align::cosine(&a, &b);
+        assert!(c > 0.55 && c < 0.8, "fixture cosine drifted: {c}");
+        let enr = Enrollment {
+            user: "u".into(),
+            profiles: vec![FaceProfile {
+                ir_calib: None,
+                name: "P1".into(),
+                scans: vec![scan(b)],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            colliding_profile(&enr, &a, None, LEGACY_RECOGNIZER_SPACE, 0.55).is_some(),
+            "must collide at the shipped threshold"
+        );
+        assert!(
+            colliding_profile(&enr, &a, None, LEGACY_RECOGNIZER_SPACE, 0.8).is_none(),
+            "must not collide at a stricter model threshold"
+        );
     }
 
     #[test]
@@ -3797,15 +3923,35 @@ mod tests {
             ..Default::default()
         };
         // Under any OTHER recognizer the identical vector is invisible...
-        assert!(colliding_profile(&enr, &face, None, LEGACY_RECOGNIZER_SPACE).is_none());
+        assert!(colliding_profile(
+            &enr,
+            &face,
+            None,
+            LEGACY_RECOGNIZER_SPACE,
+            irlume_core::RGB_MATCH_THRESHOLD
+        )
+        .is_none());
         assert_eq!(
-            enroll_merge_target(&enr, &[&face], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            enroll_merge_target(
+                &enr,
+                &[&face],
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .unwrap(),
             None
         );
         // ...and under its own recognizer it collides as it always did (the
         // positive control that proves the filter, not the vector, decided).
         assert_eq!(
-            colliding_profile(&enr, &face, None, "embed:model-b").map(|(n, _)| n),
+            colliding_profile(
+                &enr,
+                &face,
+                None,
+                "embed:model-b",
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .map(|(n, _)| n),
             Some("P1".to_string())
         );
     }
@@ -3834,20 +3980,38 @@ mod tests {
         // Novel face: no collision, create the new profile.
         let enr = enr_with(vec![ir_scan(face1.clone(), Some("raw"))]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&novel], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            enroll_merge_target(
+                &enr,
+                &[&novel],
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .unwrap(),
             None
         );
 
         // Same face merges into its profile regardless of IR-template state:
         // healthy current-space templates...
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            enroll_merge_target(
+                &enr,
+                &[&face1],
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .unwrap(),
             Some("P1".into())
         );
         // ...untagged legacy templates...
         let enr = enr_with(vec![ir_scan(face1.clone(), None)]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            enroll_merge_target(
+                &enr,
+                &[&face1],
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .unwrap(),
             Some("P1".into())
         );
         // ...templates stranded by an adapter removal (the 0.2.0 upgrade case)...
@@ -3856,13 +4020,25 @@ mod tests {
             ir_scan(face1.clone(), Some("adapter:deadbeef0123")),
         ]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            enroll_merge_target(
+                &enr,
+                &[&face1],
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .unwrap(),
             Some("P1".into())
         );
         // ...or a profile that never had IR scans at all.
         let enr = enr_with(vec![scan(face1.clone())]);
         assert_eq!(
-            enroll_merge_target(&enr, &[&face1], LEGACY_RECOGNIZER_SPACE).unwrap(),
+            enroll_merge_target(
+                &enr,
+                &[&face1],
+                LEGACY_RECOGNIZER_SPACE,
+                irlume_core::RGB_MATCH_THRESHOLD
+            )
+            .unwrap(),
             Some("P1".into())
         );
 
@@ -3873,8 +4049,13 @@ mod tests {
             name: "P2".into(),
             scans: vec![ir_scan(face2.clone(), Some("adapter:deadbeef0123"))],
         });
-        let err =
-            enroll_merge_target(&enr, &[&face1, &face2], LEGACY_RECOGNIZER_SPACE).unwrap_err();
+        let err = enroll_merge_target(
+            &enr,
+            &[&face1, &face2],
+            LEGACY_RECOGNIZER_SPACE,
+            irlume_core::RGB_MATCH_THRESHOLD,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("two different profiles"));
     }
 
@@ -4719,6 +4900,83 @@ mod engine_tests {
         s.engine.refit_profile_calib(&mut fresh);
         assert!(fresh.ir_calib.is_none(), "adapter mode must not fit anew");
         s.engine.ir_adapter = None; // restore the shared baseline
+    }
+
+    #[test]
+    fn thirdparty_recognizer_policy_threshold_and_ir_shutdown() {
+        let _g = env_guard();
+        let mut s = shared();
+        // Default: the shipped constant, scaled; IR matching on.
+        assert_eq!(
+            s.engine.rgb_grant_threshold(1),
+            irlume_core::RGB_MATCH_THRESHOLD
+        );
+        assert!(s.engine.ir_matching);
+        // An IR-scanned enrollment the choke point can be proven against.
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(FaceProfile {
+            name: "p".into(),
+            ir_calib: None,
+            scans: (0..3).map(|i| scan512(i, true, Some("raw"))).collect(),
+        });
+        let probe = unit512(0);
+        assert_eq!(
+            s.engine.ir_match(&enr, &probe).n_templates,
+            3,
+            "control: IR matching must work before the policy flips"
+        );
+
+        // The third-party policy: measured threshold in, IR matching dead.
+        s.engine.rgb_threshold = 0.60;
+        s.engine.ir_matching = false;
+        assert_eq!(s.engine.rgb_grant_threshold(1), 0.60);
+        // Scaling still applies on top of the model's own base.
+        assert!(s.engine.rgb_grant_threshold(8) > 0.60);
+        // The choke point: no IR template is scored, whoever asks.
+        let m = s.engine.ir_match(&enr, &probe);
+        assert_eq!(m.n_templates, 0);
+        assert_eq!(m.best, f32::NEG_INFINITY);
+        assert!(m.centroid.is_none());
+        // And no calibration is fitted, so nothing on disk implies dark
+        // support that cannot exist for this model.
+        let mut prof = FaceProfile {
+            name: "p2".into(),
+            ir_calib: None,
+            scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
+        };
+        s.engine.refit_profile_calib(&mut prof);
+        assert!(prof.ir_calib.is_none());
+
+        // Restore the shared baseline; prove the restore took (a poisoned
+        // shared engine would fail every later test for the wrong reason).
+        s.engine.rgb_threshold = irlume_core::RGB_MATCH_THRESHOLD;
+        s.engine.ir_matching = true;
+        assert_eq!(s.engine.ir_match(&enr, &probe).n_templates, 3);
+        s.engine.refit_profile_calib(&mut prof);
+        assert!(prof.ir_calib.is_some(), "restored engine must fit again");
+    }
+
+    #[test]
+    fn with_thirdparty_recognizer_sets_both_halves_of_the_policy() {
+        // The builder is the public face of the policy: one call, both
+        // effects. Split halves would let a future caller set the threshold
+        // and forget the IR shutdown.
+        let _g = env_guard();
+        let s = shared();
+        // Cheap structural check on a rebuilt engine is not possible without
+        // loading models again; assert via the builder on a clone of the
+        // shared engine's config instead: consume-and-rebuild is what the
+        // daemon does, so exercise exactly that shape.
+        drop(s);
+        let e = Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("engine load")
+        .with_devices(NO_RGB, NO_IR)
+        .with_thirdparty_recognizer(0.6);
+        assert_eq!(e.rgb_grant_threshold(1), 0.6);
+        assert!(!e.ir_matching);
     }
 
     #[test]

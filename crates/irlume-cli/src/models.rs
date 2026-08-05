@@ -397,9 +397,14 @@ fn place_verified(m: &ThirdPartyModel, bytes: &[u8]) -> bool {
         eprintln!("[models] could not install {}: {e}", path.display());
         return false;
     }
-    if let Err(e) =
-        irlume_common::config::write_kv("settings.conf", thirdparty::SETTINGS_KEY, m.name)
-    {
+    // The key is the entry's STAGE's key: naming a recognizer under the PAD
+    // key would wire it as an anti-spoof cue (the daemon refuses that, but the
+    // installer should not write nonsense for a guard to catch).
+    if let Err(e) = irlume_common::config::write_kv(
+        "settings.conf",
+        thirdparty::settings_key_for(m.stage),
+        m.name,
+    ) {
         eprintln!("[models] weights installed but settings.conf update failed: {e}");
         return false;
     }

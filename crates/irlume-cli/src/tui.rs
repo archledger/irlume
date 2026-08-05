@@ -451,7 +451,17 @@ struct App {
     nodes: Vec<(String, irlume_camera::Role)>,
     /// Cached camera pairs, refreshed on the slow timer so the Cameras tab and
     /// move_sel don't re-probe the hardware on every keystroke and frame.
-    pairs: Vec<irlume_camera::CameraPair>,
+    /// The camera pairs as the DAEMON enumerated them (#187): the TUI never
+    /// opens a video node itself, so this arrives via ListCameras and each
+    /// entry carries the privacy state the daemon read while it had the
+    /// device.
+    pairs: Vec<irlume_common::CameraPairInfo>,
+    /// Whether the daemon has ever ANSWERED ListCameras. An empty `pairs`
+    /// with this false means "not asked yet, refused, or an older daemon",
+    /// which must not be drawn as "no cameras found" (#187): that claim
+    /// contradicted the active-pair line right under it on a daemon that
+    /// predates the request.
+    pairs_known: bool,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
     confirm: Option<Confirm>,
@@ -597,10 +607,6 @@ struct Probes {
     fp_coverage: Vec<(&'static str, &'static str, bool)>,
     /// The reader is claimed by a stale fprintd session (prompts fail silently).
     reader_stuck: bool,
-    /// A privacy shutter/switch is engaged on any camera node.
-    privacy_engaged: bool,
-    /// Per-pair privacy state, keyed by the pair's RGB node (Cameras screen).
-    pair_privacy: Vec<(String, bool)>,
     /// SELinux is enforcing this boot.
     selinux_enforcing: bool,
     /// The daemon socket carries the irlume SELinux label.
@@ -622,37 +628,17 @@ struct Probes {
     boot_mode: String,
 }
 
-/// May the TUI open camera device nodes right now?
-///
-/// Classifying a node opens it, and a second open is EBUSY on strict UVC
-/// modules while the daemon streams the same node (#187). The daemon is the
-/// authority on cameras whenever it is reachable: it reports its tier and
-/// devices through Health, so the TUI never needs to look for itself. When
-/// the daemon is DOWN the local probe is both the only source and safe,
-/// because nothing else holds the cameras.
-fn enumerate_cameras_now(daemon_up: bool) -> bool {
-    !daemon_up
-}
-
 impl Probes {
     /// The full sweep, verbatim from the code that used to run inline. Runs
     /// on a worker thread; everything here may block on D-Bus activation, a
     /// subprocess, or a device open without costing the UI a frame.
     fn gather(user: &str) -> Self {
         use irlume_common::secureboot;
-        // Same rule as LightState::gather (#187): capabilities() classifies
-        // every node, which opens it. The caller passes the daemon-reported
-        // tier in when the daemon is up, so this only probes when it is
-        // down.
-        let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
-        let probe_cameras = enumerate_cameras_now(daemon_up);
-        let caps = if probe_cameras {
-            irlume_camera::capabilities()
-        } else {
-            irlume_camera::Caps {
-                ir_pair: false,
-                rgb: false,
-            }
+        // No camera probe (#187): capabilities() classifies every node,
+        // which opens it. Capabilities come from the daemon's Health.
+        let caps = irlume_camera::Caps {
+            ir_pair: false,
+            rgb: false,
         };
         let fp_present = irlume_fingerprint::available();
         let fp = FpInfo {
@@ -672,14 +658,9 @@ impl Probes {
                 || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists(),
             handoffs: crate::pamwire::keyring_handoff_warnings(),
         };
-        let (nodes, pairs) = if probe_cameras {
-            (irlume_camera::discover_nodes(), irlume_camera::list_pairs())
-        } else {
-            (Vec::new(), Vec::new())
-        };
         Probes {
             caps,
-            caps_probed: probe_cameras,
+            caps_probed: false,
             fp_present,
             reader_stuck: fp_present && irlume_fingerprint::reader_stuck(user),
             fp,
@@ -689,17 +670,6 @@ impl Probes {
                 Vec::new()
             },
             pam_cache,
-            privacy_engaged: nodes.iter().any(|(p, _)| irlume_camera::privacy_engaged(p)),
-            pair_privacy: pairs
-                .iter()
-                .map(|p| {
-                    (
-                        p.rgb.clone(),
-                        irlume_camera::privacy_engaged(&p.rgb)
-                            || irlume_camera::privacy_engaged(&p.ir),
-                    )
-                })
-                .collect(),
             selinux_enforcing: std::fs::read_to_string("/sys/fs/selinux/enforce")
                 .map(|s| s.trim() == "1")
                 .unwrap_or(false),
@@ -735,8 +705,6 @@ struct LightState {
     keyring_drift: Option<bool>,
     keyring_kind: Option<irlume_common::KeyringSecretKind>,
     recovery: Option<RecoveryInfo>,
-    nodes: Vec<(String, irlume_camera::Role)>,
-    pairs: Vec<irlume_camera::CameraPair>,
 }
 
 impl LightState {
@@ -745,17 +713,13 @@ impl LightState {
     fn gather(user: &str, prev_armed: Option<bool>) -> Self {
         let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
         // Classifying a node OPENS it. While the daemon is reachable it may
-        // be streaming those same nodes, and a second open is EBUSY on
-        // strict UVC modules, which surfaced as "camera is busy" during
-        // enrollment on a reporter's hardware (#187) and is invisible on
-        // modules that tolerate it. Enumerate only when the daemon is down,
-        // where the local probe is the ONLY source and nothing else holds
-        // the cameras.
-        let (nodes, pairs) = if enumerate_cameras_now(daemon_up) {
-            (irlume_camera::discover_nodes(), irlume_camera::list_pairs())
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        // be streaming those same nodes, and a second opener is EBUSY on
+        // strict UVC modules (#187). Gating on "is the daemon up" was not
+        // enough: a Ping that TIMES OUT reads as down, and a timing-out Ping
+        // is exactly what a daemon busy with the camera produces, so the
+        // fallback fired precisely when it was most dangerous. Capabilities
+        // come from Health, the picker's listing from ListCameras, and both
+        // are serialized against captures on the daemon's side.
         let mut out = LightState {
             daemon_up,
             health: None,
@@ -764,8 +728,6 @@ impl LightState {
             keyring_drift: None,
             keyring_kind: None,
             recovery: None,
-            nodes,
-            pairs,
         };
         if !daemon_up {
             return out;
@@ -875,9 +837,30 @@ impl App {
     /// wrong account. `user_arg` is the single rule the rest of the CLI already
     /// follows, and it also honours an explicit `--user`.
     fn new(user: String) -> Self {
-        // Hardware-adaptive screens: only show what the device can actually do, so
-        // a fingerprint-only box never offers face/camera setup steps.
-        let caps = irlume_camera::capabilities();
+        // Hardware-adaptive screens: only show what the device can actually
+        // do, so a fingerprint-only box never offers face/camera setup steps.
+        //
+        // Asked of the DAEMON, never probed here (#187 review): probing
+        // classifies every node, which opens it, and App::new runs before
+        // any other daemon contact, so it could open a node mid-capture. A
+        // daemon that does not answer leaves capabilities unknown, and
+        // unknown must not hide the camera screens on a machine that has
+        // cameras, so the optimistic default stands until the first light
+        // poll replaces it with the daemon's answer.
+        let caps = match crate::daemon_poll(&Request::Health) {
+            Ok(Response::Health {
+                ref tier,
+                ref rgb_dev,
+                ..
+            }) => irlume_camera::Caps {
+                ir_pair: tier == "secure",
+                rgb: rgb_dev.is_some() || tier == "secure",
+            },
+            _ => irlume_camera::Caps {
+                ir_pair: true,
+                rgb: true,
+            },
+        };
         let fp_present = irlume_fingerprint::available();
         let visible = Self::compute_visible(
             &caps,
@@ -902,8 +885,13 @@ impl App {
             keyring_policy: None,
             keyring_drift: None,
             keyring_kind: None,
-            nodes: irlume_camera::discover_nodes(),
-            pairs: irlume_camera::list_pairs(),
+            // EMPTY at construction (#187 review caught this one): App::new
+            // ran before any daemon contact, so probing here opened every
+            // node while the daemon might be mid-authentication. The light
+            // poll fills both in from the daemon within the first tick.
+            nodes: Vec::new(),
+            pairs: Vec::new(),
+            pairs_known: false,
             activity: Vec::new(),
             input: None,
             confirm: None,
@@ -1065,19 +1053,23 @@ impl App {
         self.light_load = Some(rx);
     }
 
-    /// Enumerate the camera nodes for the Cameras picker, which is the one
-    /// screen that needs the full listing rather than the daemon's summary.
+    /// Refresh the Cameras picker from the DAEMON.
     ///
-    /// Deliberately on ENTERING that screen instead of in the background
-    /// polls (#187): opening nodes is only safe when the user is not
-    /// simultaneously authenticating, and a picker visit is an explicit act.
-    /// Idempotent and cheap enough for a keypress; it does not stream.
+    /// `ListCameras` is camera-class on the daemon side, so the arbiter
+    /// serializes it against captures exactly like an enrollment: the
+    /// enumeration still opens nodes, but only ever on the one thread that
+    /// owns them (#187). A refusal (an authentication holds the camera) or
+    /// any transport error leaves the previous listing in place rather than
+    /// blanking it, because neither is an observation that the cameras are
+    /// gone.
     fn refresh_camera_listing(&mut self) {
-        self.nodes = irlume_camera::discover_nodes();
-        self.pairs = irlume_camera::list_pairs();
-        let pairs = self.pairs.len().max(1);
-        if self.cam_sel >= pairs {
-            self.cam_sel = pairs - 1;
+        if let Ok(Response::Cameras(pairs)) = crate::daemon_poll(&Request::ListCameras) {
+            self.pairs = pairs;
+            self.pairs_known = true;
+            let n = self.pairs.len().max(1);
+            if self.cam_sel >= n {
+                self.cam_sel = n - 1;
+            }
         }
     }
 
@@ -1118,14 +1110,6 @@ impl App {
         // now instead of waiting for a tab visit.
         if self.daemon_up && !self.profiles_loaded && self.enroll_error.is_none() {
             self.refresh_profiles();
-        }
-        // Only adopt a listing that was actually taken (see gather): an
-        // empty vec means "not enumerated this round", not "no cameras".
-        // Overwriting a good listing with that emptiness is the
-        // absent-vs-not-observed collapse (defect pattern 26).
-        if !l.nodes.is_empty() || !l.pairs.is_empty() {
-            self.nodes = l.nodes;
-            self.pairs = l.pairs;
         }
         let max = self.rows().len().max(1);
         if self.sel >= max {
@@ -1319,7 +1303,7 @@ impl App {
                 Fix::None,
             ));
             // Camera row from the daemon's validated tier (never the raw fallback).
-            let priv_on = self.probes.privacy_engaged;
+            let priv_on = self.pairs.iter().any(|p| p.privacy);
             let (csev, cdetail, cfix) = match h.tier.as_str() {
                 _ if priv_on => (Sev::Warn, "camera present, but a privacy switch is ON".to_string(),
                     Fix::Manual("turn off the camera privacy switch".into())),
@@ -1406,7 +1390,7 @@ impl App {
                 .nodes
                 .iter()
                 .any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
-            let priv_on = self.probes.privacy_engaged;
+            let priv_on = self.pairs.iter().any(|p| p.privacy);
             let (csev, cdetail, cfix) = if !rgb && !ir {
                 (
                     Sev::Warn,
@@ -4208,7 +4192,23 @@ impl App {
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
-        let (argb, air) = irlume_camera::select_pair(); // currently active pair
+        // The active pair comes from the daemon's Health, NOT from
+        // select_pair(): that helper falls through to discovery when no
+        // explicit pair is configured, and discovery opens every node. This
+        // is a DRAW function, so it ran per frame, which is where the last
+        // hundred-odd opens per session came from (#187). Health reports the
+        // devices the daemon actually has open, which is a better answer
+        // anyway.
+        let (argb, air) = self
+            .health
+            .as_ref()
+            .map(|h| {
+                (
+                    h.rgb_dev.clone().unwrap_or_default(),
+                    h.ir_dev.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
         let pairs = &self.pairs;
         // Size the list to its rows (header + one row per camera/note) so the
         // info block sits right under it instead of a stretched gap; leftover
@@ -4239,8 +4239,19 @@ impl App {
                 }
             }
             if v.is_empty() {
+                // Only claim "none" when the daemon actually said so. An
+                // unanswered ListCameras (daemon down, busy with a capture,
+                // or older than the request) is not an observation, and
+                // printing "no camera found" for it contradicted the active
+                // pair shown right below (#187).
                 v.push(ListItem::new(Span::styled(
-                    "no camera found: face auth unavailable on this device",
+                    if self.pairs_known {
+                        "no camera found: face auth unavailable on this device"
+                    } else if self.daemon_up {
+                        "asking irlumed for the camera list (it answers once the camera is free)"
+                    } else {
+                        "irlumed is not running, so the camera list is unknown; start it from Repair"
+                    },
                     Style::new().dim(),
                 )));
             } else {
@@ -4257,11 +4268,7 @@ impl App {
                     let active = p.rgb == argb && p.ir == air;
                     let kind = if p.fixed { "built-in" } else { "external" };
                     let id = p.id.clone().unwrap_or_else(|| "?".into());
-                    let priv_on = self
-                        .probes
-                        .pair_privacy
-                        .iter()
-                        .any(|(rgb, on)| *on && *rgb == p.rgb);
+                    let priv_on = p.privacy;
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
@@ -5911,6 +5918,7 @@ mod tests {
             keyring_kind: None,
             nodes: Vec::new(),
             pairs: Vec::new(),
+            pairs_known: false,
             activity: Vec::new(),
             input: None,
             confirm: None,
@@ -6477,21 +6485,31 @@ mod tests {
     // return (rgb is true whenever ir_pair is), so a frozen field keeps it and
     // a re-derived one cannot.
     #[test]
-    fn the_tui_never_opens_camera_nodes_while_the_daemon_is_up() {
-        // #187: classifying a node opens it, and a second open is EBUSY on
-        // strict UVC modules while the daemon streams the same node. The
-        // reporter's fuser trace showed `irlume` and `irlumed` holding
-        // /dev/video0 at once; reproduced here on a tolerant module by
-        // sampling the TUI's own probe window. The rule that closes it is
-        // this one function, so it is pinned directly.
-        assert!(
-            !enumerate_cameras_now(true),
-            "a reachable daemon is the authority; the TUI must not open nodes behind it"
-        );
-        assert!(
-            enumerate_cameras_now(false),
-            "with the daemon down the local probe is the only source, and nothing else holds the cameras"
-        );
+    fn no_tui_code_path_enumerates_cameras_locally() {
+        // #187: the TUI must never open a video node. Gating on "is the
+        // daemon up" was not enough, because a Ping that times out (exactly
+        // what a camera-busy daemon produces) read as down and licensed the
+        // opens. The rule is now absolute, so it is pinned as a source
+        // property: no camera-enumerating call may appear in this module
+        // outside tests. An instrumented run is the empirical half (strace
+        // counted 12 node opens before this change, 0 after); this catches
+        // a reintroduction at review time instead.
+        let src = include_str!("tui.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        for banned in [
+            "irlume_camera::discover_nodes",
+            "irlume_camera::list_pairs",
+            "irlume_camera::capabilities",
+            "irlume_camera::privacy_engaged",
+            // Falls through to discovery when no pair is configured, and it
+            // sat in a per-frame draw path (#187 review).
+            "irlume_camera::select_pair",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "{banned} opens video nodes; the TUI must ask the daemon (#187)"
+            );
+        }
     }
 
     #[test]
@@ -6536,33 +6554,6 @@ mod tests {
         };
         let caps = App::caps_from_health(&none);
         assert!(!caps.ir_pair && !caps.rgb, "no devices reported: {caps:?}");
-    }
-
-    #[test]
-    fn an_unenumerated_light_poll_does_not_blank_a_known_camera_listing() {
-        // gather() returns empty vecs when it skipped enumeration; adopting
-        // those would turn "not observed" into "no cameras" and empty the
-        // picker (defect pattern 26).
-        let mut app = test_app();
-        app.nodes = vec![("/dev/video0".into(), irlume_camera::Role::Rgb)];
-        app.pairs = Vec::new();
-        let l = LightState {
-            daemon_up: true,
-            health: None,
-            keyring_armed: None,
-            keyring_policy: None,
-            keyring_drift: None,
-            keyring_kind: None,
-            recovery: None,
-            nodes: Vec::new(),
-            pairs: Vec::new(),
-        };
-        app.apply_light(l);
-        assert_eq!(
-            app.nodes.len(),
-            1,
-            "a skipped enumeration must not blank the listing"
-        );
     }
 
     #[test]
@@ -7094,17 +7085,19 @@ mod tests {
         assert_eq!(app.repair_sel, 0);
         app.screen = SC_CAMERAS;
         app.pairs = vec![
-            irlume_camera::CameraPair {
+            irlume_common::CameraPairInfo {
                 rgb: "/dev/video0".into(),
                 ir: "/dev/video2".into(),
                 id: None,
                 fixed: true,
+                privacy: false,
             },
-            irlume_camera::CameraPair {
+            irlume_common::CameraPairInfo {
                 rgb: "/dev/video4".into(),
                 ir: "/dev/video6".into(),
                 id: None,
                 fixed: false,
+                privacy: false,
             },
         ];
         app.on_key(KeyCode::Up);
@@ -7427,11 +7420,12 @@ mod tests {
         assert!(app.suspend.is_none());
         let (_, msg) = app.activity.last().expect("the no-pair case is explained");
         assert!(msg.contains("no paired Hello camera"), "got: {msg}");
-        app.pairs = vec![irlume_camera::CameraPair {
+        app.pairs = vec![irlume_common::CameraPairInfo {
             rgb: "/dev/video0".into(),
             ir: "/dev/video2".into(),
             id: Some("abcd:1234".into()),
             fixed: true,
+            privacy: false,
         }];
         app.cam_sel = 0;
         app.on_key(KeyCode::Enter);
@@ -8225,8 +8219,6 @@ mod tests {
             keyring_drift: None,
             keyring_kind: None,
             recovery: None,
-            nodes: Vec::new(),
-            pairs: Vec::new(),
         });
         assert!(
             app.profiles_load.is_none(),
@@ -8498,9 +8490,15 @@ mod tests {
     fn cameras_screen_renders_pairs_and_the_no_pair_fallbacks() {
         let mut app = test_app();
         app.screen = SC_CAMERAS;
-        // No camera at all.
+        // Not asked yet: the screen must NOT claim there are no cameras,
+        // because an unanswered listing is not an observation (#187).
         let text = draw_text(&app);
-        assert!(text.contains("no camera found"));
+        assert!(!text.contains("no camera found"), "{text}");
+        assert!(text.contains("camera list is unknown"), "{text}");
+        // The daemon ANSWERED with an empty list: now "none" is a fact.
+        app.pairs_known = true;
+        let text = draw_text(&app);
+        assert!(text.contains("no camera found"), "{text}");
         // RGB node only: convenience tier, and why Secure needs IR.
         app.nodes = vec![("/dev/video9".into(), irlume_camera::Role::Rgb)];
         let text = draw_text(&app);
@@ -8508,11 +8506,12 @@ mod tests {
         assert!(text.contains("RGB-only, convenience tier"));
         assert!(text.contains("no IR node"));
         // A real Hello pair renders its nodes, kind, and USB id.
-        app.pairs = vec![irlume_camera::CameraPair {
+        app.pairs = vec![irlume_common::CameraPairInfo {
             rgb: "/dev/video0".into(),
             ir: "/dev/video2".into(),
             id: Some("abcd:1234".into()),
             fixed: true,
+            privacy: false,
         }];
         let text = draw_text(&app);
         assert!(text.contains("video0+video2"));
@@ -8944,8 +8943,6 @@ mod tests {
             keyring_drift: None,
             keyring_kind: None,
             recovery: None,
-            nodes: Vec::new(),
-            pairs: Vec::new(),
         });
         assert_eq!(app.sel, 1, "sel must clamp to the last real row");
         assert!(

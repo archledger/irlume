@@ -417,7 +417,7 @@ pub fn status(args: &[String]) -> ExitCode {
     // Secure-tier hardware, that does not exist. The daemon's own Health reply
     // has always paired the capability probe with an existence check; this now
     // agrees with it.
-    let caps = irlume_camera::capabilities();
+    let caps = crate::caps();
     let (rgb, ir) = irlume_camera::select_pair();
     let camera = json!({
         "rgb": caps.rgb && std::path::Path::new(&rgb).exists(),

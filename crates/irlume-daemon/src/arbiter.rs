@@ -88,7 +88,10 @@ pub fn classify(req: &Request) -> Class {
         | CaptureEarMedian { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
-        | SelfTest { .. } => Class::Camera,
+        | SelfTest { .. }
+        // Enumeration OPENS every node, so it belongs to the camera class
+        // even though it captures nothing (#187).
+        | ListCameras => Class::Camera,
         _ => Class::Plain,
     }
 }

@@ -274,7 +274,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
 fn offer_blink_challenge(user: &str) {
     use std::io::{BufRead, IsTerminal, Write};
     // Only meaningful on IR-capable (Secure-tier) hardware.
-    if !irlume_camera::capabilities().ir_pair {
+    if !crate::caps().ir_pair {
         return;
     }
     let tip =
@@ -1483,6 +1483,31 @@ pub(crate) fn user_arg(args: &[String]) -> String {
 }
 
 /// Effective UID 0: the command can write /etc and manage the daemon.
+/// This process's view of the camera hardware, asked of the DAEMON first and
+/// cached for the process.
+///
+/// Every caller used to call `irlume_camera::capabilities()`, which
+/// classifies each `/dev/video*` node by OPENING it. Reached from the TUI's
+/// refresh paths (through `pamwire::wants`, among others) that ran hundreds
+/// of times per session, each one a second opener racing whatever the daemon
+/// was streaming: EBUSY on strict UVC modules, which is #187. The daemon
+/// already knows what its cameras are and answers from memory, so ask it.
+///
+/// The local probe survives only as the daemon-silent fallback, and the
+/// `OnceLock` bounds it to a single probe per process instead of one per
+/// call. Long-running surfaces that must notice a camera being plugged in
+/// (the TUI) refresh from Health on their own poll rather than from here.
+pub(crate) fn caps() -> irlume_camera::Caps {
+    static CAPS: std::sync::OnceLock<irlume_camera::Caps> = std::sync::OnceLock::new();
+    *CAPS.get_or_init(|| match daemon_poll(&irlume_common::Request::Health) {
+        Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
+            ir_pair: tier == "secure",
+            rgb: rgb_dev.is_some() || tier == "secure",
+        },
+        _ => irlume_camera::capabilities(), // the one permitted probe
+    })
+}
+
 pub(crate) fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -3991,7 +4016,7 @@ fn doctor_run(
     // Secure/IR hardware only, and only when actually enrolled.
     report.check(
         "ir-calibration",
-        if !enrolled || !irlume_camera::capabilities().ir_pair {
+        if !enrolled || !crate::caps().ir_pair {
             // Not applicable on this machine or for this account; reported so a
             // consumer sees the check ran rather than silently vanishing.
             State::Info
@@ -4001,7 +4026,7 @@ fn doctor_run(
             State::Warn
         },
     );
-    if enrolled && !ir_ratio_calibrated && irlume_camera::capabilities().ir_pair {
+    if enrolled && !ir_ratio_calibrated && crate::caps().ir_pair {
         dout!(
             report,
             "[doctor] {user}'s face enrollment predates the per-user IR center/edge floor\n     \

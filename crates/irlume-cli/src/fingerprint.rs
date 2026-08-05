@@ -334,7 +334,7 @@ fn enable(user: &str, args: &[String]) -> ExitCode {
     // both stay active and the user unlocks with whichever is convenient.
     // `--fingerprint-only` forces the old fingerprint-only mode (face disabled).
     let fingerprint_only = args.iter().any(|a| a == "--fingerprint-only");
-    let coexist = !fingerprint_only && irlume_camera::capabilities().rgb;
+    let coexist = !fingerprint_only && crate::caps().rgb;
     // Enroll a finger first if the user has none.
     if !fp::has_enrollment(user) {
         println!("[fingerprint] no finger enrolled yet; enrolling one now");

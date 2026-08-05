@@ -1651,6 +1651,15 @@ struct EngineBits {
     third_party_pad: Option<String>,
     third_party_recognizer: Option<String>,
     third_party_detector: Option<String>,
+    /// The camera facts as the ENGINE observed them when it loaded, so
+    /// `Health` can answer from memory. Probing them per request opened
+    /// video nodes on a connection thread, outside the camera worker's
+    /// serialization, which is a second opener racing the worker's own
+    /// stream (#187 review) and contradicted the Status class's documented
+    /// "touches no camera" contract.
+    tier: String,
+    rgb_dev: Option<String>,
+    ir_dev: Option<String>,
 }
 
 fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
@@ -1663,12 +1672,28 @@ fn publish_engine_bits_raw(bits: EngineBits) {
 }
 
 fn publish_engine_bits(engine: &irlume_auth::Engine) {
+    // One probe, at load, on the thread that owns the engine. Every later
+    // Health answer reads this copy.
+    let caps = irlume_auth::capabilities();
+    let (rgb, ir) = irlume_auth::select_pair();
+    let rgb_dev = (caps.rgb && std::path::Path::new(&rgb).exists()).then_some(rgb);
+    let ir_dev = (caps.ir_pair && std::path::Path::new(&ir).exists()).then_some(ir);
+    let tier = if ir_dev.is_some() {
+        "secure"
+    } else if rgb_dev.is_some() {
+        "convenience"
+    } else {
+        "none"
+    };
     publish_engine_bits_raw(EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
         third_party_pad: engine.thirdparty_pad_name().map(String::from),
         third_party_recognizer: engine.thirdparty_recognizer_name().map(String::from),
         third_party_detector: engine.thirdparty_detector_name().map(String::from),
+        tier: tier.into(),
+        rgb_dev,
+        ir_dev,
     });
 }
 
@@ -1846,23 +1871,16 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
     Some(match req {
         Request::Ping => Response::Pong,
         Request::Health => {
-            // Live probe (cameras can appear/vanish); report selected nodes only
-            // when they actually exist; never the unvalidated fallback pair.
-            let caps = irlume_auth::capabilities();
-            let (rgb, ir) = irlume_auth::select_pair();
-            let rgb_dev = (caps.rgb && std::path::Path::new(&rgb).exists()).then_some(rgb);
-            let ir_dev = (caps.ir_pair && std::path::Path::new(&ir).exists()).then_some(ir);
-            let tier = if ir_dev.is_some() {
-                "secure"
-            } else if rgb_dev.is_some() {
-                "convenience"
-            } else {
-                "none"
-            };
+            // MEMORY ONLY. The camera facts were probed once when the engine
+            // loaded and published with the rest of the bits; probing here
+            // opened video nodes on a connection thread while the worker
+            // might be streaming them (#187 review). A camera that appears
+            // or vanishes is picked up at the next engine (re)load, which is
+            // also when the daemon could act on it.
             Response::Health {
-                tier: tier.into(),
-                rgb_dev,
-                ir_dev,
+                tier: bits.tier.clone(),
+                rgb_dev: bits.rgb_dev.clone(),
+                ir_dev: bits.ir_dev.clone(),
                 mesh: bits.mesh,
                 adapter: bits.adapter,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -2721,6 +2739,22 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(e) => Response::Error(e.to_string()),
             }
         }
+        Request::ListCameras => Response::Cameras(
+            irlume_auth::list_pairs()
+                .into_iter()
+                .map(|p| irlume_common::CameraPairInfo {
+                    // Privacy is read HERE, on the camera worker, for the
+                    // same reason the enumeration is: the control read opens
+                    // the node (#187).
+                    privacy: irlume_auth::privacy_engaged(&p.rgb)
+                        || irlume_auth::privacy_engaged(&p.ir),
+                    rgb: p.rgb,
+                    ir: p.ir,
+                    id: p.id,
+                    fixed: p.fixed,
+                })
+                .collect(),
+        ),
         Request::DeleteProfile { user, profile } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to modify '{user}'"));
@@ -4190,6 +4224,9 @@ mod tests {
             third_party_pad: Some("flir".into()),
             third_party_recognizer: None,
             third_party_detector: None,
+            tier: "none".into(),
+            rgb_dev: None,
+            ir_dev: None,
         });
         let peer = Peer {
             uid: 0,

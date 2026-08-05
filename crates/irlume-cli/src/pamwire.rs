@@ -743,7 +743,7 @@ pub(crate) struct Wants {
 
 /// `Auto` follows the hardware; an explicit method overrides it.
 pub(crate) fn wants() -> Wants {
-    let caps = irlume_camera::capabilities();
+    let caps = crate::caps();
     let method = irlume_core::policy::method();
     let is_fp_method = method.face_disabled(); // Method::Fingerprint
     let is_face_method = matches!(method, irlume_core::policy::Method::Face);
@@ -1130,7 +1130,7 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     // this hardware, and (on enable) UNWIRE what it doesn't, so switching method
     // re-configures cleanly instead of leaving stale lines. `want_*` gate each
     // factor; on disable everything is unwired.
-    let caps = irlume_camera::capabilities();
+    let caps = crate::caps();
     let method = irlume_core::policy::method();
     let Wants {
         face_login: want_face_login,

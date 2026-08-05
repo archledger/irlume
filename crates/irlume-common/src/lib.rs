@@ -459,6 +459,12 @@ pub enum Request {
     },
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
+    /// Enumerate the Hello camera pairs for the picker. CAMERA-CLASS: it
+    /// opens every video node to classify it, so it must be serialized
+    /// against captures by the arbiter like any other camera work. Clients
+    /// must NOT enumerate for themselves; a second opener racing the
+    /// daemon's stream is EBUSY on strict UVC modules (#187).
+    ListCameras,
     /// Liveness/health ping.
     Ping,
     /// Daemon self-report: what it actually has loaded and which camera tier it
@@ -614,6 +620,22 @@ pub enum OperationErrorCode {
     Unknown,
 }
 
+/// One physical camera exposing an RGB and an IR node, as the daemon sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraPairInfo {
+    pub rgb: String,
+    pub ir: String,
+    /// `idVendor:idProduct`, when readable.
+    pub id: Option<String>,
+    /// Built-in (`removable=fixed`) rather than an external USB camera.
+    pub fixed: bool,
+    /// A privacy shutter/switch is engaged on either node of this pair.
+    /// Read by the daemon while it enumerates, because reading the control
+    /// opens the device and only the daemon may do that (#187).
+    #[serde(default)]
+    pub privacy: bool,
+}
+
 /// A profile and the names of its scans, for `ListProfiles`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSummary {
@@ -669,6 +691,9 @@ pub enum Response {
         reason: String,
     },
     Profiles(Vec<String>),
+    /// Answer to [`Request::ListCameras`]: every physical camera exposing an
+    /// RGB+IR pair, built-in first.
+    Cameras(Vec<CameraPairInfo>),
     /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
     /// face matched (check `live` to tell "no match" from "not a live face").
     Identified {

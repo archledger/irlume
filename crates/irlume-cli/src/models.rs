@@ -956,7 +956,18 @@ mod tests {
             .unwrap();
         };
         fake(1);
-        std::env::set_var("PATH", &dir);
+        // PREPEND, never replace: PATH is process-global, tests run in
+        // parallel threads, and replacing it made every concurrent test that
+        // spawns a helper (sh, gzip) fail to find it. That is what made the
+        // update-probe test look like a flaky CI runner for three runs.
+        // Prepending still resolves systemctl to the fake first.
+        let faked_path = {
+            let mut p = std::ffi::OsString::from(&dir);
+            p.push(":");
+            p.push(&old_path);
+            p
+        };
+        std::env::set_var("PATH", &faked_path);
         let failed = restart_daemon();
         fake(0);
         let succeeded = restart_daemon();

@@ -2062,27 +2062,44 @@ fn profiles_data(
     let profiles = profiles
         .into_iter()
         .map(|profile| {
-            json!({
+            // Per-recognizer counts, and which recognizer is loaded, so a
+            // consumer can say which templates are live right now (#288).
+            // A profile can hold several recognizers' templates, and only
+            // the loaded one's can match; "scans" alone cannot say that.
+            //
+            // A daemon older than 0.9.0 never sends the counts, and they arrive
+            // as an empty map. Rendering that as `"recognizers": []` next to ten
+            // scans claims no recognizer can match this profile, which is the
+            // "unknown is not zero" mistake this file's own contract forbids and
+            // would invite a consumer to prompt for re-enrollment. A 0.9.0
+            // daemon always populates the map for a profile that has scans
+            // (untagged ones count under the legacy space), so empty-with-scans
+            // means only that nobody told us: omit the key instead.
+            let live = profile.live_recognizer.clone();
+            let recognizers = (!profile.scans_by_recognizer.is_empty() || profile.scans.is_empty())
+                .then(|| {
+                    profile
+                        .scans_by_recognizer
+                        .iter()
+                        .map(|(space, count)| {
+                            json!({
+                                "space": space,
+                                "scans": count,
+                                "live": live.as_deref() == Some(space.as_str()),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+            let mut obj = json!({
                 "display_name": profile.name,
                 "scans": profile.scans.into_iter().map(|name| {
                     json!({ "display_name": name })
                 }).collect::<Vec<_>>(),
-                // Per-recognizer counts, and which recognizer is loaded, so a
-                // consumer can say which templates are live right now (#288).
-                // A profile can hold several recognizers' templates, and only
-                // the loaded one's can match; "scans" alone cannot say that.
-                "recognizers": profile
-                    .scans_by_recognizer
-                    .into_iter()
-                    .map(|(space, count)| {
-                        json!({
-                            "space": space,
-                            "scans": count,
-                            "live": profile.live_recognizer.as_deref() == Some(space.as_str()),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
+            });
+            if let Some(recognizers) = recognizers {
+                obj["recognizers"] = json!(recognizers);
+            }
+            obj
         })
         .collect::<Vec<_>>();
     json!({
@@ -2198,6 +2215,52 @@ mod tests {
         assert!(document.get("error").is_none());
     }
 
+    /// A daemon older than 0.9.0 does not send per-recognizer counts, so they
+    /// deserialize to an empty map. Emitting `"recognizers": []` beside ten
+    /// scans asserts that no recognizer can match this profile, which is false
+    /// and would invite a consumer to prompt for re-enrollment. This is the
+    /// upgrade window: a 0.9.0 CLI against a running 0.8.1 daemon, which is
+    /// exactly what a user sees between `dnf upgrade` and the daemon restart.
+    #[test]
+    fn an_old_daemons_missing_recognizer_counts_are_absent_not_empty() {
+        let data = profiles_data(
+            vec![ProfileSummary {
+                name: "BEN".into(),
+                scans: vec!["s1".into(), "s2".into()],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
+            }],
+            false,
+            false,
+        );
+        let profile = &data["profiles"][0];
+        assert_eq!(profile["scans"].as_array().unwrap().len(), 2);
+        assert!(
+            profile.get("recognizers").is_none(),
+            "unknown counts must be ABSENT, not an empty array: {profile}"
+        );
+
+        // A profile that genuinely has no scans is not the unknown case, and
+        // an empty list there is the honest answer.
+        let empty = profiles_data(
+            vec![ProfileSummary {
+                name: "Fresh".into(),
+                scans: vec![],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
+            }],
+            false,
+            false,
+        );
+        assert_eq!(
+            empty["profiles"][0]["recognizers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
     #[test]
     fn profiles_report_each_recognizer_and_mark_only_the_loaded_one_live() {
         // #288: a profile can hold several recognizers' templates and only
@@ -2249,10 +2312,15 @@ mod tests {
         assert!(old_wire.scans_by_recognizer.is_empty());
         assert!(old_wire.live_recognizer.is_none());
         let data = profiles_data(vec![old_wire], false, false);
-        assert!(data["profiles"][0]["recognizers"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        // This used to assert an empty ARRAY. It now asserts the key is absent:
+        // an empty array beside a populated `scans` list says "no recognizer has
+        // templates in this profile", which is a definite claim the CLI cannot
+        // support and which would send a consumer to re-enroll a working
+        // profile. Absent means unknown, which is what an older daemon leaves us
+        // with. The wire-decode half of this test is unchanged and is the point:
+        // decoding from real JSON rather than a struct literal is what keeps it
+        // honest if the serde defaults are ever removed (#291 review).
+        assert!(data["profiles"][0].get("recognizers").is_none());
     }
 
     #[test]

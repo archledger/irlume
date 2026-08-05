@@ -339,6 +339,14 @@ now; the entry whose `live` is true can. None is live when the loaded
 recognizer has no templates in that profile, which is what an operator sees
 after switching models before re-adding scans.
 
+`recognizers` is ABSENT, not empty, when the daemon did not report the counts.
+That happens against a daemon older than 0.9.0, which is what a consumer sees
+between the package upgrade and the daemon restart. An empty array would mean
+"no recognizer has templates here", so emitting it beside a populated `scans`
+list would be the unknown-as-zero mistake. Treat a missing `recognizers` as
+unknown and fall back to `scans`; do not treat it as a profile that needs
+re-enrolling.
+
 ### `irlume models list --json`
 
 Capability: `models-list-json`.

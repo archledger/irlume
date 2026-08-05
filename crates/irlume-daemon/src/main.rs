@@ -1559,6 +1559,7 @@ fn request_user(req: &Request) -> Option<&str> {
         | ListProfiles { user, .. }
         | DeleteProfile { user, .. }
         | DeleteScan { user, .. }
+        | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
         | AddScan { user, .. }
@@ -1746,6 +1747,7 @@ fn enrollment_mutating_user(req: &Request) -> Option<&str> {
         | AddScan { user, .. }
         | DeleteProfile { user, .. }
         | DeleteScan { user, .. }
+        | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
         | SetRequireEyesOpen { user, .. }
@@ -2698,6 +2700,69 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 } else {
                     Ok(format!("deleted scan '{scan}' from '{profile}'"))
                 }
+            })
+        }
+        Request::ForgetRecognizer { user, space } => {
+            if !authorized_for(peer, &user) {
+                return Response::Error(format!("not authorized to modify '{user}'"));
+            }
+            // Read before mutating: is the loaded recognizer the one being
+            // forgotten? Decided here because the closure below has no engine.
+            let forgetting_live = space == engine.embed_space();
+            mutate_enrollment(&user, |enr| {
+                let mut scans_removed = 0usize;
+                let mut calibs_removed = 0usize;
+                for p in &mut enr.profiles {
+                    let before = p.scans.len();
+                    p.scans.retain(|s| {
+                        !irlume_core::storage::recognizer_space_matches(
+                            s.embed_space.as_deref(),
+                            &space,
+                        )
+                    });
+                    scans_removed += before - p.scans.len();
+                    // The calibration for this space was fitted from the scans
+                    // just removed; it is derived biometric material and goes
+                    // with them. Cleared even when the scans are already gone
+                    // (deleted one by one), because a stale fit can outlive
+                    // its scans.
+                    if p.calib_for(&space).is_some() {
+                        calibs_removed += 1;
+                        p.set_calib_for(&space, None);
+                    }
+                }
+                if scans_removed == 0 && calibs_removed == 0 {
+                    return Err(format!("no enrollment data from recognizer {space}"));
+                }
+                // Same rule as DeleteScan: a profile is never left empty. A
+                // profile whose only scans were this recognizer's goes with
+                // them, and when the last profile goes, mutate_enrollment
+                // erases the file.
+                let emptied: Vec<String> = enr
+                    .profiles
+                    .iter()
+                    .filter(|p| p.scans.is_empty())
+                    .map(|p| p.name.clone())
+                    .collect();
+                enr.profiles.retain(|p| !p.scans.is_empty());
+                let mut msg = format!("forgot recognizer {space}: {scans_removed} scan(s) removed");
+                if !emptied.is_empty() {
+                    msg.push_str(&format!(
+                        " (profile(s) {} deleted: no scans left)",
+                        emptied
+                            .iter()
+                            .map(|n| format!("'{n}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if forgetting_live && scans_removed > 0 {
+                    msg.push_str(
+                        "; these were the LOADED recognizer's templates, so face \
+                         authentication needs a re-enroll or an add-scan",
+                    );
+                }
+                Ok(msg)
             })
         }
         Request::RenameProfile {
@@ -5288,6 +5353,203 @@ mod tests {
             Response::Error(msg) => assert_eq!(msg, "'carol' is not enrolled"),
             other => panic!("second delete must report unenrolled, got {other:?}"),
         }
+    }
+
+    /// A two-model enrollment for the forget-recognizer tests: 'BEN' holds two
+    /// untagged (shipped-space) scans; 'Mixed' holds one shipped scan, two
+    /// scans in `embed:model-b`, and calibrations for both spaces.
+    fn two_model_enrollment(user: &str) -> Enrollment {
+        let calib = |pairs: usize| irlume_core::calib::IrCalibration {
+            m: vec![],
+            n_rows: vec![],
+            lambda: 0.0,
+            fitted_pairs: pairs,
+        };
+        let tagged = |name: &str, seed: usize, space: &str| FaceScan {
+            embed_space: Some(space.into()),
+            ..rgb_scan(name, seed)
+        };
+        let mut mixed = FaceProfile {
+            name: "Mixed".into(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+            scans: vec![
+                rgb_scan("Face Scan 1", 3),
+                tagged("Face Scan 2", 4, "embed:model-b"),
+                tagged("Face Scan 3", 5, "embed:model-b"),
+            ],
+        };
+        mixed.set_calib_for(
+            irlume_core::storage::LEGACY_RECOGNIZER_SPACE,
+            Some(calib(1)),
+        );
+        mixed.set_calib_for("embed:model-b", Some(calib(2)));
+        let mut e = enrollment_with(user, &["Face Scan 1", "Face Scan 2"]);
+        e.profiles[0].name = "BEN".into();
+        e.profiles.push(mixed);
+        e
+    }
+
+    #[test]
+    fn forget_recognizer_refuses_a_foreign_peer_and_an_unknown_space() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("forget-deny");
+        write_enrollment(&sb.dir, &two_model_enrollment("carol"));
+        match dispatch(
+            Request::ForgetRecognizer {
+                user: "carol".into(),
+                space: "embed:model-b".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert_eq!(msg, "not authorized to modify 'carol'"),
+            other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+        // A space with no scans and no calibration anywhere: an error, so an
+        // operator learns the name did not match rather than reading success.
+        match dispatch(
+            Request::ForgetRecognizer {
+                user: "carol".into(),
+                space: "embed:model-c".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => {
+                assert_eq!(msg, "no enrollment data from recognizer embed:model-c")
+            }
+            other => panic!("unknown space must be an error, got {other:?}"),
+        }
+        // Both deny paths left the enrollment untouched.
+        let enr = irlume_core::storage::load("carol").unwrap().unwrap();
+        assert_eq!(enr.profiles.len(), 2);
+        assert_eq!(enr.profiles[1].scans.len(), 3);
+    }
+
+    #[test]
+    fn forget_recognizer_removes_scans_and_calibs_drops_emptied_profiles_and_erases_the_file() {
+        // The keep-path ends in storage::save; on a host with /dev/tpm* that
+        // would seal a real template key, so this runs on no-TPM hosts (CI,
+        // the container suite). Same convention as the other mutation tests.
+        if irlume_core::template_key::tpm_available() {
+            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("forget-two-model");
+        write_enrollment(&sb.dir, &two_model_enrollment("carol"));
+        let root = peer(0);
+        // Forget the third-party space: its scans and its calibration go, the
+        // shipped-space material (including untagged scans) stays.
+        match dispatch(
+            Request::ForgetRecognizer {
+                user: "carol".into(),
+                space: "embed:model-b".into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Ok(msg) => {
+                assert_eq!(msg, "forgot recognizer embed:model-b: 2 scan(s) removed")
+            }
+            other => panic!("forget model-b must succeed, got {other:?}"),
+        }
+        let enr = irlume_core::storage::load("carol").unwrap().unwrap();
+        assert_eq!(enr.profiles.len(), 2, "no profile was emptied yet");
+        let mixed = &enr.profiles[1];
+        assert_eq!(
+            mixed
+                .scans
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Face Scan 1"]
+        );
+        assert!(
+            mixed.calib_for("embed:model-b").is_none(),
+            "the forgotten space's calibration is derived biometric material"
+        );
+        assert!(
+            mixed
+                .calib_for(irlume_core::storage::LEGACY_RECOGNIZER_SPACE)
+                .is_some(),
+            "another recognizer's calibration must survive"
+        );
+        // Forget the shipped space, which the test engine has loaded: every
+        // remaining scan is untagged or shipped, so both profiles empty out
+        // and the enrollment file goes with them, and the reply says the
+        // loaded recognizer's templates are gone.
+        assert_eq!(
+            e.embed_space(),
+            irlume_core::storage::LEGACY_RECOGNIZER_SPACE,
+            "test engine is expected to hold the shipped recognizer"
+        );
+        match dispatch(
+            Request::ForgetRecognizer {
+                user: "carol".into(),
+                space: irlume_core::storage::LEGACY_RECOGNIZER_SPACE.into(),
+            },
+            &root,
+            &mut e,
+        ) {
+            Response::Ok(msg) => assert_eq!(
+                msg,
+                format!(
+                    "forgot recognizer {}: 3 scan(s) removed (profile(s) 'BEN', 'Mixed' \
+                     deleted: no scans left); these were the LOADED recognizer's templates, \
+                     so face authentication needs a re-enroll or an add-scan",
+                    irlume_core::storage::LEGACY_RECOGNIZER_SPACE
+                )
+            ),
+            other => panic!("forget shipped must succeed, got {other:?}"),
+        }
+        assert!(
+            !sb.dir.join("carol.json").exists(),
+            "an enrollment with zero profiles must not linger on disk"
+        );
+    }
+
+    #[test]
+    fn forget_recognizer_clears_a_calibration_that_outlived_its_scans() {
+        if irlume_core::template_key::tpm_available() {
+            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            return;
+        }
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("forget-stale-calib");
+        // Only shipped-space scans, but a stale model-b calibration left over
+        // from scans deleted one by one. Forgetting model-b is a real change.
+        let mut enr = enrollment_with("carol", &["Face Scan 1"]);
+        enr.profiles[0].set_calib_for(
+            "embed:model-b",
+            Some(irlume_core::calib::IrCalibration {
+                m: vec![],
+                n_rows: vec![],
+                lambda: 0.0,
+                fitted_pairs: 7,
+            }),
+        );
+        write_enrollment(&sb.dir, &enr);
+        match dispatch(
+            Request::ForgetRecognizer {
+                user: "carol".into(),
+                space: "embed:model-b".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Ok(msg) => {
+                assert_eq!(msg, "forgot recognizer embed:model-b: 0 scan(s) removed")
+            }
+            other => panic!("calibration-only forget must succeed, got {other:?}"),
+        }
+        let enr = irlume_core::storage::load("carol").unwrap().unwrap();
+        assert_eq!(enr.profiles[0].scans.len(), 1, "scans are untouched");
+        assert!(enr.profiles[0].calib_for("embed:model-b").is_none());
     }
 
     #[test]

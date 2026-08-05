@@ -35,6 +35,7 @@ Conventions that apply everywhere:
 | `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded) |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
+| `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user; the deliberate counterpart to `models disable`, which deletes weights but keeps templates. `<model>` is `shipped`, a catalog name, or an `embed:<sha256>` tag as `profiles list` prints it. A profile left with no scans is deleted with them |
 | `irlume profiles eyes-open <on\|off>` | require eyes open to unlock |
 | `irlume profiles challenge <on\|off>` | opt-in passive blink liveness |
 | `sudo irlume calibrate-closure [--rounds N] [--force]` | teach the eye-closure consent gesture for app prompts. Captures eyes-open/closed EAR over N rounds (default 3) and stores the median, because a single capture varies enough to leave the threshold sitting on top of your own closures; it then reports how many of your readings the result would actually accept. Replacing an existing calibration asks first, and `--force` is required to do it with no terminal. The head nod is the default and needs no calibration |

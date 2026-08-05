@@ -380,6 +380,9 @@ fn profiles_usage_errors_exit_2() {
         &["profiles", "eyes-open"],
         &["profiles", "eyes-open", "on", "off"],
         &["profiles", "challenge"],
+        // forget-model with no model name; a flag must not be read as one.
+        &["profiles", "forget-model"],
+        &["profiles", "forget-model", "--user"],
     ];
     for argv in cases {
         let (code, _, err) = run(&mut sb.cmd(argv));
@@ -392,6 +395,7 @@ fn profiles_usage_errors_exit_2() {
         "add-scan --profile P [--scans N]",
         "rename --profile P [--scan S] --name N",
         "delete --profile P [--scan S]",
+        "forget-model <model>",
         "eyes-open <on|off>",
         "challenge <on|off>",
     ] {
@@ -449,6 +453,7 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
         ],
         &["profiles", "eyes-open", "on"],
         &["profiles", "challenge", "off"],
+        &["profiles", "forget-model", "shipped"],
     ];
     for argv in cases {
         let (code, _, err) = run(&mut sb.cmd(argv));
@@ -459,6 +464,25 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
         );
         assert!(!err.contains("usage:"), "{argv:?} parsed fine: {err}");
     }
+}
+
+#[test]
+fn forget_model_refuses_a_name_that_is_not_a_recognizer() {
+    // Refused at resolution, before any daemon request: with no daemon
+    // running, a request attempt would exit 1, so exit 2 proves the order.
+    let sb = Sandbox::new("forgetbad");
+    let (code, _, err) = run(&mut sb.cmd(&["profiles", "forget-model", "nonsense"]));
+    assert_eq!(code, 2, "an unknown model must be a usage error: {err}");
+    assert!(
+        err.contains("unknown model 'nonsense'") && err.contains("shipped"),
+        "the error must list the recognizers: {err}"
+    );
+    let (code, _, err) = run(&mut sb.cmd(&["profiles", "forget-model", "embed:nothex"]));
+    assert_eq!(
+        code, 2,
+        "a malformed space tag must be a usage error: {err}"
+    );
+    assert!(err.contains("64 hex"), "{err}");
 }
 
 // ---------------------------------------------------------- daemon-backed cmds

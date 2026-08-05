@@ -403,6 +403,19 @@ pub enum Request {
         profile: String,
         scan: String,
     },
+    /// Remove every scan `user` holds in one recognizer's embedding space,
+    /// plus the calibrations fitted from them (#288). PRIVILEGED, same rule
+    /// as DeleteProfile.
+    ///
+    /// `models disable` deletes a recognizer's weights and deliberately keeps
+    /// its templates, so that re-enabling it later needs no re-enrollment.
+    /// This request is the deliberate counterpart for when the operator wants
+    /// that biometric material gone. `space` is the embedding-space tag
+    /// (`embed:<sha256>` of the recognizer weights); the CLI resolves a
+    /// catalog name to it. A profile left with no scans is deleted with them:
+    /// an empty profile can never match, and `DeleteScan` upholds the same
+    /// never-orphaned rule.
+    ForgetRecognizer { user: String, space: String },
     /// Rename a profile. PRIVILEGED.
     RenameProfile {
         user: String,

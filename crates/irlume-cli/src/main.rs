@@ -367,6 +367,25 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             }
             None => return usage_profiles(),
         },
+        Some("forget-model") => {
+            // Positional: `irlume profiles forget-model <model>` (args[0] is
+            // "profiles", args[1] the subcommand). A flag must not be read as
+            // the model name when the positional is missing.
+            match args
+                .get(2)
+                .map(String::as_str)
+                .filter(|a| !a.starts_with("--"))
+            {
+                Some(name) => match crate::models::recognizer_space_for(name) {
+                    Ok(space) => Request::ForgetRecognizer { user, space },
+                    Err(e) => {
+                        eprintln!("[profiles] {e}");
+                        return std::process::ExitCode::from(2);
+                    }
+                },
+                None => return usage_profiles(),
+            }
+        }
         Some("delete") => match (flag(args, "--profile"), flag(args, "--scan")) {
             (Some(p), Some(s)) => Request::DeleteScan {
                 user,
@@ -949,6 +968,8 @@ fn usage_profiles() -> std::process::ExitCode {
                                                 add templates for a second model)\n  \
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
+        forget-model <model>                    remove one recognizer's scans from every\n  \
+                                                profile (shipped | a catalog name | embed:<sha256>)\n  \
         eyes-open <on|off>                      require eyes open to unlock\n  \
         challenge <on|off>                      opt-in passive blink liveness"
     );

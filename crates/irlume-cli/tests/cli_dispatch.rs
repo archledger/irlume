@@ -684,6 +684,32 @@ fn daemon_error_responses_surface_per_command() {
     }
 }
 
+#[test]
+fn forget_model_sends_the_resolved_space_over_the_wire() {
+    // The CLI resolves a catalog name to its embedding-space tag; the daemon
+    // only ever sees the tag. The fake daemon asserts the exact request, so a
+    // resolver regression (wrong pin, name passed through raw) fails here and
+    // not on a real enrollment.
+    let sb = Sandbox::new("forgetwire");
+    let rec = irlume_common::thirdparty::CATALOG
+        .iter()
+        .find(|m| m.stage == irlume_common::thirdparty::Stage::Recognition)
+        .expect("the catalog carries a recognizer");
+    let want = format!("embed:{}", rec.sha256);
+    serve(&sb.sock(), move |req| match req {
+        Request::ForgetRecognizer { user, space } if user == "tester" && *space == want => {
+            Response::Ok(format!("forgot recognizer {space}: 2 scan(s) removed"))
+        }
+        other => Response::Error(format!("unexpected request {other:?}")),
+    });
+    let (code, out, err) = run(
+        &mut sb.cmd(&["profiles", "forget-model", rec.name, "--user", "tester"]),
+        "forget-model",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("2 scan(s) removed"), "{out}");
+}
+
 // The write-side commands' unexpected-response arms (keyring arm/forget,
 // recovery setup/restore/forget). cli.rs's Pong sweep does not include these.
 #[test]

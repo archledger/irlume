@@ -3810,13 +3810,40 @@ impl App {
             .map(|r| match r {
                 Row::Profile(pi) => {
                     let p = &self.profiles[*pi];
-                    ListItem::new(Line::from(vec![
+                    // Same rule as the CLI listing (#288): only the loaded
+                    // recognizer's scans can match, so a bare total would let
+                    // a profile look usable when none of it is. The breakdown
+                    // appears when the total would mislead; an old daemon
+                    // reports neither field and keeps the flat count.
+                    let live = p.live_recognizer.as_deref();
+                    let live_count = live
+                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
+                        .unwrap_or(0);
+                    let misleading = p.scans_by_recognizer.len() > 1
+                        || (live.is_some() && live_count != p.scans.len());
+                    let count = if misleading {
+                        format!(
+                            "   ({} scans, {} for the loaded recognizer)",
+                            p.scans.len(),
+                            live_count
+                        )
+                    } else {
+                        format!("   ({} scans)", p.scans.len())
+                    };
+                    let mut item = vec![Line::from(vec![
                         Span::styled(
                             format!("● {}", p.name),
                             Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("   ({} scans)", p.scans.len()), Style::new().dim()),
-                    ]))
+                        Span::styled(count, Style::new().dim()),
+                    ])];
+                    if misleading && live_count == 0 {
+                        item.push(Line::from(Span::styled(
+                            "     none of these match the loaded recognizer; add scans with [a] Improve Recognition",
+                            Style::new().fg(th().warn),
+                        )));
+                    }
+                    ListItem::new(item)
                 }
                 Row::Scan(pi, si) => ListItem::new(Line::from(Span::raw(format!(
                     "     ↳ {}",
@@ -4510,6 +4537,25 @@ impl App {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
+    /// How many enrolled scans the LOADED recognizer can match, or `None`
+    /// when the daemon predates per-recognizer reporting (then nothing can be
+    /// said and the flat total stands). Feeds [`count_badge`]: a profile full
+    /// of another recognizer's scans is not healthy enrollment (#288).
+    fn live_scans(&self) -> Option<usize> {
+        // One daemon, one loaded recognizer: every summary carries the same
+        // live_recognizer, so the first is the answer.
+        let live = self
+            .profiles
+            .iter()
+            .find_map(|p| p.live_recognizer.as_deref())?;
+        Some(
+            self.profiles
+                .iter()
+                .map(|p| p.scans_by_recognizer.get(live).copied().unwrap_or(0))
+                .sum(),
+        )
+    }
+
     /// Hub rows for the Welcome screen: each visible section with its live
     /// state, selectable and Enter-jumpable (hub-and-spoke: the summary IS
     /// the navigation, the tab ribbon stays for direct access).
@@ -4642,7 +4688,7 @@ impl App {
                 style = style.fg(th().accent).add_modifier(Modifier::BOLD);
             }
             let badge = if label == "enrollment" {
-                count_badge(self.profiles.len(), scans)
+                count_badge(self.profiles.len(), scans, self.live_scans())
             } else {
                 onoff(ok)
             };
@@ -5076,7 +5122,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  enrollment        "),
-                count_badge(self.profiles.len(), scans),
+                count_badge(self.profiles.len(), scans, self.live_scans()),
             ]),
             Line::from(vec![
                 Span::raw("  eyes-open gate    "),
@@ -5441,15 +5487,23 @@ fn method_label(method: &str) -> String {
     }
 }
 
-/// "N profile(s), M scan(s)" or a dim "none".
-fn count_badge(profiles: usize, scans: usize) -> Span<'static> {
+/// "N profile(s), M scan(s)" or a dim "none". `live` is how many of those
+/// scans the loaded recognizer can match, `None` when the daemon does not
+/// report it. Zero live scans is a warning, not a green badge: enrollment
+/// that cannot match is not healthy, however many scans it holds (#288).
+fn count_badge(profiles: usize, scans: usize, live: Option<usize>) -> Span<'static> {
     if profiles == 0 {
-        Span::styled("○ none", Style::new().dim())
-    } else {
-        Span::styled(
+        return Span::styled("○ none", Style::new().dim());
+    }
+    match live {
+        Some(0) => Span::styled(
+            format!("● {profiles} profile(s), {scans} scan(s), none for the loaded recognizer"),
+            Style::new().fg(th().warn).add_modifier(Modifier::BOLD),
+        ),
+        _ => Span::styled(
             format!("● {profiles} profile(s), {scans} scan(s)"),
             Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-        )
+        ),
     }
 }
 
@@ -7816,6 +7870,72 @@ mod tests {
             text.contains("Improve Recognition"),
             "the add-scan guidance is missing"
         );
+    }
+
+    #[test]
+    fn profiles_screen_separates_live_scans_from_another_recognizers() {
+        // Only the loaded recognizer's scans can match, so a flat count let a
+        // profile read as healthy when none of it was usable (#288). The
+        // breakdown appears exactly when the flat count would mislead.
+        let live_space = "embed:model-b";
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        // All scans live: the flat count stands, no warning.
+        let mut p = profile("Alice", &["scan-a", "scan-b"]);
+        p.scans_by_recognizer = [(live_space.to_string(), 2)].into();
+        p.live_recognizer = Some(live_space.into());
+        app.profiles = vec![p];
+        let text = draw_text(&app);
+        assert!(text.contains("(2 scans)"), "{text}");
+        assert!(!text.contains("for the loaded recognizer"), "{text}");
+        // No scan lives in the loaded space: the count says so, and the row
+        // grows the warning naming the fix.
+        let mut p = profile("Alice", &["scan-a", "scan-b"]);
+        p.scans_by_recognizer = [("embed:model-a".to_string(), 2)].into();
+        p.live_recognizer = Some(live_space.into());
+        app.profiles = vec![p];
+        let text = draw_text(&app);
+        assert!(
+            text.contains("(2 scans, 0 for the loaded recognizer)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("none of these match the loaded recognizer"),
+            "{text}"
+        );
+        // An old daemon reports neither field: nothing can be said, so the
+        // flat count stands rather than a false all-clear or a false warning.
+        app.profiles = vec![profile("Alice", &["scan-a", "scan-b"])];
+        let text = draw_text(&app);
+        assert!(text.contains("(2 scans)"), "{text}");
+        assert!(!text.contains("for the loaded recognizer"), "{text}");
+    }
+
+    #[test]
+    fn welcome_badge_warns_when_no_scan_matches_the_loaded_recognizer() {
+        // The Welcome hub's enrollment badge fed off the same flat total; a
+        // green "1 profile(s), 2 scan(s)" over zero usable scans is the same
+        // lie one screen earlier.
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        // The enrollment hub row only exists when SC_PROFILES is visible,
+        // which needs an RGB camera.
+        app.caps.rgb = true;
+        app.visible = App::compute_visible(&app.caps, VisibilityInputs::default(), &[]);
+        let mut p = profile("Alice", &["scan-a", "scan-b"]);
+        p.scans_by_recognizer = [("embed:model-a".to_string(), 2)].into();
+        p.live_recognizer = Some("embed:model-b".into());
+        app.profiles = vec![p];
+        let text = draw_text(&app);
+        assert!(text.contains("none for the loaded recognizer"), "{text}");
+        // With live scans (or an old daemon), the badge is the plain count.
+        let mut p = profile("Alice", &["scan-a", "scan-b"]);
+        p.scans_by_recognizer = [("embed:model-b".to_string(), 2)].into();
+        p.live_recognizer = Some("embed:model-b".into());
+        app.profiles = vec![p];
+        let text = draw_text(&app);
+        assert!(text.contains("1 profile(s), 2 scan(s)"), "{text}");
+        assert!(!text.contains("none for the loaded recognizer"), "{text}");
     }
 
     #[test]

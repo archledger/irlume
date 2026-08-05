@@ -141,6 +141,52 @@ fn enabled_entries() -> Vec<(&'static ThirdPartyModel, &'static str)> {
         .collect()
 }
 
+/// The embedding-space tag `profiles forget-model` acts on for `name`.
+///
+/// Accepts the shipped recognizer (`shipped`), a catalog recognizer's name,
+/// or a raw `embed:<64 hex>` tag as `profiles list` prints it, so an operator
+/// can forget a recognizer the catalog no longer carries. A catalog entry
+/// from another stage is refused by name: detection, landmarks, and the PAD
+/// cue store no enrollment data, so there is nothing to forget.
+pub(crate) fn recognizer_space_for(name: &str) -> Result<String, String> {
+    use irlume_common::thirdparty::Stage;
+    if name == "shipped" {
+        return Ok(irlume_core::storage::LEGACY_RECOGNIZER_SPACE.to_string());
+    }
+    if let Some(hex) = name.strip_prefix("embed:") {
+        if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(name.to_string());
+        }
+        return Err(format!(
+            "'{name}' is not a recognizer space tag (embed: followed by 64 hex digits)"
+        ));
+    }
+    match thirdparty::by_name(name) {
+        // The space tag is `embed:<sha256 of the weights>`, and the catalog
+        // pin IS that sha256: the daemon verified the loaded bytes against it
+        // before hashing them into the tag.
+        Some(m) if m.stage == Stage::Recognition => Ok(format!("embed:{}", m.sha256)),
+        Some(m) => Err(format!(
+            "'{name}' is a {} model; that stage stores no enrollment data",
+            m.stage.as_str()
+        )),
+        None => {
+            let known: Vec<&str> = std::iter::once("shipped")
+                .chain(
+                    thirdparty::CATALOG
+                        .iter()
+                        .filter(|m| m.stage == Stage::Recognition)
+                        .map(|m| m.name),
+                )
+                .collect();
+            Err(format!(
+                "unknown model '{name}'; recognizers: {}",
+                known.join(", ")
+            ))
+        }
+    }
+}
+
 fn file_state(m: &ThirdPartyModel) -> &'static str {
     use thirdparty::WeightState::*;
     match thirdparty::weight_state(m) {
@@ -526,6 +572,17 @@ fn disable(name: Option<&str>) -> ExitCode {
         "[models] '{}' disabled: weights deleted, daemon back on the shipped stack.",
         m.name
     );
+    if m.stage == thirdparty::Stage::Recognition {
+        // Deliberate asymmetry (#288): disabling deletes the WEIGHTS but keeps
+        // the enrollment templates recorded under this recognizer, so
+        // re-enabling it later needs no re-enrollment.
+        println!(
+            "[models] enrollment scans recorded under '{}' are kept; re-enabling needs no \
+             re-enrollment. To erase that biometric material instead: \
+             `sudo irlume profiles forget-model {} --user <user>`.",
+            m.name, m.name
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -762,6 +819,43 @@ pub fn doctor_line() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn forget_model_space_resolution_accepts_recognizers_and_refuses_the_rest() {
+        use irlume_common::thirdparty::Stage;
+        // Names come from the live catalog, so this keeps holding as entries
+        // are added: any recognizer resolves to its pin's space, any other
+        // stage is refused because it stores no enrollment data.
+        let rec = thirdparty::CATALOG
+            .iter()
+            .find(|m| m.stage == Stage::Recognition)
+            .expect("the catalog carries a recognizer");
+        let other = thirdparty::CATALOG
+            .iter()
+            .find(|m| m.stage != Stage::Recognition)
+            .expect("the catalog carries a non-recognizer");
+        assert_eq!(
+            super::recognizer_space_for("shipped").unwrap(),
+            irlume_core::storage::LEGACY_RECOGNIZER_SPACE
+        );
+        assert_eq!(
+            super::recognizer_space_for(rec.name).unwrap(),
+            format!("embed:{}", rec.sha256)
+        );
+        // The raw tag, as `profiles list` prints it, passes through: it is
+        // how a recognizer the catalog no longer carries stays forgettable.
+        let raw = format!("embed:{}", "a".repeat(64));
+        assert_eq!(super::recognizer_space_for(&raw).unwrap(), raw);
+        let e = super::recognizer_space_for("embed:nothex").unwrap_err();
+        assert!(e.contains("64 hex"), "{e}");
+        let e = super::recognizer_space_for(other.name).unwrap_err();
+        assert!(e.contains("stores no enrollment data"), "{e}");
+        let e = super::recognizer_space_for("nonsense").unwrap_err();
+        assert!(
+            e.contains("shipped") && e.contains(rec.name),
+            "an unknown name must list the recognizers: {e}"
+        );
+    }
 
     /// A synthetic bring-your-own entry. The catalog has no such model yet, so
     /// the tier the code must handle would otherwise be untested until one is

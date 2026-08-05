@@ -365,7 +365,10 @@ pub enum Request {
     /// under /etc/irlume, which is not an arbitrary peer's to change. (This said
     /// "root or self", which never matched the dispatch gate.)
     SetCameras { rgb: String, ir: String },
-    /// Add one scan to an existing profile ("improve recognition"). PRIVILEGED.
+    /// Add scans to an existing profile ("improve recognition"). PRIVILEGED.
+    /// Add scans to an existing profile, in the recognizer space the daemon
+    /// has loaded. Also how a profile gains a second recognizer's templates
+    /// without re-enrolling as a new person (#288).
     AddScan {
         user: String,
         profile: String,

@@ -389,7 +389,7 @@ fn profiles_usage_errors_exit_2() {
     // The full usage text names the real subcommands and flags.
     let (_, _, err) = run(&mut sb.cmd(&["profiles", "bogus"]));
     for frag in [
-        "add-scan --profile P",
+        "add-scan --profile P [--scans N]",
         "rename --profile P [--scan S] --name N",
         "delete --profile P [--scan S]",
         "eyes-open <on|off>",
@@ -400,6 +400,27 @@ fn profiles_usage_errors_exit_2() {
             "profiles usage must name `{frag}`: {err}"
         );
     }
+}
+
+#[test]
+fn add_scan_rejects_a_non_positive_or_unparseable_count() {
+    // A state-changing biometric command must refuse an invalid count rather
+    // than silently capturing one scan instead (#290 review). Exit 2 is the
+    // usage code, and it must happen before any daemon request: with no
+    // daemon running, a request attempt would exit 1.
+    let sb = Sandbox::new("addscanbad");
+    for bad in ["0", "-1", "abc", ""] {
+        let (code, _, err) = run(&mut sb.cmd(&["profiles", "add-scan", "--profile", "P", "--scans", bad]));
+        assert_eq!(code, 2, "--scans {bad:?} must be a usage error: {err}");
+        assert!(
+            err.contains("--scans must be a positive integer"),
+            "--scans {bad:?}: {err}"
+        );
+    }
+    // A valid count parses and reaches the (dead) socket instead.
+    let (code, _, err) = run(&mut sb.cmd(&["profiles", "add-scan", "--profile", "P", "--scans", "5"]));
+    assert_eq!(code, 1, "a valid count must build a request: {err}");
+    assert!(err.contains("adding 5 scans"), "{err}");
 }
 
 #[test]

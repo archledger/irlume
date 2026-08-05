@@ -32,7 +32,7 @@ Conventions that apply everywhere:
 |---|---|
 | `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` starts the profile space over |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
-| `irlume profiles add-scan --profile P` | add a scan to profile P (improves recognition in new conditions) |
+| `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded) |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles eyes-open <on\|off>` | require eyes open to unlock |

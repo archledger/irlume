@@ -2749,16 +2749,18 @@ impl Engine {
             self.rgb_threshold,
         )? {
             Some(target) => {
-                let have = enr
+                let room = enr
                     .profiles
                     .iter()
                     .find(|p| p.name == target)
-                    .map_or(0, |p| p.scans.len());
-                let room = MAX_SCANS_PER_PROFILE - have;
+                    .map_or(MAX_SCANS_PER_PROFILE, |p| {
+                        scan_room_in(p, &self.embed_space)
+                    });
                 if room == 0 {
                     return Err(irlume_common::Error::Protocol(format!(
                         "this face is already enrolled as '{target}', which is at the max \
-                         {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
+                         {MAX_SCANS_PER_PROFILE} scans for the loaded recognizer; delete \
+                         some of its scans first"
                     )));
                 }
                 want.min(room)
@@ -2788,11 +2790,12 @@ impl Engine {
                 .iter()
                 .position(|p| p.name == target)
                 .expect("merge target came from these profiles");
-            let room = MAX_SCANS_PER_PROFILE - enr.profiles[idx].scans.len();
+            let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
             if room == 0 {
                 return Err(irlume_common::Error::Protocol(format!(
                     "this face is already enrolled as '{target}', which is at the max \
-                     {MAX_SCANS_PER_PROFILE} scans; delete some of its scans first"
+                     {MAX_SCANS_PER_PROFILE} scans for the loaded recognizer; delete \
+                     some of its scans first"
                 )));
             }
             let added = captured.len().min(room);
@@ -2886,9 +2889,9 @@ impl Engine {
         None
     }
 
-    /// Add one scan to an existing profile ("improve recognition"). Errors if the
+    /// Add scans to an existing profile ("improve recognition"). Errors if the
     /// profile is missing or already at MAX_SCANS_PER_PROFILE.
-    /// Add `count` scans to an existing profile, in the LOADED recognizer's
+    /// Add `count` scans (at least one) to an existing profile, in the LOADED recognizer's
     /// space. This is also how a profile gains templates for a second
     /// recognizer without re-enrolling as a new person: the operator names
     /// the profile, which is the only way the link can be made, since
@@ -2912,19 +2915,25 @@ impl Engine {
         // Counted for THIS recognizer: a profile holding another model's
         // scans must still accept this one's, and the limit's false-accept
         // rationale is about templates compared in one operation (#288).
-        let have = enr.profiles[idx].scans_in(&self.embed_space);
-        if have >= MAX_SCANS_PER_PROFILE {
+        let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
+        if room == 0 {
             return Err(irlume_common::Error::Protocol(format!(
                 "'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans for the \
                  loaded recognizer"
             )));
         }
-        let want = count.clamp(1, MAX_SCANS_PER_PROFILE - have);
+        let want = count.clamp(1, room);
         let captured = self.capture_scans(want, enr.pitch_neutral())?;
-        if captured.is_empty() {
-            return Err(irlume_common::Error::Protocol(
-                "no live scan captured; check lighting and framing".into(),
-            ));
+        // capture_scans is best-effort and may return fewer than asked. A
+        // partial save would report success while leaving the recognizer
+        // under-enrolled, so refuse before anything is written, exactly as
+        // enrollment does.
+        if captured.len() < want {
+            return Err(irlume_common::Error::Protocol(format!(
+                "only {} live scans captured (need {want}); nothing was saved, check \
+                 lighting and framing",
+                captured.len()
+            )));
         }
         // Anti-mixing: reject scans whose face belongs to a different profile.
         let rgbs: Vec<&[f32]> = captured.iter().map(|c| c.rgb.as_slice()).collect();
@@ -3233,6 +3242,18 @@ fn enroll_merge_target(
         }
     }
     Ok(hit)
+}
+
+/// How many more scans this profile may hold for `space`.
+///
+/// Saturating, and counted per recognizer: a profile may legally hold the
+/// limit under each of several recognizers (#288), so subtracting the total
+/// from the limit underflows once a second model's templates exist. Every
+/// site that decides room uses this one function, because the enroll merge
+/// path had two more subtractions that the first cut of the per-space change
+/// missed entirely.
+fn scan_room_in(profile: &irlume_core::storage::FaceProfile, space: &str) -> usize {
+    irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(profile.scans_in(space))
 }
 
 /// The first captured scan whose face belongs to a DIFFERENT profile, if any.
@@ -4061,6 +4082,48 @@ mod tests {
             irlume_core::RGB_MATCH_THRESHOLD
         )
         .is_none());
+    }
+
+    #[test]
+    fn room_is_counted_in_the_loaded_space_and_never_underflows() {
+        // The bug the per-space limit created: a profile may legally hold the
+        // limit under each of several recognizers, so subtracting the TOTAL
+        // from the limit underflows once a second model's templates exist,
+        // which panics a checked build and wraps to a huge room in release,
+        // bypassing the cap. The enroll merge path had two such subtractions
+        // (#290 review).
+        let mut profile = FaceProfile {
+            name: "P1".into(),
+            scans: Vec::new(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        };
+        profile.scans.extend(
+            (0..irlume_core::storage::MAX_SCANS_PER_PROFILE).map(|i| FaceScan {
+                embed_space: Some("embed:model-a".into()),
+                ..scan(vec![i as f32, 0.0, 0.0])
+            }),
+        );
+        profile.scans.extend((0..5).map(|i| FaceScan {
+            embed_space: Some("embed:model-b".into()),
+            ..scan(vec![0.0, i as f32, 0.0])
+        }));
+        assert_eq!(
+            profile.scans.len(),
+            irlume_core::storage::MAX_SCANS_PER_PROFILE + 5,
+            "more total scans than the per-recognizer limit, which is legal"
+        );
+        assert_eq!(scan_room_in(&profile, "embed:model-a"), 0);
+        assert_eq!(
+            scan_room_in(&profile, "embed:model-b"),
+            irlume_core::storage::MAX_SCANS_PER_PROFILE - 5
+        );
+        // A recognizer with nothing enrolled has the full allowance, and the
+        // computation never underflows for any space.
+        assert_eq!(
+            scan_room_in(&profile, "embed:model-c"),
+            irlume_core::storage::MAX_SCANS_PER_PROFILE
+        );
     }
 
     #[test]

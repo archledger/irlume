@@ -323,7 +323,19 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
-                let scans = flag(args, "--scans").and_then(|s| s.parse::<usize>().ok());
+                // A state-changing biometric command must not silently
+                // substitute a different operation: an unparseable or zero
+                // count is a usage error, not "capture one".
+                let scans = match flag(args, "--scans") {
+                    None => None,
+                    Some(raw) => match raw.parse::<usize>() {
+                        Ok(n) if n > 0 => Some(n),
+                        _ => {
+                            eprintln!("[profiles] --scans must be a positive integer");
+                            return std::process::ExitCode::from(2);
+                        }
+                    },
+                };
                 match scans {
                     Some(n) if n > 1 => eprintln!(
                         "[profiles] adding {n} scans to '{p}'; stay in frame, vary your pose slightly…"

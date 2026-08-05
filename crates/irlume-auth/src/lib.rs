@@ -2886,11 +2886,16 @@ impl Engine {
             }
             self.refit_profile_calib(&mut enr.profiles[idx]);
             let total = enr.profiles[idx].scans.len();
+            // The budget the caller may still spend is per RECOGNIZER
+            // (#290), so compute it from the same helper enrollment itself
+            // uses rather than leaving a client to derive it from `total`.
+            let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
             storage::save(&enr)?;
             return Ok(EnrollOutcome::Merged {
                 name: target,
                 added,
                 total,
+                room,
                 added_scans,
             });
         }
@@ -3265,6 +3270,8 @@ pub enum EnrollOutcome {
     /// after an embedding-space change strands the old IR templates).
     Merged {
         name: String,
+        /// Remaining scans allowed in the LOADED recognizer's space.
+        room: usize,
         added: usize,
         total: usize,
         /// Names of the scans this capture appended, so a caller can undo the

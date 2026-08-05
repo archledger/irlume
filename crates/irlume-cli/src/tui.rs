@@ -389,7 +389,9 @@ enum WMsg {
     /// `added_scans` are the scan(s) already appended (undo target on decline).
     MergePrompt {
         profile: String,
-        total: usize,
+        /// Scans the daemon will still accept for this profile in the LOADED
+        /// recognizer's space (#290 made the limit per recognizer).
+        room: usize,
         added_scans: Vec<String>,
     },
 }
@@ -2208,14 +2210,17 @@ impl App {
                     }
                     WMsg::MergePrompt {
                         profile,
-                        total,
+                        room,
                         added_scans,
                     } => {
-                        // The rest of the requested scans, capped at the profile's
-                        // remaining 30-scan budget (scan 1 already merged in).
-                        let remaining = target
-                            .saturating_sub(1)
-                            .min(irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(total));
+                        // The rest of the requested scans, capped at the room
+                        // the DAEMON reports for the loaded recognizer. It was
+                        // computed here from the profile's total scan count,
+                        // which is wrong since the limit became per-recognizer
+                        // (#290): a profile holding two models' templates
+                        // under-counted and the UI refused scans the daemon
+                        // would have accepted.
+                        let remaining = target.saturating_sub(1).min(room);
                         merge = Some(MergeConfirm {
                             profile,
                             added_scans,
@@ -5824,13 +5829,13 @@ fn enroll_worker(
                 Ok(Response::Enrolled {
                     created: false,
                     profile: resolved,
-                    total,
+                    room,
                     added_scans,
                     ..
                 }) => {
                     let _ = send(WMsg::MergePrompt {
                         profile: resolved,
-                        total,
+                        room,
                         added_scans,
                     });
                     return;
@@ -7812,10 +7817,11 @@ mod tests {
         let mut app = test_app();
         let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
         app.enroll = Some(enroll);
-        // 28 of 30 scans already on the profile: only 2 more fit the budget.
+        // Two slots left for the loaded recognizer, so the modal offers 2 even
+        // though the requested target is larger.
         tx.send(WMsg::MergePrompt {
             profile: "Alice".into(),
-            total: 28,
+            room: 2,
             added_scans: vec!["scan28".into()],
         })
         .unwrap();
@@ -7823,17 +7829,14 @@ mod tests {
         assert!(app.enroll.is_none(), "the worker hands off to the modal");
         let mc = app.enroll_merge.as_ref().expect("the merge modal is up");
         assert_eq!(mc.profile, "Alice");
-        assert_eq!(
-            mc.remaining, 2,
-            "remaining = min(target-1, 30-scan budget left)"
-        );
+        assert_eq!(mc.remaining, 2, "remaining = min(target-1, room)");
         // Below the budget the requested count minus the merged scan survives.
         let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
         app.enroll = Some(enroll);
         app.enroll_merge = None;
         tx.send(WMsg::MergePrompt {
             profile: "Alice".into(),
-            total: 5,
+            room: 25,
             added_scans: vec!["scan5".into()],
         })
         .unwrap();
@@ -7841,6 +7844,34 @@ mod tests {
         assert_eq!(
             app.enroll_merge.as_ref().unwrap().remaining,
             ENROLL_SCANS - 1
+        );
+    }
+
+    /// The mixed-recognizer state this release creates: a profile can hold more
+    /// than MAX_SCANS_PER_PROFILE scans in total across recognizers while the
+    /// loaded one still has room. Deriving remaining from `total` computed 0
+    /// here, so the user asked for ten scans, got the one merged scan, and the
+    /// new recognizer was left under-enrolled with no message saying so. The
+    /// daemon counts per recognizer and sends the answer; the TUI uses it.
+    #[test]
+    fn merge_remaining_follows_the_daemons_room_not_the_profile_total() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, ENROLL_SCANS);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::MergePrompt {
+            profile: "Alice".into(),
+            // The profile holds more than MAX_SCANS_PER_PROFILE across both
+            // recognizers, yet the loaded one still has most of its own budget.
+            room: 25,
+            added_scans: vec!["scan1".into()],
+        })
+        .unwrap();
+        app.poll();
+        assert_eq!(
+            app.enroll_merge.as_ref().expect("modal is up").remaining,
+            ENROLL_SCANS - 1,
+            "a full profile-wide count must not zero out a recognizer with room"
         );
     }
 

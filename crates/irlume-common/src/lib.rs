@@ -733,7 +733,19 @@ pub enum Response {
         profile: String,
         created: bool,
         added: usize,
+        /// Scans in the profile across EVERY recognizer. Display only: the
+        /// scan limit is counted per recognizer (#290), so this is not the
+        /// number to compute a remaining budget from. Use `room`.
         total: usize,
+        /// How many more scans this profile may take IN THE LOADED
+        /// RECOGNIZER'S SPACE, which is what the limit actually governs.
+        /// Carried rather than recomputed by the client: deriving it from
+        /// `total` under-counts on a multi-model profile and refuses scans
+        /// the daemon would accept. `serde(default)` so an older daemon
+        /// still decodes (its 0 then reads as "no room known", and the
+        /// caller falls back to its requested count).
+        #[serde(default)]
+        room: usize,
         added_scans: Vec<String>,
     },
     SelfTest {
@@ -1320,6 +1332,7 @@ mod tests {
                 created: true,
                 added: 3,
                 total: 3,
+                room: 27,
                 added_scans: vec![],
             },
             Response::Enrolled {
@@ -1327,6 +1340,7 @@ mod tests {
                 created: false,
                 added: 1,
                 total: 8,
+                room: 22,
                 added_scans: vec!["scan8".into()],
             },
         ] {
@@ -1339,6 +1353,7 @@ mod tests {
                         created: c1,
                         added: a1,
                         total: t1,
+                        room: r1,
                         added_scans: s1,
                     },
                     Response::Enrolled {
@@ -1346,10 +1361,11 @@ mod tests {
                         created: c2,
                         added: a2,
                         total: t2,
+                        room: r2,
                         added_scans: s2,
                     },
                 ) => {
-                    assert_eq!((p1, c1, a1, t1, s1), (p2, c2, a2, t2, s2));
+                    assert_eq!((p1, c1, a1, t1, r1, s1), (p2, c2, a2, t2, r2, s2));
                 }
                 _ => panic!("Enrolled did not round-trip to Enrolled"),
             }

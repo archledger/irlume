@@ -3019,18 +3019,23 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             created: true,
             added: scans,
             total: scans,
+            // A brand-new profile holds only this recognizer's scans, so the
+            // per-recognizer room is the plain remainder.
+            room: irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(scans),
             added_scans: Vec::new(),
         },
         irlume_auth::EnrollOutcome::Merged {
             name,
             added,
             total,
+            room,
             added_scans,
         } => Response::Enrolled {
             profile: name,
             created: false,
             added,
             total,
+            room,
             added_scans,
         },
     }
@@ -3567,6 +3572,7 @@ mod tests {
             name: "Face Profile 1".into(),
             added: 1,
             total: 8,
+            room: 22,
             added_scans: vec!["Face Scan 8".into()],
         });
         match merged {
@@ -3575,11 +3581,17 @@ mod tests {
                 created,
                 added,
                 total,
+                room,
                 added_scans,
             } => {
                 assert_eq!(profile, "Face Profile 1");
                 assert!(!created, "a merge must not claim a new profile was created");
                 assert_eq!((added, total), (1, 8));
+                assert_eq!(
+                    room, 22,
+                    "the daemon's per-recognizer room must reach the client, not \
+                     be recomputed there from the profile-wide total"
+                );
                 assert_eq!(added_scans, vec!["Face Scan 8".to_string()]);
             }
             other => panic!("merge must answer Enrolled, got {other:?}"),

@@ -586,6 +586,11 @@ struct PamCache {
 #[derive(Default, Clone)]
 struct Probes {
     caps: irlume_camera::Caps,
+    /// Whether `caps` came from an actual device probe. False means the
+    /// daemon was up and the probe was skipped to avoid opening nodes it may
+    /// be streaming (#187); the caller must then take capabilities from the
+    /// daemon's Health rather than believing this all-false default.
+    caps_probed: bool,
     fp_present: bool,
     fp: FpInfo,
     pam_cache: PamCache,
@@ -617,13 +622,38 @@ struct Probes {
     boot_mode: String,
 }
 
+/// May the TUI open camera device nodes right now?
+///
+/// Classifying a node opens it, and a second open is EBUSY on strict UVC
+/// modules while the daemon streams the same node (#187). The daemon is the
+/// authority on cameras whenever it is reachable: it reports its tier and
+/// devices through Health, so the TUI never needs to look for itself. When
+/// the daemon is DOWN the local probe is both the only source and safe,
+/// because nothing else holds the cameras.
+fn enumerate_cameras_now(daemon_up: bool) -> bool {
+    !daemon_up
+}
+
 impl Probes {
     /// The full sweep, verbatim from the code that used to run inline. Runs
     /// on a worker thread; everything here may block on D-Bus activation, a
     /// subprocess, or a device open without costing the UI a frame.
     fn gather(user: &str) -> Self {
         use irlume_common::secureboot;
-        let caps = irlume_camera::capabilities();
+        // Same rule as LightState::gather (#187): capabilities() classifies
+        // every node, which opens it. The caller passes the daemon-reported
+        // tier in when the daemon is up, so this only probes when it is
+        // down.
+        let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
+        let probe_cameras = enumerate_cameras_now(daemon_up);
+        let caps = if probe_cameras {
+            irlume_camera::capabilities()
+        } else {
+            irlume_camera::Caps {
+                ir_pair: false,
+                rgb: false,
+            }
+        };
         let fp_present = irlume_fingerprint::available();
         let fp = FpInfo {
             available: fp_present,
@@ -642,10 +672,14 @@ impl Probes {
                 || std::path::Path::new("/etc/apparmor.d/usr.local.bin.irlumed").exists(),
             handoffs: crate::pamwire::keyring_handoff_warnings(),
         };
-        let nodes = irlume_camera::discover_nodes();
-        let pairs = irlume_camera::list_pairs();
+        let (nodes, pairs) = if probe_cameras {
+            (irlume_camera::discover_nodes(), irlume_camera::list_pairs())
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Probes {
             caps,
+            caps_probed: probe_cameras,
             fp_present,
             reader_stuck: fp_present && irlume_fingerprint::reader_stuck(user),
             fp,
@@ -706,9 +740,22 @@ struct LightState {
 }
 
 impl LightState {
-    /// Verbatim the reads `refresh_light` used to make inline.
+    /// Verbatim the reads `refresh_light` used to make inline, EXCEPT that
+    /// camera enumeration is now conditional: see [`enumerate_cameras_now`].
     fn gather(user: &str, prev_armed: Option<bool>) -> Self {
         let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
+        // Classifying a node OPENS it. While the daemon is reachable it may
+        // be streaming those same nodes, and a second open is EBUSY on
+        // strict UVC modules, which surfaced as "camera is busy" during
+        // enrollment on a reporter's hardware (#187) and is invisible on
+        // modules that tolerate it. Enumerate only when the daemon is down,
+        // where the local probe is the ONLY source and nothing else holds
+        // the cameras.
+        let (nodes, pairs) = if enumerate_cameras_now(daemon_up) {
+            (irlume_camera::discover_nodes(), irlume_camera::list_pairs())
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut out = LightState {
             daemon_up,
             health: None,
@@ -717,8 +764,8 @@ impl LightState {
             keyring_drift: None,
             keyring_kind: None,
             recovery: None,
-            nodes: irlume_camera::discover_nodes(),
-            pairs: irlume_camera::list_pairs(),
+            nodes,
+            pairs,
         };
         if !daemon_up {
             return out;
@@ -1018,6 +1065,34 @@ impl App {
         self.light_load = Some(rx);
     }
 
+    /// Enumerate the camera nodes for the Cameras picker, which is the one
+    /// screen that needs the full listing rather than the daemon's summary.
+    ///
+    /// Deliberately on ENTERING that screen instead of in the background
+    /// polls (#187): opening nodes is only safe when the user is not
+    /// simultaneously authenticating, and a picker visit is an explicit act.
+    /// Idempotent and cheap enough for a keypress; it does not stream.
+    fn refresh_camera_listing(&mut self) {
+        self.nodes = irlume_camera::discover_nodes();
+        self.pairs = irlume_camera::list_pairs();
+        let pairs = self.pairs.len().max(1);
+        if self.cam_sel >= pairs {
+            self.cam_sel = pairs - 1;
+        }
+    }
+
+    /// Capabilities as the DAEMON reports them, for use whenever it is
+    /// reachable (#187): it already has the cameras open, so it can say what
+    /// they are without the TUI opening anything. `tier` is the daemon's own
+    /// hardware classification; only the secure tier means a usable IR pair,
+    /// and any reported RGB device means RGB capture works.
+    fn caps_from_health(h: &HealthInfo) -> irlume_camera::Caps {
+        irlume_camera::Caps {
+            ir_pair: h.tier == "secure",
+            rgb: h.rgb_dev.is_some() || h.tier == "secure",
+        }
+    }
+
     /// Land a background light poll: the daemon reads plus the selection
     /// clamps the inline version used to apply.
     fn apply_light(&mut self, l: LightState) {
@@ -1025,6 +1100,10 @@ impl App {
         // Daemon down/unresponsive: show the down state; the local probes
         // still land via the heavy sweep so Repair can diagnose.
         self.health = l.health;
+        // The daemon is the authority on cameras while it is reachable.
+        if let Some(h) = self.health.as_ref() {
+            self.caps = Self::caps_from_health(h);
+        }
         if l.daemon_up {
             self.keyring_armed = l.keyring_armed;
             self.keyring_policy = l.keyring_policy;
@@ -1040,8 +1119,14 @@ impl App {
         if self.daemon_up && !self.profiles_loaded && self.enroll_error.is_none() {
             self.refresh_profiles();
         }
-        self.nodes = l.nodes;
-        self.pairs = l.pairs;
+        // Only adopt a listing that was actually taken (see gather): an
+        // empty vec means "not enumerated this round", not "no cameras".
+        // Overwriting a good listing with that emptiness is the
+        // absent-vs-not-observed collapse (defect pattern 26).
+        if !l.nodes.is_empty() || !l.pairs.is_empty() {
+            self.nodes = l.nodes;
+            self.pairs = l.pairs;
+        }
         let max = self.rows().len().max(1);
         if self.sel >= max {
             self.sel = max - 1;
@@ -1137,7 +1222,14 @@ impl App {
         // them would erase the capabilities `App::new` detected and hide the
         // camera screens until the sweep arrives.
         if self.probes_landed {
-            self.caps = self.probes.caps;
+            // Only adopt probed capabilities. When the daemon was up the
+            // sweep skipped the device probe (#187), and its all-false
+            // default is not an observation: `caps_from_health` already set
+            // the authoritative value, and copying the default over it would
+            // hide the camera screens on a machine that has cameras.
+            if self.probes.caps_probed {
+                self.caps = self.probes.caps;
+            }
             self.fp_present = self.probes.fp_present;
             self.fp = self.probes.fp.clone();
             self.pam_cache = self.probes.pam_cache.clone();
@@ -2728,6 +2820,9 @@ impl App {
         // Fast diagnostics on entering Repair/Fingerprint (no slow profile
         // poll, so the switch is instant); a fresh profile poll only when
         // landing on Profiles, where an external `irlume enroll` should show.
+        if self.screen == SC_CAMERAS {
+            self.refresh_camera_listing();
+        }
         if self.screen == SC_REPAIR || self.screen == SC_FINGERPRINT {
             self.refresh_diagnostics();
         } else if self.screen == SC_PROFILES {
@@ -2761,6 +2856,9 @@ impl App {
                     self.sel = 0;
                     // Same fast paths as a Tab switch: diagnostics for
                     // Repair/Fingerprint, a fresh profile poll for Profiles.
+                    if target == SC_CAMERAS {
+                        self.refresh_camera_listing();
+                    }
                     if target == SC_REPAIR || target == SC_FINGERPRINT {
                         self.refresh_diagnostics();
                     } else if target == SC_PROFILES {
@@ -6379,6 +6477,95 @@ mod tests {
     // return (rgb is true whenever ir_pair is), so a frozen field keeps it and
     // a re-derived one cannot.
     #[test]
+    fn the_tui_never_opens_camera_nodes_while_the_daemon_is_up() {
+        // #187: classifying a node opens it, and a second open is EBUSY on
+        // strict UVC modules while the daemon streams the same node. The
+        // reporter's fuser trace showed `irlume` and `irlumed` holding
+        // /dev/video0 at once; reproduced here on a tolerant module by
+        // sampling the TUI's own probe window. The rule that closes it is
+        // this one function, so it is pinned directly.
+        assert!(
+            !enumerate_cameras_now(true),
+            "a reachable daemon is the authority; the TUI must not open nodes behind it"
+        );
+        assert!(
+            enumerate_cameras_now(false),
+            "with the daemon down the local probe is the only source, and nothing else holds the cameras"
+        );
+    }
+
+    #[test]
+    fn health_supplies_capabilities_while_the_daemon_is_up() {
+        // The other half of #187: having stopped probing, the TUI must still
+        // know what hardware it has, from the daemon that already has the
+        // cameras open. A secure tier means a usable IR pair; a reported RGB
+        // device means RGB capture works.
+        let secure = HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: Some("/dev/video0".into()),
+            ir_dev: Some("/dev/video2".into()),
+            mesh: true,
+            adapter: false,
+            version: "test".into(),
+            third_party_pad: None,
+            third_party_recognizer: None,
+            third_party_detector: None,
+            apparmor: None,
+        };
+        let caps = App::caps_from_health(&secure);
+        assert!(
+            caps.ir_pair && caps.rgb,
+            "secure tier is an IR pair: {caps:?}"
+        );
+        let convenience = HealthInfo {
+            tier: "convenience".into(),
+            ir_dev: None,
+            ..secure.clone()
+        };
+        let caps = App::caps_from_health(&convenience);
+        assert!(
+            !caps.ir_pair,
+            "only the secure tier means an IR pair: {caps:?}"
+        );
+        assert!(caps.rgb, "an RGB device was reported: {caps:?}");
+        let none = HealthInfo {
+            tier: "none".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            ..secure
+        };
+        let caps = App::caps_from_health(&none);
+        assert!(!caps.ir_pair && !caps.rgb, "no devices reported: {caps:?}");
+    }
+
+    #[test]
+    fn an_unenumerated_light_poll_does_not_blank_a_known_camera_listing() {
+        // gather() returns empty vecs when it skipped enumeration; adopting
+        // those would turn "not observed" into "no cameras" and empty the
+        // picker (defect pattern 26).
+        let mut app = test_app();
+        app.nodes = vec![("/dev/video0".into(), irlume_camera::Role::Rgb)];
+        app.pairs = Vec::new();
+        let l = LightState {
+            daemon_up: true,
+            health: None,
+            keyring_armed: None,
+            keyring_policy: None,
+            keyring_drift: None,
+            keyring_kind: None,
+            recovery: None,
+            nodes: Vec::new(),
+            pairs: Vec::new(),
+        };
+        app.apply_light(l);
+        assert_eq!(
+            app.nodes.len(),
+            1,
+            "a skipped enumeration must not blank the listing"
+        );
+    }
+
+    #[test]
     fn refresh_rederives_hardware_capabilities() {
         // The async flavor of the old property: a LANDED sweep replaces a
         // stale capability snapshot. refresh() itself only requests
@@ -6392,7 +6579,14 @@ mod tests {
         };
         let mut app = test_app();
         app.caps = impossible;
-        app.probes = Probes::default(); // an observed no-camera machine
+        // An OBSERVED no-camera machine. `caps_probed` is what makes it an
+        // observation rather than the unprobed default: since #187 the sweep
+        // skips the device probe while the daemon is up, so the flag is the
+        // only thing separating "looked, found none" from "did not look".
+        app.probes = Probes {
+            caps_probed: true,
+            ..Probes::default()
+        };
         app.probes_landed = true;
         app.recompute_checks();
         assert_ne!(

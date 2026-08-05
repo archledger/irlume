@@ -6,6 +6,13 @@ upstream_package_name: irlume
 downstream_package_name: irlume
 # Tags are v-prefixed (v0.1.1); without this the RPM Version keeps the "v".
 upstream_tag_template: "v{version}"
+# Only release tags are versions. The repo also carries a tag for the bundled
+# TFLite C runtime artifact (tflite-runtime-v2.19.0), and Packit takes the
+# NEWEST tag to determine the version, so from the moment that tag was pushed
+# every SRPM build failed with:
+#   Unable to extract "version" from tflite-runtime-v2.19.0 using v{version}
+# Anchored with re.match, so a tag not starting with vN.N.N is not a candidate.
+upstream_tag_include: 'v\d+\.\d+\.\d+$'
 
 jobs:
   - job: copr_build

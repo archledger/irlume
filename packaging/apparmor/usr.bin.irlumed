@@ -55,6 +55,11 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
 
   # Cameras: capture nodes + the sysfs identity walk of the anti-injection
   # camera pinning (canonicalized device path, USB ids, privacy switch).
+  # The /dev/ directory read is the discovery walk (discover_nodes lists
+  # /dev to find video nodes); without it, capabilities() sees no cameras
+  # from inside the daemon while sysfs-based selection still works, and the
+  # engine mis-tiers (found enforcing on Arch, 2026-08-05; issues #281/#283).
+  /dev/ r,
   /dev/video[0-9]* rw,
   /sys/class/video4linux/ r,
   /sys/class/video4linux/** r,
@@ -62,6 +67,21 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
 
   # IPC socket (thin PAM module and CLI connect here; SO_PEERCRED authz).
   /run/irlume.sock rw,
+
+  # The emitter undo-journal's per-camera lock (flock over the whole
+  # check/act window; emitter_journal.rs). Lives under /run/lock because a
+  # lock's lifetime is a boot. 'k' is the flock permission; without these
+  # rules the daemon refuses to drive the IR emitter and logs the #283
+  # warning on every start. The profile's 2026-07-09 soak predates the
+  # journal (0.8.x), which is how the gap shipped.
+  /run/lock/ rw,
+  /run/lock/irlume-emitter-*.lock rwk,
+
+  # The per-stream emitter bookkeeping lock is a flock too, and it lives
+  # under the state dir, whose ** rule grants rw WITHOUT the flock 'k'
+  # permission. Fixing the /run/lock rule above unmasked this one on the
+  # same machine, one restart later: locks need naming wherever they live.
+  /var/lib/irlume/ir-emitter-stream/*.lock rwk,
 
   # TPM (template-key sealing, keyring unlock).
   /dev/tpmrm[0-9] rw,

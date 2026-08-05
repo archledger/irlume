@@ -165,6 +165,15 @@ fn main() -> std::process::ExitCode {
         {
             machine::models_list(&args)
         }
+        // Refuse rather than ignore: `models --json` reached the human renderer
+        // and printed prose, so a script that asked for JSON silently got
+        // something it could not parse. The capability is `models list --json`.
+        (Some("models"), _) if args.iter().any(|a| a == "--json") => {
+            eprintln!(
+                "[models] --json is available on `models list`; try: irlume models list --json"
+            );
+            std::process::ExitCode::from(2)
+        }
         (Some("models"), sub) => models::run(sub, &args),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
         (Some("credential-release-challenge"), sub) => {
@@ -695,7 +704,9 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
             Ok(n) if (1..=10).contains(&n) => n,
             _ => {
                 eprintln!("[calibrate] --rounds takes a number from 1 to 10 (got {v:?})");
-                return std::process::ExitCode::FAILURE;
+                // Usage error, not a runtime failure; the refusal itself was
+                // already right, only the code disagreed with every sibling.
+                return std::process::ExitCode::from(2);
             }
         },
     };
@@ -973,7 +984,19 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
 /// measurement on the camera in front of the user can tell the two apart.
 fn camera_tune(args: &[String]) -> std::process::ExitCode {
     use irlume_common::Request;
-    let rounds = flag(args, "--rounds").and_then(|v| v.parse::<usize>().ok());
+    // Same rule as `enroll --scans`: this command fires the IR emitter for up to
+    // a minute, so an unparseable count is a usage error rather than a silent
+    // substitution of the default round count.
+    let rounds = match flag(args, "--rounds") {
+        None => None,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                eprintln!("[camera-tune] --rounds must be a positive integer");
+                return std::process::ExitCode::from(2);
+            }
+        },
+    };
     eprintln!(
         "[camera-tune] measuring this camera under load; it fires the IR emitter \
          for up to a minute…"

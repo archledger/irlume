@@ -253,10 +253,7 @@ mod onnx {
     /// then the Debian/Ubuntu universal .deb and PPA layout (their systemd
     /// override hands the path to the daemon only, so a bare CLI run needs
     /// this list; packaging/README.md records both).
-    const PACKAGED_ORTS: &[&str] = &[
-        "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
-        "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
-    ];
+    const PACKAGED_ORTS: &[&str] = irlume_common::PACKAGED_ORT_PATHS;
 
     /// The candidate the resolver would load, pure over its inputs so the
     /// selection is testable without touching the process environment: an

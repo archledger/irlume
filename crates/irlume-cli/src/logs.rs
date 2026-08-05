@@ -87,7 +87,10 @@ fn view(opts: &[String]) -> ExitCode {
         Ok(a) => a,
         Err(msg) => {
             eprintln!("{msg}");
-            return ExitCode::FAILURE;
+            // A bad option is a usage error (2), not a runtime failure (1);
+            // every other command in the CLI answers 2 here and a wrapper that
+            // branches on the code was told the journal read had failed.
+            return ExitCode::from(2);
         }
     };
     let mut cmd = Command::new(&argv[0]);

@@ -80,6 +80,20 @@ impl std::fmt::Debug for SecretBytes {
     }
 }
 
+/// Where the irlume packages install onnxruntime: Fedora/Copr first, then the
+/// Debian/Ubuntu universal .deb and PPA layout (packaging/README.md records
+/// both). Their systemd drop-in hands `ORT_DYLIB_PATH` to the DAEMON only, so
+/// anything running as a bare CLI has to probe these paths itself.
+///
+/// Shared rather than restated: `irlume deps` kept its own shorter list that
+/// had neither packaged path, so with the daemon stopped it told users to
+/// install onnxruntime on machines where the package had already installed it,
+/// at exactly the moment they were debugging a failed login.
+pub const PACKAGED_ORT_PATHS: &[&str] = &[
+    "/usr/share/irlume/onnxruntime/lib/libonnxruntime.so",
+    "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
+];
+
 /// Per-user enrolled templates + TPM-sealed release secrets.
 pub const STATE_DIR: &str = "/var/lib/irlume";
 

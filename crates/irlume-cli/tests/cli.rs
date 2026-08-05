@@ -250,7 +250,7 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         (&["enrolldev"], 2, "usage: irlume enrolldev --user U --det"),
         (&["padcapture"], 2, "usage: irlume padcapture --species"),
         (&["padreport"], 2, "usage: irlume padreport --in"),
-        (&["suncal"], 1, "usage: IRLUME_DEV=1 irlume suncal"),
+        (&["suncal"], 2, "usage: IRLUME_DEV=1 irlume suncal"),
         (
             &["selftest", "align"],
             2,
@@ -809,7 +809,8 @@ fn logs_option_errors_never_run_journalctl() {
     sb.fake_tool("journalctl", r#"printf 'JOURNALCTL RAN\n'"#);
 
     let (code, out, err) = run(&mut sb.cmd_with_fakes(&["logs", "--since"]));
-    assert_eq!(code, 1);
+    // A bad option is a usage error (2), not a runtime failure (1).
+    assert_eq!(code, 2);
     assert!(err.contains("--since needs a value"), "{err}");
     assert!(
         !out.contains("JOURNALCTL RAN"),
@@ -946,7 +947,8 @@ fn selinux_status_classifies_module_state_from_probe_output() {
     assert!(out.contains("unknown"), "{out}");
 
     let (code, _, err) = run(&mut sb.cmd(&["selinux", "bogus"]));
-    assert_eq!(code, 1);
+    // A bad subcommand is a usage error (2), not a runtime failure (1).
+    assert_eq!(code, 2);
     assert!(err.contains("unknown subcommand 'bogus'"), "{err}");
 }
 

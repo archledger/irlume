@@ -97,7 +97,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     // args[0] is the "suncal" subcommand itself.
     let (Some(det_path), Some(dir)) = (args.get(1), args.get(2)) else {
         eprintln!("usage: IRLUME_DEV=1 irlume suncal <det.onnx> <dataset_dir>");
-        return ExitCode::FAILURE;
+        // Usage error, not a runtime failure; every sibling dev tool answers 2.
+        return ExitCode::from(2);
     };
     let mut det = match irlume_vision::Detector::load_from_file(det_path) {
         Ok(d) => d,

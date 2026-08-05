@@ -1478,6 +1478,7 @@ fn setup_walks_every_step_noninteractively() {
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
+            third_party_recognizer: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {

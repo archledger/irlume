@@ -334,7 +334,7 @@ fn main() {
                             eprintln!(
                                 "irlumed: third-party recognizer '{name}' loaded (threshold {thr}; IR matching disabled — unmeasured for this model)"
                             );
-                            e.with_thirdparty_recognizer(*thr)
+                            e.with_thirdparty_recognizer(*thr, name)
                         })
                     }
                     None => irlume_auth::Engine::load(&det, &model),
@@ -1593,6 +1593,7 @@ struct EngineBits {
     mesh: bool,
     adapter: bool,
     third_party_pad: Option<String>,
+    third_party_recognizer: Option<String>,
 }
 
 fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
@@ -1609,6 +1610,7 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
         third_party_pad: engine.thirdparty_pad_name().map(String::from),
+        third_party_recognizer: engine.thirdparty_recognizer_name().map(String::from),
     });
 }
 
@@ -1792,6 +1794,7 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 // Authoritative loaded-cue name so a non-root TUI can show the
                 // real on/off state (settings.conf is root-only).
                 third_party_pad: bits.third_party_pad.clone(),
+                third_party_recognizer: bits.third_party_recognizer.clone(),
                 apparmor: apparmor_confinement(),
             }
         }
@@ -3983,6 +3986,7 @@ mod tests {
             mesh: true,
             adapter: true,
             third_party_pad: Some("flir".into()),
+            third_party_recognizer: None,
         });
         let peer = Peer {
             uid: 0,

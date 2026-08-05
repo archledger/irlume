@@ -578,11 +578,20 @@ fn stdin_is_tty() -> bool {
 /// so installed-but-unconfirmable gets reported instead of a false "none".
 /// Condensed third-party-model state for a TUI status row, so it can show a
 /// ●/○ icon like the other Settings sections instead of a bare text blob.
+/// One enabled catalog entry, STRUCTURED: consumers decide wording per stage
+/// and per weight state, so a joined display string cannot smear one entry's
+/// checksum failure across every enabled model (#285 review).
+pub(crate) struct TuiEntry {
+    pub name: &'static str,
+    pub stage: irlume_common::thirdparty::Stage,
+    pub weight_state: irlume_common::thirdparty::WeightState,
+}
+
 pub(crate) enum TuiState {
-    /// One or more catalog models are enabled in settings.conf; carries a
-    /// display name (joined when several stages are enabled at once) and the
-    /// weight health per entry (checksum ok / mismatch).
-    Enabled { name: String, detail: String },
+    /// One or more catalog models are enabled in settings.conf.
+    Enabled { entries: Vec<TuiEntry> },
+    /// A settings key names something not in the catalog (daemon ignores it).
+    UnknownName { name: String },
     /// Weights are installed but the enabled flag is root-only and we are not
     /// root, so we can report presence but not the on/off state.
     InstalledUnknown { name: String },
@@ -596,31 +605,26 @@ pub(crate) fn tui_state() -> TuiState {
     // enabled would be the TUI lying about it (#280 follow-up).
     let enabled = enabled_entries();
     if !enabled.is_empty() {
-        let name = enabled
-            .iter()
-            .map(|(m, _)| m.name)
-            .collect::<Vec<_>>()
-            .join(" + ");
-        let detail = enabled
-            .iter()
-            .map(|(m, _)| format!("{} stage · {}", m.stage.as_str(), file_state(m)))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        return TuiState::Enabled { name, detail };
+        return TuiState::Enabled {
+            entries: enabled
+                .into_iter()
+                .map(|(m, _)| TuiEntry {
+                    name: m.name,
+                    stage: m.stage,
+                    weight_state: thirdparty::weight_state(m),
+                })
+                .collect(),
+        };
     }
     // An enabled name that is not in the catalog (daemon ignores it) still
-    // deserves the Enabled row so the mismatch is visible.
+    // deserves a row so the mismatch is visible.
     for key in [
         thirdparty::SETTINGS_KEY,
         thirdparty::RECOGNIZER_SETTINGS_KEY,
     ] {
         if let Some(name) = enabled_name_for(key) {
             if thirdparty::by_name(&name).is_none() {
-                return TuiState::Enabled {
-                    name,
-                    detail: "set in settings.conf but NOT in the catalog (daemon ignores it)"
-                        .into(),
-                };
+                return TuiState::UnknownName { name };
             }
         }
     }
@@ -1117,20 +1121,21 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
 
+        use irlume_common::thirdparty::Stage;
         match rec_only {
-            TuiState::Enabled { name, detail } => {
-                assert_eq!(name, "buffalo");
-                assert!(detail.contains("recognition stage"), "got: {detail}");
+            TuiState::Enabled { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, "buffalo");
+                assert_eq!(entries[0].stage, Stage::Recognition);
             }
             _ => panic!("a recognizer-only selection must show as Enabled"),
         }
         match both {
-            TuiState::Enabled { name, detail } => {
-                assert_eq!(name, "flir + buffalo");
-                assert!(
-                    detail.contains("pad stage") && detail.contains("recognition stage"),
-                    "got: {detail}"
-                );
+            TuiState::Enabled { entries } => {
+                let got: Vec<_> = entries.iter().map(|e| (e.name, e.stage)).collect();
+                assert!(got.contains(&("flir", Stage::Pad)));
+                assert!(got.contains(&("buffalo", Stage::Recognition)));
+                assert_eq!(got.len(), 2);
             }
             _ => panic!("two enabled stages must both show"),
         }
@@ -1339,7 +1344,10 @@ mod tests {
 
         // tui_state mirrors the same config: an enabled name -> Enabled row.
         match tui_state() {
-            TuiState::Enabled { name, .. } => assert_eq!(name, m.name),
+            TuiState::Enabled { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, m.name);
+            }
             _ => panic!("expected Enabled after setting the config key"),
         }
 

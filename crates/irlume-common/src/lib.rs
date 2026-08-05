@@ -703,6 +703,13 @@ pub enum Response {
         /// no cue is loaded (or an older daemon that predates this field).
         #[serde(default)]
         third_party_pad: Option<String>,
+        /// Name of the loaded third-party RECOGNIZER, if any (#276 stage 4).
+        /// Same authority argument as the PAD field: this is what the daemon
+        /// actually loaded, which a non-root TUI cannot learn from the
+        /// root-only settings file. `None` = shipped recognizer (or an older
+        /// daemon predating the field).
+        #[serde(default)]
+        third_party_recognizer: Option<String>,
         /// The daemon's OWN AppArmor confinement, read from its /proc/self/attr
         /// at request time: e.g. `irlumed (enforce)`, `irlumed (complain)`, or
         /// `unconfined`. `None` when AppArmor is not enabled on this boot (or an

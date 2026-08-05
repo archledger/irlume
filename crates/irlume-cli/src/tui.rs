@@ -356,6 +356,8 @@ struct HealthInfo {
     /// Loaded third-party PAD cue name (authoritative on/off, since
     /// settings.conf is root-only and a non-root TUI can't read it).
     third_party_pad: Option<String>,
+    /// Loaded third-party recognizer name, same authority argument.
+    third_party_recognizer: Option<String>,
     /// The daemon's real AppArmor confinement label ("irlumed (enforce)",
     /// "unconfined", ...), or None when AppArmor is off or the daemon predates
     /// the field. Authoritative: the on-disk profile can exist while the daemon
@@ -727,6 +729,7 @@ impl LightState {
                 adapter,
                 version,
                 third_party_pad,
+                third_party_recognizer,
                 apparmor,
             }) => Some(HealthInfo {
                 tier,
@@ -736,6 +739,7 @@ impl LightState {
                 adapter,
                 version,
                 third_party_pad,
+                third_party_recognizer,
                 apparmor,
             }),
             _ => None, // older daemon / daemon down → Repair falls back to local probes
@@ -1698,23 +1702,51 @@ impl App {
             ));
         }
 
-        // A third-party liveness model enabled but with a CHECKSUM MISMATCH: the
-        // daemon refuses to load it, so the deny-only cue the user opted into is
-        // silently OFF. Only flag it when the daemon is up and did NOT load a
-        // cue (if it loaded one, Health.third_party_pad proves the weights were
-        // fine). doctor reports this; a TUI-only user would never see it.
-        let daemon_loaded_pad = self
-            .health
-            .as_ref()
-            .is_some_and(|h| h.third_party_pad.is_some());
-        if self.daemon_up && !daemon_loaded_pad {
-            if let crate::models::TuiState::Enabled { name, detail } = crate::models::tui_state() {
-                if detail.contains("MISMATCH") {
+        // A third-party model enabled but with a CHECKSUM MISMATCH, reported
+        // PER ENTRY: a joined string smeared one model's failure across every
+        // enabled stage (#285 review). The consequence differs by stage — a
+        // refused PAD cue is silently OFF, a refused recognizer means the
+        // daemon will not start with it selected. Only flag a stage the
+        // daemon did not actually load (Health proves loaded weights fine).
+        if self.daemon_up {
+            if let crate::models::TuiState::Enabled { entries } = crate::models::tui_state() {
+                use irlume_common::thirdparty::{Stage, WeightState};
+                for entry in entries {
+                    if entry.weight_state != WeightState::ChecksumMismatch {
+                        continue;
+                    }
+                    let loaded = match entry.stage {
+                        Stage::Pad => self
+                            .health
+                            .as_ref()
+                            .is_some_and(|h| h.third_party_pad.as_deref() == Some(entry.name)),
+                        Stage::Recognition => self.health.as_ref().is_some_and(|h| {
+                            h.third_party_recognizer.as_deref() == Some(entry.name)
+                        }),
+                        _ => false,
+                    };
+                    if loaded {
+                        continue;
+                    }
+                    let effect = match entry.stage {
+                        Stage::Pad => "the deny-only cue is OFF",
+                        Stage::Recognition => {
+                            "the daemon refuses to start with it selected; face auth falls back to the password"
+                        }
+                        _ => "the daemon refuses the selected model",
+                    };
                     v.push(mk(
                         "Third-party model",
                         Sev::Fail,
-                        format!("'{name}' weights fail their checksum; the daemon refuses them (cue is OFF)"),
-                        Fix::Manual("Settings tab → [m] disable then re-enable the model".into()),
+                        format!(
+                            "'{}' ({} stage) weights fail their checksum; {effect}",
+                            entry.name,
+                            entry.stage.as_str()
+                        ),
+                        Fix::Manual(format!(
+                            "run `sudo irlume models disable {0}`, then re-enable {0}",
+                            entry.name
+                        )),
                     ));
                 }
             }
@@ -3137,42 +3169,53 @@ impl App {
             // confirm in the cooked terminal: that friction is the policy,
             // the TUI hosts it rather than bypassing it.
             (SC_SETTINGS, KeyCode::Char('m')) => {
-                use irlume_common::thirdparty::{weight_state, Stage, WeightState, CATALOG};
-                let installed: Vec<_> = CATALOG
-                    .iter()
-                    .filter(|m| matches!(weight_state(m), WeightState::ChecksumOk))
-                    .collect();
-                match installed.as_slice() {
-                    // Exactly one installed model: the toggle is unambiguous.
-                    [m] => {
+                use irlume_common::thirdparty::{Stage, CATALOG};
+                // Decide from ENABLED state, not installed files: weights can
+                // be orphaned on disk with no settings key (an admitted
+                // partial state of install), and `models disable <name>`
+                // refuses names that are not enabled (#285 review).
+                match crate::models::tui_state() {
+                    crate::models::TuiState::Enabled { entries } if entries.len() == 1 => {
+                        let entry = &entries[0];
                         self.confirm = Some((
                             format!(
                                 "Disable third-party {} model '{}'? (its weights are deleted)",
-                                m.stage.as_str(),
-                                m.name
+                                entry.stage.as_str(),
+                                entry.name
                             ),
                             "Disable",
-                            ConfirmAct::Sus(Suspend::ModelsDisable(m.name.to_string())),
+                            ConfirmAct::Sus(Suspend::ModelsDisable(entry.name.to_string())),
                         ));
                     }
-                    // Several installed (different stages): a single toggle
-                    // key must not guess which authentication policy to
-                    // remove; name them and point at the explicit command.
-                    [_, ..] => {
-                        for m in &installed {
+                    // Several enabled stages: a single toggle key must not
+                    // guess which authentication policy to remove.
+                    crate::models::TuiState::Enabled { entries } => {
+                        for entry in entries {
                             self.log(
                                 '·',
                                 format!(
-                                    "installed: {} ({} stage) — disable with: sudo irlume models disable {}",
-                                    m.name,
-                                    m.stage.as_str(),
-                                    m.name
+                                    "enabled: {} ({} stage) — disable with: sudo irlume models disable {}",
+                                    entry.name,
+                                    entry.stage.as_str(),
+                                    entry.name
                                 ),
                             );
                         }
                     }
-                    [] => {
-                        // Nothing installed: offer the PAD recommendation, the
+                    crate::models::TuiState::UnknownName { name } => {
+                        self.log(
+                            '·',
+                            format!("'{name}' is set in settings.conf but not in the catalog; fix it with `sudo irlume models`"),
+                        );
+                    }
+                    crate::models::TuiState::InstalledUnknown { .. } => {
+                        self.log(
+                            '·',
+                            "weights are installed but the enabled state is root-only; run `sudo irlume models` for the authoritative view",
+                        );
+                    }
+                    crate::models::TuiState::None => {
+                        // Nothing enabled: offer the PAD recommendation, the
                         // same one doctor makes (the built-in gate does not
                         // stop a print).
                         match CATALOG.iter().find(|m| m.stage == Stage::Pad) {
@@ -3924,42 +3967,80 @@ impl App {
                     ),
                 ]),
                 Line::raw(""),
-                section("Third-party liveness models"),
+                section("Third-party models"),
                 {
                     // A ●/○ status row like the sections above, not a text blob.
                     // The daemon's loaded-cue name is authoritative (it knows
                     // what it loaded); fall back to the filesystem probe only
                     // when the daemon can't answer, since settings.conf is
                     // root-only and a non-root TUI can't read the flag itself.
-                    let (icon, icon_style, label) =
-                        match self.health.as_ref().and_then(|h| h.third_party_pad.clone()) {
-                            Some(name) => (
+                    // Every daemon-reported stage, not just PAD: a loaded
+                    // cue must not hide a loaded recognizer (#285 review).
+                    let loaded: Vec<String> = self
+                        .health
+                        .iter()
+                        .flat_map(|h| {
+                            [
+                                h.third_party_pad
+                                    .as_ref()
+                                    .map(|n| format!("{n} (pad stage, loaded)")),
+                                h.third_party_recognizer
+                                    .as_ref()
+                                    .map(|n| format!("{n} (recognition stage, loaded)")),
+                            ]
+                        })
+                        .flatten()
+                        .collect();
+                    let (icon, icon_style, label) = if !loaded.is_empty() {
+                        (
+                            "●",
+                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                            format!("enabled: {}", loaded.join(" + ")),
+                        )
+                    } else {
+                        // Nothing daemon-reported: could be a daemon too old
+                        // to report the fields OR genuinely none. We can't
+                        // tell the two apart (both deserialize to None), so
+                        // trust the filesystem probe rather than claim "off":
+                        // an older daemon with flir loaded must not read as
+                        // ○ none.
+                        match crate::models::tui_state() {
+                            crate::models::TuiState::Enabled { entries } => (
                                 "●",
                                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                format!("enabled: {name}   (loaded by the daemon, deny-only cue)"),
+                                format!(
+                                    "enabled: {}",
+                                    entries
+                                        .iter()
+                                        .map(|e| format!(
+                                            "{} ({} stage · {})",
+                                            e.name,
+                                            e.stage.as_str(),
+                                            match e.weight_state {
+                                                irlume_common::thirdparty::WeightState::ChecksumOk => "checksum ok",
+                                                irlume_common::thirdparty::WeightState::ChecksumMismatch => "CHECKSUM MISMATCH",
+                                                irlume_common::thirdparty::WeightState::Absent => "weights missing",
+                                            }
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join(" + ")
+                                ),
                             ),
-                            // No daemon-reported cue: could be a daemon too old
-                            // to report the field (0.6.0 and earlier) OR genuinely
-                            // none. We can't tell the two apart (both deserialize
-                            // to None), so trust the filesystem probe rather than
-                            // claim "off": an older daemon with flir loaded must
-                            // not read as ○ none (regression fixed here).
-                            None => match crate::models::tui_state() {
-                                crate::models::TuiState::Enabled { name, detail } => (
-                                    "●",
-                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                    format!("enabled: {name}   {detail}"),
-                                ),
-                                crate::models::TuiState::InstalledUnknown { name } => (
-                                    "◐",
-                                    Style::new().fg(th().warn),
-                                    format!("{name} weights installed; on/off is root-only"),
-                                ),
-                                crate::models::TuiState::None => {
-                                    ("○", Style::new().dim(), "none (default)".to_string())
-                                }
-                            },
-                        };
+                            crate::models::TuiState::UnknownName { name } => (
+                                "◐",
+                                Style::new().fg(th().warn),
+                                format!("'{name}' set in settings.conf but NOT in the catalog (daemon ignores it)"),
+                            ),
+                            crate::models::TuiState::InstalledUnknown { name } => (
+                                "◐",
+                                Style::new().fg(th().warn),
+                                format!("{name} weights installed; on/off is root-only"),
+                            ),
+                            crate::models::TuiState::None => {
+                                ("○", Style::new().dim(), "none (default)".to_string())
+                            }
+                        }
+                    };
                     Line::from(vec![
                         Span::raw("  state  "),
                         Span::styled(format!("{icon} "), icon_style),
@@ -3967,11 +4048,11 @@ impl App {
                     ])
                 },
                 Line::from(Span::styled(
-                    "  Opt-in, measured, deny-only extra anti-spoof cue; fetched from the",
+                    "  Opt-in, measured models by pipeline stage: PAD adds a deny-only cue,",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  publisher, checksum-pinned, never shipped by irlume.",
+                    "  recognition replaces RGB matching. Checksum-pinned, never shipped by irlume.",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
@@ -6340,6 +6421,7 @@ mod tests {
             adapter: false,
             version: "test".into(),
             third_party_pad: None,
+            third_party_recognizer: None,
             apparmor: None,
         });
         let start = std::time::Instant::now();
@@ -8133,6 +8215,7 @@ mod tests {
             adapter: false,
             version: "1.0".into(),
             third_party_pad: None,
+            third_party_recognizer: None,
             apparmor: None,
         });
         let text = draw_text(&app);
@@ -8154,11 +8237,46 @@ mod tests {
         assert!(text.contains("Require eyes open"));
         assert!(text.contains("○ no"), "eyes-open starts off");
         assert!(text.contains("Biopolicy operation-class gate"));
-        assert!(text.contains("Third-party liveness models"));
+        assert!(text.contains("Third-party models"));
+        assert!(
+            !text.contains("Third-party liveness models"),
+            "the heading must not claim every model is a liveness cue"
+        );
         assert!(text.contains("Match thresholds (read-only)"));
         app.eyes_open = true;
         let text = draw_text(&app);
         assert!(text.contains("● yes"), "the toggled state must show");
+    }
+
+    #[test]
+    fn settings_row_reports_pad_and_recognizer_together() {
+        // The #285 review's counterexample: with both stages loaded, the
+        // health-driven arm previously showed only the PAD cue — a loaded
+        // deny-only cue hid the replacement RECOGNIZER, the more
+        // consequential of the two.
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.daemon_up = true;
+        // Health constructed EXPLICITLY: test_app leaves it None, and an
+        // `if let Some` mutation here would silently opt the test out of the
+        // very state it exists to render.
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            version: "test".into(),
+            third_party_pad: Some("flir".into()),
+            third_party_recognizer: Some("buffalo".into()),
+            apparmor: None,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("flir (pad stage, loaded)"), "{text}");
+        assert!(
+            text.contains("buffalo (recognition stage, loaded)"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -8177,6 +8295,7 @@ mod tests {
             adapter: false,
             version: "test".into(),
             third_party_pad: Some("flir".into()),
+            third_party_recognizer: None,
             apparmor: None,
         });
         let text = draw_text(&app);
@@ -8506,6 +8625,7 @@ mod tests {
             adapter: true,
             version: env!("CARGO_PKG_VERSION").into(),
             third_party_pad: None,
+            third_party_recognizer: None,
             apparmor: None,
         });
         app.run_checks();
@@ -8560,6 +8680,7 @@ mod tests {
             adapter: false,
             version: "0.0.1-old".into(),
             third_party_pad: None,
+            third_party_recognizer: None,
             apparmor: None,
         });
         app.challenge = true;

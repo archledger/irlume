@@ -44,6 +44,10 @@ pub struct Engine {
     /// value (#276), because a threshold is a property of one model's cosine
     /// scale and applying another model's number to it is a guess.
     rgb_threshold: f32,
+    /// Name of the loaded third-party recognizer (None = shipped). Display
+    /// and Health reporting only; the POLICY lives in rgb_threshold and
+    /// ir_matching.
+    thirdparty_recognizer: Option<String>,
     /// Whether IR matching (fusion, IR fallback, calibrated centroid, dark
     /// IR-only auth) may run. False under a third-party recognizer: the IR
     /// thresholds and the fusion Platt calibration are measurements of the
@@ -611,6 +615,7 @@ impl Engine {
             ir_space: "raw".into(),
             embed_space,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
+            thirdparty_recognizer: None,
             ir_matching: true,
             mesh: None,
             blaze: None,
@@ -731,10 +736,17 @@ impl Engine {
     /// catalog entry carries IR-side measurements. The liveness gate is
     /// unaffected: it reads pixels, not embeddings. Dark logins refuse with
     /// their own reason and fall back to the password.
-    pub fn with_thirdparty_recognizer(mut self, rgb_threshold: f32) -> Self {
+    pub fn with_thirdparty_recognizer(mut self, rgb_threshold: f32, name: &str) -> Self {
         self.rgb_threshold = rgb_threshold;
         self.ir_matching = false;
+        self.thirdparty_recognizer = Some(name.to_string());
         self
+    }
+
+    /// Name of the loaded third-party recognizer, if any; the daemon publishes
+    /// this in Health so an unprivileged TUI sees the authoritative state.
+    pub fn thirdparty_recognizer_name(&self) -> Option<&str> {
+        self.thirdparty_recognizer.as_deref()
     }
 
     /// The RGB grant threshold for a comparison against `n_templates`
@@ -5116,9 +5128,10 @@ mod engine_tests {
         )
         .expect("engine load")
         .with_devices(NO_RGB, NO_IR)
-        .with_thirdparty_recognizer(0.6);
+        .with_thirdparty_recognizer(0.6, "fixture-rec");
         assert_eq!(e.rgb_grant_threshold(1), 0.6);
         assert!(!e.ir_matching);
+        assert_eq!(e.thirdparty_recognizer_name(), Some("fixture-rec"));
     }
 
     #[test]

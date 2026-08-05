@@ -16,6 +16,8 @@
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 
 pub mod align;
+#[cfg(feature = "tflite")]
+pub mod blaze_full;
 pub mod detect;
 pub mod light;
 pub mod moire;

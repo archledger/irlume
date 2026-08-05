@@ -53,7 +53,8 @@ def detector(model_path):
 def main(short_p, full_p, roots):
     dets = {"short": detector(short_p), "full": detector(full_p)}
     w = csv.writer(sys.stdout)
-    w.writerow(["camera", "segment", "kind", "frame", "model", "n", "score", "mean"])
+    w.writerow(["camera", "segment", "kind", "frame", "model", "n", "score", "mean",
+                "x1", "y1", "x2", "y2"])
     for root in roots:
         cam = Path(root).name
         for seg in sorted(p for p in Path(root).iterdir() if p.is_dir()):
@@ -64,12 +65,21 @@ def main(short_p, full_p, roots):
                     for mname, d in dets.items():
                         r = d.detect(img)
                         n = len(r.detections)
-                        score = max(
-                            (c.score for det in r.detections for c in det.categories),
-                            default="",
+                        # Top detection's box in pixels, for decoder parity.
+                        top = max(
+                            r.detections,
+                            key=lambda det: max(c.score for c in det.categories),
+                            default=None,
                         )
+                        score = ""
+                        box = ["", "", "", ""]
+                        if top is not None:
+                            score = f"{max(c.score for c in top.categories):.4f}"
+                            bb = top.bounding_box
+                            box = [f"{bb.origin_x}", f"{bb.origin_y}",
+                                   f"{bb.origin_x + bb.width}", f"{bb.origin_y + bb.height}"]
                         w.writerow([cam, seg.name, kind, f"{sub}/{f.name}", mname, n,
-                                    f"{score:.4f}" if score != "" else "", f"{mean:.1f}"])
+                                    score, f"{mean:.1f}", *box])
 
 
 if __name__ == "__main__":

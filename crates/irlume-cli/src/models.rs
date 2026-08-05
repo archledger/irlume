@@ -129,6 +129,22 @@ fn enabled_name_for(key: &str) -> Option<String> {
     irlume_common::config::read_kv("settings.conf", key)
 }
 
+/// Whether this process can read settings.conf at all.
+///
+/// settings.conf is 0600 root-only, so `read_kv` returns None for an
+/// unprivileged caller whether the key is absent or merely unreadable. Rendering
+/// that None as "disabled" told a user whose anti-spoof model IS enabled that
+/// none was, which invites them to re-run enable or to believe the PAD layer is
+/// off. `models list --json` already reports `enabled: {known: false}` here; the
+/// human list has to say the same thing.
+fn enabled_state_readable() -> bool {
+    use irlume_common::config::KvObservation;
+    !matches!(
+        irlume_common::config::observe_kv("settings.conf", thirdparty::SETTINGS_KEY),
+        KvObservation::Unknown(_)
+    )
+}
+
 /// Every (entry, its stage's settings key) currently enabled, across stages.
 fn enabled_entries() -> Vec<(&'static ThirdPartyModel, &'static str)> {
     thirdparty::CATALOG
@@ -204,13 +220,16 @@ fn list() -> ExitCode {
     println!("Nothing is listed here that was not measured on real hardware");
     println!("(docs/pad-results/, docs/recognition-results/, docs/THIRD-PARTY-MODELS.md).");
     println!();
+    let readable = enabled_state_readable();
     for m in thirdparty::CATALOG {
         let enabled_here =
             enabled_name_for(thirdparty::settings_key_for(m.stage)).as_deref() == Some(m.name);
         let state = if enabled_here {
             format!("ENABLED ({})", file_state(m))
-        } else {
+        } else if readable {
             "disabled".into()
+        } else {
+            format!("enabled state unknown, root-only ({})", file_state(m))
         };
         println!("  {}  [{state}]", m.name);
         println!("    license:    {}", m.license);
@@ -239,7 +258,13 @@ fn list() -> ExitCode {
     }
     println!();
     let enabled = enabled_entries();
-    if enabled.is_empty() {
+    if !readable {
+        println!(
+            "cannot read /etc/irlume/settings.conf (root-only), so the enabled \
+             state above is unknown"
+        );
+        println!("for the authoritative answer: sudo irlume models list");
+    } else if enabled.is_empty() {
         println!("none enabled · see the 'obtain' line above for each model");
     } else {
         for (m, _) in &enabled {

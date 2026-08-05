@@ -752,15 +752,12 @@ pub fn status(args: &[String]) -> ExitCode {
     }
 
     // Biopolicy enforcement (opt-in).
-    let bio = irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     println!(
         "  biopolicy     : {}",
-        if bio {
-            format!("ENFORCING {OK} (operation-class gate)")
-        } else {
-            "off (default)".into()
+        match irlume_common::config::enforce_biopolicy_visible() {
+            Some(true) => format!("ENFORCING {OK} (operation-class gate)"),
+            Some(false) => "off (default)".into(),
+            None => "unknown: root-only setting, re-run with sudo".into(),
         }
     );
 
@@ -1209,14 +1206,16 @@ pub fn deps(_args: &[String]) -> ExitCode {
 /// so enabling it can restrict which services a face may satisfy but never
 /// locks anyone out.
 pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
-    let on = irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+    let visible = irlume_common::config::enforce_biopolicy_visible();
     match sub {
         None | Some("status") => {
             println!(
                 "[biopolicy] operation-class gate: {}",
-                if on { "ENFORCING" } else { "off (default)" }
+                match visible {
+                    Some(true) => "ENFORCING",
+                    Some(false) => "off (default)",
+                    None => "unknown: root-only setting, re-run with sudo",
+                }
             );
             ExitCode::SUCCESS
         }

@@ -9,7 +9,7 @@
 //! guided setup. Developer/benchmark tools are gated behind `IRLUME_DEV=1`.
 //! A selection of the main subcommands:
 //!   irlume tui                                   guided setup + live dashboard
-//!   irlume enroll [--user U] [--profile NAME]   register a face profile
+//!   irlume enroll [--user U] [--name NAME] [--scans N]  register a face profile
 //!   irlume identify                              1:N "who is this?"
 //!   irlume doctor                                check cameras/IR/TPM/models
 //!   irlume keyring <arm|status|forget>           TPM-sealed keyring/wallet unlock
@@ -19,7 +19,6 @@
 //!   irlume fingerprint <status|add|verify|reset|enable|disable> fprintd companion (face OR fingerprint)
 //!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
-//!   irlume tui                                   interactive setup/management UI
 
 mod bitwarden;
 mod blinkcap;
@@ -210,6 +209,25 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Parse `--scans N` for a command that captures biometrics. A state-changing
+/// biometric command must not silently substitute a different operation: an
+/// unparseable or zero count is a usage error, not "capture the default". This
+/// lives in one place because `enroll` was written without the check that
+/// `profiles add-scan` documents, so `enroll --scans abc` fired a real capture
+/// at the default count. `Ok(None)` means the flag was absent.
+fn scans_flag(args: &[String], tool: &str) -> Result<Option<usize>, std::process::ExitCode> {
+    match flag(args, "--scans") {
+        None => Ok(None),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => {
+                eprintln!("[{tool}] --scans must be a positive integer");
+                Err(std::process::ExitCode::from(2))
+            }
+        },
+    }
+}
+
 /// `irlume enroll --user U [--name "..."]`: enroll a NEW face profile (captures
 /// the default number of scans) via the daemon, which owns the camera. Default
 /// profile name is "Face Profile N".
@@ -217,7 +235,10 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     use irlume_common::{Request, Response};
     let user = user_arg(args);
     let name = flag(args, "--name").map(String::from);
-    let scans = flag(args, "--scans").and_then(|s| s.parse::<usize>().ok());
+    let scans = match scans_flag(args, "enroll") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let reset = args.iter().any(|a| a == "--reset");
     if reset {
         eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
@@ -347,18 +368,9 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         },
         Some("add-scan") => match flag(args, "--profile") {
             Some(p) => {
-                // A state-changing biometric command must not silently
-                // substitute a different operation: an unparseable or zero
-                // count is a usage error, not "capture one".
-                let scans = match flag(args, "--scans") {
-                    None => None,
-                    Some(raw) => match raw.parse::<usize>() {
-                        Ok(n) if n > 0 => Some(n),
-                        _ => {
-                            eprintln!("[profiles] --scans must be a positive integer");
-                            return std::process::ExitCode::from(2);
-                        }
-                    },
+                let scans = match scans_flag(args, "profiles") {
+                    Ok(s) => s,
+                    Err(code) => return code,
                 };
                 match scans {
                     Some(n) if n > 1 => eprintln!(
@@ -3766,10 +3778,25 @@ fn doctor_run(
         dout!(report, "  {}: {line}", s.stage);
         report.check_detail(id, state, line);
     }
-    dout!(
-        report,
-        "  (third-party models: the pad stage only today, #276; `irlume models` lists them)"
-    );
+    // Derived from the catalog, never spelled out: this line said "the pad stage
+    // only today" through the release that opened recognition, so doctor denied a
+    // feature the same binary shipped.
+    {
+        let open: Vec<&str> = irlume_common::thirdparty::Stage::ALL
+            .iter()
+            .filter(|st| st.open())
+            .map(|st| st.as_str())
+            .collect();
+        dout!(
+            report,
+            "  (third-party models accepted for: {}; #276. `irlume models` lists them)",
+            if open.is_empty() {
+                "no stage".to_string()
+            } else {
+                open.join(", ")
+            }
+        );
+    }
     dout!(
         report,
         "[doctor] third-party PAD model: {}",

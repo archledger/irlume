@@ -266,6 +266,31 @@ pub fn credential_release_challenge_visible() -> Option<bool> {
     }
 }
 
+/// Whether the operation-class gate (`enforce_biopolicy`) is on, or `None` when
+/// settings.conf exists and this process may not read it.
+///
+/// Same reasoning as [`credential_release_challenge_visible`]: the file is 0600
+/// root-only, so an unprivileged `irlume status` cannot tell "key absent" (off,
+/// the default) from "key set to on". Printing "off (default)" in that case
+/// reports a guessed security state as a fact, which is what this returns None
+/// to prevent.
+pub fn enforce_biopolicy_visible() -> Option<bool> {
+    // Must agree with the daemon's `biopolicy_enforced()`, which is the only
+    // opinion that decides anything: same truthy set, same env override. The two
+    // display sites used to accept "1"|"true" alone, so `enforce_biopolicy=yes`
+    // printed "off" while the daemon was enforcing.
+    let truthy = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
+    if let Ok(v) = std::env::var("IRLUME_ENFORCE_BIOPOLICY") {
+        return Some(truthy(&v));
+    }
+    match observe_kv("settings.conf", "enforce_biopolicy") {
+        KvObservation::Value(v) => Some(truthy(&v)),
+        // No file, or no key in it, is unambiguous: the default is off.
+        KvObservation::Absent => Some(false),
+        KvObservation::Unknown(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2230,18 +2230,16 @@ mod tests {
             "only the loaded recognizer is live"
         );
 
-        // An older daemon reports neither field: no recognizers array
-        // entries, and nothing claimed live.
-        let data = profiles_data(
-            vec![ProfileSummary {
-                name: "P".into(),
-                scans: vec!["s1".into()],
-                scans_by_recognizer: Default::default(),
-                live_recognizer: None,
-            }],
-            false,
-            false,
-        );
+        // An older daemon reports neither field. Decoded from WIRE JSON that
+        // omits them, not from a struct literal supplying them: a literal
+        // would keep passing if the serde defaults were ever removed, which
+        // is exactly the compatibility this half claims to guard (#291
+        // review).
+        let old_wire: ProfileSummary = serde_json::from_str(r#"{"name":"P","scans":["s1"]}"#)
+            .expect("an older daemon's summary must still decode");
+        assert!(old_wire.scans_by_recognizer.is_empty());
+        assert!(old_wire.live_recognizer.is_none());
+        let data = profiles_data(vec![old_wire], false, false);
         assert!(data["profiles"][0]["recognizers"]
             .as_array()
             .unwrap()

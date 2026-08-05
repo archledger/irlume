@@ -317,7 +317,7 @@ fn ppa_serves_via(mut curl: std::process::Command, codename: &str) -> Option<boo
     // "the PPA doesn't serve you" just because they happen to be offline.
     let out = curl.args(["-fsS", "--max-time", "8", &url]).output().ok()?;
     match out.status.code() {
-        Some(0) => Some(gz_lists_irlume(&out.stdout)),
+        Some(0) => gz_lists_irlume(&out.stdout),
         Some(22) => Some(false), // curl -f exits 22 on HTTP >= 400 (404) → not served
         _ => None,               // DNS/connect/timeout → couldn't tell
     }
@@ -326,26 +326,33 @@ fn ppa_serves_via(mut curl: std::process::Command, codename: &str) -> Option<boo
 /// Does a gzipped Debian `Packages` index list our package? Decompresses via
 /// `gzip -dc` (no bundled zlib) and looks for a `Package: irlume` line. The
 /// index is tiny (one package), so writing it to gzip's stdin can't deadlock.
-fn gz_lists_irlume(gz: &[u8]) -> bool {
+fn gz_lists_irlume(gz: &[u8]) -> Option<bool> {
     use std::io::Write;
-    let Ok(mut child) = std::process::Command::new("gzip")
+    let mut child = std::process::Command::new("gzip")
         .arg("-dc")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-    else {
-        return false;
-    };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(gz); // si dropped here → EOF to gzip
+        .ok()?;
+    // A failed or partial write is NOT "the package is absent": gzip would
+    // decompress a truncated index and the answer would read as "the PPA does
+    // not serve you", steering a current-LTS user away from their own archive.
+    // Observed as a recurring CI failure on a loaded runner before this
+    // distinction existed.
+    let mut si = child.stdin.take()?;
+    let wrote = si.write_all(gz).and_then(|()| si.flush());
+    drop(si); // EOF to gzip
+    let out = child.wait_with_output().ok()?;
+    wrote.ok()?;
+    if !out.status.success() {
+        return None; // decompression failed; we cannot tell what it lists
     }
-    let Ok(out) = child.wait_with_output() else {
-        return false;
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .any(|l| l == "Package: irlume")
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l == "Package: irlume"),
+    )
 }
 
 /// Run each package-manager step with root: directly if we already are, else
@@ -1828,19 +1835,31 @@ mod origin_tests {
     // must key on an actual `Package: irlume` entry in the Packages index.
     #[test]
     fn gz_lists_irlume_needs_an_actual_package_entry() {
-        assert!(gz_lists_irlume(&gzip_bytes(
-            b"Package: irlume\nVersion: 0.2.1\nArchitecture: amd64\n"
-        )));
-        assert!(
-            !gz_lists_irlume(&gzip_bytes(b"")),
+        assert_eq!(
+            gz_lists_irlume(&gzip_bytes(
+                b"Package: irlume\nVersion: 0.2.1\nArchitecture: amd64\n"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            gz_lists_irlume(&gzip_bytes(b"")),
+            Some(false),
             "an empty index is not served"
         );
-        assert!(!gz_lists_irlume(&gzip_bytes(
-            b"Package: linhello\nVersion: 1.0\n"
-        )));
+        assert_eq!(
+            gz_lists_irlume(&gzip_bytes(b"Package: linhello\nVersion: 1.0\n")),
+            Some(false)
+        );
         // A partial-name line must not count either (exact-line match).
-        assert!(!gz_lists_irlume(&gzip_bytes(b"Package: irlume-selinux\n")));
-        assert!(!gz_lists_irlume(b"definitely not gzip data"));
+        assert_eq!(
+            gz_lists_irlume(&gzip_bytes(b"Package: irlume-selinux\n")),
+            Some(false)
+        );
+        // Undecompressable input is "cannot tell", NOT "not served": reading
+        // it as absence tells a current-LTS user their own archive does not
+        // serve them, and it is what made this probe fail intermittently on a
+        // loaded CI runner.
+        assert_eq!(gz_lists_irlume(b"definitely not gzip data"), None);
     }
 
     /// A fake tool as a `Command`, not a file: `/bin/sh -c <script>`.

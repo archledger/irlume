@@ -311,6 +311,18 @@ fn offer_blink_challenge(user: &str) {
     }
 }
 
+/// Wrap a value so a shell reads it as ONE argument, whatever it contains.
+///
+/// Profile names are user text: the rename path accepts any string, root can
+/// list another user's profiles, and this crate prints commands for a person
+/// to copy. A name carrying a quote would otherwise close the quoting and
+/// append its own command to something an administrator runs. Single quotes
+/// are closed, escaped, and reopened, the only sequence a POSIX shell accepts
+/// inside single quotes.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 /// `irlume profiles [list|add-scan|rename|delete|eyes-open] ...`: manage the up-
 /// to-3 face profiles and their scans via the daemon.
 fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
@@ -435,8 +447,8 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                         if live_count == 0 {
                             println!(
                                 "      none of these match the loaded recognizer; add scans \
-                                 with `irlume profiles add-scan --profile '{}'`",
-                                p.name
+                                 with `irlume profiles add-scan --profile {}`",
+                                shell_single_quote(&p.name)
                             );
                         }
                     }
@@ -4325,6 +4337,34 @@ mod tests {
             devices_from_flags(Some("/dev/video4"), None, sel),
             Some(("/dev/video4".into(), "/dev/sel-ir".into()))
         );
+    }
+
+    #[test]
+    fn shell_single_quote_keeps_a_hostile_profile_name_in_one_argument() {
+        // Profile names are user text, root can list another user's profiles,
+        // and this crate prints commands for a person to copy. A name
+        // carrying a quote would otherwise close the quoting and append its
+        // own command to something an administrator runs (#291 review).
+        let name = "Face'; touch /tmp/irlume-command-injection; #";
+        let quoted = shell_single_quote(name);
+        assert_eq!(
+            quoted,
+            "'Face'\"'\"'; touch /tmp/irlume-command-injection; #'"
+        );
+        // The escaped form is what a shell actually parses back as one
+        // argument: confirmed by asking a shell, not by reading the string.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .expect("sh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            name,
+            "the shell must see exactly the original name, as one argument"
+        );
+        // Ordinary names are unchanged apart from the wrapping quotes.
+        assert_eq!(shell_single_quote("Face Profile 1"), "'Face Profile 1'");
     }
 
     #[test]

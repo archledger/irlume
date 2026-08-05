@@ -3800,6 +3800,39 @@ mod tests {
     }
 
     #[test]
+    fn the_matcher_picks_the_calibration_by_recognizer_space() {
+        // #288: a profile can hold calibrations for several recognizers, and
+        // ir_match_in must apply the LOADED one. Discriminated by presence:
+        // with the calibration filed under a different space, the loaded
+        // recognizer has none, so the calibrated-centroid protocol does not
+        // run at all. Reaching for any available calibration instead of the
+        // keyed one puts another model's transform on these templates.
+        let (mut prof, probe) = calibrated_profile(16);
+        // Control: the calibration is in the legacy slot and the scans are
+        // untagged, so the shipped recognizer finds it and scores a centroid.
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof.clone());
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
+        assert!(
+            m.centroid.is_some(),
+            "control: the shipped recognizer's own calibration must apply"
+        );
+
+        // Same scans, but the only calibration on file belongs to another
+        // recognizer: the loaded one must score raw.
+        let calib = prof.ir_calib.take().expect("fixture calibration");
+        prof.ir_calibs.insert("embed:model-b".into(), calib);
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
+        assert_eq!(m.n_templates, 5, "the templates still score");
+        assert!(
+            m.centroid.is_none(),
+            "another recognizer's calibration must not be applied"
+        );
+    }
+
+    #[test]
     fn ir_match_skips_templates_from_another_recognizer() {
         // The recognizer produces the raw IR embedding, so its identity gates
         // IR matching exactly like RGB matching: a foreign tag is excluded, a

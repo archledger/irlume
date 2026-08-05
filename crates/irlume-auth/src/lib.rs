@@ -548,6 +548,26 @@ pub fn thirdparty_abstains(p_fake: Option<f32>, threshold: f32) -> bool {
         .is_some_and(|p| p >= irlume_common::thirdparty::MEASURED_GENUINE_CEILING && p < threshold)
 }
 
+/// IR availability for a caller-selected IR device path.
+///
+/// The path half answers #281 (the selection, not a racy probe, is the truth);
+/// the forced-off half preserves `IRLUME_FORCE_NO_IR=1`, the documented
+/// drop-to-convenience override, which must outrank the selection exactly as
+/// it outranks `capabilities()` — the first cut of #282 overwrote it and
+/// silently re-secured a forced-convenience machine whose IR node existed.
+fn selected_ir_available(ir: &str) -> bool {
+    ir_selection_available(
+        std::path::Path::new(ir).exists(),
+        irlume_camera::ir_forced_off(),
+    )
+}
+
+/// The decision itself, as a value: testable without touching the
+/// process-wide override the engine test suite keeps set.
+fn ir_selection_available(ir_exists: bool, forced_off: bool) -> bool {
+    ir_exists && !forced_off
+}
+
 /// Highest-scoring detection: the face every pipeline stage keys on when a
 /// frame holds more than one.
 fn top_detection(faces: &[Detection]) -> Option<&Detection> {
@@ -645,8 +665,9 @@ impl Engine {
         // as the selected path existing (its tier log uses exactly that), so
         // the engine adopts the same definition when devices are handed to it;
         // the NO_IR test sentinel is a nonexistent path and keeps reading as
-        // unavailable.
-        self.ir_available = std::path::Path::new(ir).exists();
+        // unavailable, and the operator's forced-convenience override outranks
+        // the selection exactly as it outranks the probe (#282 review).
+        self.ir_available = selected_ir_available(ir);
         self
     }
 
@@ -668,7 +689,7 @@ impl Engine {
         // Same rule as with_devices: the selection carries IR availability, so
         // a runtime camera switch to (or from) an IR-less pair retiers the
         // engine instead of trusting the load-time snapshot (#281).
-        self.ir_available = std::path::Path::new(ir).exists();
+        self.ir_available = selected_ir_available(ir);
     }
 
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the
@@ -4875,24 +4896,32 @@ mod engine_tests {
     }
 
     #[test]
-    fn device_selection_carries_ir_availability() {
-        // #281: the engine's one-shot capabilities() probe at load can lose a
-        // startup race against the emitter setup holding the IR node, leaving
-        // the engine in convenience tier while the daemon (whose selection
-        // FOUND the pair) logs secure tier. The caller's selection is the
-        // truth: a selected IR path that exists retiers the engine Secure, a
-        // nonexistent one (the test sentinel, or an IR-less box's fallback
-        // default) reads Convenience. /dev/null stands in for "an existing
-        // node" — the rule is exists(), the daemon's own definition of usable.
+    fn device_selection_carries_ir_availability_and_honours_forced_off() {
+        // #281: the selection, not the load-time probe, decides IR
+        // availability. The truth table is the testable decision (this suite
+        // keeps IRLUME_FORCE_NO_IR=1 set process-wide, so the positive arm is
+        // unreachable through a real engine here):
+        assert!(ir_selection_available(true, false));
+        assert!(!ir_selection_available(false, false));
+        // The #282 review's regression: the operator's forced-convenience
+        // override must outrank an existing selected path. The first cut
+        // overwrote it — and the first version of THIS test only passed
+        // because of that cancellation.
+        assert!(!ir_selection_available(true, true));
+        assert!(!ir_selection_available(false, true));
+
+        // Through the real engine, under the suite's forced-off env: an
+        // existing IR path must STAY unavailable via both entry points, and a
+        // nonexistent one reads unavailable either way.
         let _g = env_guard();
         let mut s = shared();
         s.engine.set_devices(NO_RGB, "/dev/null");
-        assert!(s.engine.ir_available(), "an existing IR path must retier");
-        assert_eq!(s.engine.tier(), Tier::Secure);
-        s.engine.set_devices(NO_RGB, NO_IR);
-        assert!(!s.engine.ir_available(), "a nonexistent IR path must not");
+        assert!(
+            !s.engine.ir_available(),
+            "forced-off must survive a runtime switch to an existing IR path"
+        );
         assert_eq!(s.engine.tier(), Tier::Convenience);
-        // The builder path applies the same rule.
+        s.engine.set_devices(NO_RGB, NO_IR); // restore the shared baseline
         drop(s);
         let e = Engine::load(
             &model_path("face_detection_yunet_2023mar.onnx"),
@@ -4900,9 +4929,29 @@ mod engine_tests {
         )
         .expect("engine load")
         .with_devices(NO_RGB, "/dev/null");
-        assert!(e.ir_available());
+        assert!(
+            !e.ir_available(),
+            "forced-off must survive the builder with an existing IR path"
+        );
+        // The assignment itself, discriminated: under this suite's forced-off
+        // env every computed value is false, so a deleted assignment is
+        // invisible to the asserts above (its mutant survived exactly that
+        // way). Pre-forcing the field TRUE makes the entry points' write the
+        // only thing that can restore the truth.
+        let mut e = e;
+        e.ir_available = true;
         let e = e.with_devices(NO_RGB, NO_IR);
-        assert!(!e.ir_available());
+        assert!(
+            !e.ir_available(),
+            "with_devices must WRITE the selection's answer, not keep state"
+        );
+        let mut e = e;
+        e.ir_available = true;
+        e.set_devices(NO_RGB, NO_IR);
+        assert!(
+            !e.ir_available(),
+            "set_devices must WRITE the selection's answer, not keep state"
+        );
     }
 
     #[test]

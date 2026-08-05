@@ -1117,11 +1117,18 @@ pub struct Caps {
     pub rgb: bool,
 }
 
-pub fn capabilities() -> Caps {
-    let force_no_ir = std::env::var("IRLUME_FORCE_NO_IR")
+/// Whether the operator explicitly disabled IR-backed authentication
+/// (`IRLUME_FORCE_NO_IR=1`, the documented drop-to-convenience override in
+/// docs/VERIFY.md). One reader, so a second consumer cannot drift on the
+/// accepted value.
+pub fn ir_forced_off() -> bool {
+    std::env::var("IRLUME_FORCE_NO_IR")
         .map(|v| v == "1")
-        .unwrap_or(false);
-    let ir_pair = !force_no_ir && !list_pairs().is_empty();
+        .unwrap_or(false)
+}
+
+pub fn capabilities() -> Caps {
+    let ir_pair = !ir_forced_off() && !list_pairs().is_empty();
     let rgb = ir_pair || discover_nodes().iter().any(|(_, r)| matches!(r, Role::Rgb));
     Caps { ir_pair, rgb }
 }

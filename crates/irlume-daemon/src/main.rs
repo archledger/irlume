@@ -4719,6 +4719,7 @@ mod tests {
             profiles: vec![FaceProfile {
                 name: "Face Profile 1".into(),
                 ir_calib: None,
+                ir_calibs: Default::default(),
                 scans: scans
                     .iter()
                     .enumerate()

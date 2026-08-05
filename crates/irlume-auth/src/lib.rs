@@ -488,10 +488,14 @@ fn ir_match_in(
             continue;
         }
         m.n_templates += tmpls.len();
+        // The calibration for THIS recognizer: a profile can hold scans (and
+        // calibrations) from several, and applying one model's calibration to
+        // another's templates puts uninterpretable numbers into the matcher
+        // (#288).
         let calib = if adapter_loaded {
             None
         } else {
-            p.ir_calib.as_ref()
+            p.calib_for(embed_space)
         };
         let cprobe = calib.and_then(|c| c.apply(probe));
         if let (Some(c), Some(cprobe)) = (calib, &cprobe) {
@@ -820,14 +824,20 @@ impl Engine {
             ir_rows.push(ir.clone());
             rgb_rows.push(s.rgb.clone());
         }
-        prof.ir_calib = irlume_core::calib::fit(&ir_rows, &rgb_rows);
-        if let Some(c) = &prof.ir_calib {
+        // Recorded against THIS recognizer only: a single slot was overwritten
+        // by whichever model happened to be loaded at refit, which silently
+        // replaced the calibration of the model the user switched away from
+        // (#288).
+        let fitted = irlume_core::calib::fit(&ir_rows, &rgb_rows);
+        if let Some(c) = &fitted {
             irlume_common::dlog!(
-                "calib: fitted '{}' from {} scan pairs",
+                "calib: fitted '{}' from {} scan pairs (space {})",
                 prof.name,
-                c.fitted_pairs
+                c.fitted_pairs,
+                self.embed_space
             );
         }
+        prof.set_calib_for(&self.embed_space, fitted);
     }
 
     /// Method wrapper over [`ir_match_in`], bound to the engine's space and
@@ -2820,6 +2830,7 @@ impl Engine {
         let name = profile_name.unwrap_or_else(|| enr.next_profile_name());
         let mut prof = FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: name.clone(),
             scans: Vec::new(),
         };
@@ -3594,6 +3605,7 @@ mod tests {
                 name: "p".into(),
                 scans,
                 ir_calib: calib,
+                ir_calibs: Default::default(),
             },
             probe,
         )
@@ -3941,11 +3953,13 @@ mod tests {
             profiles: vec![
                 FaceProfile {
                     ir_calib: None,
+                    ir_calibs: Default::default(),
                     name: "Face Profile 1".into(),
                     scans: vec![scan(face1.clone())],
                 },
                 FaceProfile {
                     ir_calib: None,
+                    ir_calibs: Default::default(),
                     name: "Face Profile 2".into(),
                     scans: vec![scan(face2.clone())],
                 },
@@ -4000,6 +4014,7 @@ mod tests {
             user: "u".into(),
             profiles: vec![FaceProfile {
                 ir_calib: None,
+                ir_calibs: Default::default(),
                 name: "P1".into(),
                 scans: vec![scan(b)],
             }],
@@ -4028,6 +4043,7 @@ mod tests {
             user: "u".into(),
             profiles: vec![FaceProfile {
                 ir_calib: None,
+                ir_calibs: Default::default(),
                 name: "P1".into(),
                 scans: vec![foreign],
             }],
@@ -4082,6 +4098,7 @@ mod tests {
             let mut enr = Enrollment::new("u");
             enr.profiles.push(FaceProfile {
                 ir_calib: None,
+                ir_calibs: Default::default(),
                 name: "P1".into(),
                 scans,
             });
@@ -4157,6 +4174,7 @@ mod tests {
         let mut enr = enr_with(vec![ir_scan(face1.clone(), Some("adapter:deadbeef0123"))]);
         enr.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "P2".into(),
             scans: vec![ir_scan(face2.clone(), Some("adapter:deadbeef0123"))],
         });
@@ -4299,6 +4317,7 @@ mod tests {
         let mk_prof = |name: &str, v: &[f32]| FaceProfile {
             name: name.into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: vec![FaceScan {
                 name: "s".into(),
                 rgb: vec![0.0; 4],
@@ -5023,6 +5042,7 @@ mod engine_tests {
         let mut prof = FaceProfile {
             name: "p".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
         };
         s.engine.refit_profile_calib(&mut prof);
@@ -5032,6 +5052,7 @@ mod engine_tests {
         let mut bad = FaceProfile {
             name: "bad".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..5)
                 .map(|i| FaceScan {
                     ir: Some(vec![0.1; 256]),
@@ -5045,6 +5066,7 @@ mod engine_tests {
         let mut foreign = FaceProfile {
             name: "foreign".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..5)
                 .map(|i| scan512(i, true, Some("adapter:deadbeef0123")))
                 .collect(),
@@ -5056,6 +5078,7 @@ mod engine_tests {
         let mut foreign_rec = FaceProfile {
             name: "foreign-rec".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..5)
                 .map(|i| FaceScan {
                     embed_space: Some("embed:model-b".into()),
@@ -5079,6 +5102,7 @@ mod engine_tests {
         let mut fresh = FaceProfile {
             name: "fresh".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
         };
         s.engine.refit_profile_calib(&mut fresh);
@@ -5101,6 +5125,7 @@ mod engine_tests {
         enr.profiles.push(FaceProfile {
             name: "p".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..3).map(|i| scan512(i, true, Some("raw"))).collect(),
         });
         let probe = unit512(0);
@@ -5126,6 +5151,7 @@ mod engine_tests {
         let mut prof = FaceProfile {
             name: "p2".into(),
             ir_calib: None,
+            ir_calibs: Default::default(),
             scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
         };
         s.engine.refit_profile_calib(&mut prof);
@@ -5184,6 +5210,56 @@ mod engine_tests {
     }
 
     #[test]
+    fn a_refit_under_one_recognizer_leaves_another_models_calibration_alone() {
+        // #288, the switching scenario end to end through the engine: a
+        // profile calibrated under the shipped recognizer, then refitted
+        // while a different recognizer is loaded, must keep BOTH. The single
+        // slot made the second refit destroy the first, so switching back
+        // applied the wrong model's calibration inside ir_match_in.
+        let _g = env_guard();
+        let mut s = shared();
+        let shipped = s.engine.embed_space().to_string();
+        let mut prof = FaceProfile {
+            name: "p".into(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+            scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
+        };
+        s.engine.refit_profile_calib(&mut prof);
+        let shipped_pairs = prof
+            .calib_for(&shipped)
+            .expect("shipped calibration fitted")
+            .fitted_pairs;
+
+        // Now the same profile gains scans from another recognizer, and a
+        // refit runs with that recognizer loaded.
+        let other = "embed:model-b";
+        prof.scans.extend((10..15).map(|i| FaceScan {
+            embed_space: Some(other.to_string()),
+            ..scan512(i, true, Some("raw"))
+        }));
+        s.engine.embed_space = other.to_string();
+        s.engine.refit_profile_calib(&mut prof);
+        s.engine.embed_space = shipped.clone(); // restore the shared baseline
+
+        assert!(
+            prof.calib_for(other).is_some(),
+            "the loaded recognizer must get its own calibration"
+        );
+        assert_eq!(
+            prof.calib_for(&shipped).map(|c| c.fitted_pairs),
+            Some(shipped_pairs),
+            "the other recognizer's calibration must survive the refit"
+        );
+        // And the matcher picks by space: the shipped engine must not see
+        // model B's calibration.
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        let m = ir_match_in("raw", other, false, &enr, &unit512(0));
+        assert_eq!(m.n_templates, 5, "only model B's templates score under B");
+    }
+
+    #[test]
     fn binding_mismatch_refuses_swapped_or_vanished_cameras() {
         let _g = env_guard();
         let s = shared();
@@ -5239,6 +5315,7 @@ mod engine_tests {
             name: "P1".into(),
             scans: vec![],
             ir_calib: None,
+            ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
         let o = s.engine.authenticate("irlume-test-empty", None).unwrap();
@@ -5251,6 +5328,7 @@ mod engine_tests {
             name: "P1".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
+            ir_calibs: Default::default(),
         });
         e.camera_binding = Some(CameraBinding {
             rgb: Some("dead:beef".into()),
@@ -5272,6 +5350,7 @@ mod engine_tests {
             name: "P1".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
+            ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
         let err = s.engine.authenticate("irlume-test-cam", None).unwrap_err();
@@ -5560,6 +5639,7 @@ mod engine_tests {
             name: "Work Laptop".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
+            ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
         let err = s
@@ -5590,6 +5670,7 @@ mod engine_tests {
             name: "P1".into(),
             scans: vec![scan512(1, false, None)],
             ir_calib: None,
+            ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
         let err = s.engine.add_scan("irlume-test-add", "nope").unwrap_err();
@@ -5602,6 +5683,7 @@ mod engine_tests {
                 .map(|i| scan512(i, false, None))
                 .collect(),
             ir_calib: None,
+            ir_calibs: Default::default(),
         });
         write_enrollment(&dir, &e);
         let err = s.engine.add_scan("irlume-test-full", "P1").unwrap_err();
@@ -5749,6 +5831,7 @@ mod engine_tests {
                 closure_calibration: None,
                 profiles: vec![FaceProfile {
                     ir_calib: None,
+                    ir_calibs: Default::default(),
                     name: "Face Profile 1".into(),
                     scans: vec![scan512(1, false, None)],
                 }],

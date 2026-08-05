@@ -93,12 +93,56 @@ pub struct FaceScan {
 pub struct FaceProfile {
     pub name: String,
     pub scans: Vec<FaceScan>,
-    /// Per-profile IR calibration (ADR-0004), fitted from this profile's own
-    /// scan pairs at enroll/add-scan time. Only fitted and applied when no
-    /// global IR adapter is loaded (raw embedding space); `None` otherwise
-    /// and on profiles from before the feature.
+    /// The LEGACY single calibration slot: the shipped recognizer's
+    /// calibration, and the only one an irlume older than per-model keying
+    /// can read. Kept in step with `ir_calibs[LEGACY_RECOGNIZER_SPACE]` so a
+    /// downgrade still finds it. New code reads [`Self::calib_for`].
     #[serde(default)]
     pub ir_calib: Option<crate::calib::IrCalibration>,
+    /// Per-profile IR calibration (ADR-0004) KEYED BY RECOGNIZER, fitted from
+    /// this profile's own scan pairs at enroll/add-scan time. Only fitted and
+    /// applied when no global IR adapter is loaded (raw embedding space).
+    ///
+    /// Keyed because a calibration maps one recognizer's IR embeddings onto
+    /// its own RGB embeddings: applying model A's calibration to model B's
+    /// templates puts uninterpretable numbers into the matcher. A single slot
+    /// was silently overwritten by a refit under whichever model happened to
+    /// be loaded (#288), which is what made switching models corrupt the
+    /// calibration of the model you switched away from.
+    #[serde(default)]
+    pub ir_calibs: std::collections::BTreeMap<String, crate::calib::IrCalibration>,
+}
+
+impl FaceProfile {
+    /// This profile's calibration for `space`, or `None`.
+    ///
+    /// Falls back to the legacy single slot for the shipped recognizer, so a
+    /// profile written before per-model keying keeps its calibration.
+    pub fn calib_for(&self, space: &str) -> Option<&crate::calib::IrCalibration> {
+        self.ir_calibs.get(space).or_else(|| {
+            (space == LEGACY_RECOGNIZER_SPACE)
+                .then_some(self.ir_calib.as_ref())
+                .flatten()
+        })
+    }
+
+    /// Record (or clear) this profile's calibration for `space`, leaving every
+    /// other recognizer's calibration untouched.
+    pub fn set_calib_for(&mut self, space: &str, calib: Option<crate::calib::IrCalibration>) {
+        match &calib {
+            Some(c) => {
+                self.ir_calibs.insert(space.to_string(), c.clone());
+            }
+            None => {
+                self.ir_calibs.remove(space);
+            }
+        }
+        // Mirror the shipped recognizer's calibration into the legacy slot so
+        // an older irlume reading this file still finds it.
+        if space == LEGACY_RECOGNIZER_SPACE {
+            self.ir_calib = calib;
+        }
+    }
 }
 
 /// The physical camera(s) an enrollment was captured on, for anti-swap binding:
@@ -412,6 +456,7 @@ fn migrate(old: LegacyProfile) -> Enrollment {
         user: old.user,
         profiles: vec![FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "Face Profile 1".into(),
             scans,
         }],
@@ -649,6 +694,7 @@ mod tests {
                     scan("legacy", 3.0, None),
                 ],
                 ir_calib: None,
+                ir_calibs: Default::default(),
             }],
             ..Default::default()
         };
@@ -673,6 +719,84 @@ mod tests {
         // A recognizer nothing was enrolled under gets NO templates: matching
         // must come up empty rather than score across spaces.
         assert!(enr.rgb_scans_in("embed:cccccccccccc").is_empty());
+    }
+
+    #[test]
+    fn calibrations_are_per_recognizer_and_the_legacy_slot_still_reads() {
+        use crate::calib::IrCalibration;
+        let calib = |pairs: usize| IrCalibration {
+            m: vec![vec![1.0]],
+            n_rows: vec![vec![1.0]],
+            lambda: 0.1,
+            fitted_pairs: pairs,
+        };
+        let mut p = FaceProfile {
+            name: "p".into(),
+            scans: Vec::new(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        };
+
+        // A profile written before per-model keying carries only the legacy
+        // slot; it must still read under the shipped recognizer, and must NOT
+        // be handed to another model.
+        p.ir_calib = Some(calib(5));
+        assert_eq!(
+            p.calib_for(LEGACY_RECOGNIZER_SPACE).map(|c| c.fitted_pairs),
+            Some(5)
+        );
+        assert!(p.calib_for("embed:model-b").is_none());
+
+        // Recording model B's calibration must leave the shipped one intact.
+        // This is the #288 bug: one slot, overwritten by whichever model was
+        // loaded at refit, so switching back applied B's calibration to A's
+        // templates.
+        p.set_calib_for("embed:model-b", Some(calib(7)));
+        assert_eq!(
+            p.calib_for("embed:model-b").map(|c| c.fitted_pairs),
+            Some(7)
+        );
+        assert_eq!(
+            p.calib_for(LEGACY_RECOGNIZER_SPACE).map(|c| c.fitted_pairs),
+            Some(5),
+            "another model's refit must not touch the shipped calibration"
+        );
+
+        // Recording the shipped recognizer's calibration mirrors into the
+        // legacy slot, so an older irlume reading this file still finds it.
+        p.set_calib_for(LEGACY_RECOGNIZER_SPACE, Some(calib(9)));
+        assert_eq!(p.ir_calib.as_ref().map(|c| c.fitted_pairs), Some(9));
+        assert_eq!(
+            p.calib_for("embed:model-b").map(|c| c.fitted_pairs),
+            Some(7)
+        );
+
+        // Clearing is per model, and clears the mirror for the shipped one.
+        p.set_calib_for("embed:model-b", None);
+        assert!(p.calib_for("embed:model-b").is_none());
+        assert_eq!(
+            p.calib_for(LEGACY_RECOGNIZER_SPACE).map(|c| c.fitted_pairs),
+            Some(9)
+        );
+        p.set_calib_for(LEGACY_RECOGNIZER_SPACE, None);
+        assert!(p.ir_calib.is_none());
+        assert!(p.calib_for(LEGACY_RECOGNIZER_SPACE).is_none());
+    }
+
+    #[test]
+    fn an_enrollment_written_before_keying_still_deserializes() {
+        // On-disk compatibility: the keyed map is additive, so a file from an
+        // older irlume (legacy slot only, no ir_calibs key) must load and keep
+        // its calibration.
+        let json = r#"{"user":"u","profiles":[{"name":"p","scans":[],
+            "ir_calib":{"m":[[1.0]],"n_rows":[[1.0]],"lambda":0.1,"fitted_pairs":4}}]}"#;
+        let enr: Enrollment = serde_json::from_str(json).expect("old file must load");
+        let p = &enr.profiles[0];
+        assert!(p.ir_calibs.is_empty());
+        assert_eq!(
+            p.calib_for(LEGACY_RECOGNIZER_SPACE).map(|c| c.fitted_pairs),
+            Some(4)
+        );
     }
 
     #[test]
@@ -768,6 +892,7 @@ mod tests {
             user: "u".into(),
             profiles: vec![FaceProfile {
                 ir_calib: None,
+                ir_calibs: Default::default(),
                 name: "Face Profile 1".into(),
                 scans: vec![FaceScan {
                     name: "Face Scan 1".into(),
@@ -852,6 +977,7 @@ mod tests {
         // One calibrated scan -> not enough.
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "p".into(),
             scans: vec![scan_with_pitch(0.60)],
         });
@@ -871,6 +997,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "p".into(),
             scans: vec![scan_with_ir(1.5, 100.0)],
         });
@@ -901,6 +1028,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "p".into(),
             scans: vec![
                 scan_in_space("legacy-untagged", 4, None),
@@ -930,6 +1058,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "p".into(),
             scans: vec![
                 scan_in_space("legacy", 4, None),          // stamped
@@ -963,6 +1092,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "p".into(),
             scans: vec![
                 FaceScan {
@@ -987,6 +1117,7 @@ mod tests {
         assert_eq!(e.next_profile_name(), "Face Profile 1");
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "Face Profile 1".into(),
             scans: vec![],
         });
@@ -1098,6 +1229,7 @@ mod tests {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
             ir_calib: None,
+            ir_calibs: Default::default(),
             name: "P".into(),
             scans: vec![
                 ir_scan("adapter-era", Some("adapter:deadbeef0123")),

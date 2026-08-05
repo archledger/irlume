@@ -35,3 +35,4 @@ __pycache__/
 # Mutation-harness backups. One was committed by a `git add -A` run while the
 # harness had files out, which put a 1938-line copy of a source file in a commit.
 *.rs.bak
+.aider*

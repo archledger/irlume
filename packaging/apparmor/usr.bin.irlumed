@@ -97,6 +97,13 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # absent on GRUB installs, where the read is existence-gated).
   /{etc,run,usr/lib}/systemd/tpm2-pcr-signature.json r,
   /{etc,run,usr/lib}/systemd/tpm2-pcr-public-key.pem r,
+  # systemd-pcrlock's prediction, which is the TIER 2 policy input. Without
+  # this rule every pcrlock-tier unseal fails on an AppArmor-enforcing
+  # install: measured on a ThinkPad where the keyring silently stopped
+  # opening at login for two days, while the error text sent the user to
+  # re-run `systemd-pcrlock make-policy`, which cannot help. Tier 1's two
+  # artifacts above were granted; this one was missed.
+  /var/lib/systemd/pcrlock.json r,
 
   # Config + state: enrollments (per-user), template keys, recovery blobs.
   /etc/irlume/ r,

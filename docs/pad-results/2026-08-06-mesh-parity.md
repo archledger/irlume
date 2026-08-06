@@ -24,8 +24,17 @@ every irlume consumer reads. NME normalizes by the native mesh's outer-eye
 distance (indices 33 and 263).
 
 Instrument check before believing the result: `MESH_PARITY_SKEW_PX=2` shifts
-only the native crop and must move the metric. It does: mean NME 4.901e-3,
-worst 1.561e-2, zero bit-identical points. The comparison discriminates.
+only the native crop and must move the metric, and the harness asserts it
+does (a skew run that stays below mean NME 1e-3, or leaves any point
+bit-identical, fails). Measured over the full corpus: mean NME 5.191e-3,
+worst 2.018e-2, zero bit-identical points
+(`2026-08-06-mesh-parity-skew.txt`).
+
+The run is a GATE, not a report: it asserts the corpus denominator
+(512 emitted, 223 compared) and bounds worst NME at 2.0e-6, so a parity or
+coverage regression fails the run instead of shrinking the CSV. All three
+model files are sha256-pinned to the shipped artifacts and the published
+mesh; a run against anything else refuses by name.
 
 ## Corpus
 
@@ -38,26 +47,34 @@ the denominator stays visible.
 
 ## Result
 
-| kind | compared | mean NME | worst NME |
-|------|----------|----------|-----------|
-| rgb  | 90       | 6.88e-7  | 1.23e-6   |
-| ir   | 133      | 6.88e-7  | 1.50e-6   |
+| kind | compared | mean NME  | worst NME |
+|------|----------|-----------|-----------|
+| rgb  | 90       | 6.879e-7  | 1.234e-6  |
+| ir   | 133      | 6.877e-7  | 1.502e-6  |
 
-7,930 of 104,364 compared points are bit-identical across the two runtimes;
-the rest differ at float-noise magnitude. At the corpus's eye distances
-(roughly 40 to 130 px) the worst single-point disagreement is about 0.0002 px.
+7,930 of 104,364 compared points are bit-identical across the two runtimes
+(count in `2026-08-06-mesh-parity-summary.txt`, which also records the model
+and runtime hashes). Recorded outer-eye distances range 48.5 to 211.2 px,
+and the largest rounded per-point distance in `max_px` is 0.0006 px.
 
 ## Reading
 
-The shipped conversion is numerically faithful: same weights, same graph,
-differences attributable to backend arithmetic ordering (ORT vs
-TFLite/XNNPACK), four orders of magnitude below anything the EAR rings,
-frontality gate, or glint cues could register. Two consequences:
+For the pinned shipped ONNX mesh and the pinned published TFLite mesh, these
+223 stage-3 frames show numerical agreement in x and y. The experiment does
+not compare z, does not prove graph or weight identity, and establishes
+nothing outside this corpus and runtime configuration. The residuals are
+consistent with backend arithmetic differences (ORT vs TFLite/XNNPACK), and
+the harness does not identify their cause; what it bounds is their size,
+four orders of magnitude below anything the EAR rings, frontality gate, or
+glint cues could register.
 
-- The landmarks stage keeps its ONNX artifact with zero fidelity cost; there
-  is no accuracy argument for switching it to the native runtime.
-- If the conversion step is ever dropped for supply-chain simplicity, the
-  native path is proven equivalent on this corpus, and this harness is the
-  regression gate for that switch.
+Two consequences:
+
+- The landmarks stage keeps its ONNX artifact with no fidelity cost measured
+  on this corpus; there is no accuracy argument here for switching it to the
+  native runtime.
+- If the conversion step is ever dropped for supply-chain simplicity, this
+  harness is the regression gate for the switch, and it now fails on its own
+  when parity or coverage regresses.
 
 Raw rows: `2026-08-06-mesh-parity.csv` beside this file.

@@ -1,0 +1,8 @@
+# mesh_parity skew self-test (MESH_PARITY_SKEW_PX=2), 2026-08-06
+# same cmd and corpus as the real run; skew shifts only the native crop
+# tflite_runtime_sha256=ff47b69f78cd81dd07e074c54192a55869f3e9bd81415eac26fad971596bfe84
+# exit=0
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+detector_sha256=8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4 onnx_mesh_sha256=821683be088447839638f79d64268bd501bdb72e5d9e262ec981c7e252956caf tflite_mesh_sha256=c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5 skew=Some(2.0)
+native mesh input 256x256
+emitted 512 rows; both-ran 223; mean NME 5.191e-3; worst NME 2.018e-2; bit-identical points 0/104364

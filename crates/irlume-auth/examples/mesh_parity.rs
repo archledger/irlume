@@ -57,7 +57,12 @@ fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
     let magic = it.next()?;
     let w: usize = it.next()?.parse().ok()?;
     let h: usize = it.next()?.parse().ok()?;
-    let _max: usize = it.next()?.parse().ok()?;
+    // 8-bit only: a 16-bit PNM (maxval > 255) has two bytes per sample and
+    // this reader would decode interleaved garbage instead of failing.
+    let max: usize = it.next()?.parse().ok()?;
+    if max != 255 {
+        return None;
+    }
     let (mut seen, mut fields) = (0usize, 0);
     let mut off = 0;
     for (i, b) in data.iter().enumerate() {
@@ -96,17 +101,10 @@ fn native_landmarks(
     input_side: usize,
     frame: &RgbView,
     bbox: &[f32; 4],
+    skew: f32,
 ) -> Result<Vec<(f32, f32)>, String> {
     let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
     let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * MESH_MARGIN);
-    // Instrument self-test: MESH_PARITY_SKEW_PX shifts ONLY the native crop,
-    // so a run with it set must report a clearly nonzero NME. A comparison
-    // that stays at zero under a known injected difference is measuring
-    // nothing (the harness equivalent of a test that cannot fail).
-    let skew: f32 = std::env::var("MESH_PARITY_SKEW_PX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
     let (x0, y0) = (cx - half + skew, cy - half);
     let side = 2.0 * half;
     let n = input_side;
@@ -131,6 +129,54 @@ fn native_landmarks(
     map_checked_mesh_output(raw, input_side as f32, x0, y0, side)
 }
 
+/// Instrument self-test: a nonzero skew shifts ONLY the native crop, and the
+/// run must then report a clearly nonzero NME; a comparison that stays at
+/// zero under a known injected difference is measuring nothing. Parsed
+/// strictly (#306 review): an unparseable or zero value refuses instead of
+/// silently becoming an unskewed run that "passes" its self-test.
+fn parity_skew() -> Option<f32> {
+    match std::env::var("MESH_PARITY_SKEW_PX") {
+        Ok(value) => {
+            let skew: f32 = value
+                .parse()
+                .unwrap_or_else(|e| panic!("MESH_PARITY_SKEW_PX={value:?}: {e}"));
+            assert!(
+                skew.is_finite() && skew != 0.0,
+                "MESH_PARITY_SKEW_PX must be finite and nonzero"
+            );
+            Some(skew)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Read a model file and refuse it unless it is the exact artifact this
+/// measurement claims to cover (#306 review: a CSV from an unpinned model
+/// cannot establish anything about the shipped one).
+fn read_pinned(path: &str, expected: &str, label: &str) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: read {label}: {e}"));
+    let actual = irlume_common::thirdparty::sha256_hex(&bytes);
+    assert_eq!(actual, expected, "{path}: not the shipped {label}");
+    bytes
+}
+
+/// The shipped artifacts this measurement is about, pinned to the repository's
+/// own `models/SHA256SUMS`.
+const SHIPPED_MESH_SHA256: &str =
+    "821683be088447839638f79d64268bd501bdb72e5d9e262ec981c7e252956caf";
+const SHIPPED_DETECTOR_SHA256: &str =
+    "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4";
+
+/// The stage-3 corpus baseline and the parity bound this gate enforces. The
+/// counts pin the denominator: a corpus or acceptance change must update them
+/// DELIBERATELY, not shrink the comparison in silence. The bound sits just
+/// above the measured worst (1.502e-6) so any regression past float noise
+/// fails the run.
+const EXPECTED_EMITTED: usize = 512;
+const EXPECTED_COMPARED: usize = 223;
+const MAX_ALLOWED_NME: f64 = 2.0e-6;
+const MIN_SKEW_MEAN_NME: f64 = 1.0e-3;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (models, roots) = args.split_at(3.min(args.len()));
@@ -141,12 +187,19 @@ fn main() {
         );
     };
     assert!(!roots.is_empty(), "at least one corpus root is required");
+    let skew = parity_skew();
 
-    let mut det = Detector::load_from_file(det_path).expect("load detector");
-    let mut onnx_mesh = FaceMesh::load_from_file(onnx_mesh_path).expect("load onnx mesh");
+    let det_bytes = read_pinned(det_path, SHIPPED_DETECTOR_SHA256, "detector");
+    let mesh_bytes = read_pinned(onnx_mesh_path, SHIPPED_MESH_SHA256, "ONNX mesh");
+    let mut det = Detector::load_from_memory(&det_bytes).expect("load detector");
+    let mut onnx_mesh = FaceMesh::load_from_memory(&mesh_bytes).expect("load onnx mesh");
     let tflite_bytes = std::fs::read(tflite_mesh_path).expect("read tflite mesh");
     let mut native = TfliteSession::from_pinned_bytes(&tflite_bytes, LANDMARKER_MESH_SHA256, 1)
         .expect("load native mesh");
+    eprintln!(
+        "detector_sha256={SHIPPED_DETECTOR_SHA256} onnx_mesh_sha256={SHIPPED_MESH_SHA256} \
+         tflite_mesh_sha256={LANDMARKER_MESH_SHA256} skew={skew:?}"
+    );
     let shape = native.input_shape().expect("native input shape");
     // NHWC [1, S, S, 3] with a square S: anything else is a different model
     // generation and the crop math below would silently distort it.
@@ -210,7 +263,13 @@ fn main() {
                         continue;
                     };
                     let a = onnx_mesh.landmarks(&view, &top.bbox, MESH_MARGIN);
-                    let b = native_landmarks(&mut native, native_side, &view, &top.bbox);
+                    let b = native_landmarks(
+                        &mut native,
+                        native_side,
+                        &view,
+                        &top.bbox,
+                        skew.unwrap_or(0.0),
+                    );
                     let (Ok(a), Ok(b)) = (a, b) else {
                         // One side declining is a finding, not a crash: the
                         // row stays, the metrics are empty, the bound script
@@ -252,14 +311,35 @@ fn main() {
             }
         }
     }
-    assert!(emitted > 0, "parity corpus produced zero frames");
-    assert!(
-        compared > 0,
-        "zero frames where both meshes ran; nothing was compared"
+    // The GATE (#306 review): without these, one surviving comparison out of
+    // 512, or an arbitrarily bad NME, exited zero, and the "regression gate"
+    // in the doc was a claim with nothing enforcing it.
+    assert_eq!(
+        emitted, EXPECTED_EMITTED,
+        "stage-3 corpus changed; update the pinned baseline deliberately"
     );
+    assert_eq!(
+        compared, EXPECTED_COMPARED,
+        "mesh acceptance coverage changed"
+    );
+    let mean_nme = nme_sum / compared as f64;
+    if skew.is_some() {
+        assert!(
+            mean_nme >= MIN_SKEW_MEAN_NME,
+            "instrument self-test did not move the metric: mean NME {mean_nme:.3e}"
+        );
+        assert_eq!(
+            total_identical, 0,
+            "instrument self-test left bit-identical landmarks"
+        );
+    } else {
+        assert!(
+            nme_max <= MAX_ALLOWED_NME,
+            "mesh parity exceeded bound: worst NME {nme_max:.3e} > {MAX_ALLOWED_NME:.3e}"
+        );
+    }
     eprintln!(
-        "emitted {emitted} rows; both-ran {compared}; mean NME {:.3e}; worst NME {nme_max:.3e}; \
-         bit-identical points {total_identical}/{total_points}",
-        nme_sum / compared as f64
+        "emitted {emitted} rows; both-ran {compared}; mean NME {mean_nme:.3e}; \
+         worst NME {nme_max:.3e}; bit-identical points {total_identical}/{total_points}"
     );
 }

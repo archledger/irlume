@@ -1001,6 +1001,37 @@ fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {
     find_attr_dir(&real, "idVendor")
 }
 
+/// The configured pair, using ONLY sources that never open a device: the
+/// explicit env override, then the pair persisted in `cameras.conf` exactly as
+/// saved. `None` when neither is set, because answering then would require
+/// enumerating, and enumerating opens every node.
+///
+/// Exists for one caller shape: something that wants the pair while a daemon
+/// MIGHT be mid-capture. A short socket poll timing out does not prove the
+/// daemon is gone, and a busy capture is exactly what a timeout looks like, so
+/// falling back to [`select_pair`] there would open the nodes at the worst
+/// possible moment (#187). Identity re-resolution is deliberately skipped: it
+/// probes, which is the thing being avoided.
+pub fn configured_pair_no_probe() -> Option<(String, String)> {
+    let nonblank_pair =
+        |r: String, i: String| (!r.trim().is_empty() && !i.trim().is_empty()).then_some((r, i));
+    if let (Ok(r), Ok(i)) = (
+        std::env::var("IRLUME_RGB_DEVICE"),
+        std::env::var("IRLUME_IR_DEVICE"),
+    ) {
+        if let Some(pair) = nonblank_pair(r, i) {
+            return Some(pair);
+        }
+    }
+    match (
+        irlume_common::config::read_kv("cameras.conf", "rgb"),
+        irlume_common::config::read_kv("cameras.conf", "ir"),
+    ) {
+        (Some(r), Some(i)) => nonblank_pair(r, i),
+        _ => None,
+    }
+}
+
 /// Select the RGB+IR camera pair to authenticate with. Supports the built-in
 /// Hello camera *and* external USB Hello webcams (Logitech Brio, NexiGo HelloCam)
 /// without hard-coded node numbers. Precedence:

@@ -336,8 +336,29 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     //    remaining sealed envelopes, cameras.conf/settings.conf. Guarded so
     //    --keep-data leaves them for a later reinstall.
     if !keep_data {
-        let _ = std::fs::remove_dir_all(irlume_common::STATE_DIR);
-        let _ = std::fs::remove_dir_all(irlume_common::config::CONFIG_ROOT);
+        // Through `state_dir()`, not the bare constant: the user enumeration
+        // above already honors IRLUME_STATE_DIR, so deleting the literal path
+        // here meant a SANDBOXED teardown reached into live /var/lib/irlume and
+        // took the enrollments, template keys, recovery envelopes and keyring
+        // seals with it. That is not hypothetical; the same split resolution in
+        // template_key.rs destroyed a real machine's keys on 2026-08-05.
+        //
+        // A failure is reported rather than swallowed: this used to discard the
+        // result, so a partial teardown still announced success and left secrets
+        // on disk under a directory the user believes is gone.
+        for dir in [
+            irlume_common::state_dir(),
+            irlume_common::config::CONFIG_ROOT.into(),
+        ] {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "[uninstall] could not remove {}: {e} (files may remain)",
+                        dir.display()
+                    );
+                }
+            }
+        }
     }
 
     TeardownReport {

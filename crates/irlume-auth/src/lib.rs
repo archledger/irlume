@@ -678,7 +678,15 @@ impl Engine {
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
-            ir_available: irlume_camera::capabilities().ir_pair,
+            // From the DEFAULT selection's mere existence, not a probe.
+            // `capabilities()` opens every /dev/video* node to classify it, and
+            // every shipped caller then chains `.with_devices(...)`, which
+            // recomputes this field the non-probing way and throws the probed
+            // answer away. So it was pure dead work of exactly the shape that
+            // races the daemon's own capture (#187), and it used the racy
+            // source #281 removed everywhere else. Same helper as
+            // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
+            ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             gesture_seen_before_match: false,
             stop_requested: None,
         })

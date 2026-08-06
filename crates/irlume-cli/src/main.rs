@@ -1534,13 +1534,40 @@ pub(crate) fn user_arg(args: &[String]) -> String {
 /// (the TUI) refresh from Health on their own poll rather than from here.
 pub(crate) fn caps() -> irlume_camera::Caps {
     static CAPS: std::sync::OnceLock<irlume_camera::Caps> = std::sync::OnceLock::new();
-    *CAPS.get_or_init(|| match daemon_poll(&irlume_common::Request::Health) {
-        Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
-            ir_pair: tier == "secure",
-            rgb: rgb_dev.is_some() || tier == "secure",
-        },
-        _ => irlume_camera::capabilities(), // the one permitted probe
+    *CAPS.get_or_init(|| {
+        match irlume_common::client::request_poll(&irlume_common::Request::Health) {
+            Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
+                ir_pair: tier == "secure",
+                rgb: rgb_dev.is_some() || tier == "secure",
+            },
+            // Enumerating opens every node, so it needs POSITIVE evidence that no
+            // daemon holds them. Only a failure that proves nobody is listening is
+            // that evidence; a timeout is what a daemon busy mid-capture looks
+            // like, which is the worst moment to probe.
+            Err(e) if daemon_proven_absent(&e) => irlume_camera::capabilities(), // the one permitted probe
+            // Ambiguous: answer from the configured pair's mere existence, which
+            // never opens anything, and assume the shipped shape when there is no
+            // configuration to read.
+            _ => match irlume_camera::configured_pair_no_probe() {
+                Some((rgb, ir)) => irlume_camera::Caps {
+                    ir_pair: std::path::Path::new(&ir).exists(),
+                    rgb: std::path::Path::new(&rgb).exists(),
+                },
+                None => irlume_camera::Caps {
+                    ir_pair: false,
+                    rgb: false,
+                },
+            },
+        }
     })
+}
+
+/// These two accessors call `request_poll` directly rather than `daemon_poll`,
+/// because `daemon_poll` flattens `io::Error` into a String for its callers'
+/// messages and the error KIND is exactly what decides whether probing the
+/// cameras is safe here.
+fn daemon_proven_absent(e: &std::io::Error) -> bool {
+    irlume_common::client::proves_daemon_absent(e)
 }
 
 /// The RGB and IR node paths in use, asked of the DAEMON first and cached for
@@ -1558,14 +1585,19 @@ pub(crate) fn caps() -> irlume_camera::Caps {
 /// else holds the cameras and it is the only source of an answer.
 pub(crate) fn camera_pair() -> (String, String) {
     static PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
-    PAIR.get_or_init(|| match daemon_poll(&irlume_common::Request::Health) {
-        Ok(irlume_common::Response::Health {
-            rgb_dev, ir_dev, ..
-        }) => (
-            rgb_dev.unwrap_or_else(|| "none".into()),
-            ir_dev.unwrap_or_else(|| "none".into()),
-        ),
-        _ => irlume_camera::select_pair(), // the one permitted probe
+    PAIR.get_or_init(|| {
+        match irlume_common::client::request_poll(&irlume_common::Request::Health) {
+            Ok(irlume_common::Response::Health {
+                rgb_dev, ir_dev, ..
+            }) => (
+                rgb_dev.unwrap_or_else(|| "none".into()),
+                ir_dev.unwrap_or_else(|| "none".into()),
+            ),
+            // Same rule as `caps`: probe only on proven absence.
+            Err(e) if daemon_proven_absent(&e) => irlume_camera::select_pair(), // the one permitted probe
+            _ => irlume_camera::configured_pair_no_probe()
+                .unwrap_or_else(|| ("unknown".into(), "unknown".into())),
+        }
     })
     .clone()
 }

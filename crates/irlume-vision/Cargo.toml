@@ -25,7 +25,6 @@ tensorrt = ["ort/tensorrt"]
 [dependencies]
 libc.workspace = true   # dlopen/dlsym probe: prove a library is loadable ort BEFORE ort can park on it (#266)
 irlume-common.workspace = true
-irlume-camera.workspace = true
 thiserror.workspace = true
 ort = { workspace = true, optional = true }
 # Pinned EXACTLY: the 0.9.0 sources were audited (loader + discovery) before

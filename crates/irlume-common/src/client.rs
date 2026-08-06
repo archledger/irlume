@@ -102,6 +102,26 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
 /// EACCES/EPERM means the opposite: the socket is there and the daemon is very
 /// likely fine, but this uid may not connect. Say that, and do not suggest
 /// `sudo` or a chmod, because both hide whatever set the mode.
+/// Whether this failure PROVES nobody is listening on the socket.
+///
+/// The distinction matters wherever "the daemon is not there" licenses an act
+/// that would be unsafe if it were: classifying camera nodes is the case that
+/// motivated this. A timeout does NOT prove absence. A daemon busy mid-capture
+/// is exactly what a timed-out short poll looks like, and that is precisely
+/// when it holds the video nodes, so treating a timeout as absence would open
+/// the devices at the worst possible moment (#187). EACCES says the same thing
+/// from the other side: the socket is there and the daemon is very likely fine,
+/// this uid just may not connect.
+pub fn proves_daemon_absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
 fn map_connect_failure(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::NotFound

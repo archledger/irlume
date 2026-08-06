@@ -156,6 +156,12 @@ jobs:
           # identical in the job log without this.
           {
             ls -l /dev/video* /dev/media* 2>&1
+            # WHO holds the nodes, recorded BEFORE anything below opens them.
+            # The format probe below is itself an opener, so on a strict UVC
+            # module it can report EBUSY that it caused; this line says whether
+            # irlumed already had the node, which is the difference between "the
+            # camera is wedged" and "the daemon was mid-capture" (#187).
+            echo "--- holders ---"; fuser -v /dev/video* 2>&1 || echo "(none)"
             echo "--- v4l2 devices ---"; v4l2-ctl --list-devices 2>&1
             for d in /dev/video*; do
               echo "--- $d formats ---"; v4l2-ctl -d "$d" --list-formats-ext 2>&1

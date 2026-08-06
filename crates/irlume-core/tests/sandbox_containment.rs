@@ -56,11 +56,26 @@ fn no_state_path_is_built_from_the_bare_constant() {
                     .to_string();
                 let text = std::fs::read_to_string(&path).expect("read source");
                 scanned += 1;
+                // Tests name the constant on purpose, to assert a resolved path
+                // does NOT start with it. Everything from the first #[cfg(test)]
+                // to the end of the file is theirs.
+                let mut in_test_code = false;
                 for (n, line) in text.lines().enumerate() {
-                    // The escape shape: wrapping the constant in a PathBuf, which
-                    // is what you do right before `.join(...)` a state subdir.
-                    if line.contains("PathBuf::from(irlume_common::STATE_DIR)")
-                        || line.contains("PathBuf::from(crate::STATE_DIR)")
+                    if line.trim() == "#[cfg(test)]" {
+                        in_test_code = true;
+                    }
+                    if in_test_code {
+                        continue;
+                    }
+                    // ANY production reference to the bare constant, not one
+                    // construction spelling. The first version of this test
+                    // matched only `PathBuf::from(...)` and sailed past
+                    // `remove_dir_all(irlume_common::STATE_DIR)` in uninstall,
+                    // which is the same escape with a recursive delete on the
+                    // end. A guard that checks a syntax rather than the fact is
+                    // worse than none: it is believed.
+                    if line.contains("irlume_common::STATE_DIR")
+                        || line.contains("crate::STATE_DIR")
                     {
                         if allowed(&name).is_some() {
                             continue;

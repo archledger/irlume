@@ -1097,7 +1097,6 @@ dependencies = [
 name = "irlume-liveness"
 version = "0.9.0"
 dependencies = [
- "irlume-camera",
  "irlume-common",
  "irlume-vision",
 ]
@@ -1118,7 +1117,6 @@ name = "irlume-vision"
 version = "0.9.0"
 dependencies = [
  "edgefirst-tflite",
- "irlume-camera",
  "irlume-common",
  "libc",
  "ort",

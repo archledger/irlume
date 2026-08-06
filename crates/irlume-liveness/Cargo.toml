@@ -6,5 +6,4 @@ license.workspace = true
 
 [dependencies]
 irlume-common.workspace = true
-irlume-camera.workspace = true
 irlume-vision.workspace = true

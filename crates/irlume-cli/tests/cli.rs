@@ -1276,6 +1276,61 @@ fn an_encrypted_store_with_no_key_says_so_instead_of_plaintext() {
     );
 }
 
+/// A slow daemon is not an absent daemon.
+///
+/// `caps()` and `camera_pair()` fall back to a local probe when the socket poll
+/// fails, and that probe OPENS every video node. The short poll allows 1.2s to
+/// connect and 1.5s to read. A daemon busy mid-capture is exactly what blowing
+/// that budget looks like, and it is also exactly when it holds the nodes, so
+/// treating any failure as absence put the probe at the worst possible moment
+/// (#187 again, by a different route). Only an error that PROVES nobody is
+/// listening licenses the probe.
+///
+/// The fixture accepts the connection and then never answers, which no
+/// existing test did: every other one either serves promptly or has no socket
+/// at all, so both took the success path or the proven-absent path. The
+/// cameras.conf pair is reported back, proving the answer came from
+/// configuration rather than from enumerating hardware.
+#[test]
+fn a_daemon_that_accepts_but_never_answers_is_not_treated_as_absent() {
+    let sb = Sandbox::new("slowdaemon");
+    std::fs::create_dir_all(sb.path("cfg")).unwrap();
+    std::fs::write(
+        sb.path("cfg").join("cameras.conf"),
+        "rgb=/dev/video81
+ir=/dev/video82
+",
+    )
+    .unwrap();
+
+    // Accept, read the request, then hold the connection open and answer
+    // nothing. The client must time out rather than see a closed socket.
+    let sock_path = sock(&sb);
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                // Outlive the client's 1.5s read budget, holding the fd so the
+                // peer sees a timeout and not an EOF.
+                std::thread::sleep(std::time::Duration::from_secs(6));
+                drop(stream);
+            });
+        }
+    });
+
+    let (_, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]));
+    assert!(
+        out.contains("/dev/video81") && out.contains("/dev/video82"),
+        "a timed-out poll must fall back to the CONFIGURED pair, never to \
+         enumeration, which opens the nodes the daemon may be holding: {out}"
+    );
+}
+
 /// #187: classifying a video node means OPENING it, and on a UVC module that
 /// answers EBUSY to a second open, doing that while the daemon streams fails the
 /// user's enrollment. #300 stopped the TUI doing it; `status` was still

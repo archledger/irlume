@@ -527,7 +527,7 @@ jobs:
   nix:
     name: nix flake check
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       # No model fetch here: flake check --no-build only evaluates the outputs
       # (flake structure, the package derivation, the NixOS module, the dev
@@ -545,9 +545,7 @@ jobs:
             experimental-features = nix-command flakes
 
       # Evaluates packages.default, nixosModules.irlume, and the dev shell.
-      # Catches eval and type errors in flake.nix and nix/*.nix before merge;
-      # the full source build (packages.default) is covered by `nix build`
-      # locally and the RPM/deb CI, so keep this eval-only and quick.
+      # Catches eval and type errors in flake.nix and nix/*.nix before merge.
       - name: nix flake check
         run: nix flake check --no-build --show-trace
 
@@ -557,6 +555,16 @@ jobs:
       # passes eval. Realizing just the FODs fetches against the recorded
       # hashes and fails on exactly that class of bug, without building the
       # workspace.
+      # ACTUALLY BUILD IT. This job used to stop at eval, on the reasoning that
+      # the source build was "covered by `nix build` locally", which meant
+      # nobody ran it: 0.9.0 was cut with `nix build` failing at the irlumed
+      # link step with "cannot find -lcrypt", because nixpkgs stopped providing
+      # libcrypt transitively and the daemon declares #[link(name = "crypt")].
+      # Eval passed on that same tree, and the RPM and deb lanes cannot see a
+      # Nix derivation's buildInputs. Nothing but building it catches this.
+      - name: nix build (the Nix lane is a shipped lane)
+        run: nix build .#default --no-link --print-out-paths --show-trace
+
       - name: Build fixed-output derivations (catches stale vendor hashes)
         run: nix build --no-link .#default.cargoDeps .#onnxruntime-bin
 

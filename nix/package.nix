@@ -17,6 +17,7 @@
   clang,
   tpm2-tss,
   linux-pam,
+  libxcrypt,
   linuxHeaders,
   fetchurl,
   runCommand,

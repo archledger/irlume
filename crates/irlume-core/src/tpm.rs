@@ -1480,7 +1480,7 @@ mod tests {
     /// The condition it keys on needs another process to extend a PCR while our
     /// policy session is open, which no unit test can arrange; the CHOICE made
     /// about that condition is a pure function and is what is asserted here.
-    /// `scripts/tpm-pcr-race-check.sh` produces the real thing on hardware.
+    /// `scripts/tpm-pcr-race-swtpm.sh` produces the real thing on hardware.
     #[test]
     fn only_the_pcr_counter_race_is_treated_as_retryable() {
         use tss_esapi::constants::response_code::Tss2ResponseCodeKind;

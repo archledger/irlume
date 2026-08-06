@@ -8,7 +8,7 @@ the closing section says what would have to be measured first.
 Every table below is regenerated from the committed corpus beside this file:
 
 ```sh
-python3 scripts/analyze-landmark-relief.py \
+python3 scripts/research/analyze-landmark-relief.py \
   docs/pad-results/2026-08-04-landmark-relief.jsonl \
   --check docs/pad-results/2026-08-04-landmark-relief.md
 ```

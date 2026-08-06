@@ -18,7 +18,7 @@ geometry gates on genuine input.
   baseline was glasses-on already; OFF baseline + ON contrast for the
   NexiGo set). A dim segment was planned and NOT exercised (the room could
   not be darkened); nothing here speaks to low-light detection floors.
-- **Instrument:** `scripts/capture-stage3-segment.sh` (8 RGB PPM + 24 IR PGM
+- **Instrument:** `scripts/research/capture-stage3-segment.sh` (8 RGB PPM + 24 IR PGM
   per segment) and `examples/detect_bench.rs` (one CSV row per frame:
   detection count/score/box, mesh EAR/central-span, Blaze score/box, frame
   mean). Raw CSVs: `2026-08-05-stage3-bench-{zenbook,nexigo}.csv`, one row
@@ -110,7 +110,7 @@ that, and the measurement below replaced it. To keep hand-rolled decode out
 of the answer, both BlazeFace variants ran over the same stored corpus
 through the official `mediapipe` Python runtime (version 1.0.0, Tasks
 `FaceDetector`, `min_detection_confidence=0.5`, the same floor as irlume's
-`BLAZE_SCORE_THRESHOLD`): `scripts/mp-face-detector-bench.py`, raw rows in
+`BLAZE_SCORE_THRESHOLD`): `scripts/research/mp-face-detector-bench.py`, raw rows in
 `2026-08-05-stage3-bench-official-runtime.csv`. Artifacts: the pinned
 `/float16/1/` downloads, short-range sha256
 `b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f`

@@ -10,8 +10,10 @@
 //! score distributions are near-independent). Fusion only ADDS dim-light rescues on
 //! top of the existing single-modality thresholds; it never relaxes them.
 //!
-//! Constants fit offline (scripts/calibrate.py): RGB Platt on LFW genuine/impostor
-//! cosines; IR Platt on CBSR+Oulu NIR.
+//! Constants fit offline, NOT by a script in this repo: `scripts/calibrate.py`
+//! was never committed, so do not go looking for it. RGB Platt on LFW
+//! genuine/impostor cosines; IR Platt on CBSR+Oulu NIR. Refitting means
+//! reproducing that offline fit; the caveat below says when that is needed.
 //!
 //! CALIBRATION CAVEAT (ADR-0004): the IR Platt (`IR_PLATT_A/B`) was fit on IR
 //! cosines produced by the former v3 IR adapter, which no longer ships. The

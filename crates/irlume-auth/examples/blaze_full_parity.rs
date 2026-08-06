@@ -4,14 +4,14 @@
 //! Parity harness for the full-range BlazeFace decoder (#295 stage 2): run
 //! irlume's `FullRangeBlaze` over the stored stage-3 corpus and emit one
 //! CSV row per frame, comparable against the official-runtime CSV from
-//! `scripts/mp-face-detector-bench.py`. The short-range decoder earned its
+//! `scripts/research/mp-face-detector-bench.py`. The short-range decoder earned its
 //! place with a 0.94-IoU parity bench against the official runtime; this is
 //! the same gate for the full-range one.
 //!
 //! STRICT on purpose: an unreadable directory, a malformed frame, an empty
 //! segment, or zero emitted rows is a loud failure, never a smaller CSV. A
 //! dump that silently shrinks turns the downstream comparison
-//! (`scripts/compare-blaze-parity.py`) into a vacuous pass over whatever
+//! (`scripts/research/compare-blaze-parity.py`) into a vacuous pass over whatever
 //! survived (#298 review).
 //!
 //! Usage: cargo run --release -p irlume-auth --example blaze_full_parity -- \

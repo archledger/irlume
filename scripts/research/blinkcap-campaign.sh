@@ -7,16 +7,16 @@
 # after. Run several takes per label, then replay the directory to read off the
 # closure threshold.
 #
-#   sudo scripts/blinkcap-campaign.sh held-closure     # deliberate held closes
-#   sudo scripts/blinkcap-campaign.sh natural-blink    # passive spontaneous blinks
-#   sudo scripts/blinkcap-campaign.sh ae-settle        # look while the light changes
-#   sudo scripts/blinkcap-campaign.sh spoof            # a photo/print on a phone
+#   sudo scripts/research/blinkcap-campaign.sh held-closure     # deliberate held closes
+#   sudo scripts/research/blinkcap-campaign.sh natural-blink    # passive spontaneous blinks
+#   sudo scripts/research/blinkcap-campaign.sh ae-settle        # look while the light changes
+#   sudo scripts/research/blinkcap-campaign.sh spoof            # a photo/print on a phone
 #
 #   # when done, read the threshold:
 #   IRLUME_DEV=1 target/release/irlume blinkcap replay ~/blink-dataset
 set -euo pipefail
 
-LABEL="${1:?usage: sudo scripts/blinkcap-campaign.sh <label> [n]}"
+LABEL="${1:?usage: sudo scripts/research/blinkcap-campaign.sh <label> [n]}"
 N="${2:-75}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO/target/release/irlume"

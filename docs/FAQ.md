@@ -1,7 +1,7 @@
 # Frequently asked questions
 
 Moved out of the README so the front page stays short. For what irlume does
-not do, read [Honest limitations](../README.md#honest-limitations) first;
+not do, read [Limits](LIMITATIONS.md) first;
 several answers below depend on it.
 
 <details>
@@ -24,7 +24,7 @@ well-printed photo of you could be enough to fool it. irlume is built as an
 AES-256-GCM-encrypted templates under a TPM-sealed key, camera pinning, and
 TPM keyring unlock at login, with tiers, so RGB-only face match is
 deliberately limited to screen unlock. That gate has a documented hole of its
-own, though: read [Honest limitations](../README.md#honest-limitations) before
+own, though: read [Limits](LIMITATIONS.md) before
 treating it as a security boundary.
 </details>
 
@@ -138,5 +138,5 @@ It is off by default. Turn it on with `irlume profiles challenge on` if you
 want the extra deterrent, or leave it off for the ~2.5-second login. The
 default IR-structure gate rejected the tested screens, video replays, and
 matte-paper photos, but a glossy vinyl print of the enrolled face passed it;
-see [Honest limitations](../README.md#honest-limitations).
+see [Limits](LIMITATIONS.md).
 </details>

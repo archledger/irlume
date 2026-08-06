@@ -1489,9 +1489,9 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    eye_ear, mesh_box_valid, mesh_min_ear, mesh_output_plausible, runtime_resolution,
-    selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr,
-    BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    eye_ear, map_checked_mesh_output, mesh_box_valid, mesh_min_ear, mesh_output_plausible,
+    runtime_resolution, selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder,
+    FaceMesh, PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Model-backed pipeline tests: run the REAL shipped ONNX models (fetched to

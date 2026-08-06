@@ -116,10 +116,7 @@ useful contribution right now:
 
 **GPL-3.0-or-later** · no CLA, no commercial relicensing · [credits](docs/CREDITS.md)
 
-<sub>Built with an AI assistant, human-directed and human-reviewed
-([details](docs/FAQ.md)). Windows Hello is a trademark of Microsoft Corporation;
-irlume is independent and unaffiliated.</sub>
-
-<sub>Built with Rust · your face stays yours</sub>
+<sub>Built with Rust and AI assistance, human-directed ([details](docs/FAQ.md)) ·
+Windows Hello is a Microsoft trademark; irlume is independent · your face stays yours</sub>
 
 </div>

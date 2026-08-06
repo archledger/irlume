@@ -155,4 +155,7 @@ irlume irbench --dir <lfw/images> --det <yunet> --model <glintr100> --lfw
 
 Datasets: FairFace (CC-BY-4.0, demographic labels), LFW (real, identity labels),
 SFHQ (synthetic, FAR), CBSR/Oulu (NIR), DigiFace-1M (synthetic, non-commercial,
-debiasing). All evaluation-only; none are bundled.
+debiasing). All evaluation-only; none are bundled. Where each copy was actually
+obtained, which is not always the canonical academic page, is in
+[`../benchmarks/README.md`](../benchmarks/README.md); the LFW figures here come
+from the `lfw-deepfunneled` alignment.

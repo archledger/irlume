@@ -23,12 +23,31 @@ it. CPU runs give the same accuracy (only latency differs).
 
 ## Datasets (all public; obtain them yourself)
 
-| Name | What | Source | Terms |
-|---|---|---|---|
-| LFW | 13k in-the-wild RGB faces, standard 6000-pair verification protocol | [Kaggle `jessicali9530/lfw-dataset`](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset); the original UMass page (vis-www.cs.umass.edu/lfw) no longer resolves | research use, free download |
-| CBSR NIR | CASIA near-infrared faces (OTCBVS benchmark dataset 07) | [OTCBVS](http://vcipl-okstate.org/pbvs/bench/) | research/education only |
-| Oulu-CASIA NIR | near-infrared faces, multiple illuminations | Oulu-CASIA NIR-VIS academic release | research only |
-| Tufts Face | paired RGB + NIR (thermal/near-IR), many subjects | [tdface.ece.tufts.edu](http://tdface.ece.tufts.edu/) | research use |
+**Obtained from** is where the copy irlume measured actually came from, not the
+canonical academic page. Those differ, and the difference changes numbers: a
+mirror can be a subset, re-encoded, or a different alignment variant than the
+original release. The originator is named separately, because the credit and the
+licence terms are theirs. Every Kaggle reference below was checked with the
+Kaggle API, not just visited.
+
+| Name | What | Originator | Obtained from | Terms |
+|---|---|---|---|---|
+| LFW | 13k in-the-wild RGB faces, 6000-pair verification protocol | UMass Amherst | [Kaggle `jessicali9530/lfw-dataset`](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset), 112 MiB | research use, free download |
+| CBSR NIR | CASIA near-infrared faces (OTCBVS benchmark dataset 07) | CASIA (Chinese Academy of Sciences) | [Kaggle `gpreda/cbsr-nir-face-dataset`](https://www.kaggle.com/datasets/gpreda/cbsr-nir-face-dataset), 352 MiB of `.bmp` | research/education only |
+| Oulu-CASIA NIR | near-infrared faces, multiple illuminations and expressions | University of Oulu with CASIA | [Kaggle `aryanbaibaswata/oulu-casia`](https://www.kaggle.com/datasets/aryanbaibaswata/oulu-casia), 1.2 GiB, `Oulu_CASIA_NIR_VIS/NI/<light>/<subject>/` | research only |
+| Tufts Face | paired RGB + NIR, many subjects | Tufts University | request form at [tdface.ece.tufts.edu](http://tdface.ece.tufts.edu/) | research use |
+
+Two details that matter if you reproduce a number:
+
+- **The LFW copy is `lfw-deepfunneled`**, the deep-funneled alignment, not raw
+  LFW. Alignment variant moves verification accuracy, so a figure produced from
+  the raw or funneled release is not directly comparable to one here.
+- **There is a Kaggle entry named `kpvisionlab/tufts-face-database`, and it is
+  not the dataset.** It holds one file of 1551 bytes. The images come from the
+  Tufts request form; do not send anyone to that Kaggle ref expecting data.
+
+Earlier revisions of this table cited the canonical pages as the source for LFW,
+CBSR and Oulu, which implied the data was fetched there. It was not.
 
 CBSR and Oulu are the datasets the removed IR adapter was trained on; that is
 exactly why an adapter result on them (e.g. CBSR) is an in-training-set number,

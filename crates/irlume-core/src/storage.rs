@@ -224,6 +224,10 @@ pub fn recognizer_space_matches(have: Option<&str>, want: &str) -> bool {
     }
 }
 
+/// The IR embedding space of the shipped pipeline with no adapter loaded. The
+/// only space an untagged legacy scan can have come from.
+pub const IR_RAW_SPACE: &str = "raw";
+
 impl Enrollment {
     pub fn new(user: &str) -> Self {
         Self {
@@ -351,6 +355,25 @@ impl Enrollment {
     /// explicitly tagged and can fail loud ("re-enroll") instead of scoring
     /// across spaces. Idempotent; returns how many scans were stamped.
     pub fn retag_untagged_ir(&mut self, space: &str, dim: usize) -> usize {
+        // Only ever stamp the RAW space, and never an adapter's.
+        //
+        // An untagged scan predates tagging, and no IR adapter has ever shipped
+        // (ADR-0004), so an untagged IR template is raw by construction. The
+        // caller passes the LIVE pipeline's space, which is taken after
+        // `with_ir_adapter` has run, so on a machine whose first tagging-aware
+        // start already has `IRLUME_IR_ADAPTER` set, every legacy raw template
+        // would be permanently relabelled adapter-space. `ir_match_in` would
+        // then compare an ADAPTED probe against RAW templates at the adapted
+        // threshold of 0.40, the lowest number in the codebase, on a
+        // grant-capable path: a genuine cross-space cosine, which is the one
+        // thing the space tag exists to prevent.
+        //
+        // Refusing here loses nothing. The scans stay untagged, which
+        // `recognizer_space_matches` already treats as legacy, and the next
+        // start without an adapter stamps them correctly.
+        if space != IR_RAW_SPACE {
+            return 0;
+        }
         let mut n = 0;
         for p in &mut self.profiles {
             for s in &mut p.scans {
@@ -698,6 +721,51 @@ pub fn list_users() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An untagged IR scan predates tagging, and no adapter has ever shipped,
+    /// so it is raw by construction. The daemon passes the LIVE pipeline's
+    /// space, taken after any adapter loads, so a machine whose first
+    /// tagging-aware start already had IRLUME_IR_ADAPTER set would have had
+    /// every legacy raw template relabelled adapter-space. `ir_match_in` would
+    /// then score an ADAPTED probe against RAW templates at the adapted
+    /// threshold of 0.40, the lowest in the codebase, on a grant-capable path.
+    #[test]
+    fn retag_refuses_to_stamp_legacy_ir_with_an_adapter_space() {
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(FaceProfile {
+            ir_calib: None,
+            ir_calibs: Default::default(),
+            name: "P".into(),
+            scans: vec![FaceScan {
+                name: "s1".into(),
+                rgb: vec![0.1; 4],
+                ir: Some(vec![0.2; 4]),
+                // Untagged: what a scan written before tagging existed looks like.
+                ir_space: None,
+                embed_space: None,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            }],
+        });
+
+        assert_eq!(
+            enr.retag_untagged_ir("adapter:deadbeef", 4),
+            0,
+            "an adapter space must never be stamped onto an untagged scan"
+        );
+        assert!(
+            enr.profiles[0].scans[0].ir_space.is_none(),
+            "the scan must stay untagged, which already reads as legacy"
+        );
+
+        // The raw space is still stamped, which is the whole point of the sweep.
+        assert_eq!(enr.retag_untagged_ir(IR_RAW_SPACE, 4), 1);
+        assert_eq!(
+            enr.profiles[0].scans[0].ir_space.as_deref(),
+            Some(IR_RAW_SPACE)
+        );
+    }
 
     fn scan(name: &str, v: f32, space: Option<&str>) -> FaceScan {
         FaceScan {
@@ -1126,15 +1194,18 @@ mod tests {
                 scan_in_space("stale-dim", 2, None),       // wrong dim: left alone
             ],
         });
-        assert_eq!(e.retag_untagged_ir("adapter:abc123", 4), 1);
+        // The space is the RAW one now: stamping an adapter space onto a scan
+        // that predates tagging would invent a provenance it never had, and the
+        // sibling test covers that refusal.
+        assert_eq!(e.retag_untagged_ir(IR_RAW_SPACE, 4), 1);
         assert_eq!(
             e.profiles[0].scans[0].ir_space.as_deref(),
-            Some("adapter:abc123")
+            Some(IR_RAW_SPACE)
         );
         assert_eq!(e.profiles[0].scans[1].ir_space.as_deref(), Some("other"));
         assert!(e.profiles[0].scans[2].ir_space.is_none());
         // Idempotent: nothing left to stamp.
-        assert_eq!(e.retag_untagged_ir("adapter:abc123", 4), 0);
+        assert_eq!(e.retag_untagged_ir(IR_RAW_SPACE, 4), 0);
     }
 
     #[test]

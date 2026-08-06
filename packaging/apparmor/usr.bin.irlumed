@@ -12,7 +12,20 @@
 # Reload:  apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed
 # Complain (per-box soak):  add `flags=(complain)` to the profile line + reload.
 
-abi <abi/4.0>,
+# AppArmor ABI: pin the OLDEST parser we support, not the newest.
+#
+# This said `abi <abi/4.0>`. Debian 12 ships apparmor 3.0.8 and Ubuntu 22.04
+# ships 3.0.4, and neither has an abi/4.0 file, so the parser failed with
+# "Could not open 'abi/4.0'". The postinstall wraps the load in
+# `2>/dev/null || true`, so the package installed cleanly and the daemon ran
+# UNCONFINED with nothing said. The universal .deb declares libc6 (>= 2.35)
+# precisely so it installs on those two releases, and Debian enables AppArmor
+# by default, so that was the shipped configuration for them.
+#
+# 3.0 parses on 3.0.8, 4.0.1 and 4.1.0 (checked in containers), and pinning the
+# floor means one rule semantics everywhere instead of whatever each distro's
+# parser defaults to.
+abi <abi/3.0>,
 include <tunables/global>
 
 profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {

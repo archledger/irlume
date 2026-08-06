@@ -285,7 +285,8 @@ fn reconcile() -> ExitCode {
         return ExitCode::FAILURE;
     }
     eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
-    act(true, true, with_sudo, with_polkit)
+    // The lock is already held above; taking it again would deadlock.
+    act_holding_lock(true, true, with_sudo, with_polkit)
 }
 
 /// Whether the ACTIVE display manager's own greeter service carries the module.
@@ -1123,6 +1124,19 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
     } else {
         None
     };
+    act_holding_lock(enable, apply, with_sudo, with_polkit)
+}
+
+/// The body of [`act`], for a caller that ALREADY holds the PAM lock.
+///
+/// `flock` is per open file description, so a second `lock_pam()` from the same
+/// process blocks on the first one forever. `reconcile` took the lock, found a
+/// regression, and called `act`, which took it again: the self-heal deadlocked
+/// on exactly the condition it exists to repair, so it had never once worked.
+/// The hung process is root and holds the lock exclusively, so every other
+/// irlume PAM operation blocked behind it too, and the unit's `Type=oneshot`
+/// default of `TimeoutStartUSec=infinity` meant systemd never killed it.
+fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
     }
@@ -1629,6 +1643,47 @@ fn effective_uid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `flock` is per open file description, so a second `lock_pam()` from the
+    /// SAME process blocks on the first one forever rather than succeeding.
+    ///
+    /// `reconcile` took the lock, found a regression, and called `act`, which
+    /// took it again: the self-heal deadlocked on exactly the condition it
+    /// exists to repair, so it had never once worked. The hung process is root
+    /// and holds the lock exclusively, so every other irlume PAM operation
+    /// queued behind it, and the unit's `Type=oneshot` default of
+    /// `TimeoutStartUSec=infinity` meant systemd never killed it.
+    ///
+    /// This pins the hazard rather than the call graph, because the call graph
+    /// is what drifts. If `lock_pam` is ever made reentrant this test fails and
+    /// the split in `act`/`act_holding_lock` can be revisited.
+    #[test]
+    fn a_second_pam_lock_in_the_same_process_does_not_succeed() {
+        let dir = std::env::temp_dir().join(format!("irlume-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("pam.lock");
+        std::env::set_var("IRLUME_PAM_LOCK", &lock_path);
+
+        let first = super::lock_pam().expect("the first lock must be granted");
+
+        // The second attempt runs on a thread so a deadlock cannot hang the
+        // suite: we assert on whether it reports back, not on it returning.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _second = super::lock_pam();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).is_err(),
+            "a second lock_pam() returned, so re-locking is now safe and the \
+             act/act_holding_lock split should be re-examined"
+        );
+
+        drop(first);
+        std::env::remove_var("IRLUME_PAM_LOCK");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     // Reached through the submodule because the parent has no production use
     // for it; `use super::*` only carries what the parent itself imports.

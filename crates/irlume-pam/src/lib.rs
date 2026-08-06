@@ -484,6 +484,27 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
     let _ = hand_token_to_keyring_daemon(user, &token);
 }
 
+/// Resolve a helper binary, ignoring the environment override under
+/// secure execution.
+///
+/// The same rule `socket_path` already follows, and for the same reason: this
+/// module is linked into PAM stacks that can be entered setuid-root (notably
+/// `/etc/pam.d/sudo` under `--with-sudo`), which inherit the invoking user's
+/// environment. These two helpers are spawned AS ROOT with a TPM-released
+/// secret written to their stdin, so a plain `env::var` there would hand an
+/// attacker root execution and the credential together. `secure_getenv`
+/// returns NULL under AT_SECURE, so the compiled path wins in exactly those
+/// contexts while the daemon and the test harness keep the override.
+///
+/// The shipped wiring does not put `unseal` in a setuid stack today, so this
+/// closes a latent hole rather than a live one.
+fn secure_helper_path(var: &str, compiled: &str) -> String {
+    irlume_common::client::secure_env(var)
+        .and_then(|v| v.into_string().ok())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| compiled.to_string())
+}
+
 /// Spawn the unlock helper with the token on stdin. The helper drops to the
 /// target user before touching their runtime directory (the daemon's control
 /// socket authenticates the peer uid, and root pathname work inside a
@@ -493,8 +514,7 @@ fn hand_token_to_keyring_daemon(user: &str, token: &irlume_common::SecretBytes) 
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let helper = std::env::var("IRLUME_GKR_UNLOCK")
-        .unwrap_or_else(|_| irlume_common::GKR_UNLOCK_PATH.to_string());
+    let helper = secure_helper_path("IRLUME_GKR_UNLOCK", irlume_common::GKR_UNLOCK_PATH);
     if !std::path::Path::new(&helper).is_file() {
         return false;
     }
@@ -804,8 +824,7 @@ fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let helper = std::env::var("IRLUME_KWALLET_INIT")
-        .unwrap_or_else(|_| irlume_common::KWALLET_INIT_PATH.to_string());
+    let helper = secure_helper_path("IRLUME_KWALLET_INIT", irlume_common::KWALLET_INIT_PATH);
     if !std::path::Path::new(&helper).is_file() {
         return false;
     }

@@ -419,18 +419,31 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                 None => return usage_profiles(),
             }
         }
-        Some("delete") => match (flag(args, "--profile"), flag(args, "--scan")) {
-            (Some(p), Some(s)) => Request::DeleteScan {
-                user,
-                profile: p.into(),
-                scan: s.into(),
-            },
-            (Some(p), None) => Request::DeleteProfile {
-                user,
-                profile: p.into(),
-            },
-            _ => return usage_profiles(),
-        },
+        Some("delete") => {
+            // A `--scan` with no value must not widen the deletion from one
+            // scan to the whole profile. `flag` cannot tell "absent" from
+            // "present with nothing after it", and the arms below read absence
+            // as "the user meant the profile", so `profiles delete --profile P
+            // --scan` put `DeleteProfile` on the wire from a command whose
+            // visible intent was a single scan. Same shape as the dangling
+            // `--user` this file resolves above.
+            if args.iter().any(|a| a == "--scan") && flag(args, "--scan").is_none() {
+                eprintln!("[profiles] --scan requires a scan name");
+                return std::process::ExitCode::from(2);
+            }
+            match (flag(args, "--profile"), flag(args, "--scan")) {
+                (Some(p), Some(s)) => Request::DeleteScan {
+                    user,
+                    profile: p.into(),
+                    scan: s.into(),
+                },
+                (Some(p), None) => Request::DeleteProfile {
+                    user,
+                    profile: p.into(),
+                },
+                _ => return usage_profiles(),
+            }
+        }
         Some("rename") => match (
             flag(args, "--profile"),
             flag(args, "--scan"),
@@ -1502,6 +1515,27 @@ fn toggle_value(args: &[String], sub: &str) -> Option<bool> {
 }
 
 pub(crate) fn user_arg(args: &[String]) -> String {
+    // A `--user` with nothing after it is a usage error, never a request to
+    // operate on whoever is invoking.
+    //
+    // `flag` answers None both for "absent" and for "present with no value", so
+    // a trailing `--user` fell through to the SUDO_USER default and silently
+    // retargeted the command at the person typing it. On the destructive verbs
+    // that is total, unconfirmed data loss: `sudo irlume enroll --reset --user`
+    // put `{"Enroll":{"user":"<you>","reset":true}}` on the wire, and the
+    // daemon's reset deletes the enrollment, the template key, and the recovery
+    // envelope together. `recovery forget --user` and `keyring forget --user`
+    // did the same.
+    //
+    // The guard existed, but only inside `profiles`, so it covered one of the
+    // four. It belongs here, where all 24 callers share it: this is a resolver,
+    // and the one thing a resolver must not do is quietly resolve to the wrong
+    // subject. Exiting rather than returning an error keeps every caller's
+    // signature, and there is no sensible way to continue.
+    if args.iter().any(|a| a == "--user") && flag(args, "--user").is_none() {
+        eprintln!("irlume: --user requires a username");
+        std::process::exit(2);
+    }
     flag(args, "--user")
         .map(str::to_string)
         .filter(|s| !s.is_empty())

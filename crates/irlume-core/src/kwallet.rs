@@ -46,6 +46,69 @@ pub fn salt_path(home: &Path) -> PathBuf {
     home.join(SALT_RELPATH)
 }
 
+/// The most this file can be and still be a wallet salt. A real one is
+/// [`SALT_LEN`] bytes; the headroom is for a future format, not for a payload.
+const MAX_SALT_BYTES: u64 = 4096;
+
+/// Read a REGULAR file of at most `max` bytes, without blocking and without
+/// following a symlink at the final component.
+///
+/// This path lives inside the user's own home, so its contents and its type are
+/// theirs to choose, and the daemon reads it as root on the worker thread. A
+/// plain `fs::read` here was a wedge: `mkfifo`ing the salt path blocks in
+/// `open(2)` until a writer appears, which stalls the camera worker forever
+/// while the connection threads keep answering Ping, so the daemon looks
+/// healthy while every capture and mutation is dead. The systemd watchdog then
+/// kills and restarts it, and the file is still a FIFO, so it happens again.
+/// Pointing it at /dev/zero gives unbounded allocation instead.
+///
+/// `O_NONBLOCK` makes opening a FIFO return instead of waiting, `O_NOFOLLOW`
+/// stops a symlink redirecting the final component elsewhere, and the fstat
+/// rejects anything that is not a regular file, which covers FIFOs, devices,
+/// and directories together. The size cap bounds the allocation.
+fn read_regular_file_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = file.metadata()?;
+    let ft = meta.file_type();
+    if !ft.is_file() {
+        let what = if ft.is_fifo() {
+            "a FIFO"
+        } else if ft.is_char_device() || ft.is_block_device() {
+            "a device"
+        } else if ft.is_dir() {
+            "a directory"
+        } else if ft.is_socket() {
+            "a socket"
+        } else {
+            "not a regular file"
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is {what}, not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is {} bytes, over the {max}-byte limit",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    // Cap the read as well as the stat: the file can grow between the two.
+    file.take(max).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// Read `home`'s wallet salt.
 ///
 /// Deliberately does NOT create a missing salt, unlike `pam_kwallet5`, which
@@ -54,7 +117,7 @@ pub fn salt_path(home: &Path) -> PathBuf {
 /// looking like a successful arm.
 pub fn read_salt(home: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let path = salt_path(home);
-    let raw = std::fs::read(&path).map_err(|e| {
+    let raw = read_regular_file_capped(&path, MAX_SALT_BYTES).map_err(|e| {
         Error::Policy(format!(
             "no KDE wallet salt at {}: {e}. Log into a Plasma session once so \
              the wallet exists, then arm again",
@@ -125,6 +188,49 @@ pub fn detect_kind(home: &Path) -> crate::envelope::SecretKind {
 
 #[cfg(test)]
 mod tests {
+
+    /// The salt path lives in the user's own home, so its TYPE is theirs to
+    /// choose. `fs::read` on a FIFO blocks in `open(2)` until a writer appears,
+    /// which stalls the daemon's camera worker forever while the connection
+    /// threads keep answering Ping: the daemon looks healthy while every capture
+    /// is dead, the watchdog kills it, and the FIFO is still there on restart.
+    #[test]
+    fn a_non_regular_salt_is_refused_instead_of_blocking() {
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("kwallet-fifo"))
+            .join(".local/share/kwalletd");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kdewallet.salt");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+
+        let home = dir.parent().unwrap().parent().unwrap().parent().unwrap();
+        // Must RETURN. Before the fix this call never came back.
+        let err = read_salt(home).expect_err("a FIFO must not be read as a salt");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("FIFO"),
+            "the refusal must name what it found: {msg}"
+        );
+
+        // A real salt still reads.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![7u8; SALT_LEN]).unwrap();
+        assert_eq!(read_salt(home).unwrap().len(), SALT_LEN);
+
+        // And an implausibly large one is refused rather than allocated.
+        std::fs::write(&path, vec![0u8; (MAX_SALT_BYTES + 1) as usize]).unwrap();
+        assert!(
+            read_salt(home).is_err(),
+            "an oversized salt must be refused"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     use super::*;
 
     #[test]

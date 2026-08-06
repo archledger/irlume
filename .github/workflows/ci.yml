@@ -434,9 +434,29 @@ jobs:
           sudo apt-get -qq update
           sudo apt-get -qq install -y apparmor
           for f in packaging/apparmor/*; do
-            echo "checking $f"
+            echo "checking $f on the runner's parser"
             apparmor_parser -QK "$f"
           done
+
+      # The runner's parser is 4.x. The universal .deb declares
+      # libc6 (>= 2.35) so it installs on Debian 12 and Ubuntu 22.04, whose
+      # apparmor is 3.0.x, and a profile can parse here and fail there: an
+      # `abi <abi/4.0>` line did exactly that, and since the postinstall did not
+      # report the failure, those installs ran unconfined with nothing said.
+      # Check the OLDEST supported parser too, in the distro that ships it.
+      - name: apparmor profiles parse on the oldest supported parser
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/packaging/apparmor:/p:ro" ubuntu:22.04 bash -c '
+            set -euo pipefail
+            apt-get -qq update >/dev/null
+            apt-get -qq install -y apparmor >/dev/null
+            apparmor_parser --version
+            useradd -m checker
+            for f in /p/*; do
+              echo "checking $f"
+              su checker -c "apparmor_parser -QK $f"
+            done'
 
       # The guard that stops a zero-match test filter from reporting success is
       # itself a parser, so it gets the same treatment it enforces: prove it can

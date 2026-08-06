@@ -84,6 +84,12 @@ rustPlatform.buildRustPackage {
   buildInputs = [
     tpm2-tss # tss-esapi links tss2-*
     linux-pam # the PAM cdylib links libpam
+    # irlumed declares #[link(name = "crypt")] for its /etc/shadow fallback.
+    # nixpkgs stopped providing libcrypt transitively, and `nix build` failed
+    # with "cannot find -lcrypt" at the irlumed link step. CI could not see it:
+    # the nix job runs `nix flake check --no-build`, which passes on the same
+    # tree that fails to build.
+    libxcrypt
   ];
 
   # v4l2-sys-mit's bindgen parses <linux/videodev2.h>; hand clang the kernel

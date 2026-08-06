@@ -39,7 +39,7 @@ const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 /// capabilities), so in exactly those contexts the compiled default wins, while
 /// the daemon (a clean systemd environment) and dev/test clients keep the
 /// override.
-fn secure_env(name: &str) -> Option<std::ffi::OsString> {
+pub fn secure_env(name: &str) -> Option<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
     // glibc's secure_getenv; not surfaced by the `libc` crate, so declare it
     // (the shipping targets are all glibc: Fedora, Debian/Ubuntu, Arch).

@@ -18,4 +18,6 @@ rsa.workspace = true
 aes-gcm.workspace = true
 argon2.workspace = true
 pbkdf2.workspace = true
+# O_NONBLOCK/O_NOFOLLOW when reading a file inside a user-writable home.
+libc.workspace = true
 rand.workspace = true

@@ -1276,6 +1276,53 @@ fn an_encrypted_store_with_no_key_says_so_instead_of_plaintext() {
     );
 }
 
+/// A flag with nothing after it must never silently become a different, wider
+/// operation.
+///
+/// `flag()` answers None both for "absent" and for "present with no value", and
+/// two resolvers read that None as a default: `--user` fell back to SUDO_USER,
+/// and `profiles delete`'s missing `--scan` meant "the whole profile". So
+/// `sudo irlume enroll --reset --user` deleted the enrollment, the template key
+/// and the recovery envelope of the person typing it, unconfirmed, and
+/// `profiles delete --profile P --scan` deleted P. The guard existed but only
+/// inside `profiles`, so it covered one of four commands.
+///
+/// The fixture serves nothing: every case here must be refused BEFORE any
+/// request reaches a daemon, which the empty request log proves.
+#[test]
+fn a_flag_with_no_value_is_refused_before_anything_is_destroyed() {
+    let sb = Sandbox::new("danglingflag");
+    let log = serve(&sock(&sb), |_| Response::Ok("must not be reached".into()));
+
+    let destructive: &[&[&str]] = &[
+        &["enroll", "--reset", "--user"],
+        &["recovery", "forget", "--user"],
+        &["keyring", "forget", "--user"],
+        &["profiles", "delete", "--profile", "P", "--user"],
+        &["profiles", "forget-model", "shipped", "--user"],
+        &["profiles", "delete", "--profile", "P", "--scan"],
+    ];
+    for argv in destructive {
+        let (code, _, err) = run(sb.cmd(argv).env("SUDO_USER", "victim"));
+        assert_eq!(code, 2, "`{}` must be a usage error: {err}", argv.join(" "));
+        assert!(
+            err.contains("requires a"),
+            "`{}` must say what is missing: {err}",
+            argv.join(" ")
+        );
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing may reach the daemon: {:?}",
+        log.lock().unwrap()
+    );
+
+    // The ordinary forms are untouched.
+    let (code, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]));
+    assert_eq!(code, 0);
+    assert!(out.contains("tester"), "{out}");
+}
+
 /// A slow daemon is not an absent daemon.
 ///
 /// `caps()` and `camera_pair()` fall back to a local probe when the socket poll

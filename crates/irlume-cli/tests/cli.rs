@@ -1467,7 +1467,7 @@ fn enroll_reports_a_new_profile_and_forwards_the_flags() {
         created: true,
         added: 3,
         total: 3,
-        room: 27,
+        room: Some(27),
         added_scans: vec!["Scan 1".into(), "Scan 2".into(), "Scan 3".into()],
     });
     let (code, out, _) = run(&mut sb.cmd(&[
@@ -1501,7 +1501,7 @@ fn enroll_merge_points_at_add_scan() {
         created: false,
         added: 2,
         total: 8,
-        room: 22,
+        room: Some(22),
         added_scans: vec!["Scan 7".into(), "Scan 8".into()],
     });
     let (code, out, _) = run(&mut sb.cmd(&["enroll", "--user", "tester"]));
@@ -1681,7 +1681,7 @@ fn setup_walks_every_step_noninteractively() {
             created: true,
             added: 6,
             total: 6,
-            room: 24,
+            room: Some(24),
             added_scans: Vec::new(),
         },
         Request::SealPassword { .. } => Response::PasswordSealed,

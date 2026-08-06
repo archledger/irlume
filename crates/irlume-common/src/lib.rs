@@ -759,11 +759,19 @@ pub enum Response {
         /// RECOGNIZER'S SPACE, which is what the limit actually governs.
         /// Carried rather than recomputed by the client: deriving it from
         /// `total` under-counts on a multi-model profile and refuses scans
-        /// the daemon would accept. `serde(default)` so an older daemon
-        /// still decodes (its 0 then reads as "no room known", and the
-        /// caller falls back to its requested count).
+        /// the daemon would accept.
+        ///
+        /// `None` means the daemon did not say, which is every daemon older
+        /// than 0.9.0. That is NOT the same as `Some(0)`, a profile that is
+        /// genuinely full, and the difference is load-bearing: a plain
+        /// `usize` defaulted to 0, so a 0.9.0 client talking to a
+        /// still-running 0.8.1 daemon (the window every upgrade passes
+        /// through, between the package swap and the daemon restart) offered
+        /// zero continuation scans and silently under-enrolled, which is the
+        /// failure #290 exists to prevent. A caller seeing `None` uses its
+        /// own requested count and lets the daemon refuse what it will.
         #[serde(default)]
-        room: usize,
+        room: Option<usize>,
         added_scans: Vec<String>,
     },
     SelfTest {
@@ -1357,7 +1365,7 @@ mod tests {
                 created: true,
                 added: 3,
                 total: 3,
-                room: 27,
+                room: Some(27),
                 added_scans: vec![],
             },
             Response::Enrolled {
@@ -1365,7 +1373,7 @@ mod tests {
                 created: false,
                 added: 1,
                 total: 8,
-                room: 22,
+                room: Some(22),
                 added_scans: vec!["scan8".into()],
             },
         ] {

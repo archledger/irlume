@@ -3025,7 +3025,7 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             total: scans,
             // A brand-new profile holds only this recognizer's scans, so the
             // per-recognizer room is the plain remainder.
-            room: irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(scans),
+            room: Some(irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(scans)),
             added_scans: Vec::new(),
         },
         irlume_auth::EnrollOutcome::Merged {
@@ -3039,7 +3039,7 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             created: false,
             added,
             total,
-            room,
+            room: Some(room),
             added_scans,
         },
     }
@@ -3592,7 +3592,8 @@ mod tests {
                 assert!(!created, "a merge must not claim a new profile was created");
                 assert_eq!((added, total), (1, 8));
                 assert_eq!(
-                    room, 22,
+                    room,
+                    Some(22),
                     "the daemon's per-recognizer room must reach the client, not \
                      be recomputed there from the profile-wide total"
                 );

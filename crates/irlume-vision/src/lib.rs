@@ -328,13 +328,37 @@ mod onnx {
                         .to_string(),
                 );
             }
+            // The FILE the loader mapped, not the soname it was asked for.
+            // The two diverge exactly when it matters: on the #187 reporter's
+            // machine, "libonnxruntime.so" resolved to a third-party
+            // /usr/lib/libonnxruntime_x64.so that no package manager owned,
+            // and the mapped path in /proc was the fact that solved the
+            // issue. dladdr on the symbol we already resolved answers it for
+            // free; a null or absent dli_fname degrades to the asked-for
+            // name rather than failing a probe that otherwise succeeded.
+            let mut info: libc::Dl_info = std::mem::zeroed();
+            let mapped = if libc::dladdr(sym, &mut info) != 0 && !info.dli_fname.is_null() {
+                let reported = std::ffi::CStr::from_ptr(info.dli_fname).to_string_lossy();
+                // dladdr reports the path dlopen was given, which through a
+                // symlink is the symlink; canonicalize so the message names
+                // the file that is actually mapped (measured: a 1.20.1
+                // behind a symlink reported the symlink until this).
+                std::fs::canonicalize(reported.as_ref())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| reported.into_owned())
+            } else {
+                name.to_string_lossy().into_owned()
+            };
             let get_base: unsafe extern "system" fn() -> *const ort::sys::OrtApiBase =
                 std::mem::transmute(sym);
             let verdict = inspect_api_base(get_base());
             if verdict.is_err() {
                 libc::dlclose(handle);
             }
-            verdict
+            match verdict {
+                Ok(version) => Ok(format!("{version}, mapped from {mapped}")),
+                Err(why) => Err(format!("{why} (the loader mapped {mapped})")),
+            }
         }
     }
 

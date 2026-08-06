@@ -232,8 +232,28 @@ fn lookup_user(user: &str) -> Result<User, String> {
     })
 }
 
+/// Whether this process holds privilege that the environment must not steer.
+/// The same check `irlume-gkr-unlock` applies to its two overrides.
+fn privileged() -> bool {
+    let (euid, uid) = unsafe { (libc::geteuid(), libc::getuid()) };
+    euid == 0 || uid == 0
+}
+
 fn wallet_daemon() -> Result<CString, String> {
+    // The override names a binary this program EXECS while holding the
+    // TPM-released wallet key. `secure_getenv` in the PAM parent does not cover
+    // it: AT_SECURE is a property of one execve, and this helper is not setuid,
+    // so its own AT_SECURE is 0 no matter how the parent was entered. The
+    // sibling helper refuses its environment overrides when privileged and this
+    // one, which is the one that execs, did not.
     if let Some(over) = std::env::var_os("IRLUME_KSECRETD") {
+        if privileged() {
+            return Err(
+                "IRLUME_KSECRETD is ignored when running privileged; it names a \
+                 binary this helper would exec while holding the wallet key"
+                    .into(),
+            );
+        }
         return CString::new(over.as_bytes()).map_err(|_| "IRLUME_KSECRETD has a NUL".into());
     }
     for c in CANDIDATES {

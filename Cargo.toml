@@ -101,4 +101,4 @@ strip = true
 # policy commands to required_session_1 only as an 8.0 break (PR #624). Only move to
 # a plain crates.io release after that release exists AND passes the HW round-trip.
 [patch.crates-io]
-tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "irlume-patches" }
+tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", rev = "7567f6048d2bcb42779e80c0dad90e7eacf6185c" }

@@ -154,9 +154,15 @@ pub(crate) fn control_is_documented(
 
 /// Persisted config path (written by `ir-setup`, read by [`enable`]).
 fn conf_path() -> PathBuf {
+    // Through `state_dir()`, like `emitter_journal::store_dir` and
+    // `stream_record`, not the literal. This file decides whether the IR
+    // emitter lights at login, and a sandboxed `ir-setup` set up exactly as
+    // docs/INTEGRATION.md documents (SOCKET, STATE, KEYRING, RECOVERY,
+    // TEMPLATE_KEY) would have written straight through to the live one. Same
+    // split-resolution shape that emptied a real machine's template keys.
     std::env::var("IRLUME_IR_EMITTER_CONF")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/irlume/ir_emitter.conf"))
+        .unwrap_or_else(|_| irlume_common::state_dir().join("ir_emitter.conf"))
 }
 
 /// Which control `ir-setup` found, if it was recorded for the camera now

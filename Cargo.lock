@@ -2685,7 +2685,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi"
 version = "7.7.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
+source = "git+https://github.com/archledger/rust-tss-esapi?rev=7567f6048d2bcb42779e80c0dad90e7eacf6185c#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
 dependencies = [
  "bitfield",
  "enumflags2",
@@ -2707,7 +2707,7 @@ dependencies = [
 [[package]]
 name = "tss-esapi-sys"
 version = "0.6.0"
-source = "git+https://github.com/archledger/rust-tss-esapi?branch=irlume-patches#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
+source = "git+https://github.com/archledger/rust-tss-esapi?rev=7567f6048d2bcb42779e80c0dad90e7eacf6185c#7567f6048d2bcb42779e80c0dad90e7eacf6185c"
 dependencies = [
  "pkg-config",
  "target-lexicon",

@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
-# Build an installable irlume .pkg.tar.zst from the local checkout, for
-# distribution via GitHub Releases (AUR registration is currently disabled, so
-# `irlume update` on Arch installs this prebuilt package with pacman -U). Run on
-# an Arch box:  bash packaging/arch/build-pkg.sh
+# NOT A RELEASE LANE. Arch users get irlume from the AUR.
 #
-# Unlike the AUR PKGBUILD (which fetches the git tag), this packages the
-# already-built binaries + LFS models in place; no network source.
+# The header here used to say AUR registration was disabled and that
+# `irlume update` on Arch installs this prebuilt package. Neither is true: the
+# CLI's pacman arm points at the AUR, a regression test in
+# crates/irlume-cli/src/commands.rs pins that, and no `.pkg.tar.zst` asset has
+# been referenced since 0.1.x.
+#
+# It matters because the inline PKGBUILD below is not at parity with
+# packaging/arch/PKGBUILD: it omits irlumed.socket, both keyring helpers
+# (irlume-kwallet-init, irlume-gkr-unlock), the TFLite runtime, the machine-API
+# schema, and the AppArmor profile. A package built from it installs a daemon
+# with no socket activation, no wallet unlock, and no confinement.
+# check-packaging-parity.sh does not look at this file, so nothing catches that.
+#
+# Kept for local experiments, behind an explicit opt-in so nobody publishes
+# from it by accident:
+#   IRLUME_ARCH_LOCAL_BUILD=1 bash packaging/arch/build-pkg.sh
 set -euo pipefail
+
+if [ "${IRLUME_ARCH_LOCAL_BUILD:-}" != "1" ]; then
+    echo "packaging/arch/build-pkg.sh is not a release lane; Arch ships via the AUR." >&2
+    echo "It is missing the socket unit, both keyring helpers, the TFLite runtime," >&2
+    echo "the schema, and the AppArmor profile. For a local experiment only:" >&2
+    echo "  IRLUME_ARCH_LOCAL_BUILD=1 bash packaging/arch/build-pkg.sh" >&2
+    exit 2
+fi
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 PKGVER="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
@@ -17,7 +36,10 @@ command -v makepkg >/dev/null || { echo "run on Arch (needs makepkg)"; exit 1; }
 
 # Fetch + verify the release-hosted model weights (not Git LFS).
 bash scripts/fetch-models.sh
-cargo build --release --locked 2>/dev/null || cargo build --release
+# --locked only. The fallback here silently rebuilt with a fresh resolve, which
+# for the [patch.crates-io] TPM crate meant whatever its branch head was at that
+# moment; that crate performs the sealing.
+cargo build --release --locked
 
 rm -rf "$BUILD"; mkdir -p "$BUILD"
 cp -r target/release "$BUILD/release"

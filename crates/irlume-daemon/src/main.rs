@@ -690,6 +690,10 @@ fn main() {
     // sends requests cannot exhaust memory. Well above any real client: the
     // greeter, the lock screen, a TUI and sudo together are a handful.
     const MAX_CONNECTION_THREADS: usize = 64;
+    /// Slots an unprivileged peer may not take. The greeter, the lock screen
+    /// and a sudo stack together are a handful, so a small reserve is enough to
+    /// keep the login path answerable while an unprivileged peer floods.
+    const ROOT_RESERVED_SLOTS: usize = 16;
     let live_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // How long a throttled connection is held before being closed, and how many
@@ -746,9 +750,25 @@ fn main() {
                     // descriptors one abusive peer can pin.
                     continue;
                 }
+                // Reserve the top of the pool for root.
+                //
+                // The cap is global, and a connection occupies a slot from
+                // accept until its read times out 15 seconds later, so an
+                // unprivileged peer that opens 64 sockets and sends NOTHING is
+                // never charged by `refusal_throttled` (which only counts
+                // arbiter refusals) and locks the socket for everyone: measured,
+                // a root peer's Ping got "daemon busy" for as long as the
+                // attacker held them. Root is where the login path lives, so it
+                // keeps slots an ordinary uid cannot take. The fallback when the
+                // peer cannot be identified is to treat it as unprivileged.
+                let peer_is_root = peer_cred(&stream).is_ok_and(|p| p.uid == 0);
+                let ceiling = if peer_is_root {
+                    MAX_CONNECTION_THREADS
+                } else {
+                    MAX_CONNECTION_THREADS - ROOT_RESERVED_SLOTS
+                };
                 let live = std::sync::Arc::clone(&live_threads);
-                if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTION_THREADS
-                {
+                if live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= ceiling {
                     live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = respond(
                         stream,

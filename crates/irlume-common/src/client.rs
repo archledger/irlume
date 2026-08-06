@@ -13,7 +13,7 @@
 //! unsealed secret in transit, before it lands inside a zeroizing `SecretBytes`).
 
 use crate::{Request, Response, SOCKET_PATH};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,6 +26,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// UI: fail fast and let the next tick retry.
 const POLL_CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
 const POLL_RW_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Largest response this client will accept. The daemon's own replies are far
+/// smaller; the cap exists so a peer that is not the daemon cannot make a
+/// client read forever. Matches the daemon's request cap.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
 /// Default read/write timeout for management requests.
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -167,9 +172,22 @@ fn request_with_timeouts(
     // The request may carry a password (SealPassword/RecoverySetup); wipe it.
     line.zeroize();
 
-    let mut reader = BufReader::new(&stream);
+    // Capped, like the daemon caps requests. `SO_RCVTIMEO` restarts on every
+    // read, so the rw budget bounds one read and not the exchange: a peer that
+    // dribbles bytes with no newline holds the caller forever and grows the
+    // buffer without bound. That caller can be `pam_irlume` inside a login.
+    // The daemon is honest, but `IRLUME_SOCKET` redirects any non-setuid
+    // invocation, so the peer is not always the daemon.
+    let mut reader = BufReader::new((&stream).take(MAX_RESPONSE_BYTES));
     let mut buf = String::new();
     reader.read_line(&mut buf).map_err(map_connect_failure)?;
+    if buf.len() as u64 >= MAX_RESPONSE_BYTES {
+        buf.zeroize();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded the size limit; refusing it",
+        ));
+    }
     if buf.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -206,7 +224,6 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream
 mod tests {
     use super::*;
     use crate::testenv;
-    use std::io::Read as _;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 

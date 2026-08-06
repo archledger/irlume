@@ -1506,9 +1506,7 @@ impl<'a> RgbSession<'a> {
         let device = self.cam.device.clone();
         warm_up_stream(&device, self.stream()?)?;
         for _ in 0..AE_WARMUP {
-            self.stream()?
-                .next()
-                .map_err(|e| map_io(&device, e))?; // discard while AE settles
+            self.stream()?.next().map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
         self.warmed = true;
         Ok(())
@@ -1522,10 +1520,7 @@ impl<'a> RgbSession<'a> {
         let chosen = self.cam.chosen;
         let mut frames = Vec::with_capacity(n.max(1));
         for _ in 0..n.max(1) {
-            let (buf, _meta) = self
-                .stream()?
-                .next()
-                .map_err(|e| map_io(&device, e))?;
+            let (buf, _meta) = self.stream()?.next().map_err(|e| map_io(&device, e))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),

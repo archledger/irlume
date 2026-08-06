@@ -645,12 +645,71 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 /// live anyway, which on a bandwidth-starved camera is indistinguishable
 /// from concurrent (#187).
 fn sequential_capture_selected(rgb_dev: &str) -> (bool, &'static str) {
-    match std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
-        Ok(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
-        Err(_) => match irlume_camera::stored_capture_mode(rgb_dev) {
+    capture_mode_decision(
+        std::env::var("IRLUME_SEQUENTIAL_CAPTURE").ok().as_deref(),
+        irlume_camera::stored_capture_mode(rgb_dev),
+    )
+}
+
+/// The decision itself, pure over its two observations so every arm is
+/// testable without a camera or an environment mutation: a set env var
+/// decides alone (even when it says concurrent, because setting it is an
+/// explicit instruction and the stored answer must not outrank it), then the
+/// stored per-camera measurement, then the concurrent default.
+fn capture_mode_decision(
+    env: Option<&str>,
+    stored: Option<irlume_camera::CaptureMode>,
+) -> (bool, &'static str) {
+    match env {
+        Some(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
+        None => match stored {
             Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
             None => (false, "default"),
         },
+    }
+}
+
+#[cfg(test)]
+mod capture_mode_decision_tests {
+    use super::capture_mode_decision;
+    use irlume_camera::CaptureMode;
+
+    #[test]
+    fn a_set_env_var_decides_alone_in_both_directions() {
+        assert_eq!(
+            capture_mode_decision(Some("1"), None),
+            (true, "IRLUME_SEQUENTIAL_CAPTURE")
+        );
+        // Explicit concurrent outranks a stored sequential: setting the var
+        // is an instruction, and a mutant that consults `stored` here would
+        // sequentialize a run the operator forced concurrent.
+        assert_eq!(
+            capture_mode_decision(Some("0"), Some(CaptureMode::Sequential)),
+            (false, "IRLUME_SEQUENTIAL_CAPTURE")
+        );
+        assert_eq!(
+            capture_mode_decision(Some(" 1 "), Some(CaptureMode::Concurrent)),
+            (true, "IRLUME_SEQUENTIAL_CAPTURE")
+        );
+    }
+
+    #[test]
+    fn the_stored_measurement_decides_when_no_env_is_set() {
+        // Both directions, because a mutant flipping the comparison passes
+        // any test that only checks one of them.
+        assert_eq!(
+            capture_mode_decision(None, Some(CaptureMode::Sequential)),
+            (true, "cameras.conf")
+        );
+        assert_eq!(
+            capture_mode_decision(None, Some(CaptureMode::Concurrent)),
+            (false, "cameras.conf")
+        );
+    }
+
+    #[test]
+    fn nothing_stored_defaults_to_concurrent() {
+        assert_eq!(capture_mode_decision(None, None), (false, "default"));
     }
 }
 
@@ -1303,7 +1362,11 @@ impl Engine {
             Err(e) if !held_sessions => {
                 irlume_common::dlog!(
                     "assess: rgb capture retry ({} capture failed: {e})",
-                    if sequential { "sequential" } else { "concurrent" }
+                    if sequential {
+                        "sequential"
+                    } else {
+                        "concurrent"
+                    }
                 );
                 rgb_hard_retried = true;
                 irlume_camera::capture_rgb_denoised(&self.rgb_dev)?

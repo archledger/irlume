@@ -330,34 +330,54 @@ mod onnx {
             }
             let get_base: unsafe extern "system" fn() -> *const ort::sys::OrtApiBase =
                 std::mem::transmute(sym);
-            let base = get_base();
-            if base.is_null() {
+            let verdict = inspect_api_base(get_base());
+            if verdict.is_err() {
                 libc::dlclose(handle);
-                return Err(
-                    "OrtGetApiBase returned null; the library is not a usable ONNX Runtime"
-                        .to_string(),
-                );
             }
-            // Copied to an owned String while the library is still mapped:
-            // the pointer aims into the library's own data.
-            let version_ptr = ((*base).GetVersionString)();
-            let version = if version_ptr.is_null() {
-                "(unknown version)".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(version_ptr)
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            if ((*base).GetApi)(ort::MINOR_VERSION).is_null() {
-                libc::dlclose(handle);
-                return Err(format!(
-                    "this is ONNX Runtime {version}, which does not provide API level {api} \
-                     (first shipped in ONNX Runtime 1.{api}); irlume needs 1.{api} or newer",
-                    api = ort::MINOR_VERSION
-                ));
-            }
-            Ok(version)
+            verdict
         }
+    }
+
+    /// The verdict on an `OrtApiBase`: the runtime's version string when it
+    /// provides the API level pinned ort will demand, the refusal naming its
+    /// version and the floor when it does not.
+    ///
+    /// Separate from [`probe_runtime`] so the floor decision is testable
+    /// against an in-process fake `OrtApiBase` (#304 review): the real
+    /// refusal needs a pre-1.24 libonnxruntime, which CI does not have, and
+    /// both probe tests return before reaching the floor check, so a mutant
+    /// deleting it would have survived them.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be null or point to a live `OrtApiBase` whose function
+    /// pointers are callable; the version string, when non-null, is copied
+    /// out while the library backing it is still mapped (the caller holds
+    /// the dlopen handle across this call).
+    unsafe fn inspect_api_base(base: *const ort::sys::OrtApiBase) -> Result<String, String> {
+        if base.is_null() {
+            return Err(
+                "OrtGetApiBase returned null; the library is not a usable ONNX Runtime".to_string(),
+            );
+        }
+        let version_ptr = ((*base).GetVersionString)();
+        let version = if version_ptr.is_null() {
+            "(unknown version)".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(version_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        // `GetApi` documents null as "this version is unsupported", so null
+        // IS the version answer, not a call failure.
+        if ((*base).GetApi)(ort::MINOR_VERSION).is_null() {
+            return Err(format!(
+                "this is ONNX Runtime {version}, which does not provide API level {api} \
+                 (first shipped in ONNX Runtime 1.{api}); irlume needs 1.{api} or newer",
+                api = ort::MINOR_VERSION
+            ));
+        }
+        Ok(version)
     }
 
     /// Probe, then hand the SAME name to pinned ort, which retains the handle
@@ -1404,6 +1424,40 @@ mod onnx {
             assert!(
                 err.contains("exports no OrtGetApiBase"),
                 "expected the not-an-ONNX-Runtime refusal, got: {err}"
+            );
+        }
+
+        #[test]
+        fn a_runtime_below_the_pinned_api_floor_is_refused() {
+            // An in-process fake of a pre-1.24 runtime: GetApi answers null
+            // for every level, exactly the upstream contract for "this
+            // version is unsupported". The exact-string assertion is what
+            // discriminates: a wrong API number, a reversed null check, or a
+            // deleted floor check each produce a different value here.
+            unsafe extern "system" fn get_api(_version: u32) -> *const ort::sys::OrtApi {
+                std::ptr::null()
+            }
+            unsafe extern "system" fn get_version() -> *const std::ffi::c_char {
+                c"1.20.1".as_ptr()
+            }
+            let base = ort::sys::OrtApiBase {
+                GetApi: get_api,
+                GetVersionString: get_version,
+            };
+            let err = unsafe { inspect_api_base(&base) }.unwrap_err();
+            assert_eq!(
+                err,
+                "this is ONNX Runtime 1.20.1, which does not provide API level 24 \
+                 (first shipped in ONNX Runtime 1.24); irlume needs 1.24 or newer"
+            );
+        }
+
+        #[test]
+        fn a_null_api_base_is_refused() {
+            let err = unsafe { inspect_api_base(std::ptr::null()) }.unwrap_err();
+            assert!(
+                err.contains("OrtGetApiBase returned null"),
+                "expected the null-base refusal, got: {err}"
             );
         }
     }

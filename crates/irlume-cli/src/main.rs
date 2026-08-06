@@ -3867,11 +3867,12 @@ fn doctor_run(
         };
         match verdict {
             Ok(version) => {
-                report.check("onnxruntime", State::Pass);
-                dout!(report, "[doctor] ONNX Runtime: {source} ({version}) ✓");
+                let detail = format!("{source} ({version})");
+                report.check_detail("onnxruntime", State::Pass, &detail);
+                dout!(report, "[doctor] ONNX Runtime: {detail} ✓");
             }
             Err(why) => {
-                report.check("onnxruntime", State::Fail);
+                report.check_detail("onnxruntime", State::Fail, format!("{source}: {why}"));
                 dout!(
                     report,
                     "[doctor] ONNX Runtime: {source} UNUSABLE ✗ ({why}). The daemon \

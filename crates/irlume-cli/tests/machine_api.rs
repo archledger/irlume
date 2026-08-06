@@ -297,6 +297,35 @@ fn every_doctor_check_id_is_documented_and_every_documented_id_exists() {
     );
 }
 
+/// The registry says the `onnxruntime` check carries the resolved path and
+/// version, and the whole point of the check is that a support tool can see
+/// WHICH library was chosen (#187). A bare pass/fail with no detail is the
+/// documented diagnostic silently disappearing (#304 review), so this pins
+/// the detail's presence in the machine output on both verdicts: pass names
+/// the path and version, fail names the path and the refusal.
+#[test]
+fn doctor_onnxruntime_check_names_its_resolved_candidate() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["doctor", "--json"])
+        .env("IRLUME_SOCKET", "/nonexistent/irlume-doctor-ort-test.sock")
+        .output()
+        .expect("run irlume");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let check = document["data"]["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["id"] == "onnxruntime")
+        .cloned()
+        .expect("onnxruntime check present");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "onnxruntime must identify its resolved candidate and verdict: {check}"
+    );
+}
+
 #[test]
 fn login_status_json_lists_every_surface_by_service_name() {
     // The surface list is COMPLETE: services that do not exist on this machine

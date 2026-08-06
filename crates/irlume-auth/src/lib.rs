@@ -1206,7 +1206,7 @@ impl Engine {
     /// applications, keeps the capture LED lit, and would go stale across a
     /// suspend.
     fn assess_full(&mut self) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None)
+        self.assess_full_with(None, None)
     }
 
     /// [`Self::assess_full`], optionally reusing already-streaming cameras.
@@ -1216,6 +1216,7 @@ impl Engine {
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )>,
+        capture_mode: Option<(bool, &'static str)>,
     ) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
@@ -1240,7 +1241,14 @@ impl Engine {
         // brightness when both of its interfaces stream, the ASUS built-in keeps
         // all of it, and only a measurement on the actual camera can tell which
         // kind is plugged in.
-        let (sequential, mode_source) = sequential_capture_selected(&self.rgb_dev);
+        // The caller's snapshot when sessions are HELD, a fresh read only when
+        // this call opens one-shot. Two reads of cameras.conf around one held
+        // capture are a check-to-act window (#313 review): the first read
+        // arms both streams for concurrent, a config write lands, and the
+        // second read orders "sequential" reads over two already-live
+        // streams, the exact state the mode exists to prevent.
+        let (sequential, mode_source) =
+            capture_mode.unwrap_or_else(|| sequential_capture_selected(&self.rgb_dev));
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
         // guessing this measurement work exists to remove.
@@ -2830,7 +2838,12 @@ impl Engine {
             );
         } else if let Some((r, i)) = &cams {
             if let (Ok(mut rs), Ok(mut is)) = (r.session(), i.session()) {
-                return self.capture_scan_loop(want, pitch_neutral, Some((&mut rs, &mut is)));
+                return self.capture_scan_loop(
+                    want,
+                    pitch_neutral,
+                    Some((&mut rs, &mut is)),
+                    Some((sequential, mode_source)),
+                );
             }
         }
         // No held session. RELEASE THE DEVICES FIRST. The per-frame path below
@@ -2844,7 +2857,11 @@ impl Engine {
         irlume_common::dlog!(
             "enroll: capturing per-frame (no held camera session; released the devices first)"
         );
-        self.capture_scan_loop(want, pitch_neutral, None)
+        // The same snapshot as the held path: one enrollment, one policy. A
+        // config flip mid-loop would otherwise change the one-shot capture
+        // shape between scans, which on a starvation-prone camera turns some
+        // scans into the failure the stored mode exists to avoid.
+        self.capture_scan_loop(want, pitch_neutral, None, Some((sequential, mode_source)))
     }
 
     /// The enrolment capture loop, over held streams when `sessions` is given
@@ -2861,6 +2878,7 @@ impl Engine {
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )>,
+        capture_mode: Option<(bool, &'static str)>,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
         let mut out = Vec::new();
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
@@ -2879,7 +2897,7 @@ impl Engine {
                 ));
             }
             let a = match &mut sessions {
-                Some((rs, is)) => self.assess_full_with(Some((rs, is)))?,
+                Some((rs, is)) => self.assess_full_with(Some((rs, is)), capture_mode)?,
                 None => self.assess()?,
             };
             // Authoritative capture gate: LIVE *and* squarely frontal. The guided

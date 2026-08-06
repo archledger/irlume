@@ -1453,15 +1453,39 @@ fn wire_service(
                 );
             }
             let current = read(s.etc)?;
-            // Rebuild from the pristine stock: the backup if we've wired before,
-            // else the current file, then strip any irlume lines and re-apply.
+            // Rebuild from the CURRENT file with irlume's own lines stripped,
+            // not from the backup.
+            //
+            // Taking the backup as origin discarded every change made to the
+            // stack after irlume first wired it. A distro update that adds
+            // `pam_faillock` lines is the ordinary case, and re-running
+            // `login enable --apply` deleted them: a security control removed
+            // with no mention, from a command whose stated job is to add a
+            // line. The tail risk is worse than that, since a months-old backup
+            // can name a module the system no longer ships, which is a stack
+            // that denies every login.
+            //
+            // Stripping is a complete inverse: `unwire_lines` matches irlume's
+            // module on the PAM directive and its landing lines on irlume's own
+            // comment tags, so it removes what irlume added and nothing else.
+            // The disable path already refuses to restore a backup that no
+            // longer matches the stripped current file, for this same reason.
             let bak = PathBuf::from(format!("{}{BACKUP}", s.etc));
-            let origin = if bak.exists() {
-                read(&bak.to_string_lossy())?
-            } else {
-                current.clone()
-            };
-            let (base, _) = unwire_lines(&origin);
+            let (base, _) = unwire_lines(&current);
+            // Say so when the stack has moved since irlume wired it. Not a
+            // failure: the rebuild above already keeps the change. The operator
+            // should know their backup no longer describes the file.
+            if bak.exists() {
+                if let Ok(bak_content) = read(&bak.to_string_lossy()) {
+                    if bak_content.trim() != base.trim() {
+                        eprintln!(
+                            "[login] note: {} changed since irlume first wired it; keeping \
+                             those changes and re-applying irlume's lines on top",
+                            s.etc
+                        );
+                    }
+                }
+            }
             let (wired, changed) = wire(&base);
             if !changed {
                 return out(
@@ -1643,6 +1667,41 @@ fn effective_uid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// Re-wiring rebuilds from the CURRENT file stripped of irlume's lines, not
+    /// from the `.pre-irlume` backup.
+    ///
+    /// Taking the backup as origin discarded every change made to the stack
+    /// after irlume first wired it. A distro update adding `pam_faillock` is the
+    /// ordinary case, and `login enable --apply` then deleted it: a security
+    /// control removed without a word, by a command whose job is to add a line.
+    /// This pins the property the rebuild rests on, that stripping is a complete
+    /// inverse which touches irlume's lines and nothing else.
+    #[test]
+    fn stripping_a_wired_stack_keeps_what_the_distro_added_later() {
+        let stock = "auth       required     pam_env.so\n                     auth       sufficient   pam_unix.so try_first_pass nullok\n";
+        let (wired, changed) = wire_greeter_impl(stock, true, true, false);
+        assert!(changed, "the fixture must actually wire");
+
+        // The distro later adds faillock above and below, as it does on a real
+        // update; irlume never saw these lines and has no backup containing them.
+        let after_update = wired.replace(
+            "auth       required     pam_env.so",
+            "auth       required     pam_faillock.so preauth\n             auth       required     pam_env.so",
+        ) + "account    required     pam_faillock.so\n";
+
+        let (base, _) = super::unwire_lines(&after_update);
+        assert!(
+            base.contains("pam_faillock.so preauth")
+                && base.contains("account    required     pam_faillock.so"),
+            "stripping must keep every line irlume did not add: {base}"
+        );
+        assert!(
+            !base.contains("pam_irlume.so"),
+            "and must remove every line irlume did add: {base}"
+        );
+        assert!(base.contains("pam_unix.so"), "{base}");
+    }
 
     /// `flock` is per open file description, so a second `lock_pam()` from the
     /// SAME process blocks on the first one forever rather than succeeding.

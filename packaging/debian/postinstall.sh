@@ -44,6 +44,16 @@ if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
     systemctl enable --now irlume-reconcile.timer 2>/dev/null || true
     : > /var/lib/irlume/.reconcile-timer-armed
 fi
+# Run one reconcile on UPGRADE too. The block above is fresh-install only, and
+# its comment claimed the run made "an upgrade adopt an already-wired install"
+# while sitting inside the branch an upgrade never takes: traced against the
+# built package, `configure 0.8.1` called daemon-reload, is-enabled,
+# enable-socket and try-restart, and no reconcile. Fedora's %post and Arch's
+# post_upgrade both run it. It self-gates on the login.wired marker, so it is a
+# no-op on a box that never wired login.
+if [ -n "${2:-}" ]; then
+    systemctl start irlume-reconcile.service 2>/dev/null || true
+fi
 # Upgrading from a version without the socket unit.
 if systemctl is-enabled --quiet irlumed.service 2>/dev/null; then
     systemctl enable --now irlumed.socket 2>/dev/null || true

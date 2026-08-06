@@ -1,0 +1,45 @@
+Third-party components inside libtensorflowlite_c.so
+====================================================
+
+irlume ships a prebuilt TensorFlow Lite C runtime at
+/usr/share/irlume/tflite/libtensorflowlite_c.so. It is built by
+scripts/build-tflite-runtime.sh from TensorFlow v2.19.0, commit
+e36baa302922ea3c7131b302c2996bd2051ee5c4, and the Apache-2.0 licence of the
+TensorFlow sources ships beside it as LICENSE.tensorflow.
+
+That licence does not cover everything in the file. The build statically links
+several other projects, so their notices belong with the binary too. The list
+below was taken from the shipped library itself, by reading the symbol and
+string tables of the published artifact
+(libtensorflowlite_c-v2.19.0-linux-x64.tar.gz, sha256
+dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311), not from
+TensorFlow's dependency manifest, so it reflects what is actually present:
+
+  XNNPACK        https://github.com/google/XNNPACK
+  ruy            https://github.com/google/ruy
+  Eigen          https://gitlab.com/libeigen/eigen
+  FlatBuffers    https://github.com/google/flatbuffers
+  gemmlowp       https://github.com/google/gemmlowp
+  Abseil         https://github.com/abseil/abseil-cpp
+  cpuinfo        https://github.com/pytorch/cpuinfo
+  pthreadpool    https://github.com/google/pthreadpool
+  fft2d          https://www.kurims.kyoto-u.ac.jp/~ooura/fft.html
+
+Each project's licence text is in the TensorFlow source tree at the pinned
+commit, under third_party/ and the bazel external workspace it fetches. To read
+the exact texts that correspond to this binary, check out that commit:
+
+  git clone https://github.com/tensorflow/tensorflow
+  git -C tensorflow checkout e36baa302922ea3c7131b302c2996bd2051ee5c4
+
+Note for redistributors: these are not all the same licence. Eigen is primarily
+MPL-2.0, which carries source-availability obligations that Apache-2.0 does not,
+and the others are a mix of Apache-2.0, BSD and MIT variants. If you
+redistribute this library, satisfy each licence, not just TensorFlow's.
+
+Known gap, recorded rather than hidden: the ideal fix is for
+scripts/build-tflite-runtime.sh to copy these licence texts into the published
+tarball, so the notices travel with the artifact instead of with the packaging.
+Doing that changes the tarball and therefore its sha256, which is pinned in four
+packaging lanes, so it is a change for the next runtime rebuild rather than a
+same-day edit to a released artifact.

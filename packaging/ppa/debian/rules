@@ -62,6 +62,7 @@ override_dh_auto_install:
 	install -m0755 tflite-prebuilt/lib/libtensorflowlite_c.so debian/irlume/usr/share/irlume/tflite/
 	install -m0644 tflite-prebuilt/LICENSE.tensorflow debian/irlume/usr/share/irlume/tflite/
 	install -m0644 tflite-prebuilt/PROVENANCE debian/irlume/usr/share/irlume/tflite/
+	install -m0644 packaging/licenses/THIRD-PARTY-NOTICES.tflite debian/irlume/usr/share/irlume/tflite/THIRD-PARTY-NOTICES
 	install -D -m0644 packaging/systemd/irlumed.service \
 		debian/irlume/usr/lib/systemd/system/irlumed.service
 	# Makes /run/irlume.sock exist before the greeter authenticates (#244).

@@ -13,6 +13,19 @@ License: Apache-2.0
 Comment: TensorFlow Lite C runtime built from TensorFlow v2.19.0,
  commit e36baa302922ea3c7131b302c2996bd2051ee5c4, by
  scripts/build-tflite-runtime.sh. https://github.com/tensorflow/tensorflow
+ .
+ libtensorflowlite_c.so statically links further components whose licences
+ are NOT Apache-2.0: Eigen (MPL-2.0), XNNPACK, ruy, farmhash and fft2d
+ (BSD/MIT/Apache-2.0 variants). Their notices ship beside the library at
+ /usr/share/irlume/tflite/THIRD-PARTY-NOTICES; this stanza covers the
+ TensorFlow sources only.
+
+Files: models/blaze_face_short_range.onnx
+Copyright: 2020-2023 The MediaPipe Authors
+License: Apache-2.0
+Comment: MediaPipe BlazeFace (short range) detector, converted to ONNX.
+ Without this stanza the file fell under `Files: *` above and was declared
+ GPL-3.0+, which is not its licence.
 
 Files: models/glintr100.onnx
 Copyright: fal.ai (AuraFace)

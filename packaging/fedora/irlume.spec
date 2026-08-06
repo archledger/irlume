@@ -133,6 +133,9 @@ install -d %{buildroot}%{_datadir}/%{name}/tflite
 install -m0755 libtensorflowlite_c-%{tflite_ver}-linux-x64/lib/libtensorflowlite_c.so %{buildroot}%{_datadir}/%{name}/tflite/libtensorflowlite_c.so
 install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/LICENSE.tensorflow %{buildroot}%{_datadir}/%{name}/tflite/LICENSE.tensorflow
 install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/PROVENANCE %{buildroot}%{_datadir}/%{name}/tflite/PROVENANCE
+# Not all of libtensorflowlite_c.so is Apache-2.0: it statically links Eigen
+# (MPL-2.0), XNNPACK, ruy and others. Name them beside the library.
+install -m0644 packaging/licenses/THIRD-PARTY-NOTICES.tflite %{buildroot}%{_datadir}/%{name}/tflite/THIRD-PARTY-NOTICES
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
 # Preset: the daemon is enabled on install (see %%post); it only serves a local

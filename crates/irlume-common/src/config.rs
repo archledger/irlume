@@ -102,7 +102,6 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
 /// Insert or update `key=value`, preserving every other line (including
 /// comments) and dropping duplicate keys. Creates the file at 0600 if absent.
 pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let path = config_path(file);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -131,21 +130,14 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
         out.push_str(&format!("{key}={val}\n"));
     }
 
-    // Create with mode 0600 so the file is never briefly world-readable in the
-    // window between write and chmod (umask can only clear bits, so 0600 stays
-    // at most 0600); set_permissions still normalizes an already-existing file.
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
-    f.write_all(out.as_bytes())?;
-    f.flush()?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    // Published atomically, not truncated in place. Truncate-then-write means a
+    // full disk or a power loss mid-write leaves a partial file, and these hold
+    // the camera binding and the third-party model selection: on a full tmpfs
+    // this left cameras.conf as 4096 bytes of half a config. `write_0600_atomic`
+    // creates the temp at the final mode, fsyncs it, renames, then fsyncs the
+    // directory, so a reader sees either the whole old file or the whole new
+    // one, and the same helper already protects the envelopes and template keys.
+    crate::write_0600_atomic(&path, out.as_bytes())
 }
 
 /// The settings.conf key for the credential-release temporal-liveness gate.

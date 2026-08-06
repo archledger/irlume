@@ -182,7 +182,12 @@ pub(crate) fn write_wired_marker(
     // plantable by a non-root user, since reconcile trusts its with_sudo flag.
     // A silent failure would leave self-heal disabled without the user knowing,
     // so warn rather than swallow it.
-    if let Err(e) = irlume_common::write_0600(&path, body.as_bytes()) {
+    // Atomic: a short write here reads back as all-false (see
+    // `read_wired_marker`), which silently drops the sudo, polkit and lock
+    // scopes from the self-heal. Reproduced on a full filesystem, where the
+    // truncating helper left 4096 bytes of a partial marker while the atomic
+    // one left the previous marker intact.
+    if let Err(e) = irlume_common::write_0600_atomic(&path, body.as_bytes()) {
         eprintln!(
             "[login] warning: could not write the self-heal marker {}: {e}\n\
              [login] automatic re-wiring after a distro PAM update will not run.",

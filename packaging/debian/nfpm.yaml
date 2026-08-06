@@ -72,6 +72,8 @@ contents:
     dst: /usr/share/irlume/tflite/libtensorflowlite_c.so
   - src: ../../.deb-staging/tflite/LICENSE.tensorflow
     dst: /usr/share/irlume/tflite/LICENSE.tensorflow
+  - src: ../licenses/THIRD-PARTY-NOTICES.tflite
+    dst: /usr/share/irlume/tflite/THIRD-PARTY-NOTICES
   - src: ../../.deb-staging/tflite/PROVENANCE
     dst: /usr/share/irlume/tflite/PROVENANCE
   # systemd unit + an override pointing ORT at the bundled lib

@@ -14,3 +14,10 @@ enable irlume-reconcile.path
 # Backstop for the path unit, which does not see a file replaced by rename
 # (measured: `sed -i` triggers nothing). Same reconcile, on a schedule.
 enable irlume-reconcile.timer
+# The boot-time trigger. It carries WantedBy=multi-user.target, and Fedora's
+# default preset disables everything not listed here, so leaving it out meant
+# `systemctl enable` never created the symlink and the at-boot reconcile never
+# ran on Fedora: measured as `disabled` on a fresh install while the .deb had it
+# enabled. That is the trigger that catches a PAM strip applied while the
+# machine was off, which the 30-minute timer only bounds after the fact.
+enable irlume-reconcile.service

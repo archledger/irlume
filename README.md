@@ -14,6 +14,7 @@ IR camera. Stored as an embedding, never an image. Password always works.
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/archledger/irlume/badge)](https://scorecard.dev/viewer/?uri=github.com/archledger/irlume)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
+[![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](docs/FAQ.md)
 
 **[Setup](docs/SETUP.md)** · **[Commands](docs/COMMANDS.md)** · **[Limits](docs/LIMITATIONS.md)** · **[FAQ](docs/FAQ.md)** · **[All docs](docs/)**
 

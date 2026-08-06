@@ -1019,7 +1019,7 @@ mod onnx {
     /// Rescue-path detection threshold (same operating point as the bench).
     pub const BLAZE_SCORE_THRESHOLD: f32 = 0.5;
 
-    fn blaze_anchors() -> Vec<(f32, f32)> {
+    pub fn blaze_anchors() -> Vec<(f32, f32)> {
         let mut a = Vec::with_capacity(896);
         for (cells, per_cell) in [(16usize, 2usize), (8, 6)] {
             for r in 0..cells {
@@ -1055,26 +1055,20 @@ mod onnx {
             &mut self,
             frame: &align::RgbView,
         ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
+            self.detect_top_at(frame, BLAZE_SCORE_THRESHOLD)
+        }
+
+        /// Same decode at an explicit floor, for measurement harnesses that
+        /// need sub-threshold scores (the `FullRangeBlaze::detect_top_at`
+        /// pattern). Production callers use [`Self::detect_top`].
+        pub fn detect_top_at(
+            &mut self,
+            frame: &align::RgbView,
+            floor: f32,
+        ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
             let side = frame.width.max(frame.height) as f32;
-            let n = BLAZE_INPUT;
-            let mut data = vec![0.0f32; n * n * 3];
-            for oy in 0..n {
-                for ox in 0..n {
-                    let sx = (ox as f32 + 0.5) / n as f32 * side;
-                    let sy = (oy as f32 + 0.5) / n as f32 * side;
-                    // Zero-pad outside the frame (letterbox), matching the
-                    // parity reference exactly.
-                    if sx >= frame.width as f32 || sy >= frame.height as f32 {
-                        continue;
-                    }
-                    let p = frame.sample_bilinear(sx, sy);
-                    let i = (oy * n + ox) * 3;
-                    data[i] = (p[0] - 127.5) / 127.5;
-                    data[i + 1] = (p[1] - 127.5) / 127.5;
-                    data[i + 2] = (p[2] - 127.5) / 127.5;
-                }
-            }
-            let s = n as i64;
+            let data = blaze_letterbox_input(frame);
+            let s = BLAZE_INPUT as i64;
             let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             // Identify the two heads by length (order-agnostic).
@@ -1090,36 +1084,81 @@ mod onnx {
             let (Some(reg), Some(cls)) = (reg, cls) else {
                 return Err(err("blaze: unexpected output tensors"));
             };
-            let (mut best_i, mut best_s) = (0usize, f32::NEG_INFINITY);
-            for (i, &logit) in cls.iter().enumerate() {
-                let sc = 1.0 / (1.0 + (-logit.clamp(-100.0, 100.0)).exp());
-                if sc > best_s {
-                    best_s = sc;
-                    best_i = i;
-                }
-            }
-            if best_s < BLAZE_SCORE_THRESHOLD {
+            let Some((unit, score)) = decode_short_range_best(&reg, &cls, &self.anchors, floor)
+            else {
                 return Ok(None);
-            }
-            let r = &reg[best_i * 16..best_i * 16 + 16];
-            let (ax, ay) = self.anchors[best_i];
-            let scale = BLAZE_INPUT as f32;
-            let (cx, cy) = (ax + r[0] / scale, ay + r[1] / scale);
-            let (bw, bh) = (r[2] / scale, r[3] / scale);
-            let bbox = [
-                (cx - bw / 2.0) * side,
-                (cy - bh / 2.0) * side,
-                (cx + bw / 2.0) * side,
-                (cy + bh / 2.0) * side,
-            ];
-            // A NaN regressor with a finite logit decodes into a NaN box that
-            // the mesh refine step would then sample. Same rule as the YuNet
-            // path's `detection_is_finite` retain: no face beats a non-face.
-            if !bbox.iter().all(|v| v.is_finite()) {
-                return Ok(None);
-            }
-            Ok(Some((bbox, best_s)))
+            };
+            Ok(Some((
+                [
+                    unit[0] * side,
+                    unit[1] * side,
+                    unit[2] * side,
+                    unit[3] * side,
+                ],
+                score,
+            )))
         }
+    }
+
+    /// Resize+letterbox an RGB frame into the BlazeFace 128x128x3 RGB NHWC
+    /// `[-1,1]` input tensor (zero-padded square). Pure and shared with the
+    /// native-runtime parity harness so both runtimes eat the IDENTICAL
+    /// tensor: any disagreement left is the weights', not the preprocessing's.
+    pub fn blaze_letterbox_input(frame: &align::RgbView) -> Vec<f32> {
+        let side = frame.width.max(frame.height) as f32;
+        let n = BLAZE_INPUT;
+        let mut data = vec![0.0f32; n * n * 3];
+        for oy in 0..n {
+            for ox in 0..n {
+                let sx = (ox as f32 + 0.5) / n as f32 * side;
+                let sy = (oy as f32 + 0.5) / n as f32 * side;
+                // Zero-pad outside the frame (letterbox), matching the
+                // parity reference exactly.
+                if sx >= frame.width as f32 || sy >= frame.height as f32 {
+                    continue;
+                }
+                let p = frame.sample_bilinear(sx, sy);
+                let i = (oy * n + ox) * 3;
+                data[i] = (p[0] - 127.5) / 127.5;
+                data[i + 1] = (p[1] - 127.5) / 127.5;
+                data[i + 2] = (p[2] - 127.5) / 127.5;
+            }
+        }
+        data
+    }
+
+    /// Best short-range SSD anchor above `floor`, decoded to a unit-letterbox
+    /// bbox (multiply by the letterbox side for frame pixels). Pure over the
+    /// two output heads so the ONNX path and the native-runtime parity
+    /// harness share ONE decode. A NaN regressor with a finite logit decodes
+    /// to `None`: no face beats a non-face, the `detection_is_finite` rule.
+    pub fn decode_short_range_best(
+        reg: &[f32],
+        cls: &[f32],
+        anchors: &[(f32, f32)],
+        floor: f32,
+    ) -> Option<([f32; 4], f32)> {
+        let (mut best_i, mut best_s) = (0usize, f32::NEG_INFINITY);
+        for (i, &logit) in cls.iter().enumerate() {
+            let sc = 1.0 / (1.0 + (-logit.clamp(-100.0, 100.0)).exp());
+            if sc > best_s {
+                best_s = sc;
+                best_i = i;
+            }
+        }
+        if best_s < floor {
+            return None;
+        }
+        let r = &reg[best_i * 16..best_i * 16 + 16];
+        let (ax, ay) = anchors[best_i];
+        let scale = BLAZE_INPUT as f32;
+        let (cx, cy) = (ax + r[0] / scale, ay + r[1] / scale);
+        let (bw, bh) = (r[2] / scale, r[3] / scale);
+        let bbox = [cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0];
+        if !bbox.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        Some((bbox, best_s))
     }
 
     /// Resize+letterbox an RGB frame into a BGR, raw 0–255, NCHW input tensor for
@@ -1489,10 +1528,60 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    eye_ear, map_checked_mesh_output, mesh_box_valid, mesh_min_ear, mesh_output_plausible,
+    blaze_anchors, blaze_letterbox_input, decode_short_range_best, eye_ear,
+    map_checked_mesh_output, mesh_box_valid, mesh_min_ear, mesh_output_plausible,
     runtime_resolution, selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder,
-    FaceMesh, PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    FaceMesh, PadIr, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N,
+    MESH_N_IRIS,
 };
+
+/// Pure decode tests for the short-range head: the reject half (floor, NaN)
+/// and the apply half (known regressors decode to the arithmetic's bbox)
+/// each get their own observation, so a mutant that ignores one half cannot
+/// pass on the other's assertions.
+#[cfg(test)]
+#[cfg(feature = "onnx")]
+mod short_range_decode_tests {
+    use super::{blaze_anchors, decode_short_range_best};
+
+    fn heads_with(best: usize, logit: f32, reg4: [f32; 4]) -> (Vec<f32>, Vec<f32>) {
+        let mut cls = vec![-100.0f32; 896];
+        cls[best] = logit;
+        let mut reg = vec![0.0f32; 896 * 16];
+        reg[best * 16..best * 16 + 4].copy_from_slice(&reg4);
+        (reg, cls)
+    }
+
+    #[test]
+    fn above_floor_decodes_the_best_anchor_to_the_expected_unit_bbox() {
+        let anchors = blaze_anchors();
+        // Nonzero index so a decode that hardcodes anchor 0 fails.
+        let (reg, cls) = heads_with(17, 2.0, [16.0, 16.0, 32.0, 32.0]);
+        let (bbox, score) =
+            decode_short_range_best(&reg, &cls, &anchors, 0.5).expect("above floor");
+        let sigmoid2 = 1.0 / (1.0 + (-2.0f32).exp());
+        assert!((score - sigmoid2).abs() < 1e-6, "score {score}");
+        let (ax, ay) = anchors[17];
+        let want = [ax + 0.125 - 0.125, ay + 0.125 - 0.125, ax + 0.25, ay + 0.25];
+        for (got, want) in bbox.iter().zip(want) {
+            assert!((got - want).abs() < 1e-6, "bbox {bbox:?}");
+        }
+    }
+
+    #[test]
+    fn floor_above_the_best_score_rejects() {
+        let anchors = blaze_anchors();
+        let (reg, cls) = heads_with(17, 2.0, [16.0, 16.0, 32.0, 32.0]);
+        assert!(decode_short_range_best(&reg, &cls, &anchors, 0.9).is_none());
+    }
+
+    #[test]
+    fn nan_regressor_with_finite_logit_rejects() {
+        let anchors = blaze_anchors();
+        let (reg, cls) = heads_with(17, 2.0, [f32::NAN, 16.0, 32.0, 32.0]);
+        assert!(decode_short_range_best(&reg, &cls, &anchors, 0.5).is_none());
+    }
+}
 
 /// Model-backed pipeline tests: run the REAL shipped ONNX models (fetched to
 /// `models/` at the repo root by scripts/fetch-models.sh) on synthetic frames, asserting output

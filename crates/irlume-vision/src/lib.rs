@@ -1138,6 +1138,15 @@ mod onnx {
         anchors: &[(f32, f32)],
         floor: f32,
     ) -> Option<([f32; 4], f32)> {
+        // A public pure function cannot rely on its callers' tensor-length
+        // checks: mismatched heads decode to nothing, not to a panic (and a
+        // non-finite floor would compare as always-passing below).
+        if !floor.is_finite() || cls.is_empty() || cls.len() != anchors.len() {
+            return None;
+        }
+        if reg.len() != cls.len().checked_mul(16)? {
+            return None;
+        }
         let (mut best_i, mut best_s) = (0usize, f32::NEG_INFINITY);
         for (i, &logit) in cls.iter().enumerate() {
             let sc = 1.0 / (1.0 + (-logit.clamp(-100.0, 100.0)).exp());
@@ -1580,6 +1589,20 @@ mod short_range_decode_tests {
         let anchors = blaze_anchors();
         let (reg, cls) = heads_with(17, 2.0, [f32::NAN, 16.0, 32.0, 32.0]);
         assert!(decode_short_range_best(&reg, &cls, &anchors, 0.5).is_none());
+    }
+
+    /// The public decode must reject malformed tensor contracts instead of
+    /// panicking (#314 review): each guard gets the input that would have
+    /// indexed out of bounds or made the floor vacuous.
+    #[test]
+    fn malformed_contracts_reject_instead_of_panicking() {
+        let anchors = blaze_anchors();
+        let (reg, cls) = heads_with(17, 2.0, [16.0, 16.0, 32.0, 32.0]);
+        assert!(decode_short_range_best(&reg, &[], &anchors, 0.5).is_none());
+        assert!(decode_short_range_best(&reg[..16 * 100], &cls, &anchors, 0.5).is_none());
+        assert!(decode_short_range_best(&reg, &cls[..100], &anchors, 0.5).is_none());
+        assert!(decode_short_range_best(&reg, &cls, &anchors, f32::NAN).is_none());
+        assert!(decode_short_range_best(&reg, &cls, &anchors, 0.5).is_some());
     }
 }
 

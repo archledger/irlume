@@ -279,12 +279,16 @@ fn main() {
         380, 381, 382, 384, 385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454,
         466, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
     ];
-    let mut input = Vec::with_capacity(SUBSET.len() * 2);
-    for &i in &SUBSET {
-        input.push(lm[i].0);
-        input.push(lm[i].1);
-    }
     bench("blendshapes", "face_blendshapes", "tflite", 1, || {
+        // Input construction is per-frame work in production, so it stays
+        // inside the timed closure (#314 review: the module contract says
+        // preprocessing included, and the upstream graph rebuilds this
+        // tensor on every invocation).
+        let mut input = Vec::with_capacity(SUBSET.len() * 2);
+        for &i in &SUBSET {
+            input.push(lm[i].0);
+            input.push(lm[i].1);
+        }
         let outputs = blend.run_f32(&input).expect("blendshapes");
         let s = outputs
             .iter()

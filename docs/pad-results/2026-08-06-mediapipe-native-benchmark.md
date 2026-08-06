@@ -2,8 +2,12 @@
 
 Date: 2026-08-06. Machine: ASUS Zenbook S 14, Intel Core Ultra 7 258V, 8 CPUs,
 Fedora 44, bundled TFLite runtime v2.19.0 (`/usr/share/irlume/tflite/`).
-Corpus: the committed 2026-08-05 stage-3 set, 512 frames (223 with an accepted
-YuNet face), both cameras (Zenbook internal, NexiGo N930W).
+Corpus: the 2026-08-05 stage-3 set, 512 frames (223 with an accepted YuNet
+face), both cameras (Zenbook internal, NexiGo N930W). The frames live outside
+the repository; their contents are pinned by
+`2026-08-05-stage3-corpus.sha256`, and both new harnesses verify every frame
+against that manifest and refuse on any difference, so the gates bind to this
+exact evidence rather than to frame counts.
 
 This closes the question the 0.9.0 cycle opened: irlume can now run Google's
 published `.tflite` artifacts unconverted (#295), so every MediaPipe model
@@ -55,24 +59,31 @@ iterations after 10 warmup (`2026-08-06-mp-latency-zenbook.csv`):
 
 | Stage call | Runtime | Threads | Mean ms | p50 | p95 |
 |---|---|---|---|---|---|
-| YuNet detect | ort | default | 14.32 | 8.93 | 29.73 |
-| Short-range Blaze | ort | default | 3.13 | 2.35 | 6.37 |
-| Short-range Blaze | tflite | 1 | 2.24 | 2.13 | 2.42 |
-| Short-range Blaze | tflite | 2 | 1.46 | 1.38 | 1.82 |
-| Short-range Blaze | tflite | 4 | 1.23 | 1.20 | 1.47 |
-| Full-range Blaze | tflite | 2 | 4.11 | 4.07 | 4.43 |
-| Mesh 468 (shipped) | ort | default | 7.62 | 7.37 | 9.01 |
-| Mesh 478 (native) | tflite | 1 | 7.99 | 7.94 | 8.28 |
-| Mesh 478 (native) | tflite | 2 | 5.85 | 5.74 | 6.98 |
-| Mesh 478 (native) | tflite | 4 | 4.29 | 4.17 | 5.67 |
-| Blendshapes | tflite | 1 | 1.76 | 1.71 | 1.83 |
+| YuNet detect | ort | default | 13.12 | 12.10 | 23.67 |
+| Short-range Blaze | ort | default | 4.23 | 3.16 | 11.89 |
+| Short-range Blaze | tflite | 1 | 2.56 | 2.27 | 4.02 |
+| Short-range Blaze | tflite | 2 | 2.77 | 1.98 | 4.65 |
+| Short-range Blaze | tflite | 4 | 1.23 | 1.21 | 1.50 |
+| Full-range Blaze | tflite | 2 | 4.29 | 4.20 | 5.23 |
+| Mesh 468 (shipped) | ort | default | 10.34 | 9.90 | 15.53 |
+| Mesh 478 (native) | tflite | 1 | 8.28 | 8.02 | 9.51 |
+| Mesh 478 (native) | tflite | 2 | 5.79 | 5.69 | 6.96 |
+| Mesh 478 (native) | tflite | 4 | 3.92 | 3.85 | 4.65 |
+| Blendshapes | tflite | 1 | 1.72 | 1.71 | 1.77 |
 
-Google's own reference for short-range Blaze is 2.94ms on a Pixel 6 CPU (Face
-Detector solution page); the native runtime here lands in the same band. The
-tflite rows also sit visibly tighter between p50 and p95 than the ort rows on
-this machine.
+Blendshapes timing includes per-frame input-tensor construction (#314
+review; the upstream graph rebuilds that tensor every invocation). Google's
+own reference for short-range Blaze is 2.94ms on a Pixel 6 CPU (Face
+Detector solution page); the native runtime here lands in the same band.
 
-## Blendshapes: first contact, and it tracks the production EAR cue
+One repeatability caveat, learned by running the bench twice: the ort means
+moved between runs on this machine (mesh 7.62 to 10.34ms, short-range Blaze
+3.13 to 4.23ms) while every tflite row held within its own p95. The safe
+cross-runtime claim is therefore not a single percentage but a direction:
+the native mesh at 2 threads was faster than the ONNX mesh in both runs,
+with a visibly tighter p50-to-p95 band.
+
+## Blendshapes: open-eye behavior and runtime
 
 Harness: `crates/irlume-auth/examples/blendshapes_probe.rs`. Contract read
 from `face_blendshapes_graph.cc` in the MediaPipe source: input [1, 146, 2],
@@ -82,18 +93,21 @@ which only the 478-pt landmarker-generation mesh emits. The shipped 468-pt
 ONNX mesh cannot feed this model.
 
 Over the 223 accepted corpus frames (`2026-08-06-blendshapes-probe.csv`),
-per-frame `max(eyeBlinkLeft, eyeBlinkRight)` against irlume's production
-`min(EAR)` gives Pearson r = -0.938: eye narrowing raises the blink
-coefficient exactly as it lowers EAR. All 52 outputs stayed finite on every
-frame. On this all-eyes-open corpus the blink coefficient never exceeded
-0.37 in any segment mean; RGB segments sit at 0.04 to 0.21, IR runs higher
-(0.13 to 0.37), and glasses-on IR is the worst case (0.32 to 0.37), the same
-conditions that degrade EAR.
+pooled per-frame `max(eyeBlinkLeft, eyeBlinkRight)` against irlume's
+production `min(EAR)` gives Pearson r = -0.938. This is an observational
+correlation across changing cameras, illumination, glasses, pose, and mesh
+quality; the corpus contains no controlled eyelid closures, so the number
+cannot distinguish a blink cue from a shared image-condition artifact
+driving both readings, and it establishes neither blink sensitivity nor
+liveness value. All 52 outputs stayed finite on every frame.
 
-What this corpus cannot answer: open/closed separation. It holds no
-closed-eye frames, so the margin between a genuine blink and the 0.37
-worst-case open-eye reading is unmeasured. A blink capture session is the
-missing measurement, not more analysis.
+What the run does establish is an open-eye nuisance baseline a future
+labeled blink experiment must exceed: the blink coefficient never passed
+0.37 as a segment mean, with RGB segments at 0.04 to 0.21, IR at 0.13 to
+0.37, and glasses-on IR the worst case (0.32 to 0.37), the same conditions
+that degrade EAR. Any authentication use needs paired open/closed captures
+per camera, illumination, and glasses condition, with the threshold chosen
+on frames the evaluation never saw.
 
 ## Verdict, per pipeline stage
 
@@ -104,7 +118,8 @@ frames it drops.
 
 **Rescue detection: full-range is the measured winner, and the stage stays
 closed anyway.** Full-range detects 100% of the far-IR frames short-range
-misses 9 of 9 on (2026-08-05 bench) at an affordable 4.1ms against 1.5ms.
+misses 9 of 9 on (2026-08-05 bench) at an affordable 4.3ms against the
+short-range rows' 1.2 to 2.8ms.
 That ranking changes nothing today: the rescue slot is grant-capable, so
 flipping `Stage::Detection` open waits on an end-to-end false-grant corpus
 (prints, screens, other faces carried to the auth outcome), not on any
@@ -114,16 +129,18 @@ the exact mistake the #299 review caught.
 **Landmarks: switch to the native 478-pt .tflite.** The evidence is now
 complete on all three axes the decision needed. Fidelity: the two models
 agree to mean NME 6.9e-7, and both parity harnesses run as enforcing
-regression gates. Latency: native at 2 threads is 23% faster than the
-shipped ONNX (5.85ms vs 7.62ms mean), with a tighter tail; 2 threads matches
-the precedent `FullRangeBlaze` set. Supply chain: the switch deletes a
-conversion step nobody can reproduce from the shipped artifact alone and
-replaces it with Google's published file, byte-pinned, on the runtime irlume
-already bundles and verifies. It also unlocks the iris block the blendshapes
-model requires. Packaging cost: `face_landmarks_detector.tflite` (2.5MB)
-joins the model set on every lane, and the mesh loader grows a TFLite path
-behind the same pin discipline. Recommendation: do it as its own PR with the
-mesh_parity gate as the acceptance test.
+regression gates. Latency: native at 2 threads beat the shipped ONNX mesh in
+both bench runs (5.79 vs 10.34ms mean in the committed run; the ort mean
+moved between runs, the tflite mean did not) and holds a tighter tail; 2
+threads matches the precedent `FullRangeBlaze` set. Supply chain: the switch
+deletes a conversion step nobody can reproduce from the shipped artifact
+alone and replaces it with Google's published file, byte-pinned, on the
+runtime irlume already bundles and verifies. It also unlocks the iris block
+the blendshapes model requires. Packaging cost:
+`face_landmarks_detector.tflite` (2.5MB) joins the model set on every lane,
+and the mesh loader grows a TFLite path behind the same pin discipline.
+Recommendation: do it as its own PR with the mesh_parity gate as the
+acceptance test.
 
 **Short-range Blaze runtime: no move needed.** The conversion is proven
 faithful to 2e-6, so the ONNX copy is not a correctness risk. If the
@@ -131,11 +148,13 @@ landmarks switch lands and the rescue slot later moves to full-range, the
 ONNX blaze and its conversion step retire naturally; switching it alone buys
 1.7ms in a slot that only runs when YuNet already failed.
 
-**Blendshapes: promising, blocked twice.** 1.8ms, finite everywhere, r=-0.94
-against the production cue. As a consent-gesture or liveness signal it would
-need (1) the native-mesh switch, since it eats iris points the shipped mesh
-lacks, and (2) a blink corpus to measure open/closed separation before any
-threshold exists. Not a candidate for wiring until both exist.
+**Blendshapes: not evaluated as an authentication cue.** The model runs, at
+an affordable cost, and its open-eye baseline is now on record; no
+authentication conclusion follows from an all-open-eye corpus. Before it can
+even be evaluated as a consent-gesture or liveness signal it needs (1) the
+native-mesh switch, since it eats iris points the shipped mesh lacks, and
+(2) a labeled blink corpus with controlled eyelid closures. Both are filed;
+until then it is not a candidate for wiring.
 
 ## Not measured
 
@@ -145,3 +164,15 @@ threshold exists. Not a candidate for wiring until both exist.
   single-threaded, and a 2-thread production mesh should re-run the
   mesh_parity gate at its production thread count before shipping.
 - Full-range Blaze accuracy beyond the 2026-08-05 corpus; nothing new today.
+
+## Future optimization candidates, unbenchmarked
+
+- The sparse full-range Blaze variant on the Face Detector page claims a
+  roughly 60% smaller file, but its graph carries a Densify op the current
+  decoder path has never run; it would need its own parity gate.
+- Thread counts above 4 were not swept, and the 4-thread mesh numbers
+  already show diminishing returns against 2 (3.92ms vs 5.79ms mean for a
+  doubled thread budget).
+- Google publishes no quantized (int8) variants of these face models on the
+  solution pages, so the float16 files stay the only supply-chain-clean
+  option.

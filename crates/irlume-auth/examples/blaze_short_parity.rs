@@ -21,6 +21,7 @@
 //! shrinks turns the comparison into a vacuous pass over whatever survived).
 //!
 //! Usage: cargo run --release -p irlume-auth --example blaze_short_parity -- \
+//!   docs/pad-results/2026-08-05-stage3-corpus.sha256 \
 //!   <blaze_face_short_range.onnx> <blaze_face_short_range.tflite> \
 //!   <corpus_root>... > blaze-short-parity.csv
 //!   (IRLUME_TFLITE_LIB overrides the packaged libtensorflowlite_c.so)
@@ -28,6 +29,7 @@
 use irlume_vision::align::RgbView;
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{blaze_letterbox_input, decode_short_range_best, BlazeRescue, BLAZE_INPUT};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The shipped conversion, pinned to the repository's own `models/SHA256SUMS`.
@@ -59,10 +61,40 @@ const MAX_ALLOWED_SCORE_DELTA: f64 = 5.0e-6;
 /// at least this far below perfect, or the harness is measuring nothing.
 const SKEW_MAX_MEAN_IOU: f64 = 0.95;
 
-fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
+/// Load the committed corpus manifest, `sha256  camera/segment/kind/frame`
+/// per line. The run consumes it entry-for-entry, so a corpus swap that
+/// preserves the frame COUNTS still fails (#314 review: a count-only pin
+/// lets different evidence satisfy the bounds).
+fn load_manifest(path: &str) -> BTreeMap<String, String> {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: read manifest: {e}"));
+    let mut map = BTreeMap::new();
+    for (no, line) in text.lines().enumerate() {
+        let (sha, rel) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("{path}:{}: expected '<sha256>  <path>'", no + 1));
+        assert_eq!(sha.len(), 64, "{path}:{}: invalid sha256", no + 1);
+        assert!(
+            map.insert(rel.to_string(), sha.to_string()).is_none(),
+            "{path}:{}: duplicate entry {rel}",
+            no + 1
+        );
+    }
+    map
+}
+
+/// Check one frame's bytes against the manifest and consume its entry.
+fn consume_manifest_entry(manifest: &mut BTreeMap<String, String>, rel: &str, bytes: &[u8]) {
+    let expected = manifest
+        .remove(rel)
+        .unwrap_or_else(|| panic!("{rel}: not in the corpus manifest"));
+    let actual = irlume_common::thirdparty::sha256_hex(bytes);
+    assert_eq!(actual, expected, "{rel}: content differs from the manifest");
+}
+
+fn read_pnm(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // Same lossy header parse as mesh_parity: the bytes after the header are
     // pixels, not UTF-8.
-    let data = std::fs::read(p).ok()?;
     let text = String::from_utf8_lossy(&data[..data.len().min(64)]);
     let mut it = text.split_ascii_whitespace();
     let magic = it.next()?;
@@ -195,14 +227,15 @@ fn native_detect(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (models, roots) = args.split_at(2.min(args.len()));
-    let [onnx_path, tflite_path] = models else {
+    let (fixed, roots) = args.split_at(3.min(args.len()));
+    let [manifest_path, onnx_path, tflite_path] = fixed else {
         panic!(
-            "usage: blaze_short_parity <blaze_face_short_range.onnx> \
-             <blaze_face_short_range.tflite> <corpus_root>..."
+            "usage: blaze_short_parity <corpus-manifest.sha256> \
+             <blaze_face_short_range.onnx> <blaze_face_short_range.tflite> <corpus_root>..."
         );
     };
     assert!(!roots.is_empty(), "at least one corpus root is required");
+    let mut manifest = load_manifest(manifest_path);
     let skew = parity_skew();
 
     let onnx_bytes = read_pinned(onnx_path, SHIPPED_ONNX_SHA256, "ONNX short-range blaze");
@@ -255,15 +288,23 @@ fn main() {
                 assert!(!files.is_empty(), "{}: no PNM frames", dir.display());
                 files.sort();
                 for f in files {
+                    let bytes = std::fs::read(&f)
+                        .unwrap_or_else(|e| panic!("{}: read frame: {e}", f.display()));
+                    let seg_name = seg.file_name().to_string_lossy().into_owned();
+                    let fname = f.file_name().unwrap().to_string_lossy().into_owned();
+                    consume_manifest_entry(
+                        &mut manifest,
+                        &format!("{cam}/{seg_name}/{sub}/{fname}"),
+                        &bytes,
+                    );
                     let (data, w, h) =
-                        read_pnm(&f).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
+                        read_pnm(&bytes).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
                     let view = RgbView {
                         data: &data,
                         width: w,
                         height: h,
                     };
-                    let seg_name = seg.file_name().to_string_lossy().into_owned();
-                    let name = format!("{sub}/{}", f.file_name().unwrap().to_string_lossy());
+                    let name = format!("{sub}/{fname}");
                     emitted += 1;
                     let side = w.max(h) as f32;
                     let input = blaze_letterbox_input(&view);
@@ -306,6 +347,11 @@ fn main() {
             }
         }
     }
+    assert!(
+        manifest.is_empty(),
+        "manifest entries never seen on disk: {:?}",
+        manifest.keys().take(4).collect::<Vec<_>>()
+    );
     assert_eq!(
         emitted, EXPECTED_EMITTED,
         "stage-3 corpus changed; update the pinned baseline deliberately"

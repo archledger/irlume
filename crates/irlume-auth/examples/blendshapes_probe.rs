@@ -18,12 +18,14 @@
 //! denormalized by image size).
 //!
 //! Usage: cargo run --release -p irlume-auth --example blendshapes_probe -- \
-//!   <yunet.onnx> <face_landmarks_detector.tflite> <face_blendshapes.tflite> \
+//!   docs/pad-results/2026-08-05-stage3-corpus.sha256 <yunet.onnx> \
+//!   <face_landmarks_detector.tflite> <face_blendshapes.tflite> \
 //!   <corpus_root>... > blendshapes-probe.csv
 
 use irlume_vision::align::RgbView;
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{eye_ear, map_checked_mesh_output, Detector, EAR_LEFT, EAR_RIGHT, MESH_N_IRIS};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Pins: repository YuNet, the face_landmarker.task's mesh (mesh_parity's
@@ -63,10 +65,40 @@ const EXPECTED_EMITTED: usize = 512;
 /// Matches mesh_parity's 223: same detector, same crop, same acceptance.
 const EXPECTED_COMPARED: usize = 223;
 
-fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
+/// Load the committed corpus manifest, `sha256  camera/segment/kind/frame`
+/// per line. The run consumes it entry-for-entry, so a corpus swap that
+/// preserves the frame COUNTS still fails (#314 review: a count-only pin
+/// lets different evidence satisfy the bounds).
+fn load_manifest(path: &str) -> BTreeMap<String, String> {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: read manifest: {e}"));
+    let mut map = BTreeMap::new();
+    for (no, line) in text.lines().enumerate() {
+        let (sha, rel) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("{path}:{}: expected '<sha256>  <path>'", no + 1));
+        assert_eq!(sha.len(), 64, "{path}:{}: invalid sha256", no + 1);
+        assert!(
+            map.insert(rel.to_string(), sha.to_string()).is_none(),
+            "{path}:{}: duplicate entry {rel}",
+            no + 1
+        );
+    }
+    map
+}
+
+/// Check one frame's bytes against the manifest and consume its entry.
+fn consume_manifest_entry(manifest: &mut BTreeMap<String, String>, rel: &str, bytes: &[u8]) {
+    let expected = manifest
+        .remove(rel)
+        .unwrap_or_else(|| panic!("{rel}: not in the corpus manifest"));
+    let actual = irlume_common::thirdparty::sha256_hex(bytes);
+    assert_eq!(actual, expected, "{rel}: content differs from the manifest");
+}
+
+fn read_pnm(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // Same lossy header parse as mesh_parity: the bytes after the header are
     // pixels, not UTF-8. 8-bit only.
-    let data = std::fs::read(p).ok()?;
     let text = String::from_utf8_lossy(&data[..data.len().min(64)]);
     let mut it = text.split_ascii_whitespace();
     let magic = it.next()?;
@@ -148,14 +180,15 @@ fn read_pinned(path: &str, expected: &str, label: &str) -> Vec<u8> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (models, roots) = args.split_at(3.min(args.len()));
-    let [det_path, mesh_path, blend_path] = models else {
+    let (fixed, roots) = args.split_at(4.min(args.len()));
+    let [manifest_path, det_path, mesh_path, blend_path] = fixed else {
         panic!(
-            "usage: blendshapes_probe <yunet.onnx> <face_landmarks_detector.tflite> \
-             <face_blendshapes.tflite> <corpus_root>..."
+            "usage: blendshapes_probe <corpus-manifest.sha256> <yunet.onnx> \
+             <face_landmarks_detector.tflite> <face_blendshapes.tflite> <corpus_root>..."
         );
     };
     assert!(!roots.is_empty(), "at least one corpus root is required");
+    let mut manifest = load_manifest(manifest_path);
 
     let det_bytes = read_pinned(det_path, SHIPPED_DETECTOR_SHA256, "detector");
     let mut det = Detector::load_from_memory(&det_bytes).expect("load detector");
@@ -212,15 +245,23 @@ fn main() {
                 assert!(!files.is_empty(), "{}: no PNM frames", dir.display());
                 files.sort();
                 for f in files {
+                    let bytes = std::fs::read(&f)
+                        .unwrap_or_else(|e| panic!("{}: read frame: {e}", f.display()));
+                    let seg_name = seg.file_name().to_string_lossy().into_owned();
+                    let fname = f.file_name().unwrap().to_string_lossy().into_owned();
+                    consume_manifest_entry(
+                        &mut manifest,
+                        &format!("{cam}/{seg_name}/{sub}/{fname}"),
+                        &bytes,
+                    );
                     let (data, w, h) =
-                        read_pnm(&f).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
+                        read_pnm(&bytes).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
                     let view = RgbView {
                         data: &data,
                         width: w,
                         height: h,
                     };
-                    let seg_name = seg.file_name().to_string_lossy().into_owned();
-                    let name = format!("{sub}/{}", f.file_name().unwrap().to_string_lossy());
+                    let name = format!("{sub}/{fname}");
                     emitted += 1;
                     let faces = det
                         .detect(&view)
@@ -290,6 +331,11 @@ fn main() {
     eprintln!(
         "emitted {emitted} rows; compared {compared}; \
          ear_min mean {mx:.4}; blink_max mean {my:.4}; pearson r {r:.4}"
+    );
+    assert!(
+        manifest.is_empty(),
+        "manifest entries never seen on disk: {:?}",
+        manifest.keys().take(4).collect::<Vec<_>>()
     );
     assert_eq!(
         emitted, EXPECTED_EMITTED,

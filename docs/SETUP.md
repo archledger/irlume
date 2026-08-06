@@ -1,6 +1,6 @@
 # Setting up irlume
 
-You've installed irlume (see the [README](../README.md#-install) for `dnf` /
+You've installed irlume (see the [README](../README.md#install) for `dnf` /
 `apt` / `pacman`). This guide takes you from there to a working face login.
 
 The package **starts the `irlumed` daemon for you**; nothing else is running or

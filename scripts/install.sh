@@ -215,7 +215,7 @@ main() {
         rm -rf "$(dirname "$deb")"
         ;;
       *)
-        die "unrecognised distro (ID=${ID:-?}). See the manual instructions at https://github.com/${REPO}#-install"
+        die "unrecognised distro (ID=${ID:-?}). See the manual instructions at https://github.com/${REPO}#install"
         ;;
     esac
   fi

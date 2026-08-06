@@ -4,15 +4,13 @@
 
 <br>
 
-**Your face unlocks Linux: login, `sudo`, the lock screen, and app prompts
-(Bitwarden, `pkexec`). Works in the dark, resists photo & screen spoofs, never
-stored as an image.**
+**Your face unlocks Linux: login, `sudo`, the lock screen, and app prompts like
+Bitwarden. Works in the dark. Your face is stored as a 512-D embedding, never as
+an image, encrypted under a TPM-sealed key.**
 
-Works with the camera you have: an **IR (Windows Hello) camera** unlocks the full
-secure tier, a **regular webcam** gives convenient screen unlock, and a
-**fingerprint reader** slots in as a companion factor.
-
-Windows Hello-style security for Linux, on a fully open, commercially clean stack.
+An **IR (Windows Hello) camera** gives the full secure tier; a **regular webcam**
+gives screen unlock; a **fingerprint reader** works alongside as a second factor.
+The password is always the fallback, and there is no lockout.
 
 <br>
 
@@ -23,447 +21,135 @@ Windows Hello-style security for Linux, on a fully open, commercially clean stac
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/archledger/irlume/badge)](https://scorecard.dev/viewer/?uri=github.com/archledger/irlume)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
-[![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](#-faq)
+[![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](docs/FAQ.md)
 
-[Install](#-install) · [How it works](#-how-it-works) · [Security](#-your-face-never-leaves-as-an-image) · [Limits](#-honest-limitations) · [FAQ](#-faq) · [Docs](docs/)
+[Install](#install) · [Limits](#honest-limitations) · [Docs](docs/) · [FAQ](docs/FAQ.md)
 
 <br>
 
-<img src="docs/assets/irlume-demo.gif" alt="irlume demo: one-line install, guided face enrollment in the TUI, wiring the greeter and lock screen, and opt-in face-sudo" width="720">
-
-<sub>From a one-line install to a wired face login: guided face enrollment in the TUI, greeter and lock-screen wiring, and opt-in face-<code>sudo</code>.</sub>
+<img src="docs/assets/irlume-demo.gif" alt="irlume demo: install, guided face enrollment in the TUI, wiring the greeter and lock screen, and opt-in face-sudo" width="720">
 
 </div>
 
 ---
 
-## ✨ What you get
+> [!IMPORTANT]
+> **A printed photograph of an enrolled face passes the built-in liveness gate.**
+> Not occasionally: a life-size glossy print was accepted in 69 of 70 measured
+> presentations, and the cue that should reject it cannot be tuned to.
+> `irlume setup` offers a trained cue that does refuse it. Read
+> [Honest limitations](#honest-limitations) before wiring this into anything
+> that matters.
 
-|  |  |
-|---|---|
-| 🌑 **Works in the dark** | Active **infrared** recognition (Windows-Hello cameras); no ambient light needed. |
-| 🔒 **Unlocks everything** | Login greeter, lock screen, `sudo` (opt-in via `login enable --with-sudo`), and app prompts like **Bitwarden's biometric unlock** via polkit (opt-in via `login enable --with-polkit`; approve with a deliberate **nod**, [details](docs/APP-INTEGRATION.md)), with the password always as fallback (**no lockout, ever**). |
-| 🙋 **On-demand, by consent** | The camera fires only when you ask: leave the password field **empty and press Enter**. Typing a password never starts a scan. A **grace window** after the gesture (~15 s at login/lock, ~5 s for `sudo`) keeps retrying while you settle into frame, but never retries a failed match. Wiring is tailored per login manager (GDM · SDDM · Plasma Login · LightDM · greetd · COSMIC · ly). |
-| 🗝️ **Opens your keyring** | On IR hardware a face match **TPM-unseals your login password** so the wallet unlocks at login, like Hello. |
-| 👁️ **Real liveness** | Algorithmic IR anti-spoof gate + **opt-in passive blink** detection (no prompt, no action). |
-| 🧬 **No face images stored** | Stores **512-D embeddings, never images**; on TPM hardware they're **AES-256-GCM encrypted** under a **TPM-sealed** key (without a TPM: root-only files, and the TUI says so). |
-| 🎚️ **Adapts to your hardware** | IR camera → **Secure** tier · RGB-only → **Convenience** (screen-unlock) tier · fingerprint reader → **face OR fingerprint** (coexist, either unlocks). All auto-detected. |
-| 🩺 **Self-healing** | A live TUI (`irlume tui`) detects & one-key-fixes daemon/PAM/reader/config faults, and a systemd watcher **re-applies the PAM wiring** if a distro update (`authselect` / `pam-auth-update`) strips it. |
-| 📦 **Self-contained** | One package per distro, all models bundled. `git clone` and go. |
+## What you get
 
-## 🆚 Comparison: Windows Hello, Howdy, visage
+- **Works in the dark.** Active infrared recognition on Windows Hello cameras; no
+  ambient light needed.
+- **Unlocks login, lock screen, `sudo`, and app prompts.** `sudo` and polkit are
+  opt-in. The password always works, and there is no lockout.
+- **Fires only when you ask.** Leave the password field empty and press Enter.
+  Typing a password never starts a scan.
+- **Opens your keyring.** On IR hardware a face match TPM-unseals the secret that
+  opens your wallet: the KWallet key on KDE, or a token that re-keys the login
+  keyring on GNOME. Your login password is not what is sealed.
+- **No face images.** 512-D embeddings only, AES-256-GCM encrypted under a
+  TPM-sealed key. Without a TPM they are root-only files, and the TUI says so.
+- **Adapts to your hardware.** IR camera gives the secure tier, RGB-only gives
+  screen unlock, a fingerprint reader coexists. All auto-detected.
+- **Repairs itself.** `irlume tui` finds and one-key-fixes daemon, PAM, and camera
+  faults, and a systemd watcher re-applies the PAM wiring when a distro update
+  strips it.
 
-How irlume stacks up against Windows Hello and the Linux face-unlock projects you've
-probably met ([Howdy](https://github.com/boltgolt/howdy), [visage](https://github.com/sovren-software/visage)):
+[How it works](docs/ARCHITECTURE.md) · [What is stored, and how](docs/SECURITY_AT_REST.md)
 
-| | Windows Hello | Howdy | `visage` | **irlume** |
-|---|:---:|:---:|:---:|:---:|
-| **Liveness / anti-spoof** | IR only *(bypassable: [CVE-2021-34466](https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34466))* | ❌ none; its own README warns a *"well-printed photo of you could be enough"* | ⚠️ passive (landmark-stability; blocks photos, not video) | ✅ algorithmic IR gate on by default (blocks screens and matte prints); **opt-in** passive blink adds a glossy-print/replay defense.<sup>†</sup> Self-tested vs [ISO/IEC 30107-3](docs/PAD_SELFTEST.md) |
-| **Camera-injection defense** | device-trust *(newer HW)* | ❌ none | ❌ none | ✅ device pinning **+** cross-spectrum RGB↔IR |
-| **Template protection** | TPM-bound enclave | ⚠️ unencrypted encodings on disk | AES-256-GCM, key in a 0600 disk file *(not TPM-sealed)* | ✅ AES-256-GCM, **TPM-sealed key** *(survives disk theft)* |
-| **Opens your keyring/wallet** | ✅ | ❌ *(keyring stays locked)* | ❌ | ✅ **TPM-unseals** it at login |
-| **Stores your face as…** | template | encoding | embedding | **embedding only, never an image** |
-| **Model licensing** | proprietary | MIT code · dlib weights | ⚠️ non-commercial weights | ✅ **permissive, bundleable** |
-| **Runs on** | Windows | Linux | Linux | **Linux: Fedora · Arch · Debian/Ubuntu · NixOS** |
+## Install
 
-<sup>†</sup> The default IR gate blocks screens and matte prints (0% APCER in
-self-test), but a determined life-size *glossy* print passed it at 98.6% APCER;
-the opt-in passive-blink challenge closes that at the cost of a slower login.
-Enrollment on IR hardware offers to enable it. See [Honest limitations](#-honest-limitations).
-
-## 📦 Install
-
-> **v0.9.0.** Works end-to-end on real hardware across all three families,
-> including face-approved app prompts (Bitwarden). Not certified (no iBeta lab
-> pass), and a printed photograph of an enrolled face passes the built-in
-> liveness gate: see [Honest limitations](#-honest-limitations) before you wire
-> it into anything that matters.
-
-**You need:** x86-64 Linux with systemd & PAM; the distros below are
-packaged and tested. A **TPM 2.0** is strongly recommended (encrypted templates,
-keyring unlock) but not required. Any camera works; it just sets your tier:
-**IR camera** → secure login · **RGB webcam** → screen unlock · **fingerprint** → companion.
-
-### One-step install
+**You need** x86-64 Linux with systemd and PAM. A TPM 2.0 is strongly recommended
+(encrypted templates, keyring unlock) but not required. Any camera works; it sets
+your tier.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/install.sh | sh
 ```
 
-Detects your distro and installs from the **signed Copr repo** (Fedora), the
-**PPA** (Ubuntu LTS), the **AUR** (Arch), or a **checksum-verified** release
-`.deb` (Debian 12+, Ubuntu derivatives). It installs a package only and wires nothing into your
-login, and it stops without changing anything if irlume is already installed
-(use `irlume update` to upgrade). Prefer to read it before running it?
+It picks the right source for your distro, installs a package only, and wires
+nothing into your login. Read it first if you prefer:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/install.sh -o install.sh
 less install.sh && sh install.sh
 ```
 
-Or install manually with your package manager:
-
-<table>
-<tr><th>Fedora</th><th>Ubuntu</th><th>Arch</th><th>Debian 12+</th></tr>
-<tr valign="top">
-<td>
+Or by hand:
 
 ```sh
-# Copr
-sudo dnf copr enable \
-  archledger/irlume
-sudo dnf install irlume
-```
+# Fedora
+sudo dnf copr enable archledger/irlume && sudo dnf install irlume
 
-</td>
-<td>
+# Ubuntu (current release)
+sudo add-apt-repository ppa:archledger/irlume && sudo apt install irlume
 
-```sh
-# PPA
-sudo add-apt-repository \
-  ppa:archledger/irlume
-sudo apt install irlume
-```
-
-</td>
-<td>
-
-```sh
-# AUR
+# Arch
 yay -S irlume
+
+# Debian 12+, older Ubuntu, and derivatives
+sudo apt install ./irlume_*.deb    # from Releases
 ```
 
-</td>
-<td>
+Then:
 
 ```sh
-# .deb from Releases
-sudo apt install \
-  ./irlume_*.deb
+irlume doctor    # what your hardware supports
+irlume tui       # guided enrollment and wiring
 ```
 
-</td>
-</tr>
-</table>
+Every lane's package is also attached to each [release](https://github.com/archledger/irlume/releases),
+signed, so you can install or roll back when a repository is unavailable.
 
-Fedora and current-LTS Ubuntu update with the system (`dnf upgrade` /
-`apt upgrade`). The [PPA](https://launchpad.net/~archledger/+archive/ubuntu/irlume)
-carries the **current Ubuntu LTS only**; on an older LTS or a derivative (Mint,
-Pop!_OS, Zorin, elementary) use the universal Debian `.deb` from
-[Releases](https://github.com/archledger/irlume/releases); it needs glibc
-2.35 or newer (Debian 12+, Ubuntu 22.04+, and their derivatives all qualify)
-and refuses to install on anything older.
-`irlume update`
-handles every case: it detects how irlume was installed and updates the same way.
+On NixOS use `nixosModules.irlume` from this flake instead ([docs/NIXOS.md](docs/NIXOS.md)).
+Full setup, including which lane suits which distro version, is in
+[docs/SETUP.md](docs/SETUP.md).
 
-On NixOS, add `nixosModules.irlume` from this flake instead; it runs the daemon
-and wires the PAM stacks declaratively. See [docs/NIXOS.md](docs/NIXOS.md).
+## Honest limitations
 
-Then, once:
-
-```sh
-irlume tui                         # enroll your face + configure, guided
-sudo irlume login enable --apply   # opt-in: wire the greeter + lock screen
-```
-
-`login enable` (and the TUI's `[w]`) wires the **greeter and lock screen** for
-your login manager. From then on face is **on-demand**: at the greeter or lock
-screen, leave the password empty and press Enter. The camera fires only then.
-Face-`sudo` is a separate opt-in; add it with
-`sudo irlume login enable --with-sudo --apply`, since granting root by face is a
-trade-off worth choosing deliberately (the password always still works).
-
-**Full step-by-step** (both the guided TUI and the individual CLI commands, with
-keyring unlock, recovery, and fingerprint): [`docs/SETUP.md`](docs/SETUP.md).
-**Every command and flag on one page:** [`docs/COMMANDS.md`](docs/COMMANDS.md).
-**Something not working, or want to audit every decision?**
-[`docs/DEBUGGING.md`](docs/DEBUGGING.md): `irlume doctor` runs the platform
-checks in one pass (TPM, Secure Boot, camera, models), `irlume logs` puts every
-face-auth journal line in one view, and `sudo irlume logs debug on` traces
-every pipeline stage (scores, liveness cues, thresholds, timings; numbers
-only, never frames or embeddings).
-
-Usually no IR-emitter step is needed. Many Hello cameras drive their own
-illuminator whenever the infrared stream is open, and for the modules irlume has
-been validated against it applies the control those cameras document. Nothing
-runs on its own: if your infrared frames stay dark, `sudo irlume ir-setup` will
-look for a control, and it tells you first that it writes to your camera.
-
-It only ever addresses the extension unit your camera's USB descriptor
-identifies as Microsoft's camera-control unit, only selectors that unit
-advertises, and only with values built from the camera's own answers. Before
-0.7.1 it did something very different, and it destroyed a reporter's camera; see
-[#159](https://github.com/archledger/irlume/issues/159).
-
-**Safe to try.** Installing the package wires **nothing** into your login.
-Auth only changes when you run `login enable`, and without `--apply` it's a
-dry run that prints the full per-file wiring plan without writing anything. Your password always keeps
-working, and one command undoes everything: `sudo irlume login disable --apply`.
-
-`irlume update` checks for a new release the way your distro expects. Prefer to
-build from source? See [`packaging/`](packaging/) and [`scripts/install-host.sh`](scripts/install-host.sh).
-
-## 🧠 How it works
-
-Privilege separation first. The thin **`pam_irlume.so`** module and **`irlume`**
-CLI are *untrusted* clients of the privileged **`irlumed`** daemon, the only thing
-that ever touches the camera, IR emitter, models, templates, or TPM. They speak
-over a Unix socket authenticated with `SO_PEERCRED`.
-
-```mermaid
-flowchart LR
-    subgraph U["Untrusted clients"]
-        direction TB
-        P["pam_irlume.so<br/>greeter · sudo · lock"]
-        C["irlume CLI<br/>+ live TUI"]
-    end
-    subgraph D["irlumed · privileged daemon (root)"]
-        direction TB
-        CAM["Camera + IR emitter"]
-        ML["YuNet + rescue → AuraFace<br/>IR liveness gate · matcher"]
-        T["TPM seal · encrypted templates"]
-    end
-    P -->|"Unix socket · SO_PEERCRED"| D
-    C -->|"Unix socket · SO_PEERCRED"| D
-```
-
-**A login, end to end.** Every branch that isn't a clean, live match falls
-back to the password; there is no lockout.
-
-```mermaid
-flowchart TD
-    A["Greeter / lock screen:<br/>leave password empty, press Enter"] --> B["Camera fires, on demand<br/>captures RGB + IR in parallel"]
-    B --> DET["Detect face<br/>YuNet → BlazeFace rescue"]
-    DET --> L{"IR liveness gate<br/>relief ratio · reflectance · glint"}
-    L -->|spoof or no face| PW["Type your password<br/>no lockout, ever"]
-    L -->|live| M{"Match embedding<br/>at or above threshold?"}
-    M -->|no| PW
-    M -->|yes| G["Grant<br/>+ TPM-unseal your keyring"]
-```
-
-**Model bill-of-materials.** Every weight is permissive or first-party, all
-GPLv3-compatible, so the whole thing is bundleable:
-
-| Stage | Model | License |
-|---|---|:---:|
-| Detection | **YuNet** | MIT |
-| Detection rescue | **BlazeFace short-range** *(fires only on a YuNet miss)* | Apache-2.0 |
-| Recognition | **AuraFace** *(512-D ArcFace)* | Apache-2.0 |
-| IR liveness gate | self-built, algorithmic *(no weights)* | n/a |
-| Passive blink liveness + rescue alignment | **MediaPipe FaceMesh** *(478-pt)* → eye-aspect-ratio *(opt-in)* | Apache-2.0 |
-| IR domain match | raw AuraFace + **per-enrollment on-device calibration** *(fitted from your own scans; no third-party data, [ADR-0004](docs/adr/0004-per-enrollment-ir-adapter.md))* | n/a |
-
-More depth: [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Standards mapping](docs/STANDARDS.md) · [Cross-distro notes](docs/cross-distro/).
-
-## 🔐 Your face never leaves as an image
-
-irlume stores **only 512-D embeddings** (a one-way projection; you can't rebuild
-a photo from it), **AES-256-GCM encrypted**, under a key the **TPM seals to your
-boot state**. We [audited this live](docs/SECURITY_AT_REST.md):
-
-- 🧑‍💻 A normal user account → `cat`ting the files gives **Permission denied** *(root-only, 0600)*.
-- 💽 **Disk-theft test:** copied the encrypted templates **and** the sealed key to a
-  *second machine with its own TPM* → **`tpm: integrity check failed`**. The stolen
-  data is undecryptable off the original box.
-
-The delta vs Hello: Hello isolates templates in a VBS/TPM enclave the kernel
-never sees; irlume's daemon is a root process holding decrypted embeddings in RAM
-during a match, so **root on the live machine is the trust boundary** (as with
-most Linux secrets). Full write-up: [`docs/SECURITY_AT_REST.md`](docs/SECURITY_AT_REST.md).
-
-Every claim here maps to something you can run on your own machine:
-[`docs/VERIFY.md`](docs/VERIFY.md).
-
-## ⚖️ Honest limitations
-
-The current gaps:
-
-- **A printed photograph of an enrolled face passes the built-in gate.** Not
-  occasionally: the
+- **A glossy printed photo defeats the built-in gate.** The
   [2026-06-30 self-test](docs/pad-results/2026-06-30-ir-liveness-selftest.md)
-  accepted a life-size glossy vinyl print of the enrolled face in 69 of 70
-  presentations, and the cue that should reject it cannot be tuned to. It is a
-  brightness ratio on a 2D infrared sensor, and a life-size print held at an
-  angle produces the same falloff a face does (1.02 to 1.58 over those 70
-  presentations, against 1.26 to 1.49 for the live user), so no threshold
-  accepts the user and rejects the print. **`irlume setup` offers a trained,
-  deny-only cue (`flir`) for this, and recommends it**: it refused the same
-  print at p_fake 0.941 to 1.000, and still refused at 0.998 to 0.999 when the
-  print was enhanced with an infrared-absorbing patch that carries the built-in
-  ratio from 1.06 to 1.32-1.44 while the built-in gate still says `Live`. That evidence covers one subject and one print
-  instrument. irlume does not ship or warrant those weights, because their
-  publisher documents neither the training data nor a way to reproduce the
-  model, which fails [ADR-0001](docs/adr/0001-liveness-pad-strategy.md); setup
-  shows the license and provenance before fetching anything, and
-  `sudo irlume models enable flir` does the same later. Passive blink liveness also
-  **doesn't cover glasses-wearers** (IR lens reflections hide the eyelid). Every
-  miss falls **safely to the password**. See
-  [ADR-0002](docs/adr/0002-challenge-response-liveness.md) and the
-  [PAD self-test results](docs/pad-results/).
-- **RGB-only laptops get the Convenience tier:** face unlocks the *screen only*,
-  never `sudo`, login, or the keyring (those keep the password). By design.
-- **Bright IR behind you defeats the relief check.** The anti-spoof gate infers
-  shape from how the IR emitter's light falls across the face; when the scene's
-  own infrared floods it, no such signal is left, and a genuine face is rejected
-  to the password. It is a brightness ratio, not a range measurement: the sensor
-  does not measure distance, and a glossy print with a hot centre passes it.
-  Measured
-  in a 430-sample field session (2026-07-16, cloudy-bright sky): reliable below
-  ambient ~120 on the 0-255 IR scale (indoors, inside vehicles, shade, a closed
-  car with 20% tint passed 99/99), marginal to ~170, and 0/129 genuine samples
-  passed above ~170 (open sky or sun behind the user; the emitter's contribution
-  fell to noise and 46-82% of the IR frame was saturated). irlume can't tell sky
-  from a bright lamp (both are just infrared), so the rejection names the
-  condition and the fix: turn away from the light, or type the password.
-- **Not lab-certified.** We self-test against ISO/IEC 30107-3; there's no paid iBeta
-  pass. Demographic FMR tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
+  accepted a life-size vinyl print in 69 of 70 presentations. The cue is a
+  brightness ratio on a 2D infrared sensor, and a print held at an angle produces
+  the same falloff a face does, so no threshold accepts the user and rejects the
+  print. `irlume setup` offers a trained deny-only cue (`flir`) that refused the
+  same print at p_fake 0.941 to 1.000, including when it was enhanced with an
+  infrared-absorbing patch. irlume does not ship or warrant those weights,
+  because their publisher documents neither the training data nor a way to
+  reproduce the model ([ADR-0001](docs/adr/0001-liveness-pad-strategy.md)).
+  Every miss falls safely to the password.
+- **Bright infrared behind you rejects a genuine face.** The gate infers shape
+  from how the emitter's light falls, and open sky or a hot lamp floods it. In a
+  430-sample field session it was reliable below ambient ~120 on the 0-255 IR
+  scale and rejected 129 of 129 genuine samples above ~170. The rejection names
+  the condition and the fix.
+- **Passive blink liveness misses glasses-wearers**, because IR lens reflections
+  hide the eyelid.
+- **RGB-only laptops get screen unlock only**, never `sudo`, login, or the
+  keyring. By design.
+- **Not lab-certified.** Self-tested against ISO/IEC 30107-3, with no iBeta pass.
+  Demographic tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
+- **Root on the live machine is the trust boundary.** The daemon holds decrypted
+  embeddings in RAM during a match, unlike Hello's VBS enclave. Disk theft is
+  covered: templates copied to another machine fail to decrypt
+  ([tested](docs/SECURITY_AT_REST.md)).
 
-## ❓ FAQ
+Every claim here maps to something you can run yourself: [docs/VERIFY.md](docs/VERIFY.md).
 
-<details>
-<summary><b>Is this "Windows Hello for Linux"?</b></summary>
-
-Yes, that's the bar. irlume brings Windows Hello-style face login to Linux:
-face-unlock the login screen, lock screen, `sudo`, and your keyring/wallet,
-using the same IR (Windows Hello) camera your laptop already has. And it aims
-past Hello where Hello is weak: real anti-spoof liveness, encrypted
-TPM-sealed templates, and a fully open stack.
-</details>
-
-<details>
-<summary><b>How is irlume different from Howdy?</b></summary>
-
-[Howdy](https://github.com/boltgolt/howdy) is the best-known face unlock for
-Linux, and it's honest about being a *convenience*: its README says a
-well-printed photo of you could be enough to fool it. irlume is built as an
-*authenticator*: an IR liveness gate (self-tested against ISO/IEC 30107-3),
-AES-256-GCM-encrypted templates under a TPM-sealed key, camera pinning, and
-TPM keyring unlock at login, with tiers, so RGB-only face match is
-deliberately limited to screen unlock. See the [comparison](#-comparison-windows-hello-howdy-visage).
-</details>
-
-<details>
-<summary><b>Do I need an IR camera?</b></summary>
-
-No. An IR (Windows Hello) camera gets the full **Secure** tier: greeter
-login, `sudo`, keyring unlock, works in the dark. A **regular RGB webcam**
-gets the Convenience tier: face unlock for the lock screen only. A
-**fingerprint reader** works as a companion factor on either. All
-auto-detected.
-</details>
-
-<details>
-<summary><b>Is this AI-generated?</b></summary>
-
-AI-assisted, human-directed, and disclosed throughout the git history: the
-large majority of commits carry `Co-Authored-By` trailers naming the AI
-assistant (Anthropic's Claude, also visible under this repo's contributors). A human maintainer sets
-direction, reviews the changes, and validates every release with clean-slate
-installs on real hardware (Fedora, Arch, Ubuntu; IR camera, TPM, fingerprint)
-before anything ships. Judge the project by its verifiable artifacts: the
-threat model, measured error rates, spoof-test results, and the code itself
-are all in the repo, reproducible regardless of what tools wrote them.
-</details>
-
-<details>
-<summary><b>Can I verify these claims myself?</b></summary>
-
-That's the point of [`docs/VERIFY.md`](docs/VERIFY.md). Each claim maps to a
-command you can run: see your own camera's anti-spoof score, confirm the stored
-template is encrypted ciphertext (not an image), run the presentation-attack
-self-test against your own spoofs, reproduce the real-face FAR on LFW, and build
-and run the test suite. Some checks take two minutes, some take real effort, but
-every one is runnable.
-</details>
-
-<details>
-<summary><b>Glasses, beards, outdoors: when should I re-enroll?</b></summary>
-
-One enrollment usually lasts. A profile is one identity, and a face can only
-own one profile, so different looks of the same person are extra **scans** on
-that profile, not a second profile. **Wear glasses sometimes?** Add a scan with
-Improve Recognition (TUI Profiles → `[a]`, or `irlume profiles add-scan`) while
-wearing them. **Major appearance change** (shaved beard, new heavy frames)? Same
-thing, add a scan rather than starting over. **Recognition flaky in bright
-sunlight?** Strong ambient IR can wash out the emitter's illumination; add a
-scan captured in that environment.
-Profiles are per-user and deletable any time.
-</details>
-
-<details>
-<summary><b>Does it work on Ubuntu / Fedora / Arch, GNOME / KDE, Wayland?</b></summary>
-
-It does. irlume authenticates through PAM, and tailors the greeter wiring to the
-login manager it detects. Validated live on real machines: **Fedora KDE**
-end-to-end on IR hardware (Plasma Login Manager greeter, lock screen, `sudo`,
-TPM keyring unlock; Wayland), **Ubuntu GNOME** on an RGB+fingerprint laptop
-(lock-screen face unlock, fingerprint, correct password-only refusals for
-login/sudo), and the full login-manager matrix: **GDM** (on-demand on GNOME ≥ 46;
-face-first before that), **SDDM**, **LightDM** (gtk and slick greeters, X11),
-**greetd** (tuigreet), and **COSMIC's greeter**. **Arch** is validated for packaging,
-install, and the full CLI/daemon stack (that testbed has no camera). Reports
-from other hardware are very welcome.
-</details>
-
-<details>
-<summary><b>I changed my login password and now my keyring/wallet won't open</b></summary>
-
-This is general Linux behaviour, not specific to irlume. Changing your login
-password (`passwd` or a settings dialog) updates `/etc/shadow`, but it does not
-re-encrypt your KWallet / GNOME keyring. The wallet keeps the key derived from
-your old password until you change the wallet's password separately, so it no
-longer matches the new login password.
-
-irlume seals whatever password you armed and hands it to the wallet, so it
-passes along the old one and cannot fix this by itself. To bring all three back
-in sync after a password change:
-
-1. **Login password** is already updated by `passwd`.
-2. **Wallet password**: change it to the new one in KWallet Manager →
-   "Change Password" (KDE), or Seahorse → the "Login" keyring →
-   "Change Password" (GNOME).
-3. **irlume's sealed copy**: run `irlume keyring arm` to re-seal the new password.
-
-Rule of thumb: whenever the wallet password changes, re-run `irlume keyring arm`
-so irlume's seal keeps matching it. Your typed password opens everything in the
-meantime, so nothing locks you out.
-</details>
-
-<details>
-<summary><b>How fast is a face login, and why is the blink challenge slower?</b></summary>
-
-A normal face login takes about **2.5 seconds** on an integrated IR camera
-(measured on an ASUS Zenbook, CPU inference). Most of that is opening the
-camera and letting auto-exposure settle, not the neural networks. The RGB and
-IR captures run in parallel, which cuts the capture stage by about a third;
-[docs/DEBUGGING.md](docs/DEBUGGING.md) shows how to time every stage on your
-own hardware.
-
-The **opt-in blink challenge** (`irlume profiles challenge on`) is a deterrent
-against a glossy print or vinyl that mimics the infrared relief pattern: it
-watches for a
-natural blink, which a static image cannot do. Detecting a blink is inherently
-temporal, so it captures a roughly 5-second infrared sequence, and the login
-takes about **10 seconds** (measured across six runs, glasses on and off). That
-is the trade: the challenge closes a spoof gap the default single-frame gate
-cannot, at about four times the latency.
-
-It is off by default. Turn it on with `irlume profiles challenge on` if you
-want the extra deterrent, or leave it off for the ~2.5-second login. The
-default IR-structure gate rejected the tested screens, video replays, and
-matte-paper photos, but a glossy vinyl print of the enrolled face passed it;
-see [Honest limitations](#-honest-limitations).
-</details>
-
-## 📚 Documentation
+## Documentation
 
 | I want to… | Go to |
 |---|---|
 | **Install and set up**, guided or by hand | [`docs/SETUP.md`](docs/SETUP.md) |
 | Look up **every command and flag** | [`docs/COMMANDS.md`](docs/COMMANDS.md) |
-| **Write software that drives irlume** | [`docs/INTEGRATION.md`](docs/INTEGRATION.md) |
-| Look up the versioned **machine API**, field by field | [`docs/MACHINE-API.md`](docs/MACHINE-API.md) |
+| Read the **FAQ** | [`docs/FAQ.md`](docs/FAQ.md) |
 | Understand the **architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| **Write software that drives irlume** | [`docs/INTEGRATION.md`](docs/INTEGRATION.md) · [`docs/MACHINE-API.md`](docs/MACHINE-API.md) |
 | Choose a **third-party model** irlume has measured | [`docs/THIRD-PARTY-MODELS.md`](docs/THIRD-PARTY-MODELS.md) |
 | Read the **threat model** and standards mapping | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) · [`docs/STANDARDS.md`](docs/STANDARDS.md) |
 | **Verify the claims** on my own machine | [`docs/VERIFY.md`](docs/VERIFY.md) |
@@ -472,70 +158,63 @@ see [Honest limitations](#-honest-limitations).
 | Run it on **NixOS** | [`docs/NIXOS.md`](docs/NIXOS.md) |
 | See **what changed** in each release | [`CHANGELOG.md`](CHANGELOG.md) |
 
-## 🛠️ Status
+## Status
 
-**v0.9.0: working and validated on real hardware.** Fedora runs the full IR
-Secure tier end to end, including face-approved app prompts (Bitwarden biometric
-unlock via polkit, verified live); Ubuntu / Pop!_OS runs the RGB Convenience tier
-plus a fingerprint; Arch is validated for packaging and the CLI/daemon on a
-camera-less testbed. Packaged for all three families (Copr · AUR · PPA).
-Interfaces may still shift before 1.0.
+**v0.9.0, working on real hardware.** Fedora runs the full IR secure tier end to
+end including face-approved Bitwarden prompts; Ubuntu runs the RGB convenience
+tier with a fingerprint; Arch is validated on an IR camera and a USB webcam.
+Packaged for Fedora, Arch, Debian/Ubuntu and NixOS. Interfaces may still shift
+before 1.0.
 
-- ⚠️ **Presentation attacks tested** on a NexiGo N930W: laptop screen, phone
-  screen at full brightness, a video replay with real head motion, and a
-  matte-paper photo (including in direct sunlight) were rejected at the infrared
-  stage. A life-size glossy vinyl print of the enrolled face passed the built-in
-  gate; see [Honest limitations](#-honest-limitations). A physical 3D mask is
-  not yet tested ([contributions welcome](#-contributing--license)).
-- ✅ **TPM sealing picks the strongest tier the machine supports** (signed-PCR →
-  pcrlock → literal PCR-7) and round-trip-verifies it before trusting it, so a
-  policy that cannot unseal on this boot never holds the secret.
-- 🧪 **Self-tested against ISO/IEC 30107-3**; not lab-certified (no iBeta pass).
-  Demographic FMR tuning ([FAIRNESS.md](docs/FAIRNESS.md)) is ongoing.
-- 🧰 **Contributor-ready:** a reproducible Nix dev shell and
-  [developer guide](docs/DEVELOPMENT.md); CI runs fmt / clippy / build / test on
-  every push and PR.
+Presentation attacks tested on a NexiGo N930W: laptop screen, phone screen at
+full brightness, a video replay with head motion, and a matte-paper photo were
+rejected at the infrared stage. A life-size glossy vinyl print was not; see
+[Honest limitations](#honest-limitations). A physical 3D mask is untested, and
+[contributions are welcome](CONTRIBUTING.md).
 
-The per-release detail (0.1.x through 0.9.0) lives in [`CHANGELOG.md`](CHANGELOG.md).
+Per-release detail is in [`CHANGELOG.md`](CHANGELOG.md).
 
-## 🙏 Credits
+## Credits
 
-irlume relies on models and code from other projects. The bundled models:
+The bundled models:
 
-- **[YuNet](https://github.com/opencv/opencv_zoo)** (OpenCV Zoo, MIT) detects faces in both the RGB and IR streams.
+- **[YuNet](https://github.com/opencv/opencv_zoo)** (OpenCV Zoo, MIT) detects faces in both streams.
 - **[AuraFace](https://huggingface.co/fal/AuraFace-v1)** by fal (Apache-2.0) is the 512-D ArcFace recognizer; irlume ships only its `glintr100.onnx`.
-- **[MediaPipe FaceLandmarker mesh](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** (Google, Apache-2.0) supplies the 478 dense landmarks behind the opt-in blink liveness and refines rescue detections into alignment points.
-- **[MediaPipe BlazeFace short-range](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)** (Google, Apache-2.0) is the detection-rescue stage: it runs only when YuNet finds no face, such as sun-saturated frames.
+- **[MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** and **[BlazeFace short-range](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)** (Google, Apache-2.0) supply the dense landmarks behind blink liveness, and the detection-rescue stage for saturated frames.
 
 The TPM and camera code builds on:
 
-- **[rust-tss-esapi](https://github.com/parallaxsecond/rust-tss-esapi)** (the Parsec project, Apache-2.0) wraps the TPM 2.0 ESAPI. irlume builds from a small patch branch that adds the `PolicyAuthorizeNV` wrapper (upstream [PR #486](https://github.com/parallaxsecond/rust-tss-esapi/pull/486)) plus the [PR #530](https://github.com/parallaxsecond/rust-tss-esapi/pull/530) session-leak fix, pinned to an exact commit.
-- **[systemd](https://github.com/systemd/systemd)** (LGPL-2.1-or-later): the Tier-2 pcrlock seal and unseal in `crates/irlume-core/src/tpm.rs` follows the scheme in systemd's `src/shared/tpm2-util.c` and `src/pcrlock/pcrlock.c`.
-- **[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)** first showed that the 850nm emitter on integrated Hello cameras can be driven from userspace over UVC Extension Units. irlume no longer uses its search technique: irlume's own version of it destroyed a camera ([#159](https://github.com/archledger/irlume/issues/159)), and upstream gates that search behind an interactive warning about firmware corruption that irlume did not have.
-- **[ort](https://github.com/pykeio/ort)** binds Microsoft's ONNX Runtime, which irlume loads at runtime for every model above.
+- **[rust-tss-esapi](https://github.com/parallaxsecond/rust-tss-esapi)** (Parsec, Apache-2.0) wraps TPM 2.0 ESAPI; irlume builds from a small patch branch pinned to an exact commit.
+- **[systemd](https://github.com/systemd/systemd)** (LGPL-2.1-or-later): the Tier-2 pcrlock seal follows the scheme in its `tpm2-util.c` and `pcrlock.c`.
+- **[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)** first showed the 850nm emitter can be driven from userspace over UVC Extension Units. irlume no longer uses its search technique, which destroyed a camera here ([#159](https://github.com/archledger/irlume/issues/159)).
+- **[ort](https://github.com/pykeio/ort)** binds ONNX Runtime, which irlume loads at runtime.
+- **[TensorFlow Lite](https://github.com/tensorflow/tensorflow)** (Apache-2.0) is bundled as a C runtime; its statically linked components are named in the notices beside it.
 
-Prior art that shaped the design: **Windows Hello** for the infrared, dual-sensor credential model, and [Howdy](https://github.com/boltgolt/howdy) and [visage](https://github.com/sovren-software/visage) as the existing Linux face-unlock projects (see the [comparison](#-comparison-windows-hello-howdy-visage)). irlume is the from-scratch successor to the author's earlier linhello.
+Prior art: **Windows Hello** for the infrared dual-sensor credential model, and
+[Howdy](https://github.com/boltgolt/howdy) and [visage](https://github.com/sovren-software/visage)
+as the existing Linux face-unlock projects. irlume is the from-scratch successor
+to the author's earlier linhello.
 
-*Windows and Windows Hello are trademarks of Microsoft Corporation. irlume is an independent project, not affiliated with, sponsored by, or endorsed by Microsoft; the marks are used only to describe compatibility and prior art.*
+*Windows and Windows Hello are trademarks of Microsoft Corporation. irlume is an
+independent project, not affiliated with or endorsed by Microsoft; the marks are
+used only to describe compatibility and prior art.*
 
-## 🤝 Contributing & license
+## Contributing & license
 
-**GPL-3.0-or-later**, fully open, copyleft: modifications stay free, nobody can
-lock this down. Contributions welcome under the [DCO](CONTRIBUTING.md); **no CLA,
-no commercial relicensing**. Security reports: see [SECURITY.md](SECURITY.md).
+**GPL-3.0-or-later.** Contributions welcome under the [DCO](CONTRIBUTING.md); no
+CLA, no commercial relicensing. Security reports: [SECURITY.md](SECURITY.md).
 
-**Questions, setup help, hardware reports** →
-[GitHub Discussions](https://github.com/archledger/irlume/discussions). Reports
-from laptops with IR cameras (working *or* not) are the most valuable
-contribution right now. Bugs → [Issues](https://github.com/archledger/irlume/issues).
+Questions, setup help, and hardware reports go to
+[Discussions](https://github.com/archledger/irlume/discussions); reports from
+laptops with IR cameras, working or not, are the most useful contribution right
+now. Bugs go to [Issues](https://github.com/archledger/irlume/issues).
 
 > [!NOTE]
 > **AI disclosure: assisted, human-directed.** irlume is built by a human
-> maintainer working with an AI assistant (Anthropic's Claude), disclosed
-> throughout the git history via `Co-Authored-By` trailers; see the log or the
-> [contributors](https://github.com/archledger/irlume/graphs/contributors) page.
-> Direction, review, and releases are human-driven; every release is validated
-> with clean-slate installs on real hardware, and the security claims rest on
-> reproducible evaluations in this repo, not on who typed the code.
+> maintainer working with an AI assistant (Anthropic's Claude), disclosed in the
+> git history via `Co-Authored-By` trailers. Direction, review, and releases are
+> human-driven; every release is validated with clean-slate installs on real
+> hardware, and the security claims rest on reproducible evaluations in this
+> repo.
 
 <div align="center"><sub>Built with Rust · <a href="LICENSE">GPL-3.0-or-later</a> · your face stays yours</sub></div>

@@ -759,6 +759,17 @@ fn zeroed_buffer(index: u32) -> V4l2Buffer {
 /// on the interface rather than on `videoN + 1` is what keeps this correct on a
 /// machine with several cameras, where numbering interleaves.
 fn metadata_node_for(ir_device: &str) -> Option<String> {
+    // Diagnostic kill switch, added while working #187's hardware session.
+    // On a camera whose four nodes share ONE USB interface (Logitech Brio),
+    // the lowest-number-first sibling search below picks the RGB stream's
+    // metadata node for the IR camera, and arming that queue is suspected of
+    // breaking the RGB stream it belongs to (VIDIOC_QBUF EINVAL mid-burst).
+    // The switch exists so that suspicion can be tested on hardware without
+    // a rebuild; absence of the variable changes nothing.
+    if std::env::var_os("IRLUME_NO_ILLUM_META").is_some_and(|v| v == "1") {
+        irlume_common::dlog!("{ir_device}: illumination metadata disabled (IRLUME_NO_ILLUM_META)");
+        return None;
+    }
     let sysfs = std::path::Path::new("/sys/class/video4linux");
     let found = siblings_on_same_interface(ir_device, sysfs)
         .into_iter()

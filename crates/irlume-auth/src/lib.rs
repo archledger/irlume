@@ -633,6 +633,27 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
     faces.iter().max_by(|a, b| a.score.total_cmp(&b.score))
 }
 
+/// Whether captures on `rgb_dev` should run one stream at a time, and where
+/// that answer came from. Order of authority: the explicit env override, then
+/// what `irlume camera-tune` measured on THIS camera (cameras.conf, per
+/// camera identity), then the concurrent default.
+///
+/// One resolver for every consumer, because the two halves of the answer must
+/// agree: the ASSESS path uses it to order its reads, and the ENROLL path
+/// uses it to decide whether both streams may be armed at once. When they
+/// disagreed, "sequential" ordered the reads of two streams that were both
+/// live anyway, which on a bandwidth-starved camera is indistinguishable
+/// from concurrent (#187).
+fn sequential_capture_selected(rgb_dev: &str) -> (bool, &'static str) {
+    match std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
+        Ok(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
+        Err(_) => match irlume_camera::stored_capture_mode(rgb_dev) {
+            Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
+            None => (false, "default"),
+        },
+    }
+}
+
 impl Engine {
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         // Identify the recognizer by its weights, not its path: a file swapped
@@ -1160,13 +1181,7 @@ impl Engine {
         // brightness when both of its interfaces stream, the ASUS built-in keeps
         // all of it, and only a measurement on the actual camera can tell which
         // kind is plugged in.
-        let (sequential, mode_source) = match std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
-            Ok(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
-            Err(_) => match irlume_camera::stored_capture_mode(&self.rgb_dev) {
-                Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
-                None => (false, "default"),
-            },
-        };
+        let (sequential, mode_source) = sequential_capture_selected(&self.rgb_dev);
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
         // guessing this measurement work exists to remove.
@@ -1182,10 +1197,32 @@ impl Engine {
         // just the frames. Every RETRY below deliberately stays on the one-shot
         // path: a retry exists because something went wrong with this capture,
         // and re-opening is what makes a broken stream recoverable.
+        // One denoised capture from a HELD session, recovering the stream in
+        // place on a mid-stream fault. The broken stream owns the device's
+        // buffer queue, so the standalone-reopen retry below answers EBUSY
+        // from our own handle and surfaces as "camera busy, close that app"
+        // with nothing to close (#187 hardware session: Brio QBUF EINVAL at
+        // .266366, retry's S_FMT EBUSY at .269393, no close between).
+        // Recovery renegotiates on the fd the session already holds.
+        fn held_rgb_capture(
+            rgb_s: &mut irlume_camera::RgbSession<'_>,
+        ) -> irlume_common::Result<irlume_camera::Frame> {
+            match rgb_s.denoised() {
+                Ok(f) => Ok(f),
+                Err(e) => {
+                    irlume_common::dlog!(
+                        "assess: held rgb stream broke ({e}); recovering it in place"
+                    );
+                    rgb_s.recover()?;
+                    rgb_s.denoised()
+                }
+            }
+        }
+        let held_sessions = held.is_some();
         let (rgb_res, rgb_ms, ir_res, ir_ms) = if let Some((rgb_s, ir_s)) = held {
             if sequential {
                 let t = std::time::Instant::now();
-                let rgb = rgb_s.denoised();
+                let rgb = held_rgb_capture(rgb_s);
                 let rgb_ms = t.elapsed().as_millis();
                 if rgb.is_err() {
                     (rgb, rgb_ms, Ok(None), 0)
@@ -1201,7 +1238,7 @@ impl Engine {
                         (ir_s.capture_with_stats(), t.elapsed().as_millis())
                     });
                     let t = std::time::Instant::now();
-                    let rgb = rgb_s.denoised();
+                    let rgb = held_rgb_capture(rgb_s);
                     let rgb_ms = t.elapsed().as_millis();
                     let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                         (
@@ -1259,11 +1296,19 @@ impl Engine {
         let mut rgb_hard_retried = false;
         let mut rgb = match rgb_res {
             Ok(f) => f,
-            Err(e) => {
-                irlume_common::dlog!("assess: rgb capture retry (concurrent failed: {e})");
+            // Standalone reopen is only safe when THIS call opened one-shot:
+            // with held sessions the device queue belongs to the caller's
+            // stream, the in-place recovery above already had its attempt,
+            // and a reopen here meets our own handle as EBUSY (#187).
+            Err(e) if !held_sessions => {
+                irlume_common::dlog!(
+                    "assess: rgb capture retry ({} capture failed: {e})",
+                    if sequential { "sequential" } else { "concurrent" }
+                );
                 rgb_hard_retried = true;
                 irlume_camera::capture_rgb_denoised(&self.rgb_dev)?
             }
+            Err(e) => return Err(e),
         };
         let mut rgb_faces = self.det.detect(&align::RgbView {
             data: &rgb.data,
@@ -2703,7 +2748,24 @@ impl Engine {
             None
         };
         // Fast path: hold both streams for the whole loop.
-        if let Some((r, i)) = &cams {
+        //
+        // NOT under sequential capture mode. A held session arms its stream
+        // at creation, so holding both means both stream at once and
+        // "sequential" only orders the reads. Measured on a Logitech Brio on
+        // a USB2 link (#187 hardware session, strace + dmesg): with the IR
+        // stream armed, the RGB stream gets no isochronous bandwidth at all;
+        // STREAMON succeeds, no frame ever arrives, and the queue dies with
+        // QBUF EINVAL ("Failed to resubmit video URB" in dmesg). Sequential
+        // mode exists for exactly the cameras that cannot sustain both
+        // streams, so on them this loop takes the per-frame path, which
+        // opens one stream at a time and releases it before the other.
+        let (sequential, mode_source) = sequential_capture_selected(&rgb_dev);
+        if sequential {
+            irlume_common::dlog!(
+                "enroll: sequential capture mode (from {mode_source}); not holding \
+                 both streams, capturing per-frame"
+            );
+        } else if let Some((r, i)) = &cams {
             if let (Ok(mut rs), Ok(mut is)) = (r.session(), i.session()) {
                 return self.capture_scan_loop(want, pitch_neutral, Some((&mut rs, &mut is)));
             }

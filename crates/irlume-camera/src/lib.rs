@@ -1286,7 +1286,7 @@ impl RgbCamera {
         let stream = SafeStream::open(&self.device, &self.dev)?;
         Ok(RgbSession {
             cam: self,
-            stream,
+            stream: Some(stream),
             warmed: false,
         })
     }
@@ -1456,11 +1456,46 @@ pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<Stre
 /// A running RGB stream. Every capture after the first skips the warm-up.
 pub struct RgbSession<'a> {
     cam: &'a RgbCamera,
-    stream: SafeStream<'a>,
+    /// `None` only transiently inside [`Self::recover`]: the broken stream
+    /// must be DROPPED (STREAMOFF + buffer release) before its replacement
+    /// negotiates, and a plain re-assignment builds the new value first.
+    stream: Option<SafeStream<'a>>,
     warmed: bool,
 }
 
-impl RgbSession<'_> {
+impl<'a> RgbSession<'a> {
+    /// The live stream. `recover` is the only path that leaves the slot
+    /// empty, and it either refills it or returns the error; a `None` here
+    /// outside that window is a bug, reported as hardware trouble rather
+    /// than a panic because this sits in the authentication path.
+    fn stream(&mut self) -> irlume_common::Result<&mut SafeStream<'a>> {
+        self.stream
+            .as_mut()
+            .ok_or_else(|| Error::Hardware("RGB stream missing after a failed recovery".into()))
+    }
+
+    /// Rebuild this session's stream on the SAME open device after a
+    /// mid-stream fault.
+    ///
+    /// The broken stream owns the device's buffer queue until it is torn
+    /// down, so a recapture through a SECOND open answers EBUSY from our own
+    /// handle. Measured on a Logitech Brio (#187 hardware session, strace
+    /// 2026-08-06): `VIDIOC_QBUF` on the live stream failed EINVAL at
+    /// .266366, the standalone retry's `VIDIOC_S_FMT` on a fresh open failed
+    /// EBUSY at .269393, and no close ran in between. Dropping the stream
+    /// first releases the queue, and the replacement renegotiates on the fd
+    /// this session already holds, so nothing new opens and nothing collides.
+    /// Same drop-then-reopen shape as the frozen-stream restart in the IR
+    /// one-shot path.
+    pub fn recover(&mut self) -> irlume_common::Result<()> {
+        self.stream = None; // drop first: STREAMOFF + buffer release
+        self.stream = Some(SafeStream::open(&self.cam.device, &self.cam.dev)?);
+        // The fresh stream's auto-exposure starts unsettled, like any new
+        // session's.
+        self.warmed = false;
+        Ok(())
+    }
+
     /// Discard frames until auto-exposure has settled, once per session. A
     /// second capture on the same stream is already settled, and re-running the
     /// warm-up would throw away good frames to no purpose.
@@ -1468,11 +1503,12 @@ impl RgbSession<'_> {
         if self.warmed {
             return Ok(());
         }
-        warm_up_stream(&self.cam.device, &mut self.stream)?;
+        let device = self.cam.device.clone();
+        warm_up_stream(&device, self.stream()?)?;
         for _ in 0..AE_WARMUP {
-            self.stream
+            self.stream()?
                 .next()
-                .map_err(|e| map_io(&self.cam.device, e))?; // discard while AE settles
+                .map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
         self.warmed = true;
         Ok(())
@@ -1482,14 +1518,16 @@ impl RgbSession<'_> {
     pub fn burst(&mut self, n: usize) -> irlume_common::Result<Vec<Frame>> {
         self.warm_up()?;
         let (w, h) = (self.cam.width, self.cam.height);
+        let device = self.cam.device.clone();
+        let chosen = self.cam.chosen;
         let mut frames = Vec::with_capacity(n.max(1));
         for _ in 0..n.max(1) {
             let (buf, _meta) = self
-                .stream
+                .stream()?
                 .next()
-                .map_err(|e| map_io(&self.cam.device, e))?;
+                .map_err(|e| map_io(&device, e))?;
             let taken = std::time::Instant::now();
-            let data = match &self.cam.chosen {
+            let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
                 _ => yuyv_to_rgb(buf, w, h),
             };

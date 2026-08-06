@@ -111,3 +111,72 @@ jobs:
 
       - name: test (PAM FFI, against pam_wrapper)
         run: ./scripts/run-tests-guarded.sh --min 16 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
+
+  # The rest of the hosted gate's non-Rust checks, on the same push trigger
+  # (fork PRs can never reach this runner; see the SECURITY note above). Two
+  # ci.yml steps stay hosted-only on purpose: the systemd exposure ratchet
+  # (its thresholds are measured on the hosted image's systemd 255, and this
+  # runner's rolling systemd scores differently) and coverage/fuzz/nix
+  # (toolchain provisioning on the runner is its own change).
+  gate-extras:
+    name: gate-extras · packaging · apparmor · units (archhost)
+    runs-on: [self-hosted, arch]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: packaging parity (units in every lane, versions agree)
+        run: ./scripts/check-packaging-parity.sh
+
+      # This runner's parser is rolling (4.1.x): the same newest-parser check
+      # the hosted gate runs on its 4.x.
+      - name: apparmor profiles parse
+        run: |
+          set -euo pipefail
+          for f in packaging/apparmor/*; do
+            echo "checking $f on the runner's parser"
+            apparmor_parser -QK "$f"
+          done
+
+      # Same oldest-supported-parser check as the hosted gate; the ubuntu:22.04
+      # image is pre-pulled on the runner so the outage-prone registry fetch is
+      # not in the loop.
+      - name: apparmor profiles parse on the oldest supported parser
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/packaging/apparmor:/p:ro" ubuntu:22.04 bash -c '
+            set -euo pipefail
+            apt-get -qq update >/dev/null
+            apt-get -qq install -y apparmor >/dev/null
+            apparmor_parser --version
+            useradd -m checker
+            for f in /p/*; do
+              echo "checking $f"
+              su checker -c "apparmor_parser -QK $f"
+            done'
+
+      - name: test-count guard self-test
+        run: ./scripts/run-tests-guarded.sh --self-test
+
+      - name: PPA publish verifier (verdict logic)
+        run: python3 scripts/verify-ppa-publish.py --self-test
+
+      # verify resolves ExecStart. On this runner irlume is REALLY installed,
+      # so no stub is needed; the guard exists so this job can never overwrite
+      # a real binary the way the hosted job's unconditional stub would.
+      - name: systemd-analyze verify (unit syntax)
+        run: |
+          set -euo pipefail
+          for bin in irlumed irlume; do
+            if [ ! -e "/usr/bin/$bin" ]; then
+              echo "::error::/usr/bin/$bin missing on the runner; refusing to stub over a live system"
+              exit 1
+            fi
+          done
+          for u in packaging/systemd/*.service packaging/systemd/*.timer packaging/systemd/*.path; do
+            echo "::group::verify $(basename "$u")"
+            systemd-analyze verify "$u"
+            echo "::endgroup::"
+          done

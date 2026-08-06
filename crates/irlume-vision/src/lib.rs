@@ -273,8 +273,9 @@ mod onnx {
             .find(|path| is_file(path))
     }
 
-    /// Prove `name` (a path or a bare soname) is a loadable library exporting
-    /// `OrtGetApiBase`, with the loader's own words when it is not.
+    /// Prove `name` (a path or a bare soname) is a loadable ONNX Runtime that
+    /// provides the API level pinned ort will demand, with the loader's own
+    /// words when it is not. On success, returns the runtime's version string.
     ///
     /// This CANNOT be delegated to `ort::init_from`: measured on 2026-08-04,
     /// a load failure inside ort parks the process in a futex exactly like
@@ -288,10 +289,21 @@ mod onnx {
     /// on a C++ runtime orphans the allocations its static initializers made
     /// (measured in CI: 80 bytes in 2 allocations from libonnxruntime's init
     /// under dlopen).
-    fn probe_loadable(name: &std::ffi::CStr) -> Result<(), String> {
+    ///
+    /// The API-level floor is checked here for the same reason: handed a
+    /// runtime below the floor, `ort::init_from` does not return. Measured on
+    /// 2026-08-06 against onnxruntime 1.20.1 (#187): the calling thread
+    /// parked in `futex_do_wait` with no output and no CPU, so the daemon
+    /// answered every client "still starting" indefinitely while systemd
+    /// showed it healthy. `GetApi` documents null as "this version is
+    /// unsupported", so null IS the version answer, not a call failure.
+    fn probe_runtime(name: &std::ffi::CStr) -> Result<String, String> {
         // SAFETY: dlopen/dlerror/dlsym/dlclose with valid NUL-terminated
         // strings; the handle is non-null when dlsym runs, retained on
-        // success, and closed on the one failure past it.
+        // success, and closed on the failures past it. The two OrtApiBase
+        // calls go through `ort_sys`'s own declarations, so the signatures
+        // match the ABI ort itself uses, and every returned pointer is
+        // null-checked before it is read.
         unsafe {
             let handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
             if handle.is_null() {
@@ -305,8 +317,8 @@ mod onnx {
             }
             let sym = libc::dlsym(handle, c"OrtGetApiBase".as_ptr());
             if sym.is_null() {
-                // The one place dlclose is right: a foreign library that will
-                // not be used again. A future test exercising this path under
+                // Where dlclose is right: a foreign library that will not be
+                // used again. A future test exercising this path under
                 // LeakSanitizer will see that library's own initializer
                 // allocations; that is this close, not a defect in the probe.
                 libc::dlclose(handle);
@@ -316,21 +328,51 @@ mod onnx {
                         .to_string(),
                 );
             }
-            Ok(())
+            let get_base: unsafe extern "system" fn() -> *const ort::sys::OrtApiBase =
+                std::mem::transmute(sym);
+            let base = get_base();
+            if base.is_null() {
+                libc::dlclose(handle);
+                return Err(
+                    "OrtGetApiBase returned null; the library is not a usable ONNX Runtime"
+                        .to_string(),
+                );
+            }
+            // Copied to an owned String while the library is still mapped:
+            // the pointer aims into the library's own data.
+            let version_ptr = ((*base).GetVersionString)();
+            let version = if version_ptr.is_null() {
+                "(unknown version)".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(version_ptr)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if ((*base).GetApi)(ort::MINOR_VERSION).is_null() {
+                libc::dlclose(handle);
+                return Err(format!(
+                    "this is ONNX Runtime {version}, which does not provide API level {api} \
+                     (first shipped in ONNX Runtime 1.{api}); irlume needs 1.{api} or newer",
+                    api = ort::MINOR_VERSION
+                ));
+            }
+            Ok(version)
         }
     }
 
     /// Probe, then hand the SAME name to pinned ort, which retains the handle
-    /// in its own global and applies its api-24 version floor. A version-floor
-    /// rejection inside ort is the one failure class the probe cannot
-    /// pre-empt; whether it errors or parks there is untested, since no
-    /// pre-1.24 library was on hand.
-    fn load_ort(path: &std::path::Path) -> Result<(), String> {
+    /// in its own global. The probe has already established everything ort's
+    /// own init would park on: the library loads, it is an ONNX Runtime, and
+    /// it provides the pinned API level (ort re-checks that floor, but only
+    /// ever against a runtime the probe passed). Measured 2026-08-06, #187:
+    /// before the probe checked the floor, a below-floor runtime made this
+    /// call park forever instead of returning.
+    fn load_ort(path: &std::path::Path) -> Result<String, String> {
         let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| format!("{} contains a NUL byte", path.display()))?;
-        probe_loadable(&name)
+        let version = probe_runtime(&name)
             .map_err(|why| format!("cannot load ONNX Runtime from {}: {why}", path.display()))?;
-        ort::init_from(path).map(|_| ()).map_err(|e| {
+        ort::init_from(path).map(|_| version).map_err(|e| {
             format!(
                 "cannot initialize ONNX Runtime from {}: {e}",
                 path.display()
@@ -370,21 +412,53 @@ mod onnx {
                             PACKAGED_ORTS[1]
                         ));
                     }
-                    return load_ort(&path);
+                    return load_ort(&path).map(|version| {
+                        irlume_common::dlog!(
+                            "onnxruntime {version} loaded from {}",
+                            path.display()
+                        );
+                    });
                 }
                 // No explicit path, no packaged copy: ask the system loader,
                 // through ort so acceptance and retention still apply.
-                load_ort(std::path::Path::new("libonnxruntime.so")).map_err(|system_error| {
-                    format!(
-                        "libonnxruntime.so was not loadable (no ORT_DYLIB_PATH, nothing \
-                         at {} or {}, and the system loader failed: {system_error}); \
-                         install the irlume package's onnxruntime or set ORT_DYLIB_PATH",
-                        PACKAGED_ORTS[0], PACKAGED_ORTS[1]
-                    )
-                })
+                load_ort(std::path::Path::new("libonnxruntime.so"))
+                    .map(|version| {
+                        irlume_common::dlog!("onnxruntime {version} loaded via the system loader");
+                    })
+                    .map_err(|system_error| {
+                        format!(
+                            "libonnxruntime.so was not loadable (no ORT_DYLIB_PATH, nothing \
+                             at {} or {}, and the system loader failed: {system_error}); \
+                             install the irlume package's onnxruntime or set ORT_DYLIB_PATH",
+                            PACKAGED_ORTS[0], PACKAGED_ORTS[1]
+                        )
+                    })
             })
             .clone()
             .map_err(irlume_common::Error::Hardware)
+    }
+
+    /// What the onnxruntime resolver would use in this process, for `irlume
+    /// doctor`: the candidate (an explicit or packaged path, or the system
+    /// loader when `None`) plus the probe's verdict on it, `Ok` carrying the
+    /// runtime's own version string.
+    ///
+    /// A dlopen probe, not a full `ort` init: doctor must be able to report a
+    /// broken runtime and move on, and `ort`'s global init is the code whose
+    /// failure mode is a silent park (#187). dlopen of a runtime already
+    /// loaded by this process is a reference-count bump, so calling this
+    /// after models loaded costs nothing new.
+    pub fn runtime_resolution() -> (Option<std::path::PathBuf>, Result<String, String>) {
+        let explicit = std::env::var_os("ORT_DYLIB_PATH");
+        let candidate = configured_ort(explicit.as_deref(), |p| p.is_file());
+        let name = candidate
+            .as_deref()
+            .unwrap_or(std::path::Path::new("libonnxruntime.so"));
+        let verdict = match std::ffi::CString::new(name.as_os_str().as_encoded_bytes()) {
+            Ok(name) => probe_runtime(&name),
+            Err(_) => Err(format!("{} contains a NUL byte", name.display())),
+        };
+        (candidate, verdict)
     }
 
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
@@ -1304,14 +1378,42 @@ mod onnx {
         fn nothing_found_defers_to_the_system_loader() {
             assert_eq!(configured_ort(None, |_| false), None);
         }
+
+        // The version-floor refusal itself (a runtime that loads, is an ONNX
+        // Runtime, and answers null for API level 24) needs a pre-1.24
+        // libonnxruntime, which CI does not have; it was validated against
+        // onnxruntime 1.20.1 in a container (#187), where the unpatched
+        // probe let the process park forever and this one returns the
+        // version-naming error. The two refusal classes below are the ones a
+        // stock Linux runner can produce deterministically.
+
+        #[test]
+        fn an_unloadable_path_reports_the_loaders_words() {
+            let err = probe_runtime(c"/nonexistent/libonnxruntime.so").unwrap_err();
+            assert!(
+                err.contains("cannot open shared object file"),
+                "expected the loader's own message, got: {err}"
+            );
+        }
+
+        #[test]
+        fn a_library_without_ortgetapibase_is_not_an_onnx_runtime() {
+            // libc is loadable on every supported platform and exports no
+            // OrtGetApiBase, so it exercises the loads-but-is-not-ort branch.
+            let err = probe_runtime(c"libc.so.6").unwrap_err();
+            assert!(
+                err.contains("exports no OrtGetApiBase"),
+                "expected the not-an-ONNX-Runtime refusal, got: {err}"
+            );
+        }
     }
 }
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    eye_ear, mesh_box_valid, mesh_min_ear, mesh_output_plausible, selftest_alignment_identity,
-    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, BLAZE_SCORE_THRESHOLD, EAR_LEFT,
-    EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    eye_ear, mesh_box_valid, mesh_min_ear, mesh_output_plausible, runtime_resolution,
+    selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr,
+    BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Model-backed pipeline tests: run the REAL shipped ONNX models (fetched to

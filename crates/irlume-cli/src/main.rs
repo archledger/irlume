@@ -3852,6 +3852,35 @@ fn doctor_run(
             ort
         }
     );
+    // Which ONNX Runtime this shell would actually load, and whether it is
+    // usable. The resolver prefers a packaged copy over the system library,
+    // so a stale file at a packaged path silently outranks a healthy system
+    // install; naming the resolved candidate and its version here is what
+    // makes that visible (#187: a below-floor leftover from a previous
+    // distro's package hung the daemon, and nothing reported which library
+    // had been chosen).
+    {
+        let (candidate, verdict) = irlume_vision::runtime_resolution();
+        let source = match &candidate {
+            Some(path) => path.display().to_string(),
+            None => "system libonnxruntime.so".to_string(),
+        };
+        match verdict {
+            Ok(version) => {
+                report.check("onnxruntime", State::Pass);
+                dout!(report, "[doctor] ONNX Runtime: {source} ({version}) ✓");
+            }
+            Err(why) => {
+                report.check("onnxruntime", State::Fail);
+                dout!(
+                    report,
+                    "[doctor] ONNX Runtime: {source} UNUSABLE ✗ ({why}). The daemon \
+                     cannot load models from this; if a packaged path above is a \
+                     leftover from a previous install, remove it"
+                );
+            }
+        }
+    }
     // --- pipeline stages (#276) -----------------------------------------
     // Each stage's model CANDIDATE from this process's search order. A
     // candidate, not a claim about the daemon: the service unit (or a

@@ -222,7 +222,8 @@ reused for a different meaning. The registry as of this contract:
 | `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
 | `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: mesh-dependent gates (passive blink liveness, consent gesture) are disabled |
 | `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
-| `ort-dylib-path` | which ONNX runtime library will be loaded |
+| `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
+| `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `third-party-pad-model` | optional third-party presentation-attack weights, if installed |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |

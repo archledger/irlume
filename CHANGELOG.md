@@ -138,6 +138,71 @@ All notable changes to irlume are documented here. This project adheres to
   `profiles add-scan`, which exits 2 on the same input; both now share one
   parser so they cannot drift apart again.
 
+- **The CLI and TUI opened camera nodes behind the daemon's back.**
+  Classifying a video node means opening it, so any of these racing the daemon
+  is EBUSY on a strict UVC module, which fails the user's enrollment with
+  nothing in the logs naming the cause. `irlume status` and `status --json`
+  each opened /dev/video0 through video3 with the daemon running, and `setup`
+  probed in its preflight and then enrolled seconds later on the nodes it had
+  just touched. All of them now ask the daemon, which already holds the nodes
+  and reports the pair it picked; the local probe survives only as the
+  daemon-silent fallback, where nothing else holds the cameras. Measured with
+  strace, four opens to zero. A source-property test pins the rule, and the two
+  probes that remain deliberate (doctor inspecting hardware, the dev engine
+  resolving the node it is about to open) carry the reason at the call site.
+
+- **A scan budget the daemon did not report read as zero.** `room` defaulted
+  to 0, which is what a genuinely full profile also reports, so a 0.9.0 client
+  against a still-running 0.8.1 daemon offered no continuation scans: the user
+  asked for ten and got the one merged scan with nothing saying why. That is
+  the window every upgrade passes through, between the package swap and the
+  daemon restart. The field is optional now, and unknown means ask for what
+  the user requested and let the daemon refuse what it will.
+
+- **Per-recognizer counts a daemon never sent were reported as none.**
+  `profiles list --json` emitted `"recognizers": []` beside ten scans against
+  a pre-0.9.0 daemon, which claims no recognizer can match this profile and
+  would send a consumer to prompt for re-enrollment. The key is omitted when
+  the answer is unknown; a profile that genuinely has no scans still reports
+  an empty list.
+
+- **The TUI chrome claimed state its own body had not established.** An
+  enrolled user was told "New here? Press [e] to scan your face", an armed
+  keyring was told to arm, a set recovery passphrase was told to set one, and
+  the Done footer offered to wire a login that was already wired, where the
+  key fires a real `sudo irlume login enable --apply`. The Profiles tips
+  truncated mid-sentence at every terminal width, the Settings biopolicy row
+  disagreed with the Done screen about the same root-only setting, and the
+  `?` overlay was missing four keys it claims to list in full.
+
+- **`irlume deps` told users to install onnxruntime on machines that have
+  it.** Its path list had neither location the irlume packages use, and the
+  packages hand `ORT_DYLIB_PATH` to the daemon through a unit drop-in that a
+  bare CLI run never sees, so with irlumed stopped it reported the runtime
+  missing. That is exactly when someone runs `deps`. The list now lives in one
+  place that the vision crate shares.
+
+- **`camera-tune --rounds` with a non-numeric value fired the IR emitter for
+  a minute at the default count** instead of refusing, the same silent
+  substitution `enroll --scans` had. Three usage errors also answered exit 1
+  where every sibling answers 2 (`logs`, `selinux`, and bare `suncal`).
+
+- **Packit could not build an SRPM, so tagging 0.9.0 would have produced no
+  Copr package at all.** Publishing the TFLite runtime as a GitHub release
+  added the tag `tflite-runtime-v2.19.0`, and Packit derives the version from
+  the newest tag: "Unable to extract version from tflite-runtime-v2.19.0 using
+  v{version}". Both rpm-build checks had been red on every PR since, read as
+  background noise; the same code path runs on the release trigger, where
+  Packit failures are silent. `.packit.yaml` now filters to release tags.
+
+- **The AppArmor profiles are checked by CI, and stop asking for ptrace.**
+  Nothing validated them before, and they are the only confinement on the
+  Debian/Ubuntu lane: a profile that fails to parse does not confine. The
+  camera-consumer scan's `sys_ptrace` request is now explicitly denied rather
+  than left to log about 30 audit refusals per boot; granting it would let
+  irlumed inspect any process on the machine, which is more than a diagnostic
+  message is worth, and the scan already degrades and proceeds.
+
 - **The TUI opened camera nodes behind the daemon's back.** Classifying a
   video node means opening it, and the TUI did that on every background
   refresh, including while the daemon was streaming the same nodes for an
@@ -235,6 +300,32 @@ All notable changes to irlume are documented here. This project adheres to
   p_fake 0.988 to 1.000. The corpora, the `landmark_replay` offline
   instrument, and checkers that fail on an edited figure are in
   docs/pad-results/.
+
+### Upgrading from 0.8.1
+
+Enrollments written by 0.8.1 load unchanged: untagged scans count under the
+shipped recognizer, and a calibration written before this release keeps
+working. The upgrade was tested both ways with fixtures produced by real
+0.8.1 code, including sealed template keys, and with every combination of
+0.8.1 and 0.9.0 client and daemon. Three things are worth knowing.
+
+- **Restart the daemon.** Between the package swap and the restart you are
+  running a 0.9.0 CLI against an 0.8.1 daemon. Nothing breaks and no data is
+  at risk, but that older daemon cannot answer the questions this release
+  added, so a few surfaces read as unknown until it comes back. The RPM and
+  Debian packages request the restart themselves.
+
+- **A downgrade must be read-only.** 0.8.1 can READ a store written by 0.9.0,
+  but if it WRITES one it drops what it does not understand: the per-scan
+  recognizer tags and the per-recognizer calibrations. That only matters if
+  you have enrolled scans under a third-party recognizer, and only if you go
+  back to 0.8.1 and then enroll or edit a profile. Reading with 0.8.1 leaves
+  the file untouched.
+
+- **`enforce_biopolicy=TRUE` was never in effect.** Both daemons accept only
+  `1`, `true`, `yes`, or `on`, all lowercase, so an uppercase value has always
+  been off. 0.8.1's `status` displayed it as ENFORCING anyway; 0.9.0 shows what
+  the daemon actually does. If you set it that way, lowercase it.
 
 ## [0.8.1] - 2026-08-04
 

@@ -251,7 +251,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 - A native TFLite runtime ships at /usr/share/irlume/tflite/ behind a stage gate that stays closed
 - Dark login was unreachable since 0.8.0 and works again (#284)
 - Garbage landmark geometry abstains instead of scoring confident wrong numbers
-- enroll --scans with a non-numeric value is a usage error, not a default-count capture
+- enroll --scans and camera-tune --rounds with a non-numeric value are usage errors, not a capture at the default count
+- The CLI no longer opens video nodes while the daemon streams them, completing the #187 fix that #300 started in the TUI
+- A scan budget an older daemon did not report reads as unknown rather than zero, which had silently under-enrolled during the upgrade window
+- Packit could not build an SRPM at all since the TFLite runtime tag was published; .packit.yaml now filters to release tags
+- CI validates the AppArmor profiles, which nothing checked before
 * Tue Aug 04 2026 archledger <archledger236@gmail.com> - 0.8.1-1
 - A printed photograph of an enrolled face passes the built-in liveness gate; the cue cannot be repaired by tuning it, and the mitigation is `irlume models enable flir` (advisory, #235)
 - A blown infrared frame is refused rather than judged, so clipping no longer silences the PAD cue (#237)

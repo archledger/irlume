@@ -1543,6 +1543,33 @@ pub(crate) fn caps() -> irlume_camera::Caps {
     })
 }
 
+/// The RGB and IR node paths in use, asked of the DAEMON first and cached for
+/// the process.
+///
+/// The sibling of [`caps`], and for the same reason: `select_pair` classifies
+/// nodes by OPENING them, so calling it while the daemon streams is a second
+/// opener racing it, which is EBUSY on strict UVC modules (#187). #300 fixed
+/// the TUI; `status`, `status --json`, and `setup` were still enumerating,
+/// measured with strace as four opens of /dev/video0..3 each with the daemon
+/// running. `setup` was the worst: it probed in preflight and enrolled seconds
+/// later on the nodes it had just touched.
+///
+/// The local probe survives only as the daemon-silent fallback, where nothing
+/// else holds the cameras and it is the only source of an answer.
+pub(crate) fn camera_pair() -> (String, String) {
+    static PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| match daemon_poll(&irlume_common::Request::Health) {
+        Ok(irlume_common::Response::Health {
+            rgb_dev, ir_dev, ..
+        }) => (
+            rgb_dev.unwrap_or_else(|| "none".into()),
+            ir_dev.unwrap_or_else(|| "none".into()),
+        ),
+        _ => irlume_camera::select_pair(), // the one permitted probe
+    })
+    .clone()
+}
+
 pub(crate) fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -1629,6 +1656,8 @@ pub(crate) fn engine(
 ) -> irlume_common::Result<irlume_auth::Engine> {
     let e = irlume_auth::Engine::load(det, model)?;
     let e = match devices_from_flags(flag(args, "--rgb"), flag(args, "--ir"), || {
+        // deliberate camera probe: this engine is about to OPEN the node it
+        // resolves, so resolving it is the first step of using it.
         irlume_camera::select_pair()
     }) {
         Some((r, i)) => e.with_devices(&r, &i),
@@ -3710,6 +3739,9 @@ fn doctor_run(
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------
     {
+        // deliberate camera probe: doctor's job is to inspect the hardware,
+        // and negotiating a stream format needs the node open. Foreground and
+        // occasional, not a refresh loop, so it is not the #187 shape.
         let (rgb_node, ir_node) = irlume_camera::select_pair();
         stream_minimum_checks(report, &rgb_node, &ir_node);
     }

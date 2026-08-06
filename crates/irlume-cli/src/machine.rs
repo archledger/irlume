@@ -427,7 +427,7 @@ pub fn status(args: &[String]) -> ExitCode {
     // has always paired the capability probe with an existence check; this now
     // agrees with it.
     let caps = crate::caps();
-    let (rgb, ir) = irlume_camera::select_pair();
+    let (rgb, ir) = crate::camera_pair();
     let camera = json!({
         "rgb": caps.rgb && std::path::Path::new(&rgb).exists(),
         "ir": caps.ir_pair && std::path::Path::new(&ir).exists(),

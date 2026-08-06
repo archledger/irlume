@@ -785,8 +785,16 @@ pub fn status(args: &[String]) -> ExitCode {
         }
     );
 
-    // Cameras.
-    let (rgb, ir) = irlume_camera::select_pair();
+    // Cameras. Ask the DAEMON first: it already holds these nodes and reports
+    // the pair it selected, and classifying a node locally means OPENING it.
+    // On a UVC module that answers EBUSY to a second open, `irlume status` run
+    // during an enrollment fails that enrollment. That is #187, and the #300
+    // fix covered the TUI but left this path enumerating: measured with strace,
+    // `status` opened /dev/video0 through video3 with the daemon running.
+    // Falling back to a local probe when the daemon is down is safe for the
+    // same reason it is in the TUI: nothing else holds the cameras then, and it
+    // is the only source of an answer.
+    let (rgb, ir) = crate::camera_pair();
     println!("  cameras       : rgb={rgb} ir={ir}");
 
     // Fingerprint.
@@ -1476,7 +1484,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     }
     println!("  daemon running {OK}");
     let _ = deps(args);
-    let (rgb, ir) = irlume_camera::select_pair();
+    let (rgb, ir) = crate::camera_pair();
     println!("  cameras: rgb={rgb} ir={ir}");
 
     // 2. Enroll (reset if already enrolled and the user wants a clean start).

@@ -1276,6 +1276,41 @@ fn an_encrypted_store_with_no_key_says_so_instead_of_plaintext() {
     );
 }
 
+/// #187: classifying a video node means OPENING it, and on a UVC module that
+/// answers EBUSY to a second open, doing that while the daemon streams fails the
+/// user's enrollment. #300 stopped the TUI doing it; `status` was still
+/// enumerating, measured with strace as four opens of /dev/video0..3 with the
+/// daemon running. The daemon already reports the pair it selected, so a running
+/// daemon is the authority here too.
+///
+/// The fixture reports device paths that exist on no machine, so seeing them in
+/// the output proves the answer came over the socket rather than from a probe.
+#[test]
+fn status_takes_the_camera_pair_from_the_daemon_not_a_local_probe() {
+    let sb = Sandbox::new("statuscam");
+    serve(&sock(&sb), |req| match req {
+        Request::Health => Response::Health {
+            tier: "secure".into(),
+            rgb_dev: Some("/dev/video91".into()),
+            ir_dev: Some("/dev/video92".into()),
+            mesh: true,
+            adapter: false,
+            version: env!("CARGO_PKG_VERSION").into(),
+            third_party_pad: None,
+            third_party_recognizer: None,
+            third_party_detector: None,
+            apparmor: None,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (_, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]));
+    assert!(
+        out.contains("/dev/video91") && out.contains("/dev/video92"),
+        "status must report the daemon's pair, not one it probed: {out}"
+    );
+}
+
 #[test]
 fn recovery_success_paths_with_a_live_daemon() {
     let sb = Sandbox::new("recoveryok");

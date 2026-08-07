@@ -30,6 +30,31 @@ arm64 onnxruntime + rebuild validation, not anything in the code.
 | Arch | desktop, no camera | none | package build, daemon + full CLI stack, PAM wiring dry-run, clean camera-less refusals |
 | Debian 12 | container (no camera) | none | from-source build, `.deb` install, `irlume doctor` |
 | external IR camera | NexiGo HelloCam N930W (USB) | IR/Secure | presentation-attack testing (photo, screen, replay denied), daemon-to-password fallback end to end |
+| external IR camera | Logitech Brio 4K (046d:085e) | link-dependent, see below | sequential capture both links; emitter strobe and dark-room IR measured on USB3; RGB starvation measured on both links |
+
+### Logitech Brio 4K: capability depends on the USB link
+
+Measured 2026-08-07 (USB3 host, dark room) and 2026-08-06 (USB2 host, the
+#187 session):
+
+- **The IR emitter fires only on a USB3 link.** On USB3 it strobes on
+  alternate frames from bare STREAMON after a cold re-enumeration, with no
+  extension-unit write (dark-phase frame mean 0.6, lit-phase 126 to 224 in
+  an ambient-IR-free room). On a USB2 link the same model never strobes,
+  so secure-tier authentication there works only when the environment
+  supplies infrared.
+- **Held dual streams fail on BOTH links.** With the IR stream armed, RGB
+  delivers zero frames and dies with QBUF EINVAL (USB2: `Failed to
+  resubmit video URB`; USB3: immediate EINVAL, three of three probe
+  rounds). Sequential capture works on both.
+- The IR sensor answers 340x340 GREY at ~19 fps regardless of the
+  requested size.
+
+Verdict: on USB2, convenience tier or an external camera with a working
+emitter (the NexiGo above). On USB3 the measured pieces (emitter, dark-room
+IR, sequential capture) support Hello-class use, but full enrollment and
+authentication on that link are not yet exercised; the verdict is only as
+wide as those measurements.
 
 The first cross-distro survey (build, daemon, PAM plan, tier detection on
 Arch and Ubuntu) is written up in

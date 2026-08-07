@@ -386,6 +386,7 @@ struct RecoveryInfo {
 }
 
 /// Messages streamed from the guided-enroll worker to the UI.
+#[derive(Debug)]
 enum WMsg {
     Cue(PositionReport),
     /// A framing-guide poll got no answer (timeout / connection error). NOT a
@@ -3947,6 +3948,32 @@ impl App {
                 Style::new().add_modifier(Modifier::BOLD),
             )),
             Line::raw(""),
+        ];
+        if let Some(err) = &e.stalled {
+            // Not a biometric verdict: the guide stopped answering, so EVERY
+            // live reading (quality bar, checklist, guidance) is stale and
+            // rendering any of it reads as a current verdict against a hung
+            // capture (#309). The stall replaces the whole live panel.
+            lines.push(Line::from(vec![
+                Span::styled("  ✗ ", Style::new().fg(th().err)),
+                Span::styled(
+                    "Camera guide not answering; this is not about your face or lighting.",
+                    Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("    ({err}) Check: journalctl -u irlumed -n 50"),
+                Style::new().dim(),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  [esc] cancel",
+                Style::new().dim(),
+            )));
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+        lines.extend([
             Line::from(vec![
                 Span::raw("  Quality  "),
                 Span::styled(
@@ -3971,23 +3998,8 @@ impl App {
                 "Well lit",
             ),
             Line::raw(""),
-        ];
-        if let Some(err) = &e.stalled {
-            // Not a biometric verdict: the guide stopped answering, so the
-            // cue above is stale and nothing the user does in front of the
-            // camera can help (#309). Say that instead of the last guidance.
-            lines.push(Line::from(vec![
-                Span::styled("  ✗ ", Style::new().fg(th().err)),
-                Span::styled(
-                    "Camera guide not answering; this is not about your face or lighting.",
-                    Style::new().fg(th().err).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(
-                format!("    ({err}) Check: journalctl -u irlumed -n 50"),
-                Style::new().dim(),
-            )));
-        } else if let Some(c) = e.count {
+        ]);
+        if let Some(c) = e.count {
             lines.push(Line::from(Span::styled(
                 format!("  ● Hold still; capturing in {c}…",),
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
@@ -6045,6 +6057,141 @@ fn map_settings(resp: Response) -> (bool, String) {
     }
 }
 
+/// One transport miss against the framing guide, counted toward
+/// [`GUIDE_MISS_LIMIT`]. Sends the stall (or the final give-up error) to the
+/// UI. Returns what the caller must do next.
+fn guide_miss(
+    misses: &mut u32,
+    e: String,
+    send: &impl Fn(WMsg) -> bool,
+) -> GuideOutcome {
+    *misses += 1;
+    if *misses >= GUIDE_MISS_LIMIT {
+        let _ = send(WMsg::Err(format!(
+            "the camera guide never answered ({e}); this is not a \
+             detection result. Check: journalctl -u irlumed -n 50"
+        )));
+        return GuideOutcome::Halt;
+    }
+    if !send(WMsg::Stall(e)) {
+        return GuideOutcome::Halt;
+    }
+    GuideOutcome::Reframe
+}
+
+enum GuideOutcome {
+    /// Well-framed streak held through the countdown: fire the capture.
+    Ready,
+    /// Framing drifted or a sample was missed (under the limit): re-frame.
+    /// The consecutive-miss counter lives with the SCAN, not this attempt,
+    /// so countdown misses cannot reset it by re-entering (Codex round on
+    /// #309: the re-entry reset made a flapping daemon loop forever).
+    Reframe,
+    /// Stop was requested, the UI hung up, or a fatal error was sent.
+    Halt,
+}
+
+/// Framing streak + 3-2-1 countdown for one capture attempt, over an
+/// injectable sampler so the miss/give-up state machine is testable without
+/// a daemon socket.
+fn guide_until_capture(
+    user: &str,
+    stop: &AtomicBool,
+    send: &impl Fn(WMsg) -> bool,
+    sample: &mut impl FnMut(&Request) -> Result<Response, String>,
+    misses: &mut u32,
+) -> GuideOutcome {
+    // Framing loop: wait for a well-framed streak. Samples use a bounded
+    // budget: a guide that does not answer is a transport fact, not a
+    // framing fact, and must never leave the last cue on screen reading as
+    // a current biometric verdict (#309). A missed sample shows a visible
+    // "not answering" state; GUIDE_MISS_LIMIT consecutive misses (across
+    // framing AND countdown) end the enrollment saying so plainly.
+    let mut streak = 0u32;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        match sample(&Request::PositionSample {
+            user: Some(user.to_owned()),
+        }) {
+            Ok(Response::Position(r)) => {
+                *misses = 0;
+                let good = r.well_framed;
+                if !send(WMsg::Cue(r)) {
+                    return GuideOutcome::Halt;
+                }
+                streak = if good { streak + 1 } else { 0 };
+                if streak >= GOOD_STREAK {
+                    break;
+                }
+            }
+            Ok(Response::Error(e)) => {
+                let _ = send(WMsg::Err(e));
+                return GuideOutcome::Halt;
+            }
+            // A response of the wrong type is a protocol break, not a cue to
+            // retry: swallowing it here would spin a tight request loop
+            // against a confused daemon.
+            Ok(o) => {
+                let _ = send(WMsg::Err(format!(
+                    "camera guide answered with the wrong response type: {o:?}"
+                )));
+                return GuideOutcome::Halt;
+            }
+            Err(e) => {
+                streak = 0;
+                match guide_miss(misses, e, send) {
+                    GuideOutcome::Reframe => {} // stay in the framing loop
+                    halt => return halt,
+                }
+            }
+        }
+    }
+    // 3-2-1 countdown: re-verify framing at each beat (the poll lands
+    // just before the next beat / the capture). Drift off-angle aborts.
+    for c in (1..=3).rev() {
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        if !send(WMsg::Count(c)) {
+            return GuideOutcome::Halt;
+        }
+        std::thread::sleep(Duration::from_millis(650));
+        match sample(&Request::PositionSample {
+            user: Some(user.to_owned()),
+        }) {
+            // Still framed: keep counting (don't send a Cue; that would
+            // clear the on-screen count). Only surface a cue on abort.
+            Ok(Response::Position(r)) if r.well_framed => {
+                *misses = 0;
+            }
+            Ok(Response::Position(r)) => {
+                *misses = 0;
+                let _ = send(WMsg::Cue(r));
+                return GuideOutcome::Reframe;
+            }
+            Ok(Response::Error(e)) => {
+                let _ = send(WMsg::Err(e));
+                return GuideOutcome::Halt;
+            }
+            Ok(o) => {
+                let _ = send(WMsg::Err(format!(
+                    "camera guide answered with the wrong response type: {o:?}"
+                )));
+                return GuideOutcome::Halt;
+            }
+            // A mid-countdown miss counts like any other: the counter
+            // survives the trip back through the framing loop.
+            Err(e) => match guide_miss(misses, e, send) {
+                GuideOutcome::Reframe => return GuideOutcome::Reframe,
+                halt => return halt,
+            },
+        }
+    }
+    GuideOutcome::Ready
+}
+
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,
 /// then capture, repeating until `target` scans. Streams cues to the UI.
 fn enroll_worker(
@@ -6057,95 +6204,25 @@ fn enroll_worker(
 ) {
     let send = |m: WMsg| tx.send(m).is_ok();
     for i in 0..target {
+        // Consecutive guide misses for THIS scan, framing and countdown
+        // together; only a successful sample resets it.
+        let mut misses = 0u32;
         // Retry this scan until it's captured while well-framed: a drift during
         // the 3-2-1 aborts the countdown and re-frames instead of firing capture.
         'scan: loop {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            // Framing loop: wait for a well-framed streak. Samples use a
-            // bounded budget: a guide that does not answer is a transport
-            // fact, not a framing fact, and must never leave the last cue on
-            // screen reading as a current biometric verdict (#309). One slow
-            // sample gets a visible "not answering" state and two retries;
-            // a third consecutive miss ends the enrollment saying plainly
-            // that the camera never answered.
-            let mut streak = 0u32;
-            let mut misses = 0u32;
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                match crate::daemon_sample(&Request::PositionSample {
-                    user: Some(user.clone()),
-                }) {
-                    Ok(Response::Position(r)) => {
-                        misses = 0;
-                        let good = r.well_framed;
-                        if !send(WMsg::Cue(r)) {
-                            return;
-                        }
-                        streak = if good { streak + 1 } else { 0 };
-                        if streak >= GOOD_STREAK {
-                            break;
-                        }
-                    }
-                    Ok(Response::Error(e)) => {
-                        let _ = send(WMsg::Err(e));
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        misses += 1;
-                        streak = 0;
-                        if misses >= GUIDE_MISS_LIMIT {
-                            let _ = send(WMsg::Err(format!(
-                                "the camera guide never answered ({e}); this is not a \
-                                 detection result. Check: journalctl -u irlumed -n 50"
-                            )));
-                            return;
-                        }
-                        if !send(WMsg::Stall(e)) {
-                            return;
-                        }
-                    }
-                }
-            }
-            // 3-2-1 countdown: re-verify framing at each beat (the poll lands
-            // just before the next beat / the capture). Drift off-angle aborts.
-            for c in (1..=3).rev() {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                if !send(WMsg::Count(c)) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(650));
-                match crate::daemon_sample(&Request::PositionSample {
-                    user: Some(user.clone()),
-                }) {
-                    // Still framed: keep counting (don't send a Cue; that would
-                    // clear the on-screen count). Only surface a cue on abort.
-                    Ok(Response::Position(r)) if r.well_framed => {}
-                    Ok(Response::Position(r)) => {
-                        let _ = send(WMsg::Cue(r));
-                        continue 'scan;
-                    }
-                    Ok(Response::Error(e)) => {
-                        let _ = send(WMsg::Err(e));
-                        return;
-                    }
-                    Ok(_) => {}
-                    // A mid-countdown miss aborts the countdown back to the
-                    // framing loop (whose miss counter decides when to give
-                    // up), with the stall visible instead of a stale cue.
-                    Err(e) => {
-                        if !send(WMsg::Stall(e)) {
-                            return;
-                        }
-                        continue 'scan;
-                    }
-                }
+            match guide_until_capture(
+                &user,
+                &stop,
+                &send,
+                &mut |req| crate::daemon_sample(req),
+                &mut misses,
+            ) {
+                GuideOutcome::Ready => {}
+                GuideOutcome::Reframe => continue 'scan,
+                GuideOutcome::Halt => return,
             }
             // Capture: first scan of a NEW profile creates it; the rest append.
             let req = if i == 0 && add.is_none() {
@@ -8432,12 +8509,12 @@ mod tests {
         let mut app = test_app();
         let (tx, enroll) = fake_enroll(0, 4);
         app.enroll = Some(enroll);
-        tx.send(WMsg::Cue(PositionReport {
-            face: false,
-            well_framed: false,
-            guidance: "No face detected; look straight at the camera and center yourself".into(),
-            ..good_report("")
-        }))
+        // The nastiest stale state: every reading GOOD. A stall must hide all
+        // of it, not just the guidance line (Codex round: the checklist and
+        // quality bar are biometric verdicts too).
+        tx.send(WMsg::Cue(good_report(
+            "No face detected; look straight at the camera and center yourself",
+        )))
         .unwrap();
         tx.send(WMsg::Count(3)).unwrap();
         app.poll();
@@ -8454,10 +8531,69 @@ mod tests {
             text.contains("read timed out"),
             "the transport error is shown: {text}"
         );
-        assert!(
-            !text.contains("No face detected"),
-            "a stale cue must not render as a current verdict: {text}"
-        );
+        for stale in [
+            "No face detected",
+            "Quality",
+            "Face detected",
+            "Centered in frame",
+            "Facing the camera",
+            "Well lit",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "stale live reading rendered during a stall: {stale}\n{text}"
+            );
+        }
+        assert!(text.contains("[esc] cancel"), "cancel stays offered: {text}");
+    }
+
+    /// Codex round on #309: the miss counter must survive the trip from a
+    /// countdown miss back through the framing loop. Before the fix, the
+    /// re-entry re-declared it at zero, so a daemon that flapped (answers
+    /// framing, dies in the countdown) could keep an enrollment looping
+    /// forever without ever reaching the give-up message.
+    #[test]
+    fn countdown_misses_count_toward_the_guide_limit() {
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let send = |m: WMsg| tx.send(m).is_ok();
+        // Scripted guide: three well-framed samples reach the countdown, then
+        // every request times out. One countdown miss + two framing misses
+        // must hit GUIDE_MISS_LIMIT (3) with no further requests.
+        let script: Vec<Result<Response, String>> = vec![
+            Ok(Response::Position(good_report("hold still"))),
+            Ok(Response::Position(good_report("hold still"))),
+            Ok(Response::Position(good_report("hold still"))),
+            Err("read timed out".into()),
+            Err("read timed out".into()),
+            Err("read timed out".into()),
+        ];
+        let mut calls = script.into_iter();
+        let mut sample = |_req: &Request| calls.next().expect("guide polled past the give-up");
+        let mut misses = 0u32;
+        let outcome = loop {
+            match guide_until_capture("u", &stop, &send, &mut sample, &mut misses) {
+                GuideOutcome::Reframe => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(outcome, GuideOutcome::Halt), "give-up must halt");
+        assert!(calls.next().is_none(), "all six scripted samples consumed");
+        drop(tx);
+        let msgs: Vec<WMsg> = rx.iter().collect();
+        let last = msgs.last().expect("messages were sent");
+        match last {
+            WMsg::Err(e) => assert!(
+                e.contains("never answered") && e.contains("journalctl"),
+                "the give-up says the guide never answered: {e}"
+            ),
+            o => panic!("the final message must be the give-up error, got {o:?}"),
+        }
+        let stalls = msgs
+            .iter()
+            .filter(|m| matches!(m, WMsg::Stall(_)))
+            .count();
+        assert_eq!(stalls, 2, "misses below the limit render as stalls");
     }
 
     /// A guide that recovers goes back to live cues with no stall residue.

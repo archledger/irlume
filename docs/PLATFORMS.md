@@ -50,9 +50,11 @@ Measured 2026-08-07 (USB3 host, dark room) and 2026-08-06 (USB2 host, the
 - The IR sensor answers 340x340 GREY at ~19 fps regardless of the
   requested size.
 
-Verdict: on USB3, a usable Hello-class camera in sequential mode; on USB2,
-convenience tier or an external camera with a working emitter (the NexiGo
-above). Full enrollment on the USB3 link is not yet exercised.
+Verdict: on USB2, convenience tier or an external camera with a working
+emitter (the NexiGo above). On USB3 the measured pieces (emitter, dark-room
+IR, sequential capture) support Hello-class use, but full enrollment and
+authentication on that link are not yet exercised; the verdict is only as
+wide as those measurements.
 
 The first cross-distro survey (build, daemon, PAM plan, tier detection on
 Arch and Ubuntu) is written up in

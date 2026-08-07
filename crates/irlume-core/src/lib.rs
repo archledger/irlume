@@ -39,7 +39,17 @@ pub mod tpm_pcrlock;
 /// makes each run's dir distinct; ENV_LOCK still serializes within a process.
 #[cfg(test)]
 pub(crate) fn test_tmp_dir(name: &str) -> String {
-    format!("/tmp/irlume-test-{name}-{}", std::process::id())
+    // uid FIRST, then pid (#321 review): the pid alone is not unique over
+    // time (PIDs wrap at kernel.pid_max), so a reused pid could land on
+    // another CI user's stale directory and reproduce the very EACCES
+    // cascade this helper exists to prevent. With the uid in the path, a
+    // stale directory can only ever be OUR OWN, which is why the callers'
+    // `let _ = remove_dir_all(..)` is safe rather than a hidden failure.
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .unwrap_or_else(|_| u32::MAX);
+    format!("/tmp/irlume-test-{name}-u{uid}-p{}", std::process::id())
 }
 
 /// RGB (visible-light) match threshold. Measured FAR: real faces (LFW, 13,233

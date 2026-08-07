@@ -25,7 +25,7 @@ use crate::commands::{install_origin, InstallOrigin};
 use crate::is_root;
 use crate::pamwire;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// What the teardown actually did, so the CLI and the TUI can report it the
@@ -163,10 +163,20 @@ pub fn run(args: &[String]) -> ExitCode {
     // Clean the leftovers a package `remove` doesn't (drop-in, empty dirs, repo)
     // regardless of whether the package removal itself succeeded.
     clean_residuals(&origin);
+    // Snapshot tooling keeps copies of everything the wipe just deleted: on the
+    // #335 audit box, snapper's pacman hooks had snapshotted the templates, the
+    // sealed keyring blob, and the recovery envelope, so "no data left behind"
+    // was not the whole truth. Detection is evidence-only (no snapshot tool is
+    // ever run) and irrelevant when --keep-data skipped the wipe.
+    let snapshots = if report.data_wiped {
+        detect_snapshot_tools()
+    } else {
+        SnapshotEvidence::default()
+    };
     match removed {
         Ok(what) => {
             println!("[uninstall] {what}");
-            println!("[uninstall] irlume is removed, with no repo, drop-in, or data left behind.");
+            println!("[uninstall] {}", closing_line(&snapshots));
         }
         Err(e) => {
             println!("[uninstall] could not finish removal automatically: {e}");
@@ -294,6 +304,133 @@ fn remove_repo_files(dir: &str) {
     }
 }
 
+/// Where systemd records each timer's last-trigger stamp.
+const TIMER_STAMP_DIR: &str = "/var/lib/systemd/timers";
+
+/// Delete systemd's `stamp-*` files for irlume's timer units under `dir`. The
+/// stamps are systemd's own bookkeeping, so no package owns them and disabling
+/// the timer leaves them behind (#335). Best-effort like the other residual
+/// cleaners: a missing directory or file is simply nothing to do.
+fn remove_timer_stamps(dir: &str) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("stamp-irlume") && name.ends_with(".timer") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// The filesystem facts that say a snapshot tool retains copies of the wiped
+/// data (#335). Gathered from cheap existence checks only; the tools' own
+/// commands are never run, because detection must not be able to mutate
+/// snapshot state or fail the uninstall.
+#[derive(Default)]
+struct SnapshotEvidence {
+    snapper: bool,
+    timeshift: bool,
+}
+
+fn detect_snapshot_tools() -> SnapshotEvidence {
+    SnapshotEvidence {
+        snapper: snapper_evidence(),
+        timeshift: timeshift_evidence(),
+    }
+}
+
+/// snapper is retaining data when its binary exists AND /etc/snapper/configs
+/// holds at least one config, or when a package-manager hook re-snapshots every
+/// transaction: snap-pac's pacman hooks (the mechanism that snapshotted the
+/// #335 audit box) or openSUSE's zypp commit plugin.
+fn snapper_evidence() -> bool {
+    let bin = [
+        "/usr/bin/snapper",
+        "/usr/sbin/snapper",
+        "/usr/local/bin/snapper",
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists());
+    if bin && dir_has_entries("/etc/snapper/configs") {
+        return true;
+    }
+    for d in ["/usr/share/libalpm/hooks", "/etc/pacman.d/hooks"] {
+        if dir_has_entry_named(d, "snap-pac") || dir_has_entry_named(d, "snapper") {
+            return true;
+        }
+    }
+    dir_has_entry_named("/usr/lib/zypp/plugins/commit", "snapper")
+}
+
+/// Timeshift needs less corroboration than snapper: its binary or /etc/timeshift
+/// only exist when someone installed it, and it exists only to take snapshots.
+fn timeshift_evidence() -> bool {
+    [
+        "/usr/bin/timeshift",
+        "/usr/sbin/timeshift",
+        "/usr/local/bin/timeshift",
+        "/etc/timeshift",
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists())
+}
+
+/// True when `dir` exists and holds at least one entry. An unreadable directory
+/// counts as no evidence, never as an error: detection must not fail the
+/// uninstall (#335).
+fn dir_has_entries(dir: &str) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// True when `dir` holds an entry whose name contains `needle`, compared in
+/// lowercase. Same tolerance as `dir_has_entries`.
+fn dir_has_entry_named(dir: &str, needle: &str) -> bool {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(needle)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The closing line of a successful uninstall. Without snapshot evidence it is
+/// the exact line the module has always printed. With evidence it stays honest
+/// (#335): the wipe cannot reach inside filesystem snapshots, so the line names
+/// the tool holding them and the command that lists them, and drops the "no
+/// data left behind" claim it can no longer make. Pure over the gathered
+/// evidence so both arms are unit tested.
+fn closing_line(snapshots: &SnapshotEvidence) -> String {
+    let mut tools: Vec<&str> = Vec::new();
+    let mut list_cmds: Vec<&str> = Vec::new();
+    if snapshots.snapper {
+        tools.push("snapper");
+        list_cmds.push("`snapper list`");
+    }
+    if snapshots.timeshift {
+        tools.push("Timeshift");
+        list_cmds.push("`timeshift --list`");
+    }
+    if tools.is_empty() {
+        return "irlume is removed, with no repo, drop-in, or data left behind.".into();
+    }
+    format!(
+        "irlume is removed, with no repo or drop-in left behind, but {} filesystem \
+         snapshots may still contain the wiped templates and sealed secrets (list \
+         them with {}).",
+        tools.join(" and "),
+        list_cmds.join(" and ")
+    )
+}
+
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI
 /// calls the identical sequence behind its own confirmation.
 pub fn perform_teardown(keep_data: bool) -> TeardownReport {
@@ -320,6 +457,11 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     ] {
         let _ = systemctl(&["disable", "--now", unit]);
     }
+    // systemd keeps a monotonic stamp per timer under /var/lib/systemd/timers
+    // and deletes it neither on disable nor on package remove: the #335 audit
+    // found stamp-irlume-reconcile.timer still there after the uninstall AND a
+    // reboot. Removed here, right after the unit that owned it.
+    remove_timer_stamps(TIMER_STAMP_DIR);
     let service_stopped = stop && disable;
 
     // 3. Disarm each enrolled user's keyring seal (idempotent), and 4. wipe the
@@ -480,6 +622,114 @@ mod tests {
     fn yn_reports_yes_or_the_maybe_not_running_note() {
         assert_eq!(yn(true), "yes");
         assert_eq!(yn(false), "no (may not have been running)");
+    }
+
+    // The stamp cleaner (#335) runs against systemd's timer-stamp directory,
+    // where irlume's stamps sit next to every other timer's; it must take only
+    // the irlume ones. Exercised on an owned temp dir through the same `dir`
+    // parameter the teardown passes TIMER_STAMP_DIR.
+    #[test]
+    fn remove_timer_stamps_deletes_only_irlume_stamp_files() {
+        let dir = std::env::temp_dir().join(format!("irlume-timer-stamps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = ["stamp-irlume-reconcile.timer"];
+        let theirs = [
+            "stamp-fstrim.timer",
+            "stamp-logrotate.timer",
+            // Not a stamp: the shape matters, not just the irlume name.
+            "irlume-reconcile.timer",
+        ];
+        for f in ours.iter().chain(theirs.iter()) {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        remove_timer_stamps(dir.to_str().unwrap());
+        for f in ours {
+            assert!(!dir.join(f).exists(), "{f} should have been removed");
+        }
+        for f in theirs {
+            assert!(dir.join(f).exists(), "{f} must be left alone");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_timer_stamps_tolerates_a_missing_directory() {
+        remove_timer_stamps("/nonexistent/irlume-timer-stamp-dir");
+    }
+
+    // The closing line is the uninstall's last word, and #335 measured it being
+    // wrong on a snapshotting box. Without evidence it must be the historical
+    // line, byte for byte; with evidence it must name the tool, keep the
+    // templates-and-secrets warning, and give the listing command.
+    #[test]
+    fn closing_line_without_snapshot_evidence_is_the_historical_line() {
+        assert_eq!(
+            closing_line(&SnapshotEvidence::default()),
+            "irlume is removed, with no repo, drop-in, or data left behind."
+        );
+    }
+
+    #[test]
+    fn closing_line_names_each_detected_snapshot_tool_and_its_list_command() {
+        let snapper = closing_line(&SnapshotEvidence {
+            snapper: true,
+            timeshift: false,
+        });
+        assert!(
+            snapper.contains("snapper filesystem snapshots"),
+            "{snapper}"
+        );
+        assert!(
+            snapper.contains("wiped templates and sealed secrets"),
+            "{snapper}"
+        );
+        assert!(snapper.contains("`snapper list`"), "{snapper}");
+        assert!(
+            !snapper.contains("no repo, drop-in, or data left behind"),
+            "the all-gone claim must not survive snapshot evidence: {snapper}"
+        );
+
+        let timeshift = closing_line(&SnapshotEvidence {
+            snapper: false,
+            timeshift: true,
+        });
+        assert!(
+            timeshift.contains("Timeshift filesystem snapshots"),
+            "{timeshift}"
+        );
+        assert!(timeshift.contains("`timeshift --list`"), "{timeshift}");
+
+        let both = closing_line(&SnapshotEvidence {
+            snapper: true,
+            timeshift: true,
+        });
+        assert!(both.contains("snapper and Timeshift"), "{both}");
+        assert!(
+            both.contains("`snapper list` and `timeshift --list`"),
+            "{both}"
+        );
+    }
+
+    // The evidence helpers back detection; both must read "cannot look" as "no
+    // evidence" rather than an error, because detection may never fail the
+    // uninstall (#335).
+    #[test]
+    fn dir_evidence_helpers_report_contents_and_tolerate_absence() {
+        let dir = std::env::temp_dir().join(format!("irlume-snap-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir_has_entries(dir.to_str().unwrap()), "empty dir");
+        std::fs::write(dir.join("05-snap-pac-pre.hook"), b"x").unwrap();
+        assert!(dir_has_entries(dir.to_str().unwrap()));
+        assert!(dir_has_entry_named(dir.to_str().unwrap(), "snap-pac"));
+        assert!(!dir_has_entry_named(dir.to_str().unwrap(), "snapper"));
+        assert!(!dir_has_entries("/nonexistent/irlume-evidence-dir"));
+        assert!(!dir_has_entry_named(
+            "/nonexistent/irlume-evidence-dir",
+            "snapper"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // run_pkg maps a package manager's exit into a readable Result: success →

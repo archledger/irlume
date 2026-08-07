@@ -2049,13 +2049,12 @@ fn run_capture_mode_probe(
     rounds: usize,
     policy: ProbeStore,
 ) -> Result<String, String> {
-    let report = irlume_auth::measure_contention_with_progress(
-        rgb_dev,
-        ir_dev,
-        rounds,
-        &note_worker_progress,
-    )
-    .map_err(|e| e.to_string())?;
+    // Reports between captures so a long but healthy tune is not read as a
+    // wedged driver by the watchdog (#141), and per silent warm-up window
+    // inside each capture (#336).
+    let progress: irlume_auth::Progress = std::sync::Arc::new(note_worker_progress);
+    let report = irlume_auth::measure_contention_with_progress(rgb_dev, ir_dev, rounds, &progress)
+        .map_err(|e| e.to_string())?;
     let mode = report.recommended_mode();
     if !probe_verdict_storable(policy, &report, rounds) {
         // Not an error: the pair stays unmeasured, which the sequential
@@ -4856,6 +4855,62 @@ mod tests {
         note_worker_idle();
         std::thread::sleep(std::time::Duration::from_millis(70));
         assert!(!worker_wedged(short), "idle after a job is still healthy");
+    }
+
+    /// The #336 arithmetic gate: the longest stretch a defined capture failure
+    /// can go WITHOUT reporting progress must fit inside HALF the unit's
+    /// `WatchdogSec`, with margin. Half, because that is the bound under which
+    /// the watchdog can never miss a ping regardless of phase: `spawn_watchdog`
+    /// ticks every `period / 2` and withholds a tick only when the worker has
+    /// been quiet longer than that interval, so a stretch under it always has
+    /// its tick answered, while a stretch past it can line up so the last real
+    /// ping was at the stretch's start and systemd's deadline expires before
+    /// the next one. A frameless camera used to produce ~82-96s of exactly
+    /// such silence in one assess chain (two 40s warm-up stalls plus the grace
+    /// window) and systemd killed a daemon that was working through a defined
+    /// worst case. The fix reports each RETURNED dequeue window as progress
+    /// (a window that returned proves the thread was never stuck; a wedged
+    /// ioctl still reports nothing), so the bound here is the per-window
+    /// silent stretch, not the capture chain's total.
+    ///
+    /// Reads the shipped unit rather than repeating "90", so retuning EITHER
+    /// side (a dequeue window, the warm-up pacing, or `WatchdogSec` itself)
+    /// without the other fails here instead of shipping a daemon that dies on
+    /// frameless hardware. The stretch constant is derived, not free-floating:
+    /// it is built from `irlume-camera`'s dequeue/warm-up constants; the
+    /// per-window heartbeat WIRING it assumes is pinned by irlume-camera's
+    /// `a_frameless_warm_up_reports_every_completed_silent_window`, and the CI
+    /// loopback test `loopback_frameless_capture_fits_the_watchdog_budget`
+    /// measures both on a real frameless capture.
+    #[test]
+    fn frameless_capture_worst_case_fits_inside_the_watchdog() {
+        let unit_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/irlumed.service"
+        );
+        let unit =
+            std::fs::read_to_string(unit_path).unwrap_or_else(|e| panic!("read {unit_path}: {e}"));
+        let secs: u64 = unit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("WatchdogSec="))
+            .expect("irlumed.service declares WatchdogSec")
+            .trim()
+            .trim_end_matches('s')
+            .parse()
+            .expect("WatchdogSec is plain seconds (e.g. 90s)");
+        let period_ms = secs * 1000;
+        let never_missed_ping_ms = period_ms / 2;
+        // 20% margin under the phase-safe bound, for scheduler jitter and
+        // whatever the seam allowance underestimates on a loaded CPU.
+        let budget_ms = never_missed_ping_ms * 8 / 10;
+        assert!(
+            irlume_auth::CAPTURE_MAX_SILENT_STRETCH_MS <= budget_ms,
+            "a capture path can go {}ms without reporting progress, over the \
+             {budget_ms}ms budget (80% of half of WatchdogSec={secs}s); shorten \
+             the dequeue window, or raise WatchdogSec in \
+             packaging/systemd/irlumed.service (#336)",
+            irlume_auth::CAPTURE_MAX_SILENT_STRETCH_MS
+        );
     }
 
     /// The explanatory refusal line is printed once per uid, so a local process

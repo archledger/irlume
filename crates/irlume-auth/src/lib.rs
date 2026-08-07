@@ -15,8 +15,8 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
     apply_known_ir_emitter, list_ir_controls, measure_contention, measure_contention_with_progress,
-    setup_ir_emitter, store_capture_mode, store_capture_mode_if_absent, stored_capture_mode,
-    CaptureMode, ContentionReport, PairSample, StoreIfAbsent,
+    no_progress, setup_ir_emitter, store_capture_mode, store_capture_mode_if_absent,
+    stored_capture_mode, CaptureMode, ContentionReport, PairSample, Progress, StoreIfAbsent,
 };
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair
@@ -302,6 +302,35 @@ pub const GRACE_WINDOW_MS: u64 = 15000;
 /// looking at the screen, so a match lands on the first attempt; if they look
 /// away they want a quick drop to the password prompt, not a long freeze.
 pub const SUDO_GRACE_WINDOW_MS: u64 = 5000;
+
+/// The longest a capture path wired through [`irlume_camera::Progress`] can go
+/// without reporting watchdog progress (#336), against ANY defined camera
+/// failure, a frameless device included.
+///
+/// The warm-up heartbeats after every completed silent window, so the silent
+/// pieces left are the windows nothing reports: a post-warm-up burst dequeue
+/// errors out on its FIRST timeout (one unreported window), the seam to the
+/// retry then runs detection or a reopen, and the retry's own first warm-up
+/// window ends with the next heartbeat. Two windows plus one seam; no code
+/// path stacks a third unreported window, because every warm-up window
+/// heartbeats and every burst loop propagates its first timeout.
+///
+/// The window term is PROVEN arithmetic (the poll timeout the camera crate
+/// sets). The seam term is an ALLOWANCE, stated as such: detection and
+/// embedding inference and device re-open ioctls have no deadline in code, so
+/// no constant can bound them; 10s is over double the slowest full sequential
+/// RGB+IR pair measured on hardware here (~3.6s, NexiGo N930W, the
+/// `MAX_CROSS_SPECTRUM_SKEW` record), and the daemon test's margin sits on
+/// top of it.
+///
+/// An `irlume-daemon` test holds this constant against the `WatchdogSec` in
+/// `packaging/systemd/irlumed.service`, so lengthening a dequeue window (or
+/// shrinking the watchdog) past what the other tolerates fails the suite.
+pub const CAPTURE_MAX_SILENT_STRETCH_MS: u64 =
+    2 * irlume_camera::CAPTURE_SILENT_WINDOW_WORST_MS + RETRY_SEAM_ALLOWANCE_MS;
+
+/// The seam term of [`CAPTURE_MAX_SILENT_STRETCH_MS`]; see there.
+const RETRY_SEAM_ALLOWANCE_MS: u64 = 10_000;
 
 /// How far apart the RGB and IR frames of ONE decision may be captured.
 ///
@@ -850,6 +879,44 @@ impl Engine {
         self.stop_requested.as_ref().is_some_and(|f| f())
     }
 
+    /// Report a between-captures boundary without acting on the yield request.
+    ///
+    /// Polling the stop signal is what marks watchdog progress in the daemon
+    /// (#141: its closure notes progress, then answers), and the grace loop
+    /// needs that mark between attempts: `IRLUME_GRACE_MS` can stretch the
+    /// window arbitrarily, and a window of healthy no-face captures followed
+    /// by one frameless capture chain summed past `WatchdogSec` with no
+    /// progress reported anywhere between (#336). The answer itself is
+    /// deliberately dropped: only a queued authentication raises it, and
+    /// cutting a RUNNING authentication's grace window for a queued one would
+    /// hand the first user a password prompt whenever a polkit verify races
+    /// the lock screen. Enrolment keeps honoring it via [`Self::should_stop`].
+    fn note_capture_boundary(&self) {
+        let _ = self.should_stop();
+    }
+
+    /// The per-window heartbeat handed into camera captures (#336).
+    ///
+    /// Polls the same daemon closure [`Self::note_capture_boundary`] does, for
+    /// the same effect: the daemon marks watchdog progress on every poll, so a
+    /// frameless camera reporting each returned dequeue window never looks
+    /// wedged, while a driver call that never returns still does. The yield
+    /// answer is dropped for the boundary's reason too, and one more: this
+    /// fires INSIDE a capture, where nothing can safely stop anyway. Owned
+    /// (`Arc`) so the concurrent capture pair can carry it across scoped
+    /// threads without borrowing the engine.
+    fn capture_progress(&self) -> irlume_camera::Progress {
+        match &self.stop_requested {
+            Some(f) => {
+                let f = std::sync::Arc::clone(f);
+                std::sync::Arc::new(move || {
+                    let _ = f();
+                })
+            }
+            None => irlume_camera::no_progress(),
+        }
+    }
+
     /// Assurance tier from the hardware: `Secure` with a real RGB+IR camera,
     /// `Convenience` on an RGB-only device.
     pub fn tier(&self) -> Tier {
@@ -1187,7 +1254,10 @@ impl Engine {
     /// (well-lit + frontal + screen/glare heuristic), which is why this tier is
     /// limited to lock-screen unlock and never releases credentials.
     fn assess_rgb_only(&mut self) -> irlume_common::Result<Assessment> {
-        let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+        let rgb = irlume_camera::capture_rgb_denoised_with_progress(
+            &self.rgb_dev,
+            &self.capture_progress(),
+        )?;
         let rgb_view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,
@@ -1350,6 +1420,9 @@ impl Engine {
             }
         }
         let held_sessions = held.is_some();
+        // Every one-shot capture below carries the per-window heartbeat
+        // (#336); held sessions already carry theirs from `capture_scans`.
+        let progress = self.capture_progress();
         let (rgb_res, rgb_ms, ir_res, ir_ms) = if let Some((rgb_s, ir_s)) = held {
             if sequential {
                 let t = std::time::Instant::now();
@@ -1384,7 +1457,7 @@ impl Engine {
             }
         } else if sequential {
             let t = std::time::Instant::now();
-            let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
+            let rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress);
             let rgb_ms = t.elapsed().as_millis();
             // Match the old short-circuit: don't fire the IR emitter after an
             // RGB fault (privacy switch, missing node); the shared retry below
@@ -1393,21 +1466,23 @@ impl Engine {
                 (rgb, rgb_ms, Ok(None), 0)
             } else {
                 let t = std::time::Instant::now();
-                let ir = irlume_camera::capture_ir_with_stats(&self.ir_dev);
+                let ir = irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress);
                 (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
             }
         } else {
             std::thread::scope(|s| {
                 let ir_dev = self.ir_dev.clone();
+                let ir_progress = progress.clone();
                 let ir_thread = s.spawn(move || {
                     let t = std::time::Instant::now();
                     (
-                        irlume_camera::capture_ir_with_stats(&ir_dev),
+                        irlume_camera::capture_ir_with_stats_and_progress(&ir_dev, &ir_progress),
                         t.elapsed().as_millis(),
                     )
                 });
                 let t = std::time::Instant::now();
-                let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev);
+                let rgb =
+                    irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress);
                 let rgb_ms = t.elapsed().as_millis();
                 let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                     (
@@ -1441,7 +1516,7 @@ impl Engine {
                     }
                 );
                 rgb_hard_retried = true;
-                irlume_camera::capture_rgb_denoised(&self.rgb_dev)?
+                irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?
             }
             Err(e) => return Err(e),
         };
@@ -1474,10 +1549,10 @@ impl Engine {
         // but capture alone rather than unwrap to stay panic-free.
         let (ir, ir_stats) = match ir_res {
             Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir_with_stats(&self.ir_dev)?,
+            Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
             Err(e) => {
                 irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir_with_stats(&self.ir_dev)?
+                irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?
             }
         };
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
@@ -1516,7 +1591,7 @@ impl Engine {
             irlume_common::dlog!(
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
-            rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+            rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?;
             rgb_faces = self.det.detect(&align::RgbView {
                 data: &rgb.data,
                 width: rgb.width,
@@ -2356,6 +2431,10 @@ impl Engine {
                 "grace: attempt {attempt} found no usable face ({}); retrying within window",
                 out.reason
             );
+            // A whole capture ended and another is about to start: the safe
+            // boundary the watchdog counts as progress (#336). Without it the
+            // entire grace window is one silent stretch on the daemon's clock.
+            self.note_capture_boundary();
         };
         // The gesture belongs to the authentication that just ended.
         self.gesture_seen_before_match = false;
@@ -2824,7 +2903,10 @@ impl Engine {
     /// cosine MUST be ~1.0. Catches the AuraFace alignment/normalization trap
     /// (the "identical images score 0.6" failure). `Request::SelfTest { AlignmentIdentity }`.
     pub fn alignment_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
-        let rgb = irlume_camera::capture_rgb_denoised(&self.rgb_dev)?;
+        let rgb = irlume_camera::capture_rgb_denoised_with_progress(
+            &self.rgb_dev,
+            &self.capture_progress(),
+        )?;
         let view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,
@@ -2909,7 +2991,11 @@ impl Engine {
                  both streams, capturing per-frame"
             );
         } else if let Some((r, i)) = &cams {
-            if let (Ok(mut rs), Ok(mut is)) = (r.session(), i.session()) {
+            let progress = self.capture_progress();
+            if let (Ok(mut rs), Ok(mut is)) = (
+                r.session_with_progress(&progress),
+                i.session_with_progress(&progress),
+            ) {
                 return self.capture_scan_loop(
                     want,
                     pitch_neutral,
@@ -3321,7 +3407,13 @@ impl Engine {
             .and_then(|u| irlume_core::storage::load(u).ok().flatten())
             .and_then(|e| e.pitch_neutral());
 
-        let rgb = irlume_camera::capture_rgb(&self.rgb_dev)?;
+        let rgb = irlume_camera::capture_rgb_burst_with_progress(
+            &self.rgb_dev,
+            1,
+            &self.capture_progress(),
+        )?
+        .pop()
+        .ok_or_else(|| irlume_common::Error::Hardware("no frames captured".into()))?;
         let view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,

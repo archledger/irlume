@@ -34,11 +34,19 @@ concurrency:
 # single point of failure for a REQUIRED check. The N100 never sees a
 # release build.
 #
-# Branch protection on `main` requires these four job names as status checks:
-#   "fmt · clippy · build · test", "cargo-deny (advisories · licenses ·
-#   duplicate versions)", "nix flake check", "fuzz (untrusted-input parsers)".
+# Branch protection on `main` requires these SEVEN job names as status checks,
+# verified against the live ruleset 2026-08-07:
+#   "fmt · clippy · build · test"
+#   "test (stable)"
+#   "coverage (line-coverage ratchet)"
+#   "fuzz (untrusted-input parsers)"
+#   "cargo-deny (advisories · licenses · duplicate versions)"
+#   "systemd units (verify + exposure ratchet)"
+#   "nix flake check"
 # Renaming a job below without updating the protection rule leaves a PR waiting
 # on a check that never reports, so it can never merge. Change both together.
+# Five of the seven can only run on `arch` (archhost); the two on the shared
+# `ci` label can run on either machine.
 jobs:
   check:
     name: fmt · clippy · build · test
@@ -162,6 +170,22 @@ jobs:
       # test patterns in the exact formats the capture paths negotiate
       # (YUYV 640x480 for RGB, GREY 640x400 for IR). Same idea as swtpm:
       # fake hardware, real code.
+      # The swtpm set above proves the code path; this proves it against the
+      # REAL chip (device:/dev/tpmrm0, the built-in default; the runner user
+      # is in the tss group). Absorbed from preflight.yml, whose only unique
+      # coverage this was, when that duplicate lane was deleted. The guard
+      # NAMES the set instead of counting it: renaming one while adding
+      # another would leave the total at six and hide the loss.
+      - name: test (TPM-gated, against the REAL TPM)
+        run: |
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals,seal_unseal_pcrlock_roundtrip_provisioned_nv \
+            -- cargo test -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
+            tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals seal_unseal_pcrlock_roundtrip_provisioned_nv \
+            --test-threads=1
+        env:
+          IRLUME_TCTI: device:/dev/tpmrm0
+
       - name: Start virtual cameras (v4l2loopback + ffmpeg feeders)
         run: |
           # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
@@ -189,14 +213,25 @@ jobs:
           fi
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
-          # Poll until the fed nodes are actually readable (a feeder opening the
-          # node can re-trigger udev), re-asserting perms each round, instead of a
-          # blind sleep that can finish before the device is ready.
-          for _ in $(seq 1 15); do
+          rgb_pid=$!
+          # Wait for FRAMES, not for a readable inode: the nodes are chmod 666
+          # before the feeders start, so the old `[ -r ... ]` poll always
+          # succeeded on the first iteration and verified nothing. ffmpeg
+          # reading one frame is the only proof the feeder is actually
+          # producing. A dead feeder is a hard failure, not a slow start.
+          ready=0
+          for _ in $(seq 1 20); do
             sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
+            if ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
+               && ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
+              ready=1; break
+            fi
+            if ! kill -0 "$rgb_pid" 2>/dev/null; then
+              echo "::error::the RGB feeder died before producing a frame"; exit 1
+            fi
             sleep 1
           done
+          [ "$ready" = 1 ] || { echo "::error::virtual cameras never produced a frame"; exit 1; }
           ls -l /dev/video8 /dev/video9 /dev/video10
 
       - name: test (camera + capture paths, against v4l2loopback)
@@ -384,14 +419,25 @@ jobs:
           fi
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
-          # Poll until the fed nodes are actually readable (a feeder opening the
-          # node can re-trigger udev), re-asserting perms each round, instead of a
-          # blind sleep that can finish before the device is ready.
-          for _ in $(seq 1 15); do
+          rgb_pid=$!
+          # Wait for FRAMES, not for a readable inode: the nodes are chmod 666
+          # before the feeders start, so the old `[ -r ... ]` poll always
+          # succeeded on the first iteration and verified nothing. ffmpeg
+          # reading one frame is the only proof the feeder is actually
+          # producing. A dead feeder is a hard failure, not a slow start.
+          ready=0
+          for _ in $(seq 1 20); do
             sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            if [ -r /dev/video8 ] && [ -r /dev/video9 ]; then break; fi
+            if ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
+               && ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
+              ready=1; break
+            fi
+            if ! kill -0 "$rgb_pid" 2>/dev/null; then
+              echo "::error::the RGB feeder died before producing a frame"; exit 1
+            fi
             sleep 1
           done
+          [ "$ready" = 1 ] || { echo "::error::virtual cameras never produced a frame"; exit 1; }
           ls -l /dev/video8 /dev/video9 /dev/video10
 
       - name: Coverage incl. TPM-gated and camera tests (fail under the ratchet floor)

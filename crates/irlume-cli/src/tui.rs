@@ -79,7 +79,7 @@ fn th() -> &'static Theme {
     })
 }
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SCREENS: [&str; 11] = [
+const SCREENS: [&str; 12] = [
     "Welcome",
     "Repair",
     "Cameras",
@@ -90,6 +90,7 @@ const SCREENS: [&str; 11] = [
     "Fingerprint",
     "Login wiring",
     "Settings",
+    "Models",
     "Done",
 ];
 // Screen indices (keep in sync with SCREENS).
@@ -103,7 +104,8 @@ const SC_RECOVERY: usize = 6;
 const SC_FINGERPRINT: usize = 7;
 const SC_PAM: usize = 8;
 const SC_SETTINGS: usize = 9;
-const SC_DONE: usize = 10;
+const SC_MODELS: usize = 10;
+const SC_DONE: usize = 11;
 const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
 const MAX_PROFILES: usize = 3;
 const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
@@ -1002,7 +1004,10 @@ impl App {
                 // third-party models), not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
-                SC_SETTINGS => true,
+                // Models (#331) is reachable for the same reason: the measured
+                // catalog is the surface the issue exists to expose, and the
+                // Settings third-party section points at it.
+                SC_SETTINGS | SC_MODELS => true,
                 // Repair: only when something needs attention (or advanced view).
                 SC_REPAIR => advanced || needs_repair,
                 // Keyring unlock: an IR camera (face releases the credential) OR a
@@ -3902,6 +3907,9 @@ impl App {
                 SC_SETTINGS => {
                     "[enter] toggles the eyes-open check, [c] the blink challenge; other settings are root or read-only."
                 }
+                SC_MODELS => {
+                    "Measured model options; switching the recognizer means re-enrolling."
+                }
                 SC_DONE => {
                     "Green = done; anything left shows its key. Press [q] to close."
                 }
@@ -3943,6 +3951,7 @@ impl App {
             SC_FINGERPRINT => self.draw_fingerprint(f, inner),
             SC_PAM => self.draw_pam(f, inner),
             SC_SETTINGS => self.draw_settings(f, inner),
+            SC_MODELS => self.draw_models(f, inner),
             _ => self.draw_done(f, inner),
         }
     }
@@ -4377,8 +4386,10 @@ impl App {
                     "  Opt-in, measured models by pipeline stage: PAD adds a deny-only cue,",
                     Style::new().dim(),
                 )),
+                // Points at the Models tab (#331) so the full listing is one
+                // Tab away, not a CLI command the user has to know about.
                 Line::from(Span::styled(
-                    "  recognition replaces RGB matching. Checksum-pinned, never shipped by irlume.",
+                    "  recognition replaces RGB matching. Licenses + measurements: the Models tab.",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
@@ -4398,6 +4409,100 @@ impl App {
             .wrap(Wrap { trim: false }),
             area,
         );
+    }
+
+    /// The measured model choices (#331). Every catalog entry renders with
+    /// the license line, measurement summary, and effect line the CLI listing
+    /// prints, all read from the one catalog in `irlume_common::thirdparty`
+    /// (via `crate::models`), so nothing unmeasured can appear and the two
+    /// surfaces cannot drift. Provenance is deliberately omitted: this panel
+    /// does not scroll, the provenance rows pushed the root-only note off a
+    /// 50-row terminal, and the CLI consent flow prints provenance before any
+    /// enable can proceed. The
+    /// re-enrollment consequence is a section ABOVE the entries, so it is met
+    /// before any switch command (#288: templates are per recognizer, and on
+    /// a one-user machine a stranded enrollment is a lockout path if the
+    /// camera then misbehaves). Display and guidance only: a state change
+    /// goes through the CLI's own sudo + license flow, so the screen shows
+    /// the exact command instead of wrapping it, and root-gating stays where
+    /// the CLI already enforces it.
+    fn draw_models(&self, f: &mut Frame, area: Rect) {
+        use irlume_common::thirdparty::CATALOG;
+        let kv = |k: &str, v: &str| {
+            Line::from(vec![
+                Span::styled(format!("    {k:<12}"), Style::new().dim()),
+                Span::raw(v.to_string()),
+            ])
+        };
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "  Models irlume measured on real hardware but does not ship or warrant.",
+                Style::new().dim(),
+            )),
+            Line::from(Span::styled(
+                "  Only measured entries appear (ADR-0001): the same catalog, numbers and",
+                Style::new().dim(),
+            )),
+            Line::from(Span::styled(
+                "  license lines `irlume models` prints.",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+            section("Switching the recognizer means re-enrolling"),
+            Line::from(Span::styled(
+                "  Templates are stored per recognizer (#288): scans enrolled under one do",
+                Style::new().fg(th().warn),
+            )),
+            Line::from(Span::styled(
+                "  not match under another. After a switch, face login stays off until you",
+                Style::new().fg(th().warn),
+            )),
+            Line::from(Span::styled(
+                "  re-enroll; until then only your password works.",
+                Style::new().fg(th().warn),
+            )),
+            Line::raw(""),
+        ];
+        for m in CATALOG {
+            let state = crate::models::entry_state_label(m);
+            let enabled = state.starts_with("ENABLED");
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}", m.name),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({} stage)  [{state}]", m.stage.as_str()),
+                    Style::new().dim(),
+                ),
+            ]));
+            lines.push(kv("license:", m.license));
+            lines.push(kv("measured:", m.summary));
+            lines.push(kv("effect:", &crate::models::role_line(m)));
+            lines.push(kv("obtain:", &crate::models::obtain_line(m)));
+            if enabled {
+                lines.push(kv(
+                    "disable:",
+                    &format!("sudo irlume models disable {}", m.name),
+                ));
+            }
+            lines.push(Line::raw(""));
+        }
+        // Root-gated like the CLI: settings.conf is 0600 root-only, so an
+        // unprivileged TUI cannot read the enabled flags and must say so
+        // rather than render "disabled" (the same tri-state rule the Settings
+        // sections follow). The commands above are the way to act either way.
+        if !crate::models::enabled_state_readable() {
+            lines.push(Line::from(Span::styled(
+                "  settings.conf is root-only, so the enabled states above are unknown;",
+                Style::new().fg(th().warn),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  the authoritative answer: sudo irlume models list",
+                Style::new().fg(th().warn),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
@@ -4911,7 +5016,7 @@ impl App {
         // None = never observed (the daemon has not answered); the badge
         // renders it as unknown. `unwrap_or(false)` here turned every
         // unanswered question into "○ no", two of them security claims.
-        let all: [(&'static str, Option<bool>, usize); 7] = [
+        let all: [(&'static str, Option<bool>, usize); 8] = [
             ("checks & repair", Some(self.daemon_up), SC_REPAIR),
             ("cameras", Some(self.caps.rgb), SC_CAMERAS),
             (
@@ -4927,6 +5032,7 @@ impl App {
             ),
             ("login wiring", self.login_wired_known(), SC_PAM),
             ("settings", Some(true), SC_SETTINGS),
+            ("model options", Some(true), SC_MODELS),
         ];
         all.into_iter()
             .filter(|(_, _, sc)| self.visible.contains(sc))
@@ -5685,6 +5791,10 @@ impl App {
                 ("b", "biopolicy"),
                 ("m", "3rd-party model"),
             ],
+            // Read-only by design (#331): a model change goes through the
+            // CLI's own sudo + license flow, and the screen prints the exact
+            // command for it, so there is no action key to advertise.
+            SC_MODELS => &[],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
             // a needless `sudo irlume login enable --apply` re-run. Unknown
@@ -7415,7 +7525,7 @@ mod tests {
         // No biometric hardware: only the always-on steps.
         assert_eq!(
             App::compute_visible(&none, basic, &[]),
-            vec![SC_WELCOME, SC_PAM, SC_SETTINGS, SC_DONE]
+            vec![SC_WELCOME, SC_PAM, SC_SETTINGS, SC_MODELS, SC_DONE]
         );
         // RGB-only adds the face path (Profiles + Recovery), not Keyring.
         assert_eq!(
@@ -7426,6 +7536,7 @@ mod tests {
                 SC_RECOVERY,
                 SC_PAM,
                 SC_SETTINGS,
+                SC_MODELS,
                 SC_DONE
             ]
         );
@@ -7439,6 +7550,7 @@ mod tests {
                 SC_RECOVERY,
                 SC_PAM,
                 SC_SETTINGS,
+                SC_MODELS,
                 SC_DONE
             ]
         );
@@ -7458,6 +7570,7 @@ mod tests {
                 SC_FINGERPRINT,
                 SC_PAM,
                 SC_SETTINGS,
+                SC_MODELS,
                 SC_DONE
             ]
         );
@@ -7484,7 +7597,14 @@ mod tests {
                 },
                 &[]
             ),
-            vec![SC_WELCOME, SC_REPAIR, SC_PAM, SC_SETTINGS, SC_DONE]
+            vec![
+                SC_WELCOME,
+                SC_REPAIR,
+                SC_PAM,
+                SC_SETTINGS,
+                SC_MODELS,
+                SC_DONE
+            ]
         );
         // …and when anything needs reporting (a failure OR an advisory), so the
         // Welcome health summary's "→ open checks & repair" pointer is reachable.
@@ -9354,6 +9474,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// Sandbox the config + state dirs for a Models-screen draw and restore
+    /// them after. The screen reads settings.conf and the weights dir through
+    /// `crate::models`; without the sandbox a dev box with a real (0600)
+    /// /etc/irlume/settings.conf renders "root-only unknown" and the tests
+    /// assert on that machine's state instead of the state they set up.
+    /// Caller must hold ENV_LOCK.
+    fn with_models_sandbox<R>(tag: &str, body: impl FnOnce(&std::path::Path) -> R) -> R {
+        let root = std::env::temp_dir().join(format!("irlume-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cfg, state) = (root.join("cfg"), root.join("state"));
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+        let out = body(&cfg);
+        // Restored independently: a paired match would drop whichever var
+        // existed alone before the test.
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        match old_state {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    #[test]
+    fn models_screen_lists_each_catalog_entry_with_license_and_measurement() {
+        // The listing is the CATALOG rendered, nothing else (#331): each
+        // entry's name, license line, measurement summary, and obtain command
+        // come from the same `crate::models` helpers the CLI listing uses.
+        // Iterates the live catalog so this keeps holding as entries land.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let text = with_models_sandbox("mlist", |_| {
+            let mut app = test_app();
+            app.screen = SC_MODELS;
+            draw_text(&app)
+        });
+        // First words only: the full lines word-wrap at the panel width, so a
+        // long needle can be split across rendered rows.
+        let first3 = |s: &str| s.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        for m in irlume_common::thirdparty::CATALOG {
+            row_with(&text, m.name);
+            assert!(
+                text.contains(&first3(m.license)),
+                "license line for '{}' missing:\n{text}",
+                m.name
+            );
+            assert!(
+                text.contains(&first3(m.summary)),
+                "measurement summary for '{}' missing:\n{text}",
+                m.name
+            );
+            // The obtain line is short enough to sit on one rendered row, so
+            // it is asserted whole: the exact sudo command is the point.
+            assert!(
+                text.contains(&crate::models::obtain_line(m)),
+                "obtain command for '{}' missing:\n{text}",
+                m.name
+            );
+        }
+        // An enabled entry earns the one extra row: its exact disable command
+        // (still under the same ENV_LOCK guard).
+        let enabled = with_models_sandbox("mlist-on", |cfg| {
+            std::fs::write(cfg.join("settings.conf"), "third_party_pad=flir\n").unwrap();
+            let mut app = test_app();
+            app.screen = SC_MODELS;
+            draw_text(&app)
+        });
+        assert!(
+            enabled.contains("ENABLED"),
+            "the enabled tag must show:\n{enabled}"
+        );
+        assert!(
+            enabled.contains("sudo irlume models disable flir"),
+            "an enabled entry must name its disable command:\n{enabled}"
+        );
+    }
+
+    #[test]
+    fn models_screen_states_the_reenroll_consequence_before_any_switch_command() {
+        // #331's ordering policy: templates are per recognizer (#288), so the
+        // cost of switching renders ABOVE every switch command, and a reader
+        // meets it before the offer. Byte order in the flattened frame is
+        // render order (rows top to bottom).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let text = with_models_sandbox("morder", |_| {
+            let mut app = test_app();
+            app.screen = SC_MODELS;
+            draw_text(&app)
+        });
+        let warn = text
+            .find("Templates are stored per recognizer")
+            .unwrap_or_else(|| panic!("no re-enroll warning:\n{text}"));
+        let cmd = text
+            .find("sudo irlume models")
+            .unwrap_or_else(|| panic!("no switch command:\n{text}"));
+        assert!(
+            warn < cmd,
+            "the re-enroll consequence must render before the first switch command:\n{text}"
+        );
+    }
+
+    #[test]
+    fn models_screen_unprivileged_shows_unknown_state_and_the_sudo_commands() {
+        // Root-gated like the CLI: settings.conf unreadable (0600 root-only in
+        // the field, chmod 000 here) must render as unknown state, never as
+        // "disabled", with the sudo commands as the only way to act. Skipped
+        // as root because root reads any mode and the unprivileged branch is
+        // what is under test.
+        if crate::is_root() {
+            return;
+        }
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let text = with_models_sandbox("mroot", |cfg| {
+            use std::os::unix::fs::PermissionsExt;
+            let conf = cfg.join("settings.conf");
+            std::fs::write(&conf, "third_party_pad=flir\n").unwrap();
+            std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let mut app = test_app();
+            app.screen = SC_MODELS;
+            draw_text(&app)
+        });
+        assert!(
+            text.contains("enabled state unknown, root-only"),
+            "unreadable settings must not claim disabled:\n{text}"
+        );
+        assert!(
+            text.contains("sudo irlume models list"),
+            "the authoritative sudo listing must be named:\n{text}"
+        );
+        // The state-changing commands render read-only for everyone; the
+        // unprivileged case is where they are the ONLY path.
+        assert!(
+            text.contains("sudo irlume models enable flir"),
+            "the fetchable entry's enable command must show:\n{text}"
+        );
+        assert!(
+            text.contains("sudo irlume models add buffalo"),
+            "the bring-your-own entry's add command must show:\n{text}"
+        );
+    }
+
     #[test]
     fn done_screen_status_line_matches_setup_state() {
         let mut app = test_app();
@@ -9466,11 +9734,11 @@ mod tests {
 
     #[test]
     fn header_counts_steps_over_visible_screens_only() {
-        let mut app = test_app(); // visible: Welcome, Login wiring, Settings, Done
+        let mut app = test_app(); // visible: Welcome, Login wiring, Settings, Models, Done
         app.screen = SC_PAM;
         let text = draw_text(&app);
         assert!(
-            text.contains("step 2/4: Login wiring"),
+            text.contains("step 2/5: Login wiring"),
             "the step counter must track visible tabs, got:\n{text}"
         );
         assert!(text.contains("testuser"), "the managed user is shown");

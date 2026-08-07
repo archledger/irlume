@@ -1,46 +1,50 @@
 # The irlume crates
 
-Twelve crates, layered so that policy sits above mechanism: the base layer
-speaks wire formats and hardware, the middle layer turns frames into
-verdicts, and the top layer is the two binaries and three integration
-shims users actually run. Arrows read "depends on".
+Twelve crates. The base layer speaks wire formats and hardware, the
+middle layer turns frames into verdicts, and the top layer is the two
+binaries and three integration shims users actually run. Solid arrows
+read "Cargo-depends on" (every edge verified against cargo metadata);
+dotted arrows are runtime socket IPC, not Cargo dependencies.
 
 ```mermaid
 flowchart TD
-    subgraph entry["Entry points"]
-        pam["irlume-pam<br/>pam_irlume.so"]
-        cli["irlume-cli<br/>the irlume binary: CLI + TUI"]
-        gkr["irlume-gkr-unlock<br/>libexec keyring helper"]
-        kwi["irlume-kwallet-init<br/>libexec keyring helper"]
-    end
-    daemon["irlume-daemon<br/>irlumed: the socket service"]
-    auth["irlume-auth<br/>the Engine: assess, enroll, authenticate"]
-    subgraph pipeline["Pipeline"]
-        camera["irlume-camera<br/>V4L2/UVC capture, IR emitter, contention"]
-        vision["irlume-vision<br/>detection, mesh, recognition (ort + TFLite)"]
-        liveness["irlume-liveness<br/>cue evaluation and PAD gates"]
-        core["irlume-core<br/>enrollment storage, TPM sealing, biopolicy"]
-    end
-    common["irlume-common<br/>wire protocol, socket client, config, model pins"]
+    pam["irlume-pam<br/>pam_irlume.so"]
+    cli["irlume-cli<br/>irlume CLI + TUI"]
+    gkr["irlume-gkr-unlock<br/>libexec keyring helper"]
+    kwi["irlume-kwallet-init<br/>libexec keyring helper"]
+    daemon["irlume-daemon<br/>irlumed socket service"]
+    auth["irlume-auth<br/>authentication Engine"]
+    camera["irlume-camera<br/>V4L2/UVC capture, IR emitter, contention"]
+    vision["irlume-vision<br/>detection, mesh, recognition (ort + TFLite)"]
+    liveness["irlume-liveness<br/>cue evaluation and PAD gates"]
+    core["irlume-core<br/>enrollment storage, TPM sealing, biopolicy"]
+    common["irlume-common<br/>wire protocol, socket client, config"]
     fp["irlume-fingerprint<br/>fprintd companion"]
 
-    pam -- "socket request" --> daemon
-    cli -- "socket request" --> daemon
-    daemon --> auth
+    pam -. "socket IPC" .-> daemon
+    cli -. "socket IPC" .-> daemon
     auth --> camera
     auth --> vision
     auth --> liveness
     auth --> core
-    cli -.-> auth
+    auth --> common
+    daemon --> auth
+    daemon --> core
+    daemon --> liveness
+    daemon --> common
+    cli --> auth
+    cli --> camera
+    cli --> vision
+    cli --> liveness
+    cli --> core
+    cli --> common
     cli --> fp
-    core --> vision
-    liveness --> vision
     camera --> common
     vision --> common
+    liveness --> vision
     liveness --> common
+    core --> vision
     core --> common
-    auth --> common
-    daemon --> common
     pam --> common
     gkr --> common
     kwi --> common
@@ -49,16 +53,19 @@ flowchart TD
 ## One authentication, crate by crate
 
 A greeter or `sudo` reaches `pam_irlume.so` (**irlume-pam**), which sends
-one request over the Unix socket that **irlume-common** defines (the
-`Request`/`Response` protocol, the client with its connect and read
-budgets, the config store, and the sha256 pins for every model file).
+one request over the Unix socket whose `Request`/`Response` protocol and
+bounded client live in **irlume-common**. That crate also owns shared
+config handling and the third-party model catalog; pins enforced by a
+model-specific loader live beside that loader, including the production
+TFLite mesh pin in **irlume-vision**.
 **irlume-daemon** owns the socket, the systemd watchdog contract, and the
 per-request authorization (`SO_PEERCRED`), and hands the work to the
 Engine in **irlume-auth**. The Engine runs the pipeline: **irlume-camera**
 captures the RGB and IR frames (stream negotiation, the IR emitter and its
 strobe metadata, the per-camera concurrent-or-sequential contention
-verdict), **irlume-vision** runs the models on them (YuNet detection, the
-face mesh on the bundled TFLite runtime with ONNX fallback, the
+verdict), **irlume-vision** runs the models on them (YuNet detection, the face
+mesh, whose loader routes a file to the TFLite or ONNX backend by its
+bytes and fails plainly rather than retrying the other, and the
 recognizer), **irlume-liveness** turns the readings into cue verdicts
 (cross-spectrum checks, EAR, the deny-only third-party PAD slot), and
 **irlume-core** compares the embedding against the enrolled templates it
@@ -73,21 +80,24 @@ benchmarks it can also drive the Engine directly, bypassing the daemon
 (the dashed arrow). **irlume-fingerprint** wraps fprintd so a fingerprint
 can stand beside face auth where hardware exists.
 
-## Layering rules the graph enforces
+## What the graph does and does not promise
 
-- Only **irlume-auth** composes the pipeline crates; the daemon and CLI
-  never reach around it to a camera or a model.
-- **irlume-common** depends on no other irlume crate, and everything
-  depends on it: the wire protocol and the model pins have exactly one
-  home.
-- The pipeline crates do not know each other except through data:
-  **irlume-camera** produces frames, **irlume-vision** consumes frames and
-  produces detections and embeddings, **irlume-liveness** and
-  **irlume-core** consume those. The two exceptions are deliberate:
-  liveness and core read vision's output types directly.
-- The integration shims (**irlume-pam**, the libexec helpers) stay thin:
+- **irlume-auth** is the only crate that composes the pipeline into an
+  AUTHENTICATION: a grant decision is born nowhere else. The CLI also
+  Cargo-depends on the pipeline crates directly, for its diagnostics,
+  benchmarks and model tools, so a change to any pipeline crate must be
+  reviewed against the CLI's direct uses too, not only the Engine's.
+- **irlume-common** depends on no other irlume crate (except
+  **irlume-fingerprint**, which depends on nothing at all), and every
+  other crate depends on it: the wire protocol has exactly one home.
+- The pipeline crates meet through data, with two deliberate edges:
+  **irlume-liveness** and **irlume-core** read **irlume-vision**'s output
+  types directly.
+- The integration shims (**irlume-pam**, the libexec helpers) stay thin,
   socket client plus their single system interface, so the attack surface
   loaded into PAM stacks and keyring startup is as small as it can be.
+  They relate to the daemon only over the socket at runtime; no binary
+  links another binary's crate.
 
 Each crate's own source carries the detailed contracts; start at
 `irlume-auth/src/lib.rs` for the Engine's assess flow and

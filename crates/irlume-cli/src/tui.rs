@@ -6060,11 +6060,7 @@ fn map_settings(resp: Response) -> (bool, String) {
 /// One transport miss against the framing guide, counted toward
 /// [`GUIDE_MISS_LIMIT`]. Sends the stall (or the final give-up error) to the
 /// UI. Returns what the caller must do next.
-fn guide_miss(
-    misses: &mut u32,
-    e: String,
-    send: &impl Fn(WMsg) -> bool,
-) -> GuideOutcome {
+fn guide_miss(misses: &mut u32, e: String, send: &impl Fn(WMsg) -> bool) -> GuideOutcome {
     *misses += 1;
     if *misses >= GUIDE_MISS_LIMIT {
         let _ = send(WMsg::Err(format!(
@@ -8544,7 +8540,10 @@ mod tests {
                 "stale live reading rendered during a stall: {stale}\n{text}"
             );
         }
-        assert!(text.contains("[esc] cancel"), "cancel stays offered: {text}");
+        assert!(
+            text.contains("[esc] cancel"),
+            "cancel stays offered: {text}"
+        );
     }
 
     /// Codex round on #309: the miss counter must survive the trip from a
@@ -8589,10 +8588,7 @@ mod tests {
             ),
             o => panic!("the final message must be the give-up error, got {o:?}"),
         }
-        let stalls = msgs
-            .iter()
-            .filter(|m| matches!(m, WMsg::Stall(_)))
-            .count();
+        let stalls = msgs.iter().filter(|m| matches!(m, WMsg::Stall(_))).count();
         assert_eq!(stalls, 2, "misses below the limit render as stalls");
     }
 

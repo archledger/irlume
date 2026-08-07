@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- **The daemon reads and hashes the 260MB recognizer once per start instead
+  of twice.** Startup checksummed it against the release manifest and then
+  handed the loader a path, which read and sha256'd the same file again. The
+  verified weights now travel to the engine with the digest they were checked
+  under, so nothing is read or hashed twice, and the artifact that reaches the
+  ONNX session is provably the one the checksum accepted. Measured on a
+  Zenbook S 14 over 15 interleaved pairs of exec-to-serving: median 1284 ms
+  before against 1044 ms after, 14 of 15 pairs faster; with the model files
+  evicted from the page cache first, 1287 ms against 1015 ms over another 15
+  pairs. Bytes read before the socket serves fall from 527.8 MB to 267.2 MB,
+  which is one recognizer. Resident memory is unchanged, because the buffer is
+  released as soon as the session owns its copy (#346).
 - **An unmeasured camera pair now captures one stream at a time, and the
   first enrollment measures the real answer.** The old fallback assumed
   concurrent capture, which broke an enrollment outright on a module whose

@@ -19,7 +19,7 @@
 //! here loads a model that was not pinned by sha256 first, and
 //! [`TfliteSession::from_pinned_bytes`] takes the VERIFIED BYTES themselves
 //! so the checked buffer and the loaded buffer can never diverge (the same
-//! one-buffer rule as `Engine::load_with_recognizer_bytes`).
+//! one-buffer rule as `Engine::load_with_recognizer_weights`).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -177,7 +177,7 @@ impl TfliteSession {
     /// constructor named "pinned" that does not check is a promise only its
     /// call sites keep (#296 review), and one forgetful stage-2 caller
     /// would run an unverified model. Same one-buffer rule as
-    /// `Engine::load_with_recognizer_bytes`: the digest and the loaded
+    /// `Engine::load_with_recognizer_weights`: the digest and the loaded
     /// model can never diverge because they are the same bytes.
     ///
     /// `threads` caps CPU threads for the interpreter. XNNPACK is applied

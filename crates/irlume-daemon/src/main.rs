@@ -27,13 +27,23 @@ const MODEL_MANIFEST: &str = include_str!("../../../models/SHA256SUMS");
 /// Unknown weights WARN by default: operators legitimately deploy self-trained
 /// adapters, and refusing to start would turn a model swap into a lockout.
 /// `IRLUME_MODELS_STRICT=1` upgrades the warning to a startup refusal.
-fn verify_models(paths: &[&str]) {
+///
+/// `keep` names the one model the caller wants back, returned with the digest
+/// this function checked and only when the file was actually read (an
+/// unreadable model in non-strict mode returns `None` and the loader reports
+/// it). The recognizer is what the daemon asks for: without this the 260MB file
+/// was read and sha256'd here, then read and sha256'd AGAIN inside
+/// [`irlume_auth::Engine::load`] (#346). Handing the checked artifact over is
+/// also the stronger guarantee, because what reaches the ONNX session is then
+/// what this digest was taken from, with no window for a swap in between.
+fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::HashedModel> {
     let known: std::collections::HashSet<&str> = MODEL_MANIFEST
         .lines()
         .filter_map(|l| l.split_whitespace().next())
         .collect();
     let strict = std::env::var("IRLUME_MODELS_STRICT")
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
+    let mut kept = None;
     for path in paths {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
@@ -50,8 +60,11 @@ fn verify_models(paths: &[&str]) {
                 continue;
             }
         };
-        let digest = irlume_common::thirdparty::sha256_hex(&bytes);
-        if !known.contains(digest.as_str()) {
+        // Hashed once, here: the digest checked below is the same one the
+        // engine tags the embedding space with (#346).
+        let model = irlume_common::HashedModel::new(bytes);
+        let digest = model.sha256();
+        if !known.contains(digest) {
             eprintln!(
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
             );
@@ -66,6 +79,35 @@ fn verify_models(paths: &[&str]) {
                  self-trained models; set IRLUME_MODELS_STRICT=1 to refuse instead)"
             );
         }
+        // After the checks, so what is handed back is what this loop hashed
+        // and (in strict mode) accepted.
+        if keep == Some(*path) {
+            kept = Some(model);
+        }
+    }
+    kept
+}
+
+/// Build the engine on the SHIPPED-recognizer path.
+///
+/// `verified` carries what [`verify_models`] already read and checksummed at
+/// startup; handing it to the weights loader is what makes a start read and
+/// sha256 the 260MB recognizer once instead of twice (#346). It is also the
+/// tighter guarantee: [`irlume_auth::Engine::load`] re-opens the path, so a file
+/// swapped between the check and the load would reach the session unverified.
+///
+/// `None` is the camera worker's post-panic rebuild, which pays the read as it
+/// always has. Keeping the 260MB buffer alive for the daemon's whole life to
+/// save that one re-read would cost more resident memory than the entire rest
+/// of the process, so startup drops it as soon as the session owns its copy.
+fn load_shipped_recognizer(
+    det_path: &str,
+    model_path: &str,
+    verified: Option<&irlume_common::HashedModel>,
+) -> irlume_common::Result<irlume_auth::Engine> {
+    match verified {
+        Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, weights),
+        None => irlume_auth::Engine::load(det_path, model_path),
     }
 }
 
@@ -92,10 +134,11 @@ fn models_to_verify<'a>(shipped: [&'a str; 4], adapter: &'a str) -> Vec<&'a str>
 /// kept. Any invalid explicit selection refuses to start; PAM treats an
 /// unavailable daemon as password fallback, so fail-closed means "password",
 /// never lockout. `None` = nothing selected, use the shipped default. The
-/// returned VERIFIED BYTES are what the engine must load: re-reading the path
+/// returned VERIFIED WEIGHTS are what the engine must load: re-reading the path
 /// later (or at a post-panic rebuild) would let a swap pair new weights with
-/// the threshold measured for the old ones.
-fn resolve_thirdparty_recognizer() -> Option<(Vec<u8>, f32, String)> {
+/// the threshold measured for the old ones. They carry the digest checked here,
+/// so the engine tags the embedding space without hashing them again (#346).
+fn resolve_thirdparty_recognizer() -> Option<(irlume_common::HashedModel, f32, String)> {
     std::env::var("IRLUME_THIRDPARTY_RECOGNIZER")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -124,14 +167,15 @@ fn resolve_thirdparty_recognizer() -> Option<(Vec<u8>, f32, String)> {
                 );
                 std::process::exit(1);
             });
-            let digest = irlume_common::thirdparty::sha256_hex(&bytes);
-            if digest != entry.sha256 {
+            let weights = irlume_common::HashedModel::new(bytes);
+            if weights.sha256() != entry.sha256 {
                 eprintln!(
-                    "irlumed: third-party recognizer '{name}' checksum mismatch (sha256 {digest}); refusing to start so face auth falls back to the password"
+                    "irlumed: third-party recognizer '{name}' checksum mismatch (sha256 {}); refusing to start so face auth falls back to the password",
+                    weights.sha256()
                 );
                 std::process::exit(1);
             }
-            (bytes, entry.threshold, entry.name.to_string())
+            (weights, entry.threshold, entry.name.to_string())
         })
 }
 
@@ -258,7 +302,11 @@ fn main() {
             .name("irlume-startup".into())
             .spawn(move || {
             eprintln!("irlumed: loading models (det={det}, model={model})…");
-            verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter));
+            // The recognizer's verified bytes come back and go straight into the
+            // engine below (#346), so the 260MB file is read and hashed once per
+            // start rather than once here and once again inside the loader.
+            let mut verified_recognizer =
+                verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter), Some(&model));
             // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
             // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
             let (rgb_dev, ir_dev) = irlume_auth::select_pair();
@@ -363,26 +411,38 @@ fn main() {
             // weights with the threshold measured for the old ones. The stage
             // gate refuses until Stage::Recognition opens, so today an
             // explicit selection always refuses.
-            let tp_rec: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_recognizer();
+            let tp_rec: Option<(irlume_common::HashedModel, f32, String)> =
+                resolve_thirdparty_recognizer();
             let tp_det: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_detector();
+            // A third-party selection replaces the shipped recognizer outright,
+            // so the shipped bytes are dead weight from here on; free them
+            // before the load instead of carrying 260MB through it.
+            if tp_rec.is_some() {
+                verified_recognizer = None;
+            }
             // Engine factory: (re)loads the models and rebinds devices/adapters. Used
             // once at startup and again by the camera worker to rebuild the engine after
             // a caught panic, so a fresh request never runs against ONNX sessions left in
             // an unproven state by an unwind. It owns its inputs so it can move to the
             // worker thread, and it is Fn, so startup calls it before that move.
-            let build_engine = move || {
+            //
+            // `recognizer` is what startup already read, hashed and verified
+            // (#346); the worker's post-panic rebuild passes None and re-reads
+            // the path, which is why the closure takes it as an argument instead
+            // of capturing it and holding 260MB for the daemon's life.
+            let build_engine = move |recognizer: Option<&irlume_common::HashedModel>| {
                 match &tp_rec {
                     // The RETAINED verified bytes, not the path: a post-panic
                     // rebuild must run exactly the artifact the pin check saw.
-                    Some((bytes, thr, name)) => {
-                        irlume_auth::Engine::load_with_recognizer_bytes(&det, bytes).map(|e| {
+                    Some((weights, thr, name)) => {
+                        irlume_auth::Engine::load_with_recognizer_weights(&det, weights).map(|e| {
                             eprintln!(
                                 "irlumed: third-party recognizer '{name}' loaded (threshold {thr}; IR matching disabled — unmeasured for this model)"
                             );
                             e.with_thirdparty_recognizer(*thr, name)
                         })
                     }
-                    None => irlume_auth::Engine::load(&det, &model),
+                    None => load_shipped_recognizer(&det, &model, recognizer),
                 }
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
@@ -403,7 +463,7 @@ fn main() {
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
-            let mut engine = match build_engine() {
+            let mut engine = match build_engine(verified_recognizer.as_ref()) {
                 Ok(e) => {
                     eprintln!(
                         "irlumed: IR adapter {}",
@@ -450,6 +510,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            // ORT copied the weights into its own session at commit time, so
+            // this buffer is 260MB of dead memory from here on: release it
+            // before the enrollment sweep rather than at the end of startup.
+            drop(verified_recognizer);
             publish_engine_bits(&engine);
 
             // One-time inoculation: stamp legacy (untagged) IR scans with the current
@@ -649,7 +713,11 @@ fn main() {
                                     // login path down entirely. If the rebuild fails,
                                     // the old engine is kept: still better than a dead
                                     // daemon.
-                                    match build_engine() {
+                                    // No bytes in hand here: the startup buffer
+                                    // was released once the first session owned
+                                    // its copy, so this rebuild re-reads the
+                                    // recognizer from disk (#346).
+                                    match build_engine(None) {
                                         Ok(fresh) => {
                                             engine = fresh;
                                             publish_engine_bits(&engine);
@@ -3845,6 +3913,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Startup asks for one model and gets back exactly that file's bytes with
+    // exactly the digest this loop checked; every other path is verified and
+    // dropped as before (#346). A mutant that hands back the wrong file, or one
+    // that keeps something it never verified, fails below.
+    #[test]
+    fn verify_models_hands_back_the_model_it_was_asked_for_with_its_digest() {
+        let dir = std::env::temp_dir().join(format!("irlume-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wanted = dir.join("recognizer.onnx");
+        let other = dir.join("other.onnx");
+        std::fs::write(&wanted, b"recognizer weights").unwrap();
+        std::fs::write(&other, b"some other model").unwrap();
+        let (w, o) = (
+            wanted.to_str().unwrap().to_string(),
+            other.to_str().unwrap().to_string(),
+        );
+
+        let kept = verify_models(&[&o, &w], Some(&w)).expect("the asked-for model comes back");
+        assert_eq!(
+            kept.bytes(),
+            b"recognizer weights",
+            "the requested model's own bytes must come back"
+        );
+        // The digest travels WITH those bytes, which is what lets the engine
+        // tag the embedding space without hashing 260MB a second time.
+        assert_eq!(
+            kept.sha256(),
+            irlume_common::sha256_hex(b"recognizer weights"),
+            "the digest must be of the bytes handed back"
+        );
+        assert!(
+            verify_models(&[&o, &w], None).is_none(),
+            "asking for nothing keeps nothing"
+        );
+        assert!(
+            verify_models(&[&o], Some(&w)).is_none(),
+            "a model that was never verified must not be handed back"
+        );
+        // Non-strict, unreadable: the loader reports it, and nothing invented
+        // is handed over in the meantime.
+        assert!(
+            verify_models(&[&o], Some("/nonexistent/irlume-test/face.onnx")).is_none(),
+            "an unread model must not produce bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The verified bytes must reach the ONNX session WITHOUT the recognizer
+    // path being opened again (#346). Both halves matter: the first proves the
+    // byte path never touches the file, the second proves the assertion has
+    // teeth, because reintroducing a read is exactly what makes the missing
+    // path show up in the error.
+    #[test]
+    fn the_verified_recognizer_bytes_load_without_reading_the_path() {
+        let det = "/nonexistent/irlume-test/det.onnx";
+        let model = "/nonexistent/irlume-test/face.onnx";
+        // `Engine` is not Debug, so unwrap the Result by hand.
+        let why = |r: irlume_common::Result<irlume_auth::Engine>| match r {
+            Ok(_) => panic!("no model file exists here, so a load cannot succeed"),
+            Err(e) => e.to_string(),
+        };
+        let weights = irlume_common::HashedModel::new(b"pinned recognizer weights".to_vec());
+        let err = why(load_shipped_recognizer(det, model, Some(&weights)));
+        assert!(
+            !err.contains(model),
+            "the recognizer path was read despite bytes in hand: {err}"
+        );
+        // No bytes: the post-panic rebuild, which does read the path.
+        let err = why(load_shipped_recognizer(det, model, None));
+        assert!(
+            err.contains(model),
+            "the rebuild must read the recognizer path: {err}"
+        );
+    }
+
     // An invalid explicit third_party_recognizer selection must REFUSE TO
     // START, never silently substitute the shipped recognizer: that would run
     // a different grant-capable decision system than the operator selected
@@ -3902,7 +4046,7 @@ mod tests {
     fn strict_verify_still_refuses_a_missing_shipped_model() {
         if std::env::var("IRLUME_TEST_VERIFY_CHILD").is_ok() {
             // Child: strict verify of an unreadable model must exit(1) here.
-            verify_models(&["/nonexistent/irlume-test/det.onnx"]);
+            verify_models(&["/nonexistent/irlume-test/det.onnx"], None);
             return; // reaching this line means strict did NOT refuse
         }
         let exe = std::env::current_exe().unwrap();
@@ -5165,10 +5309,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let unknown = dir.join("custom_adapter.onnx");
         std::fs::write(&unknown, b"self-trained weights").unwrap();
-        verify_models(&[
-            unknown.to_str().unwrap(),
-            "/nonexistent/irlume-test/missing.onnx",
-        ]);
+        verify_models(
+            &[
+                unknown.to_str().unwrap(),
+                "/nonexistent/irlume-test/missing.onnx",
+            ],
+            None,
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5179,11 +5326,11 @@ mod tests {
     #[test]
     fn strict_verify_refuses_a_tampered_model_and_accepts_a_shipped_one() {
         if let Ok(path) = std::env::var("IRLUME_TEST_VERIFY_TAMPER_CHILD") {
-            verify_models(&[&path]); // must exit(1) before the return
+            verify_models(&[&path], None); // must exit(1) before the return
             return;
         }
         if let Ok(path) = std::env::var("IRLUME_TEST_VERIFY_KNOWN_CHILD") {
-            verify_models(&[&path]); // digest is in the manifest: must survive
+            verify_models(&[&path], None); // digest is in the manifest: must survive
             println!("known-model-accepted");
             std::process::exit(0);
         }

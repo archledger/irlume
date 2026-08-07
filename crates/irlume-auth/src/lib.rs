@@ -810,34 +810,33 @@ impl Engine {
         // Identify the recognizer by its weights, not its path: a file swapped
         // in place under the same name is a different embedding space and must
         // not silently score against templates from the old one. Read the file
-        // ONCE and hand those bytes to the byte loader below.
+        // ONCE and hand those bytes to the weights loader below.
         let model_bytes = std::fs::read(model_path)
             .map_err(|e| irlume_common::Error::Io(format!("{model_path}: {e}")))?;
-        Self::load_with_recognizer_bytes(det_path, &model_bytes)
+        Self::load_with_recognizer_weights(det_path, &irlume_common::HashedModel::new(model_bytes))
     }
 
-    /// [`Self::load`], from recognizer bytes the CALLER already holds.
+    /// [`Self::load`], from recognizer weights the CALLER already holds.
     ///
-    /// For callers that verified those bytes against a pin: re-reading a path
+    /// For callers that verified those weights against a pin: re-reading a path
     /// here would let a swap between their check and this load pair the new
-    /// weights with a threshold measured for the old ones — the digest below
+    /// weights with a threshold measured for the old ones. The digest below
     /// would honestly tag the new space, but the POLICY attached to the engine
-    /// would belong to a different artifact. One byte buffer flows from the
-    /// caller's checksum through the digest into the ONNX session, so the
-    /// three can never disagree.
-    pub fn load_with_recognizer_bytes(
+    /// would belong to a different artifact. One
+    /// [`irlume_common::HashedModel`] flows from the caller's checksum through
+    /// the embedding-space tag into the ONNX session, so the three can never
+    /// disagree, and the 260MB hash happens once per start rather than once
+    /// here and once at the caller (#346).
+    pub fn load_with_recognizer_weights(
         det_path: &str,
-        model_bytes: &[u8],
+        model: &irlume_common::HashedModel,
     ) -> irlume_common::Result<Self> {
         // Full digest: the tag resists an adversarial model, and truncation
         // halves its strength per dropped character.
-        let embed_space = format!(
-            "embed:{}",
-            irlume_common::thirdparty::sha256_hex(model_bytes)
-        );
+        let embed_space = format!("embed:{}", model.sha256());
         Ok(Self {
             det: Detector::load_from_file(det_path)?,
-            emb: Embedder::load_from_memory(model_bytes)?,
+            emb: Embedder::load_from_memory(model.bytes())?,
             ir_adapter: None,
             ir_space: "raw".into(),
             embed_space,
@@ -5885,18 +5884,19 @@ mod engine_tests {
 
     #[test]
     fn verified_recognizer_bytes_are_the_loaded_embedding_space() {
-        // The byte loader exists so a caller's pin check, the template-space
-        // digest, and the ONNX session all come from ONE buffer: the digest
-        // must be of exactly the bytes handed in, or a path swap between a
-        // caller's checksum and this load could pair new weights with a
-        // threshold measured for old ones (#279 review).
+        // The weights loader exists so a caller's pin check, the
+        // template-space digest, and the ONNX session all come from ONE
+        // buffer: the digest must be of exactly the bytes handed in, or a path
+        // swap between a caller's checksum and this load could pair new
+        // weights with a threshold measured for old ones (#279 review).
         let _g = env_guard();
         let _s = shared(); // ensure ORT is initialized for this process
         let bytes = std::fs::read(model_path("glintr100.onnx")).unwrap();
         let expected = format!("embed:{}", irlume_common::thirdparty::sha256_hex(&bytes));
-        let engine = Engine::load_with_recognizer_bytes(
+        let weights = irlume_common::HashedModel::new(bytes);
+        let engine = Engine::load_with_recognizer_weights(
             &model_path("face_detection_yunet_2023mar.onnx"),
-            &bytes,
+            &weights,
         )
         .expect("engine from bytes");
         assert_eq!(engine.embed_space(), expected);

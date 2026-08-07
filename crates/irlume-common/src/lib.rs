@@ -120,6 +120,43 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// A model's weights together with the sha256 of THOSE weights.
+///
+/// Whoever checks a model against a manifest or a catalog pin, and whoever
+/// loads it, both need the digest, and hashing a 260MB recognizer twice per
+/// start cost measurable time for nothing (#346). Carrying the pair in one
+/// value removes the second pass, and it removes the failure mode that would
+/// have come with passing a loose digest alongside loose bytes: the constructor
+/// is the only way in and it takes the digest from the buffer it stores, so the
+/// two cannot be from different artifacts.
+///
+/// ```
+/// let m = irlume_common::HashedModel::new(b"weights".to_vec());
+/// assert_eq!(m.sha256(), irlume_common::sha256_hex(m.bytes()));
+/// ```
+pub struct HashedModel {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl HashedModel {
+    /// Hash `bytes` once and keep both halves.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        let sha256 = sha256_hex(&bytes);
+        Self { bytes, sha256 }
+    }
+
+    /// Hex sha256 of [`Self::bytes`].
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// The weights themselves.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Make every directory above `dir` durable, so the names leading to it survive
 /// a power loss.
 ///

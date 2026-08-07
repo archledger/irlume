@@ -62,7 +62,12 @@ jobs:
   check:
     name: fmt · clippy · build · test
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 70
+    # Sized for a 4-core hosted runner, not archhost's 16: this job fetches
+    # ~266MB of weights (the cache key moves whenever models/SHA256SUMS
+    # does), builds the ONNX runtime download, compiles the workspace, then
+    # runs the full suite plus the swtpm, loopback-camera and PAM sets. It
+    # was cancelled at exactly 30:00 with tests still running.
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.

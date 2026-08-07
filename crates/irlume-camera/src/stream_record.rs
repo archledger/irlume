@@ -970,7 +970,7 @@ mod tests {
         drop(lock); // this process lets go; the child has not.
         assert!(
             matches!(acquire(&id), Err(AcquireError::Busy)),
-            "a forked child must still hold the inherited lock; if this ever              stops being true the crate lock no longer needs to cover spawning"
+            "a forked child must still hold the inherited lock; if this ever stops being true the crate lock no longer needs to cover spawning"
         );
 
         let mut status = 0;

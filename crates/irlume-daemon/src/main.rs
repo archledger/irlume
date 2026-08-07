@@ -1369,13 +1369,6 @@ fn refusal_throttled(uid: u32) -> bool {
     b.tokens < 0.0
 }
 
-/// Read and parse one connection, hand the request to the arbiter, write back
-/// what the worker answers.
-///
-/// Everything here runs on the connection's own thread. The only work that
-/// reaches the camera worker is a parsed, authorized-shaped request, which is
-/// what lets an authentication overtake a queue of preview work: before this,
-/// a request nobody had read yet was invisible to the daemon.
 /// The listening socket systemd passed us, if we were socket-activated.
 ///
 /// Implements the sd_listen_fds protocol directly rather than pulling in
@@ -1524,6 +1517,13 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
     }
 }
 
+/// Read and parse one connection, hand the request to the arbiter, write back
+/// what the worker answers.
+///
+/// Everything here runs on the connection's own thread. The only work that
+/// reaches the camera worker is a parsed, authorized-shaped request, which is
+/// what lets an authentication overtake a queue of preview work: before this,
+/// a request nobody had read yet was invisible to the daemon.
 fn serve(
     stream: UnixStream,
     arbiter: &arbiter::Arbiter<Queued>,
@@ -3311,14 +3311,6 @@ fn mutate_enrollment(
     }
 }
 
-/// Face-verify `user` and, on a passing match, release the TPM-sealed password.
-/// The biometric check happens HERE (inside unseal), so a caller cannot get the
-/// password without a capture that clears the liveness gate and matches the
-/// enrolled templates. Clearing the gate is evidence, not proof, that a live
-/// person is present: the single-frame IR cues are defeatable by a good print
-/// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
-/// temporal consent gesture by default. We log the decision + cosine score, but
-/// never the password or its length.
 /// Deny-line score display: exact under IRLUME_LOG=debug tracing, else
 /// quantized to one decimal (anti-oracle; see comment at the deny log).
 fn deny_score(s: f32) -> String {
@@ -3398,6 +3390,14 @@ fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
     }
 }
 
+/// Face-verify `user` and, on a passing match, release the TPM-sealed password.
+/// The biometric check happens HERE (inside unseal), so a caller cannot get the
+/// password without a capture that clears the liveness gate and matches the
+/// enrolled templates. Clearing the gate is evidence, not proof, that a live
+/// person is present: the single-frame IR cues are defeatable by a good print
+/// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
+/// temporal consent gesture by default. We log the decision + cosine score, but
+/// never the password or its length.
 fn do_unseal_password(
     user: &str,
     service: Option<&str>,

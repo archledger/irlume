@@ -8,10 +8,10 @@
 //! runs the session and feeds these. YuNet input is letterboxed BGR, raw 0–255,
 //! NCHW; outputs per stride are cls(1) · obj(1) → score, bbox(4), kps(10).
 //!
-//! NOTE: validate the exact output layout against a real `face_detection_yunet`
-//! model with `Detector::describe_io()`; but because score = √(cls·obj) is
-//! symmetric and we group outputs by tensor shape, cls/obj order is irrelevant
-//! and naming differences don't matter.
+//! The exact output layout is never asserted from tensor NAMES: because
+//! score = √(cls·obj) is symmetric and `Detector::detect` groups outputs by
+//! tensor shape, cls/obj order is irrelevant and a model that names its outputs
+//! differently still decodes.
 
 use crate::{Detection, Landmarks5};
 

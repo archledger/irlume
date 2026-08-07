@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 irlume-common.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # V4L2 capture. Chosen over nokhwa: it's the path linhello proved on this exact

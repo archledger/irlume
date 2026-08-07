@@ -232,6 +232,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %dir %{_datadir}/%{name}/schemas
 %{_datadir}/%{name}/schemas/*.json
 %{_datadir}/%{name}/models/*.onnx
+%{_datadir}/%{name}/models/*.tflite
 %{_datadir}/%{name}/onnxruntime/lib/*
 %{_unitdir}/irlumed.service
 %{_unitdir}/irlumed.socket

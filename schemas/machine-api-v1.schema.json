@@ -404,6 +404,10 @@
             },
             "passphrase_set": {
               "type": "boolean"
+            },
+            "key_present": {
+              "description": "Whether the template key that opens an encrypted store exists. false with templates=encrypted means the store is orphaned and needs re-enrollment, not recovery. Documented in MACHINE-API.md; added within contract 1 (additive field).",
+              "type": "boolean"
             }
           }
         },

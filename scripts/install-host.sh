@@ -24,23 +24,30 @@ done
 
 # Mesh default: the production default is the native face_landmarks_detector
 # .tflite (#315), which needs a TFLite C runtime on this host. Probe the same
-# candidate paths the daemon's resolver uses, so the unit this script writes
-# agrees with what the daemon would actually load; without a runtime, fall
-# back to the ONNX conversion rather than installing a daemon that cannot
-# start.
+# candidate paths the daemon's resolver uses, and probe them THROUGH that
+# resolver (a truncated or wrong-architecture .so is still a regular file,
+# so -f alone would write a unit whose daemon cannot start); without a
+# loadable runtime, fall back to the ONNX conversion.
+TFLITE_PROBE="$REPO/target/release/examples/tflite_runtime_probe"
+[[ -x "$TFLITE_PROBE" ]] || {
+    echo "missing $TFLITE_PROBE; build with: cargo build --release -p irlume-vision --example tflite_runtime_probe" >&2
+    exit 1
+}
 MESH="$REPO/models/face_landmark.onnx"
 for lib in /usr/share/irlume/tflite/libtensorflowlite_c.so \
            /usr/lib64/libtensorflowlite_c.so \
            /usr/lib/libtensorflowlite_c.so \
            /usr/lib/x86_64-linux-gnu/libtensorflowlite_c.so; do
-    if [[ -f "$lib" ]]; then
+    [[ -f "$lib" ]] || continue
+    if "$TFLITE_PROBE" "$lib"; then
         MESH="$REPO/models/face_landmarks_detector.tflite"
         [[ -f "$MESH" ]] || { echo "missing $MESH (run scripts/fetch-models.sh)" >&2; exit 1; }
         break
     fi
+    echo "TFLite runtime exists but is not loadable, skipping: $lib" >&2
 done
 if [[ "$MESH" == *.onnx ]]; then
-    echo "no TFLite runtime found; mesh stays on the ONNX conversion (production default is the .tflite, see scripts/build-tflite-runtime.sh)"
+    echo "no loadable TFLite runtime found; mesh stays on the ONNX conversion (production default is the .tflite, see scripts/build-tflite-runtime.sh)"
 fi
 
 # State lives under the invoking user's home (single-admin install for now).

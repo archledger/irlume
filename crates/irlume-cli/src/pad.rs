@@ -231,6 +231,13 @@ fn presentation_record(
     rec.insert("cross_dist".into(), crate::json_f32(cross));
     rec.insert("yaw_asym".into(), crate::json_f32(s.head_yaw_asym));
     rec.insert("pitch_frac".into(), crate::json_f32(s.head_pitch_frac));
+    // Ambient IR rides with the distance proxy because the two confound each
+    // other in exactly the analysis this corpus exists for: brightness moves
+    // with both seating distance and the scene's own infrared, so near
+    // captures in a dark room against far captures under daylight would be
+    // inseparable without the ambient reading (#174 review). The gate also
+    // reads it, to reword a denial past IR_AMBIENT_FLOOD.
+    rec.insert("ir_ambient".into(), crate::json_f32(s.ir_ambient));
     // The seating-distance proxy, recorded so the next corpus can correlate
     // the cues above against it (#174); it gates nothing (see
     // `irlume_liveness::Signals::face_frac`).
@@ -682,15 +689,19 @@ mod tests {
     }
 
     /// #174's plumbing at the corpus layer: `capture_once` computes
-    /// `face_frac` and the record must not drop it, because this file's
-    /// output is what a distance correlation is computed FROM. The
-    /// 2026-08-04 campaign in the #174 thread ran through this tool while
-    /// the loop dropped the field, so its per-condition table had to be
-    /// rebuilt by hand from debug lines instead of read off the corpus.
+    /// `face_frac` and `ir_ambient` and the record must drop neither,
+    /// because this file's output is what a distance correlation is
+    /// computed FROM, and brightness moves with both seating distance and
+    /// the scene's own infrared, so a corpus with only one of the two
+    /// cannot attribute a change to either. The 2026-08-04 campaign in the
+    /// #174 thread ran through this tool while the loop dropped face_frac,
+    /// so its per-condition table had to be rebuilt by hand from debug
+    /// lines instead of read off the corpus.
     #[test]
     fn presentation_record_carries_face_frac() {
         let mut s = passing_signals();
         s.face_frac = 0.3;
+        s.ir_ambient = 123.5;
         let rec = presentation_record(
             "live_normal",
             "bonafide",
@@ -706,6 +717,13 @@ mod tests {
             .as_f64()
             .expect("face_frac must be in every record");
         assert!((got - 0.3).abs() < 1e-6, "recorded {got}, measured 0.3");
+        // A distinct value, so a record that wrote some other field's number
+        // (or a constant) here fails, not just a record that dropped the key.
+        assert_eq!(
+            rec["ir_ambient"].as_f64(),
+            Some(123.5),
+            "ir_ambient must round-trip into the record"
+        );
 
         // No detection is recorded as 0.0, the "no face" spelling
         // `face_frac_of` promises, not a missing key a reader would have to
@@ -764,6 +782,7 @@ mod tests {
             "cross_dist",
             "yaw_asym",
             "pitch_frac",
+            "ir_ambient",
             "face_frac",
             "cues",
         ] {

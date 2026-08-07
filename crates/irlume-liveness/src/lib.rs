@@ -83,7 +83,8 @@ pub struct Signals {
     /// v4l2 exposure control exposed, so raw brightness is an AE output
     /// rather than irradiance, and dividing it by face_frac squared tracks
     /// the AE instead of the physics (measured 87 at 67.5 cm where 1/d^2
-    /// from the 45 cm baseline predicts 43, #174 thread); the ratio needs no
+    /// from the 45 cm baseline predicts 43, #174 thread); for the ratio, the
+    /// available one-subject, one-module measurements do not justify a
     /// distance term in the measured band. The field stays recorded so
     /// padcapture corpora and the debug lines can re-answer the question on
     /// other modules and outside 20 to 80 cm, where nothing is measured.
@@ -221,10 +222,13 @@ pub const MIN_FACE_SCORE: f32 = 0.6;
 /// 69 of 70 trials (docs/pad-results/2026-06-30-ir-liveness-selftest.md). Treat
 /// it as one weak cue, never as proof of a live face.
 ///
-/// Seating distance does NOT move it: across a 2.7x distance change (~30 to
-/// ~80 cm) the genuine range stayed 1.39-1.56, overlapping at every distance,
-/// so this floor needs no `face_frac` term in that band (#174, measured
-/// 2026-08-04). Eyewear moves it more than seating does: bare-eyed 1.33-1.43
+/// The 2026-08-04 campaign did not show a distance-separated ratio range:
+/// across a 2.7x distance change (~30 to ~80 cm), all observed genuine values
+/// remained within 1.39-1.56 and the condition ranges overlapped (#174). On
+/// one subject and one ASUS module, that supplies no evidence for adding a
+/// `face_frac` term in the measured band, but it does not establish that
+/// distance has zero effect. Re-measure across subjects and modules before
+/// generalising. Eyewear moves it more than seating did: bare-eyed 1.33-1.43
 /// against glasses-on 1.44-1.53, disjoint ranges on the same subject at the
 /// same distance. What does collapse the ratio is saturation up close, which
 /// the exposure gate (#237) refuses before this cue reads it. A retune of the
@@ -1651,15 +1655,13 @@ mod tests {
         }
     }
 
-    /// `face_frac` is RECORDED with the cues and read by nothing. The #174
-    /// measurements (2026-08-04) answered the question it was recorded for:
-    /// brightness moves with seating distance but keeps 2.1x margin over its
-    /// floor at ~80 cm, and the center/edge ratio does not move at all in
-    /// the 30 to 80 cm band, so no cue is normalised by this field (see
-    /// `Signals::face_frac` for why brightness cannot be either: it is an
-    /// auto-exposure output). A verdict that changed with this field would
-    /// be a normalisation nobody derived from data, which is exactly what
-    /// this test exists to catch.
+    /// The limited #174 campaign (2026-08-04) did not justify a
+    /// distance-normalised gate: observed center/edge ranges overlapped
+    /// across ~30 to ~80 cm on one subject and one module, and brightness
+    /// is an auto-exposure output no 1/d^2 model can hold against (see
+    /// `Signals::face_frac`). This test pins the current contract that
+    /// `face_frac` remains observational and cannot change a verdict until
+    /// a distance-aware rule is separately derived and reviewed.
     #[test]
     fn face_frac_changes_no_verdict() {
         let gate = LivenessGate::new();

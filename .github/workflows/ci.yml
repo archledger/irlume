@@ -622,6 +622,142 @@ jobs:
           check packaging/systemd/irlume-reconcile.service 94
           exit "$fail"
 
+  deny:
+    name: cargo-deny (advisories · licenses · duplicate versions)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+
+  units:
+    name: systemd units (verify + exposure ratchet)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every unit in packaging/systemd must be shipped by every packaging lane,
+      # and every lane must agree on the version. Both failures have shipped
+      # before: the 0.6.x rpm installed a timer it left out of %files, PR #98
+      # existed to resync drifted version fields, and the 0.7.0 audit found the
+      # PPA lane missing the reconcile timer entirely.
+      - name: packaging parity (units in every lane, versions agree)
+        run: ./scripts/check-packaging-parity.sh
+
+      # Nothing validated the AppArmor profiles until 0.9.0, and they are the
+      # only confinement on the Debian/Ubuntu lane. A profile that fails to
+      # parse does not confine, and the two bugs this release fixed (a missing
+      # pcrlock rule that broke every Tier 2 unseal, and a granted-vs-denied
+      # capability) both live in these files. -Q parses without loading into the
+      # kernel and -K skips the policy cache, which together let this run
+      # unprivileged: -Q alone still writes /var/cache/apparmor and dies on
+      # permission, which is how the first version of this step failed.
+      - name: apparmor profiles parse
+        run: |
+          set -euo pipefail
+          command -v apparmor_parser >/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y apparmor; }
+          for f in packaging/apparmor/*; do
+            echo "checking $f on the runner's parser"
+            apparmor_parser -QK "$f"
+          done
+
+      # The runner's parser is 4.x. The universal .deb declares
+      # libc6 (>= 2.35) so it installs on Debian 12 and Ubuntu 22.04, whose
+      # apparmor is 3.0.x, and a profile can parse here and fail there: an
+      # `abi <abi/4.0>` line did exactly that, and since the postinstall did not
+      # report the failure, those installs ran unconfined with nothing said.
+      # Check the OLDEST supported parser too, in the distro that ships it.
+      - name: apparmor profiles parse on the oldest supported parser
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/packaging/apparmor:/p:ro" ubuntu:22.04 bash -c '
+            set -euo pipefail
+            apt-get -qq update >/dev/null
+            apt-get -qq install -y apparmor >/dev/null
+            apparmor_parser --version
+            useradd -m checker
+            for f in /p/*; do
+              echo "checking $f"
+              su checker -c "apparmor_parser -QK $f"
+            done'
+
+      # The guard that stops a zero-match test filter from reporting success is
+      # itself a parser, so it gets the same treatment it enforces: prove it can
+      # still tell a real run from an empty one. Fixtures only, no Rust build.
+      - name: test-count guard self-test
+        run: ./scripts/run-tests-guarded.sh --self-test
+
+      # The PPA publish check decides whether a release reached Ubuntu users, so
+      # its verdict logic is worth pinning. The live check needs a real upload
+      # and cannot run here; --self-test is fixtures only, no network.
+      - name: PPA publish verifier (verdict logic)
+        run: python3 scripts/verify-ppa-publish.py --self-test
+
+      - name: systemd-analyze verify (unit syntax)
+        run: |
+          set -euo pipefail
+          command -v systemd-analyze >/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq systemd; }
+          # verify resolves ExecStart and fails on a binary that is not present,
+          # which on a build runner it never is. Stub the two paths so the check
+          # is about unit syntax, which is what we actually want tested.
+          # Stub ONLY when absent: this runner has a real irlume install,
+          # and the hosted job's unconditional stub would overwrite it.
+          [ -e /usr/bin/irlumed ] || sudo install -Dm755 /bin/true /usr/bin/irlumed
+          [ -e /usr/bin/irlume ] || sudo install -Dm755 /bin/true /usr/bin/irlume
+          for u in packaging/systemd/*.service packaging/systemd/*.timer packaging/systemd/*.path; do
+            echo "::group::verify $(basename "$u")"
+            systemd-analyze verify "$u"
+            echo "::endgroup::"
+          done
+
+      - name: systemd-analyze security (exposure must not regress)
+        run: |
+          set -euo pipefail
+          # Ratchet, in the same spirit as the coverage floor. These numbers are
+          # the CURRENT measured exposure, so any change that loosens sandboxing
+          # fails here instead of shipping quietly. --threshold compares on a
+          # 0-100 scale, so 3.7 as displayed is 37 here, and it fails only when
+          # exposure goes OVER the number.
+          #
+          # To re-baseline deliberately: run
+          #   systemd-analyze security --offline=true packaging/systemd/<unit>
+          # and move the number, in the same commit as whatever changed it.
+          #
+          # The score is systemd-version-sensitive. Measured on the ubuntu-24.04
+          # image (systemd 255); a runner image that moves to a systemd with new
+          # checks may need a re-baseline, which is a deliberate act, not a
+          # silent drift.
+          # Re-measured 2026-08-06 on the self-hosted runner's systemd 261:
+          # identical scores (3.7 / 9.4), so the thresholds carry over.
+          #
+          # irlume-reconcile.service is knowingly high: it is a root oneshot that
+          # rewrites /etc/pam.d, so it holds broad access by design. Locking it
+          # here stops it getting worse. Hardening it is its own change, with its
+          # own validation, because it is the self-heal that repairs broken PAM.
+          fail=0
+          check() {
+            local unit="$1" threshold="$2"
+            echo "::group::security $(basename "$unit") (threshold ${threshold})"
+            if systemd-analyze security --offline=true --threshold="$threshold" "$unit"; then
+              echo "OK: at or below the recorded exposure"
+            else
+              echo "::error::$(basename "$unit") exposure rose above ${threshold} (0-100 scale)"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          check packaging/systemd/irlumed.service 37
+          check packaging/systemd/irlume-reconcile.service 94
+          exit "$fail"
+
   nix:
     name: nix flake check
     runs-on: ubuntu-24.04

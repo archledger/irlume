@@ -150,7 +150,14 @@ jobs:
       # rather than a surprise, so it fails here until the schema documents it.
       - name: machine API conformance (real binary against the published schema)
         run: |
-          command -v apt-get >/dev/null && sudo apt-get install -y --no-install-recommends python3-jsonschema || python3 -c "import jsonschema"
+          # if-then-else, not `A && B || C` (SC2015): with the chain, an
+          # apt-get that EXISTS but FAILS silently falls through to the
+          # import check and hides the install error.
+          if command -v apt-get >/dev/null; then
+            sudo apt-get install -y --no-install-recommends python3-jsonschema
+          else
+            python3 -c "import jsonschema"
+          fi
           python3 scripts/machine-api-conformance.py \
             --irlume "${CARGO_TARGET_DIR:-target}/release/irlume" --strict
 

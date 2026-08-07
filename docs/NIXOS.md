@@ -133,10 +133,12 @@ environment on its own.
 
 ## Testing in a VM
 
-The module runs on real hardware with both camera streams open at once. USB
+On real hardware the module opens both camera streams at once when a measured
+verdict allows it; an unmeasured pair captures one stream at a time. USB
 passthrough into a QEMU/KVM guest cannot sustain concurrent RGB and IR
-isochronous transfers, so set `sequentialCapture = true` in a VM. Leave it off
-on bare metal, where concurrent capture is faster.
+isochronous transfers, so set `sequentialCapture = true` in a VM, which pins
+the order whatever the measurement stored. Leave it off on bare metal, where
+concurrent capture is faster.
 
 For the graphical console, use QXL (`-vga qxl`) or virtio without 3D
 acceleration. virtio-vga-gl (`accel3d`) needs a local GL display and crashes a

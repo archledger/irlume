@@ -15,7 +15,7 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
     apply_known_ir_emitter, list_ir_controls, measure_contention, measure_contention_with_progress,
-    setup_ir_emitter, store_capture_mode, CaptureMode, ContentionReport,
+    setup_ir_emitter, store_capture_mode, stored_capture_mode, CaptureMode, ContentionReport,
 };
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair
@@ -672,7 +672,7 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 /// Whether captures on `rgb_dev` should run one stream at a time, and where
 /// that answer came from. Order of authority: the explicit env override, then
 /// what `irlume camera-tune` measured on THIS camera (cameras.conf, per
-/// camera identity), then the concurrent default.
+/// camera identity), then the sequential default.
 ///
 /// One resolver for every consumer, because the two halves of the answer must
 /// agree: the ASSESS path uses it to order its reads, and the ENROLL path
@@ -691,7 +691,17 @@ fn sequential_capture_selected(rgb_dev: &str) -> (bool, &'static str) {
 /// testable without a camera or an environment mutation: a set env var
 /// decides alone (even when it says concurrent, because setting it is an
 /// explicit instruction and the stored answer must not outrank it), then the
-/// stored per-camera measurement, then the concurrent default.
+/// stored per-camera measurement, then the sequential default.
+///
+/// Sequential is the unmeasured fallback because the wrong-direction costs
+/// are lopsided (camera-stack research, 2026-08-07). A wrong concurrent
+/// default broke an enrollment outright on the Brio (#308: STREAMON
+/// succeeds, no RGB frame ever arrives, the queue dies with QBUF EINVAL)
+/// and dims the NexiGo's RGB to 42-56% of its real brightness in a lit
+/// room without any error at all. A wrong sequential default costs 0.7 s
+/// (ASUS) to 1.3 s (NexiGo) of capture latency, and only until a measured
+/// verdict is stored; enrollment now probes an unmeasured pair, so most
+/// installs leave this arm at their first enrollment (#340).
 fn capture_mode_decision(
     env: Option<&str>,
     stored: Option<irlume_camera::CaptureMode>,
@@ -700,7 +710,7 @@ fn capture_mode_decision(
         Some(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
         None => match stored {
             Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
-            None => (false, "default"),
+            None => (true, "default"),
         },
     }
 }
@@ -744,8 +754,23 @@ mod capture_mode_decision_tests {
     }
 
     #[test]
-    fn nothing_stored_defaults_to_concurrent() {
-        assert_eq!(capture_mode_decision(None, None), (false, "default"));
+    fn nothing_stored_defaults_to_sequential() {
+        // The unmeasured fallback is the safe direction (#340): a wrong
+        // sequential answer costs at most 1.3 s per capture, while the old
+        // concurrent fallback broke an enrollment on hardware that cannot
+        // stream both nodes (#308).
+        assert_eq!(capture_mode_decision(None, None), (true, "default"));
+    }
+
+    #[test]
+    fn a_stored_concurrent_verdict_outranks_the_sequential_default() {
+        // Fail-closed check for the #340 flip in isolation: flipping the
+        // unmeasured default must not touch what a MEASURED concurrent
+        // camera does, or the flip would tax every healthy tuned install.
+        assert_eq!(
+            capture_mode_decision(None, Some(CaptureMode::Concurrent)),
+            (false, "cameras.conf")
+        );
     }
 }
 
@@ -1272,7 +1297,7 @@ impl Engine {
         // isolate a suspected concurrency problem.
         // Order of authority: an explicit env override, then what the
         // capture-mode probe measured on THIS camera (`irlume camera-tune`,
-        // stored per camera identity in cameras.conf), then the concurrent
+        // stored per camera identity in cameras.conf), then the sequential
         // default. The probe exists because the dimming above is a property of
         // the hardware, not of irlume: the NexiGo N930W keeps 56% of its RGB
         // brightness when both of its interfaces stream, the ASUS built-in keeps

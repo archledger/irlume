@@ -5,6 +5,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **An unmeasured camera pair now captures one stream at a time, and the
+  first enrollment measures the real answer.** The old fallback assumed
+  concurrent capture, which broke an enrollment outright on a module whose
+  firmware refuses a second stream (#308) and dims others without any error;
+  a wrong sequential fallback costs 0.7 to 1.3 seconds per capture and
+  nothing else. Enrollment on a pair with no stored verdict now runs the
+  `camera-tune` contention probe once, before the scans, and persists a
+  conclusive result; a probe run in a room too dim to trust leaves the pair
+  unmeasured and says so. Stored verdicts are untouched, in both directions,
+  and keep deciding every capture. Capture errors also now name which limit
+  refused a stream: EINVAL is the camera's own firmware declining, EIO and
+  ENOSPC are USB bandwidth (#340).
+
 ## [0.9.0] - 2026-08-05
 
 ### Security

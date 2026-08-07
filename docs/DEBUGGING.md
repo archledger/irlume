@@ -57,10 +57,12 @@ just above a floor is visible here long before it becomes a false reject. The
 dim/dark paths add `match(fusion)`, `match(ir-fallback)`,
 `liveness(ir-only/dark)`, and `match(ir/dark)` lines with the same shape. Most
 wall-clock time goes to camera I/O; the `assess:` lines show it, which helps
-when chasing a slow login. The RGB and IR captures run overlapped on the IR
-path, so those two times overlap rather than sum; setting
-`IRLUME_SEQUENTIAL_CAPTURE=1` on the daemon forces the old back-to-back order
-when isolating a camera problem.
+when chasing a slow login. When the measured capture mode is concurrent
+(`irlume camera-tune`, stored in cameras.conf; an unmeasured pair captures one
+stream at a time), the RGB and IR captures run overlapped on the IR path, so
+those two times overlap rather than sum; setting
+`IRLUME_SEQUENTIAL_CAPTURE=1` on the daemon forces back-to-back order
+when isolating a camera problem, whatever the stored mode says.
 
 The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
@@ -217,6 +219,25 @@ The report prints per-side capture times and the average overlapped cost (max
 of each rgb+ir pair) against the sequential cost (sum). On the ASUS Zenbook
 reference hardware the overlap cuts the capture stage from about 1.46s to
 about 1.0s per verify.
+
+### Stream-start failure signatures
+
+Two different limits kill a second camera stream, and they answer with
+different errnos (kernel v6.16, `drivers/media/usb/uvc/uvc_video.c` and
+`drivers/usb/host/xhci.c`); irlume's capture errors now name which one fired:
+
+- **EINVAL: the camera refused.** uvcvideo maps a device STALL on the
+  PROBE/COMMIT negotiation to EINVAL, so the module's own firmware declined
+  the second stream. Both cameras irlume has measured starving (Logitech
+  Brio, NexiGo N930W) fail this way; the Brio refuses on USB3 too, where bus
+  budget is ample. `sudo irlume camera-tune` stores one-at-a-time capture for
+  such a module. Format, resolution, and fps changes do not reach a firmware
+  refusal.
+- **EIO or ENOSPC: the bus refused.** EIO is uvcvideo's "No fast enough alt
+  setting for requested bandwidth" (visible in dmesg); ENOSPC is the xHCI
+  host's periodic-bandwidth admission. Only here can a lower resolution, a
+  lower frame rate, MJPEG, moving a camera off a shared hub, or the uvcvideo
+  module parameter `quirks=0x80` change the outcome.
 
 Reproducing the published accuracy/anti-spoof claims end-to-end is covered in
 [VERIFY.md](VERIFY.md).

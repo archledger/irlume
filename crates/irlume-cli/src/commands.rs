@@ -1625,6 +1625,12 @@ pub fn setup(args: &[String]) -> ExitCode {
 /// Enroll via the daemon (capture happens daemon-side; no camera contention).
 fn run_enroll(user: &str, reset: bool) {
     eprintln!("  capturing: stay in frame, look at the camera…");
+    // Same notice as `irlume enroll`: the daemon's one-time capture-mode
+    // probe (#340) can hold this step for up to a minute before the scans.
+    eprintln!(
+        "  (a camera pair with no measured capture mode is measured first: one time, \
+         up to a minute, the IR emitter fires)"
+    );
     match daemon_request(&Request::Enroll {
         user: user.into(),
         profile: None,

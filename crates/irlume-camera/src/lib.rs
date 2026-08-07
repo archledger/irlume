@@ -356,6 +356,29 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
             "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
         )),
+        // The two stream-start failure signatures the camera-stack research
+        // (2026-08-07, kernel v6.16 sources) separated; the wording exists so
+        // a device refusal and bus exhaustion stop reading alike in dlog and
+        // bug reports (#340). No behavior branches on either.
+        Some(libc::EINVAL) => Error::Hardware(format!(
+            "{device}: {e}. EINVAL at stream start is the camera itself refusing: \
+             uvcvideo maps a device STALL on the PROBE/COMMIT negotiation to EINVAL \
+             (uvc_video.c), so the module's firmware declined, and USB bandwidth is \
+             not the limit (bus exhaustion answers EIO or ENOSPC). Hello-style modules \
+             whose firmware cannot serve RGB and IR at once fail this way while the \
+             sibling node streams; `sudo irlume camera-tune` measures that and stores \
+             one-at-a-time capture for the camera"
+        )),
+        Some(libc::EIO) | Some(libc::ENOSPC) => Error::Hardware(format!(
+            "{device}: {e}. At stream start this signature is the USB bus, not the \
+             camera: uvcvideo answers EIO when no alt setting is fast enough for the \
+             bandwidth the device requested, and the xHCI host answers ENOSPC when its \
+             periodic-bandwidth admission refuses the reservation (a firmware refusal \
+             answers EINVAL instead). A lower resolution or frame rate, MJPEG, or a \
+             port not shared with the other camera can fit within the budget. An EIO \
+             in the first moments after resume can also be the device still waking; \
+             retry before concluding anything"
+        )),
         _ => Error::Hardware(format!("{device}: {e}")),
     }
 }
@@ -4402,16 +4425,47 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert!(e.to_string().contains("'video' group"), "{e}");
-        // Anything else: device-prefixed passthrough.
+        // Anything else: device-prefixed passthrough. EPROTO here, because
+        // EIO grew its own signature arm (#340) and no longer passes through
+        // bare.
         let e = map_io(
             "/dev/irlume-test-missing",
-            std::io::Error::from_raw_os_error(5),
+            std::io::Error::from_raw_os_error(libc::EPROTO),
         );
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "hardware: /dev/irlume-test-missing: {}",
+                std::io::Error::from_raw_os_error(libc::EPROTO)
+            ),
+        );
+    }
+
+    /// The two stream-start signatures must stop reading alike (#340): EINVAL
+    /// names the camera's own firmware as the refuser, EIO/ENOSPC name the
+    /// USB bus, and each names the other so a reader cannot mistake which
+    /// side refused.
+    #[test]
+    fn map_io_separates_firmware_refusal_from_bus_exhaustion() {
+        let einval = map_io(
+            "/dev/irlume-test-missing",
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+        )
+        .to_string();
+        assert!(einval.contains("the camera itself refusing"), "{einval}");
         assert!(
-            e.to_string()
-                .starts_with("hardware: /dev/irlume-test-missing:"),
-            "{e}"
+            einval.contains("USB bandwidth is not the limit"),
+            "{einval}"
         );
+        for errno in [libc::EIO, libc::ENOSPC] {
+            let bus = map_io(
+                "/dev/irlume-test-missing",
+                std::io::Error::from_raw_os_error(errno),
+            )
+            .to_string();
+            assert!(bus.contains("the USB bus, not the camera"), "{bus}");
+            assert!(bus.contains("EINVAL instead"), "{bus}");
+        }
     }
 
     /// Holding the node ourselves is reported as OUR defect, not as an app the

@@ -255,6 +255,13 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     eprintln!(
         "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
     );
+    // The daemon probes an unmeasured camera pair before the first scan
+    // (#340), and that probe holds the line above for up to a minute with no
+    // output; without this notice the wait reads as a hang.
+    eprintln!(
+        "[enroll] if this camera pair has no measured capture mode yet, irlume measures \
+         it first (one time, up to a minute; the IR emitter fires)"
+    );
     match daemon_request(&Request::Enroll {
         user: user.clone(),
         profile: name,

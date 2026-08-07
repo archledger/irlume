@@ -69,15 +69,27 @@ pub struct Signals {
     ///
     /// RECORDED, NEVER GATED. The framing guide accepts 0.12 to 0.55, a 4.6x
     /// span, and several cues above are absolute thresholds on quantities
-    /// that may move across it: emitter irradiance falls with distance, and
-    /// the center-to-edge contrast a near-coaxial emitter produces depends on
-    /// how large the face's own depth is relative to its distance. The
-    /// geometry of [`ir_center_edge_ratio`] is bbox-relative and so scale
-    /// invariant by construction, but neither the physics nor the pixel count
-    /// behind it is, and nobody has measured which way that cuts (#174). This
-    /// field exists so the correlation is answerable from ordinary debug
-    /// output instead of a special capture campaign.
+    /// that could move across it. Which ones do is now measured (#174 thread,
+    /// 2026-08-04, ASUS FHD IR module, one subject, 40 bona-fide
+    /// presentations through this gate at ~30 cm, normal seating, and
+    /// ~80 cm): [`ir_face_brightness`] falls 1.8x across that band, the
+    /// [`ir_center_edge_ratio`] stays inside 1.39-1.56 with overlap at every
+    /// distance, and the glint peak tracks eyewear, not seating. The field
+    /// itself is a working 1/d proxy: face_frac times tape-measured distance
+    /// came out 9.3, 9.0 and 10.7 at 20, 45 and 67.5 cm (#174 thread).
     ///
+    /// No cue is normalised by it, and the measurements are the reason, not
+    /// an omission: the module's firmware runs its own auto-exposure with no
+    /// v4l2 exposure control exposed, so raw brightness is an AE output
+    /// rather than irradiance, and dividing it by face_frac squared tracks
+    /// the AE instead of the physics (measured 87 at 67.5 cm where 1/d^2
+    /// from the 45 cm baseline predicts 43, #174 thread); for the ratio, the
+    /// available one-subject, one-module measurements do not justify a
+    /// distance term in the measured band. The field stays recorded so
+    /// padcapture corpora and the debug lines can re-answer the question on
+    /// other modules and outside 20 to 80 cm, where nothing is measured.
+    ///
+    /// [`ir_face_brightness`]: Self::ir_face_brightness
     /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
     pub face_frac: f32,
     /// Fraction (0-1) of the IR face region at or above the sensor's ceiling,
@@ -187,6 +199,17 @@ pub struct Cues {
 /// IR face region must be at least this bright (0..255). A lit live face ran ~83
 /// mean overall on the Shinetech module; the face region is brighter still. A
 /// screen reflects far less 850nm.
+///
+/// Seating distance moves this cue more than any other (#174, measured
+/// 2026-08-04, ASUS FHD IR module, 10 bona-fide presentations per condition):
+/// settled readings were 112.0-136.0 at ~30 cm, 104.8-113.5 at normal
+/// seating, and 75.1-96.2 at ~80 cm, a 1.8x fall. The weakest genuine
+/// reading still clears this floor 2.1x, so the gate holds where users
+/// actually sit, but the margin is a function of distance: re-measure the
+/// far end before raising this. If a distance-aware form of this gate is
+/// ever built, this absolute floor stays as a lower bound underneath it,
+/// because a normalisation must never admit at any distance what the floor
+/// refuses (#174).
 pub const IR_FACE_MIN_BRIGHTNESS: f32 = 35.0;
 /// Max normalized center distance between the RGB and IR face.
 pub const CROSS_SPECTRUM_TOLERANCE: f32 = 0.30;
@@ -198,6 +221,19 @@ pub const MIN_FACE_SCORE: f32 = 0.6;
 /// across poses, and that leniency is measured: a glossy IR print cleared it in
 /// 69 of 70 trials (docs/pad-results/2026-06-30-ir-liveness-selftest.md). Treat
 /// it as one weak cue, never as proof of a live face.
+///
+/// The 2026-08-04 campaign did not show a distance-separated ratio range:
+/// across a 2.7x distance change (~30 to ~80 cm), all observed genuine values
+/// remained within 1.39-1.56 and the condition ranges overlapped (#174). On
+/// one subject and one ASUS module, that supplies no evidence for adding a
+/// `face_frac` term in the measured band, but it does not establish that
+/// distance has zero effect. Re-measure across subjects and modules before
+/// generalising. Eyewear moves it more than seating did: bare-eyed 1.33-1.43
+/// against glasses-on 1.44-1.53, disjoint ranges on the same subject at the
+/// same distance. What does collapse the ratio is saturation up close, which
+/// the exposure gate (#237) refuses before this cue reads it. A retune of the
+/// 1.03 floor therefore argues against the flat-print attack range (a vinyl
+/// print read 1.12-1.17 on the same cue, #235), not against distance.
 pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
 
 /// Fraction of the IR face region at the sensor ceiling above which the frame
@@ -245,6 +281,14 @@ fn flood_reason(ambient: f32) -> String {
     )
 }
 /// Eye IR peak above this counts as a corneal glint (supporting cue).
+///
+/// Supporting-only is load-bearing, not caution (#174, measured 2026-08-04):
+/// with glasses on the peak pinned at 255 in all 30 frames, so it reads the
+/// lens specular, not the cornea (#222), and bare-eyed genuine frames read
+/// 164-247 with 6 of 10 below this value. As a hard gate it would
+/// false-reject a bare-eyed user at normal distance more often than not.
+/// The cue is an eyewear-state variable before it is anything else; it does
+/// not track seating distance.
 pub const GLINT_MIN: f32 = 180.0;
 /// Head-orientation gate (Windows-Hello-style ±15° frontality), approximated
 /// from 2D landmarks. Deliberately PERMISSIVE: rejects only clearly off-angle
@@ -1611,11 +1655,13 @@ mod tests {
         }
     }
 
-    /// `face_frac` is RECORDED with the cues and read by nothing: the whole
-    /// point of #174 is to find out whether the existing thresholds move with
-    /// seating distance BEFORE anything is normalised by it. A verdict that
-    /// changed with this field would be exactly the retune-against-
-    /// contaminated-samples the issue warns off.
+    /// The limited #174 campaign (2026-08-04) did not justify a
+    /// distance-normalised gate: observed center/edge ranges overlapped
+    /// across ~30 to ~80 cm on one subject and one module, and brightness
+    /// is an auto-exposure output no 1/d^2 model can hold against (see
+    /// `Signals::face_frac`). This test pins the current contract that
+    /// `face_frac` remains observational and cannot change a verdict until
+    /// a distance-aware rule is separately derived and reviewed.
     #[test]
     fn face_frac_changes_no_verdict() {
         let gate = LivenessGate::new();

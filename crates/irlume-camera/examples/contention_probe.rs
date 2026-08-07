@@ -15,7 +15,18 @@ fn main() {
     let mut a = std::env::args().skip(1);
     let rgb = a.next().unwrap_or_else(|| "/dev/video0".into());
     let ir = a.next().unwrap_or_else(|| "/dev/video2".into());
-    let rounds: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(3);
+    // Same rule as camera-tune's --rounds: an unparseable count is a usage
+    // error, not a silent substitution of the default (Codex round).
+    let rounds: usize = match a.next() {
+        None => 3,
+        Some(raw) => match raw.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("contention_probe: rounds must be a positive integer, got {raw:?}");
+                std::process::exit(2);
+            }
+        },
+    };
     println!("contention_probe: rgb={rgb} ir={ir} rounds={rounds}");
     match measure_contention(&rgb, &ir, rounds) {
         Ok(r) => {

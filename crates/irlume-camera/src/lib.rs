@@ -3104,10 +3104,13 @@ pub fn measure_contention_with_progress(
 
 /// The concurrent arm over HELD sessions: the shape a `concurrent` verdict
 /// licenses `capture_scans` to run (#308) — both cameras open, both streams
-/// armed for the whole loop, reads interleaved on one thread, exactly like
-/// the enrollment loop. The old arm re-opened each device per round, an
-/// order the Brio tolerates while its held shape starves RGB completely, so
-/// the stored verdict was measured on a shape the consumer never runs.
+/// held for the whole loop, and each round dequeuing IR on a scoped worker
+/// WHILE RGB captures on this thread, which is the assess path's actual
+/// concurrent schedule (Codex round: the first cut serialized the reads on
+/// one thread, a schedule the consumer never runs, the same class of
+/// mismatch this fix exists to end). The old arm re-opened each device per
+/// round, an order the Brio tolerates while its held shape starves RGB
+/// completely.
 ///
 /// Failing to OPEN or ARM the held pair is itself the measurement (the
 /// camera cannot enter the shape at all): every round is recorded as failed
@@ -3147,8 +3150,17 @@ fn held_concurrent_arm<'d>(
         for _ in 0..rounds {
             progress();
             let t0 = std::time::Instant::now();
-            let rgb = rs.burst(RGB_BURST).map(median_frame);
-            let ir = is.capture_with_stats();
+            let (rgb, ir) = std::thread::scope(|scope| {
+                let ir_thread = scope.spawn(|| is.capture_with_stats());
+                let rgb = rs.burst(RGB_BURST).map(median_frame);
+                let ir = match ir_thread.join() {
+                    Ok(result) => result,
+                    // Re-raise into the composer's catch_unwind: a panic is a
+                    // software defect, never a stored hardware verdict (#263).
+                    Err(payload) => std::panic::resume_unwind(payload),
+                };
+                (rgb, ir)
+            });
             accumulate(into, &rgb, &ir, t0.elapsed());
         }
         Ok(())

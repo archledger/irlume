@@ -1190,17 +1190,29 @@ pub(crate) fn finish_token_arm(
 
 /// Read the user's login password without echo, mirroring the arm prompt's
 /// terminal/pipe split.
-fn read_password(prompt: &str) -> Result<String, String> {
+///
+/// The secret is wrapped in `Zeroizing` at the point it is first held, the same
+/// as the TUI's `Pending::KeyringPw`, so it is wiped from the heap on drop
+/// rather than left in swappable memory for the rest of the process. Callers
+/// must keep it inside the wrapper: a `.clone()` or a `to_string()` makes a
+/// second copy that nothing wipes.
+fn read_password(prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        rpassword::prompt_password(prompt).map_err(|e| format!("could not read password: {e}"))
+        rpassword::prompt_password(prompt)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|e| format!("could not read password: {e}"))
     } else {
         use std::io::BufRead;
-        let mut line = String::new();
+        let mut line = zeroize::Zeroizing::new(String::new());
         std::io::stdin()
             .lock()
             .read_line(&mut line)
             .map_err(|e| format!("could not read password: {e}"))?;
-        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+        // Truncate in place: building the trimmed value with `to_string()` would
+        // leave the untrimmed original in a buffer nothing wipes.
+        let keep = line.trim_end_matches(['\n', '\r']).len();
+        line.truncate(keep);
+        Ok(line)
     }
 }
 
@@ -1220,20 +1232,24 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             );
             // No-echo prompt on a real terminal; fall back to a plain stdin line
             // when piped (scripts / tests), where /dev/tty isn't available.
+            // Every branch keeps the login password inside `Zeroizing` for its
+            // whole life, matching the TUI's `Pending::KeyringPw`: this is the
+            // user's real login password, and a plain `String` copy of it would
+            // sit in swappable heap until the process exits.
             let pw = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                let first = match rpassword::prompt_password("Login password: ") {
+                let first = match read_password("Login password: ") {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[keyring] could not read password: {e}");
+                        eprintln!("[keyring] {e}");
                         return std::process::ExitCode::FAILURE;
                     }
                 };
                 // Confirm to catch typos: a mistyped seal silently fails to
                 // unlock the wallet at the next face login (key mismatch).
-                let confirm = match rpassword::prompt_password("Confirm login password: ") {
+                let confirm = match read_password("Confirm login password: ") {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[keyring] could not read password: {e}");
+                        eprintln!("[keyring] {e}");
                         return std::process::ExitCode::FAILURE;
                     }
                 };
@@ -1243,13 +1259,13 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 }
                 first
             } else {
-                use std::io::BufRead;
-                let mut line = String::new();
-                if std::io::stdin().lock().read_line(&mut line).is_err() {
-                    eprintln!("[keyring] could not read password from stdin");
-                    return std::process::ExitCode::FAILURE;
+                match read_password("Login password: ") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[keyring] {e}");
+                        return std::process::ExitCode::FAILURE;
+                    }
                 }
-                line.trim_end_matches(['\n', '\r']).to_string()
             };
             if pw.is_empty() {
                 eprintln!("[keyring] empty password; aborted");
@@ -1258,7 +1274,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             let req = irlume_common::Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
-                password: irlume_common::SecretBytes::new(pw.clone().into_bytes()),
+                password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
             };
             match daemon_request(&req) {
                 Ok(irlume_common::Response::PasswordSealed) => {
@@ -1433,7 +1449,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 };
                 let token = match daemon_request(&irlume_common::Request::ReleaseTokenForDisarm {
                     user: user.clone(),
-                    password: irlume_common::SecretBytes::new(pw.clone().into_bytes()),
+                    password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
                 }) {
                     Ok(irlume_common::Response::PasswordUnsealed { secret, .. }) => secret,
                     Ok(irlume_common::Response::Error(e)) => {
@@ -4573,6 +4589,18 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_login_password_reader_hands_back_a_wiping_string() {
+        // Heap hygiene is invisible at runtime: nothing a test can observe
+        // distinguishes a wiped allocation from a freed one. The type is what
+        // carries the wipe, so the type is what gets pinned. This stops
+        // compiling if `read_password` returns to a plain `String`, which is
+        // the state the TUI's `Pending::KeyringPw` was already out of.
+        fn accepts_only_a_wiping_reader(_: fn(&str) -> Result<zeroize::Zeroizing<String>, String>) {
+        }
+        accepts_only_a_wiping_reader(read_password);
     }
 
     #[test]

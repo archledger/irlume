@@ -43,6 +43,18 @@ jobs:
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh
 
+      # The pinned MSRV toolchain (ghrunner's rustup 1.88.0), NOT the
+      # runner's rolling pacman rust: rolling clippy drifts new lints under
+      # -D warnings, and clippy 1.97's question_mark lint failed this job on
+      # code the pinned gate accepts. Same pin the GitLab lane carries. The
+      # header above says "pinned MSRV toolchain" and this makes it true.
+      - name: pin the toolchain on PATH
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: toolchain is the pin
+        run: |
+          cargo --version | grep -F '1.88.0' || { echo "::error::cargo is not the pinned 1.88.0"; exit 1; }
+
       - name: rustfmt
         run: cargo fmt --all --check
 

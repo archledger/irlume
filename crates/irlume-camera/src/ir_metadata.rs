@@ -942,10 +942,7 @@ mod tests {
     /// metadata is video11, even with a video9 sibling in the list.
     #[test]
     fn pairing_orders_numerically_on_double_digit_nodes() {
-        let candidates = vec![
-            "/dev/video9".to_string(),
-            "/dev/video11".to_string(),
-        ];
+        let candidates = vec!["/dev/video9".to_string(), "/dev/video11".to_string()];
         let offers = |_: &str| true;
         assert_eq!(
             pick_metadata_sibling("/dev/video10", candidates, offers),

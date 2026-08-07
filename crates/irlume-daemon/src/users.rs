@@ -14,6 +14,7 @@ use std::ffi::CString;
 /// Resolve a username to its uid via NSS. `None` if absent / un-encodable.
 pub fn uid_for_name(name: &str) -> Option<u32> {
     let cname = CString::new(name).ok()?;
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -38,6 +39,7 @@ pub fn uid_for_name(name: &str) -> Option<u32> {
 /// scope a non-root peer's 1:N identify to its own account. `None` if the uid
 /// has no local/NSS account.
 pub fn name_for_uid(uid: u32) -> Option<String> {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -60,6 +62,7 @@ pub fn name_for_uid(uid: u32) -> Option<String> {
 /// reentrant NSS lookups here exist to serve.
 pub fn home_for_name(name: &str) -> Option<std::path::PathBuf> {
     let cname = CString::new(name).ok()?;
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -129,6 +132,7 @@ mod tests {
         assert_eq!(uid_for_name("root"), Some(0));
         assert_eq!(name_for_uid(0).as_deref(), Some("root"));
         // The uid running this test resolves to a name that resolves back.
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = unsafe { libc::geteuid() };
         let name = name_for_uid(me).expect("test uid must have an account");
         assert!(!name.is_empty());

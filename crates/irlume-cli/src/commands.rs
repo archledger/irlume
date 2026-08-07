@@ -359,6 +359,7 @@ fn gz_lists_irlume(gz: &[u8]) -> Option<bool> {
 /// through interactive sudo so dnf/apt keep their own transaction prompt (the
 /// user still confirms the actual change). Stops at the first failure.
 fn run_pkg_steps(steps: &[&[&str]]) -> ExitCode {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let root = unsafe { libc::geteuid() } == 0;
     for step in steps {
         let display = step.join(" ");

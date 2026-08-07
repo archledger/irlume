@@ -70,6 +70,7 @@ pub fn has_recovery(user: &str) -> bool {
 
 /// The template key for `user`, generating and TPM-sealing a fresh one if none
 /// exists. Used on the write path ([`crate::storage::save`]).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn ensure_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     if has_key(user) {
         return load_key(user);
@@ -81,6 +82,7 @@ pub fn ensure_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 
 /// Unseal the existing template key for `user`. Errors if none is sealed (the
 /// caller must NOT generate one here; that would orphan already-encrypted data).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
     if !path.exists() {
@@ -111,6 +113,7 @@ pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 
 /// (Re-)seal `key` for `user` against the current TPM PCR policy and persist it.
 /// Used at first enrollment and by recovery-restore to re-bind after a PCR move.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn reseal_key(user: &str, key: &[u8]) -> Result<()> {
     if key.len() != crypto::KEY_LEN {
         return Err(Error::Policy(format!(
@@ -128,6 +131,7 @@ pub fn reseal_key(user: &str, key: &[u8]) -> Result<()> {
 
 /// Erase `user`'s sealed template key (e.g. when their enrollment is deleted).
 /// Idempotent. Does NOT touch the recovery envelope.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn forget_key(user: &str) -> Result<()> {
     let path = key_path(user);
     if path.exists() {
@@ -140,6 +144,7 @@ pub fn forget_key(user: &str) -> Result<()> {
 
 /// Create (or replace) `user`'s recovery envelope: wrap the live template key
 /// under `passphrase`. Requires a sealed template key to already exist.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     let key = load_key(user)?;
     let env = crate::recovery::wrap(passphrase, &key)?;
@@ -149,6 +154,7 @@ pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
 /// Restore `user`'s template key from the recovery envelope using `passphrase`,
 /// and re-seal it against the *current* TPM PCRs (healing a PCR move / TPM
 /// clear / disk move). Errors on a wrong passphrase or a missing envelope.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     let path = recovery_path(user);
     if !path.exists() {
@@ -162,6 +168,7 @@ pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
 }
 
 /// Erase `user`'s recovery envelope. Idempotent.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn forget_recovery(user: &str) -> Result<()> {
     let path = recovery_path(user);
     if path.exists() {

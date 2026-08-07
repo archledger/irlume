@@ -1081,6 +1081,7 @@ fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     if out.is_null() {
         return None; // unsupported hash format on this libcrypt
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let computed = unsafe { std::ffi::CStr::from_ptr(out) };
     Some(computed.to_bytes() == stored.as_bytes())
 }
@@ -3887,6 +3888,7 @@ mod tests {
         assert_eq!(identify_scope(&peer(0)), IdentifyScope::Full);
         // The uid running this test resolves to a real account; its scope must
         // be exactly that username, never Full.
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = unsafe { libc::geteuid() };
         if me != 0 {
             let name = users::name_for_uid(me).expect("test uid has an account");
@@ -4631,7 +4633,11 @@ mod tests {
     fn peer_cred_reports_our_own_identity_on_a_socketpair() {
         let (a, _b) = UnixStream::pair().unwrap();
         let peer = peer_cred(&a).unwrap();
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         assert_eq!(peer.uid, unsafe { libc::geteuid() });
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         assert_eq!(peer.gid, unsafe { libc::getegid() });
         assert_eq!(peer.pid, std::process::id() as i32);
     }
@@ -4724,6 +4730,7 @@ mod tests {
     #[test]
     fn an_unpublished_listing_reaches_the_worker_instead_of_erroring() {
         let _summary_guard = enrollment_summary_test_lock();
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         invalidate_enrollment_summary(&me);
 
@@ -4860,6 +4867,8 @@ mod tests {
                 // Own-uid query: authorized, answered from files, no engine.
                 format!(
                     "{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n",
+                    // SAFETY: getuid takes no arguments, reads only this process's own real
+                    // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
                 ),
                 Box::new(|r: &Response| matches!(r, Response::HasPassword(_))),
@@ -4926,8 +4935,10 @@ mod tests {
     #[test]
     fn a_listing_serves_the_published_summary_and_misses_queue_to_the_worker() {
         let _summary_guard = enrollment_summary_test_lock();
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         let peer = Peer {
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             uid: unsafe { libc::getuid() },
             gid: 0,
             pid: 1,

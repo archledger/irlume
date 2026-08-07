@@ -1157,6 +1157,11 @@ pub fn face_speeds(samples: &[EarSample]) -> (Vec<f32>, f32, f32) {
 /// bright when open and collapses under the lid on a blink, so open ≫ dip; a
 /// diffuse print has no glint to lose, so open ≈ dip. Returns (open, dip);
 /// both 0 if no usable face frames. Diagnostic for calibrating the second cue.
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "cannot panic: `faces` is filtered on `ear.is_some_and(..)`, so every \
+              `ear.unwrap()` below is on a value already proven to be Some"
+)]
 pub fn contrast_signature(samples: &[EarSample]) -> (f32, f32) {
     let faces: Vec<&EarSample> = samples
         .iter()

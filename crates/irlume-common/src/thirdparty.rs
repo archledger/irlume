@@ -71,6 +71,7 @@ pub enum RecognizerRefusal {
 /// this with [`by_name`], the pin check, and the file read. The stage-open
 /// check is here rather than trusted to the installer because the settings key
 /// is root-editable text the installer never saw.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn recognizer_override(
     entry: Option<&ThirdPartyModel>,
 ) -> Result<&ThirdPartyModel, RecognizerRefusal> {
@@ -79,6 +80,7 @@ pub fn recognizer_override(
 
 /// [`recognizer_override`] for the detection stage: may this entry be wired
 /// as the RESCUE detector?
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn detector_override(
     entry: Option<&ThirdPartyModel>,
 ) -> Result<&ThirdPartyModel, RecognizerRefusal> {

@@ -397,6 +397,7 @@ pub fn stronger_tier_available_than(current: &PolicyKind) -> bool {
 /// reseal self-heals), so a reseal re-runs the ladder: it can move an envelope
 /// up a tier when one became available, and only lands on a lower tier when
 /// the higher one genuinely does not unseal on this machine.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
     if crate::pcrsig::signed_policy_available() {
         match seal_authorized(secret) {
@@ -447,6 +448,7 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
 
 /// Seal `secret` under a literal `PolicyPCR` over `pcrs` (empty ⇒ no binding:
 /// any boot state can unseal; use only for testing).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     let pcrs = pcrs.to_vec();
     let mut ctx = open_context()?;
@@ -549,6 +551,7 @@ pub fn is_pcr_changed_race(e: &Error) -> bool {
 /// not re-issuing the failed command. This is the same gap systemd closed in
 /// systemd/systemd#35657, where unsealing already retried but the `PolicyPCR`
 /// leg did not.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     let out = retry_on_pcr_race(
         PCR_CHANGED_RETRIES,
@@ -1316,6 +1319,7 @@ fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u
 
 /// Public entry point used by the CLI / daemon to arm a pcrlock-bound seal once
 /// a pcrlock policy has been provisioned at `nv_index`.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_with_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
     seal_pcrlock(secret, nv_index)
 }
@@ -1362,6 +1366,7 @@ pub fn is_pcr_mismatch(e: &Error) -> bool {
 
 /// Compare current PCR values against those stored in the envelope. Returns the
 /// PCRs whose SHA-256 differs (empty ⇒ no drift, or no values captured at seal).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
     if env.pcr_values.is_empty() {
         return Ok(Vec::new());

@@ -464,6 +464,7 @@ impl IlluminationLog {
         let node = metadata_node_for(ir_device)?;
         // SAFETY: a NUL-terminated path built directly below.
         let path = std::ffi::CString::new(node.as_bytes()).ok()?;
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
             irlume_common::dlog!(

@@ -539,12 +539,14 @@ mod onnx {
     }
 
     impl Embedder {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
             })
         }
 
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
@@ -555,6 +557,7 @@ mod onnx {
         /// Preprocessing MUST match AuraFace/InsightFace exactly or genuine pairs
         /// collapse (the "identical images score 0.6" trap): channel order per
         /// [`align::INPUT_IS_RGB`], (px-127.5)/128.0, NCHW; output L2-normalized.
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
             Ok(self.embed_with_norm(chip_rgb)?.0)
         }
@@ -564,6 +567,7 @@ mod onnx {
         /// at thr 0.50; FRR@0.55 13.6%→9.5%) with FAR unchanged (≤1e-4). RGB PATH
         /// ONLY: on NIR it over-smooths the low-texture embedding (no EER gain,
         /// slightly worse at low FAR), so the IR path keeps plain `embed`.
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
             let a = self.embed(chip_rgb)?;
             let b = self.embed(&crate::align::flip_h(chip_rgb))?;
@@ -581,6 +585,7 @@ mod onnx {
         /// embedding is still L2-normalized; the norm is the quality signal for
         /// fusion weighting / low-quality gating. (AuraFace is ArcFace-trained, not
         /// AdaFace, so the norm↔quality correlation must be validated empirically.)
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed_with_norm(
             &mut self,
             chip_rgb: &[u8],
@@ -614,18 +619,21 @@ mod onnx {
     }
 
     impl Adapter {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
             })
         }
 
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
         }
 
         /// Adapt one IR embedding -> adapted vector (already L2-normalized).
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn apply(&mut self, emb: &[f32]) -> irlume_common::Result<Vec<f32>> {
             let tensor =
                 Tensor::from_array(([1i64, emb.len() as i64], emb.to_vec())).map_err(err)?;
@@ -690,6 +698,7 @@ mod onnx {
     pub const MESH_N_IRIS: usize = 478;
 
     impl FaceMesh {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             // TFLite flatbuffers carry the "TFL3" identifier at offset 4;
             // everything else goes to the ONNX loader, whose own parser
@@ -729,6 +738,7 @@ mod onnx {
                 input,
             })
         }
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
@@ -750,6 +760,7 @@ mod onnx {
         /// alignment refine through `.ok()`. A new caller that `?`s this
         /// error re-creates the #293 defect (one refused frame costing the
         /// whole consent watch).
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn landmarks(
             &mut self,
             frame: &align::RgbView,
@@ -815,6 +826,7 @@ mod onnx {
     /// cannot be skipped without losing the coordinates themselves (the
     /// pattern where a validation bolted on beside the data path quietly
     /// stops being called).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn map_checked_mesh_output(
         raw: &[f32],
         input: f32,
@@ -866,6 +878,7 @@ mod onnx {
     /// smear; every one came back `Ok`. Each is a broken or hostile DETECTOR,
     /// the stage #276 wants to open to third-party models, and the mesh
     /// output built on one feeds the liveness cues as confident numbers.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn mesh_box_valid(bbox: &[f32; 4], frame_w: u32, frame_h: u32) -> Result<(), String> {
         if !bbox.iter().all(|v| v.is_finite()) {
             return Err("non-finite coordinates".into());
@@ -901,6 +914,7 @@ mod onnx {
     /// mostly lives elsewhere. Non-finite output is a broken op in a
     /// converted model, and a collapsed extent is a stuck output head; both
     /// were observed as `Ok` before this gate (see the probe example).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn mesh_output_plausible(
         lm: &[(f32, f32)],
         x0: f32,
@@ -973,11 +987,13 @@ mod onnx {
     }
 
     impl Detector {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
             })
         }
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
@@ -986,6 +1002,7 @@ mod onnx {
         /// Detect faces in an RGB frame. Letterboxes to YuNet's square input,
         /// runs the net, groups outputs by tensor shape (cls/obj=1ch, bbox=4ch,
         /// kps=10ch) per stride, decodes, NMS, and maps coords back to the frame.
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn detect(&mut self, frame: &align::RgbView) -> irlume_common::Result<Vec<Detection>> {
             use crate::detect::{
                 decode_stride, letterbox_scale, nms, unletterbox, INPUT_SIZE, NMS_IOU,
@@ -1092,12 +1109,14 @@ mod onnx {
     }
 
     impl BlazeRescue {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
                 anchors: blaze_anchors(),
             })
         }
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
@@ -1106,6 +1125,7 @@ mod onnx {
         /// Top-scoring face, or `None` below threshold. Returns the bbox in
         /// frame pixels (x1,y1,x2,y2) and the score. No keypoints: they are
         /// too coarse for alignment; refine with [`FaceMesh::landmarks`].
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn detect_top(
             &mut self,
             frame: &align::RgbView,
@@ -1116,6 +1136,7 @@ mod onnx {
         /// Same decode at an explicit floor, for measurement harnesses that
         /// need sub-threshold scores (the `FullRangeBlaze::detect_top_at`
         /// pattern). Production callers use [`Self::detect_top`].
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn detect_top_at(
             &mut self,
             frame: &align::RgbView,
@@ -1260,17 +1281,20 @@ mod onnx {
     }
 
     impl PadIr {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
             })
         }
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             Self::load_from_memory(&bytes)
         }
 
         /// P(fake) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn p_fake(
             &mut self,
             frame: &align::RgbView,
@@ -1571,6 +1595,7 @@ mod onnx {
                 GetApi: get_api,
                 GetVersionString: get_version,
             };
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             let err = unsafe { inspect_api_base(&base) }.unwrap_err();
             assert_eq!(
                 err,
@@ -1581,6 +1606,7 @@ mod onnx {
 
         #[test]
         fn a_null_api_base_is_refused() {
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             let err = unsafe { inspect_api_base(std::ptr::null()) }.unwrap_err();
             assert!(
                 err.contains("OrtGetApiBase returned null"),

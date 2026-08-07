@@ -549,6 +549,7 @@ pub fn verify_once(user: &str) -> VerifyOutcome {
 /// for chip/host template desync, where the sensor's on-chip storage holds
 /// prints the host database no longer matches (dual-boot Windows enrollment,
 /// OS reinstall, BIOS "clear fingerprints"; libfprint#301, fprintd#126).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn delete_all(user: &str) -> Result<(), String> {
     let Some(del) = tool("fprintd-delete") else {
         return Err("fprintd-delete not installed".into());

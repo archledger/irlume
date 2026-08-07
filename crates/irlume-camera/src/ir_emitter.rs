@@ -220,6 +220,7 @@ fn load_conf(id: &crate::uvc_descriptor::CameraIdentity) -> Option<(u8, u8)> {
 /// Versions before 0.7.1 stored the payload too, and a second "brightness boost"
 /// line found by writing 0xFF across a control of unknown meaning. Neither is
 /// written or read any more.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn save_conf(
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
@@ -1498,6 +1499,7 @@ impl StreamMode {
     /// replacement; `Drop` remains the ordinary end-of-session path, and can
     /// only print. `Err(Bookkeeping)` means no camera request was made at
     /// all — the mode is still applied, on purpose.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
         if !self.armed {
             return Ok(());
@@ -1902,6 +1904,7 @@ fn override_key(
 ) -> std::io::Result<OverrideKey> {
     // SAFETY: fstat writes into `st` and borrows `fd` for the call only.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -3233,6 +3236,7 @@ impl RecoveryOutcome {
 /// Preference order is IR Torch first (its whole purpose is the lamp), then Face
 /// Authentication (which drives the illuminator as a side effect of putting a
 /// streaming interface into face-auth mode).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
@@ -3356,12 +3360,14 @@ impl Discovered {
     ///
     /// Call BEFORE writing the configuration. Failing here drops `self`, which
     /// puts the control back, and nothing durable has been published about it.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn confirm_applied(&mut self) -> std::result::Result<(), String> {
         self.pending.confirm_applied()
     }
 
     /// Release the undo record. Call only once the configuration naming this
     /// control is durable.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn committed(mut self) -> std::result::Result<(), String> {
         self.pending.commit()
     }
@@ -3380,6 +3386,7 @@ impl Discovered {
     /// last, because until the configuration is durable the camera is changed
     /// with nothing saying which control did it, and dropping `self` unresolved
     /// puts it back.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn finish(
         mut self,
         id: &crate::uvc_descriptor::CameraIdentity,
@@ -3906,6 +3913,7 @@ pub(crate) fn ir_torch_default_is_usable(
 /// This is what `ir-setup --dry-run` reports. It sends nothing to the device at
 /// all: the previous version issued `GET_LEN` to all 512 unit and selector
 /// combinations, which is traffic to controls the camera never claimed to have.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
     let (desc, interface) = crate::uvc_descriptor::usb_context(device)?;
     Ok(
@@ -5133,7 +5141,10 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        unsafe { libc::umask(previous) };
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        unsafe {
+            libc::umask(previous)
+        };
         assert_eq!(
             masked_mode, 0o640,
             "a requested 0644 under UMask=0027 is 0640, which is what the shipped \
@@ -6405,6 +6416,7 @@ mod tests {
         // Staged via an UNREADABLE record file (EACCES), which is machine
         // trouble rather than a protected record. Meaningless as root, where
         // mode 000 still reads.
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("skipped: running as root, mode 000 does not refuse reads");
             return;

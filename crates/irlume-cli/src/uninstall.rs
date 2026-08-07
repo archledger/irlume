@@ -607,7 +607,10 @@ fn yn(b: bool) -> &'static str {
 }
 
 fn stdin_is_tty() -> bool {
-    unsafe { libc::isatty(0) == 1 }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    unsafe {
+        libc::isatty(0) == 1
+    }
 }
 
 #[cfg(test)]

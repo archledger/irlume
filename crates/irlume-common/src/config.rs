@@ -40,6 +40,7 @@ pub struct ConfigLock {
 /// between. The lock is a sidecar `<file>.lock` under the config root, taken
 /// with flock, so plain readers are never blocked and see whole files either
 /// way; only check-then-write callers need to take it.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn lock_exclusive(file: &str) -> std::io::Result<ConfigLock> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -121,6 +122,9 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
         // for root and for non-permission errors; stay quiet for the expected
         // EACCES an ordinary user gets.
         KvObservation::Unknown(e) => {
+            // SAFETY: `geteuid` takes no arguments, reads only the calling
+            // process's own credentials, and is specified as always succeeding,
+            // so it has no preconditions for the caller to uphold.
             let unprivileged_eacces =
                 e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0;
             if !unprivileged_eacces {
@@ -138,6 +142,7 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
 
 /// Insert or update `key=value`, preserving every other line (including
 /// comments) and dropping duplicate keys. Creates the file at 0600 if absent.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     let path = config_path(file);
     if let Some(dir) = path.parent() {
@@ -465,6 +470,7 @@ mod tests {
 
         // 0600-root-style file we cannot read: the expected unprivileged EACCES
         // is the quiet branch. Only meaningful when not running as root.
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         if unsafe { libc::geteuid() } != 0 {
             use std::os::unix::fs::PermissionsExt;
             let p = config_path("locked.conf");

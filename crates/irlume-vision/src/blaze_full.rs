@@ -107,6 +107,7 @@ impl FullRangeBlaze {
     /// Load from model bytes; the pin is enforced by the session
     /// constructor, and the tensor contract is verified here so a wrong
     /// (but correctly pinned) artifact fails at load, not at decode.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn from_pinned_bytes(bytes: &[u8]) -> irlume_common::Result<Self> {
         let session = TfliteSession::from_pinned_bytes(bytes, FULL_RANGE_BLAZE_SHA256, 2)?;
         let shape = session.input_shape()?;
@@ -126,6 +127,7 @@ impl FullRangeBlaze {
     /// Preprocessing matches the short-range rescue: square zero-pad
     /// letterbox to the larger frame side, center-of-pixel bilinear
     /// sampling, `[-1,1]` normalization.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn detect_top(
         &mut self,
         frame: &align::RgbView,
@@ -137,6 +139,7 @@ impl FullRangeBlaze {
     /// setting an operating threshold needs the sub-floor score
     /// distribution (what an empty room scores), which the default floor
     /// hides by design.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn detect_top_at(
         &mut self,
         frame: &align::RgbView,

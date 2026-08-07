@@ -635,6 +635,7 @@ impl Unreadable {
 /// keeping a failure to read the node apart from a node that read as neither
 /// kind. Defensive: enumerate FORMATS (safe), never `query_controls` (panics on
 /// some UVC drivers; a hard-won linhello lesson).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
     let unreadable = |at, e: std::io::Error| Unreadable {
         path: device.to_string(),
@@ -661,6 +662,7 @@ pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
 /// index 0 directly is the only way to tell those apart with this crate
 /// version, and telling them apart is the whole of #227.
 fn capture_formats_answered(dev: &Device) -> std::io::Result<()> {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut desc: v4l::v4l_sys::v4l2_fmtdesc = unsafe { std::mem::zeroed() };
     desc.index = 0;
     desc.type_ = v4l::buffer::Type::VideoCapture as u32;
@@ -913,6 +915,7 @@ fn backend_from_caps(driver: String, bus: &str) -> (String, bool) {
 /// exactly this by shell script; `doctor` now reads it itself. A failure is an
 /// `Err` the caller must render, never silence: an unobserved backend on a
 /// diagnostic surface has to say "unknown" (#195 review).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn node_backend(device: &str) -> std::io::Result<(String, bool)> {
     let dev = Device::with_path(device)?;
     let caps = dev.query_caps()?;
@@ -955,6 +958,7 @@ fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathB
 /// attribute must read `fixed` (rejects a hot-plugged external camera;
 /// supplementary, and intentionally *off* by default so external Hello cameras
 /// work; `removable` is also frequently `unknown` even for legitimate devices).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     // Distinguish "no camera at all" from "a node that isn't physical"; the
     // anti-injection message only makes sense when something answered to the path.
@@ -1305,6 +1309,7 @@ pub struct RgbCamera {
 impl RgbCamera {
     /// Verify, open and negotiate. Does not start streaming: no buffers are
     /// allocated and the capture LED stays off until a session is opened.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
         verify_pinned(device)?;
         if privacy_engaged(device) {
@@ -1340,6 +1345,7 @@ impl RgbCamera {
     /// Start streaming. The returned session holds the buffers and the running
     /// stream until it is dropped, so keep it exactly as long as the burst of
     /// captures that needs it and no longer.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn session(&self) -> irlume_common::Result<RgbSession<'_>> {
         self.session_with_progress(&no_progress())
     }
@@ -1348,6 +1354,7 @@ impl RgbCamera {
     /// through `progress` (#336). The session KEEPS the reporter: its warm-up
     /// runs lazily on the first capture and again after [`RgbSession::recover`],
     /// both long after this call returned.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn session_with_progress(
         &self,
         progress: &Progress,
@@ -1463,6 +1470,7 @@ fn fps_from_params(p: v4l::video::capture::Parameters) -> Option<f64> {
 /// `set_format`, so this is the same raw-ioctl shape as the VIDIOC_ENUM_FMT
 /// probe above.
 fn try_format(dev: &Device, fmt: &Format) -> std::io::Result<Format> {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut wire: v4l::v4l_sys::v4l2_format = unsafe { std::mem::zeroed() };
     wire.type_ = v4l::buffer::Type::VideoCapture as u32;
     wire.fmt.pix = (*fmt).into();
@@ -1479,6 +1487,7 @@ fn try_format(dev: &Device, fmt: &Format) -> std::io::Result<Format> {
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     Ok(Format::from(unsafe { wire.fmt.pix }))
 }
 
@@ -1489,6 +1498,7 @@ fn try_format(dev: &Device, fmt: &Format) -> std::io::Result<Format> {
 /// no streaming, LED off. The candidate selection is shared with the real
 /// open paths rather than reimplemented, so this report cannot drift from
 /// what capture actually asks for (#223).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn negotiated_stream(device: &str, role: Role) -> irlume_common::Result<StreamSpec> {
     verify_pinned(device)?;
     if privacy_engaged(device) {
@@ -1571,6 +1581,7 @@ impl<'a> RgbSession<'a> {
     /// this session already holds, so nothing new opens and nothing collides.
     /// Same drop-then-reopen shape as the frozen-stream restart in the IR
     /// one-shot path.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.stream = None; // drop first: STREAMOFF + buffer release
         self.stream = Some(SafeStream::open(&self.cam.device, &self.cam.dev)?);
@@ -1598,6 +1609,7 @@ impl<'a> RgbSession<'a> {
     }
 
     /// Capture `n` (≥1) frames. All share the same dimensions.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn burst(&mut self, n: usize) -> irlume_common::Result<Vec<Frame>> {
         self.warm_up()?;
         let (w, h) = (self.cam.width, self.cam.height);
@@ -1623,6 +1635,7 @@ impl<'a> RgbSession<'a> {
     }
 
     /// One frame (framing guide, liveness probe).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn frame(&mut self) -> irlume_common::Result<Frame> {
         self.burst(1)?
             .pop()
@@ -1631,6 +1644,7 @@ impl<'a> RgbSession<'a> {
 
     /// The recognition path's denoised frame: a per-pixel temporal median over
     /// the burst, so one blurry or over-exposed frame cannot decide a match.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn denoised(&mut self) -> irlume_common::Result<Frame> {
         Ok(median_frame(self.burst(RGB_BURST)?))
     }
@@ -1640,6 +1654,7 @@ impl<'a> RgbSession<'a> {
 /// single streaming session (YUYV → RGB8). All frames share the same dimensions.
 /// One-shot: opens and tears down a session. Callers that capture more than once
 /// should hold an [`RgbCamera`] and its session instead.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
     capture_rgb_burst_with_progress(device, n, &no_progress())
 }
@@ -1648,6 +1663,7 @@ pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Fr
 /// through `progress` (#336). The daemon-facing paths pass a real reporter so
 /// a frameless camera heartbeats through its retry budget instead of looking
 /// wedged to the watchdog.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_rgb_burst_with_progress(
     device: &str,
     n: usize,
@@ -1973,6 +1989,7 @@ impl IrDecoder {
 }
 
 /// Capture one AE-warmed RGB frame (fast path: framing guide, liveness probe).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
     let mut frames = capture_rgb_burst(device, 1)?;
     frames
@@ -1985,12 +2002,14 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
 /// transiently corrupt frame is rejected by the median, so it can't drop a
 /// genuine match below threshold (false reject). Used for auth/enroll; the
 /// framing guide stays single-shot for latency.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<Frame> {
     capture_rgb_denoised_with_progress(device, &no_progress())
 }
 
 /// [`capture_rgb_denoised`] with the per-window progress reporting of
 /// [`capture_rgb_burst_with_progress`] (#336).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_rgb_denoised_with_progress(
     device: &str,
     progress: &Progress,
@@ -2077,6 +2096,7 @@ pub const SUBTRACT_MIN_RESULT: f64 = 12.0;
 /// it often fires when the stream opens, otherwise `ir_emitter::enable` sends
 /// the UVC-XU write on the open fd (its `known_control` table holds the
 /// per-camera unit/selector/payload).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
     Ok(capture_ir_with_stats(device)?.0)
 }
@@ -2084,12 +2104,14 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
 /// [`capture_ir`] plus the burst statistics the plain call discards. The
 /// darkest burst frame's mean is a free per-capture ambient-IR reading (the
 /// input the ambient-relative gates key on), only available at capture time.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCaptureStats)> {
     capture_ir_with_stats_and_progress(device, &no_progress())
 }
 
 /// [`capture_ir_with_stats`], reporting each completed silent warm-up window
 /// through `progress` (#336); see [`capture_rgb_burst_with_progress`].
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir_with_stats_and_progress(
     device: &str,
     progress: &Progress,
@@ -2120,6 +2142,7 @@ pub struct IrCamera {
 }
 
 impl IrCamera {
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
         verify_pinned(device)?;
         if privacy_engaged(device) {
@@ -2166,6 +2189,7 @@ impl IrCamera {
     /// frames rather than leaving brightness to guess. The residual risk is a
     /// module nobody here has seen going dark for a window, which costs the user
     /// a password fallback rather than the hardware.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
         self.session_with_progress(&no_progress())
     }
@@ -2173,6 +2197,7 @@ impl IrCamera {
     /// [`Self::session`], reporting each completed silent warm-up window
     /// through `progress` (#336). Used transiently: the IR warm-up runs right
     /// here, and nothing in [`IrSession`] warms up again.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn session_with_progress(
         &self,
         progress: &Progress,
@@ -2255,6 +2280,7 @@ impl IrSession<'_> {
     /// known it is the brightest one clipping at most 5% of its pixels, since
     /// a blown frame both flattens the liveness cues and blinds the PAD model
     /// (#221).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
@@ -2645,6 +2671,7 @@ pub mod ir_probe {
 
     /// [`capture_raw_burst_timed`] without the timing column, for callers that
     /// only need the frames.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_raw_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
         Ok(capture_raw_burst_timed(device, n)?
             .into_iter()
@@ -2658,6 +2685,7 @@ pub mod ir_probe {
     /// strobe cadence; the driver's nominal fps is not the delivered fps under
     /// USB contention). Used to inspect the strobe pattern, prototype
     /// subtraction, and audit capture timing offline.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_raw_burst_timed(
         device: &str,
         n: usize,
@@ -2758,6 +2786,7 @@ pub struct IrStreamFrame {
 /// Usable = the same set [`capture_ir_sequence`] historically kept: emitter-off
 /// (dark) frames ARE delivered, because a consumer classifying the strobe needs
 /// them; only frozen and blown frames are dropped.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir_streaming<B>(
     device: &str,
     max_frames: usize,
@@ -2891,6 +2920,13 @@ pub fn capture_ir_streaming<B>(
 /// This keeps its own burst/de-strobe loop rather than delegating to
 /// [`capture_ir_streaming`], which delivers raw single frames; the blink watch
 /// uses the streaming core, this stays for the `burst>=2` diagnostic path.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "cannot panic: `stream` is Some from its initialisation, and the one \
+              `take()` on the frozen-restart path reopens it in the same branch; \
+              both failure paths in between return early with `?`"
+)]
 pub fn capture_ir_sequence(
     device: &str,
     samples: usize,
@@ -3200,6 +3236,7 @@ fn retained(concurrent: f32, sequential: f32) -> f32 {
 /// Failed captures are skipped rather than aborting the probe: a camera that
 /// errors under load is exactly what we are trying to characterize, and the
 /// round counts in the report say how much evidence each arm really has.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn measure_contention(
     rgb_dev: &str,
     ir_dev: &str,
@@ -3220,6 +3257,7 @@ pub fn measure_contention(
 /// detection honest while removing the false kill. The same reporter is handed
 /// into every capture and session open, so the per-window warm-up heartbeat
 /// (#336) covers the probe's captures too.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn measure_contention_with_progress(
     rgb_dev: &str,
     ir_dev: &str,
@@ -3485,6 +3523,7 @@ fn resolve_stored_pair_mode(
 /// Persist the capture mode for the RGB+IR pairing behind these two devices.
 /// Writes `/etc/irlume/cameras.conf`, so it needs root. Overwrites; the
 /// check-before-write callers use [`store_capture_mode_if_absent`].
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn store_capture_mode(
     rgb_dev: &str,
     ir_dev: &str,
@@ -3520,6 +3559,7 @@ pub enum StoreIfAbsent {
 /// configuration manager editing the file in that window. Checking again
 /// under the lock means an automatic probe can only ever FILL an empty
 /// verdict; a verdict that appeared mid-probe wins and is returned.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn store_capture_mode_if_absent(
     rgb_dev: &str,
     ir_dev: &str,
@@ -3547,6 +3587,7 @@ pub fn store_capture_mode_if_absent(
 ///
 /// A control is only written when its current value could be read back first, so
 /// anything changed can be undone.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
     // Open only long enough to read the standard V4L2 privacy control, and
@@ -3658,6 +3699,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
 /// Read entirely from the USB descriptors, so it sends the camera nothing at
 /// all. The previous version issued `GET_LEN` to all 512 unit and selector
 /// combinations, which is traffic to controls the camera never claimed to have.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<String>> {
     verify_pinned(device)?;
     ir_emitter::describe_units(device).map_err(|e| map_io(device, e))
@@ -3677,6 +3719,7 @@ pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<String>> {
 /// means the room is dark, or nobody is in front of the camera, or the emitter
 /// needs a control this machine does not know. None of those justify writing
 /// guessed values to camera firmware.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn apply_known_ir_emitter(device: &str) -> irlume_common::Result<bool> {
     let mean_of =
         |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;

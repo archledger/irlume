@@ -961,6 +961,7 @@ mod tests {
             // The sleep is for DETERMINISM, not correctness: without it the
             // parent usually still wins the race, so its absence does not
             // falsify the assertion below.
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             unsafe {
                 libc::sleep(1);
                 libc::_exit(0);

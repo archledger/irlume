@@ -35,6 +35,7 @@ pub fn envelope_path(user: &str) -> PathBuf {
 
 /// Seal `password` for `user` so a later face login can release it. Overwrites
 /// any existing sealed password (re-arming, e.g. after a password change).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
     seal_secret(user, password, SecretKind::LoginPassword)
 }
@@ -43,6 +44,7 @@ pub fn seal_password(user: &str, password: &[u8]) -> Result<()> {
 ///
 /// The kind is stamped here rather than in [`tpm::seal`], which wraps bytes and
 /// has no business knowing what they mean.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_secret(user: &str, secret: &[u8], kind: SecretKind) -> Result<()> {
     if kind == SecretKind::GnomeKeyringToken {
         // Tokens are armed through [`arm_gnome_token`], which mints the bytes
@@ -110,6 +112,7 @@ fn mint_gnome_token() -> Zeroizing<String> {
 /// keyring still keyed to the password (the envelope's token merely goes
 /// unused until a re-arm); the other order would re-key the keyring to a token
 /// that no longer exists anywhere, which is unrecoverable.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>> {
     if password.is_empty() {
         return Err(Error::Protocol(
@@ -133,6 +136,7 @@ pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>>
 /// is recovered (TPM seal first, password wrap second, so this also works
 /// after PCR drift), the envelope is rebuilt against today's policy and
 /// re-wrapped under the possibly-new password, and the SAME token is returned.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let path = envelope_path(user);
     let env = SealedEnvelope::load(&path)?;
@@ -176,6 +180,7 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
 /// key that does not open it. That is not a regression we introduce; it is
 /// exactly what `pam_kwallet5` does with the new password, and the user fixes
 /// it the same way, by changing the wallet password.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn derive_secret(
     kind: SecretKind,
     password: &[u8],
@@ -219,6 +224,7 @@ pub fn sealed_kind(user: &str) -> Option<SecretKind> {
 /// and the difference between "no token here" and "could not tell" is the
 /// difference between a safe teardown and erasing the only copy of the secret
 /// a login keyring is encrypted under.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn list_sealed_kinds() -> Result<Vec<(String, SecretKind)>> {
     let dir = keyring_dir();
     let entries = match std::fs::read_dir(&dir) {
@@ -268,6 +274,7 @@ pub struct Unsealed {
 /// Fails if none is armed or if the bound PCR policy is no longer satisfied
 /// (e.g. Secure Boot config changed); the caller then falls back to the typed
 /// password and the wallet stays locked until the user re-arms.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal_secret(user: &str) -> Result<Unsealed> {
     let path = envelope_path(user);
     if !path.exists() {
@@ -287,6 +294,7 @@ pub fn unseal_secret(user: &str) -> Result<Unsealed> {
 ///
 /// Only for callers that genuinely do not route on the kind. Anything that
 /// delivers the secret somewhere must use [`unseal_secret`].
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal_password(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     unseal_secret(user).map(|u| u.secret)
 }
@@ -331,6 +339,7 @@ pub enum Reseal {
 /// The "unseal fails" branch is what fixes a dbx/Secure-Boot update: the old
 /// envelope's PCR7 policy no longer satisfies, so we rebind to today's PCRs
 /// using the password the user just proved (via a successful login) they know.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn reseal_password(
     user: &str,
     password: &[u8],
@@ -475,6 +484,7 @@ fn reseal_token(user: &str, password: &[u8], env: SealedEnvelope) -> Result<Rese
 /// works with the TPM seal broken, which is exactly when a disarm matters
 /// most. Fails closed: a wrong password, a stale wrap (password changed with
 /// no login since), and a non-token envelope are all refusals, each named.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn release_token_with_password(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let path = envelope_path(user);
     if !path.exists() {
@@ -507,6 +517,7 @@ pub fn has_sealed_password(user: &str) -> bool {
 }
 
 /// Erase `user`'s sealed password (disarms keyring unlock). Idempotent.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn forget_password(user: &str) -> Result<()> {
     let path = envelope_path(user);
     if path.exists() {

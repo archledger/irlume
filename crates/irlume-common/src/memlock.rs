@@ -19,6 +19,7 @@ pub fn lock_slice(buf: &[u8]) {
     // `madvise(MADV_DONTDUMP)` returns EINVAL unless the address is page-aligned,
     // so a raw Vec pointer silently failed DONTDUMP. Align the start down and
     // extend the length so both calls cover the pages backing the secret.
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
         n if n > 0 => n as usize,
         _ => 4096,
@@ -77,6 +78,7 @@ mod tests {
             // the syscall, so RLIMIT_MEMLOCK refuses nothing and the warning
             // this test looks for is never printed. Say so, rather than leaving
             // the parent to read an intercepted call as a missing warning.
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
                 n if n > 0 => n as usize,
                 _ => 4096,

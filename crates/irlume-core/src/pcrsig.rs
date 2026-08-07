@@ -92,6 +92,7 @@ pub fn signed_policy_available() -> bool {
 }
 
 /// Read the authorizing public key as PEM text.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load_pubkey_pem() -> Result<String> {
     let path = discover_pubkey_path()
         .ok_or_else(|| Error::Policy("no TPM2 PCR public key found".into()))?;
@@ -99,6 +100,7 @@ pub fn load_pubkey_pem() -> Result<String> {
 }
 
 /// Parse all signatures for `bank` from the discovered signature file.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load_signatures(bank: &str) -> Result<Vec<PcrSignature>> {
     let path = discover_signature_path()
         .ok_or_else(|| Error::Policy("no TPM2 PCR signature file found".into()))?;
@@ -108,6 +110,7 @@ pub fn load_signatures(bank: &str) -> Result<Vec<PcrSignature>> {
 
 /// Parse signatures for `bank` from in-memory JSON (the testable core of
 /// [`load_signatures`]).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn parse_signatures(text: &str, bank: &str) -> Result<Vec<PcrSignature>> {
     let raw: HashMap<String, Vec<RawEntry>> =
         serde_json::from_str(text).map_err(|e| Error::Protocol(e.to_string()))?;

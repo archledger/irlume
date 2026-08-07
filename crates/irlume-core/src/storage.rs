@@ -597,6 +597,7 @@ fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
     }
 }
 
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
@@ -617,6 +618,7 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
 /// single-profile format. A plaintext file loads without touching the TPM; an
 /// encrypted file unseals the template key (and fails cleanly, with face auth
 /// falling back to the password, if the seal can no longer be satisfied).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     let path = profile_path(user);
     if !path.exists() {
@@ -654,6 +656,7 @@ pub fn store_is_encrypted(user: &str) -> Option<bool> {
     )
 }
 
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn delete(user: &str) -> irlume_common::Result<bool> {
     let path = profile_path(user);
     let existed = path.exists();

@@ -59,6 +59,7 @@ pub fn secure_env(name: &str) -> Option<std::ffi::OsString> {
     if ptr.is_null() {
         return None;
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let bytes = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes().to_vec();
     Some(std::ffi::OsString::from_vec(bytes))
 }
@@ -74,6 +75,7 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// Send `req` with the default read/write timeout.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn request(req: &Request) -> io::Result<Response> {
     request_with_timeout(req, DEFAULT_RW_TIMEOUT)
 }
@@ -81,12 +83,14 @@ pub fn request(req: &Request) -> io::Result<Response> {
 /// A short-budget poll: used by the TUI's periodic status refresh so a busy or
 /// wedged daemon (mid-capture, not accepting) fails fast instead of stalling the
 /// UI thread for the full connect/read budget on every probe.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn request_poll(req: &Request) -> io::Result<Response> {
     request_with_timeouts(req, POLL_CONNECT_TIMEOUT, POLL_RW_TIMEOUT)
 }
 
 /// Send `req`, allowing `rw_timeout` for the reply (e.g. a longer budget for an
 /// unseal that does a full camera capture + liveness + match first).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<Response> {
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
 }
@@ -555,8 +559,10 @@ mod tests {
         // A listener that never accepts, with the smallest backlog Linux
         // allows, so queued fillers exhaust it and further connects BLOCK
         // (the exact hang connect_with_timeout exists to bound).
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
         assert!(fd >= 0);
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         let bytes = path.as_os_str().as_encoded_bytes();
@@ -574,6 +580,8 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+        // SAFETY: `fd` is the socket created above and bound on the line before
+        // this one, and it stays open for the rest of this function.
         assert_eq!(unsafe { libc::listen(fd, 0) }, 0);
 
         // Saturate the accept queue. The fillers that no longer fit block in
@@ -594,7 +602,10 @@ mod tests {
             "got: {err}"
         );
         std::env::remove_var("IRLUME_SOCKET");
-        unsafe { libc::close(fd) };
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        unsafe {
+            libc::close(fd)
+        };
         let _ = std::fs::remove_file(&path);
     }
 

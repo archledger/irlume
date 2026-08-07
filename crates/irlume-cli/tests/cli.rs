@@ -18,7 +18,10 @@ use std::process::{Command, Stdio};
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");
 
 fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    unsafe {
+        libc::geteuid() == 0
+    }
 }
 
 /// Per-test sandbox tree; dropped (deleted) when the test ends.

@@ -28,6 +28,28 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/archledger/irlume"
 authors = ["archledger <archledger236@gmail.com>"]
 
+# Documentation lints for a crate that authenticates people. All three are
+# `allow` in stock clippy, so the coding standard requiring documented panics,
+# error conditions and unsafe preconditions was never actually enforced.
+#
+# The pre-existing sites carry `#[expect(...)]` rather than a hand-waved
+# comment, so CI stays green while NEW code is gated from today. `#[expect]`
+# self-cleans: once a site is documented the expectation goes unfulfilled and
+# `-D warnings` fails until the attribute is removed, so this backlog can only
+# shrink. Each member crate opts in with `[lints] workspace = true`, which is
+# required; without it none of these apply.
+#
+# Unsafe debt is expected on each INDIVIDUAL unsafe expression, never on the
+# enclosing function. One `#[expect]` is fulfilled by one matching diagnostic
+# anywhere inside the item it sits on, so a function-level attribute would let
+# a later undocumented unsafe block in that same function ride along on an
+# already-fulfilled expectation and reach CI unflagged. Per-expression
+# placement is what makes a new unsafe block a build failure.
+[workspace.lints.clippy]
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+undocumented_unsafe_blocks = "warn"
+
 # Shared dependency versions. Heavy/native deps are listed but commented so the
 # scaffold compiles offline as pure stubs; uncomment per crate as you implement.
 [workspace.dependencies]

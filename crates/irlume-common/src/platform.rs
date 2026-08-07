@@ -138,6 +138,7 @@ fn session_is_active_user(session: &str) -> bool {
 /// Resolve a user name to its uid via NSS (`getpwnam_r`). `None` if absent.
 fn uid_for_name(name: &str) -> Option<u32> {
     let cname = std::ffi::CString::new(name).ok()?;
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();

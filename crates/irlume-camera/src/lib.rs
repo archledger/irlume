@@ -5403,15 +5403,55 @@ mod tests {
     #[test]
     #[ignore = "needs an unfed v4l2loopback node; set IRLUME_TEST_SPARE_DEVICE (CI does this)"]
     fn loopback_frameless_capture_fits_the_watchdog_budget() {
-        // The #336 measurement: a camera that streams and then delivers
-        // nothing more (feeder killed under an open device, so the negotiated
-        // format survives) spends the FULL warm-up budget, and what must fit
-        // the watchdog is not that total but the longest stretch between
-        // progress reports. This measures both legs the daemon arithmetic
-        // stands on: the warm-up reported every one of its silent windows
-        // (path assertion, Codex round: the first cut of this test accepted a
-        // residual-buffer branch that never touched the warm-up), and no gap
-        // between reports exceeded CAPTURE_SILENT_WINDOW_WORST_MS plus slack.
+        // The #336 measurement: a frameless capture spends the FULL warm-up
+        // budget, and what must fit the watchdog is not that total but the
+        // longest stretch between progress reports. This measures both legs
+        // the daemon arithmetic stands on: the warm-up reported every one of
+        // its silent windows, and no gap between reports exceeded
+        // CAPTURE_SILENT_WINDOW_WORST_MS plus slack.
+        //
+        // The frameless state is a STALLED PRODUCER built by this test: the
+        // output side of the loopback node armed (S_FMT + REQBUFS + STREAMON),
+        // exactly ONE frame queued, then silence with the tokens still held.
+        // Everything below is from the pinned module source (v4l2loopback
+        // 0.15.4 @0f9ee86; state machine research in
+        // ~/irlume-research/2026-08-07-v4l2loopback-readiness/RESEARCH.md) and
+        // was verified against the real module on the CI runner's exact
+        // kernel (6.17.0-1021-azure VM harness, 2026-08-07):
+        //
+        // - No producer at all (or killed before the consumer's first
+        //   dequeue, which is where STREAMON happens): close releases the
+        //   output stream token, the consumer's STREAMON fails the token
+        //   guard (v4l2loopback.c:2074-2076) with EIO instantly (41ms in the
+        //   research, 7ms remeasured), and no dequeue window ever opens. CI
+        //   run 31205302426 failed this test's first shape exactly there.
+        // - A producer holding the token means the consumer's STREAMON
+        //   passes, and a dequeue then blocks whenever nothing has been
+        //   written past this opener's read position (can_read,
+        //   v4l2loopback.c:1936); only the 5s poll timeout this crate sets
+        //   ends the wait. Measured: a blocking consumer against that state
+        //   sat the full 8s until killed.
+        // - BUT dev->write_position survives for the module's lifetime, and
+        //   each FRESH opener is served one catch-up frame whenever it lags
+        //   (v4l2loopback.c:1972-1977). CI's spare node always has write
+        //   history (the ambient-subtract test feeds it earlier in this same
+        //   binary), so a fresh consumer's warm-up eats that one stale frame
+        //   and the silence lands in the unreported burst loop instead.
+        //   Measured on the VM: 5.0s failure, zero heartbeats.
+        //
+        // So the producer queues ONE frame on purpose, making every node
+        // history equivalent, and the capture below runs TWICE on ONE open
+        // camera: sessions on the same fd share the same opener, whose read
+        // position persists across STREAMOFF/REQBUFS (neither touches it,
+        // v4l2loopback.c:2113-2127, :1694-1712). The first, drain session
+        // consumes the opener's one catch-up frame and fails in the burst's
+        // first silent window; the second, measured session then faces a
+        // fully caught-up queue, and its warm-up walks every silent window
+        // reporting each one. Verified end to end on the VM harness: drain
+        // ~5s, measured session all 8 heartbeats, 40.9s, gaps inside the
+        // bound. If a harness ever set the module's sustain_framerate,
+        // timeout, or keep_format options, frames would flow instead and the
+        // is_err assertions below name the harness loudly.
         let _lock = env_lock();
         let Some(spare) = spare_device() else {
             eprintln!(
@@ -5421,11 +5461,45 @@ mod tests {
             return;
         };
         let _esc = allow_virtual(&spare);
-        let feeder = FfmpegFeeder::spawn(&spare, "color=c=gray:size=640x400:rate=15");
-        // Open (and negotiate GREY) while frames flow; the held fd keeps the
-        // loopback node's format across the feeder's death.
-        let cam = IrCamera::open(&spare).expect("open the fed node");
-        drop(feeder); // now it is a frameless camera
+
+        // The stalled producer. Held (device AND armed stream) until after
+        // the capture: dropping either releases the output token and turns
+        // the state back into the fast-EIO one mid-test.
+        let producer = Device::with_path(&spare).expect("open the spare node's output side");
+        let fmt = Format::new(IR_W, IR_H, FourCC::new(b"GREY"));
+        v4l::video::Output::set_format(&producer, &fmt).expect("set the producer format");
+        let mut producer_stream =
+            v4l::io::mmap::Stream::with_buffers(&producer, Type::VideoOutput, 1)
+                .expect("allocate the producer buffer");
+        {
+            use v4l::io::traits::OutputStream;
+            // First next(): STREAMON (token taken), hands the buffer to fill.
+            let (frame, meta) =
+                OutputStream::next(&mut producer_stream).expect("arm the stalled producer");
+            frame[..(IR_W * IR_H) as usize].fill(128);
+            meta.bytesused = IR_W * IR_H;
+            // Second next(): queues that one frame (the single write), then
+            // returns the next buffer, which is never filled or queued: the
+            // producer now stalls with its tokens held.
+            OutputStream::next(&mut producer_stream).expect("queue the single frame");
+        }
+
+        // Consumer open + GREY negotiation succeed against the armed,
+        // stalled producer, same as against a live feeder.
+        let cam = IrCamera::open(&spare).expect("open the consumer side");
+
+        // Drain session: consumes this opener's one catch-up frame in its
+        // warm-up, then fails on the burst's first silent window.
+        let drained = cam
+            .session()
+            .and_then(|mut s| s.capture_with_stats())
+            .map(|_| ());
+        assert!(
+            drained.is_err(),
+            "the drain capture must fail against a stalled producer; frames \
+             are flowing (module timeout/sustain/keep_format set on this \
+             node?)"
+        );
 
         // Record the gap ending at each progress report, and the start of the
         // stretch a report closes.
@@ -5445,22 +5519,23 @@ mod tests {
             .session_with_progress(&progress)
             .and_then(|mut s| s.capture_with_stats());
         let ms = t0.elapsed().as_millis() as u64;
-        assert!(
-            shot.is_err(),
-            "a frameless node must fail the capture, got a frame after {ms}ms"
-        );
+        let err = match shot {
+            Err(e) => e,
+            Ok(_) => panic!("a frameless node must fail the capture, got a frame after {ms}ms"),
+        };
         // Path assertion: the warm-up itself must have run dry, reporting one
         // heartbeat per silent window for its whole budget. Fewer reports
-        // means a residual loopback buffer let the warm-up succeed and the
-        // failure landed elsewhere; that run proves nothing about the wiring
-        // this test exists to measure, so it fails rather than passes.
+        // means the capture failed somewhere OTHER than the silent warm-up
+        // (the error and wall time in the message say where); that run proves
+        // nothing about the wiring this test exists to measure, so it fails
+        // rather than passes.
         let gaps = gaps.lock().unwrap();
         assert_eq!(
             gaps.len(),
             WARMUP_TRIES as usize,
             "expected one progress report per silent warm-up window \
              (WARMUP_TRIES={WARMUP_TRIES}), saw {}; the warm-up path was not \
-             the one exercised (residual loopback frame?)",
+             the one exercised (capture failed after {ms}ms with: {err})",
             gaps.len()
         );
         // The measured leg of the daemon's watchdog arithmetic: no silent

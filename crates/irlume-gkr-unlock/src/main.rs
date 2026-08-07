@@ -209,7 +209,7 @@ fn connect_with_deadline(sock: &std::path::Path) -> Result<UnixStream, String> {
         let mut err: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: reading a fixed-size option into a matching local.
-        unsafe {
+        let rc = unsafe {
             libc::getsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -218,12 +218,12 @@ fn connect_with_deadline(sock: &std::path::Path) -> Result<UnixStream, String> {
                 &mut len,
             )
         };
-        if err != 0 {
-            return Err(format!(
-                "connect {}: {}",
-                sock.display(),
-                std::io::Error::from_raw_os_error(err)
-            ));
+        // Read errno immediately: anything below could clobber it.
+        let probe_errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        if let Some(why) = pending_connect_failure(rc, err, probe_errno) {
+            return Err(format!("connect {}: {why}", sock.display()));
         }
     }
 
@@ -235,7 +235,31 @@ fn connect_with_deadline(sock: &std::path::Path) -> Result<UnixStream, String> {
     Ok(stream)
 }
 
-/// The login keyring file, under the home NSS reports./// The login keyring file, under the home NSS reports.
+/// Why a non-blocking connect that `poll` reported ready did not actually
+/// connect, or `None` when it did.
+///
+/// `rc` is `getsockopt(SO_ERROR)`'s own return value, `so_error` the value it
+/// wrote, `probe_errno` the errno at the moment it failed. Discarding `rc` is
+/// the bug this exists to prevent: a failed `getsockopt` never touches the
+/// out-parameter, so `so_error` keeps its initial 0 and every failed connect
+/// reads as a success, handing the caller an unconnected socket it then tries
+/// to unlock a keyring over. Fail closed, and keep the two causes apart: one
+/// says the connect failed, the other says we could not find out.
+fn pending_connect_failure(
+    rc: libc::c_int,
+    so_error: libc::c_int,
+    probe_errno: libc::c_int,
+) -> Option<String> {
+    if rc != 0 {
+        return Some(format!(
+            "could not read SO_ERROR ({}), so whether the connect succeeded is unknown",
+            std::io::Error::from_raw_os_error(probe_errno)
+        ));
+    }
+    (so_error != 0).then(|| std::io::Error::from_raw_os_error(so_error).to_string())
+}
+
+/// The login keyring file, under the home NSS reports.
 ///
 /// `$HOME` is deliberately not consulted: this may run as root with the login
 /// stack's environment, where `$HOME` is root's or unset.
@@ -375,4 +399,42 @@ fn lookup_user(user: &str) -> Result<User, String> {
         name: cname,
         home,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_so_error_probe_is_a_failed_connect_not_a_successful_one() {
+        // The defect this pins: `getsockopt` writing nothing on failure leaves
+        // the out-parameter at its initial 0, so a caller that reads only the
+        // out-parameter treats "the probe failed" as "the connect succeeded"
+        // and goes on to hand a keyring token to an unconnected socket.
+        let why = pending_connect_failure(-1, 0, libc::EBADF)
+            .expect("a failed SO_ERROR probe must not read as a connected socket");
+        assert!(
+            why.contains("could not read SO_ERROR"),
+            "the two causes must stay apart in the message: {why}"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_reports_a_connect_error_names_that_error() {
+        let why = pending_connect_failure(0, libc::ECONNREFUSED, 0)
+            .expect("ECONNREFUSED in SO_ERROR is a failed connect");
+        assert_eq!(
+            why,
+            std::io::Error::from_raw_os_error(libc::ECONNREFUSED).to_string()
+        );
+        assert!(
+            !why.contains("could not read SO_ERROR"),
+            "a refused connect must not be reported as an unreadable probe: {why}"
+        );
+    }
+
+    #[test]
+    fn a_clean_probe_reporting_no_error_is_a_connected_socket() {
+        assert!(pending_connect_failure(0, 0, 0).is_none());
+    }
 }

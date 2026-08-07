@@ -3122,7 +3122,7 @@ fn held_concurrent_arm<'d>(
 ) -> impl FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()> + 'd {
     move |rounds, progress, into| {
         let held = RgbCamera::open(rgb_dev).and_then(|r| IrCamera::open(ir_dev).map(|i| (r, i)));
-        let (rgb_cam, mut ir_cam) = match held {
+        let (rgb_cam, ir_cam) = match held {
             Ok(pair) => pair,
             Err(e) => {
                 irlume_common::dlog!(
@@ -3873,7 +3873,9 @@ mod tests {
     /// The tests' concurrent arm: per-call scripted captures through the SAME
     /// accumulate/round shape the production held-session arm uses, so the
     /// composer's decisions (panic abort, dead arms, trailing control) are
-    /// exercised without a camera.
+    /// exercised without a camera. Callers pass `&closure` twice on purpose
+    /// (the same script feeds the sequential caps AND this arm), which
+    /// clippy's needless-borrow lint cannot see; the tests carry the allow.
     fn scripted_arm<'a, R, I>(
         rgb: &'a R,
         ir: &'a I,
@@ -3895,6 +3897,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
     fn a_panicking_capture_aborts_the_probe_instead_of_becoming_a_verdict() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // Sequential IR captures succeed; every concurrent one PANICS. Counting
@@ -3917,6 +3920,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
     fn an_all_error_concurrent_arm_needs_the_trailing_control_to_pass() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // The BRIO shape, injected: sequential rounds fine, every concurrent
@@ -3952,6 +3956,7 @@ mod tests {
     /// probe error. This is the Brio's held-session starvation as the
     /// composer sees it.
     #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
     fn a_pair_that_cannot_arm_held_streams_is_a_sequential_verdict() {
         let rgb = || Ok(frame(&[100; 4]));
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
@@ -3966,6 +3971,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
     fn a_camera_that_stops_answering_fails_the_probe_not_the_verdict() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // Sequential rounds fine, then the camera dies: every later capture

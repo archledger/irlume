@@ -542,6 +542,14 @@ struct App {
     health: Option<HealthInfo>,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
+    /// Models-tab catalog states, copied from the landed probe sweep; `None`
+    /// until the first sweep lands (draw then says the state is loading
+    /// instead of asserting either direction). See [`ModelsStatus`] for why
+    /// this is cached rather than computed in draw.
+    models_status: Option<ModelsStatus>,
+    /// Models-tab scroll offset in wrapped rows (↑/↓); clamped to the content
+    /// height in `draw_models`, reset on entering the tab.
+    models_scroll: u16,
     /// Hardware-adaptive: the subset of screen indices to show (Tab walks these).
     /// e.g. a fingerprint-only desktop hides the camera/face screens entirely.
     visible: Vec<usize>,
@@ -663,6 +671,40 @@ struct Probes {
     secureboot: (bool, bool, bool),
     /// Firmware boot mode label (UEFI/legacy), from efivars.
     boot_mode: String,
+    /// Third-party catalog states for the Models tab; `None` until gathered
+    /// (the derived default), so draw asserts nothing before the first sweep.
+    models: Option<ModelsStatus>,
+}
+
+/// Cached per-entry state for the Models tab, one label per
+/// `thirdparty::CATALOG` entry in catalog order.
+///
+/// Gathered on the probe worker, never in draw (#334 review): the ENABLED and
+/// root-only labels hash the on-disk weights (`entry_state_label` →
+/// `weight_state`), the main loop redraws every 100ms, and rendered inline an
+/// installed recognizer was reread and re-hashed about ten times a second on
+/// the UI thread for as long as the tab stayed open.
+#[derive(Clone)]
+struct ModelsStatus {
+    /// `models::entry_state_label` per catalog entry, catalog order.
+    labels: Vec<String>,
+    /// Whether settings.conf was readable; root-only when not, and the
+    /// listing then names the sudo command for the authoritative answer.
+    readable: bool,
+}
+
+impl ModelsStatus {
+    /// The one computation source (the probe worker and the tests both call
+    /// it): exactly the labels the CLI listing prints.
+    fn gather() -> Self {
+        ModelsStatus {
+            labels: irlume_common::thirdparty::CATALOG
+                .iter()
+                .map(crate::models::entry_state_label)
+                .collect(),
+            readable: crate::models::enabled_state_readable(),
+        }
+    }
 }
 
 impl Probes {
@@ -726,6 +768,7 @@ impl Probes {
                 secureboot::is_setup_mode(),
             ),
             boot_mode: secureboot::detect_boot_mode().as_str().to_string(),
+            models: Some(ModelsStatus::gather()),
         }
     }
 }
@@ -954,6 +997,8 @@ impl App {
             enroll_error: None,
             health: None,
             act_scroll: 0,
+            models_status: None,
+            models_scroll: 0,
             visible,
             caps,
             fp_present,
@@ -1285,6 +1330,11 @@ impl App {
             self.fp = self.probes.fp.clone();
             self.pam_cache = self.probes.pam_cache.clone();
             self.fp_coverage = self.probes.fp_coverage.clone();
+            // The Models-tab cache (#334 review): only ever replaced by a
+            // gathered value, so a landed sweep can never blank it.
+            if let Some(models) = self.probes.models.clone() {
+                self.models_status = Some(models);
+            }
         }
         self.run_checks();
         // Visibility is state-driven (Repair appears when something fails);
@@ -2925,10 +2975,32 @@ impl App {
             self.refresh_diagnostics();
         } else if self.screen == SC_PROFILES {
             self.refresh_profiles();
+        } else if self.screen == SC_MODELS {
+            // Fresh entry starts at the top, so the re-enroll warning is met
+            // before any switch command (#331), and the state cache refreshes
+            // via the probe worker (idempotent while one is in flight).
+            self.models_scroll = 0;
+            self.request_probes();
         }
     }
 
     fn move_sel(&mut self, d: i32) {
+        // The Models tab is a read-only text panel: ↑↓ (and j/k) scroll the
+        // catalog (#334 review: at 80×24 the body shows ~7 rows and ratatui
+        // clips the rest, hiding whole entries and their commands) instead of
+        // moving a selection nothing on that screen has. The offset is
+        // clamped HERE, not just in draw: an unclamped store kept counting
+        // past the end, and every wasted ↓ then cost an ↑ before the view
+        // moved again.
+        if self.screen == SC_MODELS {
+            let max = self.models_lines().len().saturating_sub(1) as u16;
+            self.models_scroll = if d > 0 {
+                self.models_scroll.saturating_add(d as u16).min(max)
+            } else {
+                self.models_scroll.saturating_sub(d.unsigned_abs() as u16)
+            };
+            return;
+        }
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
@@ -2961,6 +3033,11 @@ impl App {
                         self.refresh_diagnostics();
                     } else if target == SC_PROFILES {
                         self.refresh_profiles();
+                    } else if target == SC_MODELS {
+                        // Same fresh-entry rule as a Tab switch: top of the
+                        // catalog (warning before commands) + a cache refresh.
+                        self.models_scroll = 0;
+                        self.request_probes();
                     }
                 }
             }
@@ -4415,18 +4492,41 @@ impl App {
     /// the license line, measurement summary, and effect line the CLI listing
     /// prints, all read from the one catalog in `irlume_common::thirdparty`
     /// (via `crate::models`), so nothing unmeasured can appear and the two
-    /// surfaces cannot drift. Provenance is deliberately omitted: this panel
-    /// does not scroll, the provenance rows pushed the root-only note off a
-    /// 50-row terminal, and the CLI consent flow prints provenance before any
-    /// enable can proceed. The
-    /// re-enrollment consequence is a section ABOVE the entries, so it is met
-    /// before any switch command (#288: templates are per recognizer, and on
-    /// a one-user machine a stranded enrollment is a lockout path if the
+    /// surfaces cannot drift. Provenance is deliberately omitted: the
+    /// provenance rows pushed the root-only note off a 50-row terminal, and
+    /// the CLI consent flow prints provenance before any enable can proceed.
+    /// The re-enrollment consequence is a section ABOVE the entries, so it is
+    /// met before any switch command (#288: templates are per recognizer, and
+    /// on a one-user machine a stranded enrollment is a lockout path if the
     /// camera then misbehaves). Display and guidance only: a state change
     /// goes through the CLI's own sudo + license flow, so the screen shows
     /// the exact command instead of wrapping it, and root-gating stays where
     /// the CLI already enforces it.
+    ///
+    /// A PURE RENDER of `self.models_status` (#334 review): the per-entry
+    /// state hashes weight files, so it is gathered on the probe worker and
+    /// cached; the content builder must never call back into `crate::models`
+    /// state readers. `↑/↓` scroll by LOGICAL line (`models_scroll` skips
+    /// leading entries of [`Self::models_lines`]): exact and clampable, where
+    /// a wrapped-row offset needs the renderer's private line count and every
+    /// estimate of it risks clamping the tail commands out of reach.
     fn draw_models(&self, f: &mut Frame, area: Rect) {
+        let lines = self.models_lines();
+        // Clamp so the LAST content line can top the viewport but the view
+        // can never run away into blank space; models_lines ends on content
+        // (trailing blanks popped), so even fully scrolled the tail command
+        // or root-only note stays on screen.
+        let start = (self.models_scroll as usize).min(lines.len().saturating_sub(1));
+        f.render_widget(
+            Paragraph::new(lines[start..].to_vec()).wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    /// The Models tab's full content, top to bottom; see [`Self::draw_models`]
+    /// for the contract. Split out so the ↑/↓ handler can clamp the scroll
+    /// offset against the same list the renderer slices.
+    fn models_lines(&self) -> Vec<Line<'static>> {
         use irlume_common::thirdparty::CATALOG;
         let kv = |k: &str, v: &str| {
             Line::from(vec![
@@ -4463,8 +4563,16 @@ impl App {
             )),
             Line::raw(""),
         ];
-        for m in CATALOG {
-            let state = crate::models::entry_state_label(m);
+        for (i, m) in CATALOG.iter().enumerate() {
+            // From the cache, never a live read: `entry_state_label` hashes
+            // the weight file, and this runs per frame. Before the first
+            // sweep lands the answer is not known, and the tri-state rule
+            // says say so rather than claim "disabled".
+            let state = self
+                .models_status
+                .as_ref()
+                .and_then(|s| s.labels.get(i).cloned())
+                .unwrap_or_else(|| "state loading".into());
             let enabled = state.starts_with("ENABLED");
             lines.push(Line::from(vec![
                 Span::styled(
@@ -4492,7 +4600,9 @@ impl App {
         // unprivileged TUI cannot read the enabled flags and must say so
         // rather than render "disabled" (the same tri-state rule the Settings
         // sections follow). The commands above are the way to act either way.
-        if !crate::models::enabled_state_readable() {
+        // Keyed off the CACHED observation; before the first sweep neither
+        // direction is asserted.
+        if self.models_status.as_ref().is_some_and(|s| !s.readable) {
             lines.push(Line::from(Span::styled(
                 "  settings.conf is root-only, so the enabled states above are unknown;",
                 Style::new().fg(th().warn),
@@ -4502,7 +4612,16 @@ impl App {
                 Style::new().fg(th().warn),
             )));
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        // End on content, never a blank: the scroll clamp lets the last line
+        // top the viewport, and a trailing blank there would render a page
+        // holding nothing.
+        while lines
+            .last()
+            .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+        {
+            lines.pop();
+        }
+        lines
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
@@ -5793,8 +5912,8 @@ impl App {
             ],
             // Read-only by design (#331): a model change goes through the
             // CLI's own sudo + license flow, and the screen prints the exact
-            // command for it, so there is no action key to advertise.
-            SC_MODELS => &[],
+            // command for it, so the only key to advertise is the scroll.
+            SC_MODELS => &[("↑/↓", "scroll catalog")],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
             // a needless `sudo irlume login enable --apply` re-run. Unknown
@@ -6520,6 +6639,8 @@ mod tests {
             enroll_error: None,
             health: None,
             act_scroll: 0,
+            models_status: None,
+            models_scroll: 0,
             visible: App::compute_visible(&caps, VisibilityInputs::default(), &[]),
             advanced: false,
             caps,
@@ -9474,35 +9595,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
+    /// Env restoration for [`with_models_sandbox`] on DROP, so a failed
+    /// assertion inside the body still puts IRLUME_CONFIG_DIR/IRLUME_STATE_DIR
+    /// back (#334 review): restored only on return, a panicking test left the
+    /// process env pointing into its deleted sandbox and later tests failed
+    /// against the wrong configuration, burying the original failure.
+    struct ModelsEnvGuard {
+        root: std::path::PathBuf,
+        old_cfg: Option<std::ffi::OsString>,
+        old_state: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ModelsEnvGuard {
+        fn drop(&mut self) {
+            // Restored independently: a paired match would drop whichever var
+            // existed alone before the test.
+            match self.old_cfg.take() {
+                Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+                None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+            }
+            match self.old_state.take() {
+                Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+                None => std::env::remove_var("IRLUME_STATE_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     /// Sandbox the config + state dirs for a Models-screen draw and restore
-    /// them after. The screen reads settings.conf and the weights dir through
-    /// `crate::models`; without the sandbox a dev box with a real (0600)
-    /// /etc/irlume/settings.conf renders "root-only unknown" and the tests
-    /// assert on that machine's state instead of the state they set up.
-    /// Caller must hold ENV_LOCK.
+    /// them after, panic or not. The screen's state cache reads settings.conf
+    /// and the weights dir through `crate::models`; without the sandbox a dev
+    /// box with a real (0600) /etc/irlume/settings.conf renders "root-only
+    /// unknown" and the tests assert on that machine's state instead of the
+    /// state they set up. Caller must hold ENV_LOCK.
     fn with_models_sandbox<R>(tag: &str, body: impl FnOnce(&std::path::Path) -> R) -> R {
         let root = std::env::temp_dir().join(format!("irlume-tui-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (cfg, state) = (root.join("cfg"), root.join("state"));
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
-        let old_state = std::env::var_os("IRLUME_STATE_DIR");
+        let _guard = ModelsEnvGuard {
+            root,
+            old_cfg: std::env::var_os("IRLUME_CONFIG_DIR"),
+            old_state: std::env::var_os("IRLUME_STATE_DIR"),
+        };
         std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
         std::env::set_var("IRLUME_STATE_DIR", &state);
-        let out = body(&cfg);
-        // Restored independently: a paired match would drop whichever var
-        // existed alone before the test.
-        match old_cfg {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        match old_state {
-            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
-            None => std::env::remove_var("IRLUME_STATE_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&root);
-        out
+        body(&cfg)
+    }
+
+    /// A test App on the Models tab with the state cache gathered from the
+    /// CURRENT (sandboxed) environment, the way `poll()` lands a probe sweep.
+    /// Draw itself must never read the environment (#334 review), so every
+    /// draw test populates the cache through the same `ModelsStatus::gather`
+    /// the probe worker runs.
+    fn models_app() -> App {
+        let mut app = test_app();
+        app.screen = SC_MODELS;
+        app.models_status = Some(ModelsStatus::gather());
+        app
     }
 
     #[test]
@@ -9512,24 +9663,30 @@ mod tests {
         // come from the same `crate::models` helpers the CLI listing uses.
         // Iterates the live catalog so this keeps holding as entries land.
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let text = with_models_sandbox("mlist", |_| {
-            let mut app = test_app();
-            app.screen = SC_MODELS;
-            draw_text(&app)
-        });
-        // First words only: the full lines word-wrap at the panel width, so a
-        // long needle can be split across rendered rows.
-        let first3 = |s: &str| s.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        let text = with_models_sandbox("mlist", |_| draw_text(&models_app()));
+        // Compared WHOLE, normalized: the rendered lines word-wrap at the
+        // panel width, so collapsing all whitespace on both sides lets the
+        // full license and summary text be asserted, not just its first
+        // words (#334 review: a renderer truncating after the opening words
+        // used to pass). The block border glyphs land between wrapped
+        // segments in the flattened frame, so they normalize to spaces too.
+        let flat = |s: &str| {
+            s.replace('│', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let flat_text = flat(&text);
         for m in irlume_common::thirdparty::CATALOG {
             row_with(&text, m.name);
             assert!(
-                text.contains(&first3(m.license)),
-                "license line for '{}' missing:\n{text}",
+                flat_text.contains(&flat(m.license)),
+                "full license line for '{}' missing:\n{text}",
                 m.name
             );
             assert!(
-                text.contains(&first3(m.summary)),
-                "measurement summary for '{}' missing:\n{text}",
+                flat_text.contains(&flat(m.summary)),
+                "full measurement summary for '{}' missing:\n{text}",
                 m.name
             );
             // The obtain line is short enough to sit on one rendered row, so
@@ -9544,9 +9701,7 @@ mod tests {
         // (still under the same ENV_LOCK guard).
         let enabled = with_models_sandbox("mlist-on", |cfg| {
             std::fs::write(cfg.join("settings.conf"), "third_party_pad=flir\n").unwrap();
-            let mut app = test_app();
-            app.screen = SC_MODELS;
-            draw_text(&app)
+            draw_text(&models_app())
         });
         assert!(
             enabled.contains("ENABLED"),
@@ -9565,11 +9720,7 @@ mod tests {
         // meets it before the offer. Byte order in the flattened frame is
         // render order (rows top to bottom).
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let text = with_models_sandbox("morder", |_| {
-            let mut app = test_app();
-            app.screen = SC_MODELS;
-            draw_text(&app)
-        });
+        let text = with_models_sandbox("morder", |_| draw_text(&models_app()));
         let warn = text
             .find("Templates are stored per recognizer")
             .unwrap_or_else(|| panic!("no re-enroll warning:\n{text}"));
@@ -9586,21 +9737,23 @@ mod tests {
     fn models_screen_unprivileged_shows_unknown_state_and_the_sudo_commands() {
         // Root-gated like the CLI: settings.conf unreadable (0600 root-only in
         // the field, chmod 000 here) must render as unknown state, never as
-        // "disabled", with the sudo commands as the only way to act. Skipped
-        // as root because root reads any mode and the unprivileged branch is
-        // what is under test.
-        if crate::is_root() {
-            return;
-        }
+        // "disabled", with the sudo commands as the only way to act. FAILS
+        // (never silently skips) under root (#334 review): root reads any
+        // mode, so the chmod fixture proves nothing there, and an early
+        // return recorded a test that observed nothing as passed on root-run
+        // package builders.
+        assert!(
+            !crate::is_root(),
+            "this test needs a non-root job: under root the chmod-000 fixture is \
+             readable and none of the assertions below observe anything"
+        );
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let text = with_models_sandbox("mroot", |cfg| {
             use std::os::unix::fs::PermissionsExt;
             let conf = cfg.join("settings.conf");
             std::fs::write(&conf, "third_party_pad=flir\n").unwrap();
             std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let mut app = test_app();
-            app.screen = SC_MODELS;
-            draw_text(&app)
+            draw_text(&models_app())
         });
         assert!(
             text.contains("enabled state unknown, root-only"),
@@ -9620,6 +9773,112 @@ mod tests {
             text.contains("sudo irlume models add buffalo"),
             "the bring-your-own entry's add command must show:\n{text}"
         );
+    }
+
+    #[test]
+    fn models_screen_renders_the_cached_state_never_a_fresh_probe() {
+        // The #334 review's HIGH finding: drawing this tab used to call
+        // entry_state_label per entry per frame, and its ENABLED/root-only
+        // branches read and hash the whole weight file, ~10x/s on the UI
+        // thread. Draw must be a pure render of App.models_status. A sentinel
+        // label no gather could produce proves it: if draw recomputed from
+        // the environment the sentinel could not reach the frame.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (fresh, cached) = with_models_sandbox("mcache", |_| {
+            let mut app = test_app();
+            app.screen = SC_MODELS;
+            let fresh = draw_text(&app); // cache still None
+            app.models_status = Some(ModelsStatus {
+                labels: irlume_common::thirdparty::CATALOG
+                    .iter()
+                    .map(|_| "SENTINEL-CACHED-STATE".into())
+                    .collect(),
+                readable: true,
+            });
+            (fresh, draw_text(&app))
+        });
+        // Before the first sweep lands the state is not yet known, and the
+        // tri-state rule says say so rather than claim either direction.
+        assert!(
+            fresh.contains("state loading"),
+            "an unlanded cache must render as loading:\n{fresh}"
+        );
+        // The state TAG specifically: "disabled" also appears in prose (the
+        // recognizer effect line names the disabled IR paths), so only the
+        // bracketed tag would be a false claim.
+        assert!(
+            !fresh.contains("[disabled]"),
+            "an unlanded cache must not claim a disabled state:\n{fresh}"
+        );
+        assert!(
+            cached.contains("SENTINEL-CACHED-STATE"),
+            "draw must render the cache verbatim:\n{cached}"
+        );
+    }
+
+    #[test]
+    fn models_screen_scrolls_to_reach_every_command_on_a_short_terminal() {
+        // The #334 review's MEDIUM finding: at 80x24 the body shows about
+        // seven rows and ratatui clips the rest, so without scrolling the
+        // entries and their commands were unreachable. ↑/↓ (move_sel's
+        // SC_MODELS branch) must bring the LAST command into view, and the
+        // re-enroll warning must sit at the unscrolled top so it is met
+        // before any command.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        with_models_sandbox("mscroll", |_| {
+            let mut app = models_app();
+            let render = |app: &App| {
+                let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+                rendered(&term)
+            };
+            let top = render(&app);
+            assert!(
+                top.contains("Templates are stored per recognizer"),
+                "the warning heads the unscrolled view:\n{top}"
+            );
+            let last_cmd = "sudo irlume models add buffalo";
+            assert!(
+                !top.contains(last_cmd),
+                "at 80x24 the last command must genuinely start off-screen, or \
+                 the scroll assertions below prove nothing:\n{top}"
+            );
+            // ↓ one logical line at a time until the LAST command scrolls in.
+            let budget = app.models_lines().len();
+            let mut found = false;
+            for _ in 0..budget {
+                app.on_key(KeyCode::Down);
+                if render(&app).contains(last_cmd) {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(
+                found,
+                "the last catalog command never scrolled into view:\n{}",
+                render(&app)
+            );
+            // The clamp (#334 review): extra presses cannot run past the end
+            // into blank space; the content's last line still tops the view.
+            for _ in 0..100 {
+                app.on_key(KeyCode::Down);
+            }
+            let clamped = render(&app);
+            assert!(
+                clamped.contains(last_cmd),
+                "over-scrolling must clamp at the content end:\n{clamped}"
+            );
+            // And ↑ returns to the warning-first top without re-walking the
+            // wasted presses (the store itself is clamped, not just the view).
+            for _ in 0..budget {
+                app.on_key(KeyCode::Up);
+            }
+            let back = render(&app);
+            assert!(
+                back.contains("Templates are stored per recognizer"),
+                "scrolling back up must restore the warning-first view:\n{back}"
+            );
+        });
     }
 
     #[test]

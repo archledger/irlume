@@ -5,15 +5,17 @@
 # contributor who follows the developer guide gets the same result CI does.
 name: CI
 
-# SECURITY: push-trigger only, the preflight.yml pattern. All jobs run on
-# the self-hosted runner, and a pull_request run executes the workflow file
-# from the PR head, so a fork PR could edit its way onto the personal
-# machine. A push can only come from someone with push access; same-repo
-# branches (and therefore same-repo PRs) get every required check from the
-# push run. Fork PRs get no checks and need a maintainer-pushed branch.
+# Every job here runs on GitHub-hosted runners, so pull_request is safe and
+# fork PRs get the full required gate. Anything needing the maintainer's
+# hardware lives in hardware-checks.yml, which is push-triggered precisely
+# because a pull_request run would execute the PR head's workflow file on a
+# personal machine.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+  # No base-branch filter: stacked PRs (a branch targeting another feature
+  # branch) previously ran ZERO checks.
+  pull_request:
 
 # Least privilege for GITHUB_TOKEN: this workflow only reads the repo
 # (checkout + LFS); nothing here publishes or writes.
@@ -26,20 +28,22 @@ permissions:
 # commit land on main untested.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Runner routing across the two self-hosted machines. Five jobs carry the
-# shared `ci` label so GitHub sends each to whichever runner is FREE:
-# waiting behind a queue on the fast machine is worse than starting now on
-# the slow one, and it stops any single machine being a single point of
-# failure for a required check. Their timeouts are sized for the 4-core
-# N100 (60m, and 90m for nix), not the 16-core Ryzen.
+# Runner routing. irlume is a PUBLIC repo, so GitHub-hosted runners are free
+# and unmetered, and hosted jobs run in PARALLEL rather than queueing behind
+# each other on two machines. The rule is capability, not availability: a job
+# touches the maintainer's hardware only when it needs something that
+# hardware has. Every job in THIS file is hosted, which is what lets it stay
+# pull_request-triggered so fork PRs get the full required gate.
 #
-# Only `coverage` and `fuzz` stay pinned to `arch`: an instrumented
-# coverage build and a nightly fuzz run are the two jobs where the slower
-# machine turns a short job into a very long one with no scheduling
-# benefit. hardware-suite is pinned separately, because it needs the real
-# IR camera.
+# The hardware lanes live elsewhere and are push-triggered on purpose:
+#   hardware-checks.yml   real TPM + the pinned TFLite runtime, either machine
+#   hardware-suite.yml    the real IR camera, archhost only
+#
+# Self-hosted runners are NOT an outage hedge: they still need the Actions
+# control plane to receive a job, and archhost's lane failed at "Set up job"
+# during the 2026-08-06 incident exactly like the hosted lanes did.
 #
 # Branch protection on `main` requires these SEVEN job names as status checks,
 # verified against the live ruleset 2026-08-07:
@@ -57,8 +61,8 @@ concurrency:
 jobs:
   check:
     name: fmt · clippy · build · test
-    runs-on: [self-hosted, ci]
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.
@@ -183,36 +187,6 @@ jobs:
       # coverage this was, when that duplicate lane was deleted. The guard
       # NAMES the set instead of counting it: renaming one while adding
       # another would leave the total at six and hide the loss.
-      # The production TFLite mesh, end to end and ENFORCED. The test is
-      # #[ignore]d because it needs the packaged runtime, so a rename or a
-      # silent skip fails the --require guard instead of reading as green.
-      # Both runners carry the pinned libtensorflowlite_c.so at the
-      # resolver's first probe path.
-      - name: test (production TFLite FaceMesh, end to end)
-        env:
-          IRLUME_TFLITE_LIB: /usr/share/irlume/tflite/libtensorflowlite_c.so
-        run: |
-          IRLUME_TFLITE_MESH_TEST_MODEL="$GITHUB_WORKSPACE/models/face_landmarks_detector.tflite" \
-            ./scripts/run-tests-guarded.sh --require pinned_landmarker_mesh_serves_landmarks_via_facemesh \
-            -- cargo test -p irlume-vision --locked -- --ignored pinned_landmarker_mesh_serves_landmarks_via_facemesh
-
-      - name: test (TPM-gated, against the REAL TPM)
-        run: |
-          # seal_unseal_pcrlock_roundtrip_provisioned_nv is DELIBERATELY not in
-          # this set: it hard-codes NV index 0x0181C0DE and undefines whatever
-          # already lives there without checking who created it. Against swtpm
-          # (the step above) that state is disposable; against the real chip it
-          # would destroy persistent hardware state this test never owned, and
-          # an interrupted run leaves the fixture installed for the next one to
-          # delete. Its pcrlock coverage runs on swtpm.
-          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals \
-            -- cargo test -p irlume-core --lib --locked -- --ignored \
-            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
-            tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals \
-            --test-threads=1
-        env:
-          IRLUME_TCTI: device:/dev/tpmrm0
-
       - name: Start virtual cameras (v4l2loopback + ffmpeg feeders)
         run: |
           # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
@@ -286,8 +260,8 @@ jobs:
   # only, so new-stable lint churn never blocks a PR. REQUIRED (see the seven-check list in the header).
   stable:
     name: test (stable)
-    runs-on: [self-hosted, ci]
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -353,7 +327,7 @@ jobs:
   # REQUIRED (see the seven-check list in the header).
   coverage:
     name: coverage (line-coverage ratchet)
-    runs-on: [self-hosted, arch]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -516,7 +490,7 @@ jobs:
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -528,7 +502,7 @@ jobs:
 
   units:
     name: systemd units (verify + exposure ratchet)
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -652,8 +626,8 @@ jobs:
 
   nix:
     name: nix flake check
-    runs-on: [self-hosted, ci]
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       # No model fetch here: flake check --no-build only evaluates the outputs
       # (flake structure, the package derivation, the NixOS module, the dev
@@ -664,8 +638,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Nix is provisioned on the runner (pacman nix, daemon, flakes)
-        run: nix --version
+      - name: Install Nix with flakes
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       # Evaluates packages.default, nixosModules.irlume, and the dev shell.
       # Catches eval and type errors in flake.nix and nix/*.nix before merge.
@@ -693,7 +670,7 @@ jobs:
 
   fuzz:
     name: fuzz (untrusted-input parsers)
-    runs-on: [self-hosted, arch]
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       # Every cargo/rustc in this job (including the child rustc that

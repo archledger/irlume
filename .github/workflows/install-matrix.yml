@@ -18,7 +18,7 @@ permissions:
 jobs:
   build-deb:
     name: build universal .deb (debian:12, podman)
-    runs-on: [self-hosted, arch]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,7 +50,7 @@ jobs:
   install-smoke:
     name: install smoke (${{ matrix.image }})
     needs: build-deb
-    runs-on: [self-hosted, arch]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -82,7 +82,7 @@ jobs:
 
   arch-build-test:
     name: build + test on Arch (rolling toolchain)
-    runs-on: [self-hosted, arch]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
       # Pinned by digest, not `:latest`: a mutable tag means the image can change

@@ -1,0 +1,71 @@
+# The checks that need REAL hardware: a physical TPM and the pinned TFLite
+# runtime installed on the machine. Everything a hosted runner can do lives
+# in ci.yml, which is pull_request-triggered so fork PRs get the full
+# required gate.
+#
+# SECURITY: push-trigger only. A pull_request run executes the workflow file
+# from the PR head, so a fork PR could edit its way onto a personal machine.
+# A push can only come from someone with push access. Fork PRs therefore do
+# not get this lane, which is why nothing here is a REQUIRED check: the
+# hosted gate decides mergeability, and this reports hardware truth on
+# maintainer-pushed branches.
+name: Hardware checks (self-hosted)
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardware-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hardware:
+    name: hardware checks (real TPM, pinned TFLite runtime)
+    # Both machines carry a real TPM and the pinned runtime, so the shared
+    # label lets whichever is free take it.
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
+
+      - name: build (release)
+        run: cargo build --release --locked
+
+      # The production TFLite mesh, end to end and ENFORCED. The test is
+      # #[ignore]d because it needs the packaged runtime, so a rename or a
+      # silent skip fails the --require guard instead of reading as green.
+      # Both runners carry the pinned libtensorflowlite_c.so at the
+      # resolver's first probe path.
+      - name: test (production TFLite FaceMesh, end to end)
+        env:
+          IRLUME_TFLITE_LIB: /usr/share/irlume/tflite/libtensorflowlite_c.so
+        run: |
+          IRLUME_TFLITE_MESH_TEST_MODEL="$GITHUB_WORKSPACE/models/face_landmarks_detector.tflite" \
+            ./scripts/run-tests-guarded.sh --require pinned_landmarker_mesh_serves_landmarks_via_facemesh \
+            -- cargo test -p irlume-vision --locked -- --ignored pinned_landmarker_mesh_serves_landmarks_via_facemesh
+
+      - name: test (TPM-gated, against the REAL TPM)
+        run: |
+          # seal_unseal_pcrlock_roundtrip_provisioned_nv is DELIBERATELY not in
+          # this set: it hard-codes NV index 0x0181C0DE and undefines whatever
+          # already lives there without checking who created it. Against swtpm
+          # (the step above) that state is disposable; against the real chip it
+          # would destroy persistent hardware state this test never owned, and
+          # an interrupted run leaves the fixture installed for the next one to
+          # delete. Its pcrlock coverage runs on swtpm.
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals \
+            -- cargo test -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
+            tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals \
+            --test-threads=1
+        env:
+          IRLUME_TCTI: device:/dev/tpmrm0

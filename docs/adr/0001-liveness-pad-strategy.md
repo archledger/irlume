@@ -30,11 +30,16 @@ stands as the PAD mechanism.
    attacks. "Low-latency rPPG" is self-contradictory.
 
 2. **The clean-BOM block.** Bypassing the latency paradox with a learned PAD CNN
-   runs into licensing: the state-of-the-art models (MiniFASNet / Silent-Face)
-   are trained on **non-commercial datasets (CelebA-Spoof)**. Integrating them
-   reintroduces exactly the license taint the project removed elsewhere (see
-   `FAIRNESS.md` and the model-licensing notes). No commercially-clean PAD
-   dataset/model currently exists.
+   runs into licensing: for the state-of-the-art models (MiniFASNet /
+   Silent-Face) the training data is undocumented, and whether the
+   repository's Apache-2.0 license was intended to cover the released
+   weights is not resolvable from the repository text, which makes the
+   grant too ambiguous for a clean bill of materials (checked 2026-08-07
+   against the Minivision repository. An earlier revision of this ADR
+   attributed CelebA-Spoof training to these models, which no public
+   source supports). Integrating them reintroduces exactly the provenance problem the project removed
+   elsewhere (see `FAIRNESS.md` and the model-licensing notes). No
+   commercially-clean PAD dataset/model currently exists.
 
 ## Consequences: accepted residual risk
 
@@ -98,9 +103,10 @@ is acceptable when all four criteria hold:
 
 1. **Permissive license** on weights and inference code, compatible with
    GPL-3.0 redistribution.
-2. **Training-data provenance:** licensed or consented data, not scraped. This
-   is the criterion CelebA-Spoof-trained models (MiniFASNet / Silent-Face)
-   fail.
+2. **Training-data provenance:** licensed or consented data, not scraped.
+   MiniFASNet / Silent-Face fail this criterion because their publisher does
+   not identify the training dataset or document its license or consent
+   basis.
 3. **Reproducible training:** the pipeline from dataset to weights can be
    re-run, so the shipped weights are auditable rather than opaque.
 4. **Inversion-risk assessment:** a model trained on real face/IR data can leak

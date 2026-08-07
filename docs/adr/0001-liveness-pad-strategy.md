@@ -30,11 +30,15 @@ stands as the PAD mechanism.
    attacks. "Low-latency rPPG" is self-contradictory.
 
 2. **The clean-BOM block.** Bypassing the latency paradox with a learned PAD CNN
-   runs into licensing: the state-of-the-art models (MiniFASNet / Silent-Face)
-   are trained on **non-commercial datasets (CelebA-Spoof)**. Integrating them
-   reintroduces exactly the license taint the project removed elsewhere (see
-   `FAIRNESS.md` and the model-licensing notes). No commercially-clean PAD
-   dataset/model currently exists.
+   runs into licensing: for the state-of-the-art models (MiniFASNet /
+   Silent-Face) the training data is undocumented and the weights carry no
+   explicit license grant, the repository's Apache license covering only the
+   code (verified 2026-08-07 against the Minivision repository; see the PAD
+   candidate survey. An earlier revision of this ADR attributed CelebA-Spoof
+   training to these models, which no public source supports). Integrating
+   them reintroduces exactly the provenance problem the project removed
+   elsewhere (see `FAIRNESS.md` and the model-licensing notes). No
+   commercially-clean PAD dataset/model currently exists.
 
 ## Consequences: accepted residual risk
 

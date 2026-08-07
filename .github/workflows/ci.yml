@@ -335,7 +335,13 @@ jobs:
   coverage:
     name: coverage (line-coverage ratchet)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 75
+    # 30 was sized for archhost's 16 cores. An instrumented build plus the
+    # whole suite (including the swtpm and loopback sets) runs past 30 on a
+    # 4-core hosted runner: this job was cancelled at exactly 30:00 with the
+    # tests still going. It stays hosted rather than moving to the fast
+    # machine because it is a REQUIRED check, and a required check on a
+    # push-only self-hosted lane would make fork PRs unmergeable.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -28,6 +28,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Runner routing: heavy jobs (build, test, coverage, fuzz, nix) stay on
+# `arch`, which only the Ryzen carries. The two light jobs take the
+# shared `ci` label, so either machine can run them and neither is a
+# single point of failure for a REQUIRED check. The N100 never sees a
+# release build.
+#
 # Branch protection on `main` requires these four job names as status checks:
 #   "fmt · clippy · build · test", "cargo-deny (advisories · licenses ·
 #   duplicate versions)", "nix flake check", "fuzz (untrusted-input parsers)".
@@ -431,7 +437,7 @@ jobs:
 
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
-    runs-on: [self-hosted, arch]
+    runs-on: [self-hosted, ci]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -443,7 +449,7 @@ jobs:
 
   units:
     name: systemd units (verify + exposure ratchet)
-    runs-on: [self-hosted, arch]
+    runs-on: [self-hosted, ci]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

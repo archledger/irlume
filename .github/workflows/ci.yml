@@ -62,12 +62,7 @@ jobs:
   check:
     name: fmt · clippy · build · test
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
-    # Sized for a 4-core hosted runner, not archhost's 16: this job fetches
-    # ~266MB of weights (the cache key moves whenever models/SHA256SUMS
-    # does), builds the ONNX runtime download, compiles the workspace, then
-    # runs the full suite plus the swtpm, loopback-camera and PAM sets. It
-    # was cancelled at exactly 30:00 with tests still running.
+    timeout-minutes: 30
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.
@@ -236,8 +231,13 @@ jobs:
           ready=0
           for _ in $(seq 1 20); do
             sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            if ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
-               && ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
+            # `timeout` is load-bearing: a v4l2loopback node with no producer
+            # blocks an ffmpeg read FOREVER, and this loop then never exits.
+            # Measured on a hosted runner: the unbounded form burned 1501s and
+            # 1867s (the whole job budget) in this step while the build and the
+            # entire test suite together took under four minutes.
+            if timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
+               && timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
               ready=1; break
             fi
             for fp in "$rgb_pid:RGB" "$ir_pid:IR"; do
@@ -340,13 +340,7 @@ jobs:
   coverage:
     name: coverage (line-coverage ratchet)
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    # 30 was sized for archhost's 16 cores. An instrumented build plus the
-    # whole suite (including the swtpm and loopback sets) runs past 30 on a
-    # 4-core hosted runner: this job was cancelled at exactly 30:00 with the
-    # tests still going. It stays hosted rather than moving to the fast
-    # machine because it is a REQUIRED check, and a required check on a
-    # push-only self-hosted lane would make fork PRs unmergeable.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -451,8 +445,13 @@ jobs:
           ready=0
           for _ in $(seq 1 20); do
             sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            if ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
-               && ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
+            # `timeout` is load-bearing: a v4l2loopback node with no producer
+            # blocks an ffmpeg read FOREVER, and this loop then never exits.
+            # Measured on a hosted runner: the unbounded form burned 1501s and
+            # 1867s (the whole job budget) in this step while the build and the
+            # entire test suite together took under four minutes.
+            if timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
+               && timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
               ready=1; break
             fi
             for fp in "$rgb_pid:RGB" "$ir_pid:IR"; do

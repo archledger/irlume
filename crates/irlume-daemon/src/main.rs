@@ -3041,7 +3041,11 @@ fn identify_scope(peer: &Peer) -> IdentifyScope {
 /// AddScans to a profile that was never created.
 fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
     match outcome {
-        irlume_auth::EnrollOutcome::New { name, scans } => Response::Enrolled {
+        irlume_auth::EnrollOutcome::New {
+            name,
+            scans,
+            ambient_lit,
+        } => Response::Enrolled {
             profile: name,
             created: true,
             added: scans,
@@ -3050,6 +3054,7 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             // per-recognizer room is the plain remainder.
             room: Some(irlume_core::storage::MAX_SCANS_PER_PROFILE.saturating_sub(scans)),
             added_scans: Vec::new(),
+            ambient_lit: Some(ambient_lit),
         },
         irlume_auth::EnrollOutcome::Merged {
             name,
@@ -3057,6 +3062,7 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             total,
             room,
             added_scans,
+            ambient_lit,
         } => Response::Enrolled {
             profile: name,
             created: false,
@@ -3064,6 +3070,7 @@ fn enroll_response(outcome: irlume_auth::EnrollOutcome) -> Response {
             total,
             room: Some(room),
             added_scans,
+            ambient_lit: Some(ambient_lit),
         },
     }
 }
@@ -3601,6 +3608,7 @@ mod tests {
             total: 8,
             room: 22,
             added_scans: vec!["Face Scan 8".into()],
+            ambient_lit: 1,
         });
         match merged {
             Response::Enrolled {
@@ -3610,8 +3618,15 @@ mod tests {
                 total,
                 room,
                 added_scans,
+                ambient_lit,
             } => {
                 assert_eq!(profile, "Face Profile 1");
+                assert_eq!(
+                    ambient_lit,
+                    Some(1),
+                    "the ambient-lit count must reach the client as Some, so \
+                     an older daemon's silence (None) stays distinguishable"
+                );
                 assert!(!created, "a merge must not claim a new profile was created");
                 assert_eq!((added, total), (1, 8));
                 assert_eq!(
@@ -3627,6 +3642,7 @@ mod tests {
         let new = enroll_response(irlume_auth::EnrollOutcome::New {
             name: "Face Profile 2".into(),
             scans: 3,
+            ambient_lit: 0,
         });
         match new {
             Response::Enrolled {

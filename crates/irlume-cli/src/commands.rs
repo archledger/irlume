@@ -1635,8 +1635,16 @@ fn run_enroll(user: &str, reset: bool) {
             profile,
             created,
             total,
+            ambient_lit,
             ..
         }) => {
+            if let Some(n) = ambient_lit.filter(|&n| n > 0) {
+                println!(
+                    "  {n} scan(s) were lit mainly by the room, not provably by the IR \
+                     emitter; dark-room login is unverified. Check it with the lights \
+                     off: irlume identify"
+                );
+            }
             if created {
                 println!("  enrolled '{profile}' with {total} scans {OK}");
             } else {

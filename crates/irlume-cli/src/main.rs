@@ -266,8 +266,16 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             created,
             added,
             total,
+            ambient_lit,
             ..
         }) => {
+            if let Some(n) = ambient_lit.filter(|&n| n > 0) {
+                println!(
+                    "[enroll] {n} scan(s) were lit mainly by the room, not provably by the \
+                     IR emitter; dark-room login is unverified. Check it with the lights \
+                     off: irlume identify"
+                );
+            }
             if created {
                 println!("[enroll] enrolled '{profile}' with {total} scans");
                 offer_blink_challenge(&user);
@@ -1675,8 +1683,19 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
         .unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
     eprintln!("[enrolldev] '{user}': {want} scans into IRLUME_STATE_DIR; stay in frame…");
     match engine(det, model, args).and_then(|mut e| e.enroll_profile(&user, name, want)) {
-        Ok(irlume_auth::EnrollOutcome::New { name, scans }) => {
+        Ok(irlume_auth::EnrollOutcome::New {
+            name,
+            scans,
+            ambient_lit,
+        }) => {
             println!("[enrolldev] enrolled '{name}' ({scans} scans)");
+            if ambient_lit > 0 {
+                println!(
+                    "[enrolldev] {ambient_lit} of {scans} scans were lit mainly by the room, \
+                     not provably by the IR emitter; dark-room login is unverified. Check it: \
+                     turn the lights off and run `irlume identify` (#312)"
+                );
+            }
             std::process::ExitCode::SUCCESS
         }
         Ok(irlume_auth::EnrollOutcome::Merged {

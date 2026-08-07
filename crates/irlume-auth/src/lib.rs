@@ -144,6 +144,13 @@ pub struct Assessment {
     pub signals: Signals,
     pub ir_center_edge_ratio: f32,
     pub ir_brightness: f32,
+    /// How much of the IR burst's lit-frame brightness the ROOM supplied:
+    /// `ambient_mean / lit_mean` from the same burst, 0.0 on the RGB-only
+    /// path. Near 0 means the emitter's own contribution lit the face (the
+    /// dark-capable case); near 1 means the scene did, and an enrollment
+    /// built from such scans has never proven it works without that scene
+    /// light (#312).
+    pub ir_ambient_share: f32,
     /// Both eyes read open (IR corneal-glint heuristic). Used only when a profile
     /// opts into the require-eyes-open gate. `false` if eyes couldn't be verified.
     pub eyes_open: bool,
@@ -251,7 +258,19 @@ struct CapturedScan {
     brightness: f32,
     /// Head pitch fraction at capture (calibrates this user's pitch neutral).
     pitch: f32,
+    /// Room's share of the IR lit-frame brightness at capture
+    /// ([`Assessment::ir_ambient_share`]).
+    ambient_share: f32,
 }
+
+/// A scan whose IR burst the ROOM at least half lit counts as ambient-lit:
+/// the emitter's own proven contribution was the minority, so the scan has
+/// never demonstrated it works without that scene light (#312). Anchors,
+/// measured: a working emitter in a dark or indoor room reads a share near 0
+/// (NexiGo ambient 0; Zenbook night bursts 0.5 ambient against 35-70 lit);
+/// the #187 lockout enrolled on an emitterless USB2 Brio under daylight,
+/// share near 1, and the next dark identify was denied every time.
+const AMBIENT_LIT_SHARE: f32 = 0.5;
 
 /// Presence grace window after the consent gesture, milliseconds, for the
 /// login and lock-screen path. The user pressed Enter (usually already in
@@ -1191,6 +1210,7 @@ impl Engine {
             signals,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
+            ir_ambient_share: 0.0, // RGB-only path: no IR burst to measure
             eyes_open: false,
             thirdparty_fake: None,
         })
@@ -1505,6 +1525,7 @@ impl Engine {
                 signals: Default::default(),
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
+                ir_ambient_share: 0.0,
                 eyes_open: false,
                 thirdparty_fake: None,
             });
@@ -1664,6 +1685,10 @@ impl Engine {
             signals,
             ir_center_edge_ratio,
             ir_brightness,
+            // The share the room supplied of the burst's lit-frame mean; the
+            // denominator floor keeps a black burst (lit ~0) reading as 0
+            // share rather than dividing to noise.
+            ir_ambient_share: ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0),
             eyes_open,
             thirdparty_fake,
         })
@@ -2913,6 +2938,7 @@ impl Engine {
                         center_edge_ratio: a.ir_center_edge_ratio,
                         brightness: a.ir_brightness,
                         pitch: a.signals.head_pitch_frac,
+                        ambient_share: a.ir_ambient_share,
                     });
                 }
             }
@@ -3020,7 +3046,11 @@ impl Engine {
             }
             let added = captured.len().min(room);
             let mut added_scans = Vec::with_capacity(added);
+            let mut ambient_lit = 0usize;
             for s in captured.into_iter().take(room) {
+                if s.ambient_share >= AMBIENT_LIT_SHARE {
+                    ambient_lit += 1;
+                }
                 let sname = enr.profiles[idx].next_scan_name();
                 added_scans.push(sname.clone());
                 let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
@@ -3048,6 +3078,7 @@ impl Engine {
                 total,
                 room,
                 added_scans,
+                ambient_lit,
             });
         }
         if enr.profiles.len() >= MAX_PROFILES {
@@ -3062,7 +3093,11 @@ impl Engine {
             name: name.clone(),
             scans: Vec::new(),
         };
+        let mut ambient_lit = 0usize;
         for s in captured {
+            if s.ambient_share >= AMBIENT_LIT_SHARE {
+                ambient_lit += 1;
+            }
             let sname = prof.next_scan_name();
             let ir_space = s.ir.as_ref().map(|_| self.ir_space.clone());
             prof.scans.push(FaceScan {
@@ -3083,7 +3118,11 @@ impl Engine {
             enr.camera_binding = Some(self.current_binding());
         }
         storage::save(&enr)?;
-        Ok(EnrollOutcome::New { name, scans: n })
+        Ok(EnrollOutcome::New {
+            name,
+            scans: n,
+            ambient_lit,
+        })
     }
 
     /// Snapshot the identity of the cameras this engine is bound to, for
@@ -3410,8 +3449,14 @@ fn luma_in_bbox(rgb: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
 /// What [`Engine::enroll_profile`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnrollOutcome {
-    /// A new face profile was created.
-    New { name: String, scans: usize },
+    /// A new face profile was created. `ambient_lit` counts the scans whose
+    /// IR burst the room at least half lit ([`AMBIENT_LIT_SHARE`]): above
+    /// zero, dark-room login is unverified for this enrollment (#312).
+    New {
+        name: String,
+        scans: usize,
+        ambient_lit: usize,
+    },
     /// The captured face already owned `name`, so the capture was added to that
     /// profile instead (`added` new scans, `total` scans now) and the
     /// per-enrollment calibration was refitted. This is what makes `irlume
@@ -3429,6 +3474,10 @@ pub enum EnrollOutcome {
         /// merge by deleting exactly them (the TUI does this on a declined
         /// "add to the existing profile?" confirm).
         added_scans: Vec<String>,
+        /// Scans among `added` whose IR burst the room at least half lit
+        /// ([`AMBIENT_LIT_SHARE`]); above zero, dark-room login is
+        /// unverified for the new scans (#312).
+        ambient_lit: usize,
     },
 }
 

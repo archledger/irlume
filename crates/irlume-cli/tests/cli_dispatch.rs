@@ -579,6 +579,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             total: 8,
             room: Some(22),
             added_scans: Vec::new(),
+            ambient_lit: None,
         },
         Request::SealPassword { .. } => Response::PasswordSealed,
         _ => Response::Error("unexpected request".into()),

@@ -1571,6 +1571,7 @@ fn enroll_reports_a_new_profile_and_forwards_the_flags() {
         total: 3,
         room: Some(27),
         added_scans: vec!["Scan 1".into(), "Scan 2".into(), "Scan 3".into()],
+        ambient_lit: None,
     });
     let (code, out, _) = run(&mut sb.cmd(&[
         "enroll", "--user", "tester", "--name", "Night", "--scans", "3",
@@ -1605,6 +1606,7 @@ fn enroll_merge_points_at_add_scan() {
         total: 8,
         room: Some(22),
         added_scans: vec!["Scan 7".into(), "Scan 8".into()],
+        ambient_lit: None,
     });
     let (code, out, _) = run(&mut sb.cmd(&["enroll", "--user", "tester"]));
     assert_eq!(code, 0);
@@ -1785,6 +1787,7 @@ fn setup_walks_every_step_noninteractively() {
             total: 6,
             room: Some(24),
             added_scans: Vec::new(),
+            ambient_lit: None,
         },
         Request::SealPassword { .. } => Response::PasswordSealed,
         _ => Response::Error("unexpected request".into()),

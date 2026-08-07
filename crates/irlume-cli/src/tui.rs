@@ -395,7 +395,11 @@ enum WMsg {
     Stall(String),
     Count(u8),
     Captured(usize, usize),
-    Done,
+    Done {
+        /// Scans whose IR burst the room mostly lit; above zero the UI says
+        /// dark-room login is unverified (#312).
+        ambient_lit: usize,
+    },
     Err(String),
     /// Scan 1 of a "new profile" enroll matched an existing identity, so the
     /// daemon merged it into `profile` instead. The worker ends here and hands
@@ -2259,8 +2263,18 @@ impl App {
                         }
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
                     }
-                    WMsg::Done => {
+                    WMsg::Done { ambient_lit } => {
                         self.log('✓', "enrollment complete");
+                        if ambient_lit > 0 {
+                            self.log(
+                                '!',
+                                format!(
+                                    "{ambient_lit} scan(s) were lit mainly by the room, not \
+                                     provably by the IR emitter; dark-room login is unverified. \
+                                     Check it with the lights off: irlume identify"
+                                ),
+                            );
+                        }
                         finished = true;
                     }
                     WMsg::Err(e) => {
@@ -6199,6 +6213,9 @@ fn enroll_worker(
     tx: mpsc::Sender<WMsg>,
 ) {
     let send = |m: WMsg| tx.send(m).is_ok();
+    // Scans this worker added whose IR burst the room mostly lit (#312);
+    // summed across captures and reported once at Done.
+    let mut ambient_lit_total = 0usize;
     for i in 0..target {
         // Consecutive guide misses for THIS scan, framing and countdown
         // together; only a successful sample resets it.
@@ -6255,7 +6272,14 @@ fn enroll_worker(
                     return;
                 }
                 // A brand-new profile (created) or an AddScan success.
-                Ok(Response::Enrolled { .. }) | Ok(Response::Ok(_)) => {
+                Ok(Response::Enrolled { ambient_lit, .. }) => {
+                    ambient_lit_total += ambient_lit.unwrap_or(0);
+                    if !send(WMsg::Captured(i + 1, target)) {
+                        return;
+                    }
+                    break 'scan;
+                }
+                Ok(Response::Ok(_)) => {
                     if !send(WMsg::Captured(i + 1, target)) {
                         return;
                     }
@@ -6276,7 +6300,9 @@ fn enroll_worker(
             }
         }
     }
-    let _ = send(WMsg::Done);
+    let _ = send(WMsg::Done {
+        ambient_lit: ambient_lit_total,
+    });
 }
 
 #[cfg(test)]
@@ -8471,7 +8497,7 @@ mod tests {
         let mut app = test_app();
         let (tx, enroll) = fake_enroll(0, 4);
         app.enroll = Some(enroll);
-        tx.send(WMsg::Done).unwrap();
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
         app.poll();
         assert!(app.enroll.is_none());
         assert!(

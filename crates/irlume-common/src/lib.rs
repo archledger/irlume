@@ -773,6 +773,15 @@ pub enum Response {
         #[serde(default)]
         room: Option<usize>,
         added_scans: Vec<String>,
+        /// Of the scans just added, how many had their IR burst at least
+        /// half lit by the ROOM rather than provably by the emitter. Above
+        /// zero, the enrollment measured a property of the lighting as well
+        /// as the user, and dark-room login is unverified until tried
+        /// (#312: "enroll at noon, locked out at night" on a camera whose
+        /// emitter never fires). `None` means the daemon did not say (any
+        /// daemon older than 0.9.1), which callers must not render as 0.
+        #[serde(default)]
+        ambient_lit: Option<usize>,
     },
     SelfTest {
         passed: bool,
@@ -973,6 +982,35 @@ pub(crate) mod testenv {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    /// The upgrade window: a 0.9.1 client reading an Enrolled reply from a
+    /// still-running older daemon. The wire JSON has no `ambient_lit`, and
+    /// that must read as `None` ("the daemon did not say"), never as
+    /// `Some(0)` ("the daemon measured zero ambient-lit scans") — the same
+    /// distinction `room` carries for #290, applied to #312.
+    #[test]
+    fn enrolled_without_ambient_lit_reads_as_daemon_did_not_say() {
+        let full = super::Response::Enrolled {
+            profile: "p".into(),
+            created: true,
+            added: 3,
+            total: 3,
+            room: Some(22),
+            added_scans: vec!["scan1".into()],
+            ambient_lit: Some(2),
+        };
+        let mut v = serde_json::to_value(&full).expect("serialize");
+        let obj = v
+            .get_mut("Enrolled")
+            .and_then(|e| e.as_object_mut())
+            .expect("externally tagged Enrolled object");
+        obj.remove("ambient_lit").expect("field serializes");
+        let old: super::Response = serde_json::from_value(v).expect("older-daemon shape parses");
+        let super::Response::Enrolled { ambient_lit, .. } = old else {
+            panic!("round-trip changed the variant");
+        };
+        assert_eq!(ambient_lit, None, "absent must be None, not Some(0)");
+    }
 
     /// Every directory whose entry has to survive is in the chain, shallowest
     /// first, including the one a RELATIVE state root is anchored in.
@@ -1367,6 +1405,7 @@ mod tests {
                 total: 3,
                 room: Some(27),
                 added_scans: vec![],
+                ambient_lit: Some(0),
             },
             Response::Enrolled {
                 profile: "Face Profile 1".into(),
@@ -1375,6 +1414,7 @@ mod tests {
                 total: 8,
                 room: Some(22),
                 added_scans: vec!["scan8".into()],
+                ambient_lit: Some(2),
             },
         ] {
             let wire = serde_json::to_string(&r).unwrap();
@@ -1388,6 +1428,7 @@ mod tests {
                         total: t1,
                         room: r1,
                         added_scans: s1,
+                        ambient_lit: l1,
                     },
                     Response::Enrolled {
                         profile: p2,
@@ -1396,9 +1437,10 @@ mod tests {
                         total: t2,
                         room: r2,
                         added_scans: s2,
+                        ambient_lit: l2,
                     },
                 ) => {
-                    assert_eq!((p1, c1, a1, t1, r1, s1), (p2, c2, a2, t2, r2, s2));
+                    assert_eq!((p1, c1, a1, t1, r1, s1, l1), (p2, c2, a2, t2, r2, s2, l2));
                 }
                 _ => panic!("Enrolled did not round-trip to Enrolled"),
             }

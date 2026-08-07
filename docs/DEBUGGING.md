@@ -188,9 +188,13 @@ A value that does not parse, is not finite, or sits outside the range its
 setting accepts is ignored: the default above stays in force and irlumed prints
 one line to the journal naming the variable and the reason. Check for that line
 before concluding a tuned threshold took effect. The same holds for
-`IRLUME_NOD_PITCH_MIN`, `IRLUME_CONSENT_CLOSURE_FRAMES` and
-`IRLUME_CONSENT_CLOSURE_MAX`, whose maximum must not be below the minimum in
-force.
+`IRLUME_NOD_PITCH_MIN` and the two consent-closure settings.
+
+`IRLUME_CONSENT_CLOSURE_FRAMES` and `IRLUME_CONSENT_CLOSURE_MAX` are resolved as
+a pair, and the resulting window is always satisfiable. A maximum below the
+minimum in force is refused, and a minimum above the built-in maximum of 25
+carries the maximum up with it rather than leaving a window no closure can fall
+inside.
 
 `IRLUME_DEBUG_IR` (any value) additionally logs the IR burst's
 ambient-subtraction decisions frame by frame.

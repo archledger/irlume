@@ -302,6 +302,36 @@ pub const GRACE_WINDOW_MS: u64 = 15000;
 /// away they want a quick drop to the password prompt, not a long freeze.
 pub const SUDO_GRACE_WINDOW_MS: u64 = 5000;
 
+/// Worst-case wall time of ONE [`Engine::assess`] against a FRAMELESS camera
+/// (#336): a device that opens and arms but never delivers a frame, the shape
+/// an unfed v4l2loopback node reproduces and a starved or half-dead UVC module
+/// presents in the field.
+///
+/// The multiplier is exactly two frameless stream opens back to back, and the
+/// code cannot stack a third: the concurrent capture pair OVERLAPS on threads
+/// (one open's worth of wall time even when both sides are frameless), a hard
+/// failure earns ONE standalone retry of the failed side (`?` on its failure
+/// ends the assess), and the dimming self-heal recapture is skipped whenever
+/// that retry already ran (`rgb_hard_retried`), so its one recapture can only
+/// replace the retry, never add to it.
+///
+/// The allowance covers everything a frameless assess spends outside the two
+/// silent opens: the healthy side's capture (measured 1912ms for a cold RGB+IR
+/// pair on the ASUS built-in, `examples/session_bench.rs`; worst full
+/// sequential pair on hardware here is the NexiGo N930W at ~3.6s, the
+/// `MAX_CROSS_SPECTRUM_SKEW` record), detection and rescue-detection on that
+/// frame, and the device open/negotiation ioctls. 10s is roughly triple that
+/// sum, for slow CPUs.
+///
+/// An `irlume-daemon` test holds this constant against the `WatchdogSec` in
+/// `packaging/systemd/irlumed.service`, so a timeout or retry edit anywhere
+/// under this sum that outgrows the watchdog fails the suite (#336).
+pub const FRAMELESS_ASSESS_WORST_MS: u64 =
+    2 * irlume_camera::FRAMELESS_STREAM_OPEN_WORST_MS + FRAMELESS_OVERHEAD_ALLOWANCE_MS;
+
+/// The non-silent part of [`FRAMELESS_ASSESS_WORST_MS`]; see there.
+const FRAMELESS_OVERHEAD_ALLOWANCE_MS: u64 = 10_000;
+
 /// How far apart the RGB and IR frames of ONE decision may be captured.
 ///
 /// The cross-spectrum cues treat the two frames as one scene: the face must sit
@@ -821,6 +851,22 @@ impl Engine {
     /// True when something has asked this operation to stop.
     fn should_stop(&self) -> bool {
         self.stop_requested.as_ref().is_some_and(|f| f())
+    }
+
+    /// Report a between-captures boundary without acting on the yield request.
+    ///
+    /// Polling the stop signal is what marks watchdog progress in the daemon
+    /// (#141: its closure notes progress, then answers), and the grace loop
+    /// needs that mark between attempts: `IRLUME_GRACE_MS` can stretch the
+    /// window arbitrarily, and a window of healthy no-face captures followed
+    /// by one frameless capture chain summed past `WatchdogSec` with no
+    /// progress reported anywhere between (#336). The answer itself is
+    /// deliberately dropped: only a queued authentication raises it, and
+    /// cutting a RUNNING authentication's grace window for a queued one would
+    /// hand the first user a password prompt whenever a polkit verify races
+    /// the lock screen. Enrolment keeps honoring it via [`Self::should_stop`].
+    fn note_capture_boundary(&self) {
+        let _ = self.should_stop();
     }
 
     /// Assurance tier from the hardware: `Secure` with a real RGB+IR camera,
@@ -2329,6 +2375,10 @@ impl Engine {
                 "grace: attempt {attempt} found no usable face ({}); retrying within window",
                 out.reason
             );
+            // A whole capture ended and another is about to start: the safe
+            // boundary the watchdog counts as progress (#336). Without it the
+            // entire grace window is one silent stretch on the daemon's clock.
+            self.note_capture_boundary();
         };
         // The gesture belongs to the authentication that just ended.
         self.gesture_seen_before_match = false;

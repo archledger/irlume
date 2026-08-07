@@ -268,6 +268,45 @@ struct SafeStream<'a> {
 /// be well inside it.
 const STREAM_DEQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Warm-up retry budget (see [`warm_up_stream`]): how many dequeue attempts
+/// the post-resume race gets, and the pause between them. The race it covers
+/// (uvcvideo re-initializing after suspend or USB re-enumeration) fails FAST,
+/// with EIO/ENODEV in milliseconds, so eight tries spaced 120ms apart cover
+/// roughly a second of re-init without adding meaningful wall time.
+const WARMUP_TRIES: u32 = 8;
+const WARMUP_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// How many of the warm-up tries may be FULL SILENT dequeue windows, i.e. end
+/// in `TimedOut` after blocking for the whole [`STREAM_DEQUEUE_TIMEOUT`].
+///
+/// Split out from [`WARMUP_TRIES`] for #336. A timeout try is nothing like a
+/// resume-race try: it already waited five full seconds with the device armed
+/// and answering poll, so eight of them was 40s inside ONE stream open, and the
+/// auth path stacks two opens back to back (a capture plus the standalone retry
+/// of the failed side), which put a frameless camera past the unit's
+/// `WatchdogSec=90s` and got a working daemon killed. Two windows still
+/// tolerate ten seconds of continuous silence before giving up, which is over
+/// an order of magnitude above every settle time this project has measured
+/// (resume re-init: a few hundred ms; worst full sequential RGB+IR pair, NexiGo
+/// N930W: ~3.6s), so no camera that ever delivered a frame inside the old
+/// budget starts failing under this one.
+const WARMUP_SILENT_TRIES: u32 = 2;
+
+/// Worst-case wall time, in milliseconds, for one stream open against a
+/// FRAMELESS camera (a device that opens, negotiates and arms, then never
+/// delivers a frame; an unfed v4l2loopback node reproduces it exactly).
+///
+/// Derived from the same constants the warm-up runs on, so editing any of them
+/// moves this bound with it: at most `WARMUP_SILENT_TRIES` silent dequeue
+/// windows of `STREAM_DEQUEUE_TIMEOUT` each, plus every inter-try gap the
+/// fast-error retries could add. `irlume-auth` builds its capture-chain worst
+/// case on top of this, and an `irlume-daemon` test holds that sum against the
+/// `WatchdogSec` in `packaging/systemd/irlumed.service` (#336), so a future
+/// edit here that outgrows the watchdog fails the suite instead of shipping.
+pub const FRAMELESS_STREAM_OPEN_WORST_MS: u64 = WARMUP_SILENT_TRIES as u64
+    * STREAM_DEQUEUE_TIMEOUT.as_millis() as u64
+    + WARMUP_TRIES as u64 * WARMUP_GAP.as_millis() as u64;
+
 impl<'a> SafeStream<'a> {
     /// Open a stream on `dev` with the standard buffer ring.
     ///
@@ -3543,18 +3582,25 @@ pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// request, so there is no stale handle to recover; the only gap is that the
 /// very first `stream.next()` can return EIO/ENODEV for a few hundred ms after
 /// resume. Retry that, then let the normal AE warmup run.
+///
+/// `TimedOut` gets its own, smaller budget ([`WARMUP_SILENT_TRIES`]): each such
+/// try already blocked for the full [`STREAM_DEQUEUE_TIMEOUT`], so retrying it
+/// as freely as the fast resume-race errors turned a frameless camera into a
+/// 40s stall per open and, stacked with the auth path's standalone retry, a
+/// watchdog kill of a working daemon (#336). The error returned is the same
+/// one the exhausted loop returned before; a camera silent this long only
+/// fails SOONER, never where it used to succeed.
 fn warm_up_stream(
     device: &str,
     stream: &mut v4l::io::mmap::Stream<'_>,
 ) -> irlume_common::Result<()> {
     use std::io::ErrorKind;
-    const TRIES: u32 = 8;
-    const GAP: std::time::Duration = std::time::Duration::from_millis(120);
-    for attempt in 0..TRIES {
+    let mut silent = 0u32;
+    for attempt in 0..WARMUP_TRIES {
         match stream.next() {
             Ok(_) => return Ok(()),
             Err(e)
-                if attempt + 1 < TRIES
+                if attempt + 1 < WARMUP_TRIES
                     && matches!(
                         e.kind(),
                         ErrorKind::BrokenPipe
@@ -3563,7 +3609,13 @@ fn warm_up_stream(
                             | ErrorKind::TimedOut
                     ) =>
             {
-                std::thread::sleep(GAP);
+                if e.kind() == ErrorKind::TimedOut {
+                    silent += 1;
+                    if silent >= WARMUP_SILENT_TRIES {
+                        return Err(map_io(device, e));
+                    }
+                }
+                std::thread::sleep(WARMUP_GAP);
             }
             Err(e) => return Err(map_io(device, e)),
         }
@@ -5256,6 +5308,60 @@ mod tests {
             assert_eq!((f.width, f.height), (IR_W, IR_H));
             assert_eq!(f.spectrum, Spectrum::Ir);
         }
+    }
+
+    #[test]
+    #[ignore = "needs an unfed v4l2loopback node; set IRLUME_TEST_SPARE_DEVICE (CI does this)"]
+    fn loopback_frameless_capture_fits_the_watchdog_budget() {
+        // The #336 measurement: a camera that streams and then delivers
+        // nothing more (feeder killed under an open device, so the negotiated
+        // format survives) must fail one whole capture inside
+        // FRAMELESS_STREAM_OPEN_WORST_MS plus setup slack. That bound is what
+        // irlume-auth's chain constant and the daemon's WatchdogSec test are
+        // built on, so this is the measured leg of that arithmetic. Before the
+        // warm-up's silent-try split, the same capture ran ~41s (8 timeout
+        // tries of 5s), and two of them stacked by the auth retry crossed the
+        // 90s watchdog.
+        let _lock = env_lock();
+        let Some(spare) = spare_device() else {
+            eprintln!(
+                "SKIPPED loopback_frameless_capture_fits_the_watchdog_budget: \
+                 no IRLUME_TEST_SPARE_DEVICE in this environment"
+            );
+            return;
+        };
+        let _esc = allow_virtual(&spare);
+        let feeder = FfmpegFeeder::spawn(&spare, "color=c=gray:size=640x400:rate=15");
+        // Open (and negotiate GREY) while frames flow; the held fd keeps the
+        // loopback node's format across the feeder's death.
+        let cam = IrCamera::open(&spare).expect("open the fed node");
+        drop(feeder); // now it is a frameless camera
+        let t = std::time::Instant::now();
+        let shot = cam.session().and_then(|mut s| s.capture_with_stats());
+        let ms = t.elapsed().as_millis() as u64;
+        assert!(
+            shot.is_err(),
+            "a frameless node must fail the capture, got a frame after {ms}ms"
+        );
+        // Loopback may replay a residual buffer, so the failure lands either in
+        // the warm-up (two silent windows) or on the burst's first dequeue (one
+        // window). Both must have actually waited a full silent window: an
+        // instant error means this measured an open failure, not the frameless
+        // dequeue path the watchdog arithmetic is about.
+        let window_ms = STREAM_DEQUEUE_TIMEOUT.as_millis() as u64;
+        assert!(
+            ms >= window_ms,
+            "capture failed in {ms}ms, under one {window_ms}ms dequeue window; \
+             this did not exercise the frameless path"
+        );
+        // 2s of slack for session setup (emitter control writes, metadata
+        // queue) on a loaded runner.
+        let bound_ms = FRAMELESS_STREAM_OPEN_WORST_MS + 2_000;
+        assert!(
+            ms <= bound_ms,
+            "frameless capture took {ms}ms, over the {bound_ms}ms budget the \
+             watchdog arithmetic (#336) is built on"
+        );
     }
 
     #[test]

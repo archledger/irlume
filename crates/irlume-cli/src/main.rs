@@ -1486,6 +1486,17 @@ pub(crate) fn daemon_poll(req: &irlume_common::Request) -> Result<irlume_common:
     irlume_common::client::request_poll(req).map_err(|e| e.to_string())
 }
 
+/// Budget for one framing-guide sample (a single RGB capture + detect). Long
+/// enough for a slow first capture, far below `daemon_request`'s 120s capture
+/// budget: against a wedged daemon the guide must FAIL and say so, not sit
+/// for minutes rendering a stale cue as if it were current (#309).
+pub(crate) fn daemon_sample(
+    req: &irlume_common::Request,
+) -> Result<irlume_common::Response, String> {
+    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(10))
+        .map_err(|e| e.to_string())
+}
+
 /// The `on`/`off` word for `profiles eyes-open|challenge`, read as the argument
 /// AFTER the subcommand rather than found anywhere in argv.
 ///

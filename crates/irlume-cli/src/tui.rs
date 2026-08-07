@@ -110,6 +110,11 @@ const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
 /// Scans captured per improve-recognition round (add to an existing profile).
 const ADD_SCANS: usize = irlume_core::storage::IMPROVE_SCANS;
 const GOOD_STREAK: u32 = 3;
+/// Consecutive framing-guide misses (10s budget each) before enrollment gives
+/// up and says the camera never answered. Three misses is ~30s of a daemon
+/// that answers nothing; the #187 wedge sat for minutes behind the old 120s
+/// budget while a stale cue read as a verdict (#309).
+const GUIDE_MISS_LIMIT: u32 = 3;
 /// Full auto-refresh cadence in ms (fingerprint probe + diagnostics; spawns
 /// subprocesses, so it runs on the slow timer).
 const HEAVY_REFRESH_MS: u64 = 10_000;
@@ -381,8 +386,13 @@ struct RecoveryInfo {
 }
 
 /// Messages streamed from the guided-enroll worker to the UI.
+#[derive(Debug)]
 enum WMsg {
     Cue(PositionReport),
+    /// A framing-guide poll got no answer (timeout / connection error). NOT a
+    /// biometric observation: the UI must stop showing the last cue as if it
+    /// were current (#309).
+    Stall(String),
     Count(u8),
     Captured(usize, usize),
     Done,
@@ -416,6 +426,11 @@ struct EnrollUi {
     profile: String,
     last: Option<PositionReport>,
     count: Option<u8>,
+    /// The framing guide stopped answering (timeout or connection error), with
+    /// the transport error. Rendered INSTEAD of the last cue: a stale
+    /// "No face detected" reads as a biometric verdict and sends the user
+    /// into lighting adjustments against a hung capture (#309).
+    stalled: Option<String>,
     captured: usize,
     target: usize,
     /// Scans already on the profile from this enroll session before the worker
@@ -2069,6 +2084,7 @@ impl App {
             profile,
             last: None,
             count: None,
+            stalled: None,
             captured: 0,
             target,
             base: 0,
@@ -2101,6 +2117,7 @@ impl App {
             profile: mc.profile,
             last: None,
             count: None,
+            stalled: None,
             captured: 0,
             target: mc.remaining,
             base,
@@ -2219,6 +2236,13 @@ impl App {
                     WMsg::Cue(r) => {
                         if let Some(e) = &mut self.enroll {
                             e.last = Some(r);
+                            e.count = None;
+                            e.stalled = None;
+                        }
+                    }
+                    WMsg::Stall(err) => {
+                        if let Some(e) = &mut self.enroll {
+                            e.stalled = Some(err);
                             e.count = None;
                         }
                     }
@@ -3654,6 +3678,7 @@ impl App {
             profile: name,
             last: None,
             count: None,
+            stalled: None,
             captured: 0,
             target: ENROLL_SCANS,
             base: 0,
@@ -3923,6 +3948,32 @@ impl App {
                 Style::new().add_modifier(Modifier::BOLD),
             )),
             Line::raw(""),
+        ];
+        if let Some(err) = &e.stalled {
+            // Not a biometric verdict: the guide stopped answering, so EVERY
+            // live reading (quality bar, checklist, guidance) is stale and
+            // rendering any of it reads as a current verdict against a hung
+            // capture (#309). The stall replaces the whole live panel.
+            lines.push(Line::from(vec![
+                Span::styled("  ✗ ", Style::new().fg(th().err)),
+                Span::styled(
+                    "Camera guide not answering; this is not about your face or lighting.",
+                    Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("    ({err}) Check: journalctl -u irlumed -n 50"),
+                Style::new().dim(),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  [esc] cancel",
+                Style::new().dim(),
+            )));
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+        lines.extend([
             Line::from(vec![
                 Span::raw("  Quality  "),
                 Span::styled(
@@ -3947,7 +3998,7 @@ impl App {
                 "Well lit",
             ),
             Line::raw(""),
-        ];
+        ]);
         if let Some(c) = e.count {
             lines.push(Line::from(Span::styled(
                 format!("  ● Hold still; capturing in {c}…",),
@@ -6006,6 +6057,137 @@ fn map_settings(resp: Response) -> (bool, String) {
     }
 }
 
+/// One transport miss against the framing guide, counted toward
+/// [`GUIDE_MISS_LIMIT`]. Sends the stall (or the final give-up error) to the
+/// UI. Returns what the caller must do next.
+fn guide_miss(misses: &mut u32, e: String, send: &impl Fn(WMsg) -> bool) -> GuideOutcome {
+    *misses += 1;
+    if *misses >= GUIDE_MISS_LIMIT {
+        let _ = send(WMsg::Err(format!(
+            "the camera guide never answered ({e}); this is not a \
+             detection result. Check: journalctl -u irlumed -n 50"
+        )));
+        return GuideOutcome::Halt;
+    }
+    if !send(WMsg::Stall(e)) {
+        return GuideOutcome::Halt;
+    }
+    GuideOutcome::Reframe
+}
+
+enum GuideOutcome {
+    /// Well-framed streak held through the countdown: fire the capture.
+    Ready,
+    /// Framing drifted or a sample was missed (under the limit): re-frame.
+    /// The consecutive-miss counter lives with the SCAN, not this attempt,
+    /// so countdown misses cannot reset it by re-entering (Codex round on
+    /// #309: the re-entry reset made a flapping daemon loop forever).
+    Reframe,
+    /// Stop was requested, the UI hung up, or a fatal error was sent.
+    Halt,
+}
+
+/// Framing streak + 3-2-1 countdown for one capture attempt, over an
+/// injectable sampler so the miss/give-up state machine is testable without
+/// a daemon socket.
+fn guide_until_capture(
+    user: &str,
+    stop: &AtomicBool,
+    send: &impl Fn(WMsg) -> bool,
+    sample: &mut impl FnMut(&Request) -> Result<Response, String>,
+    misses: &mut u32,
+) -> GuideOutcome {
+    // Framing loop: wait for a well-framed streak. Samples use a bounded
+    // budget: a guide that does not answer is a transport fact, not a
+    // framing fact, and must never leave the last cue on screen reading as
+    // a current biometric verdict (#309). A missed sample shows a visible
+    // "not answering" state; GUIDE_MISS_LIMIT consecutive misses (across
+    // framing AND countdown) end the enrollment saying so plainly.
+    let mut streak = 0u32;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        match sample(&Request::PositionSample {
+            user: Some(user.to_owned()),
+        }) {
+            Ok(Response::Position(r)) => {
+                *misses = 0;
+                let good = r.well_framed;
+                if !send(WMsg::Cue(r)) {
+                    return GuideOutcome::Halt;
+                }
+                streak = if good { streak + 1 } else { 0 };
+                if streak >= GOOD_STREAK {
+                    break;
+                }
+            }
+            Ok(Response::Error(e)) => {
+                let _ = send(WMsg::Err(e));
+                return GuideOutcome::Halt;
+            }
+            // A response of the wrong type is a protocol break, not a cue to
+            // retry: swallowing it here would spin a tight request loop
+            // against a confused daemon.
+            Ok(o) => {
+                let _ = send(WMsg::Err(format!(
+                    "camera guide answered with the wrong response type: {o:?}"
+                )));
+                return GuideOutcome::Halt;
+            }
+            Err(e) => {
+                streak = 0;
+                match guide_miss(misses, e, send) {
+                    GuideOutcome::Reframe => {} // stay in the framing loop
+                    halt => return halt,
+                }
+            }
+        }
+    }
+    // 3-2-1 countdown: re-verify framing at each beat (the poll lands
+    // just before the next beat / the capture). Drift off-angle aborts.
+    for c in (1..=3).rev() {
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        if !send(WMsg::Count(c)) {
+            return GuideOutcome::Halt;
+        }
+        std::thread::sleep(Duration::from_millis(650));
+        match sample(&Request::PositionSample {
+            user: Some(user.to_owned()),
+        }) {
+            // Still framed: keep counting (don't send a Cue; that would
+            // clear the on-screen count). Only surface a cue on abort.
+            Ok(Response::Position(r)) if r.well_framed => {
+                *misses = 0;
+            }
+            Ok(Response::Position(r)) => {
+                *misses = 0;
+                let _ = send(WMsg::Cue(r));
+                return GuideOutcome::Reframe;
+            }
+            Ok(Response::Error(e)) => {
+                let _ = send(WMsg::Err(e));
+                return GuideOutcome::Halt;
+            }
+            Ok(o) => {
+                let _ = send(WMsg::Err(format!(
+                    "camera guide answered with the wrong response type: {o:?}"
+                )));
+                return GuideOutcome::Halt;
+            }
+            // A mid-countdown miss counts like any other: the counter
+            // survives the trip back through the framing loop.
+            Err(e) => match guide_miss(misses, e, send) {
+                GuideOutcome::Reframe => return GuideOutcome::Reframe,
+                halt => return halt,
+            },
+        }
+    }
+    GuideOutcome::Ready
+}
+
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,
 /// then capture, repeating until `target` scans. Streams cues to the UI.
 fn enroll_worker(
@@ -6018,72 +6200,25 @@ fn enroll_worker(
 ) {
     let send = |m: WMsg| tx.send(m).is_ok();
     for i in 0..target {
+        // Consecutive guide misses for THIS scan, framing and countdown
+        // together; only a successful sample resets it.
+        let mut misses = 0u32;
         // Retry this scan until it's captured while well-framed: a drift during
         // the 3-2-1 aborts the countdown and re-frames instead of firing capture.
         'scan: loop {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            // Framing loop: wait for a well-framed streak.
-            let mut streak = 0u32;
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                match crate::daemon_request(&Request::PositionSample {
-                    user: Some(user.clone()),
-                }) {
-                    Ok(Response::Position(r)) => {
-                        let good = r.well_framed;
-                        if !send(WMsg::Cue(r)) {
-                            return;
-                        }
-                        streak = if good { streak + 1 } else { 0 };
-                        if streak >= GOOD_STREAK {
-                            break;
-                        }
-                    }
-                    Ok(Response::Error(e)) => {
-                        let _ = send(WMsg::Err(e));
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        let _ = send(WMsg::Err(e));
-                        return;
-                    }
-                }
-            }
-            // 3-2-1 countdown: re-verify framing at each beat (the poll lands
-            // just before the next beat / the capture). Drift off-angle aborts.
-            for c in (1..=3).rev() {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                if !send(WMsg::Count(c)) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(650));
-                match crate::daemon_request(&Request::PositionSample {
-                    user: Some(user.clone()),
-                }) {
-                    // Still framed: keep counting (don't send a Cue; that would
-                    // clear the on-screen count). Only surface a cue on abort.
-                    Ok(Response::Position(r)) if r.well_framed => {}
-                    Ok(Response::Position(r)) => {
-                        let _ = send(WMsg::Cue(r));
-                        continue 'scan;
-                    }
-                    Ok(Response::Error(e)) => {
-                        let _ = send(WMsg::Err(e));
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        let _ = send(WMsg::Err(e));
-                        return;
-                    }
-                }
+            match guide_until_capture(
+                &user,
+                &stop,
+                &send,
+                &mut |req| crate::daemon_sample(req),
+                &mut misses,
+            ) {
+                GuideOutcome::Ready => {}
+                GuideOutcome::Reframe => continue 'scan,
+                GuideOutcome::Halt => return,
             }
             // Capture: first scan of a NEW profile creates it; the rest append.
             let req = if i == 0 && add.is_none() {
@@ -6267,6 +6402,7 @@ mod tests {
                 profile: "p".into(),
                 last: None,
                 count: None,
+                stalled: None,
                 captured: 0,
                 target,
                 base,
@@ -8358,6 +8494,119 @@ mod tests {
         assert!(app.enroll.is_none());
         let err = app.error.as_ref().expect("a failed scan must surface");
         assert_eq!(err, "Enrollment failed: camera busy");
+    }
+
+    /// Regression for #309: a framing guide that stops answering must not
+    /// leave the last cue on screen reading as a current biometric verdict.
+    /// The #187 session lost an hour to "No face detected" rendered against
+    /// a wedged capture the user's face could never satisfy.
+    #[test]
+    fn guide_stall_replaces_the_stale_cue_and_names_the_transport() {
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        // The nastiest stale state: every reading GOOD. A stall must hide all
+        // of it, not just the guidance line (Codex round: the checklist and
+        // quality bar are biometric verdicts too).
+        tx.send(WMsg::Cue(good_report(
+            "No face detected; look straight at the camera and center yourself",
+        )))
+        .unwrap();
+        tx.send(WMsg::Count(3)).unwrap();
+        app.poll();
+        tx.send(WMsg::Stall("read timed out".into())).unwrap();
+        app.poll();
+        let e = app.enroll.as_ref().expect("enrollment stays up on a stall");
+        assert_eq!(e.count, None, "a stall aborts the on-screen countdown");
+        let text = draw_text(&app);
+        assert!(
+            text.contains("not answering") && text.contains("journalctl -u irlumed"),
+            "the stall must be named, with the journal pointer: {text}"
+        );
+        assert!(
+            text.contains("read timed out"),
+            "the transport error is shown: {text}"
+        );
+        for stale in [
+            "No face detected",
+            "Quality",
+            "Face detected",
+            "Centered in frame",
+            "Facing the camera",
+            "Well lit",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "stale live reading rendered during a stall: {stale}\n{text}"
+            );
+        }
+        assert!(
+            text.contains("[esc] cancel"),
+            "cancel stays offered: {text}"
+        );
+    }
+
+    /// Codex round on #309: the miss counter must survive the trip from a
+    /// countdown miss back through the framing loop. Before the fix, the
+    /// re-entry re-declared it at zero, so a daemon that flapped (answers
+    /// framing, dies in the countdown) could keep an enrollment looping
+    /// forever without ever reaching the give-up message.
+    #[test]
+    fn countdown_misses_count_toward_the_guide_limit() {
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel();
+        let send = |m: WMsg| tx.send(m).is_ok();
+        // Scripted guide: three well-framed samples reach the countdown, then
+        // every request times out. One countdown miss + two framing misses
+        // must hit GUIDE_MISS_LIMIT (3) with no further requests.
+        let script: Vec<Result<Response, String>> = vec![
+            Ok(Response::Position(good_report("hold still"))),
+            Ok(Response::Position(good_report("hold still"))),
+            Ok(Response::Position(good_report("hold still"))),
+            Err("read timed out".into()),
+            Err("read timed out".into()),
+            Err("read timed out".into()),
+        ];
+        let mut calls = script.into_iter();
+        let mut sample = |_req: &Request| calls.next().expect("guide polled past the give-up");
+        let mut misses = 0u32;
+        let outcome = loop {
+            match guide_until_capture("u", &stop, &send, &mut sample, &mut misses) {
+                GuideOutcome::Reframe => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(outcome, GuideOutcome::Halt), "give-up must halt");
+        assert!(calls.next().is_none(), "all six scripted samples consumed");
+        drop(tx);
+        let msgs: Vec<WMsg> = rx.iter().collect();
+        let last = msgs.last().expect("messages were sent");
+        match last {
+            WMsg::Err(e) => assert!(
+                e.contains("never answered") && e.contains("journalctl"),
+                "the give-up says the guide never answered: {e}"
+            ),
+            o => panic!("the final message must be the give-up error, got {o:?}"),
+        }
+        let stalls = msgs.iter().filter(|m| matches!(m, WMsg::Stall(_))).count();
+        assert_eq!(stalls, 2, "misses below the limit render as stalls");
+    }
+
+    /// A guide that recovers goes back to live cues with no stall residue.
+    #[test]
+    fn cue_after_stall_clears_the_stall() {
+        let mut app = test_app();
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        tx.send(WMsg::Stall("connect refused".into())).unwrap();
+        tx.send(WMsg::Cue(good_report("Hold still"))).unwrap();
+        app.poll();
+        let text = draw_text(&app);
+        assert!(text.contains("Hold still"), "live cues resume: {text}");
+        assert!(
+            !text.contains("not answering"),
+            "no stall residue after a live cue: {text}"
+        );
     }
 
     #[test]

@@ -755,31 +755,59 @@ fn zeroed_buffer(index: u32) -> V4l2Buffer {
 /// The metadata node paired with an IR video node, if the kernel made one.
 ///
 /// uvcvideo registers the metadata node against the same USB interface as its
-/// image node, so the pairing is "same `device` link, different node". Matching
-/// on the interface rather than on `videoN + 1` is what keeps this correct on a
-/// machine with several cameras, where numbering interleaves.
+/// image node, so the pairing is "same `device` link, different node". The
+/// interface alone is NOT enough on a camera whose streams all share one
+/// interface (Logitech Brio: video0 RGB, video1 its metadata, video2 IR,
+/// video3 its metadata): the old lowest-number-first rule handed the IR
+/// camera the RGB stream's metadata queue, whose timestamps can never match
+/// IR frames, so the reader classified nothing forever (#310). Within a
+/// stream the kernel registers the metadata node immediately AFTER its image
+/// node (measured on the Brio's media topology: entity pairs 1/4 and 7/10),
+/// so the right sibling is the lowest-numbered one ABOVE the image node.
 fn metadata_node_for(ir_device: &str) -> Option<String> {
     // Diagnostic kill switch, added while working #187's hardware session.
-    // On a camera whose four nodes share ONE USB interface (Logitech Brio),
-    // the lowest-number-first sibling search below picks the RGB stream's
-    // metadata node for the IR camera, and arming that queue is suspected of
-    // breaking the RGB stream it belongs to (VIDIOC_QBUF EINVAL mid-burst).
-    // The switch exists so that suspicion can be tested on hardware without
-    // a rebuild; absence of the variable changes nothing.
+    // Absence of the variable changes nothing.
     if std::env::var_os("IRLUME_NO_ILLUM_META").is_some_and(|v| v == "1") {
         irlume_common::dlog!("{ir_device}: illumination metadata disabled (IRLUME_NO_ILLUM_META)");
         return None;
     }
     let sysfs = std::path::Path::new("/sys/class/video4linux");
-    let found = siblings_on_same_interface(ir_device, sysfs)
-        .into_iter()
-        .find(|c| offers_uvcm(c));
+    let found = pick_metadata_sibling(
+        ir_device,
+        siblings_on_same_interface(ir_device, sysfs),
+        offers_uvcm,
+    );
     if found.is_none() {
         irlume_common::dlog!(
             "{ir_device}: no sibling node offers UVCM metadata; illumination will come from brightness"
         );
     }
     found
+}
+
+/// The sibling that is this image node's OWN metadata node: the FIRST
+/// same-interface candidate above the image node, and only when it offers
+/// the format. `candidates` must be sorted lowest node number first (as
+/// [`siblings_on_same_interface`] returns them).
+///
+/// A candidate below the image node is an earlier stream's queue (#310).
+/// Scanning FORWARD past a non-metadata node would borrow a LATER stream's
+/// queue: uvcvideo ignores a failed metadata registration and keeps
+/// registering later streams (uvc_driver.c, uvc_meta_register's return
+/// value discarded), so an image node can legitimately have no metadata
+/// node while the next stream has both. Either way a wrong queue's
+/// timestamps never match this stream's frames, so no pair means no
+/// reader, and illumination falls back to brightness by design.
+fn pick_metadata_sibling(
+    image_device: &str,
+    candidates: Vec<String>,
+    offers: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let image = node_number(image_device);
+    candidates
+        .into_iter()
+        .find(|c| node_number(c) > image)
+        .filter(|c| offers(c))
 }
 
 /// Every other v4l2 node registered against the same physical interface as
@@ -875,6 +903,77 @@ fn offers_uvcm(node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #310, the Brio layout: four nodes on ONE interface, so the IR node's
+    /// same-interface candidates include the RGB stream's metadata queue at a
+    /// LOWER number. The pair rule must skip it and take the next node above.
+    #[test]
+    fn single_interface_camera_pairs_ir_with_its_own_metadata_node() {
+        let candidates = vec![
+            "/dev/video0".to_string(), // RGB image
+            "/dev/video1".to_string(), // RGB metadata: the wrong-pair trap
+            "/dev/video3".to_string(), // IR metadata
+        ];
+        let offers = |c: &str| c.ends_with('1') || c.ends_with('3');
+        assert_eq!(
+            pick_metadata_sibling("/dev/video2", candidates, offers),
+            Some("/dev/video3".to_string()),
+            "the IR camera must arm ITS stream's metadata node, not RGB's"
+        );
+    }
+
+    /// Split-interface cameras (NexiGo): the only sibling is the pair.
+    #[test]
+    fn split_interface_pairing_is_unchanged() {
+        let offers = |_: &str| true;
+        assert_eq!(
+            pick_metadata_sibling("/dev/video0", vec!["/dev/video1".into()], offers),
+            Some("/dev/video1".to_string())
+        );
+    }
+
+    /// Only lower-numbered siblings offer the format: that is another
+    /// stream's queue, and no reader beats a wrong reader (brightness is the
+    /// designed fallback).
+    #[test]
+    fn a_lower_numbered_metadata_node_is_never_borrowed() {
+        let offers = |_: &str| true;
+        assert_eq!(
+            pick_metadata_sibling("/dev/video2", vec!["/dev/video1".into()], offers),
+            None
+        );
+    }
+
+    /// Codex round: uvcvideo ignores a failed metadata registration and keeps
+    /// going, so THIS stream can lack its metadata node while a later stream
+    /// on the same interface has both. Scanning forward would borrow the
+    /// later stream's queue; only the immediately next node can be the pair.
+    #[test]
+    fn a_later_streams_metadata_node_is_never_borrowed() {
+        let candidates = vec![
+            "/dev/video1".to_string(), // earlier stream's metadata
+            "/dev/video3".to_string(), // later stream's image
+            "/dev/video4".to_string(), // later stream's metadata
+        ];
+        let offers = |candidate: &str| candidate.ends_with('1') || candidate.ends_with('4');
+        assert_eq!(
+            pick_metadata_sibling("/dev/video2", candidates, offers),
+            None,
+            "missing metadata for this stream must fall back, not borrow a later stream"
+        );
+    }
+
+    /// Double-digit nodes order numerically, not lexically: video10's
+    /// metadata is video11, even with a video9 sibling in the list.
+    #[test]
+    fn pairing_orders_numerically_on_double_digit_nodes() {
+        let candidates = vec!["/dev/video9".to_string(), "/dev/video11".to_string()];
+        let offers = |_: &str| true;
+        assert_eq!(
+            pick_metadata_sibling("/dev/video10", candidates, offers),
+            Some("/dev/video11".to_string())
+        );
+    }
 
     /// Bytes captured from an ASUS IR module, kernel 7.1.5: uvcvideo's 12-byte
     /// header, then a 28-byte payload header (2 standard + PTS + SCR + one

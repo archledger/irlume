@@ -272,40 +272,43 @@ const STREAM_DEQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// the post-resume race gets, and the pause between them. The race it covers
 /// (uvcvideo re-initializing after suspend or USB re-enumeration) fails FAST,
 /// with EIO/ENODEV in milliseconds, so eight tries spaced 120ms apart cover
-/// roughly a second of re-init without adding meaningful wall time.
+/// roughly a second of re-init without adding meaningful wall time. `TimedOut`
+/// keeps the same full budget on purpose: a camera that sits silent for two
+/// windows and delivers on its third succeeded before #336 and must keep
+/// succeeding after it (Codex review of PR #338), so the watchdog problem is
+/// solved by REPORTING each returned window, never by shrinking this budget.
 const WARMUP_TRIES: u32 = 8;
 const WARMUP_GAP: std::time::Duration = std::time::Duration::from_millis(120);
 
-/// How many of the warm-up tries may be FULL SILENT dequeue windows, i.e. end
-/// in `TimedOut` after blocking for the whole [`STREAM_DEQUEUE_TIMEOUT`].
+/// A between-boundaries progress reporter for long camera work (#141, #336).
 ///
-/// Split out from [`WARMUP_TRIES`] for #336. A timeout try is nothing like a
-/// resume-race try: it already waited five full seconds with the device armed
-/// and answering poll, so eight of them was 40s inside ONE stream open, and the
-/// auth path stacks two opens back to back (a capture plus the standalone retry
-/// of the failed side), which put a frameless camera past the unit's
-/// `WatchdogSec=90s` and got a working daemon killed. Two windows still
-/// tolerate ten seconds of continuous silence before giving up, which is over
-/// an order of magnitude above every settle time this project has measured
-/// (resume re-init: a few hundred ms; worst full sequential RGB+IR pair, NexiGo
-/// N930W: ~3.6s), so no camera that ever delivered a frame inside the old
-/// budget starts failing under this one.
-const WARMUP_SILENT_TRIES: u32 = 2;
+/// The daemon's watchdog decides the worker has wedged when nothing reports
+/// progress for half of `WatchdogSec`, and a frameless camera legitimately
+/// spends many 5s dequeue windows inside ONE capture. Each COMPLETED window is
+/// reported through this callback: a dequeue that RETURNED `TimedOut` proves
+/// the thread was not stuck in the kernel, while an ioctl that never returns
+/// reports nothing and still looks wedged, which is exactly the distinction
+/// the watchdog exists to make. `Send + Sync` because the concurrent capture
+/// pair polls it from scoped threads. Callers without a watchdog pass
+/// [`no_progress`].
+pub type Progress = std::sync::Arc<dyn Fn() + Send + Sync>;
 
-/// Worst-case wall time, in milliseconds, for one stream open against a
-/// FRAMELESS camera (a device that opens, negotiates and arms, then never
-/// delivers a frame; an unfed v4l2loopback node reproduces it exactly).
-///
-/// Derived from the same constants the warm-up runs on, so editing any of them
-/// moves this bound with it: at most `WARMUP_SILENT_TRIES` silent dequeue
-/// windows of `STREAM_DEQUEUE_TIMEOUT` each, plus every inter-try gap the
-/// fast-error retries could add. `irlume-auth` builds its capture-chain worst
-/// case on top of this, and an `irlume-daemon` test holds that sum against the
-/// `WatchdogSec` in `packaging/systemd/irlumed.service` (#336), so a future
-/// edit here that outgrows the watchdog fails the suite instead of shipping.
-pub const FRAMELESS_STREAM_OPEN_WORST_MS: u64 = WARMUP_SILENT_TRIES as u64
-    * STREAM_DEQUEUE_TIMEOUT.as_millis() as u64
-    + WARMUP_TRIES as u64 * WARMUP_GAP.as_millis() as u64;
+/// A [`Progress`] that reports nowhere, for callers without a watchdog (the
+/// CLI, examples, tests).
+pub fn no_progress() -> Progress {
+    std::sync::Arc::new(|| {})
+}
+
+/// The longest a correctly wired capture path can wait inside ONE driver call
+/// before either delivering, erroring, or reporting progress: a full dequeue
+/// window plus the warm-up pause that precedes the next one. In milliseconds,
+/// derived from the constants it names so an edit to either moves this bound
+/// with it. `irlume-auth` builds its worst-case silent stretch on top of this,
+/// and an `irlume-daemon` test holds that stretch against the `WatchdogSec` in
+/// `packaging/systemd/irlumed.service` (#336), so lengthening a dequeue window
+/// past what the watchdog tolerates fails the suite instead of shipping.
+pub const CAPTURE_SILENT_WINDOW_WORST_MS: u64 =
+    STREAM_DEQUEUE_TIMEOUT.as_millis() as u64 + WARMUP_GAP.as_millis() as u64;
 
 impl<'a> SafeStream<'a> {
     /// Open a stream on `dev` with the standard buffer ring.
@@ -1317,6 +1320,17 @@ impl RgbCamera {
     /// stream until it is dropped, so keep it exactly as long as the burst of
     /// captures that needs it and no longer.
     pub fn session(&self) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress(&no_progress())
+    }
+
+    /// [`Self::session`], reporting each completed silent warm-up window
+    /// through `progress` (#336). The session KEEPS the reporter: its warm-up
+    /// runs lazily on the first capture and again after [`RgbSession::recover`],
+    /// both long after this call returned.
+    pub fn session_with_progress(
+        &self,
+        progress: &Progress,
+    ) -> irlume_common::Result<RgbSession<'_>> {
         // Best-effort backlight/low-light correction: tell auto-exposure to
         // expose for the face, not a bright window behind it. Harmless if
         // unsupported (NexiGo N930W needs this; verified mean 49→124 + face
@@ -1333,6 +1347,7 @@ impl RgbCamera {
             cam: self,
             stream: Some(stream),
             warmed: false,
+            progress: progress.clone(),
         })
     }
 
@@ -1506,6 +1521,9 @@ pub struct RgbSession<'a> {
     /// negotiates, and a plain re-assignment builds the new value first.
     stream: Option<SafeStream<'a>>,
     warmed: bool,
+    /// Per-window heartbeat for the lazy warm-up (#336); owned, not borrowed,
+    /// so holding a session never freezes the caller's other borrows.
+    progress: Progress,
 }
 
 impl<'a> RgbSession<'a> {
@@ -1549,7 +1567,8 @@ impl<'a> RgbSession<'a> {
             return Ok(());
         }
         let device = self.cam.device.clone();
-        warm_up_stream(&device, self.stream()?)?;
+        let progress = self.progress.clone();
+        warm_up_stream(&device, self.stream()?, &progress)?;
         for _ in 0..AE_WARMUP {
             self.stream()?.next().map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
@@ -1601,8 +1620,20 @@ impl<'a> RgbSession<'a> {
 /// One-shot: opens and tears down a session. Callers that capture more than once
 /// should hold an [`RgbCamera`] and its session instead.
 pub fn capture_rgb_burst(device: &str, n: usize) -> irlume_common::Result<Vec<Frame>> {
+    capture_rgb_burst_with_progress(device, n, &no_progress())
+}
+
+/// [`capture_rgb_burst`], reporting each completed silent warm-up window
+/// through `progress` (#336). The daemon-facing paths pass a real reporter so
+/// a frameless camera heartbeats through its retry budget instead of looking
+/// wedged to the watchdog.
+pub fn capture_rgb_burst_with_progress(
+    device: &str,
+    n: usize,
+    progress: &Progress,
+) -> irlume_common::Result<Vec<Frame>> {
     let cam = RgbCamera::open(device)?;
-    let mut session = cam.session()?;
+    let mut session = cam.session_with_progress(progress)?;
     let frames = session.burst(n);
     // Drop the stream before `cam`: the session borrows the device.
     drop(session);
@@ -1934,7 +1965,18 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
 /// genuine match below threshold (false reject). Used for auth/enroll; the
 /// framing guide stays single-shot for latency.
 pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<Frame> {
-    Ok(median_frame(capture_rgb_burst(device, RGB_BURST)?))
+    capture_rgb_denoised_with_progress(device, &no_progress())
+}
+
+/// [`capture_rgb_denoised`] with the per-window progress reporting of
+/// [`capture_rgb_burst_with_progress`] (#336).
+pub fn capture_rgb_denoised_with_progress(
+    device: &str,
+    progress: &Progress,
+) -> irlume_common::Result<Frame> {
+    Ok(median_frame(capture_rgb_burst_with_progress(
+        device, RGB_BURST, progress,
+    )?))
 }
 
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
@@ -2022,8 +2064,17 @@ pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
 /// darkest burst frame's mean is a free per-capture ambient-IR reading (the
 /// input the ambient-relative gates key on), only available at capture time.
 pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    capture_ir_with_stats_and_progress(device, &no_progress())
+}
+
+/// [`capture_ir_with_stats`], reporting each completed silent warm-up window
+/// through `progress` (#336); see [`capture_rgb_burst_with_progress`].
+pub fn capture_ir_with_stats_and_progress(
+    device: &str,
+    progress: &Progress,
+) -> irlume_common::Result<(Frame, IrCaptureStats)> {
     let cam = IrCamera::open(device)?;
-    let mut session = cam.session()?;
+    let mut session = cam.session_with_progress(progress)?;
     let shot = session.capture_with_stats();
     // Drop the stream before `cam`: the session borrows the device.
     drop(session);
@@ -2095,6 +2146,16 @@ impl IrCamera {
     /// module nobody here has seen going dark for a window, which costs the user
     /// a password fallback rather than the hardware.
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
+        self.session_with_progress(&no_progress())
+    }
+
+    /// [`Self::session`], reporting each completed silent warm-up window
+    /// through `progress` (#336). Used transiently: the IR warm-up runs right
+    /// here, and nothing in [`IrSession`] warms up again.
+    pub fn session_with_progress(
+        &self,
+        progress: &Progress,
+    ) -> irlume_common::Result<IrSession<'_>> {
         // DECLARED before the stream so it drops AFTER it. Locals drop in
         // reverse declaration order, and `warm_up_stream` below can fail: with
         // the guard declared second, that `?` dropped it first and sent the
@@ -2132,7 +2193,7 @@ impl IrCamera {
         mode = ir_emitter::enable(self.dev.handle(), &self.card, &self.device);
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
-        warm_up_stream(&self.device, &mut stream)?;
+        warm_up_stream(&self.device, &mut stream, progress)?;
         Ok(IrSession {
             cam: self,
             stream,
@@ -3123,7 +3184,7 @@ pub fn measure_contention(
     ir_dev: &str,
     rounds: usize,
 ) -> irlume_common::Result<ContentionReport> {
-    measure_contention_with_progress(rgb_dev, ir_dev, rounds, &|| {})
+    measure_contention_with_progress(rgb_dev, ir_dev, rounds, &no_progress())
 }
 
 /// [`measure_contention`], reporting between captures.
@@ -3135,18 +3196,20 @@ pub fn measure_contention(
 /// and concurrent captures and can exceed the no-progress deadline, at which
 /// point systemd would kill a daemon that is working perfectly. Reporting at the
 /// same granularity the Engine does, between whole captures, keeps the wedge
-/// detection honest while removing the false kill.
+/// detection honest while removing the false kill. The same reporter is handed
+/// into every capture and session open, so the per-window warm-up heartbeat
+/// (#336) covers the probe's captures too.
 pub fn measure_contention_with_progress(
     rgb_dev: &str,
     ir_dev: &str,
     rounds: usize,
-    progress: &dyn Fn(),
+    progress: &Progress,
 ) -> irlume_common::Result<ContentionReport> {
     verify_pinned(rgb_dev)?;
     verify_pinned(ir_dev)?;
     measure_contention_impl(
-        || capture_rgb_denoised(rgb_dev),
-        || capture_ir_with_stats(ir_dev),
+        || capture_rgb_denoised_with_progress(rgb_dev, progress),
+        || capture_ir_with_stats_and_progress(ir_dev, progress),
         held_concurrent_arm(rgb_dev, ir_dev),
         rounds,
         progress,
@@ -3170,7 +3233,7 @@ pub fn measure_contention_with_progress(
 fn held_concurrent_arm<'d>(
     rgb_dev: &'d str,
     ir_dev: &'d str,
-) -> impl FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()> + 'd {
+) -> impl FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()> + 'd {
     move |rounds, progress, into| {
         let held = RgbCamera::open(rgb_dev).and_then(|r| IrCamera::open(ir_dev).map(|i| (r, i)));
         let (rgb_cam, ir_cam) = match held {
@@ -3185,8 +3248,8 @@ fn held_concurrent_arm<'d>(
             }
         };
         let sessions = rgb_cam
-            .session()
-            .and_then(|rs| ir_cam.session().map(|is| (rs, is)));
+            .session_with_progress(progress)
+            .and_then(|rs| ir_cam.session_with_progress(progress).map(|is| (rs, is)));
         let (mut rs, mut is) = match sessions {
             Ok(pair) => pair,
             Err(e) => {
@@ -3227,12 +3290,12 @@ fn measure_contention_impl<R, I, H>(
     ir_cap: I,
     concurrent_arm: H,
     rounds: usize,
-    progress: &dyn Fn(),
+    progress: &Progress,
 ) -> irlume_common::Result<ContentionReport>
 where
     R: Fn() -> irlume_common::Result<Frame>,
     I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)>,
-    H: FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()>,
+    H: FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()>,
 {
     let rounds = rounds.max(1);
     let mut report = ContentionReport::default();
@@ -3583,23 +3646,54 @@ pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// very first `stream.next()` can return EIO/ENODEV for a few hundred ms after
 /// resume. Retry that, then let the normal AE warmup run.
 ///
-/// `TimedOut` gets its own, smaller budget ([`WARMUP_SILENT_TRIES`]): each such
-/// try already blocked for the full [`STREAM_DEQUEUE_TIMEOUT`], so retrying it
-/// as freely as the fast resume-race errors turned a frameless camera into a
-/// 40s stall per open and, stacked with the auth path's standalone retry, a
-/// watchdog kill of a working daemon (#336). The error returned is the same
-/// one the exhausted loop returned before; a camera silent this long only
-/// fails SOONER, never where it used to succeed.
+/// Every retryable kind, `TimedOut` included, keeps the FULL retry budget: a
+/// camera silent for two 5s windows that delivers on its third warmed up
+/// before #336 and still does (an earlier cut of that fix capped the silent
+/// tries at two and was rejected in review for exactly that regression). What
+/// #336 changed instead is reporting: `progress` is invoked after EACH
+/// COMPLETED `TimedOut` return, so a frameless camera spending its whole
+/// budget here reports a heartbeat every window and the daemon's watchdog
+/// (#141) only starves when a driver call genuinely never returns.
 fn warm_up_stream(
     device: &str,
     stream: &mut v4l::io::mmap::Stream<'_>,
+    progress: &Progress,
 ) -> irlume_common::Result<()> {
+    warm_up_with(
+        device,
+        || stream.next().map(|_| ()),
+        std::thread::sleep,
+        progress,
+    )
+}
+
+/// [`warm_up_stream`] over an injected dequeue and sleep, so the retry budget
+/// and the per-window progress reporting are testable without a camera: the
+/// silent-recovery and reporting contracts each have a unit test whose failure
+/// names the regression (Codex review of PR #338).
+fn warm_up_with<N, S>(
+    device: &str,
+    mut next: N,
+    mut sleep: S,
+    progress: &Progress,
+) -> irlume_common::Result<()>
+where
+    N: FnMut() -> std::io::Result<()>,
+    S: FnMut(std::time::Duration),
+{
     use std::io::ErrorKind;
-    let mut silent = 0u32;
     for attempt in 0..WARMUP_TRIES {
-        match stream.next() {
-            Ok(_) => return Ok(()),
-            Err(e)
+        match next() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // The window COMPLETED: the driver call came back, the thread
+                // was never stuck, and the watchdog clock resets before the
+                // caller spends unbounded time (inference, a retry's reopen)
+                // on the way to the next window. Reported on the terminal try
+                // too, for the same reason.
+                if e.kind() == ErrorKind::TimedOut {
+                    progress();
+                }
                 if attempt + 1 < WARMUP_TRIES
                     && matches!(
                         e.kind(),
@@ -3607,17 +3701,13 @@ fn warm_up_stream(
                             | ErrorKind::NotConnected
                             | ErrorKind::Other
                             | ErrorKind::TimedOut
-                    ) =>
-            {
-                if e.kind() == ErrorKind::TimedOut {
-                    silent += 1;
-                    if silent >= WARMUP_SILENT_TRIES {
-                        return Err(map_io(device, e));
-                    }
+                    )
+                {
+                    sleep(WARMUP_GAP);
+                } else {
+                    return Err(map_io(device, e));
                 }
-                std::thread::sleep(WARMUP_GAP);
             }
-            Err(e) => return Err(map_io(device, e)),
         }
     }
     Ok(())
@@ -3944,7 +4034,7 @@ mod tests {
     fn scripted_arm<'a, R, I>(
         rgb: &'a R,
         ir: &'a I,
-    ) -> impl FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()> + 'a
+    ) -> impl FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()> + 'a
     where
         R: Fn() -> irlume_common::Result<Frame>,
         I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)>,
@@ -3978,7 +4068,7 @@ mod tests {
         };
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // keep the test log clean
-        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &|| {});
+        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress());
         std::panic::set_hook(prev);
         let err = got.expect_err("a panic must abort the probe, never report");
         assert!(err.to_string().contains("panicked"), "{err}");
@@ -4004,7 +4094,7 @@ mod tests {
             }
         };
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
-        let report = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &|| {})
+        let report = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress())
             .expect("an answering camera with an impossible concurrent arm is a verdict");
         assert!(report.concurrent_impossible());
         assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
@@ -4025,11 +4115,11 @@ mod tests {
     fn a_pair_that_cannot_arm_held_streams_is_a_sequential_verdict() {
         let rgb = || Ok(frame(&[100; 4]));
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
-        let arming_fails = |rounds: usize, _p: &dyn Fn(), into: &mut PairSample| {
+        let arming_fails = |rounds: usize, _p: &Progress, into: &mut PairSample| {
             into.failed += rounds;
             Ok(())
         };
-        let report = measure_contention_impl(&rgb, &ir, arming_fails, 2, &|| {})
+        let report = measure_contention_impl(&rgb, &ir, arming_fails, 2, &no_progress())
             .expect("an unarmable held pair with an answering camera is a verdict");
         assert!(report.concurrent_impossible());
         assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
@@ -4052,7 +4142,7 @@ mod tests {
             }
         };
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
-        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &|| {});
+        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress());
         let err = got.expect_err("a dead camera is a failed probe");
         assert!(err.to_string().contains("trailing"), "{err}");
     }
@@ -5315,13 +5405,13 @@ mod tests {
     fn loopback_frameless_capture_fits_the_watchdog_budget() {
         // The #336 measurement: a camera that streams and then delivers
         // nothing more (feeder killed under an open device, so the negotiated
-        // format survives) must fail one whole capture inside
-        // FRAMELESS_STREAM_OPEN_WORST_MS plus setup slack. That bound is what
-        // irlume-auth's chain constant and the daemon's WatchdogSec test are
-        // built on, so this is the measured leg of that arithmetic. Before the
-        // warm-up's silent-try split, the same capture ran ~41s (8 timeout
-        // tries of 5s), and two of them stacked by the auth retry crossed the
-        // 90s watchdog.
+        // format survives) spends the FULL warm-up budget, and what must fit
+        // the watchdog is not that total but the longest stretch between
+        // progress reports. This measures both legs the daemon arithmetic
+        // stands on: the warm-up reported every one of its silent windows
+        // (path assertion, Codex round: the first cut of this test accepted a
+        // residual-buffer branch that never touched the warm-up), and no gap
+        // between reports exceeded CAPTURE_SILENT_WINDOW_WORST_MS plus slack.
         let _lock = env_lock();
         let Some(spare) = spare_device() else {
             eprintln!(
@@ -5336,31 +5426,193 @@ mod tests {
         // loopback node's format across the feeder's death.
         let cam = IrCamera::open(&spare).expect("open the fed node");
         drop(feeder); // now it is a frameless camera
-        let t = std::time::Instant::now();
-        let shot = cam.session().and_then(|mut s| s.capture_with_stats());
-        let ms = t.elapsed().as_millis() as u64;
+
+        // Record the gap ending at each progress report, and the start of the
+        // stretch a report closes.
+        let t0 = std::time::Instant::now();
+        let gaps: std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress: Progress = {
+            let gaps = std::sync::Arc::clone(&gaps);
+            let last = std::sync::Mutex::new(std::time::Instant::now());
+            std::sync::Arc::new(move || {
+                let mut last = last.lock().unwrap();
+                gaps.lock().unwrap().push(last.elapsed());
+                *last = std::time::Instant::now();
+            })
+        };
+        let shot = cam
+            .session_with_progress(&progress)
+            .and_then(|mut s| s.capture_with_stats());
+        let ms = t0.elapsed().as_millis() as u64;
         assert!(
             shot.is_err(),
             "a frameless node must fail the capture, got a frame after {ms}ms"
         );
-        // Loopback may replay a residual buffer, so the failure lands either in
-        // the warm-up (two silent windows) or on the burst's first dequeue (one
-        // window). Both must have actually waited a full silent window: an
-        // instant error means this measured an open failure, not the frameless
-        // dequeue path the watchdog arithmetic is about.
+        // Path assertion: the warm-up itself must have run dry, reporting one
+        // heartbeat per silent window for its whole budget. Fewer reports
+        // means a residual loopback buffer let the warm-up succeed and the
+        // failure landed elsewhere; that run proves nothing about the wiring
+        // this test exists to measure, so it fails rather than passes.
+        let gaps = gaps.lock().unwrap();
+        assert_eq!(
+            gaps.len(),
+            WARMUP_TRIES as usize,
+            "expected one progress report per silent warm-up window \
+             (WARMUP_TRIES={WARMUP_TRIES}), saw {}; the warm-up path was not \
+             the one exercised (residual loopback frame?)",
+            gaps.len()
+        );
+        // The measured leg of the daemon's watchdog arithmetic: no silent
+        // stretch inside camera code may exceed the exported per-window
+        // bound. 2s of slack for session setup (emitter control writes,
+        // metadata queue) and scheduler jitter on a loaded runner.
+        let bound_ms = CAPTURE_SILENT_WINDOW_WORST_MS + 2_000;
+        let worst_ms = gaps
+            .iter()
+            .map(|d| d.as_millis() as u64)
+            .max()
+            .expect("gaps is non-empty");
+        assert!(
+            worst_ms <= bound_ms,
+            "longest gap between progress reports was {worst_ms}ms, over the \
+             {bound_ms}ms per-window bound the watchdog arithmetic (#336) is \
+             built on"
+        );
+        // And each window must be a real wait, not an instant error loop: a
+        // full poll timeout is the shape being measured.
         let window_ms = STREAM_DEQUEUE_TIMEOUT.as_millis() as u64;
         assert!(
-            ms >= window_ms,
-            "capture failed in {ms}ms, under one {window_ms}ms dequeue window; \
-             this did not exercise the frameless path"
+            worst_ms >= window_ms,
+            "longest gap was {worst_ms}ms, under one {window_ms}ms dequeue \
+             window; this did not exercise the silent-window path"
         );
-        // 2s of slack for session setup (emitter control writes, metadata
-        // queue) on a loaded runner.
-        let bound_ms = FRAMELESS_STREAM_OPEN_WORST_MS + 2_000;
+    }
+
+    // ---- warm-up retry/reporting contract (#336, Codex round) ----------
+    // Over the injected core, so both halves are pinned without a camera:
+    // the FULL silent retry budget (a slow camera that delivers late must
+    // keep succeeding) and the per-window heartbeat (a frameless camera must
+    // never look wedged to the watchdog while its driver calls return).
+
+    /// The regression the Codex review of PR #338 caught in the first cut of
+    /// this fix: a camera silent for two full windows that delivers on its
+    /// third warmed up on main and must keep warming up. Reintroducing any
+    /// cap on TimedOut retries fails here.
+    #[test]
+    fn a_camera_delivering_on_its_third_silent_window_still_warms_up() {
+        use std::io::{Error, ErrorKind};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = std::cell::Cell::new(0u32);
+        let pings = std::sync::Arc::new(AtomicU32::new(0));
+        let progress: Progress = {
+            let pings = std::sync::Arc::clone(&pings);
+            std::sync::Arc::new(move || {
+                pings.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let result = warm_up_with(
+            "/dev/test",
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() <= 2 {
+                    Err(Error::new(ErrorKind::TimedOut, "synthetic silent window"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+            &progress,
+        );
         assert!(
-            ms <= bound_ms,
-            "frameless capture took {ms}ms, over the {bound_ms}ms budget the \
-             watchdog arithmetic (#336) is built on"
+            result.is_ok(),
+            "two silent windows then a frame is a WORKING camera: {result:?}"
+        );
+        assert_eq!(calls.get(), 3, "the third dequeue must have been made");
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            2,
+            "each completed silent window reports exactly once"
+        );
+    }
+
+    /// A fully frameless warm-up spends its whole budget and reports EVERY
+    /// window, the terminal one included: the report is what resets the
+    /// watchdog clock before the caller spends unbounded time (inference, a
+    /// reopen) on the way to the next window. Dropping the `progress()` call
+    /// in `warm_up_with`, or shrinking the TimedOut budget, fails here.
+    #[test]
+    fn a_frameless_warm_up_reports_every_completed_silent_window() {
+        use std::io::{Error, ErrorKind};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = std::cell::Cell::new(0u32);
+        let pings = std::sync::Arc::new(AtomicU32::new(0));
+        let progress: Progress = {
+            let pings = std::sync::Arc::clone(&pings);
+            std::sync::Arc::new(move || {
+                pings.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let result = warm_up_with(
+            "/dev/test",
+            || {
+                calls.set(calls.get() + 1);
+                Err(Error::new(ErrorKind::TimedOut, "synthetic silent window"))
+            },
+            |_| {},
+            &progress,
+        );
+        assert!(result.is_err(), "a fully frameless warm-up must fail");
+        assert_eq!(
+            calls.get(),
+            WARMUP_TRIES,
+            "TimedOut keeps the FULL retry budget; a smaller count is the \
+             fail-closed regression the Codex round rejected"
+        );
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            WARMUP_TRIES,
+            "one heartbeat per completed silent window, terminal window included"
+        );
+    }
+
+    /// The resume race keeps its full budget and stays silent on the
+    /// reporter: its errors return in milliseconds, so there is no window to
+    /// report, and asserting zero pins that only TimedOut heartbeats.
+    #[test]
+    fn fast_resume_errors_keep_the_full_retry_budget_without_heartbeats() {
+        use std::io::{Error, ErrorKind};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = std::cell::Cell::new(0u32);
+        let pings = std::sync::Arc::new(AtomicU32::new(0));
+        let progress: Progress = {
+            let pings = std::sync::Arc::clone(&pings);
+            std::sync::Arc::new(move || {
+                pings.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let result = warm_up_with(
+            "/dev/test",
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == WARMUP_TRIES {
+                    Ok(())
+                } else {
+                    Err(Error::new(ErrorKind::NotConnected, "synthetic resume race"))
+                }
+            },
+            |_| {},
+            &progress,
+        );
+        assert!(
+            result.is_ok(),
+            "the last-try frame must warm up: {result:?}"
+        );
+        assert_eq!(calls.get(), WARMUP_TRIES);
+        assert_eq!(
+            pings.load(Ordering::SeqCst),
+            0,
+            "fast errors are not silent windows and must not heartbeat"
         );
     }
 

@@ -2311,12 +2311,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 engine.ir_device().to_string(),
             );
             // Reports between captures so a long but healthy tune is not read
-            // as a wedged driver by the watchdog (#141).
+            // as a wedged driver by the watchdog (#141), and per silent
+            // warm-up window inside each capture (#336).
+            let progress: irlume_auth::Progress = std::sync::Arc::new(note_worker_progress);
             match irlume_auth::measure_contention_with_progress(
-                &rgb_dev,
-                &ir_dev,
-                rounds,
-                &note_worker_progress,
+                &rgb_dev, &ir_dev, rounds, &progress,
             ) {
                 Ok(report) => {
                     let mode = report.recommended_mode();
@@ -4492,25 +4491,31 @@ mod tests {
         assert!(!worker_wedged(short), "idle after a job is still healthy");
     }
 
-    /// The #336 arithmetic gate: the longest silent stretch a defined capture
-    /// failure can produce must fit inside HALF the unit's `WatchdogSec`, with
-    /// margin. Half, because that is the bound under which the watchdog can
-    /// never miss a ping regardless of phase: `spawn_watchdog` ticks every
-    /// `period / 2` and withholds a tick only when the worker has been quiet
-    /// longer than that interval, so a stretch under it always has its tick
-    /// answered, while a stretch past it can line up so the last real ping was
-    /// at the stretch's start and systemd's deadline expires before the next
-    /// one. A frameless camera used to produce ~82-96s of exactly such silence
-    /// in one assess chain (two 40s warm-up stalls plus the grace window) and
-    /// systemd killed a daemon that was working through a defined worst case.
+    /// The #336 arithmetic gate: the longest stretch a defined capture failure
+    /// can go WITHOUT reporting progress must fit inside HALF the unit's
+    /// `WatchdogSec`, with margin. Half, because that is the bound under which
+    /// the watchdog can never miss a ping regardless of phase: `spawn_watchdog`
+    /// ticks every `period / 2` and withholds a tick only when the worker has
+    /// been quiet longer than that interval, so a stretch under it always has
+    /// its tick answered, while a stretch past it can line up so the last real
+    /// ping was at the stretch's start and systemd's deadline expires before
+    /// the next one. A frameless camera used to produce ~82-96s of exactly
+    /// such silence in one assess chain (two 40s warm-up stalls plus the grace
+    /// window) and systemd killed a daemon that was working through a defined
+    /// worst case. The fix reports each RETURNED dequeue window as progress
+    /// (a window that returned proves the thread was never stuck; a wedged
+    /// ioctl still reports nothing), so the bound here is the per-window
+    /// silent stretch, not the capture chain's total.
     ///
     /// Reads the shipped unit rather than repeating "90", so retuning EITHER
-    /// side (a capture timeout, a retry count, or `WatchdogSec` itself) without
-    /// the other fails here instead of shipping a daemon that dies on frameless
-    /// hardware. The chain constant is derived, not free-floating: it is built
-    /// from `irlume-camera`'s dequeue/warm-up constants, and the CI loopback
-    /// test `loopback_frameless_capture_fits_the_watchdog_budget` measures a
-    /// real frameless capture against its camera-side term.
+    /// side (a dequeue window, the warm-up pacing, or `WatchdogSec` itself)
+    /// without the other fails here instead of shipping a daemon that dies on
+    /// frameless hardware. The stretch constant is derived, not free-floating:
+    /// it is built from `irlume-camera`'s dequeue/warm-up constants; the
+    /// per-window heartbeat WIRING it assumes is pinned by irlume-camera's
+    /// `a_frameless_warm_up_reports_every_completed_silent_window`, and the CI
+    /// loopback test `loopback_frameless_capture_fits_the_watchdog_budget`
+    /// measures both on a real frameless capture.
     #[test]
     fn frameless_capture_worst_case_fits_inside_the_watchdog() {
         let unit_path = concat!(
@@ -4529,16 +4534,16 @@ mod tests {
             .expect("WatchdogSec is plain seconds (e.g. 90s)");
         let period_ms = secs * 1000;
         let never_missed_ping_ms = period_ms / 2;
-        // 20% margin under the phase-safe bound, for scheduler jitter, model
-        // inference on a loaded CPU, and open/negotiation ioctls on a sick bus.
+        // 20% margin under the phase-safe bound, for scheduler jitter and
+        // whatever the seam allowance underestimates on a loaded CPU.
         let budget_ms = never_missed_ping_ms * 8 / 10;
         assert!(
-            irlume_auth::FRAMELESS_ASSESS_WORST_MS <= budget_ms,
-            "a frameless capture chain can go {}ms without reporting progress, \
-             over the {budget_ms}ms budget (80% of half of WatchdogSec={secs}s); \
-             shrink a capture timeout or retry count, or raise WatchdogSec in \
+            irlume_auth::CAPTURE_MAX_SILENT_STRETCH_MS <= budget_ms,
+            "a capture path can go {}ms without reporting progress, over the \
+             {budget_ms}ms budget (80% of half of WatchdogSec={secs}s); shorten \
+             the dequeue window, or raise WatchdogSec in \
              packaging/systemd/irlumed.service (#336)",
-            irlume_auth::FRAMELESS_ASSESS_WORST_MS
+            irlume_auth::CAPTURE_MAX_SILENT_STRETCH_MS
         );
     }
 

@@ -219,7 +219,8 @@ jobs:
           sudo udevadm settle
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           fi
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/tmp/feeder-rgb.log 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/tmp/feeder-ir.log 2>&1 &
           # Readiness gate, derived from the v4l2loopback source and measured
           # on real hardware rather than assumed:
           #
@@ -240,6 +241,7 @@ jobs:
           # timeout=N options: both make a DEAD feeder look like a live one,
           # which is the failure this gate exists to catch.
           wait_for_frame() {
+            local dev limit sys deadline rc
             dev="$1"; limit="${2:-30}"
             sys="/sys/devices/virtual/video4linux/${dev##*/}"
             deadline=$(( SECONDS + limit ))
@@ -455,7 +457,8 @@ jobs:
           sudo udevadm settle
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           fi
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/tmp/feeder-rgb.log 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/tmp/feeder-ir.log 2>&1 &
           # Readiness gate, derived from the v4l2loopback source and measured
           # on real hardware rather than assumed:
           #
@@ -476,6 +479,7 @@ jobs:
           # timeout=N options: both make a DEAD feeder look like a live one,
           # which is the failure this gate exists to catch.
           wait_for_frame() {
+            local dev limit sys deadline rc
             dev="$1"; limit="${2:-30}"
             sys="/sys/devices/virtual/video4linux/${dev##*/}"
             deadline=$(( SECONDS + limit ))

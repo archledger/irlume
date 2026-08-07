@@ -5,3 +5,9 @@ self-hosted-runner:
     - arch
     - ir-camera
     - tpm
+    # Shared by BOTH machines, so a light job can land on either instead of
+    # making one of them a single point of failure for a required check.
+    - ci
+    # minihost (Intel N100, CachyOS) capability labels.
+    - cachyos
+    - n100

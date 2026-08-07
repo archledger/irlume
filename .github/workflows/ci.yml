@@ -231,13 +231,17 @@ jobs:
           ready=0
           for _ in $(seq 1 20); do
             sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            # `timeout` is load-bearing: a v4l2loopback node with no producer
-            # blocks an ffmpeg read FOREVER, and this loop then never exits.
-            # Measured on a hosted runner: the unbounded form burned 1501s and
-            # 1867s (the whole job budget) in this step while the build and the
-            # entire test suite together took under four minutes.
-            if timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
-               && timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
+            # `timeout -k` is load-bearing, and the -k matters as much as the
+            # timeout. Measured, not assumed: with a writer attached but
+            # STALLED, an ffmpeg read blocks in the kernel, and plain
+            # `timeout 8` left it alive in futex_wait more than 8 MINUTES
+            # later with the timeout process still waiting on it, because
+            # SIGTERM cannot reach a task blocked in a V4L2 ioctl. -k follows
+            # with SIGKILL, which it cannot ignore. The unbounded form burned
+            # 1501s and 1867s (whole job budgets) in this step, while the
+            # build and the entire test suite together took under 4 minutes.
+            if timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
+               && timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
               ready=1; break
             fi
             for fp in "$rgb_pid:RGB" "$ir_pid:IR"; do
@@ -445,13 +449,17 @@ jobs:
           ready=0
           for _ in $(seq 1 20); do
             sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            # `timeout` is load-bearing: a v4l2loopback node with no producer
-            # blocks an ffmpeg read FOREVER, and this loop then never exits.
-            # Measured on a hosted runner: the unbounded form burned 1501s and
-            # 1867s (the whole job budget) in this step while the build and the
-            # entire test suite together took under four minutes.
-            if timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
-               && timeout 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
+            # `timeout -k` is load-bearing, and the -k matters as much as the
+            # timeout. Measured, not assumed: with a writer attached but
+            # STALLED, an ffmpeg read blocks in the kernel, and plain
+            # `timeout 8` left it alive in futex_wait more than 8 MINUTES
+            # later with the timeout process still waiting on it, because
+            # SIGTERM cannot reach a task blocked in a V4L2 ioctl. -k follows
+            # with SIGKILL, which it cannot ignore. The unbounded form burned
+            # 1501s and 1867s (whole job budgets) in this step, while the
+            # build and the entire test suite together took under 4 minutes.
+            if timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
+               && timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
               ready=1; break
             fi
             for fp in "$rgb_pid:RGB" "$ir_pid:IR"; do

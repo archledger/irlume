@@ -39,17 +39,43 @@ pub mod tpm_pcrlock;
 /// makes each run's dir distinct; ENV_LOCK still serializes within a process.
 #[cfg(test)]
 pub(crate) fn test_tmp_dir(name: &str) -> String {
-    // uid FIRST, then pid (#321 review): the pid alone is not unique over
-    // time (PIDs wrap at kernel.pid_max), so a reused pid could land on
-    // another CI user's stale directory and reproduce the very EACCES
-    // cascade this helper exists to prevent. With the uid in the path, a
-    // stale directory can only ever be OUR OWN, which is why the callers'
-    // `let _ = remove_dir_all(..)` is safe rather than a hidden failure.
     use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata("/proc/self")
-        .map(|m| m.uid())
-        .unwrap_or_else(|_| u32::MAX);
-    format!("/tmp/irlume-test-{name}-u{uid}-p{}", std::process::id())
+    use std::sync::OnceLock;
+
+    // Identity = uid + boot id + pid + process start time (#325 review).
+    // uid alone separates CI users; pid alone is not unique over time because
+    // PIDs wrap at kernel.pid_max, and uid+pid still collides with a stale
+    // directory left by an earlier run of the SAME user that reused the pid.
+    // The boot id changes across reboots and the start time (field 22 of
+    // /proc/self/stat, in clock ticks since boot) distinguishes two processes
+    // that shared a pid within one boot, so a surviving directory can only
+    // belong to a process that is still alive.
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    let identity = IDENTITY.get_or_init(|| {
+        let uid = std::fs::metadata("/proc/self")
+            .expect("stat /proc/self for the test temp-dir uid")
+            .uid();
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .expect("read /proc/sys/kernel/random/boot_id");
+        let stat = std::fs::read_to_string("/proc/self/stat")
+            .expect("read /proc/self/stat for the process start time");
+        // Field 22 counting from 1, but comm (field 2) may contain spaces, so
+        // parse after the closing paren rather than splitting the whole line.
+        let after_comm = stat
+            .rfind(')')
+            .map(|i| &stat[i + 1..])
+            .expect("/proc/self/stat has no comm field");
+        let starttime = after_comm
+            .split_whitespace()
+            .nth(19)
+            .expect("/proc/self/stat has no starttime field");
+        format!(
+            "u{uid}-b{}-p{}-t{starttime}",
+            boot.trim().replace('-', "").get(..8).unwrap_or("00000000"),
+            std::process::id(),
+        )
+    });
+    format!("/tmp/irlume-test-{name}-{identity}")
 }
 
 /// RGB (visible-light) match threshold. Measured FAR: real faces (LFW, 13,233

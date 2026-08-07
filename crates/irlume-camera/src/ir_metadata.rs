@@ -1119,6 +1119,30 @@ mod tests {
         assert_eq!(best_gate_frame(&means, &flags, None), Some(2));
     }
 
+    /// #264, the caller boundary (Codex round on PR #332): a metadata-less
+    /// strobing burst SELECTS its bright phase, because without illumination
+    /// flags selection is the long-standing brightest scan. The chosen frame
+    /// then clears the dark gate, so no dark diagnosis runs and no message
+    /// can mis-advise; the strobe case self-resolves whenever a bright frame
+    /// exists. The occurrences #264 records (chosen mean 28-34) are
+    /// therefore bursts with NO bright frame at all, strobe warmup, which
+    /// no diagnosis arm keyed on in-burst brightness can distinguish from a
+    /// dead emitter; that residual is a capture-policy question, re-scoped
+    /// on the issue.
+    #[test]
+    fn metadata_less_strobe_selects_the_bright_phase() {
+        let means: Vec<f64> = [0.6, 128.0].repeat(5);
+        let flags = vec![None; means.len()];
+        let best_i =
+            best_gate_frame(&means, &flags, None).expect("a non-empty burst has a gate frame");
+        assert_eq!(means[best_i], 128.0);
+        assert!(
+            !(0.0..crate::ir_dark::DARK_MEAN_MAX).contains(&means[best_i])
+                && means[best_i] < crate::ir_dark::SATURATED_MIN_MEAN,
+            "the production caller must not route this burst to dark diagnosis"
+        );
+    }
+
     #[test]
     fn best_gate_frame_skips_a_clipped_brightest_lit_frame() {
         // The #221 case: the brightest lit frame is blown, a dimmer lit frame

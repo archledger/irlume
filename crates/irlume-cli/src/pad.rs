@@ -161,6 +161,100 @@ fn capture_once(
     Ok((verdict, cues, reason, signals))
 }
 
+/// One presentation's JSONL record: the operator labels, the verdict with its
+/// attribution, and every signal the gate read. A function rather than inline
+/// in the capture loop so the schema is testable without a camera: the
+/// 2026-08-04 distance campaign (#174 thread) was captured through this tool
+/// while `capture_once` computed `face_frac` and this record dropped it, so
+/// the one corpus built to answer the distance correlation could not, and the
+/// per-condition table had to be rebuilt by hand from debug lines. The record
+/// now carries the field; a `face_frac` of 0.0 means no face was detected
+/// (see `irlume_auth::face_frac_of`), so an analysis can drop those rows
+/// instead of reading "a face filling nothing".
+#[allow(clippy::too_many_arguments)] // the record IS these nine facts; a struct would rename, not reduce
+fn presentation_record(
+    species: &str,
+    kind: &str,
+    path_str: &str,
+    idx: usize,
+    verdict: Verdict,
+    cues: &irlume_liveness::Cues,
+    reason: &str,
+    caught: Option<&'static str>,
+    s: &Signals,
+) -> serde_json::Value {
+    let mut rec = serde_json::Map::new();
+    rec.insert("species".into(), species.into());
+    rec.insert("kind".into(), kind.into());
+    rec.insert("path".into(), path_str.into());
+    rec.insert("idx".into(), idx.into());
+    rec.insert("verdict".into(), verdict_str(verdict).into());
+    rec.insert("reason".into(), reason.into());
+    rec.insert(
+        "caught".into(),
+        serde_json::to_value(caught.map(|c| vec![c]).unwrap_or_default()).unwrap(),
+    );
+    rec.insert("rgb_present".into(), s.rgb_face.is_some().into());
+    rec.insert("ir_present".into(), s.ir_face.is_some().into());
+    rec.insert(
+        "rgb_score".into(),
+        crate::json_f32(s.rgb_face.map(|f| f.score).unwrap_or(0.0)),
+    );
+    rec.insert(
+        "ir_score".into(),
+        crate::json_f32(s.ir_face.map(|f| f.score).unwrap_or(0.0)),
+    );
+    rec.insert(
+        "ir_brightness".into(),
+        crate::json_f32(s.ir_face_brightness),
+    );
+    // The exposure gate's input and its answer. A record that reported
+    // the cues without these could not distinguish a frame the gate
+    // judged from one it refused unread (#237).
+    rec.insert(
+        "ir_saturated_frac".into(),
+        match s.ir_saturated_frac {
+            Some(f) => crate::json_f32(f),
+            None => serde_json::Value::Null,
+        },
+    );
+    rec.insert("ir_exposure_ok".into(), cues.ir_exposure_ok.into());
+    rec.insert(
+        "ir_center_edge_ratio".into(),
+        crate::json_f32(s.ir_center_edge_ratio),
+    );
+    rec.insert("ir_glint".into(), crate::json_f32(s.ir_eye_glint));
+    let cross = match (s.rgb_face, s.ir_face) {
+        (Some(r), Some(i)) => ((r.cx - i.cx).powi(2) + (r.cy - i.cy).powi(2)).sqrt(),
+        _ => f32::NAN,
+    };
+    rec.insert("cross_dist".into(), crate::json_f32(cross));
+    rec.insert("yaw_asym".into(), crate::json_f32(s.head_yaw_asym));
+    rec.insert("pitch_frac".into(), crate::json_f32(s.head_pitch_frac));
+    // Ambient IR rides with the distance proxy because the two confound each
+    // other in exactly the analysis this corpus exists for: brightness moves
+    // with both seating distance and the scene's own infrared, so near
+    // captures in a dark room against far captures under daylight would be
+    // inseparable without the ambient reading (#174 review). The gate also
+    // reads it, to reword a denial past IR_AMBIENT_FLOOD.
+    rec.insert("ir_ambient".into(), crate::json_f32(s.ir_ambient));
+    // The seating-distance proxy, recorded so the next corpus can correlate
+    // the cues above against it (#174); it gates nothing (see
+    // `irlume_liveness::Signals::face_frac`).
+    rec.insert("face_frac".into(), crate::json_f32(s.face_frac));
+    let cues_json = serde_json::json!({
+        "face_in_rgb": cues.face_in_rgb,
+        "face_in_ir": cues.face_in_ir,
+        "cross_spectrum_aligned": cues.cross_spectrum_aligned,
+        "ir_reflectance_ok": cues.ir_reflectance_ok,
+        "center_edge_ratio_ok": cues.center_edge_ratio_ok,
+        "glint_present": cues.glint_present,
+        "frontal_ok": cues.frontal_ok,
+    });
+    rec.insert("cues".into(), cues_json);
+    serde_json::Value::Object(rec)
+}
+
 /// `irlume padcapture --species NAME --kind attack|bonafide --det <yunet.onnx>
 ///   --out pad.jsonl [--path full|ir-only] [--n 10] [--rgb ..] [--ir ..] [--no-prompt]`
 pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
@@ -242,67 +336,11 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 None
             };
 
-            let mut rec = serde_json::Map::new();
-            rec.insert("species".into(), species.into());
-            rec.insert("kind".into(), kind.into());
-            rec.insert("path".into(), path_str.into());
-            rec.insert("idx".into(), idx.into());
-            rec.insert("verdict".into(), verdict_str(verdict).into());
-            rec.insert("reason".into(), reason.clone().into());
-            rec.insert(
-                "caught".into(),
-                serde_json::to_value(caught.map(|c| vec![c]).unwrap_or_default()).unwrap(),
+            let rec = presentation_record(
+                species, kind, path_str, idx, verdict, &cues, &reason, caught, &s,
             );
-            rec.insert("rgb_present".into(), s.rgb_face.is_some().into());
-            rec.insert("ir_present".into(), s.ir_face.is_some().into());
-            rec.insert(
-                "rgb_score".into(),
-                crate::json_f32(s.rgb_face.map(|f| f.score).unwrap_or(0.0)),
-            );
-            rec.insert(
-                "ir_score".into(),
-                crate::json_f32(s.ir_face.map(|f| f.score).unwrap_or(0.0)),
-            );
-            rec.insert(
-                "ir_brightness".into(),
-                crate::json_f32(s.ir_face_brightness),
-            );
-            // The exposure gate's input and its answer. A record that reported
-            // the cues without these could not distinguish a frame the gate
-            // judged from one it refused unread (#237).
-            rec.insert(
-                "ir_saturated_frac".into(),
-                match s.ir_saturated_frac {
-                    Some(f) => crate::json_f32(f),
-                    None => serde_json::Value::Null,
-                },
-            );
-            rec.insert("ir_exposure_ok".into(), cues.ir_exposure_ok.into());
-            rec.insert(
-                "ir_center_edge_ratio".into(),
-                crate::json_f32(s.ir_center_edge_ratio),
-            );
-            rec.insert("ir_glint".into(), crate::json_f32(s.ir_eye_glint));
-            let cross = match (s.rgb_face, s.ir_face) {
-                (Some(r), Some(i)) => ((r.cx - i.cx).powi(2) + (r.cy - i.cy).powi(2)).sqrt(),
-                _ => f32::NAN,
-            };
-            rec.insert("cross_dist".into(), crate::json_f32(cross));
-            rec.insert("yaw_asym".into(), crate::json_f32(s.head_yaw_asym));
-            rec.insert("pitch_frac".into(), crate::json_f32(s.head_pitch_frac));
-            let cues_json = serde_json::json!({
-                "face_in_rgb": cues.face_in_rgb,
-                "face_in_ir": cues.face_in_ir,
-                "cross_spectrum_aligned": cues.cross_spectrum_aligned,
-                "ir_reflectance_ok": cues.ir_reflectance_ok,
-                "center_edge_ratio_ok": cues.center_edge_ratio_ok,
-                "glint_present": cues.glint_present,
-                "frontal_ok": cues.frontal_ok,
-            });
-            rec.insert("cues".into(), cues_json);
 
-            writeln!(f, "{}", serde_json::Value::Object(rec))
-                .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            writeln!(f, "{rec}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             written += 1;
 
             // Live-progress feedback. For an attack, an accepted verdict is a BREACH.
@@ -648,6 +686,116 @@ mod tests {
         s.ir_center_edge_ratio = MIN_CENTER_EDGE_RATIO - 0.1;
         assert_eq!(caught_cue(Path::IrOnly, &s), Some("center_edge"));
         assert_eq!(caught_cue(Path::IrOnly, &passing_signals()), None);
+    }
+
+    /// #174's plumbing at the corpus layer: `capture_once` computes
+    /// `face_frac` and `ir_ambient` and the record must drop neither,
+    /// because this file's output is what a distance correlation is
+    /// computed FROM, and brightness moves with both seating distance and
+    /// the scene's own infrared, so a corpus with only one of the two
+    /// cannot attribute a change to either. The 2026-08-04 campaign in the
+    /// #174 thread ran through this tool while the loop dropped face_frac,
+    /// so its per-condition table had to be rebuilt by hand from debug
+    /// lines instead of read off the corpus.
+    #[test]
+    fn presentation_record_carries_face_frac() {
+        let mut s = passing_signals();
+        s.face_frac = 0.3;
+        s.ir_ambient = 123.5;
+        let rec = presentation_record(
+            "live_normal",
+            "bonafide",
+            "full",
+            0,
+            Verdict::Live,
+            &irlume_liveness::Cues::default(),
+            "live",
+            None,
+            &s,
+        );
+        let got = rec["face_frac"]
+            .as_f64()
+            .expect("face_frac must be in every record");
+        assert!((got - 0.3).abs() < 1e-6, "recorded {got}, measured 0.3");
+        // A distinct value, so a record that wrote some other field's number
+        // (or a constant) here fails, not just a record that dropped the key.
+        assert_eq!(
+            rec["ir_ambient"].as_f64(),
+            Some(123.5),
+            "ir_ambient must round-trip into the record"
+        );
+
+        // No detection is recorded as 0.0, the "no face" spelling
+        // `face_frac_of` promises, not a missing key a reader would have to
+        // special-case; an analysis drops those rows.
+        s.face_frac = 0.0;
+        let rec = presentation_record(
+            "print_glossy",
+            "attack",
+            "ir-only",
+            1,
+            Verdict::Spoof,
+            &irlume_liveness::Cues::default(),
+            "no face in IR",
+            None,
+            &s,
+        );
+        assert_eq!(rec["face_frac"].as_f64(), Some(0.0));
+    }
+
+    /// Moving the record out of the capture loop must not change what an
+    /// existing analysis reads back: every key the loop wrote is still
+    /// written, under the same name. The literal list is the corpus schema
+    /// docs/pad-results/*.jsonl readers depend on; dropping or renaming a
+    /// key fails here before it silently breaks one of them.
+    #[test]
+    fn presentation_record_keeps_the_corpus_schema() {
+        let rec = presentation_record(
+            "print_glossy",
+            "attack",
+            "ir-only",
+            3,
+            Verdict::Spoof,
+            &irlume_liveness::Cues::default(),
+            "IR too flat",
+            Some("center_edge"),
+            &passing_signals(),
+        );
+        let obj = rec.as_object().unwrap();
+        for key in [
+            "species",
+            "kind",
+            "path",
+            "idx",
+            "verdict",
+            "reason",
+            "caught",
+            "rgb_present",
+            "ir_present",
+            "rgb_score",
+            "ir_score",
+            "ir_brightness",
+            "ir_saturated_frac",
+            "ir_exposure_ok",
+            "ir_center_edge_ratio",
+            "ir_glint",
+            "cross_dist",
+            "yaw_asym",
+            "pitch_frac",
+            "ir_ambient",
+            "face_frac",
+            "cues",
+        ] {
+            assert!(obj.contains_key(key), "corpus schema lost key {key}");
+        }
+        assert_eq!(rec["species"], "print_glossy");
+        assert_eq!(rec["idx"], 3);
+        assert_eq!(rec["verdict"], "Spoof");
+        assert_eq!(rec["caught"], serde_json::json!(["center_edge"]));
+        // passing_signals has no RGB face, so the cross-spectrum distance is
+        // unmeasurable and must stay the null `json_f32` writes for a
+        // non-finite value, never a fabricated number.
+        assert_eq!(rec["cross_dist"], serde_json::Value::Null);
     }
 
     #[test]

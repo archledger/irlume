@@ -28,11 +28,18 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Runner routing: heavy jobs (build, test, coverage, fuzz, nix) stay on
-# `arch`, which only the Ryzen carries. The two light jobs take the
-# shared `ci` label, so either machine can run them and neither is a
-# single point of failure for a REQUIRED check. The N100 never sees a
-# release build.
+# Runner routing across the two self-hosted machines. Five jobs carry the
+# shared `ci` label so GitHub sends each to whichever runner is FREE:
+# waiting behind a queue on the fast machine is worse than starting now on
+# the slow one, and it stops any single machine being a single point of
+# failure for a required check. Their timeouts are sized for the 4-core
+# N100 (60m, and 90m for nix), not the 16-core Ryzen.
+#
+# Only `coverage` and `fuzz` stay pinned to `arch`: an instrumented
+# coverage build and a nightly fuzz run are the two jobs where the slower
+# machine turns a short job into a very long one with no scheduling
+# benefit. hardware-suite is pinned separately, because it needs the real
+# IR camera.
 #
 # Branch protection on `main` requires these SEVEN job names as status checks,
 # verified against the live ruleset 2026-08-07:
@@ -50,8 +57,8 @@ concurrency:
 jobs:
   check:
     name: fmt · clippy · build · test
-    runs-on: [self-hosted, arch]
-    timeout-minutes: 30
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 60
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.
@@ -176,6 +183,19 @@ jobs:
       # coverage this was, when that duplicate lane was deleted. The guard
       # NAMES the set instead of counting it: renaming one while adding
       # another would leave the total at six and hide the loss.
+      # The production TFLite mesh, end to end and ENFORCED. The test is
+      # #[ignore]d because it needs the packaged runtime, so a rename or a
+      # silent skip fails the --require guard instead of reading as green.
+      # Both runners carry the pinned libtensorflowlite_c.so at the
+      # resolver's first probe path.
+      - name: test (production TFLite FaceMesh, end to end)
+        env:
+          IRLUME_TFLITE_LIB: /usr/share/irlume/tflite/libtensorflowlite_c.so
+        run: |
+          IRLUME_TFLITE_MESH_TEST_MODEL="$GITHUB_WORKSPACE/models/face_landmarks_detector.tflite" \
+            ./scripts/run-tests-guarded.sh --require pinned_landmarker_mesh_serves_landmarks_via_facemesh \
+            -- cargo test -p irlume-vision --locked -- --ignored pinned_landmarker_mesh_serves_landmarks_via_facemesh
+
       - name: test (TPM-gated, against the REAL TPM)
         run: |
           # seal_unseal_pcrlock_roundtrip_provisioned_nv is DELIBERATELY not in
@@ -266,8 +286,8 @@ jobs:
   # only, so new-stable lint churn never blocks a PR. REQUIRED (see the seven-check list in the header).
   stable:
     name: test (stable)
-    runs-on: [self-hosted, arch]
-    timeout-minutes: 30
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -632,8 +652,8 @@ jobs:
 
   nix:
     name: nix flake check
-    runs-on: [self-hosted, arch]
-    timeout-minutes: 60
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 90
     steps:
       # No model fetch here: flake check --no-build only evaluates the outputs
       # (flake structure, the package derivation, the NixOS module, the dev

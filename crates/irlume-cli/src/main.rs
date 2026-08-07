@@ -404,6 +404,10 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                     user,
                     profile: p.into(),
                     scans,
+                    // Structured reply so the ambient-lit count reaches the
+                    // completion note (#312); an older daemon ignores the
+                    // flag and answers the legacy Ok prose, handled below.
+                    report_enrollment: true,
                 }
             }
             None => return usage_profiles(),
@@ -529,6 +533,26 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                         println!("      - {s}");
                     }
                 }
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Enrolled {
+            added,
+            total,
+            added_scans,
+            ambient_lit,
+            ..
+        }) => {
+            println!(
+                "[profiles] added {added} scan(s) ({total} for the loaded recognizer): {}",
+                added_scans.join(", ")
+            );
+            if let Some(n) = ambient_lit.filter(|&n| n > 0) {
+                println!(
+                    "[profiles] {n} scan(s) were lit mainly by the room, not provably by \
+                     the IR emitter; dark-room login is unverified. Check it with the \
+                     lights off: irlume identify"
+                );
             }
             std::process::ExitCode::SUCCESS
         }
@@ -1699,9 +1723,20 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Ok(irlume_auth::EnrollOutcome::Merged {
-            name, added, total, ..
+            name,
+            added,
+            total,
+            ambient_lit,
+            ..
         }) => {
             println!("[enrolldev] merged into '{name}' (+{added} scans, {total} total)");
+            if ambient_lit > 0 {
+                println!(
+                    "[enrolldev] {ambient_lit} of {added} added scans were lit mainly by the \
+                     room, not provably by the IR emitter; dark-room login is unverified. \
+                     Check it: turn the lights off and run `irlume identify` (#312)"
+                );
+            }
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {

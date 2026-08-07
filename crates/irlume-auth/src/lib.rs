@@ -145,12 +145,15 @@ pub struct Assessment {
     pub ir_center_edge_ratio: f32,
     pub ir_brightness: f32,
     /// How much of the IR burst's lit-frame brightness the ROOM supplied:
-    /// `ambient_mean / lit_mean` from the same burst, 0.0 on the RGB-only
-    /// path. Near 0 means the emitter's own contribution lit the face (the
-    /// dark-capable case); near 1 means the scene did, and an enrollment
-    /// built from such scans has never proven it works without that scene
-    /// light (#312).
-    pub ir_ambient_share: f32,
+    /// `ambient_mean / lit_mean` from the same burst. `None` when nothing
+    /// OBSERVED an emitter-off frame (no camera-classified dark frame, or
+    /// the RGB-only path): the fallback ambient is just the burst minimum,
+    /// which converges toward the lit mean on a steady emitter and would
+    /// read as "the room did it" in a pitch-dark room (#312 review). Near 0
+    /// means the emitter's proven contribution lit the face; near 1 means
+    /// the scene did, and such scans have never proven they work without
+    /// that scene light.
+    pub ir_ambient_share: Option<f32>,
     /// Both eyes read open (IR corneal-glint heuristic). Used only when a profile
     /// opts into the require-eyes-open gate. `false` if eyes couldn't be verified.
     pub eyes_open: bool,
@@ -259,8 +262,22 @@ struct CapturedScan {
     /// Head pitch fraction at capture (calibrates this user's pitch neutral).
     pitch: f32,
     /// Room's share of the IR lit-frame brightness at capture
-    /// ([`Assessment::ir_ambient_share`]).
-    ambient_share: f32,
+    /// ([`Assessment::ir_ambient_share`]); `None` = no emitter-off frame
+    /// was observed, which never counts as ambient-lit.
+    ambient_share: Option<f32>,
+}
+
+/// What one add-scan capture stored, with everything the daemon's reply
+/// needs: the appended scan names (undo target), the per-recognizer counts,
+/// and the ambient-lit count the completion note is built from (#312).
+#[derive(Debug)]
+pub struct AddScanOutcome {
+    pub added_scans: Vec<String>,
+    pub total: usize,
+    /// Remaining scans allowed in the LOADED recognizer's space.
+    pub room: usize,
+    /// Scans among `added_scans` whose IR burst the room at least half lit.
+    pub ambient_lit: usize,
 }
 
 /// A scan whose IR burst the ROOM at least half lit counts as ambient-lit:
@@ -1210,7 +1227,7 @@ impl Engine {
             signals,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
-            ir_ambient_share: 0.0, // RGB-only path: no IR burst to measure
+            ir_ambient_share: None, // RGB-only path: no IR burst to measure
             eyes_open: false,
             thirdparty_fake: None,
         })
@@ -1525,7 +1542,7 @@ impl Engine {
                 signals: Default::default(),
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
-                ir_ambient_share: 0.0,
+                ir_ambient_share: None,
                 eyes_open: false,
                 thirdparty_fake: None,
             });
@@ -1685,10 +1702,13 @@ impl Engine {
             signals,
             ir_center_edge_ratio,
             ir_brightness,
-            // The share the room supplied of the burst's lit-frame mean; the
+            // The share the room supplied of the burst's lit-frame mean,
+            // only when an emitter-off frame was actually observed; the
             // denominator floor keeps a black burst (lit ~0) reading as 0
             // share rather than dividing to noise.
-            ir_ambient_share: ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0),
+            ir_ambient_share: ir_stats
+                .ambient_observed
+                .then(|| ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0)),
             eyes_open,
             thirdparty_fake,
         })
@@ -3048,7 +3068,7 @@ impl Engine {
             let mut added_scans = Vec::with_capacity(added);
             let mut ambient_lit = 0usize;
             for s in captured.into_iter().take(room) {
-                if s.ambient_share >= AMBIENT_LIT_SHARE {
+                if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                     ambient_lit += 1;
                 }
                 let sname = enr.profiles[idx].next_scan_name();
@@ -3095,7 +3115,7 @@ impl Engine {
         };
         let mut ambient_lit = 0usize;
         for s in captured {
-            if s.ambient_share >= AMBIENT_LIT_SHARE {
+            if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
             }
             let sname = prof.next_scan_name();
@@ -3165,7 +3185,7 @@ impl Engine {
         user: &str,
         profile_name: &str,
         count: usize,
-    ) -> irlume_common::Result<(Vec<String>, usize)> {
+    ) -> irlume_common::Result<AddScanOutcome> {
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
         let mut enr = storage::load(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
@@ -3216,7 +3236,11 @@ impl Engine {
             )));
         }
         let mut added = Vec::with_capacity(captured.len());
+        let mut ambient_lit = 0usize;
         for c in captured {
+            if c.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
+                ambient_lit += 1;
+            }
             let sname = enr.profiles[idx].next_scan_name();
             let ir_space = c.ir.as_ref().map(|_| self.ir_space.clone());
             enr.profiles[idx].scans.push(FaceScan {
@@ -3236,8 +3260,14 @@ impl Engine {
             enr.camera_binding = Some(self.current_binding());
         }
         let total = enr.profiles[idx].scans_in(&self.embed_space);
+        let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
         storage::save(&enr)?;
-        Ok((added, total))
+        Ok(AddScanOutcome {
+            added_scans: added,
+            total,
+            room,
+            ambient_lit,
+        })
     }
 
     /// One framing-guide sample for guided enrollment: capture, detect, and

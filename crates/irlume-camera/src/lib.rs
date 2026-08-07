@@ -176,6 +176,12 @@ pub enum Spectrum {
 pub struct IrCaptureStats {
     pub lit_mean: f32,
     pub ambient_mean: f32,
+    /// True only when the camera itself classified BOTH a lit and a dark
+    /// frame in this burst. False means `ambient_mean` is merely the burst's
+    /// minimum, which on a steady emitter converges toward `lit_mean` and is
+    /// NOT an emitter-off observation; callers attributing light to the room
+    /// must check this first (#312 review).
+    pub ambient_observed: bool,
     pub burst_frames: usize,
     /// How many burst frames the camera itself classified as lit or dark, via
     /// its UVC illumination metadata. Zero means the camera reported nothing
@@ -2423,6 +2429,12 @@ impl IrSession<'_> {
                 saturation_frame,
                 lit_mean: lit_level as f32,
                 ambient_mean: ambient_level as f32,
+                ambient_observed: flags
+                    .iter()
+                    .any(|f| matches!(f, Some(ir_metadata::Illumination::Lit)))
+                    && flags
+                        .iter()
+                        .any(|f| matches!(f, Some(ir_metadata::Illumination::Dark))),
                 burst_frames: IR_BURST,
                 camera_classified_frames: from_camera,
                 white_level,
@@ -3802,6 +3814,7 @@ mod tests {
         IrCaptureStats {
             lit_mean: lit,
             ambient_mean: 1.0,
+            ambient_observed: false,
             burst_frames: 8,
             camera_classified_frames: 0,
             white_level: None,

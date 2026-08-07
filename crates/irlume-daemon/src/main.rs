@@ -2413,18 +2413,32 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             user,
             profile,
             scans,
+            report_enrollment,
         } => {
             if !authorized_for(peer, &user) {
                 return Response::Error(format!("not authorized to modify '{user}'"));
             }
             match engine.add_scan(&user, &profile, scans.unwrap_or(1)) {
-                Ok((added, total)) => Response::Ok(format!(
+                // The structured reply, opted into: the TUI needs the
+                // ambient-lit count of EVERY scan for the #312 completion
+                // note, and AddScan carries every scan after the first.
+                Ok(out) if report_enrollment => Response::Enrolled {
+                    profile,
+                    created: false,
+                    added: out.added_scans.len(),
+                    total: out.total,
+                    room: Some(out.room),
+                    added_scans: out.added_scans,
+                    ambient_lit: Some(out.ambient_lit),
+                },
+                Ok(out) => Response::Ok(format!(
                     "added {} to '{profile}' ({total} scans for the loaded recognizer)",
-                    added
+                    out.added_scans
                         .iter()
                         .map(|s| format!("'{s}'"))
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(", "),
+                    total = out.total,
                 )),
                 Err(e) => Response::Error(e.to_string()),
             }
@@ -3782,6 +3796,7 @@ mod tests {
                 user: u(),
                 profile: "p".into(),
                 scans: None,
+                report_enrollment: false,
             },
             Request::SetRequireEyesOpen {
                 user: u(),
@@ -4201,6 +4216,7 @@ mod tests {
                 user: u(),
                 profile: "p".into(),
                 scans: None,
+                report_enrollment: false,
             },
             Request::DeleteProfile {
                 user: u(),
@@ -5909,6 +5925,7 @@ mod tests {
                 user: "ghost".into(),
                 profile: "Face Profile 1".into(),
                 scans: None,
+                report_enrollment: false,
             },
             &peer(0),
             &mut e,
@@ -5926,6 +5943,7 @@ mod tests {
                 user: "carol".into(),
                 profile: "Face Profile 1".into(),
                 scans: None,
+                report_enrollment: false,
             },
             &peer(0),
             &mut e,

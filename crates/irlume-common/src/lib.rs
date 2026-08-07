@@ -394,6 +394,12 @@ pub enum Request {
         /// behaviour this request always had.
         #[serde(default)]
         scans: Option<usize>,
+        /// Ask for a full [`Response::Enrolled`] (with the per-recognizer
+        /// room and the ambient-lit count, #312) instead of the legacy
+        /// `Response::Ok` prose. Absent (an older CLI) keeps the legacy
+        /// reply, so nothing already parsing the Ok string breaks.
+        #[serde(default)]
+        report_enrollment: bool,
     },
     /// List enrolled profiles + their scans for `user`.
     ListProfiles {

@@ -1994,12 +1994,6 @@ impl Engine {
         ))
     }
 
-    /// Rolling consent watch: drive a held-open IR stream, process each frame,
-    /// and return as SOON as an accepted gesture is seen (`nod` or, when
-    /// `check_closure` supplies a usable calibration, an eye closure), instead of
-    /// draining a fixed window and letting the polkit agent re-run the whole
-    /// prompt. Bounded by `max_frames`. Returns whether a gesture was accepted.
-    /// `check_closure` is `Some(cal)` only when the closure gesture is eligible.
     /// Total frames the consent gesture may be watched for across ONE
     /// authentication, split between a watch before the face match and one
     /// after. `IRLUME_CONSENT_MAX_FRAMES` overrides. At the IR node's ~15fps the
@@ -2071,6 +2065,12 @@ impl Engine {
         (allow_nod, closure_cal)
     }
 
+    /// Rolling consent watch: drive a held-open IR stream, process each frame,
+    /// and return as SOON as an accepted gesture is seen (`nod` or, when
+    /// `closure_cal` supplies a usable calibration, an eye closure), instead of
+    /// draining a fixed window and letting the polkit agent re-run the whole
+    /// prompt. Bounded by `max_frames`. Returns whether a gesture was accepted.
+    /// `closure_cal` is `Some(cal)` only when the closure gesture is eligible.
     fn consent_watch(
         &mut self,
         max_frames: usize,
@@ -3670,8 +3670,9 @@ fn enroll_merge_target(
 /// camera, so this is the only shape a test can observe.
 fn short_capture_refusal(got: usize, want: usize) -> Option<String> {
     (got < want).then(|| {
+        let scans = if got == 1 { "scan" } else { "scans" };
         format!(
-            "only {got} live scans captured (need {want}); nothing was saved, check              lighting and framing"
+            "only {got} live {scans} captured (need {want}); nothing was saved, check lighting and framing"
         )
     })
 }
@@ -4555,14 +4556,19 @@ mod tests {
         assert!(short_capture_refusal(3, 3).is_none());
         assert!(short_capture_refusal(1, 1).is_none());
         let why = short_capture_refusal(1, 10).expect("a short capture must refuse");
-        assert!(
-            why.contains("only 1 live scans captured (need 10)"),
-            "{why}"
-        );
+        assert!(why.contains("only 1 live scan captured (need 10)"), "{why}");
         assert!(
             why.contains("nothing was saved"),
             "the refusal must say the enrollment is unchanged: {why}"
         );
+        // The message reaches a user mid-enrollment, so it must read as a
+        // sentence: no run of spaces, and the noun agreeing with the count.
+        assert!(
+            !why.contains("  "),
+            "doubled space in a user-facing string: {why}"
+        );
+        let plural = short_capture_refusal(2, 10).expect("a short capture must refuse");
+        assert!(plural.contains("only 2 live scans captured"), "{plural}");
         // Zero is short too, which is the case that always refused.
         assert!(short_capture_refusal(0, 1).is_some());
     }

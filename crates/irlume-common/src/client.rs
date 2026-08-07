@@ -13,11 +13,11 @@
 //! unsealed secret in transit, before it lands inside a zeroizing `SecretBytes`).
 
 use crate::{Request, Response, SOCKET_PATH};
-use std::io::{self, BufRead, BufReader, Read as _, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Bounded wait for the initial connect (distinct from the read timeout, which
 /// must be long enough for a camera capture).
@@ -91,22 +91,6 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
 }
 
-/// Map a connect failure to an actionable message.
-///
-/// Two cases, and conflating them was a real bug: a user whose uid could not
-/// open the socket was told the daemon was down and sent to `systemctl status`
-/// on a healthy service.
-///
-/// "Nobody is listening" is the #1 first-run failure (fresh package install,
-/// unit disabled by distro preset policy), so name the daemon and the exact
-/// command instead of a raw errno. Covers every errno that case produces across
-/// kernels: ENOENT (no socket file), ECONNREFUSED (socket file, no accept),
-/// ECONNRESET / EPIPE (stale socket that connects then resets on first I/O,
-/// seen on newer kernels).
-///
-/// EACCES/EPERM means the opposite: the socket is there and the daemon is very
-/// likely fine, but this uid may not connect. Say that, and do not suggest
-/// `sudo` or a chmod, because both hide whatever set the mode.
 /// Whether this failure PROVES nobody is listening on the socket.
 ///
 /// The distinction matters wherever "the daemon is not there" licenses an act
@@ -127,6 +111,22 @@ pub fn proves_daemon_absent(e: &io::Error) -> bool {
     )
 }
 
+/// Map a connect failure to an actionable message.
+///
+/// Two cases, and conflating them was a real bug: a user whose uid could not
+/// open the socket was told the daemon was down and sent to `systemctl status`
+/// on a healthy service.
+///
+/// "Nobody is listening" is the #1 first-run failure (fresh package install,
+/// unit disabled by distro preset policy), so name the daemon and the exact
+/// command instead of a raw errno. Covers every errno that case produces across
+/// kernels: ENOENT (no socket file), ECONNREFUSED (socket file, no accept),
+/// ECONNRESET / EPIPE (stale socket that connects then resets on first I/O,
+/// seen on newer kernels).
+///
+/// EACCES/EPERM means the opposite: the socket is there and the daemon is very
+/// likely fine, but this uid may not connect. Say that, and do not suggest
+/// `sudo` or a chmod, because both hide whatever set the mode.
 fn map_connect_failure(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::NotFound
@@ -178,11 +178,9 @@ fn request_with_timeouts(
     // buffer without bound. That caller can be `pam_irlume` inside a login.
     // The daemon is honest, but `IRLUME_SOCKET` redirects any non-setuid
     // invocation, so the peer is not always the daemon.
-    let mut reader = BufReader::new((&stream).take(MAX_RESPONSE_BYTES));
-    let mut buf = String::new();
-    reader.read_line(&mut buf).map_err(map_connect_failure)?;
+    let buf =
+        read_response_line((&stream).take(MAX_RESPONSE_BYTES)).map_err(map_connect_failure)?;
     if buf.len() as u64 >= MAX_RESPONSE_BYTES {
-        buf.zeroize();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "response exceeded the size limit; refusing it",
@@ -194,12 +192,52 @@ fn request_with_timeouts(
             "daemon closed connection without responding",
         ));
     }
-    let parsed =
-        serde_json::from_str(buf.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
-    // The response may carry an unsealed secret; wipe the raw JSON now that the
-    // bytes live inside a zeroizing `SecretBytes` in the parsed value.
-    buf.zeroize();
-    parsed
+    // The response may carry an unsealed secret. `buf` wipes itself when this
+    // frame ends, and by then the bytes live inside a zeroizing `SecretBytes`
+    // in the parsed value.
+    serde_json::from_slice(buf.trim_ascii())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Read one newline-terminated response line into a buffer that wipes itself,
+/// returning it with the newline still attached (like `BufRead::read_line`).
+///
+/// Not `BufReader::read_line`, and that is the whole point: `BufReader` keeps
+/// its own 8 KiB copy of everything it has read, nothing can reach that copy to
+/// wipe it, and an `UnsealPassword` response carries the user's login password
+/// in cleartext JSON. Zeroizing only the caller's `String` left the secret
+/// sitting in the reader's heap until the allocator handed the block out again,
+/// which contradicts this module's own promise.
+///
+/// `src` must already be capped with [`Read::take`]; on hitting the cap this
+/// returns whatever arrived, which the caller refuses on length. The buffer is
+/// sized up front so no reallocation can strand a half-copy of the response in
+/// a freed block. Reading past the newline is harmless and expected: one
+/// response per connection, and the stream is dropped immediately after.
+fn read_response_line(mut src: impl Read) -> io::Result<Zeroizing<Vec<u8>>> {
+    /// One page per syscall. The real responses are a few hundred bytes; the
+    /// cap only matters for a peer that is not the daemon.
+    const CHUNK: usize = 4096;
+    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_RESPONSE_BYTES as usize));
+    let mut chunk = Zeroizing::new([0u8; CHUNK]);
+    loop {
+        let n = match src.read(&mut chunk[..]) {
+            Ok(n) => n,
+            // `read_line` swallows EINTR too; a signal during a login must not
+            // read as a dead daemon.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            // EOF or the `take` cap: no newline is coming.
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            buf.truncate(i + 1);
+            return Ok(buf);
+        }
+    }
 }
 
 /// `UnixStream::connect` has no timeout, so a stalled listener (backlog full /
@@ -224,6 +262,9 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream
 mod tests {
     use super::*;
     use crate::testenv;
+    // The test servers still use `BufReader`: they are the peer, not the
+    // client, and nothing secret crosses in that direction.
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
@@ -342,6 +383,112 @@ mod tests {
             "got: {err}"
         );
         server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `Read` that hands back one scripted answer per call, so the reader's
+    /// loop can be driven through short reads and EINTR without a socket.
+    struct Scripted(std::vec::IntoIter<io::Result<Vec<u8>>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            match self.0.next() {
+                Some(Ok(bytes)) => {
+                    let n = bytes.len().min(out.len());
+                    out[..n].copy_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn scripted(steps: Vec<io::Result<Vec<u8>>>) -> Scripted {
+        Scripted(steps.into_iter())
+    }
+
+    #[test]
+    fn the_response_line_stops_at_the_first_newline_and_keeps_it() {
+        // `read_line`'s contract, which the callers' length check depends on:
+        // the newline counts toward the length, and nothing the peer sends
+        // after it becomes part of the response.
+        let line = read_response_line(scripted(vec![Ok(b"{\"Ok\":\"hi\"}\nJUNK".to_vec())]))
+            .expect("a complete line");
+        assert_eq!(&line[..], b"{\"Ok\":\"hi\"}\n");
+    }
+
+    #[test]
+    fn a_dribbled_response_is_reassembled_across_reads() {
+        // A peer that sends a byte at a time is the case `BufReader` used to
+        // handle; the loop must keep reading until the newline arrives.
+        let steps = b"{\"Ok\":\"hi\"}\n"
+            .iter()
+            .map(|b| Ok(vec![*b]))
+            .collect::<Vec<_>>();
+        let line = read_response_line(scripted(steps)).expect("a complete line");
+        assert_eq!(&line[..], b"{\"Ok\":\"hi\"}\n");
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_rather_than_reported_as_a_dead_daemon() {
+        // EINTR maps to ECONNRESET-shaped advice through `map_connect_failure`
+        // at the call site, so swallowing it here is what stops a signal during
+        // a login from printing "irlumed is not running".
+        let line = read_response_line(scripted(vec![
+            Err(io::Error::new(io::ErrorKind::Interrupted, "signal")),
+            Ok(b"{\"Ok\":\"hi\"}\n".to_vec()),
+        ]))
+        .expect("EINTR must not end the read");
+        assert_eq!(&line[..], b"{\"Ok\":\"hi\"}\n");
+    }
+
+    #[test]
+    fn a_read_error_that_is_not_eintr_propagates() {
+        let err = read_response_line(scripted(vec![Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "peer went away",
+        ))]))
+        .expect_err("a reset must not read as a response");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[test]
+    fn a_truncated_response_comes_back_whole_for_the_caller_to_judge() {
+        // EOF with no newline is not an error here: the caller distinguishes
+        // "nothing at all" (UnexpectedEof) from "some bytes, no newline", and
+        // it can only do that if it receives the bytes.
+        let empty = read_response_line(scripted(vec![])).expect("EOF is not an error");
+        assert!(empty.is_empty());
+        let partial = read_response_line(scripted(vec![Ok(b"{\"Ok\"".to_vec())]))
+            .expect("EOF is not an error");
+        assert_eq!(&partial[..], b"{\"Ok\"");
+    }
+
+    #[test]
+    fn an_oversized_reply_is_refused_by_length_not_read_forever() {
+        let _g = testenv::lock();
+        let path = sock("huge");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            // No newline anywhere, more than the cap: the shape a peer that is
+            // not the daemon uses to make a client read without end.
+            let flood = vec![b'x'; MAX_RESPONSE_BYTES as usize * 2];
+            let _ = (&stream).write_all(&flood);
+        });
+        let err = request_with_timeout(&Request::Ping, Duration::from_secs(5))
+            .expect_err("an unbounded reply must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("response exceeded the size limit"),
+            "got: {err}"
+        );
+        let _ = server.join();
         std::env::remove_var("IRLUME_SOCKET");
         let _ = std::fs::remove_file(&path);
     }

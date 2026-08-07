@@ -736,7 +736,10 @@ mod onnx {
 
         /// Run FaceMesh on the face at `bbox` (frame pixel coords) with `margin`
         /// (fraction of the box size added on each side; MediaPipe uses ~0.25).
-        /// Returns the 468 landmarks as `(x, y)` in ORIGINAL FRAME pixel coords.
+        /// Returns the model's landmarks as `(x, y)` in ORIGINAL FRAME pixel
+        /// coords: [`MESH_N`] of them from a legacy mesh, [`MESH_N_IRIS`] from
+        /// the shipped face_landmarker one, so a caller must read the length
+        /// rather than assume it.
         /// The crop is square and centered so aspect ratio is preserved.
         ///
         /// Errors when the box is not a meaningful face region
@@ -966,7 +969,6 @@ mod onnx {
 
     /// YuNet detector (ONNX). Loaded once in the daemon.
     pub struct Detector {
-        #[allow(dead_code)]
         session: Session,
     }
 

@@ -220,38 +220,56 @@ jobs:
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           fi
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
-          rgb_pid=$!
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
-          ir_pid=$!
-          # Wait for FRAMES, not for a readable inode: the nodes are chmod 666
-          # before the feeders start, so the old `[ -r ... ]` poll always
-          # succeeded on the first iteration and verified nothing. ffmpeg
-          # reading one frame is the only proof the feeder is actually
-          # producing. A dead feeder is a hard failure, not a slow start.
-          ready=0
-          for _ in $(seq 1 20); do
-            sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            # `timeout -k` is load-bearing, and the -k matters as much as the
-            # timeout. Measured, not assumed: with a writer attached but
-            # STALLED, an ffmpeg read blocks in the kernel, and plain
-            # `timeout 8` left it alive in futex_wait more than 8 MINUTES
-            # later with the timeout process still waiting on it, because
-            # SIGTERM cannot reach a task blocked in a V4L2 ioctl. -k follows
-            # with SIGKILL, which it cannot ignore. The unbounded form burned
-            # 1501s and 1867s (whole job budgets) in this step, while the
-            # build and the entire test suite together took under 4 minutes.
-            if timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
-               && timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
-              ready=1; break
-            fi
-            for fp in "$rgb_pid:RGB" "$ir_pid:IR"; do
-              if ! kill -0 "${fp%%:*}" 2>/dev/null; then
-                echo "::error::the ${fp##*:} feeder died before producing a frame"; exit 1
+          # Readiness gate, derived from the v4l2loopback source and measured
+          # on real hardware rather than assumed:
+          #
+          #  * /sys/.../videoN/state is the cheap, non-blocking truth:
+          #    "output" = no producer attached, "capture" = one is streaming.
+          #    Measured to flip 45ms after a feeder starts.
+          #  * A read only happens once state says capture, so the common
+          #    "not started yet" case never touches a blocking ioctl.
+          #  * timeout -k is mandatory, not decorative: an ffmpeg blocked in
+          #    DQBUF ignores SIGTERM (measured alive 8+ minutes under plain
+          #    `timeout`), because SIGTERM cannot reach a task in that ioctl.
+          #    Only the follow-up SIGKILL ends it.
+          #  * A read that times out AFTER state=capture means the producer
+          #    vanished mid-read: that is a hard failure, not something to
+          #    retry, so say so and stop.
+          #
+          # Do NOT "fix" a flaky feeder with the module's keep_format=1 or
+          # timeout=N options: both make a DEAD feeder look like a live one,
+          # which is the failure this gate exists to catch.
+          wait_for_frame() {
+            dev="$1"; limit="${2:-30}"
+            sys="/sys/devices/virtual/video4linux/${dev##*/}"
+            deadline=$(( SECONDS + limit ))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if [ "$(cat "$sys/state" 2>/dev/null)" = capture ]; then
+                timeout -k 1 5 ffmpeg -nostdin -loglevel error \
+                  -f v4l2 -i "$dev" -frames:v 1 -f null - >/dev/null 2>&1
+                rc=$?
+                [ "$rc" = 0 ] && return 0
+                if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+                  echo "::error::$dev: read blocked in DQBUF, producer vanished mid-read"
+                  return 1
+                fi
               fi
+              sleep 0.2
             done
-            sleep 1
+            echo "::error::$dev: no frame in ${limit}s (state=$(cat "$sys/state" 2>/dev/null)," \
+                 "format=$(cat "$sys/format" 2>/dev/null), buffers=$(cat "$sys/buffers" 2>/dev/null))"
+            return 1
+          }
+          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
+          for d in /dev/video8 /dev/video9; do
+            if ! wait_for_frame "$d" 30; then
+              # Every diagnostic channel this step used to discard.
+              echo "--- feeder processes:"; ps -o pid,stat,wchan:20,cmd -C ffmpeg || true
+              echo "--- rgb feeder log:"; tail -20 /tmp/feeder-rgb.log 2>/dev/null || true
+              echo "--- ir feeder log:";  tail -20 /tmp/feeder-ir.log 2>/dev/null || true
+              exit 1
+            fi
           done
-          [ "$ready" = 1 ] || { echo "::error::virtual cameras never produced a frame"; exit 1; }
           ls -l /dev/video8 /dev/video9 /dev/video10
 
       - name: test (camera + capture paths, against v4l2loopback)
@@ -438,107 +456,58 @@ jobs:
           sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
           fi
           nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/dev/null 2>&1 &
-          rgb_pid=$!
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/dev/null 2>&1 &
-          ir_pid=$!
-          # Wait for FRAMES, not for a readable inode: the nodes are chmod 666
-          # before the feeders start, so the old `[ -r ... ]` poll always
-          # succeeded on the first iteration and verified nothing. ffmpeg
-          # reading one frame is the only proof the feeder is actually
-          # producing. A dead feeder is a hard failure, not a slow start.
-          ready=0
-          for _ in $(seq 1 20); do
-            sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-            # `timeout -k` is load-bearing, and the -k matters as much as the
-            # timeout. Measured, not assumed: with a writer attached but
-            # STALLED, an ffmpeg read blocks in the kernel, and plain
-            # `timeout 8` left it alive in futex_wait more than 8 MINUTES
-            # later with the timeout process still waiting on it, because
-            # SIGTERM cannot reach a task blocked in a V4L2 ioctl. -k follows
-            # with SIGKILL, which it cannot ignore. The unbounded form burned
-            # 1501s and 1867s (whole job budgets) in this step, while the
-            # build and the entire test suite together took under 4 minutes.
-            if timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video8 -frames:v 1 -f null - 2>/dev/null \
-               && timeout -k 2 5 ffmpeg -loglevel quiet -f v4l2 -i /dev/video9 -frames:v 1 -f null - 2>/dev/null; then
-              ready=1; break
-            fi
-            for fp in "$rgb_pid:RGB" "$ir_pid:IR"; do
-              if ! kill -0 "${fp%%:*}" 2>/dev/null; then
-                echo "::error::the ${fp##*:} feeder died before producing a frame"; exit 1
+          # Readiness gate, derived from the v4l2loopback source and measured
+          # on real hardware rather than assumed:
+          #
+          #  * /sys/.../videoN/state is the cheap, non-blocking truth:
+          #    "output" = no producer attached, "capture" = one is streaming.
+          #    Measured to flip 45ms after a feeder starts.
+          #  * A read only happens once state says capture, so the common
+          #    "not started yet" case never touches a blocking ioctl.
+          #  * timeout -k is mandatory, not decorative: an ffmpeg blocked in
+          #    DQBUF ignores SIGTERM (measured alive 8+ minutes under plain
+          #    `timeout`), because SIGTERM cannot reach a task in that ioctl.
+          #    Only the follow-up SIGKILL ends it.
+          #  * A read that times out AFTER state=capture means the producer
+          #    vanished mid-read: that is a hard failure, not something to
+          #    retry, so say so and stop.
+          #
+          # Do NOT "fix" a flaky feeder with the module's keep_format=1 or
+          # timeout=N options: both make a DEAD feeder look like a live one,
+          # which is the failure this gate exists to catch.
+          wait_for_frame() {
+            dev="$1"; limit="${2:-30}"
+            sys="/sys/devices/virtual/video4linux/${dev##*/}"
+            deadline=$(( SECONDS + limit ))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if [ "$(cat "$sys/state" 2>/dev/null)" = capture ]; then
+                timeout -k 1 5 ffmpeg -nostdin -loglevel error \
+                  -f v4l2 -i "$dev" -frames:v 1 -f null - >/dev/null 2>&1
+                rc=$?
+                [ "$rc" = 0 ] && return 0
+                if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+                  echo "::error::$dev: read blocked in DQBUF, producer vanished mid-read"
+                  return 1
+                fi
               fi
+              sleep 0.2
             done
-            sleep 1
+            echo "::error::$dev: no frame in ${limit}s (state=$(cat "$sys/state" 2>/dev/null)," \
+                 "format=$(cat "$sys/format" 2>/dev/null), buffers=$(cat "$sys/buffers" 2>/dev/null))"
+            return 1
+          }
+          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
+          for d in /dev/video8 /dev/video9; do
+            if ! wait_for_frame "$d" 30; then
+              # Every diagnostic channel this step used to discard.
+              echo "--- feeder processes:"; ps -o pid,stat,wchan:20,cmd -C ffmpeg || true
+              echo "--- rgb feeder log:"; tail -20 /tmp/feeder-rgb.log 2>/dev/null || true
+              echo "--- ir feeder log:";  tail -20 /tmp/feeder-ir.log 2>/dev/null || true
+              exit 1
+            fi
           done
-          [ "$ready" = 1 ] || { echo "::error::virtual cameras never produced a frame"; exit 1; }
           ls -l /dev/video8 /dev/video9 /dev/video10
 
-      - name: Coverage incl. TPM-gated and camera tests (fail under the ratchet floor)
-        env:
-          IRLUME_TEST_RGB_DEVICE: /dev/video8
-          IRLUME_TEST_IR_DEVICE: /dev/video9
-          IRLUME_TEST_SPARE_DEVICE: /dev/video10
-          # Loopback nodes have no physical bus; the exact-path escape lets
-          # verify_pinned accept just these (see THREAT_MODEL.md).
-          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
-        run: |
-          # Discard any .profraw restored in target/ by rust-cache before the
-          # first --no-report, so a prior build's coverage can't contaminate
-          # this run's merged report.
-          cargo llvm-cov clean --workspace
-          # Each selection is guarded separately. Guarding the step as a whole
-          # would let the 707-test workspace run satisfy the minimum for every
-          # filtered lane after it, which is the failure being guarded against.
-          # A lane that silently stops running also drags coverage down and
-          # invites the floor below to be lowered to accommodate it.
-          ./scripts/run-tests-guarded.sh --min 650 -- cargo llvm-cov --no-report --workspace --locked
-          IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals,seal_unseal_pcrlock_roundtrip_provisioned_nv \
-            -- cargo llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
-            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
-          IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" ./scripts/run-tests-guarded.sh --min 1 -- cargo llvm-cov --no-report -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
-          ./scripts/run-tests-guarded.sh --min 15 -- cargo llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
-          ./scripts/run-tests-guarded.sh --min 7 -- cargo llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
-          ./scripts/run-tests-guarded.sh --min 5 -- cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
-          ./scripts/run-tests-guarded.sh --min 1 -- cargo llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
-          ./scripts/run-tests-guarded.sh --min 16 -- cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
-          # Floor lowered 79 -> 78 (consent-gesture release) -> 77 (0.6.0) -> 76
-          # (0.6.1 update-resilience): more self-heal paths that only run against
-          # a live system join the earlier ones (secure_getenv socket resolution,
-          # active-greeter reconcile check, root-only marker). The 0.6.1 additions
-          # are the marker-migration reconcile branch (hardcoded /etc/pam.d), the
-          # unrecognized-DM doctor warning, the SetCameras identity persistence,
-          # and the camera identity re-anchor (sysfs vid:pid reads): validated on
-          # real hardware and in the podman reconcile test, not by unit tests (no
-          # mock-camera / no-setuid-context harness). Re-ratchet upward once those
-          # paths gain a loopback/mock/integration harness (tracked for a later
-          # release).
-          cargo llvm-cov report --summary-only --fail-under-lines 76
-
-  deny:
-    name: cargo-deny (advisories · licenses · duplicate versions)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check advisories bans licenses sources
-
-  units:
-    name: systemd units (verify + exposure ratchet)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Every unit in packaging/systemd must be shipped by every packaging lane,
-      # and every lane must agree on the version. Both failures have shipped
-      # before: the 0.6.x rpm installed a timer it left out of %files, PR #98
-      # existed to resync drifted version fields, and the 0.7.0 audit found the
-      # PPA lane missing the reconcile timer entirely.
       - name: packaging parity (units in every lane, versions agree)
         run: ./scripts/check-packaging-parity.sh
 

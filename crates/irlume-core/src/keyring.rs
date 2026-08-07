@@ -541,10 +541,10 @@ mod tests {
     #[test]
     fn envelope_path_under_keyring_dir() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_KEYRING_DIR", "/tmp/irlume-kr-test");
+        std::env::set_var("IRLUME_KEYRING_DIR", crate::test_tmp_dir("kr-test"));
         assert_eq!(
             envelope_path("alice"),
-            PathBuf::from("/tmp/irlume-kr-test/alice.json")
+            PathBuf::from(format!("{}/alice.json", crate::test_tmp_dir("kr-test")))
         );
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
@@ -555,8 +555,8 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn arm_and_unseal_roundtrip() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-rt";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-rt");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
         let pw = b"correct horse battery staple";
         seal_password("tester", pw).expect("seal");
@@ -576,8 +576,8 @@ mod tests {
     fn reseal_auto_upgrades_weaker_tier_to_signed() {
         use crate::envelope::{PolicyKind, SealedEnvelope};
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-upgrade";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-upgrade");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
         let pw = b"correct horse battery staple";
         // Simulate an "old" arm under the weakest tier (literal PCR 7).
@@ -617,7 +617,7 @@ mod tests {
         // discoverable at a login otherwise: ksecretd blocks on a short key and
         // truncates a long one, and neither says anything.
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_KEYRING_DIR", "/tmp/irlume-kr-len");
+        std::env::set_var("IRLUME_KEYRING_DIR", crate::test_tmp_dir("kr-len"));
         for bad in [crate::kwallet::KEY_LEN - 1, crate::kwallet::KEY_LEN + 1] {
             assert!(
                 seal_secret("lentest", &vec![7u8; bad], SecretKind::KdeWalletKey).is_err(),
@@ -636,12 +636,12 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn resealing_preserves_the_secret_kind() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-kind";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-kind");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
         // A home with a real salt, so the wallet key can actually be derived.
-        let home = std::path::PathBuf::from("/tmp/irlume-kr-kind-home");
+        let home = std::path::PathBuf::from(crate::test_tmp_dir("kr-kind-home"));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(crate::kwallet::salt_path(&home).parent().unwrap()).unwrap();
         std::fs::write(
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn seal_secret_refuses_a_token_so_it_cannot_be_armed_without_a_wrap() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_KEYRING_DIR", "/tmp/irlume-kr-notoken");
+        std::env::set_var("IRLUME_KEYRING_DIR", crate::test_tmp_dir("kr-notoken"));
         let err = seal_secret("t", b"0123456789abcdef", SecretKind::GnomeKeyringToken)
             .expect_err("a token must not be sealable through the generic path");
         assert!(
@@ -751,8 +751,8 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn a_token_envelope_heals_from_whichever_half_survives() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-token-heal";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-token-heal");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
         let pw = b"first-password";
@@ -854,8 +854,8 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-token-climb";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-token-climb");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
         let pw = b"climb-password";
@@ -913,8 +913,8 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn rearming_reuses_the_existing_token_rather_than_minting() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-rearm";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-rearm");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
         let pw = b"a-password";
@@ -958,8 +958,8 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn releasing_a_token_for_disarm_needs_the_right_password() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-disarm";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-disarm");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
         assert!(
@@ -1005,8 +1005,8 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn reseal_only_when_stale() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
-        let dir = "/tmp/irlume-kr-reseal";
-        std::env::set_var("IRLUME_KEYRING_DIR", dir);
+        let dir = crate::test_tmp_dir("kr-reseal");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
         // Not armed -> nothing happens.

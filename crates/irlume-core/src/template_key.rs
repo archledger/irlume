@@ -238,12 +238,15 @@ mod tests {
     #[test]
     fn paths_under_override_dirs() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/tmp/irlume-tk");
-        std::env::set_var("IRLUME_RECOVERY_DIR", "/tmp/irlume-rec");
-        assert_eq!(key_path("bob"), PathBuf::from("/tmp/irlume-tk/bob.json"));
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", crate::test_tmp_dir("tk"));
+        std::env::set_var("IRLUME_RECOVERY_DIR", crate::test_tmp_dir("rec"));
+        assert_eq!(
+            key_path("bob"),
+            PathBuf::from(format!("{}/bob.json", crate::test_tmp_dir("tk")))
+        );
         assert_eq!(
             recovery_path("bob"),
-            PathBuf::from("/tmp/irlume-rec/bob.json")
+            PathBuf::from(format!("{}/bob.json", crate::test_tmp_dir("rec")))
         );
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::env::remove_var("IRLUME_RECOVERY_DIR");
@@ -276,10 +279,10 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_key_and_recovery_lifecycle() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/tmp/irlume-tk-rt");
-        std::env::set_var("IRLUME_RECOVERY_DIR", "/tmp/irlume-rec-tpm");
-        let _ = std::fs::remove_dir_all("/tmp/irlume-tk-rt");
-        let _ = std::fs::remove_dir_all("/tmp/irlume-rec-tpm");
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", crate::test_tmp_dir("tk-rt"));
+        std::env::set_var("IRLUME_RECOVERY_DIR", crate::test_tmp_dir("rec-tpm"));
+        let _ = std::fs::remove_dir_all(crate::test_tmp_dir("tk-rt"));
+        let _ = std::fs::remove_dir_all(crate::test_tmp_dir("rec-tpm"));
 
         let k1 = ensure_key("rt").unwrap();
         assert!(has_key("rt"));
@@ -381,10 +384,10 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_tampered_seal_falls_back_then_recovery_heals() {
         let _g = ENV_LOCK.lock().unwrap();
-        let tk = "/tmp/irlume-tk-tamper";
-        let rec = "/tmp/irlume-rec-tamper";
-        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", tk);
-        std::env::set_var("IRLUME_RECOVERY_DIR", rec);
+        let tk = crate::test_tmp_dir("tk-tamper");
+        let rec = crate::test_tmp_dir("rec-tamper");
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &tk);
+        std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
         let _ = std::fs::remove_dir_all(tk);
         let _ = std::fs::remove_dir_all(rec);
 
@@ -421,9 +424,9 @@ mod tests {
         use crate::crypto;
         use crate::envelope::PolicyKind;
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", "/tmp/irlume-tk-upg");
-        let _ = std::fs::remove_dir_all("/tmp/irlume-tk-upg");
-        std::fs::create_dir_all("/tmp/irlume-tk-upg").unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", crate::test_tmp_dir("tk-upg"));
+        let _ = std::fs::remove_dir_all(crate::test_tmp_dir("tk-upg"));
+        std::fs::create_dir_all(crate::test_tmp_dir("tk-upg")).unwrap();
 
         let key = crypto::generate_key();
         // Simulate an "old" seal under the weakest tier (literal PCR 7).

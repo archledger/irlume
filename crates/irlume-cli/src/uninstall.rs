@@ -34,7 +34,16 @@ pub struct TeardownReport {
     pub pam_unwired: bool,
     pub service_stopped: bool,
     pub users_cleared: usize,
+    /// The run was asked to wipe (no `--keep-data`).
+    pub data_wipe_requested: bool,
+    /// The wipe was requested AND every deletion succeeded. The PR #337 review
+    /// caught this meaning "wipe requested": every delete result was discarded,
+    /// so a read-only or failing filesystem still produced the deleted-
+    /// everything summary while live templates sat on disk.
     pub data_wiped: bool,
+    /// The paths that still hold data after a failed wipe, for the output to
+    /// name; empty when the wipe succeeded or was never requested.
+    pub data_left: Vec<String>,
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -143,14 +152,22 @@ pub fn run(args: &[String]) -> ExitCode {
         "[uninstall] service stopped and disabled: {}",
         yn(report.service_stopped)
     );
+    // Three states, not two: a requested wipe that FAILED must never read as a
+    // completed one (PR #337 review), so the warning names what still holds
+    // data instead of borrowing the success phrasing.
+    let data_status = if !report.data_wipe_requested {
+        "data kept".to_string()
+    } else if report.data_wiped {
+        "enrollments, seals, models, and config deleted".to_string()
+    } else {
+        format!(
+            "WARNING: the data wipe was incomplete; data remains at {}",
+            report.data_left.join(", ")
+        )
+    };
     println!(
-        "[uninstall] users disarmed: {}{}",
-        report.users_cleared,
-        if report.data_wiped {
-            " (enrollments, seals, models, and config deleted)"
-        } else {
-            " (data kept)"
-        }
+        "[uninstall] users disarmed: {} ({data_status})",
+        report.users_cleared
     );
 
     // Now actually remove irlume: the package via its manager, or the
@@ -165,10 +182,11 @@ pub fn run(args: &[String]) -> ExitCode {
     clean_residuals(&origin);
     // Snapshot tooling keeps copies of everything the wipe just deleted: on the
     // #335 audit box, snapper's pacman hooks had snapshotted the templates, the
-    // sealed keyring blob, and the recovery envelope, so "no data left behind"
-    // was not the whole truth. Detection is evidence-only (no snapshot tool is
-    // ever run) and irrelevant when --keep-data skipped the wipe.
-    let snapshots = if report.data_wiped {
+    // sealed keyring blob, and the recovery envelope. Detection is evidence-only
+    // (no snapshot tool is ever run) and can only ADD listing advice; the
+    // warning itself does not depend on it, because snapshots outlive the tools
+    // that made them (PR #337 review). Skipped when --keep-data skipped the wipe.
+    let snapshots = if report.data_wipe_requested {
         detect_snapshot_tools()
     } else {
         SnapshotEvidence::default()
@@ -176,7 +194,7 @@ pub fn run(args: &[String]) -> ExitCode {
     match removed {
         Ok(what) => {
             println!("[uninstall] {what}");
-            println!("[uninstall] {}", closing_line(&snapshots));
+            println!("[uninstall] {}", closing_line(&report, &snapshots));
         }
         Err(e) => {
             println!("[uninstall] could not finish removal automatically: {e}");
@@ -323,10 +341,13 @@ fn remove_timer_stamps(dir: &str) {
     }
 }
 
-/// The filesystem facts that say a snapshot tool retains copies of the wiped
-/// data (#335). Gathered from cheap existence checks only; the tools' own
-/// commands are never run, because detection must not be able to mutate
-/// snapshot state or fail the uninstall.
+/// The filesystem facts that say a known snapshot tool is present (#335).
+/// Gathered from cheap existence checks only; the tools' own commands are never
+/// run, because detection must not be able to mutate snapshot state or fail the
+/// uninstall. Positive evidence only ADDS listing advice to the closing line;
+/// negative evidence proves nothing (PR #337 review: a Timeshift RSYNC snapshot
+/// on an external disk outlives an uninstalled Timeshift, and a plain btrfs
+/// snapshot or a backup needs neither tool), so no all-clear is ever built on it.
 #[derive(Default)]
 struct SnapshotEvidence {
     snapper: bool,
@@ -334,60 +355,70 @@ struct SnapshotEvidence {
 }
 
 fn detect_snapshot_tools() -> SnapshotEvidence {
+    detect_snapshot_tools_at(Path::new("/"))
+}
+
+/// Detection against an injected filesystem root, so the tests exercise the
+/// real path set under a directory they own; production passes `/`.
+fn detect_snapshot_tools_at(root: &Path) -> SnapshotEvidence {
     SnapshotEvidence {
-        snapper: snapper_evidence(),
-        timeshift: timeshift_evidence(),
+        snapper: snapper_evidence(root),
+        timeshift: timeshift_evidence(root),
     }
 }
 
-/// snapper is retaining data when its binary exists AND /etc/snapper/configs
-/// holds at least one config, or when a package-manager hook re-snapshots every
+/// snapper is present when its binary exists AND etc/snapper/configs holds at
+/// least one config, or when a package-manager hook re-snapshots every
 /// transaction: snap-pac's pacman hooks (the mechanism that snapshotted the
 /// #335 audit box) or openSUSE's zypp commit plugin.
-fn snapper_evidence() -> bool {
+fn snapper_evidence(root: &Path) -> bool {
     let bin = [
-        "/usr/bin/snapper",
-        "/usr/sbin/snapper",
-        "/usr/local/bin/snapper",
+        "usr/bin/snapper",
+        "usr/sbin/snapper",
+        "usr/local/bin/snapper",
     ]
     .iter()
-    .any(|p| Path::new(p).exists());
-    if bin && dir_has_entries("/etc/snapper/configs") {
+    .any(|p| root.join(p).exists());
+    if bin && dir_has_entries(&root.join("etc/snapper/configs")) {
         return true;
     }
-    for d in ["/usr/share/libalpm/hooks", "/etc/pacman.d/hooks"] {
-        if dir_has_entry_named(d, "snap-pac") || dir_has_entry_named(d, "snapper") {
+    for d in ["usr/share/libalpm/hooks", "etc/pacman.d/hooks"] {
+        let d = root.join(d);
+        if dir_has_entry_named(&d, "snap-pac") || dir_has_entry_named(&d, "snapper") {
             return true;
         }
     }
-    dir_has_entry_named("/usr/lib/zypp/plugins/commit", "snapper")
+    dir_has_entry_named(&root.join("usr/lib/zypp/plugins/commit"), "snapper")
 }
 
-/// Timeshift needs less corroboration than snapper: its binary or /etc/timeshift
+/// Timeshift needs less corroboration than snapper: its binary or etc/timeshift
 /// only exist when someone installed it, and it exists only to take snapshots.
-fn timeshift_evidence() -> bool {
+fn timeshift_evidence(root: &Path) -> bool {
     [
-        "/usr/bin/timeshift",
-        "/usr/sbin/timeshift",
-        "/usr/local/bin/timeshift",
-        "/etc/timeshift",
+        "usr/bin/timeshift",
+        "usr/sbin/timeshift",
+        "usr/local/bin/timeshift",
+        "etc/timeshift",
     ]
     .iter()
-    .any(|p| Path::new(p).exists())
+    .any(|p| root.join(p).exists())
 }
 
-/// True when `dir` exists and holds at least one entry. An unreadable directory
-/// counts as no evidence, never as an error: detection must not fail the
-/// uninstall (#335).
-fn dir_has_entries(dir: &str) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false)
+/// True when `dir` holds at least one READABLE entry. Unreadable entries are
+/// skipped, not counted: `ReadDir` yields `Some(Err(_))` for an entry it cannot
+/// read, and treating that as evidence contradicted the no-evidence contract
+/// (PR #337 review). A missing or unreadable dir is likewise no evidence, never
+/// an error: detection must not fail the uninstall (#335).
+fn dir_has_entries(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().next().is_some(),
+        Err(_) => false,
+    }
 }
 
 /// True when `dir` holds an entry whose name contains `needle`, compared in
 /// lowercase. Same tolerance as `dir_has_entries`.
-fn dir_has_entry_named(dir: &str, needle: &str) -> bool {
+fn dir_has_entry_named(dir: &Path, needle: &str) -> bool {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             if e.file_name()
@@ -402,33 +433,41 @@ fn dir_has_entry_named(dir: &str, needle: &str) -> bool {
     false
 }
 
-/// The closing line of a successful uninstall. Without snapshot evidence it is
-/// the exact line the module has always printed. With evidence it stays honest
-/// (#335): the wipe cannot reach inside filesystem snapshots, so the line names
-/// the tool holding them and the command that lists them, and drops the "no
-/// data left behind" claim it can no longer make. Pure over the gathered
-/// evidence so both arms are unit tested.
-fn closing_line(snapshots: &SnapshotEvidence) -> String {
-    let mut tools: Vec<&str> = Vec::new();
+/// The closing line of a successful removal, pure over the teardown report and
+/// the snapshot evidence so every arm is unit tested. The old "no repo,
+/// drop-in, or data left behind" claim is retired for a wipe on purpose (#335,
+/// PR #337 review): this process cannot see inside snapshots or backups, so
+/// after a wipe it always says they may retain the deleted data, and positive
+/// tool evidence only appends the matching listing command. A failed wipe never
+/// borrows the deleted phrasing; it names the paths that still hold data.
+fn closing_line(report: &TeardownReport, snapshots: &SnapshotEvidence) -> String {
+    if !report.data_wipe_requested {
+        return "irlume is removed, with no repo or drop-in left behind; your enrolled \
+                faces, sealed secrets, models, and config were kept (--keep-data)."
+            .into();
+    }
+    if !report.data_wiped {
+        return format!(
+            "irlume is removed, but the requested data wipe was incomplete: data \
+             remains at {}; filesystem snapshots and backups may also retain copies.",
+            report.data_left.join(", ")
+        );
+    }
+    let mut line = "irlume is removed, with no repo or drop-in left behind. Live irlume \
+                    data was deleted, but filesystem snapshots and backups may still \
+                    contain the deleted templates and sealed secrets."
+        .to_string();
     let mut list_cmds: Vec<&str> = Vec::new();
     if snapshots.snapper {
-        tools.push("snapper");
         list_cmds.push("`snapper list`");
     }
     if snapshots.timeshift {
-        tools.push("Timeshift");
         list_cmds.push("`timeshift --list`");
     }
-    if tools.is_empty() {
-        return "irlume is removed, with no repo, drop-in, or data left behind.".into();
+    if !list_cmds.is_empty() {
+        line.push_str(&format!(" List them with {}.", list_cmds.join(" and ")));
     }
-    format!(
-        "irlume is removed, with no repo or drop-in left behind, but {} filesystem \
-         snapshots may still contain the wiped templates and sealed secrets (list \
-         them with {}).",
-        tools.join(" and "),
-        list_cmds.join(" and ")
-    )
+    line
 }
 
 /// Run the four teardown steps in the lockout-safe order. Public so the TUI
@@ -465,12 +504,23 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     let service_stopped = stop && disable;
 
     // 3. Disarm each enrolled user's keyring seal (idempotent), and 4. wipe the
-    //    per-user enrollment + sealed secrets unless data is being kept.
+    //    per-user enrollment + sealed secrets unless data is being kept. Every
+    //    deletion result is collected: a discarded Err here is what let a
+    //    failed wipe report itself as "deleted" (PR #337 review), so any
+    //    failure lands in data_left and pulls data_wiped false.
     let users = irlume_core::storage::list_users();
+    let mut data_left: Vec<String> = Vec::new();
     for user in &users {
         let _ = irlume_core::keyring::forget_password(user);
         if !keep_data {
-            let _ = irlume_core::storage::delete(user);
+            if let Err(e) = irlume_core::storage::delete(user) {
+                let path = irlume_core::storage::profile_path(user);
+                eprintln!(
+                    "[uninstall] could not delete the enrollment of {user} at {}: {e}",
+                    path.display()
+                );
+                data_left.push(path.display().to_string());
+            }
         }
     }
 
@@ -484,31 +534,45 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         // took the enrollments, template keys, recovery envelopes and keyring
         // seals with it. That is not hypothetical; the same split resolution in
         // template_key.rs destroyed a real machine's keys on 2026-08-05.
-        //
-        // A failure is reported rather than swallowed: this used to discard the
-        // result, so a partial teardown still announced success and left secrets
-        // on disk under a directory the user believes is gone.
-        for dir in [
+        for dir in wipe_data_trees(&[
             irlume_common::state_dir(),
             irlume_common::config::CONFIG_ROOT.into(),
-        ] {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "[uninstall] could not remove {}: {e} (files may remain)",
-                        dir.display()
-                    );
-                }
-            }
+        ]) {
+            data_left.push(dir.display().to_string());
         }
     }
 
+    let data_wipe_requested = !keep_data;
     TeardownReport {
         pam_unwired,
         service_stopped,
         users_cleared: users.len(),
-        data_wiped: !keep_data,
+        data_wipe_requested,
+        data_wiped: data_wipe_requested && data_left.is_empty(),
+        data_left,
     }
+}
+
+/// Delete the given data trees and return the ones that still exist afterwards.
+/// A missing tree is a success (nothing to wipe); any other failure is reported
+/// on the spot AND returned, so the caller can refuse to claim a completed wipe
+/// (PR #337 review: this used to only print, and the report still said wiped).
+/// Takes the trees as a parameter so a failing removal is testable against
+/// paths the test owns.
+fn wipe_data_trees(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut remaining = Vec::new();
+    for dir in dirs {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[uninstall] could not remove {}: {e} (files remain)",
+                    dir.display()
+                );
+                remaining.push(dir.clone());
+            }
+        }
+    }
+    remaining
 }
 
 /// The package-removal command for how irlume was installed. Pure so it is unit
@@ -658,77 +722,180 @@ mod tests {
         remove_timer_stamps("/nonexistent/irlume-timer-stamp-dir");
     }
 
-    // The closing line is the uninstall's last word, and #335 measured it being
-    // wrong on a snapshotting box. Without evidence it must be the historical
-    // line, byte for byte; with evidence it must name the tool, keep the
-    // templates-and-secrets warning, and give the listing command.
+    // A report shaped like a run whose only interesting facts are the wipe
+    // fields; the PAM/service fields are irrelevant to the closing line.
+    fn report(requested: bool, wiped: bool, left: &[&str]) -> TeardownReport {
+        TeardownReport {
+            pam_unwired: true,
+            service_stopped: true,
+            users_cleared: 1,
+            data_wipe_requested: requested,
+            data_wiped: wiped,
+            data_left: left.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    // The closing line is the uninstall's last word, and the PR #337 review
+    // proved the old contract wrong twice: negative tool detection licensed an
+    // all-clear that snapshots on external disks falsify, and a failed wipe
+    // borrowed the success phrasing. The new contract: a completed wipe ALWAYS
+    // warns about snapshots and backups, evidence only appends listing advice.
     #[test]
-    fn closing_line_without_snapshot_evidence_is_the_historical_line() {
-        assert_eq!(
-            closing_line(&SnapshotEvidence::default()),
-            "irlume is removed, with no repo, drop-in, or data left behind."
+    fn closing_line_after_a_wipe_always_warns_even_with_no_tool_evidence() {
+        let line = closing_line(&report(true, true, &[]), &SnapshotEvidence::default());
+        assert!(
+            line.contains("snapshots and backups may still contain the deleted templates"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("no repo, drop-in, or data left behind"),
+            "the retired all-gone claim must not come back: {line}"
+        );
+        assert!(
+            !line.contains("snapper") && !line.contains("timeshift"),
+            "no tool advice without evidence: {line}"
         );
     }
 
     #[test]
-    fn closing_line_names_each_detected_snapshot_tool_and_its_list_command() {
-        let snapper = closing_line(&SnapshotEvidence {
-            snapper: true,
-            timeshift: false,
-        });
-        assert!(
-            snapper.contains("snapper filesystem snapshots"),
-            "{snapper}"
+    fn closing_line_appends_listing_advice_only_on_positive_evidence() {
+        let wiped = report(true, true, &[]);
+        let snapper = closing_line(
+            &wiped,
+            &SnapshotEvidence {
+                snapper: true,
+                timeshift: false,
+            },
         );
-        assert!(
-            snapper.contains("wiped templates and sealed secrets"),
-            "{snapper}"
-        );
+        assert!(snapper.contains("may still contain"), "{snapper}");
         assert!(snapper.contains("`snapper list`"), "{snapper}");
-        assert!(
-            !snapper.contains("no repo, drop-in, or data left behind"),
-            "the all-gone claim must not survive snapshot evidence: {snapper}"
-        );
+        assert!(!snapper.contains("timeshift"), "{snapper}");
 
-        let timeshift = closing_line(&SnapshotEvidence {
-            snapper: false,
-            timeshift: true,
-        });
-        assert!(
-            timeshift.contains("Timeshift filesystem snapshots"),
-            "{timeshift}"
+        let timeshift = closing_line(
+            &wiped,
+            &SnapshotEvidence {
+                snapper: false,
+                timeshift: true,
+            },
         );
         assert!(timeshift.contains("`timeshift --list`"), "{timeshift}");
 
-        let both = closing_line(&SnapshotEvidence {
-            snapper: true,
-            timeshift: true,
-        });
-        assert!(both.contains("snapper and Timeshift"), "{both}");
+        let both = closing_line(
+            &wiped,
+            &SnapshotEvidence {
+                snapper: true,
+                timeshift: true,
+            },
+        );
         assert!(
             both.contains("`snapper list` and `timeshift --list`"),
             "{both}"
         );
     }
 
-    // The evidence helpers back detection; both must read "cannot look" as "no
-    // evidence" rather than an error, because detection may never fail the
-    // uninstall (#335).
+    #[test]
+    fn closing_line_with_keep_data_states_the_data_was_kept() {
+        let line = closing_line(&report(false, false, &[]), &SnapshotEvidence::default());
+        assert!(line.contains("were kept"), "{line}");
+        assert!(
+            !line.contains("may still contain") && !line.contains("deleted"),
+            "kept data needs no deletion talk: {line}"
+        );
+    }
+
+    #[test]
+    fn closing_line_after_a_failed_wipe_names_the_leftovers_and_never_claims_deletion() {
+        let line = closing_line(
+            &report(true, false, &["/var/lib/irlume", "/etc/irlume"]),
+            &SnapshotEvidence::default(),
+        );
+        assert!(line.contains("incomplete"), "{line}");
+        assert!(line.contains("/var/lib/irlume, /etc/irlume"), "{line}");
+        assert!(
+            !line.contains("data was deleted") && !line.contains("left behind"),
+            "a failed wipe must not borrow the success phrasing: {line}"
+        );
+    }
+
+    // The wipe helper is what data_wiped now means (PR #337 review): a tree it
+    // could not remove must come back to the caller, not vanish into stderr.
+    // remove_dir_all on a regular FILE fails on any filesystem, root or not, so
+    // the failure fixture is deterministic.
+    #[test]
+    fn wipe_data_trees_returns_the_trees_it_could_not_remove() {
+        let root = std::env::temp_dir().join(format!("irlume-wipe-trees-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state/sub")).unwrap();
+        std::fs::write(root.join("state/sub/profile.json"), b"x").unwrap();
+        std::fs::write(root.join("not-a-dir"), b"x").unwrap();
+        let removable = root.join("state");
+        let stuck = root.join("not-a-dir");
+        let missing = root.join("never-existed");
+
+        let remaining = wipe_data_trees(&[removable.clone(), stuck.clone(), missing]);
+
+        assert_eq!(remaining, vec![stuck], "only the failed tree comes back");
+        assert!(!removable.exists(), "the removable tree must be gone");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Detection through the injected root, over the REAL path set: an empty
+    // root yields no evidence, the audit box's snap-pac hook yields snapper,
+    // the binary-plus-config pair yields snapper, /etc/timeshift yields
+    // Timeshift. This is the wiring test the first cut lacked (PR #337 review:
+    // the helpers were tested, the detectors were dead code to the suite).
+    #[test]
+    fn detect_snapshot_tools_at_reads_the_evidence_under_the_injected_root() {
+        let root = std::env::temp_dir().join(format!("irlume-snap-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let none = detect_snapshot_tools_at(&root);
+        assert!(!none.snapper && !none.timeshift, "empty root, no evidence");
+
+        // The #335 audit mechanism: snap-pac's pacman hook, no snapper binary.
+        std::fs::create_dir_all(root.join("usr/share/libalpm/hooks")).unwrap();
+        std::fs::write(
+            root.join("usr/share/libalpm/hooks/05-snap-pac-pre.hook"),
+            b"x",
+        )
+        .unwrap();
+        assert!(detect_snapshot_tools_at(&root).snapper, "hook is evidence");
+        let _ = std::fs::remove_dir_all(root.join("usr"));
+
+        // Binary alone is not enough; binary plus a config is.
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::fs::write(root.join("usr/bin/snapper"), b"x").unwrap();
+        assert!(
+            !detect_snapshot_tools_at(&root).snapper,
+            "an installed but unconfigured snapper is not evidence"
+        );
+        std::fs::create_dir_all(root.join("etc/snapper/configs")).unwrap();
+        std::fs::write(root.join("etc/snapper/configs/root"), b"x").unwrap();
+        let snapper = detect_snapshot_tools_at(&root);
+        assert!(snapper.snapper, "binary plus config is evidence");
+        assert!(!snapper.timeshift);
+
+        std::fs::create_dir_all(root.join("etc/timeshift")).unwrap();
+        assert!(detect_snapshot_tools_at(&root).timeshift);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The evidence helpers must read "cannot look" as "no evidence" rather than
+    // an error, because detection may never fail the uninstall (#335).
     #[test]
     fn dir_evidence_helpers_report_contents_and_tolerate_absence() {
         let dir = std::env::temp_dir().join(format!("irlume-snap-evidence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!dir_has_entries(dir.to_str().unwrap()), "empty dir");
+        assert!(!dir_has_entries(&dir), "empty dir");
         std::fs::write(dir.join("05-snap-pac-pre.hook"), b"x").unwrap();
-        assert!(dir_has_entries(dir.to_str().unwrap()));
-        assert!(dir_has_entry_named(dir.to_str().unwrap(), "snap-pac"));
-        assert!(!dir_has_entry_named(dir.to_str().unwrap(), "snapper"));
-        assert!(!dir_has_entries("/nonexistent/irlume-evidence-dir"));
-        assert!(!dir_has_entry_named(
-            "/nonexistent/irlume-evidence-dir",
-            "snapper"
-        ));
+        assert!(dir_has_entries(&dir));
+        assert!(dir_has_entry_named(&dir, "snap-pac"));
+        assert!(!dir_has_entry_named(&dir, "snapper"));
+        let missing = Path::new("/nonexistent/irlume-evidence-dir");
+        assert!(!dir_has_entries(missing));
+        assert!(!dir_has_entry_named(missing, "snapper"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

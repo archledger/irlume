@@ -1,0 +1,12 @@
+stage,model,runtime,threads,mean_ms,p50_ms,p95_ms
+detection,yunet,ort,0,11.559,11.982,12.615
+detection-rescue,blaze_short,ort,0,1.110,1.119,1.220
+detection-rescue,blaze_short,tflite,1,2.063,1.952,2.536
+detection-rescue,blaze_short,tflite,2,1.152,1.147,1.167
+detection-rescue,blaze_short,tflite,4,0.751,0.748,0.767
+detection-rescue,blaze_full_range,tflite,2,3.318,3.296,3.779
+landmarks,face_landmark_468,ort,0,8.513,8.506,8.954
+landmarks,face_landmarks_478,tflite,1,7.925,7.984,8.491
+landmarks,face_landmarks_478,tflite,2,4.717,4.522,5.448
+landmarks,face_landmarks_478,tflite,4,3.161,3.035,3.592
+blendshapes,face_blendshapes,tflite,1,1.377,1.377,1.391

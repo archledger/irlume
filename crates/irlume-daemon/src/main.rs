@@ -1443,10 +1443,11 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
     // it; root stays the trust boundary. For daemon-verified biometric
     // release resistant to live root, use the face/IR path.
     //
-    // The posture table gates `UnsealKeyring` root-only too, and the message
-    // is the same either way. This check stays because it is the ONLY one on
-    // the startup path: `dispatch_before_engine` answers this request without
-    // going through `pregate` (#344).
+    // The posture table gates `UnsealKeyring` root-only too, on both the
+    // worker path and the startup path, and the message is the same either
+    // way. This check stays as defence in depth: it is a property of the
+    // request, so it holds for any future caller that reaches this function
+    // without going through `pregate`.
     if peer.uid != 0 {
         return Response::Error(format!(
             "unseal_keyring requires root (peer uid {})",
@@ -1516,6 +1517,14 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
 /// attempt falls through to the password at once instead of waiting out startup,
 /// and no early caller occupies a slot for the length of it.
 fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
+    // Startup is a routing state, not an authorization state: the request
+    // served here meets the same username screen and privilege check as one
+    // served by the worker. Before #349 this path skipped both, so a keyring
+    // release could reach `envelope_path` with a username that walks out of
+    // the keyring directory.
+    if let Some(resp) = pregate(&req, peer) {
+        return resp;
+    }
     match req {
         Request::UnsealKeyring {
             user,
@@ -2448,12 +2457,6 @@ fn enroll_with_capture_probe(
 }
 
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
-    // BEFORE the mutation runs, not after: a summary dropped early leaves
-    // the cache empty (a concurrent status read queues here behind us),
-    // never stale. Repopulated by the next worker-side listing.
-    if let Some(u) = enrollment_mutating_user(&req) {
-        invalidate_enrollment_summary(u);
-    }
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
     // in behavior) if one is ever submitted anyway. The pregate rides inside.
@@ -2465,6 +2468,17 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
     // (#344). No arm re-checks either.
     if let Some(resp) = pregate(&req, peer) {
         return resp;
+    }
+    // AFTER the gate, BEFORE the mutation runs. After the gate because the
+    // cache is state, and a request that is about to be refused may not
+    // change state: an unprivileged peer could otherwise evict root's summary
+    // with a DeleteProfile it is not allowed to perform, and charge root's
+    // next listing a storage load and its TPM work (#349). Before the
+    // mutation because a summary dropped early leaves the cache empty (a
+    // concurrent status read queues here behind us), never stale.
+    // Repopulated by the next worker-side listing.
+    if let Some(user) = enrollment_mutating_user(&req) {
+        invalidate_enrollment_summary(user);
     }
     match req {
         // These four are answered by dispatch_status above; the arm is
@@ -4242,189 +4256,204 @@ mod tests {
     /// expectation from the request instead of a second hand-written list.
     const SAMPLE_USER: &str = "carol";
 
-    /// How many variants `Request` has. The count is here so that adding one
-    /// cannot pass the coverage tests by being left out of `request_samples`:
-    /// `variant_name` stops compiling first, and this stops the list being
-    /// short (#344).
-    const REQUEST_VARIANT_COUNT: usize = 34;
+    /// Every [`Request`] variant, named once, with a sample value.
+    ///
+    /// One invocation generates BOTH the sample list and `variant_name`, whose
+    /// match is exhaustive with no wildcard. That is what ties them together:
+    /// adding a variant to `Request` breaks the compile of `variant_name`, and
+    /// the only way to fix that compile is to add a line here, which also adds
+    /// the sample. A hand-maintained count next to a hand-maintained list
+    /// could not do this, because leaving both short agreed with itself
+    /// (#349).
+    ///
+    /// Each sample must be an instance of the variant it is catalogued under;
+    /// `each_sample_is_the_variant_it_was_catalogued_under` checks that, since
+    /// the macro cannot.
+    ///
+    /// The two leading identifiers are the names the samples call to build the
+    /// username and a secret. They are passed in rather than defined in the
+    /// macro body because a name the macro introduces is hygienically invisible
+    /// to the sample expressions, which the caller wrote.
+    macro_rules! request_catalog {
+        ($u:ident, $secret:ident; $($name:ident => $sample:expr),+ $(,)?) => {
+            fn variant_name(req: &Request) -> &'static str {
+                match req {
+                    $(Request::$name { .. } => stringify!($name),)+
+                }
+            }
 
-    /// One sample of every [`Request`] variant, each user-bearing one built
-    /// with `user`. `PositionSample` appears twice because its user is
-    /// optional and both shapes have a posture.
-    fn request_samples_with_user(user: &str) -> Vec<Request> {
-        use irlume_common::SecretBytes;
-        let u = || user.to_string();
-        let secret = || SecretBytes::new(b"pw".to_vec());
+            /// One sample per variant, paired with the name it was catalogued
+            /// under. User-bearing samples are built with `user`.
+            fn named_samples(user: &str) -> Vec<(&'static str, Request)> {
+                let $u = || user.to_string();
+                let $secret = || irlume_common::SecretBytes::new(b"pw".to_vec());
+                // Not every sample needs both; the catalog is one list.
+                let _ = (&$u, &$secret);
+                vec![$((stringify!($name), $sample)),+]
+            }
+        };
+    }
+
+    request_catalog! {
+        u, secret;
+        Authenticate => Request::Authenticate {
+            user: u(),
+            service: Some("sudo".into()),
+        },
+        Enroll => Request::Enroll {
+            user: u(),
+            profile: None,
+            scans: None,
+            reset: false,
+        },
+        Identify => Request::Identify,
+        SetCameras => Request::SetCameras {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+        },
+        AddScan => Request::AddScan {
+            user: u(),
+            profile: "p".into(),
+            scans: None,
+            report_enrollment: false,
+        },
+        ListProfiles => Request::ListProfiles {
+            user: u(),
+            structured_errors: false,
+        },
+        DeleteProfile => Request::DeleteProfile {
+            user: u(),
+            profile: "p".into(),
+        },
+        DeleteScan => Request::DeleteScan {
+            user: u(),
+            profile: "p".into(),
+            scan: "s".into(),
+        },
+        ForgetRecognizer => Request::ForgetRecognizer {
+            user: u(),
+            space: "embed:abc".into(),
+        },
+        RenameProfile => Request::RenameProfile {
+            user: u(),
+            profile: "p".into(),
+            new_name: "q".into(),
+        },
+        RenameScan => Request::RenameScan {
+            user: u(),
+            profile: "p".into(),
+            scan: "s".into(),
+            new_name: "t".into(),
+        },
+        SetRequireEyesOpen => Request::SetRequireEyesOpen {
+            user: u(),
+            on: true,
+        },
+        SetRequireChallenge => Request::SetRequireChallenge {
+            user: u(),
+            on: false,
+        },
+        CaptureEarMedian => Request::CaptureEarMedian { user: u() },
+        SetClosureCalibration => Request::SetClosureCalibration {
+            user: u(),
+            ear_open: 0.3,
+            ear_closed: 0.1,
+        },
+        // The writing form. The dry run is an alternative shape, below.
+        SetupIrEmitter => Request::SetupIrEmitter { dry_run: false },
+        TuneCaptureMode => Request::TuneCaptureMode { rounds: None },
+        SelfTest => Request::SelfTest {
+            kind: irlume_common::SelfTestKind::Liveness,
+        },
+        ListCameras => Request::ListCameras,
+        Ping => Request::Ping,
+        Health => Request::Health,
+        // The user-bearing form, so the traversal walk covers it.
+        PositionSample => Request::PositionSample { user: Some(u()) },
+        SealPassword => Request::SealPassword {
+            user: u(),
+            password: secret(),
+            kind: None,
+        },
+        UnsealPassword => Request::UnsealPassword {
+            user: u(),
+            service: None,
+        },
+        UnsealKeyring => Request::UnsealKeyring {
+            user: u(),
+            service: None,
+            have_password: false,
+        },
+        HasSealedPassword => Request::HasSealedPassword { user: u() },
+        KeyringInfo => Request::KeyringInfo { user: u() },
+        ForgetPassword => Request::ForgetPassword { user: u() },
+        ReleaseTokenForDisarm => Request::ReleaseTokenForDisarm {
+            user: u(),
+            password: secret(),
+        },
+        ResealPassword => Request::ResealPassword {
+            user: u(),
+            password: secret(),
+        },
+        RecoverySetup => Request::RecoverySetup {
+            user: u(),
+            passphrase: secret(),
+        },
+        RecoveryRestore => Request::RecoveryRestore {
+            user: u(),
+            passphrase: secret(),
+        },
+        RecoveryStatus => Request::RecoveryStatus { user: u() },
+        RecoveryForget => Request::RecoveryForget { user: u() },
+    }
+
+    /// Second shapes of variants the catalog already covers, where the posture
+    /// reads a field rather than the variant alone. These ADD cases to the
+    /// walks; they can never stand in for a missing variant, because the
+    /// catalog above is what the exhaustive match is generated from.
+    fn alternative_shapes(user: &str) -> Vec<Request> {
+        let _ = user;
         vec![
-            Request::Authenticate {
-                user: u(),
-                service: Some("sudo".into()),
-            },
-            Request::Enroll {
-                user: u(),
-                profile: None,
-                scans: None,
-                reset: false,
-            },
-            Request::Identify,
-            Request::SetCameras {
-                rgb: "/dev/video0".into(),
-                ir: "/dev/video2".into(),
-            },
-            Request::AddScan {
-                user: u(),
-                profile: "p".into(),
-                scans: None,
-                report_enrollment: false,
-            },
-            Request::ListProfiles {
-                user: u(),
-                structured_errors: false,
-            },
-            Request::DeleteProfile {
-                user: u(),
-                profile: "p".into(),
-            },
-            Request::DeleteScan {
-                user: u(),
-                profile: "p".into(),
-                scan: "s".into(),
-            },
-            Request::ForgetRecognizer {
-                user: u(),
-                space: "embed:abc".into(),
-            },
-            Request::RenameProfile {
-                user: u(),
-                profile: "p".into(),
-                new_name: "q".into(),
-            },
-            Request::RenameScan {
-                user: u(),
-                profile: "p".into(),
-                scan: "s".into(),
-                new_name: "t".into(),
-            },
-            Request::SetRequireEyesOpen {
-                user: u(),
-                on: true,
-            },
-            Request::SetRequireChallenge {
-                user: u(),
-                on: false,
-            },
-            Request::CaptureEarMedian { user: u() },
-            Request::SetClosureCalibration {
-                user: u(),
-                ear_open: 0.3,
-                ear_closed: 0.1,
-            },
-            Request::SetupIrEmitter { dry_run: true },
-            Request::SetupIrEmitter { dry_run: false },
-            Request::TuneCaptureMode { rounds: None },
-            Request::SelfTest {
-                kind: irlume_common::SelfTestKind::Liveness,
-            },
-            Request::ListCameras,
-            Request::Ping,
-            Request::Health,
-            Request::PositionSample { user: Some(u()) },
+            // No user to screen, and no band to tune to an account.
             Request::PositionSample { user: None },
-            Request::SealPassword {
-                user: u(),
-                password: secret(),
-                kind: None,
-            },
-            Request::UnsealPassword {
-                user: u(),
-                service: None,
-            },
-            Request::UnsealKeyring {
-                user: u(),
-                service: None,
-                have_password: false,
-            },
-            Request::HasSealedPassword { user: u() },
-            Request::KeyringInfo { user: u() },
-            Request::ForgetPassword { user: u() },
-            Request::ReleaseTokenForDisarm {
-                user: u(),
-                password: secret(),
-            },
-            Request::ResealPassword {
-                user: u(),
-                password: secret(),
-            },
-            Request::RecoverySetup {
-                user: u(),
-                passphrase: secret(),
-            },
-            Request::RecoveryRestore {
-                user: u(),
-                passphrase: secret(),
-            },
-            Request::RecoveryStatus { user: u() },
-            Request::RecoveryForget { user: u() },
+            // The reading form, which any peer may send.
+            Request::SetupIrEmitter { dry_run: true },
         ]
+    }
+
+    /// Every sample plus every alternative shape, built with `user`.
+    fn request_samples_with_user(user: &str) -> Vec<Request> {
+        named_samples(user)
+            .into_iter()
+            .map(|(_, req)| req)
+            .chain(alternative_shapes(user))
+            .collect()
     }
 
     fn request_samples() -> Vec<Request> {
         request_samples_with_user(SAMPLE_USER)
     }
 
-    /// The variant's name, from an EXHAUSTIVE match with no wildcard: adding a
-    /// `Request` variant breaks this function's compile, which is what leads
-    /// whoever added it to `request_samples` and the count above.
-    fn variant_name(req: &Request) -> &'static str {
-        match req {
-            Request::Authenticate { .. } => "Authenticate",
-            Request::Enroll { .. } => "Enroll",
-            Request::Identify => "Identify",
-            Request::SetCameras { .. } => "SetCameras",
-            Request::AddScan { .. } => "AddScan",
-            Request::ListProfiles { .. } => "ListProfiles",
-            Request::DeleteProfile { .. } => "DeleteProfile",
-            Request::DeleteScan { .. } => "DeleteScan",
-            Request::ForgetRecognizer { .. } => "ForgetRecognizer",
-            Request::RenameProfile { .. } => "RenameProfile",
-            Request::RenameScan { .. } => "RenameScan",
-            Request::SetRequireEyesOpen { .. } => "SetRequireEyesOpen",
-            Request::SetRequireChallenge { .. } => "SetRequireChallenge",
-            Request::CaptureEarMedian { .. } => "CaptureEarMedian",
-            Request::SetClosureCalibration { .. } => "SetClosureCalibration",
-            Request::SetupIrEmitter { .. } => "SetupIrEmitter",
-            Request::TuneCaptureMode { .. } => "TuneCaptureMode",
-            Request::SelfTest { .. } => "SelfTest",
-            Request::ListCameras => "ListCameras",
-            Request::Ping => "Ping",
-            Request::Health => "Health",
-            Request::PositionSample { .. } => "PositionSample",
-            Request::SealPassword { .. } => "SealPassword",
-            Request::UnsealPassword { .. } => "UnsealPassword",
-            Request::UnsealKeyring { .. } => "UnsealKeyring",
-            Request::HasSealedPassword { .. } => "HasSealedPassword",
-            Request::KeyringInfo { .. } => "KeyringInfo",
-            Request::ForgetPassword { .. } => "ForgetPassword",
-            Request::ReleaseTokenForDisarm { .. } => "ReleaseTokenForDisarm",
-            Request::ResealPassword { .. } => "ResealPassword",
-            Request::RecoverySetup { .. } => "RecoverySetup",
-            Request::RecoveryRestore { .. } => "RecoveryRestore",
-            Request::RecoveryStatus { .. } => "RecoveryStatus",
-            Request::RecoveryForget { .. } => "RecoveryForget",
+    /// The macro pairs a name with an expression and cannot check that the
+    /// expression builds that variant, so a sample written under the wrong
+    /// name would silently test one variant twice and none of the other.
+    #[test]
+    fn each_sample_is_the_variant_it_was_catalogued_under() {
+        for (name, req) in named_samples(SAMPLE_USER) {
+            assert_eq!(
+                variant_name(&req),
+                name,
+                "the sample catalogued as {name} builds a different variant"
+            );
         }
     }
 
+    /// Two invariants the table must hold for every variant, which the type
+    /// system cannot state: a privilege that names a target needs a target,
+    /// and a mutation needs an account whose summary it can drop.
     #[test]
-    fn posture_declares_every_request_variant() {
-        let samples = request_samples();
-        let named: std::collections::BTreeSet<&str> = samples.iter().map(variant_name).collect();
-        assert_eq!(
-            named.len(),
-            REQUEST_VARIANT_COUNT,
-            "every Request variant needs a sample here, or the posture tests \
-             below silently skip it: {named:?}"
-        );
-        for req in &samples {
+    fn sampled_postures_are_internally_consistent() {
+        for req in &request_samples() {
             let posture = posture(req);
             // A "root or the target account" declaration with no account names
             // nothing to check against, and the pregate fails it closed rather
@@ -4659,6 +4688,27 @@ mod tests {
                 "the refusal must say why, it reaches the user through PAM: {e}"
             ),
             other => panic!("a request needing the engine must be refused, got {other:?}"),
+        }
+    }
+
+    /// The startup path answers a keyring release before the engine exists,
+    /// and it screens the username exactly like the worker path does. The
+    /// envelope path is built by interpolating the name, so one that walks out
+    /// of the keyring directory has to be refused here too. Root, so the
+    /// root-only check cannot be what refuses (#349).
+    #[test]
+    fn startup_unseal_keyring_rejects_a_traversing_username() {
+        let resp = dispatch_before_engine(
+            Request::UnsealKeyring {
+                user: "../template-keys/alice".into(),
+                service: Some("login".into()),
+                have_password: false,
+            },
+            &peer(0),
+        );
+        match resp {
+            Response::Error(msg) => assert_eq!(msg, "invalid username"),
+            other => panic!("a traversing username must be refused at startup, got {other:?}"),
         }
     }
 
@@ -4974,6 +5024,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The cache is state, so a request that is about to be refused may not
+    /// change it. Invalidating first let any local peer evict another
+    /// account's summary with a mutation it is not allowed to perform, and
+    /// charge that account's next listing a storage load and its TPM work
+    /// (#349). The authorized mutation must still invalidate before it runs.
+    #[test]
+    fn only_an_authorized_mutation_drops_the_cached_summary() {
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("refused-mutation");
+        let _ = &sb;
+        let delete = || Request::DeleteProfile {
+            user: SAMPLE_USER.into(),
+            profile: "p".into(),
+        };
+        publish_enrollment_summary(
+            SAMPLE_USER,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                require_eyes_open: true,
+                require_challenge: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: false,
+            },
+        );
+        match dispatch(delete(), &peer(NOBODY), &mut e) {
+            Response::Error(msg) => assert_eq!(
+                msg,
+                format!("not authorized to modify '{SAMPLE_USER}'"),
+                "the refusal itself must not change"
+            ),
+            other => panic!("a foreign peer must be refused, got {other:?}"),
+        }
+        assert!(
+            cached_enrollment_summary(SAMPLE_USER).is_some(),
+            "a refused mutation must leave the summary cached"
+        );
+        // Root may act for any account. The sandbox holds no enrollment, so
+        // the deletion itself fails; the invalidation has already happened by
+        // then, which is the ordering this asserts.
+        let _ = dispatch(delete(), &peer(0), &mut e);
+        assert!(
+            cached_enrollment_summary(SAMPLE_USER).is_none(),
+            "an authorized mutation must drop the summary before it runs"
+        );
     }
 
     #[test]

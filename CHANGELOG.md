@@ -20,6 +20,23 @@ All notable changes to irlume are documented here. This project adheres to
   compile until its security posture is declared, and the traversal screen
   and the authorization check both read that one declaration (#344).
 
+- **The startup path screened no username at all.** While the daemon loads
+  its models it answers a keyring release itself, so a fingerprint login
+  after a reboot unlocks the keyring instead of meeting a password prompt.
+  That path ran neither check, so the same interpolated envelope path was
+  reachable there with any name a root caller sent. It now passes the same
+  gate as every other request before its handler runs, and the handler keeps
+  its own root check as well (#349).
+
+- **A refused request could still evict another account's cached enrollment
+  summary.** The daemon dropped the cached summary before deciding whether
+  the peer was allowed to change that enrollment, so any local account could
+  make root's next `irlume list` reload from storage, TPM work included, by
+  sending a deletion it was never permitted to perform. The cache is now
+  dropped after the authorization decision and still before the mutation
+  runs, so a concurrent read misses rather than reading something stale
+  (#349).
+
 ### Changed
 
 - **An unmeasured camera pair now captures one stream at a time, and the

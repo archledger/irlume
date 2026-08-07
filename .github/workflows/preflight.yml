@@ -35,6 +35,14 @@ jobs:
     name: preflight · fmt · clippy · test (archhost)
     runs-on: [self-hosted, arch]
     timeout-minutes: 40
+    env:
+      # The ACTUAL pin (review round): PATH alone selects rustup's proxies
+      # but leaves the toolchain to rustup's mutable default; this override
+      # outranks default and directory overrides, and auto-install off keeps
+      # the job on the pre-provisioned runner instead of a silent network
+      # install.
+      RUSTUP_TOOLCHAIN: "1.88.0"
+      RUSTUP_AUTO_INSTALL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -43,17 +51,22 @@ jobs:
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh
 
-      # The pinned MSRV toolchain (ghrunner's rustup 1.88.0), NOT the
-      # runner's rolling pacman rust: rolling clippy drifts new lints under
-      # -D warnings, and clippy 1.97's question_mark lint failed this job on
-      # code the pinned gate accepts. Same pin the GitLab lane carries. The
-      # header above says "pinned MSRV toolchain" and this makes it true.
-      - name: pin the toolchain on PATH
+      # rustup's proxies (NOT the rolling pacman rust: clippy 1.97's
+      # question_mark lint failed this job on code the pinned gate
+      # accepts); RUSTUP_TOOLCHAIN above makes the selection explicit.
+      - name: Select the pinned rustup toolchain
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Verify the pinned toolchain
         run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: toolchain is the pin
-        run: |
-          cargo --version | grep -F '1.88.0' || { echo "::error::cargo is not the pinned 1.88.0"; exit 1; }
+          set -euo pipefail
+          test "$(cargo --version | awk '{print $2}')" = "1.88.0" || {
+            echo "::error::cargo is not the pinned 1.88.0"
+            cargo --version || true
+            exit 1
+          }
+          rustc --version
+          cargo clippy --version
+          cargo fmt --version
 
       - name: rustfmt
         run: cargo fmt --all --check

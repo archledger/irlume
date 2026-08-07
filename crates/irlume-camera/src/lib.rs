@@ -356,28 +356,26 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
             "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
         )),
-        // The two stream-start failure signatures the camera-stack research
-        // (2026-08-07, kernel v6.16 sources) separated; the wording exists so
-        // a device refusal and bus exhaustion stop reading alike in dlog and
-        // bug reports (#340). No behavior branches on either.
+        // These errnos are search keys, not verdicts (#340 review round).
+        // map_io has no operation context: it maps opens, S_FMT, buffer
+        // setup, dequeues and controls alike, and the kernel reuses each
+        // errno across paths (uvcvideo returns EINVAL for a malformed frame
+        // descriptor as well as for a rejected argument, and normalizes
+        // failed PROBE/COMMIT transfers to EIO, which xHCI admission answers
+        // as ENOSPC). So the message hands the reader the deciding
+        // instrument, the kernel log, instead of naming a culprit the errno
+        // alone cannot convict. No behavior branches on either arm.
         Some(libc::EINVAL) => Error::Hardware(format!(
-            "{device}: {e}. EINVAL at stream start is the camera itself refusing: \
-             uvcvideo maps a device STALL on the PROBE/COMMIT negotiation to EINVAL \
-             (uvc_video.c), so the module's firmware declined, and USB bandwidth is \
-             not the limit (bus exhaustion answers EIO or ENOSPC). Hello-style modules \
-             whose firmware cannot serve RGB and IR at once fail this way while the \
-             sibling node streams; `sudo irlume camera-tune` measures that and stores \
-             one-at-a-time capture for the camera"
+            "{device}: {e}. The driver rejected an argument or the device's advertised \
+             format/control state; this errno alone does not distinguish a firmware \
+             refusal from invalid format metadata. The matching dmesg line names the \
+             failing path"
         )),
         Some(libc::EIO) | Some(libc::ENOSPC) => Error::Hardware(format!(
-            "{device}: {e}. At stream start this signature is the USB bus, not the \
-             camera: uvcvideo answers EIO when no alt setting is fast enough for the \
-             bandwidth the device requested, and the xHCI host answers ENOSPC when its \
-             periodic-bandwidth admission refuses the reservation (a firmware refusal \
-             answers EINVAL instead). A lower resolution or frame rate, MJPEG, or a \
-             port not shared with the other camera can fit within the budget. An EIO \
-             in the first moments after resume can also be the device still waking; \
-             retry before concluding anything"
+            "{device}: {e}. Stream setup or I/O failed; the causes this errno covers \
+             include UVC negotiation failure, malformed endpoint information, device \
+             reset/resume, and USB bandwidth admission. Check the matching kernel log \
+             line before assigning the cause"
         )),
         _ => Error::Hardware(format!("{device}: {e}")),
     }
@@ -3322,29 +3320,116 @@ fn frame_mean(data: &[u8]) -> f32 {
     data.iter().map(|&b| b as u64).sum::<u64>() as f32 / data.len() as f32
 }
 
-/// `cameras.conf` key holding the capture mode for one physical camera. Keyed by
-/// camera IDENTITY, not by device node: `/dev/videoN` numbering moves across
-/// reboots and replugs, and the answer belongs to the hardware.
+/// The pre-pair `cameras.conf` key: the RGB camera's identity alone. Read-only
+/// since #340's review round; see [`stored_capture_mode`] for the one migration
+/// case that may still consult it.
 fn capture_mode_key(identity: &str) -> String {
     format!("capture_mode.{identity}")
 }
 
-/// The stored capture mode for the camera behind `device`, if one was measured.
-/// `None` means unmeasured (the caller keeps its default) or an unreadable
-/// config; an unrecognized stored value is also `None` rather than a guess.
-pub fn stored_capture_mode(device: &str) -> Option<CaptureMode> {
-    let id = device_identity(device)?;
-    let raw = irlume_common::config::read_kv("cameras.conf", &capture_mode_key(&id))?;
-    CaptureMode::parse(&raw)
+/// `cameras.conf` key holding the capture mode for one measured RGB+IR
+/// pairing. Keyed by BOTH identities, not by device node and not by the RGB
+/// module alone: `/dev/videoN` numbering moves across reboots and replugs, and
+/// contention is a property of the pairing. The measured proof: the same
+/// NexiGo RGB node that keeps 42-56% of its brightness against its own IR
+/// sibling retains 0.99 against a different camera's IR (see
+/// [`CONCURRENT_SIGNAL_FLOOR`]), so a verdict must not survive an IR swap.
+fn capture_mode_pair_key(rgb_identity: &str, ir_identity: &str) -> String {
+    format!("capture_mode.{rgb_identity}+{ir_identity}")
 }
 
-/// Persist the capture mode for the camera behind `device`. Writes
-/// `/etc/irlume/cameras.conf`, so it needs root.
-pub fn store_capture_mode(device: &str, mode: CaptureMode) -> irlume_common::Result<()> {
-    let id = device_identity(device)
-        .ok_or_else(|| Error::Hardware(format!("{device}: cannot identify the camera")))?;
-    irlume_common::config::write_kv("cameras.conf", &capture_mode_key(&id), mode.as_str())
-        .map_err(|e| Error::Io(e.to_string()))
+/// The stored capture mode for the RGB+IR pairing behind these two devices, if
+/// that pairing was measured. `None` means unmeasured (the caller keeps its
+/// default), an unidentifiable node, or an unreadable config; an unrecognized
+/// stored value is also `None` rather than a guess.
+pub fn stored_capture_mode(rgb_dev: &str, ir_dev: &str) -> Option<CaptureMode> {
+    let rgb_id = device_identity(rgb_dev)?;
+    let ir_id = device_identity(ir_dev)?;
+    // Two Somes and equal, never None==None: a node whose sysfs identity
+    // cannot be resolved must fail toward "unmeasured", not toward "same
+    // module".
+    let same_module = matches!(
+        (physical_device_id(rgb_dev), physical_device_id(ir_dev)),
+        (Some(a), Some(b)) if a == b
+    );
+    resolve_stored_pair_mode(
+        irlume_common::config::read_kv("cameras.conf", &capture_mode_pair_key(&rgb_id, &ir_id)),
+        same_module,
+        || irlume_common::config::read_kv("cameras.conf", &capture_mode_key(&rgb_id)),
+    )
+}
+
+/// The pair-key resolution, pure over its observations so the migration rule
+/// is testable without sysfs: the pair entry decides when present; a legacy
+/// RGB-only entry (written before verdicts were keyed by pair) is honored
+/// ONLY when both nodes still belong to one physical USB device, the shape
+/// every legacy verdict was measured on. Any other pairing counts as
+/// unmeasured; a legacy entry must never vouch for an IR camera it was not
+/// measured against.
+fn resolve_stored_pair_mode(
+    pair_entry: Option<String>,
+    same_physical_device: bool,
+    legacy_entry: impl FnOnce() -> Option<String>,
+) -> Option<CaptureMode> {
+    if let Some(raw) = pair_entry {
+        return CaptureMode::parse(&raw);
+    }
+    if same_physical_device {
+        return CaptureMode::parse(&legacy_entry()?);
+    }
+    None
+}
+
+/// Persist the capture mode for the RGB+IR pairing behind these two devices.
+/// Writes `/etc/irlume/cameras.conf`, so it needs root. Overwrites; the
+/// check-before-write callers use [`store_capture_mode_if_absent`].
+pub fn store_capture_mode(
+    rgb_dev: &str,
+    ir_dev: &str,
+    mode: CaptureMode,
+) -> irlume_common::Result<()> {
+    let rgb_id = device_identity(rgb_dev)
+        .ok_or_else(|| Error::Hardware(format!("{rgb_dev}: cannot identify the RGB camera")))?;
+    let ir_id = device_identity(ir_dev)
+        .ok_or_else(|| Error::Hardware(format!("{ir_dev}: cannot identify the IR camera")))?;
+    irlume_common::config::write_kv(
+        "cameras.conf",
+        &capture_mode_pair_key(&rgb_id, &ir_id),
+        mode.as_str(),
+    )
+    .map_err(|e| Error::Io(e.to_string()))
+}
+
+/// What [`store_capture_mode_if_absent`] found when it looked.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreIfAbsent {
+    /// No verdict existed; `mode` was written.
+    Stored,
+    /// A verdict already existed and was kept untouched.
+    AlreadyPresent(CaptureMode),
+}
+
+/// Persist `mode` only if the pairing still has no verdict, under the
+/// cameras.conf writer lock.
+///
+/// Exists for the enrollment probe (#340 review): its emptiness check and its
+/// write are separated by a probe of up to a minute, and the daemon's single
+/// worker only serializes daemon requests, not an administrator or a
+/// configuration manager editing the file in that window. Checking again
+/// under the lock means an automatic probe can only ever FILL an empty
+/// verdict; a verdict that appeared mid-probe wins and is returned.
+pub fn store_capture_mode_if_absent(
+    rgb_dev: &str,
+    ir_dev: &str,
+    mode: CaptureMode,
+) -> irlume_common::Result<StoreIfAbsent> {
+    let _guard = irlume_common::config::lock_exclusive("cameras.conf")
+        .map_err(|e| Error::Io(e.to_string()))?;
+    if let Some(existing) = stored_capture_mode(rgb_dev, ir_dev) {
+        return Ok(StoreIfAbsent::AlreadyPresent(existing));
+    }
+    store_capture_mode(rgb_dev, ir_dev, mode)?;
+    Ok(StoreIfAbsent::Stored)
 }
 
 /// Configure the IR emitter for `device` from what the camera documents about
@@ -4028,6 +4113,55 @@ mod tests {
         assert!(err.to_string().contains("trailing"), "{err}");
     }
 
+    /// The pair-key migration rule (#340 review): the pair entry decides; a
+    /// legacy RGB-only entry is honored only for two interfaces of one
+    /// physical module; any other pairing is unmeasured even when a legacy
+    /// entry exists, because that entry was never measured against this IR.
+    #[test]
+    fn a_legacy_rgb_only_verdict_never_covers_a_different_ir_camera() {
+        use std::cell::Cell;
+        // Pair entry present: it decides, the legacy closure is never asked.
+        let asked = Cell::new(false);
+        let got = resolve_stored_pair_mode(Some("concurrent".into()), false, || {
+            asked.set(true);
+            Some("sequential".into())
+        });
+        assert_eq!(got, Some(CaptureMode::Concurrent));
+        assert!(!asked.get(), "a pair entry must decide alone");
+        // No pair entry, same physical module: the legacy entry migrates.
+        assert_eq!(
+            resolve_stored_pair_mode(None, true, || Some("concurrent".into())),
+            Some(CaptureMode::Concurrent)
+        );
+        // No pair entry, DIFFERENT module: unmeasured, even with a legacy
+        // concurrent entry on file. This is the #340 review's failure case:
+        // RGB A tuned concurrent against IR B must not vouch for IR C.
+        assert_eq!(
+            resolve_stored_pair_mode(None, false, || Some("concurrent".into())),
+            None
+        );
+        // Unparseable text is not a verdict on either path.
+        assert_eq!(
+            resolve_stored_pair_mode(Some("garbage".into()), true, || Some("concurrent".into())),
+            None
+        );
+    }
+
+    /// The on-disk key formats are compatibility surfaces: the pair key is
+    /// what new writes produce, the bare key is what pre-pair releases wrote
+    /// and migration reads.
+    #[test]
+    fn capture_mode_keys_keep_their_on_disk_spellings() {
+        assert_eq!(
+            capture_mode_pair_key("046d:085e:abc", "046d:085e:abc"),
+            "capture_mode.046d:085e:abc+046d:085e:abc"
+        );
+        assert_eq!(
+            capture_mode_key("046d:085e:abc"),
+            "capture_mode.046d:085e:abc"
+        );
+    }
+
     #[test]
     fn capture_mode_parses_only_the_two_spellings() {
         assert_eq!(
@@ -4441,30 +4575,31 @@ mod tests {
         );
     }
 
-    /// The two stream-start signatures must stop reading alike (#340): EINVAL
-    /// names the camera's own firmware as the refuser, EIO/ENOSPC name the
-    /// USB bus, and each names the other so a reader cannot mistake which
-    /// side refused.
+    /// The stream-relevant errnos get guidance without blame (#340 review):
+    /// map_io has no operation context and the kernel reuses these errnos
+    /// across paths, so the message must say what the errno covers and point
+    /// at the kernel log, never convict "firmware" or "the bus" on the errno
+    /// alone.
     #[test]
-    fn map_io_separates_firmware_refusal_from_bus_exhaustion() {
+    fn map_io_treats_ambiguous_errnos_as_search_keys_not_verdicts() {
         let einval = map_io(
             "/dev/irlume-test-missing",
             std::io::Error::from_raw_os_error(libc::EINVAL),
         )
         .to_string();
-        assert!(einval.contains("the camera itself refusing"), "{einval}");
         assert!(
-            einval.contains("USB bandwidth is not the limit"),
+            einval.contains("does not distinguish a firmware refusal from invalid format metadata"),
             "{einval}"
         );
+        assert!(einval.contains("dmesg"), "{einval}");
         for errno in [libc::EIO, libc::ENOSPC] {
-            let bus = map_io(
+            let msg = map_io(
                 "/dev/irlume-test-missing",
                 std::io::Error::from_raw_os_error(errno),
             )
             .to_string();
-            assert!(bus.contains("the USB bus, not the camera"), "{bus}");
-            assert!(bus.contains("EINVAL instead"), "{bus}");
+            assert!(msg.contains("USB bandwidth admission"), "{msg}");
+            assert!(msg.contains("Check the matching kernel log line"), "{msg}");
         }
     }
 

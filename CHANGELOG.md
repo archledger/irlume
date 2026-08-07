@@ -13,12 +13,25 @@ All notable changes to irlume are documented here. This project adheres to
   firmware refuses a second stream (#308) and dims others without any error;
   a wrong sequential fallback costs 0.7 to 1.3 seconds per capture and
   nothing else. Enrollment on a pair with no stored verdict now runs the
-  `camera-tune` contention probe once, before the scans, and persists a
-  conclusive result; a probe run in a room too dim to trust leaves the pair
-  unmeasured and says so. Stored verdicts are untouched, in both directions,
-  and keep deciding every capture. Capture errors also now name which limit
-  refused a stream: EINVAL is the camera's own firmware declining, EIO and
-  ENOSPC are USB bandwidth (#340).
+  `camera-tune` contention probe once, before the scans, and persists the
+  result only when every requested round completed in both arms and the
+  scene was bright enough to trust; anything thinner or dimmer leaves the
+  pair unmeasured and says why. The automatic write re-checks under a
+  cameras.conf writer lock, so it can only fill an empty verdict; explicit
+  `camera-tune` keeps its overwrite semantics. Stored verdicts are
+  untouched, in both directions, and keep deciding every capture (#340).
+- **Capture-mode verdicts are keyed by the RGB+IR pairing, not the RGB
+  camera alone.** Contention belongs to the pairing (the same RGB module
+  that starves against its own IR sibling holds 99% of its brightness
+  against another camera's IR), so swapping the IR camera now re-measures
+  instead of reusing a stale verdict. A verdict stored by an earlier release
+  carries only the RGB identity; it keeps deciding while both nodes belong
+  to that one physical module and counts as unmeasured for any other
+  pairing.
+- **Capture errors treat the errno as a search key, not a verdict.** The
+  kernel reuses EINVAL, EIO, and ENOSPC across negotiation, bandwidth, and
+  descriptor paths, so the messages now say what each errno covers and point
+  at the matching kernel log line instead of naming a culprit.
 
 ## [0.9.0] - 2026-08-05
 

@@ -23,6 +23,43 @@ pub fn config_path(file: &str) -> PathBuf {
     config_root().join(file)
 }
 
+/// An exclusive advisory lock over one config file's check-then-write
+/// sequences. Dropping the guard releases it.
+pub struct ConfigLock {
+    /// Held only for its flock; closing the fd releases the lock.
+    _file: std::fs::File,
+}
+
+/// Take the writer lock for `file` (blocking until free).
+///
+/// Guards a read-decide-write window against other PROCESSES: `write_kv`'s
+/// atomic rename keeps every individual write whole, but a caller that first
+/// READS a key and then writes based on what it saw (the enrollment
+/// capture-mode probe, whose check and write are separated by a minute of
+/// measuring) can otherwise overwrite a value another process landed in
+/// between. The lock is a sidecar `<file>.lock` under the config root, taken
+/// with flock, so plain readers are never blocked and see whole files either
+/// way; only check-then-write callers need to take it.
+pub fn lock_exclusive(file: &str) -> std::io::Result<ConfigLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = config_path(&format!("{file}.lock"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+    // SAFETY: flock on an owned, open fd; no memory is handed to the kernel.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ConfigLock { _file: f })
+}
+
 /// What one read of a config key established. `Absent` and `Unknown` are
 /// different facts: a missing file or key was OBSERVED to hold nothing, while
 /// an unreadable file established nothing at all, and a caller that reports
@@ -330,6 +367,50 @@ mod tests {
             text.matches("rgb=").count() + text.matches("rgb ").count(),
             1
         );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The writer lock is held for the guard's lifetime and released on drop:
+    /// a second exclusive take succeeds after the first guard is gone, and it
+    /// serializes against a concurrent holder rather than failing. Two
+    /// threads, not two processes; flock's cross-process behavior is the
+    /// kernel's contract, and what irlume adds (guard scope, sidecar path,
+    /// release on drop) is what this covers.
+    #[test]
+    fn lock_exclusive_serializes_and_releases_on_drop() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let first = lock_exclusive("cameras.conf").unwrap();
+        assert!(
+            config_path("cameras.conf.lock").exists(),
+            "the sidecar lock file must live under the config root"
+        );
+        // A contender on another thread must not get through while the
+        // first guard lives.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir2 = dir.clone();
+        let contender = std::thread::spawn(move || {
+            // The var is process-global and already set; the clone only
+            // keeps the dir alive for the assert below.
+            let _ = &dir2;
+            let _second = lock_exclusive("cameras.conf").unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the second take must block while the first guard is held"
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dropping the guard must release the lock");
+        contender.join().unwrap();
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

@@ -15,7 +15,8 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
     apply_known_ir_emitter, list_ir_controls, measure_contention, measure_contention_with_progress,
-    setup_ir_emitter, store_capture_mode, stored_capture_mode, CaptureMode, ContentionReport,
+    setup_ir_emitter, store_capture_mode, store_capture_mode_if_absent, stored_capture_mode,
+    CaptureMode, ContentionReport, PairSample, StoreIfAbsent,
 };
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair
@@ -669,10 +670,11 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
     faces.iter().max_by(|a, b| a.score.total_cmp(&b.score))
 }
 
-/// Whether captures on `rgb_dev` should run one stream at a time, and where
-/// that answer came from. Order of authority: the explicit env override, then
-/// what `irlume camera-tune` measured on THIS camera (cameras.conf, per
-/// camera identity), then the sequential default.
+/// Whether captures on this RGB+IR pair should run one stream at a time, and
+/// where that answer came from. Order of authority: the explicit env
+/// override, then what `irlume camera-tune` measured on THIS pairing
+/// (cameras.conf, keyed by both camera identities; contention belongs to the
+/// pairing, not to the RGB module alone), then the sequential default.
 ///
 /// One resolver for every consumer, because the two halves of the answer must
 /// agree: the ASSESS path uses it to order its reads, and the ENROLL path
@@ -680,10 +682,10 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 /// disagreed, "sequential" ordered the reads of two streams that were both
 /// live anyway, which on a bandwidth-starved camera is indistinguishable
 /// from concurrent (#187).
-fn sequential_capture_selected(rgb_dev: &str) -> (bool, &'static str) {
+fn sequential_capture_selected(rgb_dev: &str, ir_dev: &str) -> (bool, &'static str) {
     capture_mode_decision(
         std::env::var("IRLUME_SEQUENTIAL_CAPTURE").ok().as_deref(),
-        irlume_camera::stored_capture_mode(rgb_dev),
+        irlume_camera::stored_capture_mode(rgb_dev, ir_dev),
     )
 }
 
@@ -1309,8 +1311,8 @@ impl Engine {
         // arms both streams for concurrent, a config write lands, and the
         // second read orders "sequential" reads over two already-live
         // streams, the exact state the mode exists to prevent.
-        let (sequential, mode_source) =
-            capture_mode.unwrap_or_else(|| sequential_capture_selected(&self.rgb_dev));
+        let (sequential, mode_source) = capture_mode
+            .unwrap_or_else(|| sequential_capture_selected(&self.rgb_dev, &self.ir_dev));
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
         // guessing this measurement work exists to remove.
@@ -2900,7 +2902,7 @@ impl Engine {
         // mode exists for exactly the cameras that cannot sustain both
         // streams, so on them this loop takes the per-frame path, which
         // opens one stream at a time and releases it before the other.
-        let (sequential, mode_source) = sequential_capture_selected(&rgb_dev);
+        let (sequential, mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
         if sequential {
             irlume_common::dlog!(
                 "enroll: sequential capture mode (from {mode_source}); not holding \

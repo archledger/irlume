@@ -220,24 +220,27 @@ of each rgb+ir pair) against the sequential cost (sum). On the ASUS Zenbook
 reference hardware the overlap cuts the capture stage from about 1.46s to
 about 1.0s per verify.
 
-### Stream-start failure signatures
+### Stream failures
 
-Two different limits kill a second camera stream, and they answer with
-different errnos (kernel v6.16, `drivers/media/usb/uvc/uvc_video.c` and
-`drivers/usb/host/xhci.c`); irlume's capture errors now name which one fired:
+`EINVAL`, `EIO`, and `ENOSPC` are useful search keys, but they do not uniquely
+identify the failing component. irlume uses the same error mapper for device
+open, format selection, stream setup, frame dequeue, and control operations.
 
-- **EINVAL: the camera refused.** uvcvideo maps a device STALL on the
-  PROBE/COMMIT negotiation to EINVAL, so the module's own firmware declined
-  the second stream. Both cameras irlume has measured starving (Logitech
-  Brio, NexiGo N930W) fail this way; the Brio refuses on USB3 too, where bus
-  budget is ample. `sudo irlume camera-tune` stores one-at-a-time capture for
-  such a module. Format, resolution, and fps changes do not reach a firmware
-  refusal.
-- **EIO or ENOSPC: the bus refused.** EIO is uvcvideo's "No fast enough alt
-  setting for requested bandwidth" (visible in dmesg); ENOSPC is the xHCI
-  host's periodic-bandwidth admission. Only here can a lower resolution, a
-  lower frame rate, MJPEG, moving a camera off a shared hub, or the uvcvideo
-  module parameter `quirks=0x80` change the outcome.
+Check the matching kernel log line:
+
+- `No fast enough alt setting for requested bandwidth` is returned as `EIO` by
+  uvcvideo and identifies failure to find a suitable endpoint alternate
+  setting.
+- xHCI bandwidth-admission failures can return `ENOSPC`.
+- UVC PROBE/COMMIT transfer failures are normally reported as `EIO`.
+- `EINVAL` is also used for unsupported or malformed format/frame descriptors.
+
+Do not infer camera firmware or the USB bus from the userspace errno alone;
+the kernel log line decides. When the kernel names bandwidth, a lower
+resolution, a lower frame rate, MJPEG, moving a camera off a shared hub, or
+the uvcvideo module parameter `quirks=0x80` can change the outcome; when
+`sudo irlume camera-tune` measures a pair that cannot sustain both streams,
+it stores one-at-a-time capture for it whatever the mechanism.
 
 Reproducing the published accuracy/anti-spoof claims end-to-end is covered in
 [VERIFY.md](VERIFY.md).

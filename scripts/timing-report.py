@@ -13,8 +13,9 @@ Usage:
     scripts/timing-report.py /tmp/irlume.log
 
 Prints per-side count/min/avg/max, then pairs each verify's rgb+ir and
-reports the average overlapped capture cost (max of each pair, what the
-default concurrent capture pays) versus sequential (sum of each pair).
+reports the average overlapped capture cost (max of each pair, used when the
+stored or explicit capture mode is concurrent) versus sequential (sum of each
+pair).
 If one side has more samples than the other (e.g. a failed capture),
 the unpaired tail is dropped from the pair stats and a note is printed.
 """

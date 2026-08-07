@@ -287,7 +287,7 @@ pub struct AddScanOutcome {
 /// (NexiGo ambient 0; Zenbook night bursts 0.5 ambient against 35-70 lit);
 /// the #187 lockout enrolled on an emitterless USB2 Brio under daylight,
 /// share near 1, and the next dark identify was denied every time.
-const AMBIENT_LIT_SHARE: f32 = 0.5;
+pub const AMBIENT_LIT_SHARE: f32 = 0.5;
 
 /// Presence grace window after the consent gesture, milliseconds, for the
 /// login and lock-screen path. The user pressed Enter (usually already in

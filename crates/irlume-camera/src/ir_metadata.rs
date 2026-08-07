@@ -785,13 +785,19 @@ fn metadata_node_for(ir_device: &str) -> Option<String> {
     found
 }
 
-/// The sibling that is this image node's OWN metadata node: the
-/// lowest-numbered candidate above the image node that offers the format.
-/// `candidates` must be sorted lowest node number first (as
-/// [`siblings_on_same_interface`] returns them). A candidate BELOW the image
-/// node belongs to an earlier stream on the same interface; arming it reads
-/// another stream's timestamps (#310), so no match means no reader, and
-/// illumination falls back to brightness.
+/// The sibling that is this image node's OWN metadata node: the FIRST
+/// same-interface candidate above the image node, and only when it offers
+/// the format. `candidates` must be sorted lowest node number first (as
+/// [`siblings_on_same_interface`] returns them).
+///
+/// A candidate below the image node is an earlier stream's queue (#310).
+/// Scanning FORWARD past a non-metadata node would borrow a LATER stream's
+/// queue: uvcvideo ignores a failed metadata registration and keeps
+/// registering later streams (uvc_driver.c, uvc_meta_register's return
+/// value discarded), so an image node can legitimately have no metadata
+/// node while the next stream has both. Either way a wrong queue's
+/// timestamps never match this stream's frames, so no pair means no
+/// reader, and illumination falls back to brightness by design.
 fn pick_metadata_sibling(
     image_device: &str,
     candidates: Vec<String>,
@@ -800,8 +806,8 @@ fn pick_metadata_sibling(
     let image = node_number(image_device);
     candidates
         .into_iter()
-        .filter(|c| node_number(c) > image)
-        .find(|c| offers(c))
+        .find(|c| node_number(c) > image)
+        .filter(|c| offers(c))
 }
 
 /// Every other v4l2 node registered against the same physical interface as
@@ -935,6 +941,25 @@ mod tests {
         assert_eq!(
             pick_metadata_sibling("/dev/video2", vec!["/dev/video1".into()], offers),
             None
+        );
+    }
+
+    /// Codex round: uvcvideo ignores a failed metadata registration and keeps
+    /// going, so THIS stream can lack its metadata node while a later stream
+    /// on the same interface has both. Scanning forward would borrow the
+    /// later stream's queue; only the immediately next node can be the pair.
+    #[test]
+    fn a_later_streams_metadata_node_is_never_borrowed() {
+        let candidates = vec![
+            "/dev/video1".to_string(), // earlier stream's metadata
+            "/dev/video3".to_string(), // later stream's image
+            "/dev/video4".to_string(), // later stream's metadata
+        ];
+        let offers = |candidate: &str| candidate.ends_with('1') || candidate.ends_with('4');
+        assert_eq!(
+            pick_metadata_sibling("/dev/video2", candidates, offers),
+            None,
+            "missing metadata for this stream must fall back, not borrow a later stream"
         );
     }
 

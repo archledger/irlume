@@ -5,6 +5,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **One socket request reached the keyring with an unscreened username.**
+  The daemon screens the account name in every request against path
+  traversal before it builds a `<user>.json` path, but the guard read a
+  hand-maintained list of the user-bearing variants that omitted
+  `ReleaseTokenForDisarm` and ended in a catch-all, so neither the compiler
+  nor the test written to enforce that list could see the omission. The
+  release still required root or the account owner plus the account's login
+  password, so this was the loss of a defence-in-depth layer rather than a
+  way in. Privilege, account, and enrollment effect are now declared once
+  per request in a table with no wildcard arm: a new request does not
+  compile until its security posture is declared, and the traversal screen
+  and the authorization check both read that one declaration (#344).
+
 ### Changed
 
 - **An unmeasured camera pair now captures one stream at a time, and the

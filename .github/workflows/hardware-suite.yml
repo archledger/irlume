@@ -28,7 +28,11 @@ concurrency:
 jobs:
   hardware:
     name: build · test · real-TPM · IR camera
-    runs-on: [self-hosted, tpm, ir-camera]
+    # `arch` pins this to archhost deliberately: minihost carries tpm and
+    # ir-camera too, and this suite's camera-absent path exits 0, so without
+    # the pin the ONLY real-IR-camera lane could land on the other machine
+    # and report green having tested no camera at all.
+    runs-on: [self-hosted, arch, tpm, ir-camera]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -207,7 +211,11 @@ jobs:
   coverage:
     name: coverage (hardware-inclusive, report only)
     needs: hardware
-    runs-on: [self-hosted, tpm, ir-camera]
+    # `arch` pins this to archhost deliberately: minihost carries tpm and
+    # ir-camera too, and this suite's camera-absent path exits 0, so without
+    # the pin the ONLY real-IR-camera lane could land on the other machine
+    # and report green having tested no camera at all.
+    runs-on: [self-hosted, arch, tpm, ir-camera]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

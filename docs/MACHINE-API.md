@@ -162,13 +162,13 @@ enrolled".
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 
-`recovery.key_present` is whether the template key that opens an encrypted store
-still exists. It is a separate field rather than a third value of `templates`
-because contract 1 permits added fields and not new enum values, and because the
-two facts are independent: `templates: "encrypted"` with `key_present: false`
-means the enrollment is encrypted and openable by nothing, which no single value
-can say. Treat that combination as needing re-enrollment, not as a recovery
-passphrase problem. A daemon older than 0.9.0 never sends it and it reads as
+`recovery.key_present` is whether a sealed template key currently exists. It is
+a separate field rather than a third value of `templates` because contract 1
+permits added fields and not new enum values, and because the two facts are
+independent: `templates: "encrypted"` with `key_present: false` means the
+templates cannot currently be opened, which no single value can say. When
+`passphrase_set` is true, `irlume recovery restore` can recreate the sealed key
+from the recovery envelope; when it is false, re-enrollment is the only path. A daemon older than 0.9.0 never sends it and it reads as
 `true`, which is the only safe default for a field whose false value means data
 loss.
 

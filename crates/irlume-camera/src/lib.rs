@@ -3096,23 +3096,80 @@ pub fn measure_contention_with_progress(
     measure_contention_impl(
         || capture_rgb_denoised(rgb_dev),
         || capture_ir_with_stats(ir_dev),
+        held_concurrent_arm(rgb_dev, ir_dev),
         rounds,
         progress,
     )
 }
 
-/// [`measure_contention_with_progress`] over injected captures, so the
-/// decisions below are testable without a camera (a panicking capture, an
-/// arm that always errors, a trailing control that fails).
-fn measure_contention_impl<R, I>(
+/// The concurrent arm over HELD sessions: the shape a `concurrent` verdict
+/// licenses `capture_scans` to run (#308) — both cameras open, both streams
+/// armed for the whole loop, reads interleaved on one thread, exactly like
+/// the enrollment loop. The old arm re-opened each device per round, an
+/// order the Brio tolerates while its held shape starves RGB completely, so
+/// the stored verdict was measured on a shape the consumer never runs.
+///
+/// Failing to OPEN or ARM the held pair is itself the measurement (the
+/// camera cannot enter the shape at all): every round is recorded as failed
+/// and the composer's trailing one-at-a-time control decides whether the
+/// camera was still answering, same as an all-error arm.
+fn held_concurrent_arm<'d>(
+    rgb_dev: &'d str,
+    ir_dev: &'d str,
+) -> impl FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()> + 'd {
+    move |rounds, progress, into| {
+        let held = RgbCamera::open(rgb_dev).and_then(|r| IrCamera::open(ir_dev).map(|i| (r, i)));
+        let (rgb_cam, mut ir_cam) = match held {
+            Ok(pair) => pair,
+            Err(e) => {
+                irlume_common::dlog!(
+                    "capture-mode probe: cannot OPEN the held camera pair ({e}); \
+                     recording every concurrent round as failed"
+                );
+                into.failed += rounds;
+                return Ok(());
+            }
+        };
+        let sessions = rgb_cam
+            .session()
+            .and_then(|rs| ir_cam.session().map(|is| (rs, is)));
+        let (mut rs, mut is) = match sessions {
+            Ok(pair) => pair,
+            Err(e) => {
+                irlume_common::dlog!(
+                    "capture-mode probe: cannot ARM the held session pair ({e}); \
+                     recording every concurrent round as failed"
+                );
+                into.failed += rounds;
+                return Ok(());
+            }
+        };
+        for _ in 0..rounds {
+            progress();
+            let t0 = std::time::Instant::now();
+            let rgb = rs.burst(RGB_BURST).map(median_frame);
+            let ir = is.capture_with_stats();
+            accumulate(into, &rgb, &ir, t0.elapsed());
+        }
+        Ok(())
+    }
+}
+
+/// [`measure_contention_with_progress`] over injected captures and an
+/// injected concurrent-arm runner, so the decisions below are testable
+/// without a camera (a panicking capture, an arm that always errors, a
+/// trailing control that fails).
+fn measure_contention_impl<R, I, H>(
     rgb_cap: R,
     ir_cap: I,
+    concurrent_arm: H,
     rounds: usize,
     progress: &dyn Fn(),
 ) -> irlume_common::Result<ContentionReport>
 where
     R: Fn() -> irlume_common::Result<Frame>,
-    I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)> + Sync,
+    I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)>,
+    H: FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()>,
 {
     let rounds = rounds.max(1);
     let mut report = ContentionReport::default();
@@ -3124,29 +3181,21 @@ where
         let ir = ir_cap();
         accumulate(&mut report.sequential, &rgb, &ir, t0.elapsed());
     }
-    for _ in 0..rounds {
-        progress();
-        let t0 = std::time::Instant::now();
-        // A capture that returns Err is a measured failed round. A capture
-        // that PANICS is not a measurement of anything: counting it as a
-        // failed round would let a software defect that only trips off the
-        // main thread masquerade as "this camera cannot stream both nodes"
-        // and be persisted as durable policy, so a panic aborts the whole
-        // probe instead (#263 review).
-        let (rgb, ir) = std::thread::scope(|s| {
-            let ir_t = s.spawn(&ir_cap);
-            let rgb = rgb_cap();
-            match ir_t.join() {
-                Ok(ir) => Ok((rgb, ir)),
-                Err(_) => Err(Error::Hardware(
-                    "capture-mode probe: the IR capture worker panicked; this is \
-                     a software defect, not a camera measurement"
-                        .into(),
-                )),
-            }
-        })?;
-        accumulate(&mut report.concurrent, &rgb, &ir, t0.elapsed());
-    }
+    // A capture that returns Err is a measured failed round. A capture that
+    // PANICS is not a measurement of anything: counting it as a failed round
+    // would let a software defect masquerade as "this camera cannot stream
+    // both nodes" and be persisted as durable policy, so a panic aborts the
+    // whole probe instead (#263 review).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        concurrent_arm(rounds, progress, &mut report.concurrent)
+    }))
+    .map_err(|_| {
+        Error::Hardware(
+            "capture-mode probe: the concurrent capture arm panicked; this is \
+             a software defect, not a camera measurement"
+                .into(),
+        )
+    })??;
     // Only a dead SEQUENTIAL arm is a failed probe: one capture at a time is
     // the mode every camera must manage, so nothing was learned.
     if report.sequential.rounds == 0 {
@@ -3809,6 +3858,30 @@ mod tests {
         }
     }
 
+    /// The tests' concurrent arm: per-call scripted captures through the SAME
+    /// accumulate/round shape the production held-session arm uses, so the
+    /// composer's decisions (panic abort, dead arms, trailing control) are
+    /// exercised without a camera.
+    fn scripted_arm<'a, R, I>(
+        rgb: &'a R,
+        ir: &'a I,
+    ) -> impl FnOnce(usize, &dyn Fn(), &mut PairSample) -> irlume_common::Result<()> + 'a
+    where
+        R: Fn() -> irlume_common::Result<Frame>,
+        I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)>,
+    {
+        move |rounds, progress, into| {
+            for _ in 0..rounds {
+                progress();
+                let t0 = std::time::Instant::now();
+                let r = rgb();
+                let i = ir();
+                accumulate(into, &r, &i, t0.elapsed());
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_panicking_capture_aborts_the_probe_instead_of_becoming_a_verdict() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3816,19 +3889,16 @@ mod tests {
         // those as failed rounds would persist "this camera cannot stream both
         // nodes" over a software defect (#263 review); the probe must abort.
         let ir_calls = AtomicUsize::new(0);
+        let rgb = || Ok(frame(&[100; 4]));
+        let ir = || {
+            if ir_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                panic!("injected defect");
+            }
+            Ok((frame(&[10; 4]), stats(50.0)))
+        };
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // keep the test log clean
-        let got = measure_contention_impl(
-            || Ok(frame(&[100; 4])),
-            || {
-                if ir_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
-                    panic!("injected defect");
-                }
-                Ok((frame(&[10; 4]), stats(50.0)))
-            },
-            2,
-            &|| {},
-        );
+        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &|| {});
         std::panic::set_hook(prev);
         let err = got.expect_err("a panic must abort the probe, never report");
         assert!(err.to_string().contains("panicked"), "{err}");
@@ -3841,23 +3911,20 @@ mod tests {
         // RGB open errors, and the trailing control finds the camera still
         // answering — a real contention verdict.
         let rgb_calls = AtomicUsize::new(0);
-        let report = measure_contention_impl(
-            || {
-                let n = rgb_calls.fetch_add(1, Ordering::SeqCst);
-                // Calls 0-1: sequential. 2-3: concurrent (error). 4: control.
-                if (2..4).contains(&n) {
-                    Err(Error::Hardware(
-                        "EINVAL while the IR sibling streams".into(),
-                    ))
-                } else {
-                    Ok(frame(&[100; 4]))
-                }
-            },
-            || Ok((frame(&[10; 4]), stats(50.0))),
-            2,
-            &|| {},
-        )
-        .expect("an answering camera with an impossible concurrent arm is a verdict");
+        let rgb = || {
+            let n = rgb_calls.fetch_add(1, Ordering::SeqCst);
+            // Calls 0-1: sequential. 2-3: concurrent (error). 4: control.
+            if (2..4).contains(&n) {
+                Err(Error::Hardware(
+                    "EINVAL while the IR sibling streams".into(),
+                ))
+            } else {
+                Ok(frame(&[100; 4]))
+            }
+        };
+        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let report = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &|| {})
+            .expect("an answering camera with an impossible concurrent arm is a verdict");
         assert!(report.concurrent_impossible());
         assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
         assert_eq!(
@@ -3865,6 +3932,25 @@ mod tests {
             5,
             "the trailing control must actually run"
         );
+    }
+
+    /// #308: a camera pair that cannot even ENTER the held shape (open or arm
+    /// fails with both streams held) is an all-failed concurrent arm, and with
+    /// the trailing control answering, that is a sequential VERDICT, not a
+    /// probe error. This is the Brio's held-session starvation as the
+    /// composer sees it.
+    #[test]
+    fn a_pair_that_cannot_arm_held_streams_is_a_sequential_verdict() {
+        let rgb = || Ok(frame(&[100; 4]));
+        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let arming_fails = |rounds: usize, _p: &dyn Fn(), into: &mut PairSample| {
+            into.failed += rounds;
+            Ok(())
+        };
+        let report = measure_contention_impl(&rgb, &ir, arming_fails, 2, &|| {})
+            .expect("an unarmable held pair with an answering camera is a verdict");
+        assert!(report.concurrent_impossible());
+        assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
     }
 
     #[test]
@@ -3875,18 +3961,15 @@ mod tests {
         // stopped answering, not that concurrency fails, and must not persist
         // a capability verdict (#263 review).
         let rgb_calls = AtomicUsize::new(0);
-        let got = measure_contention_impl(
-            || {
-                if rgb_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
-                    Err(Error::Hardware("ENODEV".into()))
-                } else {
-                    Ok(frame(&[100; 4]))
-                }
-            },
-            || Ok((frame(&[10; 4]), stats(50.0))),
-            2,
-            &|| {},
-        );
+        let rgb = || {
+            if rgb_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                Err(Error::Hardware("ENODEV".into()))
+            } else {
+                Ok(frame(&[100; 4]))
+            }
+        };
+        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &|| {});
         let err = got.expect_err("a dead camera is a failed probe");
         assert!(err.to_string().contains("trailing"), "{err}");
     }

@@ -34,12 +34,22 @@ fn model(name: &str) -> String {
     format!("{}/../../models/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The feeder nodes, or None (skip) when the harness is not up.
-fn loopback_pair() -> Option<(String, String)> {
-    Some((
-        std::env::var("IRLUME_TEST_RGB_DEVICE").ok()?,
-        std::env::var("IRLUME_TEST_IR_DEVICE").ok()?,
-    ))
+/// The feeder nodes, or a panic.
+///
+/// Deliberately not an Option that callers skip on. These tests are
+/// `#[ignore]`d, so selecting one is a request for the harness, and a test that
+/// returns on its first line still prints `ok` and satisfies the lane's `--min`
+/// pass count (#361).
+fn loopback_pair() -> (String, String) {
+    let var = |k: &str| {
+        std::env::var(k).unwrap_or_else(|_| {
+            panic!(
+                "{k} is unset. This test is #[ignore]d, so running it is a request for the \
+                 v4l2loopback harness; it will not silently pass without one."
+            )
+        })
+    };
+    (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"))
 }
 
 /// `ORT_DYLIB_PATH` for the child: the parent's value when set (CI exports
@@ -161,9 +171,7 @@ fn run_timeboxed(what: &str, cmd: &mut Command) -> (i32, String, String) {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_capture_runs_detection_and_reports_no_face() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("capture");
     let det = model("face_detection_yunet_2023mar.onnx");
     let rec = model("glintr100.onnx");
@@ -204,9 +212,7 @@ fn loopback_capture_runs_detection_and_reports_no_face() {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_liveness_probe_gates_a_faceless_feed_as_not_live() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("liveness");
     let det = model("face_detection_yunet_2023mar.onnx");
     let (code, out, err) = run_timeboxed(
@@ -247,9 +253,7 @@ fn loopback_liveness_probe_gates_a_faceless_feed_as_not_live() {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_meshprobe_reports_spoof_when_no_eyes_are_found() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("meshprobe");
     let det = model("face_detection_yunet_2023mar.onnx");
     let mesh = model("face_landmark.onnx");
@@ -301,9 +305,7 @@ fn loopback_meshprobe_reports_spoof_when_no_eyes_are_found() {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_calcapture_writes_header_and_faceless_samples() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("calcapture");
     let det = model("face_detection_yunet_2023mar.onnx");
     let rec = model("glintr100.onnx");
@@ -383,9 +385,7 @@ fn loopback_calcapture_writes_header_and_faceless_samples() {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_padcapture_ir_only_records_faceless_attack_presentations() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("padcapture");
     let det = model("face_detection_yunet_2023mar.onnx");
     let out_path = sb.path("work/pad.jsonl");
@@ -463,9 +463,7 @@ fn loopback_padcapture_ir_only_records_faceless_attack_presentations() {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_genuine_declines_stats_without_two_face_frames() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("genuine");
     let det = model("face_detection_yunet_2023mar.onnx");
     let rec = model("glintr100.onnx");
@@ -514,9 +512,7 @@ fn pgm(w: u32, h: u32, fill: u8) -> Vec<u8> {
 #[test]
 #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
 fn loopback_suncal_analyzes_a_faceless_burst_dataset() {
-    let Some((rgb, ir)) = loopback_pair() else {
-        return;
-    };
+    let (rgb, ir) = loopback_pair();
     let sb = Sandbox::new("suncal");
     let det = model("face_detection_yunet_2023mar.onnx");
     // One burst: dim ambient frames around a bright lit frame, all flat grey.

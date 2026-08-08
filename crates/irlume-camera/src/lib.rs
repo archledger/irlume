@@ -5247,11 +5247,26 @@ mod tests {
     // kill the child on drop. Spare-node tests own that node exclusively;
     // CI runs the gated suite with --test-threads=1.
 
-    fn loopback_pair() -> Option<(String, String)> {
-        Some((
-            std::env::var("IRLUME_TEST_RGB_DEVICE").ok()?,
-            std::env::var("IRLUME_TEST_IR_DEVICE").ok()?,
-        ))
+    /// The loopback device pair, or a panic.
+    ///
+    /// Deliberately not an Option that callers skip on. These tests are
+    /// `#[ignore]`d, so selecting one is a request for the harness, and a test
+    /// that returns on its first line still prints `ok`. The CI lane guards
+    /// them with `--min`, which counts passes, so a missing `env:` key would
+    /// have turned 23 tests into no-ops while the lane stayed green forever
+    /// (#361). The same argument is already written down at
+    /// `irlume-core/src/tpm.rs`: a test that reports success without observing
+    /// the hardware it is named for is worse than no test.
+    fn loopback_pair() -> (String, String) {
+        let var = |k: &str| {
+            std::env::var(k).unwrap_or_else(|_| {
+                panic!(
+                    "{k} is unset. This test is #[ignore]d, so running it is a request for the \
+                     v4l2loopback harness; it will not silently pass without one."
+                )
+            })
+        };
+        (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"))
     }
 
     fn spare_device() -> Option<String> {
@@ -5330,9 +5345,7 @@ mod tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_rgb_burst_streams_and_converts() {
-        let Some((rgb, _)) = loopback_pair() else {
-            return;
-        };
+        let (rgb, _) = loopback_pair();
         let frames = capture_rgb_burst(&rgb, 3).expect("rgb burst");
         assert_eq!(frames.len(), 3);
         for f in &frames {
@@ -5350,9 +5363,7 @@ mod tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_rgb_single_and_denoised_agree_on_geometry() {
-        let Some((rgb, _)) = loopback_pair() else {
-            return;
-        };
+        let (rgb, _) = loopback_pair();
         let one = capture_rgb(&rgb).expect("single rgb");
         let den = capture_rgb_denoised(&rgb).expect("denoised rgb");
         for f in [&one, &den] {
@@ -5364,9 +5375,7 @@ mod tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_ir_capture_with_stats_and_sequence() {
-        let Some((_, ir)) = loopback_pair() else {
-            return;
-        };
+        let (_, ir) = loopback_pair();
         let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
         assert_eq!((frame.width, frame.height), (IR_W, IR_H));
         assert_eq!(frame.spectrum, Spectrum::Ir);
@@ -5393,9 +5402,7 @@ mod tests {
     fn loopback_capabilities_classify_rgb_but_never_pair() {
         // Only meaningful when the loopback nodes sit inside discover_nodes'
         // /dev/video0..9 scan range (CI uses 8 and 9).
-        let Some((rgb, _ir)) = loopback_pair() else {
-            return;
-        };
+        let (rgb, _ir) = loopback_pair();
         if !(0..10).any(|n| rgb == format!("/dev/video{n}")) {
             return;
         }
@@ -5408,7 +5415,7 @@ mod tests {
         // (no physical sysfs parent), rather than that no pair exists at all:
         // on the hardware CI runner a real Hello camera is attached, so the
         // global `caps.ir_pair` bit is legitimately true there.
-        let (rgb, ir) = loopback_pair().expect("checked above");
+        let (rgb, ir) = loopback_pair();
         for pair in list_pairs() {
             assert!(
                 pair.rgb != rgb && pair.rgb != ir && pair.ir != rgb && pair.ir != ir,
@@ -5518,9 +5525,7 @@ mod tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_raw_bursts_report_shape_and_monotonic_timing() {
-        let Some((_, ir)) = loopback_pair() else {
-            return;
-        };
+        let (_, ir) = loopback_pair();
         let timed = ir_probe::capture_raw_burst_timed(&ir, 5).expect("timed burst");
         assert_eq!(timed.len(), 5);
         let mut prev = -1.0f64;
@@ -5560,9 +5565,7 @@ mod tests {
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_ir_stats_flag_off_returns_the_raw_brightest_frame() {
         let _lock = env_lock();
-        let Some((_, ir)) = loopback_pair() else {
-            return;
-        };
+        let (_, ir) = loopback_pair();
         let _sub = EnvGuard::unset("IRLUME_IR_AMBIENT_SUBTRACT");
         let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
         // Stats contract: per-frame mean extremes over the fixed-size burst,
@@ -5972,9 +5975,7 @@ mod tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_busy_error_names_a_holding_process() {
-        let Some((_, ir)) = loopback_pair() else {
-            return;
-        };
+        let (_, ir) = loopback_pair();
         // Hold the node open ourselves so /proc provably contains at least one
         // holder this uid can see (the CI feeder also holds it; whichever the
         // scan finds first is fine). Read-only open, no streaming: nothing on
@@ -5996,9 +5997,7 @@ mod tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_nodes_classify_by_fed_format_with_no_identity_or_privacy() {
-        let Some((rgb, ir)) = loopback_pair() else {
-            return;
-        };
+        let (rgb, ir) = loopback_pair();
         // Classification keys purely on the advertised FourCC: the YUYV-fed
         // node is an RGB camera, the GREY-fed node its IR companion.
         assert_eq!(classify(&rgb), Role::Rgb);

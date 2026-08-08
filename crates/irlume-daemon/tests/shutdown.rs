@@ -90,6 +90,7 @@ fn daemon_exits_promptly_on_sigterm() {
     // SIGTERM and require exit within 3s (default disposition is immediate;
     // this fails loudly if a handler ever swallows it).
     let pid = child.id() as i32;
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
     assert_eq!(
         rc,

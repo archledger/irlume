@@ -175,6 +175,7 @@ fn parse_extension_unit(d: &[u8]) -> Option<ExtensionUnit> {
 /// A camera is identified by what the USB bus says it is, not by the V4L card
 /// string. `card.contains("ASUS")` matched any camera with that word in its
 /// name and wrote nine bytes to it.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn usb_ids(video_device: &str) -> std::io::Result<(u16, u16)> {
     let dir = usb_device_dir(video_device)?;
     let vid = read_hex_u16(&dir.join("idVendor"))
@@ -197,6 +198,7 @@ fn read_hex_u16(path: &Path) -> Option<u16> {
 /// the two-function camera above.
 ///
 /// An unreadable descriptor is an error, never a reason to fall back to probing.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn usb_context(video_device: &str) -> std::io::Result<(Vec<u8>, u8)> {
     let iface_dir = interface_dir(video_device)?;
     let interface_number = read_hex_u8(&iface_dir.join("bInterfaceNumber")).ok_or_else(|| {
@@ -247,6 +249,7 @@ pub struct CameraIdentity {
     pub usb_devpath: String,
 }
 
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdentity> {
     let (major, minor) = device_numbers(fd)?;
     let node = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}"))?;
@@ -321,6 +324,7 @@ impl CameraIdentity {
 fn device_numbers(fd: std::os::raw::c_int) -> std::io::Result<(u32, u32)> {
     // SAFETY: fstat writes into a zeroed stat owned here; fd is the caller's.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Err(std::io::Error::last_os_error());
     }

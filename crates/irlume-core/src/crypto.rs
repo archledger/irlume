@@ -31,6 +31,7 @@ pub fn generate_key() -> Zeroizing<Vec<u8>> {
 }
 
 /// Encrypt `plaintext` under `key`, returning `nonce ‖ ciphertext+tag`.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     if key.len() != KEY_LEN {
         return Err(Error::Policy(format!(
@@ -58,6 +59,7 @@ pub fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 /// Decrypt a `nonce ‖ ciphertext+tag` blob under `key`. A wrong key or tampered
 /// data fails the GCM tag check and returns a generic error (indistinguishable
 /// by design).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn decrypt(key: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if key.len() != KEY_LEN {
         return Err(Error::Policy(format!(

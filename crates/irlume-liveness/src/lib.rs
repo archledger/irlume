@@ -158,13 +158,141 @@ pub const RGB_SPECULAR_MAX: f32 = 0.18;
 /// per-camera baselining lands.
 pub const RGB_MOIRE_MAX: f32 = 28.0;
 
+/// A value an environment override can carry into one of this crate's
+/// thresholds: parsed from the variable's text, and printed back when it is
+/// refused.
+///
+/// `is_comparable` is the half of the check [`env_override`] applies at every
+/// site, so a new override cannot omit it the way the moiré ceiling did (#345).
+/// The other half, the range a particular setting accepts, differs per setting
+/// and stays at the call.
+trait OverrideValue: std::str::FromStr + std::fmt::Display + Copy {
+    /// False for a parsed value that cannot act as a threshold.
+    fn is_comparable(&self) -> bool;
+}
+
+impl OverrideValue for f32 {
+    /// NaN loses every comparison it takes part in, so a threshold holding it
+    /// answers "over" and "under" alike with false and the cue reading against
+    /// it can never fire. The infinities answer one side for every input, which
+    /// is the same failure pointed the other way (#345).
+    fn is_comparable(&self) -> bool {
+        self.is_finite()
+    }
+}
+
+impl OverrideValue for usize {
+    /// Every `usize` a parse can produce is an ordinary integer; the frame
+    /// counts carry their floors in their own range rule.
+    fn is_comparable(&self) -> bool {
+        true
+    }
+}
+
+/// The text of `name`, or `None` when nothing was set.
+///
+/// Bytes that are not UTF-8 come back lossily rather than as `None`: they are
+/// still a value somebody set, so they belong on the refusal path and its log
+/// line, not on the silent unset path.
+fn env_text(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Read `name` from the environment, falling back to `default`.
+///
+/// A supplied value takes effect only when it parses as `T`, is comparable, and
+/// satisfies `accepts`, the range rule of the setting being read. Anything else
+/// leaves `default` in place and reports one line naming the variable.
+///
+/// Every override in this crate goes through here. Before #345 each site
+/// hand-rolled the same chain and the moiré ceiling was written without the
+/// comparability filter, so `IRLUME_RGB_MOIRE_MAX=nan` reached the comparison
+/// in [`LivenessGate::evaluate_rgb_only`] and made it false for every frame:
+/// the only RGB anti-screen cue was off, and nothing said so.
+fn env_override<T: OverrideValue>(
+    name: &'static str,
+    default: T,
+    accepts: impl Fn(T) -> bool,
+) -> T {
+    resolve_override(
+        std::io::stderr().lock(),
+        name,
+        env_text(name).as_deref(),
+        default,
+        accepts,
+    )
+}
+
+/// [`env_override`] with the variable's text and the report's destination
+/// supplied directly (`raw` of `None` means unset).
+///
+/// Both are parameters so that a test can drive the whole decision, including
+/// the line it emits, without touching the process environment or stderr.
+/// Mutating the environment of a running process is unsound on Unix whatever
+/// lock the mutating threads agree on, because the readers that matter are in
+/// libc and in dependencies that took no lock.
+fn resolve_override<T: OverrideValue>(
+    mut out: impl std::io::Write,
+    name: &'static str,
+    raw: Option<&str>,
+    default: T,
+    accepts: impl Fn(T) -> bool,
+) -> T {
+    let Some(raw) = raw else {
+        return default; // unset: the built-in value stands and nothing was refused
+    };
+    let refused = match raw.trim().parse::<T>() {
+        Ok(v) if !v.is_comparable() => "not a finite number",
+        Ok(v) if !accepts(v) => "outside the range this setting accepts",
+        Ok(v) => return v,
+        Err(_) => "not a number",
+    };
+    if first_refusal(name) {
+        // Reported unconditionally rather than through `dlog!`: diagnostic
+        // tracing is off unless an administrator turns it on, and the moment
+        // this line is worth having is the unlock where nobody yet knows the
+        // setting was ignored. Same shape as the IRLUME_IR_EMITTER refusal in
+        // irlume-camera.
+        //
+        // The write error is dropped, and `eprintln!` is not used, because that
+        // macro panics when stderr fails (a closed, full, or non-blocking
+        // journal stream). Panicking here would destroy the authentication this
+        // function exists to hand a safe default to, which is a worse failure
+        // than the one #345 fixed.
+        let _ = writeln!(
+            out,
+            "irlume: ignoring {name}={raw:?} ({refused}); using {default}"
+        );
+    }
+    default
+}
+
+/// True the first time `name` is refused in this process.
+///
+/// The moiré ceiling is read on every authentication and the blink thresholds
+/// on every capture window, so printing per call would repeat the same line for
+/// as long as the bad value stays in the unit file. One line per variable is
+/// what makes it findable in the journal.
+fn first_refusal(name: &'static str) -> bool {
+    static REFUSED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    // A panic under this lock elsewhere must not turn a logging decision into a
+    // failed authentication.
+    let mut seen = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&name) {
+        return false;
+    }
+    seen.push(name);
+    true
+}
+
 /// The effective moiré ceiling: `IRLUME_RGB_MOIRE_MAX` env override (per-camera
 /// tuning, set on the daemon unit) or the built-in default.
+///
+/// Positive only. A ceiling of zero or below refuses every face with any
+/// measurable peakiness, and the live readings this constant was calibrated
+/// against run 9 to 27.
 pub fn rgb_moire_max() -> f32 {
-    std::env::var("IRLUME_RGB_MOIRE_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(RGB_MOIRE_MAX)
+    env_override("IRLUME_RGB_MOIRE_MAX", RGB_MOIRE_MAX, |v| v > 0.0)
 }
 
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
@@ -958,12 +1086,11 @@ fn nod_crossings(pitch: &[f32], pitch_range: f32) -> usize {
 }
 
 /// Minimum nod pitch range, overridable via `IRLUME_NOD_PITCH_MIN`.
+///
+/// Positive only: at zero the amplitude test stops discriminating, since every
+/// pitch range clears it, and the gesture rests on the crossing count alone.
 fn nod_pitch_min() -> f32 {
-    std::env::var("IRLUME_NOD_PITCH_MIN")
-        .ok()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(NOD_PITCH_MIN)
+    env_override("IRLUME_NOD_PITCH_MIN", NOD_PITCH_MIN, |v| v > 0.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1030,6 +1157,11 @@ pub fn face_speeds(samples: &[EarSample]) -> (Vec<f32>, f32, f32) {
 /// bright when open and collapses under the lid on a blink, so open ≫ dip; a
 /// diffuse print has no glint to lose, so open ≈ dip. Returns (open, dip);
 /// both 0 if no usable face frames. Diagnostic for calibrating the second cue.
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "cannot panic: `faces` is filtered on `ear.is_some_and(..)`, so every \
+              `ear.unwrap()` below is on a value already proven to be Some"
+)]
 pub fn contrast_signature(samples: &[EarSample]) -> (f32, f32) {
     let faces: Vec<&EarSample> = samples
         .iter()
@@ -1090,6 +1222,43 @@ enum BlinkScan {
 struct BlinkEvent {
     onset: usize,
     end: usize,
+}
+
+/// Median head-motion ceiling above which no EAR dip is trusted as a blink,
+/// overridable via `IRLUME_BLINK_MOTION_MAX`.
+///
+/// Positive only: at zero any measured movement at all gates the window, and a
+/// head holding still to within the bbox-jitter floor is not something a user
+/// can present on purpose.
+fn blink_motion_max() -> f32 {
+    env_override("IRLUME_BLINK_MOTION_MAX", BLINK_MOTION_MAX_MEDIAN, |v| {
+        v > 0.0
+    })
+}
+
+/// Motion level at or above which the corneal-contrast cue engages,
+/// overridable via `IRLUME_BLINK_CONTRAST_MOTION_FLOOR`.
+///
+/// Zero is accepted here and refused at the other float settings, on purpose:
+/// this floor names the motion below which the cue is SKIPPED, so zero is the
+/// meaningful setting "apply it to every window", not a disabled threshold.
+fn blink_contrast_motion_floor() -> f32 {
+    env_override(
+        "IRLUME_BLINK_CONTRAST_MOTION_FLOOR",
+        BLINK_CONTRAST_MOTION_FLOOR,
+        |v| v >= 0.0,
+    )
+}
+
+/// Minimum ratio of open-eye to closed-eye corneal contrast for a dip to count,
+/// overridable via `IRLUME_BLINK_CONTRAST_DROP`.
+///
+/// Positive only: the value is a required ratio of two measured positives,
+/// which can never fall below zero, so a non-positive bar accepts everything.
+fn blink_contrast_drop_min() -> f32 {
+    env_override("IRLUME_BLINK_CONTRAST_DROP", BLINK_CONTRAST_DROP_MIN, |v| {
+        v > 0.0
+    })
 }
 
 /// Shared blink analysis: strobe classification, per-class open baseline, the
@@ -1170,11 +1339,7 @@ fn blink_scan(samples: &[EarSample]) -> BlinkScan {
     // The threshold is per-camera-calibrated (NexiGo default); a camera with a
     // different frame rate or bbox-jitter floor can override it via
     // IRLUME_BLINK_MOTION_MAX without a rebuild.
-    let motion_max = std::env::var("IRLUME_BLINK_MOTION_MAX")
-        .ok()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(BLINK_MOTION_MAX_MEDIAN);
+    let motion_max = blink_motion_max();
     let (_, motion_med, _) = face_speeds(samples);
     if motion_med > motion_max {
         return BlinkScan::Gated;
@@ -1198,19 +1363,11 @@ fn blink_scan(samples: &[EarSample]) -> BlinkScan {
     // regression. The cue does its work in the slow-motion band [floor, gate],
     // where a slowly-moved print could otherwise fake a subtle dip. Skipped too
     // when no contrast was measured (backward-compat).
-    let contrast_floor = std::env::var("IRLUME_BLINK_CONTRAST_MOTION_FLOOR")
-        .ok()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(BLINK_CONTRAST_MOTION_FLOOR);
+    let contrast_floor = blink_contrast_motion_floor();
     if motion_med >= contrast_floor {
         let (open_c, dip_c) = contrast_signature(samples);
         if open_c > 0.0 && dip_c > 0.0 {
-            let drop_min = std::env::var("IRLUME_BLINK_CONTRAST_DROP")
-                .ok()
-                .and_then(|v| v.trim().parse::<f32>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .unwrap_or(BLINK_CONTRAST_DROP_MIN);
+            let drop_min = blink_contrast_drop_min();
             if open_c / dip_c < drop_min {
                 return BlinkScan::Gated;
             }
@@ -1431,7 +1588,7 @@ pub fn detect_deliberate_closure(samples: &[EarSample], cal: &ClosureCalibration
     }
     let closed = cal.closed_threshold();
     let reopen = cal.reopen_threshold();
-    let (min, max) = (consent_closure_frames(), consent_closure_max_frames());
+    let (min, max) = consent_closure_bounds();
     let hysteresis = CLOSURE_HYSTERESIS_FRAMES;
 
     // Walk closure runs (consecutive frames below `closed`, tolerating a few
@@ -1477,30 +1634,508 @@ pub fn detect_deliberate_closure(samples: &[EarSample], cal: &ClosureCalibration
     BlinkResult::NoBlink
 }
 
-/// Minimum closure length (consecutive face frames below the per-user closed
-/// threshold) for the consent gesture, overridable via
-/// `IRLUME_CONSENT_CLOSURE_FRAMES` for per-camera-fps tuning.
-fn consent_closure_frames() -> usize {
-    std::env::var("IRLUME_CONSENT_CLOSURE_FRAMES")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(CONSENT_CLOSURE_MIN_FRAMES)
+/// The closure length window `[min, max]` for the consent gesture, in
+/// consecutive face frames below the per-user closed threshold, overridable via
+/// `IRLUME_CONSENT_CLOSURE_FRAMES` and `IRLUME_CONSENT_CLOSURE_MAX` for
+/// per-camera-fps tuning.
+///
+/// The minimum is at least one frame, since a run of zero frames is not a
+/// closure to detect. The pair is resolved together, and the returned window is
+/// always satisfiable: `max >= min` holds for every combination of settings.
+///
+/// That invariant needs the built-in maximum to be raised as well as an
+/// explicit one refused. `detect_deliberate_closure` accepts a run when
+/// `length >= min && length <= max`, so an inverted pair silently accepts no
+/// closure of any duration; and a minimum above the built-in maximum inverts
+/// the pair without either value being refused, since a refusal rule only sees
+/// values that were supplied. `IRLUME_CONSENT_CLOSURE_FRAMES=26` with the
+/// maximum unset produced exactly that: a window of `[26, 25]`, consent
+/// disabled, no line in the journal (#345 review).
+fn consent_closure_bounds() -> (usize, usize) {
+    closure_bounds_from(
+        std::io::stderr().lock(),
+        env_text("IRLUME_CONSENT_CLOSURE_FRAMES").as_deref(),
+        env_text("IRLUME_CONSENT_CLOSURE_MAX").as_deref(),
+    )
 }
 
-/// Maximum closure length for the consent gesture; a longer run is a sustained
-/// hold, not a discrete gesture. Overridable via `IRLUME_CONSENT_CLOSURE_MAX`.
-fn consent_closure_max_frames() -> usize {
-    std::env::var("IRLUME_CONSENT_CLOSURE_MAX")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v >= consent_closure_frames())
-        .unwrap_or(CONSENT_CLOSURE_MAX_FRAMES)
+/// [`consent_closure_bounds`] with both variables' text supplied directly, so
+/// the invariant is testable at every combination without an environment.
+fn closure_bounds_from(
+    mut out: impl std::io::Write,
+    min_raw: Option<&str>,
+    max_raw: Option<&str>,
+) -> (usize, usize) {
+    let min = resolve_override(
+        &mut out,
+        "IRLUME_CONSENT_CLOSURE_FRAMES",
+        min_raw,
+        CONSENT_CLOSURE_MIN_FRAMES,
+        |v| v >= 1,
+    );
+    // The minimum is read once and carried into both the fallback and the rule.
+    // Re-reading it inside the rule would be a second observation of a setting
+    // the first half of this pair has already acted on.
+    let max = resolve_override(
+        &mut out,
+        "IRLUME_CONSENT_CLOSURE_MAX",
+        max_raw,
+        CONSENT_CLOSURE_MAX_FRAMES.max(min),
+        |v| v >= min,
+    );
+    (min, max)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- environment overrides (#345) ---
+    //
+    // No test here mutates this process's environment. `set_var` is unsafe on
+    // Unix whatever lock the mutating threads agree on, because the readers
+    // that matter sit in libc and in dependencies that take no lock. So the
+    // decision is driven through its text-in, writer-out seam, and the tests
+    // that must cross the real environment boundary re-run this binary in a
+    // CHILD whose variables `Command::env` fills in before it starts. Same
+    // shape as `irlume-common`'s dbglog test.
+
+    /// The helper's own contract on the text: only a value that parses, is
+    /// comparable, and clears the site's range rule wins.
+    #[test]
+    fn resolve_override_keeps_the_default_for_every_unusable_value() {
+        let positive = |v: f32| v > 0.0;
+        for raw in [
+            "nan", "NaN", "-nan", "inf", "-inf", "infinity", // not comparable
+            "-0.5", "-1", "0", // outside a positive-only range
+            "twelve", "", "  ", "1,5", "12.5x", "0x10", // not a number
+        ] {
+            assert_eq!(
+                resolve_override(std::io::sink(), "IRLUME_TEST_F32", Some(raw), 7.5, positive),
+                7.5,
+                "{raw:?} should not have replaced the default"
+            );
+        }
+        // The same shapes on a usize setting, whose parse also rejects a
+        // fractional or negative count.
+        for raw in ["0", "-1", "2.5", "many", ""] {
+            assert_eq!(
+                resolve_override(
+                    std::io::sink(),
+                    "IRLUME_TEST_USIZE",
+                    Some(raw),
+                    11,
+                    |v: usize| { v >= 1 }
+                ),
+                11,
+                "{raw:?} should not have replaced the default"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_override_takes_a_value_that_clears_the_range_rule() {
+        let positive = |v: f32| v > 0.0;
+        let sunk =
+            |raw| resolve_override(std::io::sink(), "IRLUME_TEST_F32", Some(raw), 7.5, positive);
+        assert_eq!(sunk("0.5"), 0.5);
+        // Whitespace a systemd drop-in leaves behind is trimmed off first.
+        assert_eq!(sunk("\t 1e3\n"), 1000.0);
+        assert_eq!(
+            resolve_override(
+                std::io::sink(),
+                "IRLUME_TEST_USIZE",
+                Some(" 3 "),
+                11,
+                |v: usize| { v >= 1 }
+            ),
+            3
+        );
+    }
+
+    /// The refusal is a diagnostic, so its failure must not become the
+    /// authentication's failure: a writer that errors on every byte still
+    /// leaves the caller holding the safe default.
+    #[test]
+    fn a_report_writer_that_fails_still_yields_the_default() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        assert_eq!(
+            resolve_override(
+                Broken,
+                "IRLUME_TEST_BROKEN_WRITER",
+                Some("nan"),
+                28.0,
+                |v: f32| { v > 0.0 }
+            ),
+            28.0
+        );
+    }
+
+    /// The line itself: one per variable, naming the variable, the value, the
+    /// reason, and the value left in force.
+    #[test]
+    fn a_refusal_writes_one_line_naming_the_variable_and_the_reason() {
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            resolve_override(
+                &mut out,
+                "IRLUME_TEST_ONE_LINE",
+                Some("nan"),
+                28.0,
+                |v: f32| v > 0.0,
+            );
+        }
+        resolve_override(
+            &mut out,
+            "IRLUME_TEST_ONE_LINE_OTHER",
+            Some("-1"),
+            11,
+            |v: usize| v >= 1,
+        );
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected one line per variable, got {text:?}"
+        );
+        assert_eq!(
+            lines[0],
+            r#"irlume: ignoring IRLUME_TEST_ONE_LINE="nan" (not a finite number); using 28"#
+        );
+        assert_eq!(
+            lines[1],
+            r#"irlume: ignoring IRLUME_TEST_ONE_LINE_OTHER="-1" (not a number); using 11"#
+        );
+    }
+
+    /// An unset variable is not a refusal, so it writes nothing at all.
+    #[test]
+    fn an_unset_variable_writes_nothing() {
+        let mut out = Vec::new();
+        assert_eq!(
+            resolve_override(&mut out, "IRLUME_TEST_UNSET_PROBE", None, 1.5, |v: f32| v
+                > 0.0),
+            1.5
+        );
+        assert!(out.is_empty(), "an unset variable reported: {out:?}");
+    }
+
+    /// The closure window must be satisfiable at every combination of the two
+    /// settings, including the ordering that needs no refusal to go wrong: a
+    /// minimum above the BUILT-IN maximum, with the maximum unset.
+    #[test]
+    fn the_closure_window_is_always_satisfiable() {
+        let above_default_max = (CONSENT_CLOSURE_MAX_FRAMES + 5).to_string();
+        let below_default_min = (CONSENT_CLOSURE_MIN_FRAMES - 1).to_string();
+        // A minimum past the built-in maximum carries the maximum up with it.
+        assert_eq!(
+            closure_bounds_from(std::io::sink(), Some(&above_default_max), None),
+            (
+                CONSENT_CLOSURE_MAX_FRAMES + 5,
+                CONSENT_CLOSURE_MAX_FRAMES + 5
+            )
+        );
+        // A maximum under the minimum in force is refused, and the built-in
+        // pair stands.
+        assert_eq!(
+            closure_bounds_from(std::io::sink(), None, Some(&below_default_min)),
+            (CONSENT_CLOSURE_MIN_FRAMES, CONSENT_CLOSURE_MAX_FRAMES)
+        );
+        // A usable pair is taken as given.
+        assert_eq!(
+            closure_bounds_from(std::io::sink(), Some("3"), Some("9")),
+            (3, 9)
+        );
+        // And the invariant over the grid, refused and usable shapes mixed.
+        let mins = [
+            None,
+            Some("1"),
+            Some("11"),
+            Some("26"),
+            Some("40"),
+            Some("0"),
+            Some("x"),
+        ];
+        let maxes = [
+            None,
+            Some("2"),
+            Some("25"),
+            Some("60"),
+            Some("-1"),
+            Some("x"),
+        ];
+        for min_raw in mins {
+            for max_raw in maxes {
+                let (min, max) = closure_bounds_from(std::io::sink(), min_raw, max_raw);
+                assert!(
+                    min >= 1 && max >= min,
+                    "min {min_raw:?} max {max_raw:?} gave an empty window [{min}, {max}]"
+                );
+            }
+        }
+    }
+
+    /// Every setting, with the variable's name, four shapes it must refuse, a
+    /// value it must take, and the effective value each yields.
+    ///
+    /// The refused shapes are per setting rather than one shared list because
+    /// the boundary is where a relaxed rule shows: at a positive-only threshold
+    /// the discriminating case is `0`, and at the contrast floor, where zero is
+    /// a real setting, it is the value just below it.
+    struct Setting {
+        name: &'static str,
+        refused: [&'static str; 4],
+        usable: (&'static str, &'static str),
+        fallback: String,
+    }
+
+    fn settings() -> Vec<Setting> {
+        vec![
+            Setting {
+                name: "IRLUME_RGB_MOIRE_MAX",
+                refused: ["nan", "-1", "0", "moire"],
+                usable: (" 15.0 ", "15"),
+                fallback: RGB_MOIRE_MAX.to_string(),
+            },
+            Setting {
+                name: "IRLUME_NOD_PITCH_MIN",
+                refused: ["inf", "-0.05", "0", "a bit"],
+                usable: ("0.2", "0.2"),
+                fallback: NOD_PITCH_MIN.to_string(),
+            },
+            Setting {
+                name: "IRLUME_BLINK_MOTION_MAX",
+                refused: ["nan", "-1", "0", "fast"],
+                usable: ("0.005", "0.005"),
+                fallback: BLINK_MOTION_MAX_MEDIAN.to_string(),
+            },
+            Setting {
+                // Zero is a SETTING here, not a refusal, so the boundary case
+                // is the value immediately below it.
+                name: "IRLUME_BLINK_CONTRAST_MOTION_FLOOR",
+                refused: ["nan", "-1", "-0.0001", "still"],
+                usable: ("0", "0"),
+                fallback: BLINK_CONTRAST_MOTION_FLOOR.to_string(),
+            },
+            Setting {
+                name: "IRLUME_BLINK_CONTRAST_DROP",
+                refused: ["inf", "-1", "0", "1.15x"],
+                usable: ("3", "3"),
+                fallback: BLINK_CONTRAST_DROP_MIN.to_string(),
+            },
+            Setting {
+                name: "IRLUME_CONSENT_CLOSURE_FRAMES",
+                refused: ["0", "-1", "2.5", "eleven"],
+                usable: ("3", "3"),
+                fallback: CONSENT_CLOSURE_MIN_FRAMES.to_string(),
+            },
+            Setting {
+                name: "IRLUME_CONSENT_CLOSURE_MAX",
+                refused: ["0", "-1", "2.5", "twenty"],
+                usable: ("30", "30"),
+                fallback: CONSENT_CLOSURE_MAX_FRAMES.to_string(),
+            },
+        ]
+    }
+
+    /// The effective value of one setting, through the accessor the detectors
+    /// call. Read in a child process, where the environment is fixed.
+    fn effective(name: &str) -> String {
+        match name {
+            "IRLUME_RGB_MOIRE_MAX" => rgb_moire_max().to_string(),
+            "IRLUME_NOD_PITCH_MIN" => nod_pitch_min().to_string(),
+            "IRLUME_BLINK_MOTION_MAX" => blink_motion_max().to_string(),
+            "IRLUME_BLINK_CONTRAST_MOTION_FLOOR" => blink_contrast_motion_floor().to_string(),
+            "IRLUME_BLINK_CONTRAST_DROP" => blink_contrast_drop_min().to_string(),
+            "IRLUME_CONSENT_CLOSURE_FRAMES" => consent_closure_bounds().0.to_string(),
+            "IRLUME_CONSENT_CLOSURE_MAX" => consent_closure_bounds().1.to_string(),
+            other => panic!("no accessor for {other}"),
+        }
+    }
+
+    fn in_child() -> Option<String> {
+        std::env::var("IRLUME_TEST_CASE").ok()
+    }
+
+    /// Re-runs `test` in a child process carrying `vars`, and fails with the
+    /// child's output if it does not pass.
+    ///
+    /// The child's environment is built by `Command::env` before the process
+    /// exists, so nothing is ever mutated in a running multithreaded program.
+    /// Every setting is cleared first: a developer with one exported must not
+    /// change what this test measures.
+    fn run_in_child(test: &str, case: &str, vars: &[(&str, &str)]) {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([test, "--exact", "--test-threads=1"]);
+        for s in settings() {
+            cmd.env_remove(s.name);
+        }
+        cmd.env("IRLUME_TEST_CASE", case);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // "1 passed" as well as the exit status: libtest exits 0 when a filter
+        // matches NOTHING, so a renamed test would otherwise turn every case
+        // here into a green run of no assertions.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child case {case:?} with {vars:?} did not run green:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Each accessor reads ITS variable, applies ITS range rule, and falls back
+    /// to ITS default. One child per row, with all seven variables set, since
+    /// the settings are independent.
+    #[test]
+    fn every_threshold_reads_its_own_variable() {
+        if let Some(case) = in_child() {
+            for s in settings() {
+                let want = match case.as_str() {
+                    "usable" => s.usable.1.to_string(),
+                    _ => s.fallback.clone(),
+                };
+                assert_eq!(effective(s.name), want, "{} in case {case}", s.name);
+            }
+            return;
+        }
+        for shape in 0..4 {
+            let vars: Vec<(&str, &str)> = settings()
+                .iter()
+                .map(|s| (s.name, s.refused[shape]))
+                .collect();
+            run_in_child(
+                "tests::every_threshold_reads_its_own_variable",
+                &format!("refused{shape}"),
+                &vars,
+            );
+        }
+        let vars: Vec<(&str, &str)> = settings().iter().map(|s| (s.name, s.usable.0)).collect();
+        run_in_child(
+            "tests::every_threshold_reads_its_own_variable",
+            "usable",
+            &vars,
+        );
+    }
+
+    /// #345 at the boundary it was reported at: a refused ceiling must leave
+    /// the screen cue firing. A `nan` ceiling loses every comparison, so
+    /// `score > ceiling` was false for any score and the RGB-only path's one
+    /// anti-screen cue was off.
+    #[test]
+    fn a_refused_moire_ceiling_leaves_the_screen_cue_armed() {
+        let face = |moire: f32| Signals {
+            rgb_face: Some(FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            rgb_face_brightness: 120.0,
+            rgb_specular_frac: 0.02,
+            rgb_moire_score: moire,
+            ..Default::default()
+        };
+        if let Some(case) = in_child() {
+            // 40 is above the 28 default, inside the close-replay band the
+            // constant was calibrated against; 20 is under it.
+            let (verdict, _, why) = LivenessGate.evaluate_rgb_only(&face(40.0));
+            assert_eq!(verdict, Verdict::Spoof, "case {case}: {why}");
+            let want = if case == "usable" {
+                Verdict::Spoof // the tightened 15 ceiling catches 20 as well
+            } else {
+                Verdict::Live
+            };
+            let (verdict, _, why) = LivenessGate.evaluate_rgb_only(&face(20.0));
+            assert_eq!(verdict, want, "case {case}: {why}");
+            return;
+        }
+        // Unset, the cue fires above 28 and not below it.
+        assert_eq!(
+            LivenessGate.evaluate_rgb_only(&face(40.0)).0,
+            Verdict::Spoof
+        );
+        assert_eq!(LivenessGate.evaluate_rgb_only(&face(20.0)).0, Verdict::Live);
+        for raw in ["nan", "inf", "-1", "0", "moire"] {
+            run_in_child(
+                "tests::a_refused_moire_ceiling_leaves_the_screen_cue_armed",
+                raw,
+                &[("IRLUME_RGB_MOIRE_MAX", raw)],
+            );
+        }
+        run_in_child(
+            "tests::a_refused_moire_ceiling_leaves_the_screen_cue_armed",
+            "usable",
+            &[("IRLUME_RGB_MOIRE_MAX", "15")],
+        );
+    }
+
+    /// The blink gates move with their variables, and the contrast floor's zero
+    /// is a setting rather than a disabled threshold: it applies the corneal cue
+    /// to a window the default skips as too still to need it.
+    #[test]
+    fn the_blink_gates_move_with_their_variables() {
+        let ears = [0.24, 0.24, 0.23, 0.15, 0.16, 0.24, 0.24, 0.23, 0.24];
+        // Still face, flat corneal contrast: below the floor the EAR blink is
+        // trusted on its own, which is what keeps glasses usable.
+        let still = moving_seq(&ears, 0.0, |_| 60.0);
+        // Slow band, contrast collapsing with the EAR: a genuine blink.
+        let slow = moving_seq(&ears, 1.7, |e| e * 500.0);
+        if let Some(case) = in_child() {
+            let (fixture, want) = match case.as_str() {
+                "floor" => (&still, BlinkResult::NoBlink),
+                "motion" => (&slow, BlinkResult::NoBlink),
+                "drop" => (&slow, BlinkResult::NoBlink),
+                other => panic!("unknown case {other}"),
+            };
+            assert_eq!(detect_blink(fixture), want, "case {case}");
+            return;
+        }
+        assert_eq!(detect_blink(&still), BlinkResult::Blinked);
+        assert_eq!(detect_blink(&slow), BlinkResult::Blinked);
+        run_in_child(
+            "tests::the_blink_gates_move_with_their_variables",
+            "floor",
+            &[("IRLUME_BLINK_CONTRAST_MOTION_FLOOR", "0")],
+        );
+        run_in_child(
+            "tests::the_blink_gates_move_with_their_variables",
+            "motion",
+            &[("IRLUME_BLINK_MOTION_MAX", "0.005")],
+        );
+        run_in_child(
+            "tests::the_blink_gates_move_with_their_variables",
+            "drop",
+            &[("IRLUME_BLINK_CONTRAST_DROP", "3.0")],
+        );
+    }
+
+    /// EAR trace with a per-frame horizontal step (in pixels, against a face
+    /// size of 100) and a corneal-contrast rule of the caller's choosing.
+    fn moving_seq(ears: &[f32], step: f32, contrast: impl Fn(f32) -> f32) -> Vec<EarSample> {
+        ears.iter()
+            .enumerate()
+            .map(|(i, &e)| EarSample {
+                idx: i,
+                ear: Some(e),
+                bri: 60.0,
+                cx: 100.0 + i as f32 * step,
+                cy: 100.0,
+                fsize: 100.0,
+                contrast: contrast(e),
+            })
+            .collect()
+    }
 
     // --- head-nod consent gesture (detect_nod) ---
     fn pose_seq(pitch: &[f32], yaw: &[f32]) -> Vec<PoseSample> {
@@ -1932,14 +2567,22 @@ mod tests {
     fn consent_closure_frame_threshold_is_env_overridable() {
         // A 4-frame closure is below the default but passes with a lowered bar.
         let seq = flat(&[0.24, 0.24, 0.05, 0.05, 0.05, 0.05, 0.24, 0.24]);
+        if in_child().is_some() {
+            assert_eq!(
+                detect_deliberate_closure(&seq, &cal()),
+                BlinkResult::Blinked
+            );
+            return;
+        }
         assert_eq!(
             detect_deliberate_closure(&seq, &cal()),
             BlinkResult::NoBlink
         );
-        std::env::set_var("IRLUME_CONSENT_CLOSURE_FRAMES", "3");
-        let got = detect_deliberate_closure(&seq, &cal());
-        std::env::remove_var("IRLUME_CONSENT_CLOSURE_FRAMES");
-        assert_eq!(got, BlinkResult::Blinked);
+        run_in_child(
+            "tests::consent_closure_frame_threshold_is_env_overridable",
+            "lowered",
+            &[("IRLUME_CONSENT_CLOSURE_FRAMES", "3")],
+        );
     }
 
     #[test]

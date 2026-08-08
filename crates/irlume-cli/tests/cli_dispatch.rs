@@ -32,7 +32,10 @@ const BIN: &str = env!("CARGO_BIN_EXE_irlume");
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    unsafe {
+        libc::geteuid() == 0
+    }
 }
 
 /// Per-test sandbox tree; deleted when the test ends.

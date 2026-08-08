@@ -115,6 +115,7 @@ fn run(user: &str) -> Result<PathBuf, String> {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         unsafe {
             libc::close(status_read);
             libc::close(write_fd);
@@ -127,6 +128,7 @@ fn run(user: &str) -> Result<PathBuf, String> {
         }
     }
 
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     unsafe {
         libc::close(status_write);
         libc::close(read_fd);
@@ -139,7 +141,10 @@ fn run(user: &str) -> Result<PathBuf, String> {
     // leaves the wallet locked AND removes the fallback that would have opened
     // it.
     if let Err(e) = await_exec(status_read) {
-        unsafe { libc::close(write_fd) };
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        unsafe {
+            libc::close(write_fd)
+        };
         return Err(e);
     }
 
@@ -147,7 +152,10 @@ fn run(user: &str) -> Result<PathBuf, String> {
     // waitForEnvironment() until Plasma's pam_kwallet_init connects, so we
     // deliberately do NOT wait for it to finish starting.
     write_all(write_fd, &key)?;
-    unsafe { libc::close(write_fd) };
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    unsafe {
+        libc::close(write_fd)
+    };
     Ok(sock_path)
 }
 
@@ -156,20 +164,32 @@ fn run(user: &str) -> Result<PathBuf, String> {
 /// Order matters: supplementary groups and the gid must be set before the uid,
 /// or the process no longer holds the privilege needed to drop them.
 fn drop_privileges(pw: &User) -> Result<(), String> {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::initgroups(pw.name.as_ptr(), pw.gid) } != 0 {
         return Err(format!("initgroups: {}", std::io::Error::last_os_error()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::setgid(pw.gid) } != 0 {
         return Err(format!("setgid: {}", std::io::Error::last_os_error()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::setuid(pw.uid) } != 0 {
         return Err(format!("setuid: {}", std::io::Error::last_os_error()));
     }
     // Checked rather than assumed: a drop that silently did not take would leave
     // every path below running as root, which is the whole thing being avoided.
+    // SAFETY: getuid, geteuid, getgid and getegid take no arguments, read
+    // only the calling process's own credentials, and are specified as
+    // always succeeding, so none has a precondition for the caller to uphold.
     if unsafe { libc::getuid() } != pw.uid
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         || unsafe { libc::geteuid() } != pw.uid
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         || unsafe { libc::getgid() } != pw.gid
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         || unsafe { libc::getegid() } != pw.gid
     {
         return Err("privilege drop did not take effect".into());
@@ -179,6 +199,7 @@ fn drop_privileges(pw: &User) -> Result<(), String> {
 
 fn make_status_pipe() -> Result<(libc::c_int, libc::c_int), String> {
     let mut fds = [0 as libc::c_int; 2];
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(format!("status pipe: {}", std::io::Error::last_os_error()));
     }
@@ -190,18 +211,28 @@ fn make_status_pipe() -> Result<(libc::c_int, libc::c_int), String> {
 fn await_exec(status_fd: libc::c_int) -> Result<(), String> {
     let mut byte = 0u8;
     loop {
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let n = unsafe { libc::read(status_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
         if n == 0 {
-            unsafe { libc::close(status_fd) };
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+            unsafe {
+                libc::close(status_fd)
+            };
             return Ok(());
         }
         if n == 1 {
-            unsafe { libc::close(status_fd) };
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+            unsafe {
+                libc::close(status_fd)
+            };
             return Err("the wallet daemon failed to start (exec did not happen)".into());
         }
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::Interrupted {
-            unsafe { libc::close(status_fd) };
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+            unsafe {
+                libc::close(status_fd)
+            };
             return Err(format!("reading the wallet daemon's start status: {e}"));
         }
     }
@@ -221,6 +252,7 @@ fn lookup_user(user: &str) -> Result<User, String> {
     if pw.is_null() {
         return Err(format!("no such user: {user}"));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
     if uid == 0 {
         return Err("refusing to open a wallet for uid 0".to_string());
@@ -235,6 +267,7 @@ fn lookup_user(user: &str) -> Result<User, String> {
 /// Whether this process holds privilege that the environment must not steer.
 /// The same check `irlume-gkr-unlock` applies to its two overrides.
 fn privileged() -> bool {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let (euid, uid) = unsafe { (libc::geteuid(), libc::getuid()) };
     euid == 0 || uid == 0
 }
@@ -275,6 +308,7 @@ fn wallet_daemon() -> Result<CString, String> {
 /// directory's owner redirect it at any root-owned file.
 fn bind_listener(path: &std::path::Path) -> Result<libc::c_int, String> {
     let bytes = path.as_os_str().as_bytes();
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if bytes.len() >= std::mem::size_of_val(&addr.sun_path) {
         return Err(format!("socket path too long: {}", path.display()));
@@ -301,6 +335,7 @@ fn bind_listener(path: &std::path::Path) -> Result<libc::c_int, String> {
     if fd < 0 {
         return Err(format!("socket: {}", std::io::Error::last_os_error()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let rc = unsafe {
         libc::bind(
             fd,
@@ -310,12 +345,19 @@ fn bind_listener(path: &std::path::Path) -> Result<libc::c_int, String> {
     };
     if rc < 0 {
         let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        unsafe {
+            libc::close(fd)
+        };
         return Err(format!("bind {}: {e}", path.display()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::listen(fd, 5) } < 0 {
         let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        unsafe {
+            libc::close(fd)
+        };
         return Err(format!("listen: {e}"));
     }
     Ok(fd)
@@ -325,6 +367,7 @@ fn make_pipe() -> Result<(libc::c_int, libc::c_int), String> {
     let mut fds = [0 as libc::c_int; 2];
     // Plain pipe(), not O_CLOEXEC: the read end must survive execve into
     // ksecretd, which is handed its number on the command line.
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
         return Err(format!("pipe: {}", std::io::Error::last_os_error()));
     }
@@ -408,6 +451,7 @@ fn name_of(uid: libc::uid_t) -> String {
     if pw.is_null() {
         return String::new();
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }
         .to_string_lossy()
         .into_owned()
@@ -419,6 +463,7 @@ fn home_of(uid: libc::uid_t) -> String {
     if pw.is_null() {
         return String::new();
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }
         .to_string_lossy()
         .into_owned()
@@ -426,6 +471,7 @@ fn home_of(uid: libc::uid_t) -> String {
 
 fn write_all(fd: libc::c_int, mut buf: &[u8]) -> Result<(), String> {
     while !buf.is_empty() {
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if n < 0 {
             let e = std::io::Error::last_os_error();

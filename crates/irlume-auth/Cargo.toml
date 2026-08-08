@@ -18,3 +18,6 @@ irlume-core.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[lints]
+workspace = true

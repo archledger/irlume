@@ -66,6 +66,7 @@ pub fn method() -> Method {
 }
 
 /// Persist the active method (creates `/etc/irlume` if needed; needs root).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn set_method(m: Method) -> irlume_common::Result<()> {
     let p = path();
     if let Some(dir) = p.parent() {

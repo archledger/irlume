@@ -96,6 +96,7 @@ pub fn encode_request(op: Op, args: &[&[u8]]) -> Vec<u8> {
 /// Decode the fixed 8-byte response. Errors name what was malformed rather than
 /// collapsing into a result code, because a garbled reply and a `Failed` ask
 /// for different reactions (report a bug vs. report the outcome).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn decode_response(bytes: &[u8]) -> Result<ControlResult, String> {
     if bytes.len() != 8 {
         return Err(format!(
@@ -116,6 +117,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<ControlResult, String> {
 ///
 /// Generic over the stream so tests can drive it with an in-memory pipe; the
 /// real caller passes a `UnixStream` connected to `control_socket_path`.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn call<S: Read + Write>(
     stream: &mut S,
     op: Op,

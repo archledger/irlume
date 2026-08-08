@@ -17,7 +17,9 @@
 # Deliberately hosted-runner only. Nothing here touches the self-hosted runner.
 name: Workflow audit
 
-# Push-trigger only (self-hosted runner; see ci.yml's security note).
+# Push-trigger only. Both jobs below use GitHub-hosted runners, as the note
+# three lines above says; an earlier version of this line claimed self-hosted
+# and contradicted it.
 on:
   push:
     branches: ["**"]

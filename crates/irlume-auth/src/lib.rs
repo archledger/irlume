@@ -806,6 +806,7 @@ mod capture_mode_decision_tests {
 }
 
 impl Engine {
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         // Identify the recognizer by its weights, not its path: a file swapped
         // in place under the same name is a different embedding space and must
@@ -827,6 +828,7 @@ impl Engine {
     /// the embedding-space tag into the ONNX session, so the three can never
     /// disagree, and the 260MB hash happens once per start rather than once
     /// here and once at the caller (#346).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load_with_recognizer_weights(
         det_path: &str,
         model: &irlume_common::HashedModel,
@@ -971,6 +973,7 @@ impl Engine {
 
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the
     /// file is absent this is a no-op (raw IR embeddings are used).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_ir_adapter(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
             // One read feeds both the digest and the session, so the tag always
@@ -1117,6 +1120,7 @@ impl Engine {
     /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
     /// the file is absent this is a no-op; the opt-in passive gate then can't run
     /// and is skipped (logged), so face auth keeps working.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_mesh(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
             self.mesh = Some(irlume_vision::FaceMesh::load_from_file(path)?);
@@ -1126,6 +1130,7 @@ impl Engine {
 
     /// Load the BlazeFace short-range rescue detector (improves detection on
     /// saturated outdoor frames). No-op if the file is absent.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_blaze_rescue(mut self, path: &str) -> irlume_common::Result<Self> {
         // Shipped short-range rescue (ONNX).
         if std::path::Path::new(path).exists() {
@@ -1141,6 +1146,7 @@ impl Engine {
     /// the session constructor re-checks the same buffer), the entry's
     /// measured operating threshold, and its catalog name for reporting.
     /// Replaces whatever rescue was loaded: one slot, one occupant.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_full_range_rescue(
         mut self,
         bytes: &[u8],
@@ -1171,6 +1177,7 @@ impl Engine {
     /// Load an opt-in third-party PAD classifier (deny-only cue on the lit IR
     /// frame). No-op if the file is absent, so a deleted model degrades to the
     /// built-in gate, never to a startup failure.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_thirdparty_pad(
         mut self,
         path: &str,
@@ -1240,6 +1247,7 @@ impl Engine {
     /// One capture: RGB+IR → liveness verdict + (if a face) its embedding.
     /// Capture + assess, choosing the path from the hardware: full cross-spectrum
     /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
         if self.ir_available {
             self.assess_full()
@@ -1853,6 +1861,12 @@ impl Engine {
     /// detection must not masquerade as a blink) but keep their brightness so the
     /// detector can classify the emitter strobe. Returns an empty vec when the
     /// FaceMesh model is not loaded (the gate cannot run).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "cannot panic: the `self.mesh.is_none()` guard above returns early, \
+                  so `expect(\"mesh present\")` runs only when it is Some"
+    )]
     pub fn capture_ear_samples(
         &mut self,
         samples: usize,
@@ -1906,6 +1920,7 @@ impl Engine {
     /// gesture. Needs only the detector, not the FaceMesh, so it works at head
     /// angles and in IR-only light where the eye-based EAR gesture collapses. A
     /// frame with no detected face carries `None` pose.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_pose_samples(
         &mut self,
         samples: usize,
@@ -2378,6 +2393,7 @@ impl Engine {
     /// `service` (the PAM service name) selects the window: `sudo`/`su` get the
     /// shorter [`SUDO_GRACE_WINDOW_MS`]; login and lock services (and `None`)
     /// get the full [`GRACE_WINDOW_MS`]. `IRLUME_GRACE_MS` overrides both.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn authenticate(
         &mut self,
         user: &str,
@@ -2394,6 +2410,7 @@ impl Engine {
     /// The purpose is computed once per call and threaded down, so a polkit verify
     /// can never leak its gate into a later login, and a credential release can
     /// never be mistaken for a plain verify.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn authenticate_for(
         &mut self,
         user: &str,
@@ -2793,6 +2810,7 @@ impl Engine {
     /// daemon restricts a non-root caller to [`Self::identify_within`] so the
     /// returned score can't become a hill-climbing oracle against other
     /// users' templates.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn identify(&mut self) -> irlume_common::Result<IdentifyOutcome> {
         self.identify_impl(None)
     }
@@ -2800,6 +2818,7 @@ impl Engine {
     /// Identify scoped to a single enrolled user ("is this `user`?"). Same
     /// liveness gate and RGB match as [`Self::identify`], but the search set is
     /// just this one account: what a non-root peer is allowed to ask about itself.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn identify_within(&mut self, user: &str) -> irlume_common::Result<IdentifyOutcome> {
         self.identify_impl(Some(user))
     }
@@ -2879,6 +2898,7 @@ impl Engine {
     /// IR liveness self-test: capture and run the algorithmic PAD gate, reporting
     /// the verdict plus the cues behind it. Backs the TUI Calibrate screen and
     /// `Request::SelfTest { Liveness }`.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn liveness_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
         let a = self.assess()?;
         let s = &a.signals;
@@ -2901,6 +2921,7 @@ impl Engine {
     /// Alignment-determinism self-test: embed the same aligned chip twice; the
     /// cosine MUST be ~1.0. Catches the AuraFace alignment/normalization trap
     /// (the "identical images score 0.6" failure). `Request::SelfTest { AlignmentIdentity }`.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn alignment_selftest(&mut self) -> irlume_common::Result<(bool, String)> {
         let rgb = irlume_camera::capture_rgb_denoised_with_progress(
             &self.rgb_dev,
@@ -3084,6 +3105,13 @@ impl Engine {
     /// is the 0.2.0 upgrade remedy, fresh scans reviving dark/dim login after
     /// an embedding-space change). A novel face gets a NEW profile; that errors
     /// if the account is already at MAX_PROFILES.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "cannot panic: `target` is a profile name returned by \
+                  `enroll_merge_target` from this same `enr`, so the `position` \
+                  lookup that follows always finds it"
+    )]
     pub fn enroll_profile(
         &mut self,
         user: &str,
@@ -3292,6 +3320,7 @@ impl Engine {
     /// recognizer without re-enrolling as a new person: the operator names
     /// the profile, which is the only way the link can be made, since
     /// comparing vectors across embedding spaces is meaningless (#288).
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn add_scan(
         &mut self,
         user: &str,
@@ -3388,6 +3417,7 @@ impl Engine {
     /// `user` (the account being enrolled) tunes the pitch band to that user's
     /// calibrated neutral when they already have scans, so the guide coaches to
     /// the same window the capture gate will accept.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn position_sample(
         &mut self,
         user: Option<&str>,

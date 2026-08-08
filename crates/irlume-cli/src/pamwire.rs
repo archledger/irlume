@@ -1885,6 +1885,7 @@ mod tests {
         // this account rather than root, because the test does not run as root
         // and a chown to another owner is refused; production rollback --apply
         // is root-only and the refusal is reported there rather than ignored.
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let gone = dir.join("kde-fingerprint");
         restore_surface(&gone, Some("restored\n"), Some((0o600, uid, gid))).expect("restore");
@@ -3965,6 +3966,8 @@ auth required pam_fprintd.so\n\
 
     #[test]
     fn effective_uid_matches_the_real_euid() {
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         assert_eq!(effective_uid(), unsafe { libc::geteuid() });
     }
 

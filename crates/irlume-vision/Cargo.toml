@@ -39,3 +39,6 @@ rustfft.workspace = true
 [[example]]
 name = "tflite_runtime_probe"
 required-features = ["tflite"]
+
+[lints]
+workspace = true

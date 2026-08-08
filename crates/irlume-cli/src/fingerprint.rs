@@ -964,6 +964,8 @@ mod tests {
     #[test]
     fn effective_uid_matches_the_real_euid() {
         // The /proc/self/status parse must yield the kernel's effective uid.
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         assert_eq!(effective_uid(), unsafe { libc::geteuid() });
     }
 

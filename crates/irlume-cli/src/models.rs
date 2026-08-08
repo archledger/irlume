@@ -675,7 +675,10 @@ fn remove_weights(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn stdin_is_tty() -> bool {
-    unsafe { libc::isatty(0) == 1 }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    unsafe {
+        libc::isatty(0) == 1
+    }
 }
 
 /// One doctor line: which third-party model is enabled and whether its file

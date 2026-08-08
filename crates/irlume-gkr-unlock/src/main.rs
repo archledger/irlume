@@ -146,6 +146,7 @@ fn run(user: &str) -> Result<(), String> {
 fn connect_with_deadline(sock: &std::path::Path) -> Result<UnixStream, String> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     let bytes = sock.as_os_str().as_bytes();
     if bytes.len() >= std::mem::size_of_val(&addr.sun_path) {
@@ -168,6 +169,7 @@ fn connect_with_deadline(sock: &std::path::Path) -> Result<UnixStream, String> {
     if fd < 0 {
         return Err(format!("socket: {}", std::io::Error::last_os_error()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
 
     // SAFETY: addr is fully initialised above; the length is its real size.
@@ -282,6 +284,7 @@ fn login_keyring_path(pw: &User) -> Result<PathBuf, String> {
 
 /// Whether this process holds privilege that the environment must not steer.
 fn privileged() -> bool {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let (euid, uid) = unsafe { (libc::geteuid(), libc::getuid()) };
     euid == 0 || uid == 0
 }
@@ -338,6 +341,9 @@ fn drop_privileges(pw: &User) -> Result<(), String> {
     // runs in-session): there is nothing to drop, and `initgroups` would fail
     // with EPERM for an unprivileged process. Verified below either way, so
     // this cannot skip a drop that was actually needed.
+    // SAFETY: getuid, geteuid, getgid and getegid take no arguments, read
+    // only the calling process's own credentials, and are specified as
+    // always succeeding, so none has a precondition for the caller to uphold.
     let already = unsafe { libc::getuid() } == pw.uid
         && unsafe { libc::geteuid() } == pw.uid
         && unsafe { libc::getgid() } == pw.gid
@@ -345,18 +351,30 @@ fn drop_privileges(pw: &User) -> Result<(), String> {
     if already {
         return Ok(());
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::initgroups(pw.name.as_ptr(), pw.gid) } != 0 {
         return Err(format!("initgroups: {}", std::io::Error::last_os_error()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::setgid(pw.gid) } != 0 {
         return Err(format!("setgid: {}", std::io::Error::last_os_error()));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     if unsafe { libc::setuid(pw.uid) } != 0 {
         return Err(format!("setuid: {}", std::io::Error::last_os_error()));
     }
+    // SAFETY: getuid, geteuid, getgid and getegid take no arguments, read
+    // only the calling process's own credentials, and are specified as
+    // always succeeding, so none has a precondition for the caller to uphold.
     if unsafe { libc::getuid() } != pw.uid
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         || unsafe { libc::geteuid() } != pw.uid
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         || unsafe { libc::getgid() } != pw.gid
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         || unsafe { libc::getegid() } != pw.gid
     {
         return Err("privilege drop did not take effect".into());
@@ -381,6 +399,7 @@ fn lookup_user(user: &str) -> Result<User, String> {
     if pw.is_null() {
         return Err(format!("no such user: {user}"));
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
     if uid == 0 {
         return Err("refusing to unlock a keyring for uid 0".to_string());

@@ -156,6 +156,7 @@ pub struct SealedEnvelope {
 }
 
 impl SealedEnvelope {
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(path: &Path) -> Result<Self> {
         let s = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
         serde_json::from_str(&s).map_err(|e| Error::Protocol(e.to_string()))
@@ -163,6 +164,7 @@ impl SealedEnvelope {
 
     /// Write the envelope as a root-only (0600) file: it contains the wrapped
     /// secret blob; only the TPM can unseal it, but keep it unreadable anyway.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;

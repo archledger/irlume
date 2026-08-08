@@ -1149,6 +1149,7 @@ fn password_matches_login(user: &str, password: &[u8]) -> Option<bool> {
     if out.is_null() {
         return None; // unsupported hash format on this libcrypt
     }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     let computed = unsafe { std::ffi::CStr::from_ptr(out) };
     Some(computed.to_bytes() == stored.as_bytes())
 }
@@ -1503,6 +1504,12 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
     // live TPM), but a live root attacker in a login context can obtain
     // it; root stays the trust boundary. For daemon-verified biometric
     // release resistant to live root, use the face/IR path.
+    //
+    // The posture table gates `UnsealKeyring` root-only too, on both the
+    // worker path and the startup path, and the message is the same either
+    // way. This check stays as defence in depth: it is a property of the
+    // request, so it holds for any future caller that reaches this function
+    // without going through `pregate`.
     if peer.uid != 0 {
         return Response::Error(format!(
             "unseal_keyring requires root (peer uid {})",
@@ -1572,6 +1579,14 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
 /// attempt falls through to the password at once instead of waiting out startup,
 /// and no early caller occupies a slot for the length of it.
 fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
+    // Startup is a routing state, not an authorization state: the request
+    // served here meets the same username screen and privilege check as one
+    // served by the worker. Before #349 this path skipped both, so a keyring
+    // release could reach `envelope_path` with a username that walks out of
+    // the keyring directory.
+    if let Some(resp) = pregate(&req, peer) {
+        return resp;
+    }
     match req {
         Request::UnsealKeyring {
             user,
@@ -1696,38 +1711,230 @@ fn valid_username(u: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
 }
 
-/// The `user` field of a request, if it carries one (for the traversal guard).
-fn request_user(req: &Request) -> Option<&str> {
+/// What a peer must be for a request to be served at all.
+///
+/// Declared once per variant in [`posture`] and enforced once in [`pregate`].
+/// Before #344 each dispatch arm restated its own check, so a variant could be
+/// added with no gate and nothing would say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Privilege {
+    /// Any peer that can open the socket. Some of these arms still narrow what
+    /// the peer GETS by uid instead of refusing it (`Identify` searches only
+    /// the peer's own account, `PositionSample` drops a band hint for an
+    /// account the peer may not act for) or charge the camera-probe interval.
+    /// Neither refuses the request, so neither is a privilege requirement.
+    AnyPeer,
+    /// Root, or the account the request names ([`authorized_for`]). `verb`
+    /// completes `not authorized to {verb} '{user}'`, which is the wording the
+    /// arm used before the check moved here.
+    RootOrTarget { verb: &'static str },
+    /// Root only. `command` completes `{command} requires root (peer uid N)`,
+    /// again the arm's own wording. The name is the operator-facing one
+    /// (`camera-tune`), not always the variant's.
+    RootOnly { command: &'static str },
+}
+
+/// Whether serving a request can leave the published enrollment summary
+/// disagreeing with what is on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnrollmentEffect {
+    /// Reads it, or does not touch it at all.
+    Reads,
+    /// Rewrites the enrollment, or the key material it is sealed under, so the
+    /// summary must be dropped before the request runs.
+    Mutates,
+}
+
+/// Everything the daemon must know about a request before it runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestPosture<'a> {
+    privilege: Privilege,
+    /// The account the request names, if any. This is the string that gets
+    /// interpolated into `<user>.json` paths, so it is what [`valid_username`]
+    /// screens; it is also the target [`Privilege::RootOrTarget`] checks.
+    user: Option<&'a str>,
+    enrollment: EnrollmentEffect,
+}
+
+/// The security posture of every request, in one place (#344).
+///
+/// Exhaustive with NO wildcard arm on purpose: a new [`Request`] variant does
+/// not compile until whoever adds it says what privilege it needs, whether it
+/// names an account, and whether it rewrites an enrollment. The variant that
+/// prompted this, `ReleaseTokenForDisarm`, carried a username that the
+/// traversal guard never saw because it was missing from one of three
+/// hand-maintained lists, and a `_ => None` arm meant neither the compiler nor
+/// the test that existed to catch exactly that could see the omission.
+fn posture(req: &Request) -> RequestPosture<'_> {
+    use EnrollmentEffect::{Mutates, Reads};
+    use Privilege::{AnyPeer, RootOnly, RootOrTarget};
     use Request::*;
     match req {
-        Authenticate { user, .. }
-        | Enroll { user, .. }
-        | ListProfiles { user, .. }
+        // Storage-only management of one account's enrollment. Same refusal
+        // wording ("modify") and same invalidation for all of them.
+        AddScan { user, .. }
         | DeleteProfile { user, .. }
         | DeleteScan { user, .. }
         | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
-        | AddScan { user, .. }
         | SetRequireEyesOpen { user, .. }
         | SetRequireChallenge { user, .. }
-        | CaptureEarMedian { user }
-        | SetClosureCalibration { user, .. }
-        | SealPassword { user, .. }
-        | UnsealPassword { user, .. }
-        | UnsealKeyring { user, .. }
-        | HasSealedPassword { user }
-        | KeyringInfo { user }
-        | ForgetPassword { user }
-        | ResealPassword { user, .. }
-        | RecoveryStatus { user }
-        | RecoverySetup { user, .. }
-        | RecoveryRestore { user, .. }
-        | RecoveryForget { user } => Some(user.as_str()),
-        // Framing guide: the (optional) user only tunes the pitch band, but it's
-        // still interpolated into a state path, so validate it like the rest.
-        PositionSample { user: Some(u) } => Some(u.as_str()),
-        _ => None,
+        | SetClosureCalibration { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "modify" },
+            user: Some(user.as_str()),
+            enrollment: Mutates,
+        },
+        Enroll { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "enroll" },
+            user: Some(user.as_str()),
+            enrollment: Mutates,
+        },
+        // Recovery counts as a mutation: it changes the key material the
+        // enrollment is sealed under.
+        RecoverySetup { user, .. } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "set recovery for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Mutates,
+        },
+        RecoveryRestore { user, .. } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "restore recovery for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Mutates,
+        },
+        RecoveryForget { user } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "forget recovery for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Mutates,
+        },
+        // Reads and keyring operations that leave the enrollment summary
+        // valid. Each keeps the refusal verb its arm used.
+        Authenticate { user, .. } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "authenticate",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        ListProfiles { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "list" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        HasSealedPassword { user } | KeyringInfo { user } | RecoveryStatus { user } => {
+            RequestPosture {
+                privilege: RootOrTarget { verb: "query" },
+                user: Some(user.as_str()),
+                enrollment: Reads,
+            }
+        }
+        SealPassword { user, .. } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "seal password for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        ForgetPassword { user } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "forget password for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        ReleaseTokenForDisarm { user, .. } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "release the keyring token for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        ResealPassword { user, .. } => RequestPosture {
+            privilege: RootOrTarget {
+                verb: "reseal password for",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        // Root-only and account-naming: the sealed credential is released to a
+        // root peer alone, and the calibration capture fires the camera.
+        UnsealPassword { user, .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "unseal_password",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        UnsealKeyring { user, .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "unseal_keyring",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        CaptureEarMedian { user } => RequestPosture {
+            privilege: RootOnly {
+                command: "capture_ear_median",
+            },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
+        // Root-only and account-free: system-wide camera policy under /etc,
+        // and a self-test whose raw liveness numbers are a spoof-tuning oracle.
+        SetCameras { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "set_cameras",
+            },
+            user: None,
+            enrollment: Reads,
+        },
+        TuneCaptureMode { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "camera-tune",
+            },
+            user: None,
+            enrollment: Reads,
+        },
+        SelfTest { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "self_test",
+            },
+            user: None,
+            enrollment: Reads,
+        },
+        // A dry run reads the camera's USB descriptors out of sysfs and sends
+        // the device nothing, so it stays open to any peer (the arm charges it
+        // the camera-probe interval); the real run writes camera firmware and
+        // is root's alone.
+        SetupIrEmitter { dry_run } => RequestPosture {
+            privilege: if *dry_run {
+                AnyPeer
+            } else {
+                RootOnly {
+                    command: "setup_ir_emitter",
+                }
+            },
+            user: None,
+            enrollment: Reads,
+        },
+        // Framing guide: the optional user only tunes the pitch band, but it is
+        // still interpolated into a state path, so it is screened like the rest.
+        PositionSample { user } => RequestPosture {
+            privilege: AnyPeer,
+            user: user.as_deref(),
+            enrollment: Reads,
+        },
+        Ping | Health | Identify | ListCameras => RequestPosture {
+            privilege: AnyPeer,
+            user: None,
+            enrollment: Reads,
+        },
     }
 }
 
@@ -1908,40 +2115,118 @@ fn cached_enrollment_summary(user: &str) -> Option<EnrollmentSummary> {
         .cloned()
 }
 
-/// The requests after which the published summary for `user` may no longer
-/// describe the enrollment on disk. The worker invalidates before running
-/// them. Recovery operations are included because they change the key
-/// material the enrollment is sealed under; re-publishing happens on the
-/// next worker-side listing.
+/// The account whose published summary may no longer describe the enrollment
+/// on disk once this request has run, from the [`posture`] table. The worker
+/// invalidates before running it; re-publishing happens on the next
+/// worker-side listing.
 fn enrollment_mutating_user(req: &Request) -> Option<&str> {
-    use Request::*;
-    match req {
-        Enroll { user, .. }
-        | AddScan { user, .. }
-        | DeleteProfile { user, .. }
-        | DeleteScan { user, .. }
-        | ForgetRecognizer { user, .. }
-        | RenameProfile { user, .. }
-        | RenameScan { user, .. }
-        | SetRequireEyesOpen { user, .. }
-        | SetRequireChallenge { user, .. }
-        | SetClosureCalibration { user, .. }
-        | RecoverySetup { user, .. }
-        | RecoveryRestore { user, .. }
-        | RecoveryForget { user, .. } => Some(user),
-        _ => None,
+    let posture = posture(req);
+    match posture.enrollment {
+        EnrollmentEffect::Reads => None,
+        // A mutation that named no account has nothing to invalidate. The
+        // table declares no such variant and a test walks every one of them to
+        // keep it that way, so this is the shape of the miss, not a live case.
+        EnrollmentEffect::Mutates => posture.user,
     }
 }
 
-/// The username-validity pregate every request passes before any arm runs,
-/// shared by the worker dispatch and the connection-thread status dispatch.
-fn precheck(req: &Request) -> Option<Response> {
-    if let Some(u) = request_user(req) {
+/// The refusal for a peer that may not act on `user`, in the wording the
+/// request's own arm used before #344 moved the check here.
+fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
+    // `ListProfiles` is the one request that can ask for a typed error, and it
+    // only ever gets one if it asked: an older client cannot deserialize a
+    // response variant it does not know, so sending one unasked breaks it
+    // across the upgrade window (#93).
+    if let Request::ListProfiles {
+        structured_errors: true,
+        ..
+    } = req
+    {
+        return Response::OperationError {
+            code: irlume_common::OperationErrorCode::NotAuthorized,
+            retryable: false,
+        };
+    }
+    Response::Error(format!("not authorized to {verb} '{user}'"))
+}
+
+/// The gate every request passes before any arm runs, shared by the worker
+/// dispatch and the connection-thread status dispatch: the username the
+/// request names is screened for traversal, then the privilege the [`posture`]
+/// table declares is enforced. `None` means the request may proceed.
+///
+/// Both checks read the same table, so a variant cannot pass one and skip the
+/// other the way `ReleaseTokenForDisarm` did (#344).
+fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
+    let posture = posture(req);
+    if let Some(u) = posture.user {
         if !valid_username(u) {
             return Some(Response::Error("invalid username".into()));
         }
     }
-    None
+    match posture.privilege {
+        Privilege::AnyPeer => None,
+        Privilege::RootOrTarget { verb } => {
+            // Fail closed: a variant that demands "root or the target account"
+            // while naming no account has no target to check, so it is refused
+            // rather than admitted. The walk-every-variant test keeps this
+            // unreachable for the variants that exist today.
+            let Some(user) = posture.user else {
+                return Some(Response::Error(
+                    "request names no account to authorize against".into(),
+                ));
+            };
+            if authorized_for(peer, user) {
+                None
+            } else {
+                Some(not_authorized(req, verb, user))
+            }
+        }
+        Privilege::RootOnly { command } => {
+            if peer.uid == 0 {
+                return None;
+            }
+            if matches!(req, Request::UnsealPassword { .. }) {
+                note_unseal_password_refusal(peer.uid);
+            }
+            Some(Response::Error(format!(
+                "{command} requires root (peer uid {})",
+                peer.uid
+            )))
+        }
+    }
+}
+
+/// Say in the journal why a non-root peer's `UnsealPassword` was refused.
+///
+/// Refusing SILENTLY is what was wrong before: the request returned before
+/// `do_unseal_password` logged its `attempt` line, so the whole exchange left
+/// no trace, and a field investigation into "face unlocked the screen but the
+/// keyring still asked for a password" reads an empty journal and concludes
+/// the daemon was never contacted. Measured 2026-07-27, that cost hours.
+///
+/// NOT every login surface is root. Greeters are (SDDM, GDM, plasmalogin,
+/// greetd all run PAM in a privileged helper), and so are sudo and the polkit
+/// helper. The KDE LOCK SCREEN is not: `kscreenlocker_greet` is not setuid and
+/// runs as the user, so its `unseal` is refused every time and `pam_irlume`'s
+/// `ondemand` fallback then verifies identity instead. That is working as
+/// intended, and it is why a warm screen unlock never releases a credential.
+///
+/// Logged once per uid per daemon lifetime, not once per unlock: the line
+/// exists to explain a surface, not to narrate every lock screen, and a local
+/// process could otherwise flood the journal by spinning on a request it knows
+/// will be refused.
+fn note_unseal_password_refusal(uid: u32) {
+    if first_nonroot_unseal(uid) {
+        eprintln!(
+            "irlumed: UnsealPassword refused for uid {uid} (not root): no sealed \
+             credential is released to a user-context caller. A greeter that runs \
+             PAM as the user, notably the KDE lock screen, gets identity \
+             verification only; this is expected and is logged once per uid."
+        );
+    } else {
+        irlume_common::dlog!("UnsealPassword refused for uid {uid} (not root)");
+    }
 }
 
 /// Answer a [`arbiter::Class::Status`] request. Runs on the CONNECTION
@@ -1950,9 +2235,11 @@ fn precheck(req: &Request) -> Option<Response> {
 /// unseal, 10.8s measured on one machine) cannot make an authentication
 /// wait, and a wedged worker cannot make `Ping` lie about the daemon being
 /// down (#212). Returns `None` for requests that are not status, which the
-/// worker then serves as before.
+/// worker then serves as before, EXCEPT that the shared [`pregate`] answers a
+/// bad username or an unauthorized peer here whatever the request is: `serve`
+/// only routes status requests here, and `dispatch` wants that answer anyway.
 fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
-    if let Some(resp) = precheck(req) {
+    if let Some(resp) = pregate(req, peer) {
         return Some(resp);
     }
     let bits = engine_bits()
@@ -1983,19 +2270,14 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 apparmor: apparmor_confinement(),
             }
         }
-        // Only tune the band to a user the peer may act for (root, or their own
-        // account); else ignore it. Stops a non-root peer forcing a per-poll TPM
-        // unseal of another user's (e.g. root's) enrollment via the framing guide.
+        // The peer's right to ask about this account was settled by the
+        // pregate (RootOrTarget in the posture table), which is also what stops
+        // a non-root peer forcing a per-poll TPM unseal of another user's (e.g.
+        // root's) enrollment through the framing guide.
         Request::HasSealedPassword { user } => {
-            if !authorized_for(peer, user) {
-                return Some(Response::Error(format!("not authorized to query '{user}'")));
-            }
             Response::HasPassword(irlume_core::keyring::has_sealed_password(user))
         }
         Request::RecoveryStatus { user } => {
-            if !authorized_for(peer, user) {
-                return Some(Response::Error(format!("not authorized to query '{user}'")));
-            }
             Response::RecoveryStatus {
                 // The store's own shape, not the key's presence: those differ
                 // exactly when the key is gone, and that case has to be
@@ -2006,26 +2288,7 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 key_present: irlume_core::template_key::has_key(user),
             }
         }
-        Request::ListProfiles {
-            user,
-            structured_errors,
-        } => {
-            let fail = |code: irlume_common::OperationErrorCode, prose: String| {
-                if *structured_errors {
-                    Response::OperationError {
-                        code,
-                        retryable: false,
-                    }
-                } else {
-                    Response::Error(prose)
-                }
-            };
-            if !authorized_for(peer, user) {
-                return Some(fail(
-                    irlume_common::OperationErrorCode::NotAuthorized,
-                    format!("not authorized to list '{user}'"),
-                ));
-            }
+        Request::ListProfiles { user, .. } => {
             // Cache HIT only: the summary the worker published after its
             // last load or mutation of this enrollment. A miss returns None
             // and the request queues to the worker, whose ListProfiles arm
@@ -2263,20 +2526,28 @@ fn enroll_with_capture_probe(
 }
 
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
-    // BEFORE the mutation runs, not after: a summary dropped early leaves
-    // the cache empty (a concurrent status read queues here behind us),
-    // never stale. Repopulated by the next worker-side listing.
-    if let Some(u) = enrollment_mutating_user(&req) {
-        invalidate_enrollment_summary(u);
-    }
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
-    // in behavior) if one is ever submitted anyway. precheck rides inside.
+    // in behavior) if one is ever submitted anyway. The pregate rides inside.
     if let Some(resp) = dispatch_status(&req, peer) {
         return resp;
     }
-    if let Some(resp) = precheck(&req) {
+    // Every arm below runs with the posture table already enforced: the
+    // username screened for traversal, and the declared privilege satisfied
+    // (#344). No arm re-checks either.
+    if let Some(resp) = pregate(&req, peer) {
         return resp;
+    }
+    // AFTER the gate, BEFORE the mutation runs. After the gate because the
+    // cache is state, and a request that is about to be refused may not
+    // change state: an unprivileged peer could otherwise evict root's summary
+    // with a DeleteProfile it is not allowed to perform, and charge root's
+    // next listing a storage load and its TPM work (#349). Before the
+    // mutation because a summary dropped early leaves the cache empty (a
+    // concurrent status read queues here behind us), never stale.
+    // Repopulated by the next worker-side listing.
+    if let Some(user) = enrollment_mutating_user(&req) {
+        invalidate_enrollment_summary(user);
     }
     match req {
         // These four are answered by dispatch_status above; the arm is
@@ -2289,9 +2560,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             Response::Error("status request routed past its handler".into())
         }
         Request::KeyringInfo { user } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to query '{user}'"));
-            }
             let armed = irlume_core::keyring::has_sealed_password(&user);
             let path = irlume_core::keyring::envelope_path(&user);
             match irlume_core::envelope::SealedEnvelope::load(&path) {
@@ -2336,12 +2604,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     Response::Error(prose)
                 }
             };
-            if !authorized_for(peer, &user) {
-                return fail(
-                    irlume_common::OperationErrorCode::NotAuthorized,
-                    format!("not authorized to list '{user}'"),
-                );
-            }
             match irlume_core::storage::load(&user) {
                 Ok(enr) => {
                     // The status path serves this snapshot from now on; the
@@ -2372,13 +2634,12 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::Authenticate { user, service } => {
-            // Root (PAM stacks) or the account owner only. Without this gate any
-            // local peer could probe Authenticate{other_user} and read the raw
-            // similarity score, a hill-climbing oracle toward a match (the
-            // threat model promises scores never leak to unprivileged peers).
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to authenticate '{user}'"));
-            }
+            // Root (PAM stacks) or the account owner only, from the posture
+            // table. Without that gate any local peer could probe
+            // Authenticate{other_user} and read the raw similarity score, a
+            // hill-climbing oracle toward a match (the threat model promises
+            // scores never leak to unprivileged peers).
+
             // Honor the configured unlock method: if the admin chose fingerprint,
             // face must actually stand down (pam_fprintd drives; password is the
             // fallback), not just be claimed disabled by the CLI message.
@@ -2510,16 +2771,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::SetCameras { rgb, ir } => {
-            // Persists to /etc and repoints the camera the daemon trusts; an
-            // attacker who could set this to a v4l2loopback node feeds recorded
-            // video into the match path (spoof) or bricks face auth (DoS). Root
-            // only (a system-wide /etc setting isn't an arbitrary peer's to make).
-            if peer.uid != 0 {
-                return Response::Error(format!(
-                    "set_cameras requires root (peer uid {})",
-                    peer.uid
-                ));
-            }
+            // Root only (posture table): this persists to /etc and repoints the
+            // camera the daemon trusts, and an attacker who could set it to a
+            // v4l2loopback node feeds recorded video into the match path
+            // (spoof) or bricks face auth (DoS).
             engine.set_devices(&rgb, &ir);
             let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
             // Record each node's stable device identity (vid:pid:serial) next to
@@ -2545,9 +2800,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             scans,
             reset,
         } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to enroll '{user}'"));
-            }
             if reset {
                 // Clean slate: drop the old enrollment (and its stale camera
                 // binding) before enrolling fresh.
@@ -2610,14 +2862,8 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         }
         Request::TuneCaptureMode { rounds } => {
             // Holds the camera for tens of seconds and rewrites capture policy in
-            // /etc/irlume, so it is root-only like the other camera-bearing
-            // management requests.
-            if peer.uid != 0 {
-                return Response::Error(format!(
-                    "camera-tune requires root (peer uid {})",
-                    peer.uid
-                ));
-            }
+            // /etc/irlume, so the table makes it root-only like the other
+            // camera-bearing management requests.
             let rounds = rounds
                 .unwrap_or(TUNE_DEFAULT_ROUNDS)
                 .clamp(1, TUNE_MAX_ROUNDS);
@@ -2654,14 +2900,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 }
             } else {
                 // The non-dry path writes to the camera's Microsoft-XU. It no
-                // longer guesses payloads (#159), but any write to camera
-                // firmware stays root-only.
-                if peer.uid != 0 {
-                    return Response::Error(format!(
-                        "setup_ir_emitter requires root (peer uid {})",
-                        peer.uid
-                    ));
-                }
+                // longer guesses payloads (#159), and any write to camera
+                // firmware stays root-only: the table declares that from the
+                // same `dry_run` field this branch reads.
                 match irlume_auth::setup_ir_emitter(engine.ir_device()) {
                     Ok(msg) => {
                         eprintln!("irlumed: {msg}");
@@ -2677,9 +2918,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             scans,
             report_enrollment,
         } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
-            }
             match engine.add_scan(&user, &profile, scans.unwrap_or(1)) {
                 // The structured reply, opted into: the TUI needs the
                 // ambient-lit count of EVERY scan for the #312 completion
@@ -2711,11 +2949,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             password,
             kind,
         } => {
-            // Arming the keyring: root or the user themselves. `password`
-            // zeroizes on drop, covering every return path.
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to seal password for '{user}'"));
-            }
+            // Arming the keyring: root or the user themselves (posture table).
+            // `password` zeroizes on drop, covering every return path.
+            //
             // Refuse to seal a password that is not the user's LOGIN password:
             // it would seal cleanly but fail later at wallet key-derive ("-9").
             // Only a POSITIVE mismatch blocks; an unverifiable hash proceeds.
@@ -2824,47 +3060,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::UnsealPassword { user, service } => {
-            // The sealed LOGIN password is released ONLY to a root peer. A
-            // non-root caller never gets it, even with a matching face.
-            //
-            // NOT every login surface is root, and the comment here used to say
-            // it was. Greeters are (SDDM, GDM, plasmalogin, greetd all run PAM
-            // in a privileged helper), and so are sudo and the polkit helper.
-            // The KDE LOCK SCREEN is not: `kscreenlocker_greet` is not setuid
-            // and runs as the user, so its `unseal` is refused here every time
-            // and `pam_irlume`'s `ondemand` fallback then verifies identity
-            // instead. That is working as intended, and it is why a warm screen
-            // unlock never releases a credential.
-            //
-            // Refusing SILENTLY is what was wrong. This returns before
-            // `do_unseal_password` logs its `attempt` line, so the whole
-            // exchange left no trace: a field investigation into "face unlocked
-            // the screen but the keyring still asked for a password" reads an
-            // empty journal and concludes the daemon was never contacted, which
-            // is exactly the wrong conclusion. Measured 2026-07-27, that cost
-            // hours.
-            //
-            // Logged once per uid per daemon lifetime, not once per unlock: the
-            // line exists to explain a surface, not to narrate every lock
-            // screen, and a local process could otherwise flood the journal by
-            // spinning on a request it knows will be refused.
-            if peer.uid != 0 {
-                if first_nonroot_unseal(peer.uid) {
-                    eprintln!(
-                        "irlumed: UnsealPassword refused for uid {} (not root): no sealed \
-                         credential is released to a user-context caller. A greeter that runs \
-                         PAM as the user, notably the KDE lock screen, gets identity \
-                         verification only; this is expected and is logged once per uid.",
-                        peer.uid
-                    );
-                } else {
-                    irlume_common::dlog!("UnsealPassword refused for uid {} (not root)", peer.uid);
-                }
-                return Response::Error(format!(
-                    "unseal_password requires root (peer uid {})",
-                    peer.uid
-                ));
-            }
+            // The sealed LOGIN password is released ONLY to a root peer (the
+            // table's RootOnly), and the refusal explains itself in the journal
+            // through `note_unseal_password_refusal`, which is where the
+            // surfaces this catches are documented.
+
             // Same method gate as Authenticate: fingerprint-configured means no
             // face-driven credential release either.
             if irlume_core::policy::method().face_disabled() {
@@ -2924,25 +3124,15 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             service,
             have_password,
         } => unseal_keyring(&user, service.as_deref(), have_password, peer),
-        Request::ForgetPassword { user } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to forget password for '{user}'"));
-            }
-            match irlume_core::keyring::forget_password(&user) {
-                Ok(()) => Response::PasswordForgotten,
-                Err(e) => Response::Error(e.to_string()),
-            }
-        }
+        Request::ForgetPassword { user } => match irlume_core::keyring::forget_password(&user) {
+            Ok(()) => Response::PasswordForgotten,
+            Err(e) => Response::Error(e.to_string()),
+        },
         Request::ReleaseTokenForDisarm { user, password } => {
-            // Same authz as arming; the password check inside (the token's own
-            // AES-GCM wrap) is what actually gates the release, so a root
-            // caller still has to present the user's password. `password`
-            // zeroizes on drop.
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!(
-                    "not authorized to release the keyring token for '{user}'"
-                ));
-            }
+            // Same authz as arming (posture table); the password check inside
+            // (the token's own AES-GCM wrap) is what actually gates the
+            // release, so a root caller still has to present the user's
+            // password. `password` zeroizes on drop.
             match irlume_core::keyring::release_token_with_password(&user, password.expose()) {
                 Ok(token) => {
                     eprintln!(
@@ -2963,9 +3153,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // (root or the user), but it can only ever *re-seal an already armed*
             // password against today's PCRs; it never arms a fresh user, so a
             // self-peer cannot use it to plant a sealed password they didn't set.
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to reseal password for '{user}'"));
-            }
+            //
             // The home directory is where the KDE wallet salt lives; a
             // login-password envelope ignores it, so an unresolvable home is
             // only fatal for the wallet kind and reseal decides that itself.
@@ -2994,9 +3182,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         }
         // --- template-key recovery passphrase -------------------------------
         Request::RecoverySetup { user, passphrase } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to set recovery for '{user}'"));
-            }
             // If templates are still plaintext (pre-encryption enrollment), mint
             // and seal a template key now by re-saving; encryption takes effect
             // and there's a key for the recovery passphrase to wrap. A no-op when
@@ -3020,9 +3205,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::RecoveryRestore { user, passphrase } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to restore recovery for '{user}'"));
-            }
             match irlume_core::template_key::restore_from_recovery(&user, passphrase.expose()) {
                 Ok(()) => {
                     eprintln!(
@@ -3034,9 +3216,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             }
         }
         Request::RecoveryForget { user } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to forget recovery for '{user}'"));
-            }
             match irlume_core::template_key::forget_recovery(&user) {
                 Ok(()) => Response::Ok(format!("recovery passphrase erased for '{user}'")),
                 Err(e) => Response::Error(e.to_string()),
@@ -3058,49 +3237,36 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 })
                 .collect(),
         ),
-        Request::DeleteProfile { user, profile } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
+        Request::DeleteProfile { user, profile } => mutate_enrollment(&user, |enr| {
+            let before = enr.profiles.len();
+            enr.profiles.retain(|p| p.name != profile);
+            if enr.profiles.len() == before {
+                Err(format!("no face profile '{profile}'"))
+            } else {
+                Ok(format!("deleted profile '{profile}'"))
             }
-            mutate_enrollment(&user, |enr| {
-                let before = enr.profiles.len();
-                enr.profiles.retain(|p| p.name != profile);
-                if enr.profiles.len() == before {
-                    Err(format!("no face profile '{profile}'"))
-                } else {
-                    Ok(format!("deleted profile '{profile}'"))
-                }
-            })
-        }
+        }),
         Request::DeleteScan {
             user,
             profile,
             scan,
-        } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
+        } => mutate_enrollment(&user, |enr| {
+            let p = enr
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == profile)
+                .ok_or(format!("no face profile '{profile}'"))?;
+            let before = p.scans.len();
+            p.scans.retain(|s| s.name != scan);
+            if p.scans.len() == before {
+                Err(format!("no scan '{scan}' in '{profile}'"))
+            } else if p.scans.is_empty() {
+                Err("a profile must keep at least one scan; delete the profile instead".into())
+            } else {
+                Ok(format!("deleted scan '{scan}' from '{profile}'"))
             }
-            mutate_enrollment(&user, |enr| {
-                let p = enr
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.name == profile)
-                    .ok_or(format!("no face profile '{profile}'"))?;
-                let before = p.scans.len();
-                p.scans.retain(|s| s.name != scan);
-                if p.scans.len() == before {
-                    Err(format!("no scan '{scan}' in '{profile}'"))
-                } else if p.scans.is_empty() {
-                    Err("a profile must keep at least one scan; delete the profile instead".into())
-                } else {
-                    Ok(format!("deleted scan '{scan}' from '{profile}'"))
-                }
-            })
-        }
+        }),
         Request::ForgetRecognizer { user, space } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
-            }
             // Read before mutating: is the loaded recognizer the one being
             // forgotten? Decided here because the closure below has no engine.
             let forgetting_live = space == engine.embed_space();
@@ -3164,84 +3330,59 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             user,
             profile,
             new_name,
-        } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
+        } => mutate_enrollment(&user, |enr| {
+            if enr.profiles.iter().any(|p| p.name == new_name) {
+                return Err(format!("'{new_name}' already exists"));
             }
-            mutate_enrollment(&user, |enr| {
-                if enr.profiles.iter().any(|p| p.name == new_name) {
-                    return Err(format!("'{new_name}' already exists"));
-                }
-                let p = enr
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.name == profile)
-                    .ok_or(format!("no face profile '{profile}'"))?;
-                p.name = new_name.clone();
-                Ok(format!("renamed profile to '{new_name}'"))
-            })
-        }
+            let p = enr
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == profile)
+                .ok_or(format!("no face profile '{profile}'"))?;
+            p.name = new_name.clone();
+            Ok(format!("renamed profile to '{new_name}'"))
+        }),
         Request::RenameScan {
             user,
             profile,
             scan,
             new_name,
-        } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
+        } => mutate_enrollment(&user, |enr| {
+            let p = enr
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == profile)
+                .ok_or(format!("no face profile '{profile}'"))?;
+            if p.scans.iter().any(|s| s.name == new_name) {
+                return Err(format!("'{new_name}' already exists in '{profile}'"));
             }
-            mutate_enrollment(&user, |enr| {
-                let p = enr
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.name == profile)
-                    .ok_or(format!("no face profile '{profile}'"))?;
-                if p.scans.iter().any(|s| s.name == new_name) {
-                    return Err(format!("'{new_name}' already exists in '{profile}'"));
-                }
-                let s = p
-                    .scans
-                    .iter_mut()
-                    .find(|s| s.name == scan)
-                    .ok_or(format!("no scan '{scan}' in '{profile}'"))?;
-                s.name = new_name.clone();
-                Ok(format!("renamed scan to '{new_name}'"))
-            })
-        }
-        Request::SetRequireEyesOpen { user, on } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
-            }
-            mutate_enrollment(&user, |enr| {
-                enr.require_eyes_open = on;
-                Ok(format!(
-                    "require-eyes-open {}",
-                    if on { "ENABLED" } else { "disabled" }
-                ))
-            })
-        }
-        Request::SetRequireChallenge { user, on } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
-            }
-            mutate_enrollment(&user, |enr| {
-                enr.require_challenge = on;
-                Ok(format!(
-                    "require-challenge {}",
-                    if on { "ENABLED" } else { "disabled" }
-                ))
-            })
-        }
+            let s = p
+                .scans
+                .iter_mut()
+                .find(|s| s.name == scan)
+                .ok_or(format!("no scan '{scan}' in '{profile}'"))?;
+            s.name = new_name.clone();
+            Ok(format!("renamed scan to '{new_name}'"))
+        }),
+        Request::SetRequireEyesOpen { user, on } => mutate_enrollment(&user, |enr| {
+            enr.require_eyes_open = on;
+            Ok(format!(
+                "require-eyes-open {}",
+                if on { "ENABLED" } else { "disabled" }
+            ))
+        }),
+        Request::SetRequireChallenge { user, on } => mutate_enrollment(&user, |enr| {
+            enr.require_challenge = on;
+            Ok(format!(
+                "require-challenge {}",
+                if on { "ENABLED" } else { "disabled" }
+            ))
+        }),
         Request::CaptureEarMedian { user: _ } => {
-            // Fires the camera; root-gate like the other camera-bearing requests.
-            // The socket is world-connectable, so this gate is what keeps other
-            // uids out.
-            if peer.uid != 0 {
-                return Response::Error(format!(
-                    "capture_ear_median requires root (peer uid {})",
-                    peer.uid
-                ));
-            }
+            // Fires the camera, so the table root-gates it like the other
+            // camera-bearing requests. The socket is world-connectable, so that
+            // gate is what keeps other uids out.
+            //
             // ~3s window: enough frames for a stable median of the current eye
             // state (open or closed, whichever the caller is prompting).
             const CAL_FRAMES: usize = 45;
@@ -3254,26 +3395,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             user,
             ear_open,
             ear_closed,
-        } => {
-            if !authorized_for(peer, &user) {
-                return Response::Error(format!("not authorized to modify '{user}'"));
-            }
-            mutate_enrollment(&user, |enr| {
-                enr.closure_calibration = Some((ear_open, ear_closed));
-                Ok(format!(
-                    "closure calibration stored (open {ear_open:.3}, closed {ear_closed:.3})"
-                ))
-            })
-        }
+        } => mutate_enrollment(&user, |enr| {
+            enr.closure_calibration = Some((ear_open, ear_closed));
+            Ok(format!(
+                "closure calibration stored (open {ear_open:.3}, closed {ear_closed:.3})"
+            ))
+        }),
         Request::SelfTest { kind } => {
             // Fires the camera and returns raw liveness/alignment measurements
-            // (IR brightness, center/edge, glint), which are a spoof-tuning oracle and
-            // a way to tie up the single-threaded daemon. Gate to root, like the
-            // other camera-bearing requests. The socket is world-connectable, so
-            // this gate is the only thing keeping an arbitrary local uid out.
-            if peer.uid != 0 {
-                return Response::Error(format!("self_test requires root (peer uid {})", peer.uid));
-            }
+            // (IR brightness, center/edge, glint), which are a spoof-tuning
+            // oracle and a way to tie up the single-threaded daemon, so the
+            // table gates it to root like the other camera-bearing requests.
+            // The socket is world-connectable, so that gate is the only thing
+            // keeping an arbitrary local uid out.
             use irlume_common::SelfTestKind;
             let r = match kind {
                 SelfTestKind::Liveness => engine.liveness_selftest(),
@@ -3822,6 +3956,7 @@ mod tests {
         assert_eq!(identify_scope(&peer(0)), IdentifyScope::Full);
         // The uid running this test resolves to a real account; its scope must
         // be exactly that username, never Full.
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = unsafe { libc::geteuid() };
         if me != 0 {
             let name = users::name_for_uid(me).expect("test uid has an account");
@@ -4261,117 +4396,380 @@ mod tests {
         assert!(valid_username(&"a".repeat(64)));
     }
 
+    /// The username every sample below is built with. It appears in the
+    /// `user` field and nowhere else, which is what lets
+    /// `posture_exposes_the_user_of_every_user_bearing_variant` derive its
+    /// expectation from the request instead of a second hand-written list.
+    const SAMPLE_USER: &str = "carol";
+
+    /// Every [`Request`] variant, named once, with a sample value.
+    ///
+    /// One invocation generates BOTH the sample list and `variant_name`, whose
+    /// match is exhaustive with no wildcard. That is what ties them together:
+    /// adding a variant to `Request` breaks the compile of `variant_name`, and
+    /// the only way to fix that compile is to add a line here, which also adds
+    /// the sample. A hand-maintained count next to a hand-maintained list
+    /// could not do this, because leaving both short agreed with itself
+    /// (#349).
+    ///
+    /// Each sample must be an instance of the variant it is catalogued under;
+    /// `each_sample_is_the_variant_it_was_catalogued_under` checks that, since
+    /// the macro cannot.
+    ///
+    /// The two leading identifiers are the names the samples call to build the
+    /// username and a secret. They are passed in rather than defined in the
+    /// macro body because a name the macro introduces is hygienically invisible
+    /// to the sample expressions, which the caller wrote.
+    macro_rules! request_catalog {
+        ($u:ident, $secret:ident; $($name:ident => $sample:expr),+ $(,)?) => {
+            fn variant_name(req: &Request) -> &'static str {
+                match req {
+                    $(Request::$name { .. } => stringify!($name),)+
+                }
+            }
+
+            /// One sample per variant, paired with the name it was catalogued
+            /// under. User-bearing samples are built with `user`.
+            fn named_samples(user: &str) -> Vec<(&'static str, Request)> {
+                let $u = || user.to_string();
+                let $secret = || irlume_common::SecretBytes::new(b"pw".to_vec());
+                // Not every sample needs both; the catalog is one list.
+                let _ = (&$u, &$secret);
+                vec![$((stringify!($name), $sample)),+]
+            }
+        };
+    }
+
+    request_catalog! {
+        u, secret;
+        Authenticate => Request::Authenticate {
+            user: u(),
+            service: Some("sudo".into()),
+        },
+        Enroll => Request::Enroll {
+            user: u(),
+            profile: None,
+            scans: None,
+            reset: false,
+        },
+        Identify => Request::Identify,
+        SetCameras => Request::SetCameras {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video2".into(),
+        },
+        AddScan => Request::AddScan {
+            user: u(),
+            profile: "p".into(),
+            scans: None,
+            report_enrollment: false,
+        },
+        ListProfiles => Request::ListProfiles {
+            user: u(),
+            structured_errors: false,
+        },
+        DeleteProfile => Request::DeleteProfile {
+            user: u(),
+            profile: "p".into(),
+        },
+        DeleteScan => Request::DeleteScan {
+            user: u(),
+            profile: "p".into(),
+            scan: "s".into(),
+        },
+        ForgetRecognizer => Request::ForgetRecognizer {
+            user: u(),
+            space: "embed:abc".into(),
+        },
+        RenameProfile => Request::RenameProfile {
+            user: u(),
+            profile: "p".into(),
+            new_name: "q".into(),
+        },
+        RenameScan => Request::RenameScan {
+            user: u(),
+            profile: "p".into(),
+            scan: "s".into(),
+            new_name: "t".into(),
+        },
+        SetRequireEyesOpen => Request::SetRequireEyesOpen {
+            user: u(),
+            on: true,
+        },
+        SetRequireChallenge => Request::SetRequireChallenge {
+            user: u(),
+            on: false,
+        },
+        CaptureEarMedian => Request::CaptureEarMedian { user: u() },
+        SetClosureCalibration => Request::SetClosureCalibration {
+            user: u(),
+            ear_open: 0.3,
+            ear_closed: 0.1,
+        },
+        // The writing form. The dry run is an alternative shape, below.
+        SetupIrEmitter => Request::SetupIrEmitter { dry_run: false },
+        TuneCaptureMode => Request::TuneCaptureMode { rounds: None },
+        SelfTest => Request::SelfTest {
+            kind: irlume_common::SelfTestKind::Liveness,
+        },
+        ListCameras => Request::ListCameras,
+        Ping => Request::Ping,
+        Health => Request::Health,
+        // The user-bearing form, so the traversal walk covers it.
+        PositionSample => Request::PositionSample { user: Some(u()) },
+        SealPassword => Request::SealPassword {
+            user: u(),
+            password: secret(),
+            kind: None,
+        },
+        UnsealPassword => Request::UnsealPassword {
+            user: u(),
+            service: None,
+        },
+        UnsealKeyring => Request::UnsealKeyring {
+            user: u(),
+            service: None,
+            have_password: false,
+        },
+        HasSealedPassword => Request::HasSealedPassword { user: u() },
+        KeyringInfo => Request::KeyringInfo { user: u() },
+        ForgetPassword => Request::ForgetPassword { user: u() },
+        ReleaseTokenForDisarm => Request::ReleaseTokenForDisarm {
+            user: u(),
+            password: secret(),
+        },
+        ResealPassword => Request::ResealPassword {
+            user: u(),
+            password: secret(),
+        },
+        RecoverySetup => Request::RecoverySetup {
+            user: u(),
+            passphrase: secret(),
+        },
+        RecoveryRestore => Request::RecoveryRestore {
+            user: u(),
+            passphrase: secret(),
+        },
+        RecoveryStatus => Request::RecoveryStatus { user: u() },
+        RecoveryForget => Request::RecoveryForget { user: u() },
+    }
+
+    /// Second shapes of variants the catalog already covers, where the posture
+    /// reads a field rather than the variant alone. These ADD cases to the
+    /// walks; they can never stand in for a missing variant, because the
+    /// catalog above is what the exhaustive match is generated from.
+    fn alternative_shapes(user: &str) -> Vec<Request> {
+        let _ = user;
+        vec![
+            // No user to screen, and no band to tune to an account.
+            Request::PositionSample { user: None },
+            // The reading form, which any peer may send.
+            Request::SetupIrEmitter { dry_run: true },
+        ]
+    }
+
+    /// Every sample plus every alternative shape, built with `user`.
+    fn request_samples_with_user(user: &str) -> Vec<Request> {
+        named_samples(user)
+            .into_iter()
+            .map(|(_, req)| req)
+            .chain(alternative_shapes(user))
+            .collect()
+    }
+
+    fn request_samples() -> Vec<Request> {
+        request_samples_with_user(SAMPLE_USER)
+    }
+
+    /// The macro pairs a name with an expression and cannot check that the
+    /// expression builds that variant, so a sample written under the wrong
+    /// name would silently test one variant twice and none of the other.
     #[test]
-    fn request_user_extracts_the_user_from_every_user_bearing_variant() {
-        use irlume_common::SecretBytes;
-        let u = || "carol".to_string();
-        let secret = || SecretBytes::new(b"pw".to_vec());
-        let carrying: Vec<Request> = vec![
-            Request::Authenticate {
-                user: u(),
-                service: Some("sudo".into()),
-            },
-            Request::Enroll {
-                user: u(),
-                profile: None,
-                scans: None,
-                reset: false,
-            },
-            Request::ListProfiles {
-                user: u(),
-                structured_errors: false,
-            },
-            Request::DeleteProfile {
-                user: u(),
-                profile: "p".into(),
-            },
-            Request::DeleteScan {
-                user: u(),
-                profile: "p".into(),
-                scan: "s".into(),
-            },
-            Request::RenameProfile {
-                user: u(),
-                profile: "p".into(),
-                new_name: "q".into(),
-            },
-            Request::RenameScan {
-                user: u(),
-                profile: "p".into(),
-                scan: "s".into(),
-                new_name: "t".into(),
-            },
-            Request::AddScan {
-                user: u(),
-                profile: "p".into(),
-                scans: None,
-                report_enrollment: false,
-            },
-            Request::SetRequireEyesOpen {
-                user: u(),
-                on: true,
-            },
-            Request::SetRequireChallenge {
-                user: u(),
-                on: false,
-            },
-            Request::SealPassword {
-                kind: None,
-                user: u(),
-                password: secret(),
-            },
-            Request::UnsealPassword {
-                user: u(),
-                service: None,
-            },
-            Request::UnsealKeyring {
-                user: u(),
-                service: None,
-                have_password: false,
-            },
-            Request::HasSealedPassword { user: u() },
-            Request::KeyringInfo { user: u() },
-            Request::ForgetPassword { user: u() },
-            Request::ResealPassword {
-                user: u(),
-                password: secret(),
-            },
-            Request::RecoveryStatus { user: u() },
-            Request::RecoverySetup {
-                user: u(),
-                passphrase: secret(),
-            },
-            Request::RecoveryRestore {
-                user: u(),
-                passphrase: secret(),
-            },
-            Request::RecoveryForget { user: u() },
-            Request::PositionSample { user: Some(u()) },
-        ];
-        for req in &carrying {
+    fn each_sample_is_the_variant_it_was_catalogued_under() {
+        for (name, req) in named_samples(SAMPLE_USER) {
             assert_eq!(
-                request_user(req),
-                Some("carol"),
-                "variant must expose its user for the traversal guard: {req:?}"
+                variant_name(&req),
+                name,
+                "the sample catalogued as {name} builds a different variant"
             );
         }
-        // Variants with no user field must not invent one.
-        let userless: Vec<Request> = vec![
-            Request::Ping,
-            Request::Health,
-            Request::Identify,
-            Request::SetCameras {
-                rgb: "/dev/video0".into(),
-                ir: "/dev/video2".into(),
+    }
+
+    /// Two invariants the table must hold for every variant, which the type
+    /// system cannot state: a privilege that names a target needs a target,
+    /// and a mutation needs an account whose summary it can drop.
+    #[test]
+    fn sampled_postures_are_internally_consistent() {
+        for req in &request_samples() {
+            let posture = posture(req);
+            // A "root or the target account" declaration with no account names
+            // nothing to check against, and the pregate fails it closed rather
+            // than serving it.
+            if let Privilege::RootOrTarget { .. } = posture.privilege {
+                assert!(
+                    posture.user.is_some(),
+                    "{} demands root-or-target but names no account",
+                    variant_name(req)
+                );
+            }
+            // A mutation with no account has no summary to invalidate, so the
+            // status path would keep serving one that no longer matches disk.
+            if posture.enrollment == EnrollmentEffect::Mutates {
+                assert!(
+                    posture.user.is_some(),
+                    "{} mutates an enrollment but names no account",
+                    variant_name(req)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posture_exposes_the_user_of_every_user_bearing_variant() {
+        for req in request_samples() {
+            // The expectation comes from the request itself, not a second
+            // list: every sample is built with SAMPLE_USER in its `user` field
+            // and that string appears in no other field, so a variant whose
+            // Debug shows it MUST hand it to the traversal guard. The pair of
+            // lists this replaces omitted ReleaseTokenForDisarm from both
+            // halves at once, which is how the gap in #344 survived a test
+            // written to catch exactly it.
+            let carries_it = format!("{req:?}").contains(SAMPLE_USER);
+            assert_eq!(
+                posture(&req).user,
+                carries_it.then_some(SAMPLE_USER),
+                "{} exposes the wrong user to the traversal guard",
+                variant_name(&req)
+            );
+        }
+    }
+
+    #[test]
+    fn pregate_screens_the_username_of_every_user_bearing_variant() {
+        // Root, so authorization can never be what refuses: whatever comes
+        // back is the traversal screen or nothing at all.
+        let root = peer(0);
+        for req in request_samples_with_user("../root") {
+            let names_an_account = posture(&req).user.is_some();
+            match pregate(&req, &root) {
+                Some(Response::Error(msg)) if names_an_account => {
+                    assert_eq!(msg, "invalid username", "{}", variant_name(&req))
+                }
+                None if !names_an_account => {}
+                other => panic!(
+                    "{} must meet the traversal screen, got {other:?}",
+                    variant_name(&req)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn pregate_enforces_the_privilege_every_variant_declares() {
+        // NOBODY owns no account, so it is neither root nor SAMPLE_USER.
+        let stranger = peer(NOBODY);
+        for req in request_samples() {
+            let refused = pregate(&req, &stranger);
+            match posture(&req).privilege {
+                Privilege::AnyPeer => assert!(
+                    refused.is_none(),
+                    "{} declares AnyPeer but the gate refused it: {refused:?}",
+                    variant_name(&req)
+                ),
+                Privilege::RootOrTarget { verb } => match refused {
+                    Some(Response::Error(msg)) => assert_eq!(
+                        msg,
+                        format!("not authorized to {verb} '{SAMPLE_USER}'"),
+                        "{} refused a foreign peer with the wrong wording",
+                        variant_name(&req)
+                    ),
+                    other => panic!(
+                        "{} must refuse a foreign peer, got {other:?}",
+                        variant_name(&req)
+                    ),
+                },
+                Privilege::RootOnly { command } => match refused {
+                    Some(Response::Error(msg)) => assert_eq!(
+                        msg,
+                        format!("{command} requires root (peer uid {NOBODY})"),
+                        "{} refused a non-root peer with the wrong wording",
+                        variant_name(&req)
+                    ),
+                    other => panic!(
+                        "{} must refuse a non-root peer, got {other:?}",
+                        variant_name(&req)
+                    ),
+                },
+            }
+        }
+    }
+
+    /// The refusal has to name the thing the operator typed, not the wire
+    /// variant: someone reading `camera-tune requires root` out of a journal
+    /// can act on it. The test above derives its expectation from the table,
+    /// so it cannot see the wording drift; these three are spelled out because
+    /// no other test pins them.
+    #[test]
+    fn root_only_refusals_name_the_command_an_operator_would_recognize() {
+        let stranger = peer(NOBODY);
+        for (req, command) in [
+            (Request::TuneCaptureMode { rounds: None }, "camera-tune"),
+            (
+                Request::CaptureEarMedian {
+                    user: SAMPLE_USER.into(),
+                },
+                "capture_ear_median",
+            ),
+            (
+                Request::SelfTest {
+                    kind: irlume_common::SelfTestKind::Liveness,
+                },
+                "self_test",
+            ),
+        ] {
+            match pregate(&req, &stranger) {
+                Some(Response::Error(msg)) => {
+                    assert_eq!(msg, format!("{command} requires root (peer uid {NOBODY})"))
+                }
+                other => panic!("{command} must be root-only, got {other:?}"),
+            }
+        }
+    }
+
+    /// `ListProfiles` is the one request that can ask for a typed error, and
+    /// the refusal has to honour that: an older client cannot deserialize a
+    /// response variant it does not know (#93).
+    #[test]
+    fn a_listing_refusal_is_typed_only_when_the_client_asked() {
+        let stranger = peer(NOBODY);
+        let typed = pregate(
+            &Request::ListProfiles {
+                user: SAMPLE_USER.into(),
+                structured_errors: true,
             },
-            Request::SetupIrEmitter { dry_run: true },
-            Request::SelfTest {
-                kind: irlume_common::SelfTestKind::Liveness,
+            &stranger,
+        );
+        assert!(
+            matches!(
+                typed,
+                Some(Response::OperationError {
+                    code: irlume_common::OperationErrorCode::NotAuthorized,
+                    retryable: false,
+                })
+            ),
+            "a client that opted in gets the code, got {typed:?}"
+        );
+        let prose = pregate(
+            &Request::ListProfiles {
+                user: SAMPLE_USER.into(),
+                structured_errors: false,
             },
-            Request::PositionSample { user: None },
-        ];
-        for req in &userless {
-            assert_eq!(request_user(req), None, "no user in {req:?}");
+            &stranger,
+        );
+        match prose {
+            Some(Response::Error(msg)) => {
+                assert_eq!(msg, format!("not authorized to list '{SAMPLE_USER}'"))
+            }
+            other => panic!("a client that did not opt in gets prose, got {other:?}"),
         }
     }
 
@@ -4379,7 +4777,11 @@ mod tests {
     fn peer_cred_reports_our_own_identity_on_a_socketpair() {
         let (a, _b) = UnixStream::pair().unwrap();
         let peer = peer_cred(&a).unwrap();
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         assert_eq!(peer.uid, unsafe { libc::geteuid() });
+        // SAFETY: takes no arguments, reads only this process's own
+        // credentials, and is specified as always succeeding.
         assert_eq!(peer.gid, unsafe { libc::getegid() });
         assert_eq!(peer.pid, std::process::id() as i32);
     }
@@ -4439,6 +4841,27 @@ mod tests {
         }
     }
 
+    /// The startup path answers a keyring release before the engine exists,
+    /// and it screens the username exactly like the worker path does. The
+    /// envelope path is built by interpolating the name, so one that walks out
+    /// of the keyring directory has to be refused here too. Root, so the
+    /// root-only check cannot be what refuses (#349).
+    #[test]
+    fn startup_unseal_keyring_rejects_a_traversing_username() {
+        let resp = dispatch_before_engine(
+            Request::UnsealKeyring {
+                user: "../template-keys/alice".into(),
+                service: Some("login".into()),
+                have_password: false,
+            },
+            &peer(0),
+        );
+        match resp {
+            Response::Error(msg) => assert_eq!(msg, "invalid username"),
+            other => panic!("a traversing username must be refused at startup, got {other:?}"),
+        }
+    }
+
     /// A Status request the connection thread CANNOT answer from memory must
     /// reach the worker, not be answered with an error.
     ///
@@ -4451,6 +4874,7 @@ mod tests {
     #[test]
     fn an_unpublished_listing_reaches_the_worker_instead_of_erroring() {
         let _summary_guard = enrollment_summary_test_lock();
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         invalidate_enrollment_summary(&me);
 
@@ -4587,6 +5011,8 @@ mod tests {
                 // Own-uid query: authorized, answered from files, no engine.
                 format!(
                     "{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n",
+                    // SAFETY: getuid takes no arguments, reads only this process's own real
+                    // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
                 ),
                 Box::new(|r: &Response| matches!(r, Response::HasPassword(_))),
@@ -4653,8 +5079,10 @@ mod tests {
     #[test]
     fn a_listing_serves_the_published_summary_and_misses_queue_to_the_worker() {
         let _summary_guard = enrollment_summary_test_lock();
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
         let peer = Peer {
+            #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
             uid: unsafe { libc::getuid() },
             gid: 0,
             pid: 1,
@@ -4713,65 +5141,91 @@ mod tests {
 
     #[test]
     fn every_enrollment_mutation_is_on_the_invalidation_list() {
-        let u = || "carol".to_string();
-        let mutating: Vec<Request> = vec![
-            Request::Enroll {
-                user: u(),
-                profile: None,
-                scans: None,
-                reset: false,
-            },
-            Request::AddScan {
-                user: u(),
-                profile: "p".into(),
-                scans: None,
-                report_enrollment: false,
-            },
-            Request::DeleteProfile {
-                user: u(),
-                profile: "p".into(),
-            },
-            Request::DeleteScan {
-                user: u(),
-                profile: "p".into(),
-                scan: "s".into(),
-            },
-            Request::RenameProfile {
-                user: u(),
-                profile: "a".into(),
-                new_name: "b".into(),
-            },
-            Request::RenameScan {
-                user: u(),
-                profile: "p".into(),
-                scan: "a".into(),
-                new_name: "b".into(),
-            },
-            Request::SetRequireEyesOpen {
-                user: u(),
-                on: true,
-            },
-            Request::SetRequireChallenge {
-                user: u(),
-                on: true,
-            },
+        // Named one by one, not derived from the table: the table is what
+        // this checks, so a variant quietly downgraded to `Reads` has to fail
+        // here rather than agree with itself. Recovery is on the list because
+        // it changes the key material the enrollment is sealed under.
+        let mutates = [
+            "Enroll",
+            "AddScan",
+            "DeleteProfile",
+            "DeleteScan",
+            "ForgetRecognizer",
+            "RenameProfile",
+            "RenameScan",
+            "SetRequireEyesOpen",
+            "SetRequireChallenge",
+            "SetClosureCalibration",
+            "RecoverySetup",
+            "RecoveryRestore",
+            "RecoveryForget",
         ];
-        for req in &mutating {
-            assert_eq!(
-                enrollment_mutating_user(req),
-                Some("carol"),
-                "a mutation missing from the invalidation list serves stale \
-                 summaries forever: {req:?}"
-            );
+        for req in request_samples() {
+            let name = variant_name(&req);
+            if mutates.contains(&name) {
+                assert_eq!(
+                    enrollment_mutating_user(&req),
+                    Some(SAMPLE_USER),
+                    "a mutation missing from the invalidation list serves stale \
+                     summaries forever: {name}"
+                );
+            } else {
+                // Reads must NOT invalidate: an Authenticate loads the
+                // enrollment but changes nothing the summary reports.
+                assert_eq!(
+                    enrollment_mutating_user(&req),
+                    None,
+                    "{name} is not a mutation and must not drop the summary"
+                );
+            }
         }
-        // Reads must NOT invalidate: an Authenticate loads the enrollment
-        // but changes nothing the summary reports.
-        assert!(enrollment_mutating_user(&Request::Authenticate {
-            user: u(),
-            service: None,
-        })
-        .is_none());
-        assert!(enrollment_mutating_user(&Request::Ping).is_none());
+    }
+
+    /// The cache is state, so a request that is about to be refused may not
+    /// change it. Invalidating first let any local peer evict another
+    /// account's summary with a mutation it is not allowed to perform, and
+    /// charge that account's next listing a storage load and its TPM work
+    /// (#349). The authorized mutation must still invalidate before it runs.
+    #[test]
+    fn only_an_authorized_mutation_drops_the_cached_summary() {
+        let _g = enrollment_summary_test_lock();
+        let mut e = engine();
+        let sb = sandbox("refused-mutation");
+        let _ = &sb;
+        let delete = || Request::DeleteProfile {
+            user: SAMPLE_USER.into(),
+            profile: "p".into(),
+        };
+        publish_enrollment_summary(
+            SAMPLE_USER,
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                require_eyes_open: true,
+                require_challenge: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: false,
+            },
+        );
+        match dispatch(delete(), &peer(NOBODY), &mut e) {
+            Response::Error(msg) => assert_eq!(
+                msg,
+                format!("not authorized to modify '{SAMPLE_USER}'"),
+                "the refusal itself must not change"
+            ),
+            other => panic!("a foreign peer must be refused, got {other:?}"),
+        }
+        assert!(
+            cached_enrollment_summary(SAMPLE_USER).is_some(),
+            "a refused mutation must leave the summary cached"
+        );
+        // Root may act for any account. The sandbox holds no enrollment, so
+        // the deletion itself fails; the invalidation has already happened by
+        // then, which is the ordering this asserts.
+        let _ = dispatch(delete(), &peer(0), &mut e);
+        assert!(
+            cached_enrollment_summary(SAMPLE_USER).is_none(),
+            "an authorized mutation must drop the summary before it runs"
+        );
     }
 
     #[test]
@@ -5638,6 +6092,13 @@ mod tests {
             Request::UnsealPassword {
                 user: "-flag".into(),
                 service: None,
+            },
+            // #344: this one reached irlume_core::keyring with an unscreened
+            // username, because the guard read a hand-maintained list that
+            // omitted it. It now reads the posture table like every other arm.
+            Request::ReleaseTokenForDisarm {
+                user: "../root".into(),
+                password: irlume_common::SecretBytes::new(b"pw".to_vec()),
             },
         ] {
             match dispatch(req, &peer(0), &mut e) {

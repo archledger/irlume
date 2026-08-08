@@ -70,6 +70,7 @@ fn derive_key(
 }
 
 /// Wrap `template_key` under a fresh Argon2id-derived key from `passphrase`.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> {
     if passphrase.is_empty() {
         return Err(Error::Policy("empty recovery passphrase".into()));
@@ -92,6 +93,7 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
 /// Recover the template key from a recovery envelope and passphrase. Returns a
 /// generic error on a wrong passphrase (AES-GCM tag mismatch), indistinguishable
 /// from tampering, by design.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     if env.kdf != "argon2id" {
         return Err(Error::Policy(format!(

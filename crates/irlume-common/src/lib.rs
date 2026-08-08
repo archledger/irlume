@@ -163,6 +163,7 @@ impl HashedModel {
 /// `/var/lib/irlume` makes `login-transactions` findable, and does nothing for
 /// `irlume` itself, whose entry is in `/var/lib`. A record fsynced into a
 /// directory whose name did not survive is not a record.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn fsync_ancestors(dir: &std::path::Path) -> std::result::Result<(), String> {
     for parent in ancestor_chain(dir) {
         fsync_dir(&parent)?;
@@ -202,6 +203,7 @@ pub fn ancestor_chain(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// `fsync(2)` is explicit that syncing a file does not necessarily persist the
 /// directory entry naming it; the directory has to be synced too. Opening a
 /// directory read-only and syncing that descriptor is the way to do it.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn fsync_dir(dir: &std::path::Path) -> std::result::Result<(), String> {
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
@@ -209,6 +211,7 @@ pub fn fsync_dir(dir: &std::path::Path) -> std::result::Result<(), String> {
 }
 
 /// Set `path`'s permission bits, naming the path when it fails.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn restrict(path: &std::path::Path, mode: u32) -> std::result::Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -222,6 +225,7 @@ pub fn restrict(path: &std::path::Path, mode: u32) -> std::result::Result<(), St
 /// cache when the machine loses power brings the record back, and a record that
 /// comes back is acted on again. Already-gone is success, because the caller's
 /// postcondition is that nothing is there.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn remove_durable(path: &std::path::Path) -> std::result::Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -239,6 +243,7 @@ pub fn remove_durable(path: &std::path::Path) -> std::result::Result<(), String>
 /// mode, open keeps its permissions, so the mode is re-asserted after the
 /// write. `sync_all` makes the bytes durable before any caller renames the
 /// file over a live one. Non-unix builds fall back to a plain write.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -269,6 +274,7 @@ pub fn write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// greeter unseal) sees either the whole old file or the whole new one, never a
 /// torn write. Temp and target must share a directory so the rename stays within
 /// one filesystem (where rename is atomic).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomic_mode(path, bytes, 0o600)
 }
@@ -287,6 +293,7 @@ pub fn write_0600_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 /// WIDEN permissions on machines already running. The 0600 callers are
 /// unaffected: a umask can only remove bits, and every ordinary umask removes
 /// none of those.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     match write_atomic_reporting(path, bytes, mode)? {
         AtomicWrite::Durable => Ok(()),
@@ -319,6 +326,7 @@ pub enum AtomicWrite {
 
 /// [`write_atomic_mode`], reporting whether the content became visible when the
 /// durability step failed. `Err` means nothing was published.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn write_atomic_reporting(
     path: &std::path::Path,
     bytes: &[u8],

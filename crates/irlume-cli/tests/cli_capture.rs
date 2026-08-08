@@ -131,6 +131,7 @@ fn run_timeboxed(what: &str, cmd: &mut Command) -> (i32, String, String) {
             }
             if !done.load(Ordering::SeqCst) {
                 timed_out.store(true, Ordering::SeqCst);
+                #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }

@@ -2470,8 +2470,10 @@ impl App {
                 // fn-item-to-integer cast trips clippy::fn_to_numeric_cast_any.
                 let handler =
                     noop_sigint as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+                #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
                 let old_int = unsafe { libc::signal(libc::SIGINT, handler) };
                 self.run_suspended(s);
+                #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
                 unsafe {
                     libc::signal(libc::SIGINT, old_int);
                 }
@@ -2593,9 +2595,13 @@ impl App {
                 Ok(())
             });
         }
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let old_int = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
         let status = cmd.status();
-        unsafe { libc::signal(libc::SIGINT, old_int) };
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        unsafe {
+            libc::signal(libc::SIGINT, old_int)
+        };
         match status {
             Ok(st) if st.success() => self.log('✓', format!("{what}: done")),
             Ok(st) => {

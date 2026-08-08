@@ -25,3 +25,6 @@ rand.workspace = true   # session and operation identifiers for the machine even
 image = { workspace = true }
 rpassword = "7"   # no-echo password prompt for `keyring arm`
 ratatui = "0.30"  # TUI (MIT), bundles crossterm; powers `irlume tui`
+
+[lints]
+workspace = true

@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 irlume-common.workspace = true
 libc.workspace = true
+
+[lints]
+workspace = true

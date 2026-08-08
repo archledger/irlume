@@ -115,6 +115,7 @@ fn read_regular_file_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
 /// creates one on first login. Absent salt means this user has no KDE wallet
 /// yet, and inventing one here would derive a key that opens nothing while
 /// looking like a successful arm.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn read_salt(home: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let path = salt_path(home);
     let raw = read_regular_file_capped(&path, MAX_SALT_BYTES).map_err(|e| {
@@ -142,6 +143,7 @@ pub fn read_salt(home: &Path) -> Result<Zeroizing<Vec<u8>>> {
 /// PBKDF2-HMAC-SHA512, [`ITERATIONS`] rounds, [`KEY_LEN`] output. This is
 /// `kwallet_hash()` in `pam_kwallet.c`, which calls `gcry_kdf_derive` with
 /// `GCRY_KDF_PBKDF2` and `GCRY_MD_SHA512`.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn derive_key(secret: &[u8], salt: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if salt.len() != SALT_LEN {
         return Err(Error::Protocol(format!(
@@ -155,6 +157,7 @@ pub fn derive_key(secret: &[u8], salt: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Derive `home`'s wallet key from the login password.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn derive_for_home(password: &[u8], home: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let salt = read_salt(home)?;
     derive_key(password, &salt)
@@ -203,6 +206,8 @@ mod tests {
         let path = dir.join("kdewallet.salt");
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(
+            // SAFETY: `c` is a live CString that outlives this call, so the pointer is
+            // a valid NUL-terminated path for the duration of mkfifo.
             unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
             0,
             "mkfifo failed"

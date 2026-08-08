@@ -76,6 +76,12 @@ impl Affine2 {
 /// Each correspondence gives two linear rows in the unknowns θ = `[a, b, tx, ty]`;
 /// we solve the 4x4 normal equations directly (no SVD needed for a non-reflective
 /// similarity; equivalent to the Umeyama/`skimage.SimilarityTransform` result).
+///
+/// # Panics
+///
+/// Panics if `src` and `dst` have different lengths. Each source point must be
+/// paired with exactly one destination point for the correspondence rows to be
+/// well formed.
 pub fn estimate_similarity(src: &[(f32, f32)], dst: &[(f32, f32)]) -> Option<Affine2> {
     assert_eq!(src.len(), dst.len());
     let mut n = [[0.0f64; 4]; 4]; // AᵀA
@@ -187,6 +193,7 @@ impl RgbView<'_> {
 /// Align `frame` to the ArcFace template using `src` landmarks; return a
 /// 112x112x3 interleaved chip in **RGB** order (u8). Deterministic for fixed
 /// inputs (the property the Phase-1 identity gate relies on).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn align_to_arcface(frame: &RgbView, src: &Landmarks5) -> irlume_common::Result<Vec<u8>> {
     // A NaN landmark slides through the least-squares fit as a NaN transform
     // that the pivoted solve does not always reject, and the sampler then

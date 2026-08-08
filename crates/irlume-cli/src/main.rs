@@ -72,6 +72,7 @@ fn main() -> std::process::ExitCode {
     // `| less` then quit, `| grep -q`) into a "failed printing to stdout: Broken
     // pipe" panic + exit 101. Restore the Unix default so we exit quietly like any
     // other CLI when a downstream reader goes away.
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -1611,6 +1612,8 @@ pub(crate) fn user_arg(args: &[String]) -> String {
             // always means their own profile: prefer the invoking user.
             std::env::var("SUDO_USER")
                 .ok()
+                // SAFETY: geteuid takes no arguments, reads only this process's own
+                // effective uid, and is specified as always succeeding.
                 .filter(|s| !s.is_empty() && unsafe { libc::geteuid() } == 0)
                 .or_else(|| std::env::var("USER").ok())
                 .unwrap_or_else(|| "user".into())
@@ -1703,7 +1706,10 @@ pub(crate) fn camera_pair() -> (String, String) {
 }
 
 pub(crate) fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    unsafe {
+        libc::geteuid() == 0
+    }
 }
 
 /// Build an Engine: optional --rgb/--ir device overrides, and load an IR
@@ -4826,6 +4832,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         if unsafe { libc::geteuid() } == 0 {
             return; // the SUDO_USER preference only applies to root; not this run
         }

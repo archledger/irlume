@@ -120,6 +120,7 @@ pub fn tflite_lib_candidates(
 /// installing the runtime (or fixing the override) works without a daemon
 /// restart of whatever probing surface asked first. dlopen attempts on a
 /// handful of explicit paths are cheap.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn tflite_runtime() -> Result<&'static Library, TfliteUnavailable> {
     static LIB: OnceLock<Library> = OnceLock::new();
     if let Some(lib) = LIB.get() {
@@ -186,6 +187,7 @@ impl TfliteSession {
     /// delegate creator; 2026-08-06 research note): the explicit delegate
     /// pins the thread count and keeps delegation independent of how a
     /// replacement shared library was built.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn from_pinned_bytes(
         bytes: &[u8],
         expected_sha256: &str,
@@ -220,6 +222,7 @@ impl TfliteSession {
     /// Int64 tensor would silently write half of each element and read
     /// garbage as numbers (#296 review). A model with a different contract
     /// is refused by name, not reinterpreted.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn input_shape(&self) -> irlume_common::Result<Vec<usize>> {
         let inputs = self.interp.inputs().map_err(err)?;
         if inputs.len() != 1 {
@@ -241,6 +244,7 @@ impl TfliteSession {
     /// Run one f32 input tensor through the model and return every output
     /// as `(shape, data)`. The input length must match the input shape's
     /// element count; refusing here beats a silent partial write.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn run_f32(&mut self, input: &[f32]) -> irlume_common::Result<Vec<(Vec<usize>, Vec<f32>)>> {
         // input_shape() carries the single-input + Float32 contract checks;
         // running them here too keeps run_f32 safe for a caller that never

@@ -3511,6 +3511,94 @@ fn report_credential_release(
     }
 }
 
+/// What `doctor` observed about the active camera pair's capture mode. Kept as
+/// a value so the wording is decided by a pure function and tested, separately
+/// from the root check and config reads that produce it.
+enum CaptureModeReport {
+    /// The verdict lives in root-only `cameras.conf` and this run cannot read it.
+    RootRequired,
+    /// No pair is persisted, so there is nothing to look a verdict up by; irlume
+    /// auto-selects a pair at capture and the mode follows from that.
+    NoPinnedPair,
+    /// A verdict was measured for this pair and stored.
+    Measured(irlume_camera::CaptureMode),
+    /// The pair is pinned but no verdict was ever measured for it.
+    Unmeasured,
+}
+
+/// The `doctor` line and machine state for a capture-mode observation.
+///
+/// Pure, so the wording of each case is tested without a camera or a config
+/// file. Every case is `Info` or `Unknown`, never `Warn`/`Fail`: a capture mode
+/// is a strategy, not a fault, and even the slower sequential mode is a correct
+/// choice for a camera that dims under concurrent capture. The point of
+/// reporting it at all is that the adaptation is otherwise silent (#100): a
+/// camera quietly parked in sequential mode forever teaches nobody that it has
+/// that fault, and a bug in irlume's own capture path would then look like
+/// normal behaviour.
+fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report::State, String) {
+    use crate::doctor_report::State;
+    use irlume_camera::CaptureMode;
+    match report {
+        CaptureModeReport::RootRequired => (
+            State::Unknown,
+            "root-only setting (reads /etc/irlume/cameras.conf); re-run `sudo irlume doctor` \
+             to read it"
+                .to_string(),
+        ),
+        CaptureModeReport::NoPinnedPair => (
+            State::Info,
+            "no pinned camera pair; irlume auto-selects one at capture and the mode follows it"
+                .to_string(),
+        ),
+        CaptureModeReport::Measured(CaptureMode::Sequential) => (
+            State::Info,
+            "sequential, measured for this camera pair (RGB then IR, one after the other: \
+             about 700ms slower, and the reliable choice on a camera that dims when both \
+             sensors stream at once)"
+                .to_string(),
+        ),
+        CaptureModeReport::Measured(CaptureMode::Concurrent) => (
+            State::Info,
+            "concurrent, measured for this camera pair (RGB and IR captured together, the \
+             faster path)"
+                .to_string(),
+        ),
+        CaptureModeReport::Unmeasured => (
+            State::Info,
+            "not measured for this camera pair; using the safe sequential default. \
+             Run `sudo irlume camera-tune` to measure whether this camera can capture RGB \
+             and IR concurrently"
+                .to_string(),
+        ),
+    }
+}
+
+/// Doctor's capture-mode block: which capture strategy the active camera pair
+/// uses, and whether that was measured or is the unmeasured default.
+///
+/// Reads the pinned pair without opening the camera ([`irlume_camera::configured_pair_no_probe`]),
+/// then the stored verdict; both live in root-only `cameras.conf`, so an
+/// unprivileged run reports `Unknown` and says to re-run under sudo, the same
+/// shape as the credential-release block. The wording of every case is
+/// [`capture_mode_report_line`], which is where the tests are.
+fn report_capture_mode(report: &mut crate::doctor_report::Report) {
+    let observed = if !is_root() {
+        CaptureModeReport::RootRequired
+    } else {
+        match irlume_camera::configured_pair_no_probe() {
+            None => CaptureModeReport::NoPinnedPair,
+            Some((rgb, ir)) => match irlume_camera::stored_capture_mode(&rgb, &ir) {
+                Some(mode) => CaptureModeReport::Measured(mode),
+                None => CaptureModeReport::Unmeasured,
+            },
+        }
+    };
+    let (state, detail) = capture_mode_report_line(&observed);
+    report.check_detail("capture-mode", state, detail.clone());
+    dout!(report, "[doctor] capture mode: {detail}");
+}
+
 /// Preflight diagnostics ("preparing"): discover + classify cameras, flag the
 /// privacy switch, and confirm models + ONNX Runtime are present.
 /// Certify that the polkit agent helper (polkit 126+ socket-activated,
@@ -3757,6 +3845,10 @@ fn doctor_run(
             report.check_detail("emitter-undo-pending", State::Unknown, why);
         }
     }
+    // Which capture strategy this camera pair runs, and whether it was measured
+    // or is the unmeasured default (#100): silent adaptation hides regressions,
+    // so name it.
+    report_capture_mode(report);
     report.check(
         "signed-pcr-policy",
         if irlume_core::pcrsig::signed_policy_available() {
@@ -4793,6 +4885,59 @@ mod tests {
 
         // And the degenerate case: no readings cannot report false confidence.
         assert_eq!(rounds_that_would_register(&[], &[], &cal), (0, 0));
+    }
+
+    /// Every capture-mode case reports a fact, never a fault: a mode is a
+    /// strategy, so the state is Info (or Unknown when a non-root run cannot read
+    /// the root-only verdict), never Warn or Fail. Each line must name the mode
+    /// or the reason it is not known, because a support report is where this is
+    /// read, and it points an unmeasured pair at `camera-tune`, the command that
+    /// measures it (#100).
+    #[test]
+    fn capture_mode_report_names_the_mode_and_never_warns() {
+        use crate::doctor_report::State;
+        use irlume_camera::CaptureMode;
+
+        let (state, line) = capture_mode_report_line(&CaptureModeReport::RootRequired);
+        assert!(matches!(state, State::Unknown), "a can't-read is Unknown");
+        assert!(line.contains("sudo"), "and tells the user how to read it");
+
+        for (obs, want) in [
+            (
+                CaptureModeReport::Measured(CaptureMode::Sequential),
+                "sequential",
+            ),
+            (
+                CaptureModeReport::Measured(CaptureMode::Concurrent),
+                "concurrent",
+            ),
+        ] {
+            let (state, line) = capture_mode_report_line(&obs);
+            assert!(
+                matches!(state, State::Info),
+                "a measured mode is a fact, not a fault"
+            );
+            assert!(line.contains(want), "the line names the mode ({want})");
+            assert!(line.contains("measured"), "and that it was measured");
+        }
+
+        let (state, line) = capture_mode_report_line(&CaptureModeReport::Unmeasured);
+        assert!(matches!(state, State::Info));
+        assert!(
+            line.contains("default"),
+            "an unmeasured pair is on the default"
+        );
+        assert!(
+            line.contains("camera-tune"),
+            "and is pointed at the command that measures it"
+        );
+
+        let (state, line) = capture_mode_report_line(&CaptureModeReport::NoPinnedPair);
+        assert!(matches!(state, State::Info));
+        assert!(
+            line.contains("auto-select"),
+            "no pin means auto-selection at capture"
+        );
     }
 
     /// The on/off word is positional. Scanning argv for it meant a flag value

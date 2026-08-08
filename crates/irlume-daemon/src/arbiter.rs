@@ -67,6 +67,17 @@ pub enum Class {
 /// release that a successful authentication leads to, and delaying them behind a
 /// preview would leave a user logged in with a locked keyring, so they share the
 /// priority rather than competing with it.
+///
+/// Exhaustive with NO wildcard arm on purpose (#351). This is the same shape
+/// the posture table took for #344, and it is kept separate from that table so
+/// neither has to answer both "who may do this" and "what does this cost the
+/// camera". The wildcard this replaced classified seventeen variants as
+/// `Plain` without anyone deciding that, and a variant added tomorrow would
+/// have joined them silently: a camera-touching one would not have been refused
+/// while an authentication was pending nor charged the per-uid camera slot, so
+/// it could hold the worker while a lock screen waited. That is availability on
+/// the login path, and no test could have seen it, because both tests over this
+/// function are hand-picked sample lists, not enumerations.
 pub fn classify(req: &Request) -> Class {
     use Request::*;
     match req {
@@ -92,7 +103,58 @@ pub fn classify(req: &Request) -> Class {
         // Enumeration OPENS every node, so it belongs to the camera class
         // even though it captures nothing (#187).
         | ListCameras => Class::Camera,
-        _ => Class::Plain,
+
+        // ---- Plain from here down. Everything below reaches the worker and
+        // nothing below opens a camera node; that was checked arm by arm when
+        // this table replaced the wildcard, not assumed from the name.
+
+        // Storage and settings writes. No camera and no TPM, but they mutate
+        // shared state, so they stay on the worker where mutations serialize
+        // against captures and against each other.
+        //
+        // SetCameras is the surprising member: it is named for the camera and
+        // still opens nothing. It assigns two device strings and reads sysfs
+        // identity plus a path existence check, which is why it is a write and
+        // not a capture.
+        SetCameras { .. }
+        | DeleteProfile { .. }
+        | DeleteScan { .. }
+        | ForgetRecognizer { .. }
+        | RenameProfile { .. }
+        | RenameScan { .. }
+        | SetRequireEyesOpen { .. }
+        | SetRequireChallenge { .. }
+        // Stores the numbers CaptureEarMedian already captured; the capture
+        // was the camera work, and it is classified Camera above.
+        | SetClosureCalibration { .. } => Class::Plain,
+
+        // TPM work. These are Plain rather than Status for the reason
+        // `Class::Status` gives: the TPM executes one command at a time, so
+        // anything that issues one serves from the worker with the other TPM
+        // users instead of racing them from a connection thread.
+        SealPassword { .. }
+        | KeyringInfo { .. }
+        | ForgetPassword { .. }
+        | ReleaseTokenForDisarm { .. }
+        | RecoverySetup { .. }
+        | RecoveryRestore { .. }
+        | RecoveryForget { .. } => Class::Plain,
+
+        // ResealPassword is the one row here that had a decision hiding in it,
+        // and the wildcard is why nobody had to write the decision down.
+        //
+        // It is fired from the login SESSION phase, after authentication has
+        // already succeeded, so an argument exists for giving it Auth priority:
+        // as Plain it queues behind camera work that is already in flight, and
+        // a session open can wait on an enrollment.
+        //
+        // It stays Plain anyway. Auth is not merely a priority, it is a
+        // cancellation: submitting one asks the running capture loop to stop
+        // and marks an authentication in flight, which refuses other camera
+        // work. Opportunistic self-healing must not cancel a user's enrollment,
+        // and the re-seal is exactly that: if it loses the race it is retried
+        // on the next password login rather than lost.
+        ResealPassword { .. } => Class::Plain,
     }
 }
 
@@ -479,6 +541,36 @@ mod tests {
                 kind: None,
                 user: "u".into(),
                 password: SecretBytes::new(vec![1u8]),
+            }),
+            Class::Plain
+        );
+    }
+
+    /// The two rows whose class is a judgement rather than an observation.
+    ///
+    /// Exhaustiveness is the compiler's job now (#351), so this does not
+    /// re-list the enum. It pins the two answers that a reader could
+    /// reasonably expect to be the other way, so that changing either is a
+    /// deliberate act with a failing test attached rather than a quiet edit.
+    #[test]
+    fn the_two_judged_classifications_stay_where_they_were_argued() {
+        // Named for the camera, opens nothing: two string assignments, a sysfs
+        // identity read and a path existence check.
+        assert_eq!(
+            classify(&Request::SetCameras {
+                rgb: "/dev/video0".into(),
+                ir: "/dev/video2".into(),
+            }),
+            Class::Plain
+        );
+        // Fired from the login session phase, so Auth priority is arguable.
+        // Auth also CANCELS the running capture loop, and opportunistic
+        // self-healing must not cancel a user's enrollment: a lost race is
+        // retried on the next password login.
+        assert_eq!(
+            classify(&Request::ResealPassword {
+                user: "u".into(),
+                password: irlume_common::SecretBytes::new(vec![1u8]),
             }),
             Class::Plain
         );

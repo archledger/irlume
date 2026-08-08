@@ -10,9 +10,9 @@
 #
 # Deliberately NOT a required check, and deliberately not on the fast path: it
 # needs a nightly toolchain (`-Zsanitizer` is unstable), so an unrelated nightly
-# regression must not be able to block a pull request. It runs on pull requests
-# that touch the code, on main, and weekly, so a break is visible without being
-# in the way.
+# regression must not be able to block a pull request. It runs on pushes that
+# touch the code, on main, and weekly, so a break is visible without being in
+# the way.
 #
 # Two known interactions, both handled rather than papered over:
 #   * the sanitizer runtime defines its own `mlock`, so the RLIMIT_MEMLOCK
@@ -22,8 +22,10 @@
 #     the reasoning are in .github/lsan-suppressions.txt.
 name: ASan
 
-# Push-trigger only: this job runs on the self-hosted runner (see ci.yml's
-# security note; a fork PR must never reach it).
+# Push-triggered on every branch, so a same-repo pull request picks this up
+# through its own branch. A fork PR fires no push event here and therefore gets
+# no ASan run, which is acceptable precisely because this is not a required
+# check.
 on:
   push:
     branches: ["**"]
@@ -36,6 +38,26 @@ on:
   schedule:
     - cron: "40 4 * * 3" # Wednesdays 04:40 UTC, clear of the other scheduled jobs
   workflow_dispatch:
+
+# Rapid pushes to a branch should not stack ASan runs; only the newest commit is
+# worth sanitizing, and this job is one of the slowest in the repo. Cancelling is
+# safe because ASan is not a required check, so a superseded run going away
+# cannot block a merge.
+#
+# The schedule gets its OWN group, and that separation is the load-bearing part.
+# A scheduled run fires on the default branch, so keying the group on the ref
+# alone would put the weekly run in `asan-refs/heads/main` alongside ordinary
+# main pushes. A concurrency group holds exactly one PENDING run, and a newly
+# queued run "is canceled and replaced" per GitHub's concurrency documentation.
+# `cancel-in-progress: false` does not save it: that protects the run already
+# executing, not the one waiting behind it. So a main push landing while the
+# weekly run sat pending would have silently deleted the weekly run, which is
+# the opposite of what this block exists to do.
+#
+# Cancelling stays off on main so an in-flight run there still finishes.
+concurrency:
+  group: asan-${{ github.event_name == 'schedule' && 'weekly' || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

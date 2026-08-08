@@ -1189,8 +1189,9 @@ pub(crate) fn finish_token_arm(
     }
 }
 
-/// Read the user's login password without echo, mirroring the arm prompt's
-/// terminal/pipe split.
+/// Read a typed secret without echo, mirroring the arm prompt's terminal/pipe
+/// split. Every no-echo prompt in this binary reads through here: the login
+/// password (`keyring arm`, `reseal`, `setup`) and the recovery passphrase.
 ///
 /// The secret is wrapped in `Zeroizing` at the point it is first held, the same
 /// as the TUI's `Pending::KeyringPw`, so it is wiped from the heap on drop
@@ -4607,6 +4608,17 @@ mod tests {
         fn accepts_only_a_wiping_reader(_: fn(&str) -> Result<zeroize::Zeroizing<String>, String>) {
         }
         accepts_only_a_wiping_reader(read_password);
+    }
+
+    #[test]
+    fn every_login_password_prompt_hands_back_a_wiping_string() {
+        // Same pin, one level up (#348). `read_password` returning `Zeroizing`
+        // bought nothing on the paths most users actually take, because the
+        // setup wizard and `reseal` read through `prompt_login_password`, which
+        // kept its own plain `String`. Pinning the reader alone did not stop
+        // that, so the prompt that wraps it is pinned too.
+        fn accepts_only_a_wiping_prompt(_: fn() -> Option<zeroize::Zeroizing<String>>) {}
+        accepts_only_a_wiping_prompt(commands::prompt_login_password);
     }
 
     #[test]

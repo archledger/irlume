@@ -1420,7 +1420,9 @@ pub fn reseal(args: &[String]) -> ExitCode {
     let req = Request::SealPassword {
         kind: None, // let the daemon judge from what the user has
         user,
-        password: irlume_common::SecretBytes::new(pw.into_bytes()),
+        // Copy the bytes out rather than moving the `String`: `Zeroizing` owns
+        // the buffer and wipes it on drop, and `SecretBytes` wipes the copy.
+        password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
     };
     match daemon_request(&req) {
         Ok(Response::PasswordSealed) => {
@@ -1441,30 +1443,34 @@ pub fn reseal(args: &[String]) -> ExitCode {
 /// Shared no-echo login-password prompt with a confirm step (catches typos that
 /// would silently break wallet unlock). Falls back to a single piped stdin line
 /// for scripts/tests. Returns `None` on mismatch / empty / read error.
-pub(crate) fn prompt_login_password() -> Option<String> {
-    use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
-        let a = rpassword::prompt_password("Login password: ").ok()?;
-        let b = rpassword::prompt_password("Confirm login password: ").ok()?;
-        if a != b {
+///
+/// Reads through [`crate::read_password`], so the password and its confirm copy
+/// are both wiped on drop. Callers must keep the value inside the wrapper: a
+/// `.clone()` or a `to_string()` makes a second copy that nothing wipes.
+pub(crate) fn prompt_login_password() -> Option<zeroize::Zeroizing<String>> {
+    // Sampled once, and used only to decide whether a confirm prompt makes
+    // sense; `read_password` makes the same terminal/pipe split itself.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let pw = crate::read_password("Login password: ")
+        .map_err(|e| eprintln!("{e}"))
+        .ok()?;
+    // Confirm only on a terminal. On a pipe there is nothing to retype: a
+    // second read would consume the NEXT line of the script's stdin and
+    // compare the password against whatever happened to follow it.
+    if interactive {
+        let again = crate::read_password("Confirm login password: ")
+            .map_err(|e| eprintln!("{e}"))
+            .ok()?;
+        if pw != again {
             eprintln!("passwords do not match; aborted (nothing changed).");
             return None;
         }
-        if a.is_empty() {
-            eprintln!("empty password; aborted.");
-            return None;
-        }
-        Some(a)
-    } else {
-        use std::io::BufRead;
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line).ok()?;
-        let pw = line.trim_end_matches(['\n', '\r']).to_string();
-        if pw.is_empty() {
-            return None;
-        }
-        Some(pw)
     }
+    if pw.is_empty() {
+        eprintln!("empty password; aborted.");
+        return None;
+    }
+    Some(pw)
 }
 
 /// `irlume setup`: guided onboarding that ties the existing pieces together:
@@ -1578,7 +1584,10 @@ pub fn setup(args: &[String]) -> ExitCode {
             match daemon_request(&Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
-                password: irlume_common::SecretBytes::new(pw.clone().into_bytes()),
+                // `pw` has to outlive this request for the token branch below,
+                // so the bytes are copied rather than moved. The old `.clone()`
+                // here left a whole second password on the heap unwiped.
+                password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
             }) {
                 Ok(Response::PasswordSealed) => println!("  armed {OK}"),
                 // GNOME token arm: the wizard runs in the user's session, so

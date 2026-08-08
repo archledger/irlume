@@ -91,7 +91,9 @@ fn setup(user: &str) -> ExitCode {
     };
     match daemon_request(&Request::RecoverySetup {
         user: user.into(),
-        passphrase: SecretBytes::new(pass.into_bytes()),
+        // Copy out rather than move: `Zeroizing` owns the buffer and wipes
+        // it on drop, and `SecretBytes` wipes the copy.
+        passphrase: SecretBytes::new(pass.as_bytes().to_vec()),
     }) {
         Ok(Response::Ok(msg)) => {
             println!("[recovery] ✓ {msg}");
@@ -122,7 +124,9 @@ fn restore(user: &str) -> ExitCode {
     };
     match daemon_request(&Request::RecoveryRestore {
         user: user.into(),
-        passphrase: SecretBytes::new(pass.into_bytes()),
+        // Copy out rather than move: `Zeroizing` owns the buffer and wipes
+        // it on drop, and `SecretBytes` wipes the copy.
+        passphrase: SecretBytes::new(pass.as_bytes().to_vec()),
     }) {
         Ok(Response::Ok(msg)) => {
             println!("[recovery] ✓ {msg}");
@@ -168,33 +172,28 @@ fn forget(user: &str) -> ExitCode {
 }
 
 /// No-echo passphrase prompt with confirmation (for `setup`); falls back to a
-/// plain stdin line when piped (scripts / tests).
-fn read_passphrase_confirmed() -> Option<String> {
-    let pass = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        let first = rpassword::prompt_password("Recovery passphrase: ").ok()?;
-        let mut confirm = rpassword::prompt_password("Confirm recovery passphrase: ").ok()?;
-        let matched = first == confirm;
-        // Wipe the extra plaintext copy of the passphrase; the accepted one is
-        // zeroized downstream once wrapped in SecretBytes.
-        use zeroize::Zeroize;
-        confirm.zeroize();
-        if !matched {
+/// plain stdin line when piped (scripts / tests). Reads through
+/// [`crate::read_password`], so both the passphrase and its confirm copy are
+/// wiped on drop.
+fn read_passphrase_confirmed() -> Option<zeroize::Zeroizing<String>> {
+    let pass = crate::read_password("Recovery passphrase: ").ok()?;
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let confirm = crate::read_password("Confirm recovery passphrase: ").ok()?;
+        if pass != confirm {
             eprintln!("[recovery] passphrases do not match; aborted (nothing set).");
             return None;
         }
-        first
-    } else {
-        // No second read to compare against on a pipe, so confirmation is the one
-        // check that cannot apply here. The strength floor below still does, and
-        // it is checked AFTER this branch on purpose: it used to live inside the
-        // terminal arm, which let `irlume recovery setup </dev/null` wrap the
-        // template key under an EMPTY passphrase and report success.
-        read_piped_line()?
-    };
+    }
     // Strength floor: this passphrase is the only barrier on the recovery
     // envelope against an offline attacker with the disk, so reject a trivial
     // one (a `1`). It is a recovery key, not a login PIN; length is the cheap,
     // language-neutral proxy for entropy.
+    //
+    // Checked out here rather than inside the terminal arm on purpose. A pipe
+    // has no second read to compare against, so confirmation is the one check
+    // that cannot apply there; when the floor lived beside it, `irlume recovery
+    // setup </dev/null` wrapped the template key under an EMPTY passphrase and
+    // reported success.
     if pass.chars().count() < MIN_RECOVERY_PASSPHRASE_CHARS {
         let what = if pass.is_empty() {
             "empty passphrase".to_string()
@@ -212,12 +211,8 @@ fn read_passphrase_confirmed() -> Option<String> {
 /// 12 characters is a modest floor that still allows a memorable phrase.
 const MIN_RECOVERY_PASSPHRASE_CHARS: usize = 12;
 
-fn read_passphrase_once(prompt: &str) -> Option<String> {
-    let pass = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        rpassword::prompt_password(prompt).ok()?
-    } else {
-        read_piped_line()?
-    };
+fn read_passphrase_once(prompt: &str) -> Option<zeroize::Zeroizing<String>> {
+    let pass = crate::read_password(prompt).ok()?;
     if pass.is_empty() {
         eprintln!("[recovery] empty passphrase; aborted.");
         return None;
@@ -225,9 +220,22 @@ fn read_passphrase_once(prompt: &str) -> Option<String> {
     Some(pass)
 }
 
-fn read_piped_line() -> Option<String> {
-    use std::io::BufRead;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).ok()?;
-    Some(line.trim_end_matches(['\n', '\r']).to_string())
+#[cfg(test)]
+mod tests {
+    use super::{read_passphrase_confirmed, read_passphrase_once};
+
+    #[test]
+    fn both_passphrase_prompts_hand_back_a_wiping_string() {
+        // Type-level pin, the same one `read_password` and
+        // `prompt_login_password` carry: heap hygiene is invisible at runtime,
+        // so the type is what gets checked. A recovery passphrase unwraps the
+        // template key, so it is worth no less than the login password (#348).
+        fn accepts_only_a_wiping_prompt(_: fn() -> Option<zeroize::Zeroizing<String>>) {}
+        fn accepts_only_a_wiping_prompt_with_text(
+            _: fn(&str) -> Option<zeroize::Zeroizing<String>>,
+        ) {
+        }
+        accepts_only_a_wiping_prompt(read_passphrase_confirmed);
+        accepts_only_a_wiping_prompt_with_text(read_passphrase_once);
+    }
 }

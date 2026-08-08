@@ -644,7 +644,7 @@ mod tests {
     /// downgrades the envelope to `LoginPassword` and the next login hands 56
     /// bytes of raw key to `pam_gnome_keyring` as an `AUTHTOK`.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: no job selects this name, and it does not pass against a bare swtpm today (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: measured failing against a bare swtpm, the tier climb reports Unchanged (#361)"]
     fn resealing_preserves_the_secret_kind() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-kind");
@@ -759,7 +759,7 @@ mod tests {
     /// token: a reseal that produced a different token would be silent data
     /// loss (the keyring stays keyed to the old one).
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: no job selects this name, and it does not pass against a bare swtpm today (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn a_token_envelope_heals_from_whichever_half_survives() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-token-heal");
@@ -862,7 +862,7 @@ mod tests {
     /// token into `PAM_AUTHTOK` on the next login. This is #253's
     /// `resealing_preserves_the_secret_kind` trap, one field wider.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: no job selects this name, and it does not pass against a bare swtpm today (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: measured failing against a bare swtpm, the tier climb reports Unchanged (#361)"]
     fn a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-token-climb");
@@ -921,7 +921,7 @@ mod tests {
     /// keyed to, and the caller's re-key from the password would then be
     /// denied, leaving the keyring permanently unreachable.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: no job selects this name, and it does not pass against a bare swtpm today (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn rearming_reuses_the_existing_token_rather_than_minting() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-rearm");
@@ -966,7 +966,7 @@ mod tests {
     /// The disarm release is the one place a token leaves the daemon on a
     /// password alone, so its gate has to hold in all three failure shapes.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: no job selects this name, and it does not pass against a bare swtpm today (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn releasing_a_token_for_disarm_needs_the_right_password() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-disarm");

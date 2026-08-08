@@ -5269,8 +5269,16 @@ mod tests {
         (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"))
     }
 
-    fn spare_device() -> Option<String> {
-        std::env::var("IRLUME_TEST_SPARE_DEVICE").ok()
+    /// The spare node, or a panic. Same rule as `loopback_pair` (#361): an
+    /// `#[ignore]`d test that returns early still prints `ok` and still counts
+    /// toward the lane's `--min` pass total.
+    fn spare_device() -> String {
+        std::env::var("IRLUME_TEST_SPARE_DEVICE").unwrap_or_else(|_| {
+            panic!(
+                "IRLUME_TEST_SPARE_DEVICE is unset. This test is #[ignore]d, so running it is a \
+                 request for the v4l2loopback harness; it will not silently pass without one."
+            )
+        })
     }
 
     // The lock and the guard live in `crate::testenv` so every env-mutating
@@ -5606,9 +5614,7 @@ mod tests {
         // 6-sample window on a fully static feed therefore returns Ok with
         // exactly 1 + 4 = 5 frames: a SHORT window, never an error.
         let _lock = env_lock();
-        let Some(spare) = spare_device() else {
-            return;
-        };
+        let spare = spare_device();
         let _sub = EnvGuard::unset("IRLUME_IR_AMBIENT_SUBTRACT");
         let _esc = allow_virtual(&spare);
         let _feeder = FfmpegFeeder::spawn(&spare, "color=c=gray:size=640x400:rate=15");
@@ -5688,13 +5694,9 @@ mod tests {
         // timeout, or keep_format options, frames would flow instead and the
         // is_err assertions below name the harness loudly.
         let _lock = env_lock();
-        let Some(spare) = spare_device() else {
-            eprintln!(
-                "SKIPPED loopback_frameless_capture_fits_the_watchdog_budget: \
-                 no IRLUME_TEST_SPARE_DEVICE in this environment"
-            );
-            return;
-        };
+        // Was a printed SKIP that still reported ok. A note in the log does not
+        // reach the lane's pass count, which is what CI actually gates on (#361).
+        let spare = spare_device();
         let _esc = allow_virtual(&spare);
 
         // The stalled producer. Held (device AND armed stream) until after
@@ -5933,9 +5935,7 @@ mod tests {
         // before any range conversion), the exact lit/off adjacency the opt-in
         // ambient subtraction pairs up.
         let _lock = env_lock();
-        let Some(spare) = spare_device() else {
-            return;
-        };
+        let spare = spare_device();
         let _esc = allow_virtual(&spare);
         let _sub = EnvGuard::set("IRLUME_IR_AMBIENT_SUBTRACT", "1");
         let _feeder = FfmpegFeeder::spawn(

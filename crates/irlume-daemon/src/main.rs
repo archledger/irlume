@@ -7737,31 +7737,33 @@ mod tests {
 
     /// Fresh engine wired to the CI loopback nodes; None when the env is
     /// absent. The feeder holds no face, so capture arms end in clean denials.
-    fn loopback_engine() -> Option<irlume_auth::Engine> {
-        let (Ok(rgb), Ok(ir)) = (
-            std::env::var("IRLUME_TEST_RGB_DEVICE"),
-            std::env::var("IRLUME_TEST_IR_DEVICE"),
-        ) else {
-            return None;
+    /// An engine bound to the feeder nodes, or a panic (#361). Not an Option
+    /// the callers skip on: these tests are `#[ignore]`d, so running one is a
+    /// request for the harness, and a self-skip prints `ok` like a real pass.
+    fn loopback_engine() -> irlume_auth::Engine {
+        let var = |k: &str| {
+            std::env::var(k).unwrap_or_else(|_| {
+                panic!(
+                    "{k} is unset. This test is #[ignore]d, so running it is a request for the \
+                     v4l2loopback harness; it will not silently pass without one."
+                )
+            })
         };
+        let (rgb, ir) = (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"));
         ort_init();
-        Some(
-            irlume_auth::Engine::load(
-                &model_path("face_detection_yunet_2023mar.onnx"),
-                &model_path("glintr100.onnx"),
-            )
-            .expect("engine load")
-            .with_devices(&rgb, &ir),
+        irlume_auth::Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
         )
+        .expect("engine load")
+        .with_devices(&rgb, &ir)
     }
 
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_authenticate_dispatches_to_a_no_face_denial() {
         let _g = env_lock();
-        let Some(mut e) = loopback_engine() else {
-            return;
-        };
+        let mut e = loopback_engine();
         let sb = sandbox("lb-auth");
         // One-shot capture instead of a grace window: a no-face run finishes
         // in one camera round.
@@ -7800,9 +7802,7 @@ mod tests {
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_identify_dispatches_to_a_no_match() {
         let _g = env_lock();
-        let Some(mut e) = loopback_engine() else {
-            return;
-        };
+        let mut e = loopback_engine();
         let sb = sandbox("lb-identify");
         std::env::set_var("IRLUME_GRACE_MS", "0");
         write_enrollment(&sb.dir, &enrollment_with("lbuser", &["Face Scan 1"]));
@@ -7831,9 +7831,7 @@ mod tests {
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_enroll_reaches_capture_and_fails_the_no_face_probe_cleanly() {
         let _g = env_lock();
-        let Some(mut e) = loopback_engine() else {
-            return;
-        };
+        let mut e = loopback_engine();
         let sb = sandbox("lb-enroll");
         std::env::set_var("IRLUME_GRACE_MS", "0");
         let resp = dispatch(

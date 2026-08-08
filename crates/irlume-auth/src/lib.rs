@@ -6599,21 +6599,32 @@ mod engine_tests {
         teardown_sandbox(&dir);
     }
 
+    /// The feeder nodes, or a panic (#361). An `#[ignore]`d test that returns
+    /// early still prints `ok`, and the CI lane counts passes, so a self-skip
+    /// is indistinguishable from a real run.
+    fn loopback_pair() -> (String, String) {
+        let var = |k: &str| {
+            std::env::var(k).unwrap_or_else(|_| {
+                panic!(
+                    "{k} is unset. This test is #[ignore]d, so running it is a request for the \
+                     v4l2loopback harness; it will not silently pass without one."
+                )
+            })
+        };
+        (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"))
+    }
+
     /// Full `authenticate()` through the LIVE capture pipeline, against the
     /// v4l2loopback feeder nodes CI provides: opens both devices, runs the
     /// parallel RGB+IR capture, detection, and the deny mapping. The ffmpeg
     /// test pattern holds no face, so the outcome must be a clean denial,
     /// not an error, with a face-shaped reason. Env-gated like the camera
     /// crate's loopback tests.
+
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_authenticate_denies_without_a_face() {
-        let (Ok(rgb), Ok(ir)) = (
-            std::env::var("IRLUME_TEST_RGB_DEVICE"),
-            std::env::var("IRLUME_TEST_IR_DEVICE"),
-        ) else {
-            return;
-        };
+        let (rgb, ir) = loopback_pair();
         let _g = env_guard();
         ort_init();
         // Legacy one-shot: a single capture pass instead of a grace window,
@@ -6672,12 +6683,7 @@ mod engine_tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_enrolment_stops_when_asked_and_saves_nothing() {
-        let (Ok(rgb), Ok(ir)) = (
-            std::env::var("IRLUME_TEST_RGB_DEVICE"),
-            std::env::var("IRLUME_TEST_IR_DEVICE"),
-        ) else {
-            return;
-        };
+        let (rgb, ir) = loopback_pair();
         let _g = env_guard();
         ort_init();
         let dir = state_sandbox("loopback-preempt");

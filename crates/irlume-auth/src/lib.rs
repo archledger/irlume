@@ -2714,11 +2714,20 @@ impl Engine {
                 // Dark-path kinds: Uncertain retries under grace, any Spoof
                 // does not (the retryable RGB-yes/IR-no transient cannot occur
                 // here: this path only runs when RGB saw no face).
-                let kind = if verdict == Verdict::Uncertain {
-                    OutcomeKind::Uncertain
-                } else {
-                    OutcomeKind::Spoof
-                };
+                //
+                // Routed through the shared classifier rather than mapped
+                // inline. `exposure_refusal` is deliberately shared by BOTH
+                // evaluators, so the unmeasurable-format refusal arrives here
+                // as Uncertain too, and an inline map would leave it in the
+                // retryable class on exactly the camera this gate exists for:
+                // six full captures reaching the identical answer, every dark
+                // login, forever. The classifier holds the one prefix rule
+                // (#358 review).
+                //
+                // `reason` here is the raw liveness string; the "dark liveness"
+                // prefix is applied in the `format!` below, after this call, so
+                // the prefix match still sees what irlume-liveness produced.
+                let kind = liveness_deny_kind(verdict, &reason);
                 return Ok(Outcome::deny(
                     kind,
                     format!("dark liveness {verdict:?}: {reason}"),
@@ -4337,6 +4346,77 @@ mod tests {
         let bk = liveness_deny_kind(bv, &br);
         assert_eq!(bk, OutcomeKind::Uncertain, "{br}");
         assert!(presence_retryable(&denied(bk, &br, false)), "{br}");
+
+        // The DARK evaluator reaches the same refusal, because
+        // `exposure_refusal` is deliberately shared by both. The first version
+        // of this fix routed only the cross-spectrum site and left the dark
+        // site mapping inline, so on the one camera class this gate exists for
+        // a dark login burned the whole grace window reaching this answer
+        // repeatedly (#358 review).
+        let (dv, _, dr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&sig);
+        assert_eq!(dv, Verdict::Uncertain, "precondition: {dr}");
+        assert!(
+            dr.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
+            "the dark evaluator stopped producing the pinned prefix: {dr}"
+        );
+        let dk = liveness_deny_kind(dv, &dr);
+        assert_eq!(dk, OutcomeKind::OtherDeny, "{dr}");
+        assert!(!presence_retryable(&denied(dk, &dr, false)), "{dr}");
+
+        // And the dark path's ordinary refusals stay exactly as they were, so
+        // routing it through the shared classifier changed nothing else.
+        let mut dark_flat = sig.clone();
+        dark_flat.ir_ceiling_known = true;
+        dark_flat.ir_saturated_frac = Some(0.0);
+        dark_flat.ir_center_edge_ratio = 0.1;
+        let (fv, _, fr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&dark_flat);
+        assert_eq!(fv, Verdict::Spoof, "precondition: {fr}");
+        assert_eq!(liveness_deny_kind(fv, &fr), OutcomeKind::Spoof, "{fr}");
+    }
+
+    /// Every liveness verdict becomes an `OutcomeKind` through
+    /// [`liveness_deny_kind`], never through a comparison written at the call
+    /// site.
+    ///
+    /// The rule exists because the failure mode is a NEW deny site, or an old
+    /// one nobody revisited, classifying inline. `liveness_deny_kind` is where
+    /// the retryability rules live; a site that maps `Verdict::Uncertain`
+    /// itself silently opts out of all of them. That is exactly what happened
+    /// with the dark path in #358: the classifier gained the unmeasurable arm,
+    /// the dark site kept `let kind = if verdict == Verdict::Uncertain`, and no
+    /// behavioural test could see it because the refusal is only reachable
+    /// with a camera whose format names no ceiling.
+    #[test]
+    fn no_deny_site_classifies_a_liveness_verdict_by_hand() {
+        let src = include_str!("lib.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let l = l.trim();
+                // The shape that was removed, and the shape a future site would
+                // most naturally reintroduce.
+                (l.starts_with("let kind = if") || l.starts_with("let kind = match"))
+                    && !l.contains("liveness_deny_kind")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these sites classify a liveness verdict by hand instead of calling \
+             liveness_deny_kind, so they do not inherit its retryability rules: {offenders:?}"
+        );
+        // Not vacuous: the call site must actually be there, or this test
+        // would pass by having nothing to look at. The needle is assembled
+        // from pieces so it does not appear verbatim in the file it scans;
+        // spelled inline, the assertion matched its own source and stayed
+        // green with the real call site deleted.
+        let needle = concat!("liveness_deny_kind", "(verdict, &reason)");
+        assert!(
+            src.matches(needle).count() >= 2,
+            "the deny sites that route through liveness_deny_kind are gone; \
+             the rule this test pins has nothing left to hold"
+        );
     }
 
     #[test]

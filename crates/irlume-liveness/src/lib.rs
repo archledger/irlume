@@ -406,8 +406,11 @@ pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
 /// widen the corpus before trusting it elsewhere (#101).
 ///
 /// Only measurable where the source format names its ceiling
-/// (`clipping_white_level`); an unmeasurable frame is judged as before, since
-/// refusing on a number nobody produced would deny every non-GREY8 module.
+/// (`clipping_white_level`), which today means the 8-bit greys. A frame whose
+/// format names no ceiling is REFUSED rather than judged, because a gate that
+/// could not run is not a gate that passed; see [`Signals::ir_ceiling_known`]
+/// (#358). This sentence used to say the opposite, and anyone retuning the
+/// constant should know the population it is fitted to is GREY8 only.
 pub const IR_SATURATED_FRAC_MAX: f32 = 0.10;
 
 /// Ambient IR (see [`Signals::ir_ambient`]) above which the brightness and
@@ -2315,8 +2318,13 @@ mod tests {
     }
 
     /// The refusal is an exposure ceiling, not a new spoof cue: everything at
-    /// or under the limit is judged exactly as before, and an unmeasurable
-    /// fraction (a format with no known ceiling) must not deny anyone.
+    /// or under the limit is judged exactly as before.
+    ///
+    /// The unmeasurable case is deliberately NOT here. This doc used to claim
+    /// that a format with no known ceiling "must not deny anyone", which is the
+    /// fail-open #358 removed, and the body three lines down now asserts the
+    /// opposite. A test whose documentation states the inverse of its own
+    /// assertions is worse than an undocumented one.
     #[test]
     fn a_readable_ir_face_is_judged_as_before() {
         let gate = LivenessGate::new();

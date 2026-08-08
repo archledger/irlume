@@ -59,11 +59,40 @@ ProtectSystem=full
 # ...but the daemon owns two files under the config root: the camera pin written
 # by `set-cameras` (which is also the anti-injection binding, re-anchored by
 # vid:pid:serial after a udev renumber) and the capture mode stored by
-# `camera-tune`. ProtectSystem=full mounts /etc read-only, so without this both
-# writes fail on a packaged install and neither setting survives a restart. The
-# leading `-` is required: no lane creates /etc/irlume, so a host that has never
-# had one would otherwise fail to start.
-ReadWritePaths=-/etc/irlume
+# `camera-tune`. ProtectSystem=full mounts /etc read-only, so without a
+# writable exception both writes fail on a packaged install and neither
+# setting survives a restart.
+#
+# ConfigurationDirectory is what grants it, and it is here because
+# ReadWritePaths alone did NOT (#307). NO packaging lane creates /etc/irlume,
+# on any distro, and the leading `-` that kept a fresh host bootable made
+# systemd SKIP the entry when the path was missing, so the daemon got an
+# entirely read-only /etc and `camera-tune` died with EROFS after a full
+# minute of measurement.
+#
+# It was reported on Arch, but the variable is HOST STATE, not the lane. The
+# only thing that has ever created this directory is `policy::set_method`,
+# reached from `irlume fingerprint enable`, which runs in the unsandboxed CLI
+# and so succeeds. A host that ran it has the directory and never sees the
+# bug; a fresh host on any lane does. Do not read this as an Arch fix.
+#
+# ConfigurationDirectory has no such hole: systemd creates the directory
+# before it assembles the namespace, then binds it read-write, so the grant
+# cannot depend on anything else having made the directory first.
+#
+# Measured with the directory absent beforehand, on Arch/systemd 261 (bare
+# metal) and on Ubuntu 22.04/systemd 249 and Debian 12/systemd 252
+# (privileged containers, sandbox confirmed live): ReadWritePaths alone
+# failed "Read-only file system" on all three, ConfigurationDirectory alone
+# succeeded on all three. 249 is the oldest systemd any lane ships to, so
+# the ReadWritePaths line that used to sit here is gone rather than kept as
+# a belt. It granted nothing, and a directive that reads like the write
+# grant without being one is what cost a release this bug.
+#
+# Left root-owned at 0755. ConfigurationDirectory is the one directory
+# directive systemd does NOT chown to User=, and this unit has no User=
+# anyway; the files inside are written 0600 by the daemon.
+ConfigurationDirectory=irlume
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

@@ -247,8 +247,13 @@ in
         ProtectSystem = "full";
         # The daemon writes the camera pin and the stored capture mode under
         # /etc/irlume, which ProtectSystem=full would otherwise mount read-only.
-        # Leading "-" so a host that has never had the directory still starts.
-        ReadWritePaths = [ "-/etc/irlume" ];
+        # ConfigurationDirectory creates the directory before the namespace is
+        # assembled and binds it read-write; the ReadWritePaths entry that used
+        # to be here did not, because its leading "-" makes systemd skip a path
+        # that does not exist and no lane creates this one (#307). Kept in sync
+        # by hand with packaging/systemd/irlumed.service, which nothing in CI
+        # enforces.
+        ConfigurationDirectory = "irlume";
         PrivateTmp = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;

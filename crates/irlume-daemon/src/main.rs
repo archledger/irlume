@@ -5511,6 +5511,56 @@ mod tests {
         );
     }
 
+    /// The config root has to be GRANTED, not merely permitted (#307).
+    ///
+    /// `ReadWritePaths=-/etc/irlume` reads like a write grant and is not one on
+    /// a fresh install: the leading `-` makes systemd skip an entry whose path
+    /// does not exist, no packaging lane creates this directory, and the
+    /// daemon then saw an entirely read-only /etc. `camera-tune` failed with
+    /// EROFS after a full minute of measurement, and `set-cameras` was worse
+    /// still, reporting success and silently losing the pin at restart.
+    ///
+    /// So the assertion is on `ConfigurationDirectory=`, which creates the
+    /// directory before the namespace is assembled and cannot be skipped.
+    /// Measured on Arch/systemd 261 with the directory absent: with
+    /// `ReadWritePaths` alone the write failed "Read-only file system"; with
+    /// `ConfigurationDirectory` alone it succeeded.
+    ///
+    /// Reads the shipped unit for the same reason the watchdog test above
+    /// does. What it cannot see is `nix/module.nix`, which carries a
+    /// hand-mirrored copy of these directives that nothing in CI compares.
+    #[test]
+    fn the_shipped_unit_creates_the_config_root_it_writes_into() {
+        let unit_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/irlumed.service"
+        );
+        let unit =
+            std::fs::read_to_string(unit_path).unwrap_or_else(|e| panic!("read {unit_path}: {e}"));
+        let declared: Vec<&str> = unit
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("ConfigurationDirectory="))
+            .map(str::trim)
+            .collect();
+        // The name is relative to /etc, so it must be the bare directory name;
+        // an absolute path here is a config error systemd would reject.
+        assert_eq!(
+            declared,
+            ["irlume"],
+            "irlumed.service must declare ConfigurationDirectory=irlume so the \
+             config root exists before the namespace is built (#307); \
+             ReadWritePaths alone is skipped when the path is missing"
+        );
+        // The path the daemon actually writes, so the unit and the code cannot
+        // drift apart into a grant for a directory nothing uses.
+        assert_eq!(
+            irlume_common::config::CONFIG_ROOT,
+            "/etc/irlume",
+            "ConfigurationDirectory=irlume grants /etc/irlume; the daemon's \
+             config root moved without the unit following it"
+        );
+    }
+
     /// The explanatory refusal line is printed once per uid, so a local process
     /// spinning on a request it knows will be refused cannot fill the journal,
     /// while each distinct surface still gets its one explanation.

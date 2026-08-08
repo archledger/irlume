@@ -1194,10 +1194,15 @@ pub(crate) fn finish_token_arm(
 /// password (`keyring arm`, `reseal`, `setup`) and the recovery passphrase.
 ///
 /// The secret is wrapped in `Zeroizing` at the point it is first held, the same
-/// as the TUI's `Pending::KeyringPw`, so it is wiped from the heap on drop
-/// rather than left in swappable memory for the rest of the process. Callers
-/// must keep it inside the wrapper: a `.clone()` or a `to_string()` makes a
-/// second copy that nothing wipes.
+/// as the TUI's `Pending::KeyringPw`, so the buffer is overwritten on drop
+/// instead of being freed with the password still in it. That bounds how long
+/// the plaintext lives; it cannot undo a page that was already swapped out, and
+/// nothing here excludes it from a core dump.
+///
+/// Callers must keep it inside the wrapper. `.clone()` is safe (a cloned
+/// `Zeroizing` wipes itself too), but anything that leaves the wrapper does
+/// not: `to_string()`, `as_str().to_owned()`, or `format!` all produce a plain
+/// `String` that nothing wipes.
 fn read_password(prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         rpassword::prompt_password(prompt)

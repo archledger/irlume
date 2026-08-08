@@ -17,7 +17,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Bounded wait for the initial connect (distinct from the read timeout, which
 /// must be long enough for a camera capture).
@@ -153,6 +153,21 @@ fn map_connect_failure(e: io::Error) -> io::Error {
     }
 }
 
+/// Serialize a request into a buffer that wipes itself on every exit path.
+///
+/// `SealPassword`, `ResealPassword`, `RecoverySetup` and `RecoveryRestore`
+/// carry a `SecretBytes`, and serialization copies those bytes into this buffer
+/// as plain JSON. Returning a wiping owner rather than wiping after the send is
+/// what covers the error paths: the send is two fallible calls, and an early
+/// return from either used to free this buffer with the secret still in it.
+fn serialize_request(req: &Request) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut line = Zeroizing::new(
+        serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+    );
+    line.push(b'\n');
+    Ok(line)
+}
+
 fn request_with_timeouts(
     req: &Request,
     connect_timeout: Duration,
@@ -163,18 +178,19 @@ fn request_with_timeouts(
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 
-    let mut line =
-        serde_json::to_vec(req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    line.push(b'\n');
+    let line = serialize_request(req)?;
     // Map send/first-read failures too, not just connect: on newer kernels
     // (7.1.4-zen, found by the self-hosted runner) a stale socket file CONNECTS
     // successfully and only resets on the first write/read, so a connect-only
     // mapping left a raw ECONNRESET. Before any bytes are exchanged, a reset or
     // broken pipe still means "nobody is really listening".
+    //
+    // Those two `?` are why `line` is a wiping owner rather than a plain Vec
+    // wiped after the writes: either one returns early, and the buffer holding
+    // the serialized password would have been freed unwiped on exactly the
+    // path the comment above says happens in the field.
     (&stream).write_all(&line).map_err(map_connect_failure)?;
     (&stream).flush().map_err(map_connect_failure)?;
-    // The request may carry a password (SealPassword/RecoverySetup); wipe it.
-    line.zeroize();
 
     // Capped, like the daemon caps requests. `SO_RCVTIMEO` restarts on every
     // read, so the rw budget bounds one read and not the exchange: a peer that
@@ -639,5 +655,26 @@ mod tests {
                 "{kind:?} lost its message"
             );
         }
+    }
+
+    #[test]
+    fn a_serialized_request_is_owned_by_a_wiping_buffer() {
+        // The send is two fallible calls, and `?` on either skips anything
+        // written after them, so wiping the buffer after the flush left the
+        // secret on the heap on exactly the reset/broken-pipe path this file
+        // documents as happening in the field. The wipe therefore has to ride
+        // on the type, and the type is what gets pinned: heap hygiene is not
+        // observable at runtime, so this stops compiling rather than failing.
+        fn accepts_only_a_wiping_serializer(_: fn(&Request) -> io::Result<Zeroizing<Vec<u8>>>) {}
+        accepts_only_a_wiping_serializer(serialize_request);
+
+        // The buffer still has to be the wire format the daemon parses: one
+        // JSON object, newline-terminated.
+        let line = serialize_request(&Request::Ping).expect("Ping serializes");
+        assert!(line.ends_with(b"\n"), "requests are newline-terminated");
+        assert!(
+            serde_json::from_slice::<Request>(&line[..line.len() - 1]).is_ok(),
+            "the wiping buffer still carries parseable JSON"
+        );
     }
 }

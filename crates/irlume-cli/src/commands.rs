@@ -1445,8 +1445,9 @@ pub fn reseal(args: &[String]) -> ExitCode {
 /// for scripts/tests. Returns `None` on mismatch / empty / read error.
 ///
 /// Reads through [`crate::read_password`], so the password and its confirm copy
-/// are both wiped on drop. Callers must keep the value inside the wrapper: a
-/// `.clone()` or a `to_string()` makes a second copy that nothing wipes.
+/// are both wiped on drop. Callers must keep the value inside the wrapper:
+/// anything that leaves it, such as `to_string()` or `format!`, produces a
+/// plain `String` that nothing wipes.
 pub(crate) fn prompt_login_password() -> Option<zeroize::Zeroizing<String>> {
     // Sampled once, and used only to decide whether a confirm prompt makes
     // sense; `read_password` makes the same terminal/pipe split itself.

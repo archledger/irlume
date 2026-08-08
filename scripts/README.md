@@ -25,6 +25,7 @@ pages, so it must never move.
 | `run-tests-guarded.sh` | Runs a test command and fails if it selected no tests. `cargo test <name>` exits 0 when the filter matches nothing, which reads as a pass. |
 | `check-packaging-parity.sh` | Every systemd unit and AppArmor rule must ship in every lane, and every lane must agree on the version. |
 | `check-action-pins.sh` | Enforces SHA-pinning on every GitHub Action, with one documented exception for the SLSA provenance generator. |
+| `ir-node-from-doctor.sh` | Names the IR capture node from `irlume doctor` output, so the nightly hardware suite can point `burst_dump` at it. Separates "no camera" from "no IR camera" from "this no longer parses", which the inline version it replaces could not. `--self-test` runs on every PR. |
 | `machine-api-conformance.py` | Checks a build answers contract 1 the way `docs/MACHINE-API.md` says. Written for consumers, so it needs only Python 3 and an irlume binary. |
 | `capture-machine-fixtures.py` | Regenerates `schemas/fixtures/` from a real engine, so consumers develop against documents irlume actually emitted. |
 

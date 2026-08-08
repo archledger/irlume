@@ -700,6 +700,15 @@ jobs:
       - name: PPA publish verifier (verdict logic)
         run: python3 scripts/verify-ppa-publish.py --self-test
 
+      # The nightly hardware suite finds its IR node by parsing `irlume doctor`,
+      # and that parse is why the camera stage did not run for the eight nights
+      # after 42c03c6 changed the node line. Nothing hosted has a camera, so the
+      # parse itself is what gets pinned: fixtures only, seconds, every PR.
+      # Here and not also in `coverage`, which carries copies of the two steps
+      # above; one job proving a fixture parse is enough.
+      - name: doctor IR-node parser (the nightly hardware suite depends on it)
+        run: ./scripts/ir-node-from-doctor.sh --self-test
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

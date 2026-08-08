@@ -97,26 +97,38 @@ jobs:
             echo "::error::irlume doctor failed — not a clean camera-absent skip"
             cat "$doc"; exit 1
           fi
-          # An empty result has two very different causes, and reading both as
-          # "no camera" turned a classifier or doctor-format regression into a
-          # clean skip on the ONLY lane with a real camera. Tell them apart by
-          # asking whether doctor classified ANY node: none at all is a genuine
-          # absent-camera skip, while nodes present with no Ir among them is a
-          # regression on a runner that is supposed to have one.
-          if ! grep -q "camera nodes (classified by pixel format)" "$doc"; then
-            echo "::error::doctor produced no camera-nodes section — its output format changed"
-            cat "$doc"; exit 1
-          fi
-          nodes=$(awk '/camera nodes \(classified by pixel format\)/{f=1;next} f&&/^  \/dev\//{n++} f&&!/^  /{f=0} END{print n+0}' "$doc")
-          ir=$(awk -F: '/: Ir$/{print $1}' "$doc" | tr -d " " | head -1)
-          if [ -z "$ir" ]; then
-            if [ "$nodes" -eq 0 ]; then
+          # An empty result has three very different causes, and the parser
+          # that used to live inline here could only express two of them. It
+          # read a changed doctor format as "no IR node", so from 2026-08-01
+          # every scheduled run failed with "classified 5 camera node(s) but
+          # none as Ir" while the doctor output printed directly beneath it
+          # said "/dev/video2: Ir (uvcvideo, USB)". Eight nights of the only
+          # check that drives the real IR emitter, not run.
+          #
+          # The parse now lives in a script with a self-test that hosted CI
+          # runs on every PR, so the next doctor format change fails in
+          # seconds instead of parking this stage until someone reads a log.
+          ir=""; rc=0
+          ir=$(scripts/ir-node-from-doctor.sh "$doc") || rc=$?
+          case "$rc" in
+            0) ;;
+            10)
               echo "::notice::no camera nodes at all — camera stage skipped (borrowed for the OS bench?)"
               exit 0
-            fi
-            echo "::error::doctor classified $nodes camera node(s) but none as Ir on a runner that has one"
-            cat "$doc"; exit 1
-          fi
+              ;;
+            11)
+              echo "::error::doctor classified camera node(s) but none as Ir on a runner that has one"
+              cat "$doc"; exit 1
+              ;;
+            12)
+              echo "::error::doctor output no longer parses — fix scripts/ir-node-from-doctor.sh; this is NOT a missing camera"
+              cat "$doc"; exit 1
+              ;;
+            *)
+              echo "::error::scripts/ir-node-from-doctor.sh exited $rc"
+              cat "$doc"; exit 1
+              ;;
+          esac
           echo "IR node: $ir"
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT

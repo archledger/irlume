@@ -113,7 +113,7 @@ jobs:
           case "$rc" in
             0) ;;
             10)
-              echo "::notice::no camera nodes at all — camera stage skipped (borrowed for the OS bench?)"
+              echo "::notice::doctor reports no camera nodes — camera stage skipped (borrowed for the OS bench?)"
               exit 0
               ;;
             11)
@@ -122,6 +122,14 @@ jobs:
               ;;
             12)
               echo "::error::doctor output no longer parses — fix scripts/ir-node-from-doctor.sh; this is NOT a missing camera"
+              cat "$doc"; exit 1
+              ;;
+            # Present but unreadable is NOT the borrowed-camera skip. Only
+            # doctor's own absence marker takes exit 0; a node held by another
+            # process or denied by permissions fails here instead of retiring
+            # the emitter test green (#383 review).
+            13)
+              echo "::error::doctor could not establish what cameras exist (unreadable nodes or an unwalkable /dev). The emitter test did NOT run; this is not an absent camera"
               cat "$doc"; exit 1
               ;;
             *)

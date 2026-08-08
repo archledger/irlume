@@ -32,17 +32,37 @@
 #
 # Exit codes, which the caller is expected to branch on:
 #   0   an IR node was found; its path is on stdout
-#   10  doctor listed no camera nodes at all (a genuine absent-camera skip)
+#   10  doctor positively reported no camera nodes (a genuine absent-camera skip)
 #   11  doctor listed nodes but classified none of them Ir (a regression)
 #   12  the output did not parse (doctor's format changed; fix this script)
+#   13  doctor could not establish what cameras exist (unreadable or unlistable)
 #    2  usage error
 set -euo pipefail
 
 readonly EXIT_NO_NODES=10
 readonly EXIT_NO_IR=11
 readonly EXIT_UNPARSEABLE=12
+readonly EXIT_CAMERA_UNKNOWN=13
 
 readonly SECTION='[doctor] camera nodes (classified by pixel format):'
+
+# The only line that asserts absence. doctor prints it under exactly one
+# condition: no listing error, no classified nodes, AND no unreadable nodes
+# (irlume-cli/src/main.rs, the `else if` beside the comment "Could not look is
+# not nothing there").
+#
+# Requiring this marker, rather than inferring absence from a node count of
+# zero, is what keeps a camera that is present but unreadable out of the skip
+# path. A node denied by EACCES, held by another process, or lost to a failed
+# /dev walk produces a section with no node lines and no absence marker, and
+# counting those as "no camera" would let a permissions or contention
+# regression retire the only test that drives the real emitter, green.
+#
+# The codebase already paid for this once at the layer below: #227 is the same
+# defect, where dropping unreadable nodes from the report made a permission
+# problem read as absent hardware. Inferring absence here would have reproduced
+# it one level up (#383 review).
+readonly ABSENCE_MARKER='(no /dev/video* nodes on this machine)'
 
 # The node lines doctor writes are `  {path}: {role:?}{backend}{privacy}`
 # (irlume-cli/src/main.rs, `dout!(report, "  {path}: {role:?}{backend}{priv_on}")`).
@@ -59,11 +79,13 @@ readonly KNOWN_ROLES='Rgb|Ir|Other'
 
 parse() {
   local doc="$1"
-  awk -v section="$SECTION" -v roles="$KNOWN_ROLES" '
+  awk -v section="$SECTION" -v roles="$KNOWN_ROLES" -v absent="$ABSENCE_MARKER" '
     index($0, section) { in_section = 1; seen_section = 1; next }
     !in_section { next }
     # The section ends at the first line that is not indented under it.
     !/^[[:space:]]/ { in_section = 0; next }
+    # doctor saying, positively, that this machine has no camera nodes.
+    index($0, absent) { absence_stated = 1; next }
     # A node line, whatever doctor appends after the role.
     /^[[:space:]]+\/dev\/[^:]+:[[:space:]]/ {
       nodes++
@@ -78,18 +100,19 @@ parse() {
       if (role == "Ir" && ir == "") ir = path
     }
     END {
-      printf "%s|%d|%d|%s|%d\n", ir, nodes + 0, parsed + 0, unknown_role, seen_section + 0
+      printf "%s|%d|%d|%s|%d|%d\n", ir, nodes + 0, parsed + 0, unknown_role, \
+        seen_section + 0, absence_stated + 0
     }
   ' "$doc"
 }
 
 resolve() {
-  local doc="$1" ir nodes parsed unknown seen
+  local doc="$1" ir nodes parsed unknown seen absent
   # `|`, not a tab: tab is an IFS whitespace character, so `read` would strip
   # the leading empty field and shift every value one position left whenever
   # no IR node was found. That silently turned "no IR node" into "the IR node
   # is 2", which is the same class of defect this whole script exists for.
-  IFS='|' read -r ir nodes parsed unknown seen < <(parse "$doc")
+  IFS='|' read -r ir nodes parsed unknown seen absent < <(parse "$doc")
 
   # The section header itself is a format claim. Losing it means the parse
   # never even started, so nothing below it can be trusted.
@@ -109,9 +132,19 @@ resolve() {
     echo "doctor listed ${nodes} node line(s) and none parsed; its line format changed" >&2
     return "$EXIT_UNPARSEABLE"
   fi
+  # Absence is only ever taken from doctor's own marker. A section with no node
+  # lines and no marker means doctor could see nodes it could not read, or could
+  # not walk /dev at all; either way what cameras exist is unknown, and unknown
+  # must not license the skip that retires the emitter test.
   if [ "$nodes" -eq 0 ]; then
-    echo "doctor listed no camera nodes" >&2
-    return "$EXIT_NO_NODES"
+    if [ "$absent" -eq 1 ]; then
+      echo "doctor reported no camera nodes on this machine" >&2
+      return "$EXIT_NO_NODES"
+    fi
+    echo "doctor's camera section held neither a node nor the absence marker: \
+nodes are present but unreadable (permissions, contention, driver), or /dev \
+could not be walked. This is NOT an absent camera" >&2
+    return "$EXIT_CAMERA_UNKNOWN"
   fi
   if [ -z "$ir" ]; then
     echo "doctor classified ${nodes} camera node(s), none of them Ir" >&2
@@ -183,6 +216,25 @@ self_test() {
   check "no nodes at all is a skip" "$EXIT_NO_NODES" "" \
 '[doctor] camera nodes (classified by pixel format):
   (no /dev/video* nodes on this machine)
+[doctor] TPM 2.0: /dev/tpmrm0 ✓
+'
+  # The three shapes that must NEVER reach the skip. Each one is a camera whose
+  # state doctor could not establish, and the first version of this script
+  # returned the absent-camera skip for all three, which would have let a
+  # permissions or contention regression retire the emitter test green
+  # (#383 review). Same defect as #227, one layer up.
+  check "unreadable nodes are not absence" "$EXIT_CAMERA_UNKNOWN" "" \
+'[doctor] camera nodes (classified by pixel format):
+  ⚠ /dev/video0, /dev/video2: could not be opened: permission denied
+[doctor] TPM 2.0: /dev/tpmrm0 ✓
+'
+  check "an unwalkable /dev is not absence" "$EXIT_CAMERA_UNKNOWN" "" \
+'[doctor] camera nodes (classified by pixel format):
+  ⚠ 2 entries in /dev could not be read; whether this machine has camera nodes is unknown
+[doctor] TPM 2.0: /dev/tpmrm0 ✓
+'
+  check "an empty section is not absence" "$EXIT_CAMERA_UNKNOWN" "" \
+'[doctor] camera nodes (classified by pixel format):
 [doctor] TPM 2.0: /dev/tpmrm0 ✓
 '
   check "nodes but none IR is a regression" "$EXIT_NO_IR" "" \

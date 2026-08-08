@@ -42,13 +42,19 @@ fn strict_requested(raw: Option<&str>, mut out: impl std::io::Write) -> bool {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => true,
         "0" | "false" | "no" | "off" | "" => false,
+        // An unreadable value means ON, not off (#365). The operator SET this
+        // variable, so the one thing we know is that they wanted the gate; the
+        // old answer disabled a tamper check because of a typo, which is the
+        // permissive direction on the security question. Refusing to start is
+        // loud and immediately fixable; starting with an unverified model is
+        // neither.
         other => {
             let _ = writeln!(
                 out,
-                "irlume: ignoring IRLUME_MODELS_STRICT={other:?} (expected 1/true/yes/on or \
-                 0/false/no/off); model verification stays OFF"
+                "irlume: IRLUME_MODELS_STRICT={other:?} is not a boolean (expected \
+                 1/true/yes/on or 0/false/no/off); treating it as ON, because it was set"
             );
-            false
+            true
         }
     }
 }
@@ -5666,13 +5672,14 @@ mod tests {
         assert!(!strict_requested(None, &mut out));
         assert!(out.is_empty());
 
-        // An unreadable value must SAY so rather than quietly leaving the gate
-        // off, which is the whole point: the operator asked for it.
+        // An unreadable value means ON, and says so. The operator SET the
+        // variable, so the permissive reading disabled a tamper gate over a
+        // typo, which is the wrong direction on a security question (#365).
         for raw in ["enabled", "y", "strict", "2"] {
             let mut out = Vec::new();
             assert!(
-                !strict_requested(Some(raw), &mut out),
-                "{raw} is not a boolean"
+                strict_requested(Some(raw), &mut out),
+                "{raw} was set, so the gate stays on rather than silently off"
             );
             let warned = String::from_utf8_lossy(&out);
             assert!(warned.contains("IRLUME_MODELS_STRICT"), "{raw}: {warned}");

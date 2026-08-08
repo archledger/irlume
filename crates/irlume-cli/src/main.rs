@@ -2550,7 +2550,15 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             // Dev gate probe: a single frame with no burst stats, so the
             // negotiated format's ceiling is not available here and the
             // reading is honestly absent rather than guessed at 255.
+            //
+            // Which means this probe now stops at the exposure gate with the
+            // unmeasurable refusal instead of running the cues below it (#358).
+            // The measured values printed after this still come from the locals
+            // above, so the diagnostic output is unchanged; what changes is that
+            // the verdict no longer claims a liveness decision this probe was
+            // never in a position to make.
             ir_saturated_frac: None,
+            ir_ceiling_known: false,
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,

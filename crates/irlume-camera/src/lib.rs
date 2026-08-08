@@ -1096,10 +1096,10 @@ pub fn configured_pair_no_probe() -> Option<(String, String)> {
             return Some(pair);
         }
     }
-    match (
-        irlume_common::config::read_kv("cameras.conf", "rgb"),
-        irlume_common::config::read_kv("cameras.conf", "ir"),
-    ) {
+    // One read of the whole file, so this no-probe path never combines an RGB
+    // path from before a repin with an IR path from after it.
+    let pin = irlume_common::config::read_camera_pin();
+    match (pin.rgb, pin.ir) {
         (Some(r), Some(i)) => nonblank_pair(r, i),
         _ => None,
     }
@@ -1123,11 +1123,11 @@ pub fn select_pair() -> (String, String) {
         }
     }
     // A user-chosen pair persisted via the daemon (TUI Cameras tab) overrides
-    // auto-selection but not an explicit env override.
-    if let (Some(r), Some(i)) = (
-        irlume_common::config::read_kv("cameras.conf", "rgb"),
-        irlume_common::config::read_kv("cameras.conf", "ir"),
-    ) {
+    // auto-selection but not an explicit env override. Read the four pin keys
+    // from ONE snapshot: the path and its identity are evaluated as a unit
+    // below, so a repin landing mid-read must not split them across versions.
+    let pin = irlume_common::config::read_camera_pin();
+    if let (Some(r), Some(i)) = (pin.rgb.as_deref(), pin.ir.as_deref()) {
         if !r.trim().is_empty() && !i.trim().is_empty() {
             // The saved paths are bare /dev/videoN, which a kernel or udev
             // update can renumber, so a plain path pin can silently land on a
@@ -1135,10 +1135,10 @@ pub fn select_pair() -> (String, String) {
             // with its device identity (vid:pid:serial), trust the identity over
             // the number: keep the saved path only while it still resolves to
             // that camera, else re-find the node that carries the identity.
-            let saved_rgb_id = nonblank(irlume_common::config::read_kv("cameras.conf", "rgb_id"));
-            let saved_ir_id = nonblank(irlume_common::config::read_kv("cameras.conf", "ir_id"));
+            let saved_rgb_id = nonblank(pin.rgb_id.clone());
+            let saved_ir_id = nonblank(pin.ir_id.clone());
             if let Some(pair) =
-                resolve_saved_pair(&r, &i, saved_rgb_id.as_deref(), saved_ir_id.as_deref())
+                resolve_saved_pair(r, i, saved_rgb_id.as_deref(), saved_ir_id.as_deref())
             {
                 return pair;
             }

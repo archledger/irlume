@@ -107,9 +107,20 @@ fn run(user: &str) -> Result<PathBuf, String> {
     // one that died before exec, and it would report success either way.
     let (status_read, status_write) = make_status_pipe()?;
 
-    // SAFETY: between fork() and execve() the child runs in a single thread and
-    // touches only async-signal-safe calls, which is the constraint fork()
-    // imposes on a process that may be multi-threaded.
+    // Resolved HERE, in the parent, so the child between fork() and execve()
+    // does nothing but dup2/close/execve on buffers that already exist (#363).
+    // It used to call getpwuid, format! and CString::new down there. This
+    // process is single-threaded at the fork, which is why that never
+    // deadlocked, but getpwuid goes through NSS (dlopen, allocation, locks) and
+    // none of it is async-signal-safe, so the old SAFETY comment claimed a
+    // property the code did not have and the correctness depended on nobody
+    // ever adding a thread above.
+    let plan = LaunchPlan::build(&exe, read_fd, listener, &sock_path)?;
+
+    // SAFETY: the child touches only async-signal-safe calls, because
+    // everything it needs was built above. `plan` outlives the fork, and its
+    // pointer arrays borrow from CString buffers on the heap, which the child
+    // inherits copy-on-write at the same addresses.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(format!("fork: {}", std::io::Error::last_os_error()));
@@ -119,7 +130,7 @@ fn run(user: &str) -> Result<PathBuf, String> {
         unsafe {
             libc::close(status_read);
             libc::close(write_fd);
-            child_exec(&exe, read_fd, listener, &sock_path);
+            child_exec(&exe, read_fd, listener, &plan);
             // Only reached when execve failed. The byte distinguishes that from
             // the EOF a successful exec produces.
             let failed = [1u8];
@@ -378,11 +389,91 @@ fn make_pipe() -> Result<(libc::c_int, libc::c_int), String> {
 ///
 /// # Safety
 /// Must only be called in the child of a `fork()`, before any other work.
+/// Everything `execve` needs, built in the PARENT before `fork`.
+///
+/// The child of a fork may call only async-signal-safe functions when the
+/// parent is multi-threaded, and `getpwuid`, `format!` and `CString::new` are
+/// none of those: `getpwuid` goes through NSS, which can `dlopen`, allocate and
+/// take locks the child may inherit held. This helper is single-threaded at the
+/// fork, so the previous version was not deadlocking, but it depended on that
+/// staying true and on a SAFETY comment that was false as written (#363).
+///
+/// Self-referential by construction: `argv`/`envp` hold pointers into the
+/// `CString`s beside them. That is sound because a `CString`'s bytes live on the
+/// heap, so moving this struct moves the `Vec` headers and not the buffers the
+/// pointers name. Nothing may push to or reallocate the owning vectors after
+/// the pointers are taken, which is why they are private and built once.
+struct LaunchPlan {
+    _argv_owned: Vec<CString>,
+    _envp_owned: Vec<CString>,
+    argv: Vec<*const libc::c_char>,
+    envp: Vec<*const libc::c_char>,
+}
+
+impl LaunchPlan {
+    fn build(
+        exe: &CString,
+        read_fd: libc::c_int,
+        listen_fd: libc::c_int,
+        sock_path: &std::path::Path,
+    ) -> Result<Self, String> {
+        // The drop already happened, so this is the target user's uid, which is
+        // the one the wallet daemon must see.
+        // SAFETY: getuid() cannot fail and touches no memory we own.
+        let uid = unsafe { libc::getuid() };
+        let cstr = |what: &str, v: String| {
+            CString::new(v).map_err(|e| format!("{what} contains a NUL byte: {e}"))
+        };
+
+        let argv_owned = vec![
+            exe.clone(),
+            cstr("argv", "--pam-login".to_string())?,
+            cstr("pipe fd", read_fd.to_string())?,
+            cstr("socket fd", listen_fd.to_string())?,
+        ];
+
+        // Without LOGIN_ENV, ksecretd never calls checkPamModule() and its
+        // argument parser rejects --pam-login as an unknown option. Verified: it
+        // exits with "Unknown option 'pam-login'" when the variable is absent.
+        //
+        // The rest of the session environment (bus address, display) arrives
+        // later over the socket; ksecretd is written to wait for exactly that.
+        let envp_owned = vec![
+            cstr(
+                "wallet socket path",
+                format!("{LOGIN_ENV}={}", sock_path.display()),
+            )?,
+            cstr("runtime dir", format!("XDG_RUNTIME_DIR=/run/user/{uid}"))?,
+            cstr("home directory", format!("HOME={}", home_of(uid)))?,
+            cstr("user name", format!("USER={}", name_of(uid)))?,
+        ];
+
+        let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let mut envp: Vec<*const libc::c_char> = envp_owned.iter().map(|c| c.as_ptr()).collect();
+        envp.push(std::ptr::null());
+
+        Ok(Self {
+            _argv_owned: argv_owned,
+            _envp_owned: envp_owned,
+            argv,
+            envp,
+        })
+    }
+}
+
+/// The post-fork child: only `dup2`, `close`, `fcntl` and `execve`, all of them
+/// on the async-signal-safe list, all on buffers [`LaunchPlan`] already built.
+///
+/// # Safety
+///
+/// Runs between `fork` and `execve`. Callers must not add anything here that
+/// allocates, formats, panics or consults NSS.
 unsafe fn child_exec(
     exe: &CString,
     read_fd: libc::c_int,
     listen_fd: libc::c_int,
-    sock_path: &std::path::Path,
+    plan: &LaunchPlan,
 ) {
     // No privilege drop here: the parent already dropped, before it touched the
     // user-owned runtime directory at all.
@@ -405,37 +496,7 @@ unsafe fn child_exec(
     clear_cloexec(read_fd);
     clear_cloexec(listen_fd);
 
-    let arg0 = exe.clone();
-    let opt = CString::new("--pam-login").unwrap();
-    let a_pipe = CString::new(read_fd.to_string()).unwrap();
-    let a_sock = CString::new(listen_fd.to_string()).unwrap();
-    let argv = [
-        arg0.as_ptr(),
-        opt.as_ptr(),
-        a_pipe.as_ptr(),
-        a_sock.as_ptr(),
-        std::ptr::null(),
-    ];
-
-    // Without LOGIN_ENV, ksecretd never calls checkPamModule() and its argument
-    // parser rejects --pam-login as an unknown option. Verified: it exits with
-    // "Unknown option 'pam-login'" when the variable is absent.
-    let uid = libc::getuid();
-    let login = CString::new(format!("{LOGIN_ENV}={}", sock_path.display())).unwrap();
-    let runtime = CString::new(format!("XDG_RUNTIME_DIR=/run/user/{uid}")).unwrap();
-    let home = CString::new(format!("HOME={}", home_of(uid))).unwrap();
-    let user = CString::new(format!("USER={}", name_of(uid))).unwrap();
-    // The rest of the session environment (bus address, display) arrives later
-    // over the socket; ksecretd is written to wait for exactly that.
-    let envp = [
-        login.as_ptr(),
-        runtime.as_ptr(),
-        home.as_ptr(),
-        user.as_ptr(),
-        std::ptr::null(),
-    ];
-
-    libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr());
+    libc::execve(exe.as_ptr(), plan.argv.as_ptr(), plan.envp.as_ptr());
 }
 
 unsafe fn clear_cloexec(fd: libc::c_int) {
@@ -483,4 +544,86 @@ fn write_all(fd: libc::c_int, mut buf: &[u8]) -> Result<(), String> {
         buf = &buf[n as usize..];
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchPlan, LOGIN_ENV};
+    use std::ffi::{CStr, CString};
+
+    /// Read back an argv/envp array the way `execve` would: pointers until NULL.
+    ///
+    /// # Safety
+    /// `arr` must be a NUL-terminated array of valid C string pointers.
+    unsafe fn read_back(arr: &[*const libc::c_char]) -> Vec<String> {
+        let mut out = Vec::new();
+        for &p in arr {
+            if p.is_null() {
+                break;
+            }
+            out.push(CStr::from_ptr(p).to_string_lossy().into_owned());
+        }
+        out
+    }
+
+    /// The plan the child execs must be complete and NUL-terminated, because
+    /// the child can no longer build any of it (#363).
+    #[test]
+    fn the_plan_carries_a_terminated_argv_and_envp() {
+        let exe = CString::new("/usr/bin/kwalletd6").unwrap();
+        let plan = LaunchPlan::build(
+            &exe,
+            7,
+            9,
+            std::path::Path::new("/run/user/0/kwallet5.socket"),
+        )
+        .expect("plan builds");
+
+        // SAFETY: both arrays were just built NUL-terminated by `build`.
+        let (argv, envp) = unsafe { (read_back(&plan.argv), read_back(&plan.envp)) };
+
+        assert_eq!(
+            argv,
+            ["/usr/bin/kwalletd6", "--pam-login", "7", "9"],
+            "the fd numbers are passed positionally, so their order is the contract"
+        );
+        assert!(
+            plan.argv.last().is_some_and(|p| p.is_null())
+                && plan.envp.last().is_some_and(|p| p.is_null()),
+            "execve reads until NULL; without it, it walks off the end"
+        );
+        // ksecretd rejects --pam-login as an unknown option when LOGIN_ENV is
+        // absent, so its presence is load-bearing rather than cosmetic.
+        assert!(
+            envp.iter().any(|e| e.starts_with(&format!("{LOGIN_ENV}="))),
+            "wallet socket path missing from envp: {envp:?}"
+        );
+        for key in ["XDG_RUNTIME_DIR=", "HOME=", "USER="] {
+            assert!(
+                envp.iter().any(|e| e.starts_with(key)),
+                "{key} missing from envp: {envp:?}"
+            );
+        }
+    }
+
+    /// The struct is self-referential: `argv`/`envp` point into the `CString`s
+    /// held beside them. That is only sound because a `CString`'s bytes live on
+    /// the heap, so moving the struct moves the `Vec` headers and not the
+    /// buffers. The child dereferences these pointers after a fork, so if a
+    /// move ever invalidated them the failure would be a corrupt exec in a
+    /// process that cannot report anything.
+    #[test]
+    fn the_plans_pointers_survive_being_moved() {
+        let exe = CString::new("/usr/bin/kwalletd6").unwrap();
+        let plan = LaunchPlan::build(&exe, 3, 4, std::path::Path::new("/run/user/0/s.socket"))
+            .expect("plan builds");
+        // SAFETY: valid until `moved` is dropped.
+        let before = unsafe { read_back(&plan.argv) };
+
+        let moved = Box::new(plan);
+        // SAFETY: the heap buffers the pointers name did not move with the struct.
+        let after = unsafe { read_back(&moved.argv) };
+
+        assert_eq!(before, after, "moving the plan must not invalidate argv");
+    }
 }

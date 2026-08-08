@@ -100,8 +100,13 @@ mod tests {
             "--test-threads=1",
         ])
         .env("IRLUME_TEST_MEMLOCK_CHILD", "1");
-        // SAFETY: setrlimit is async-signal-safe; nothing else runs between
-        // fork and exec.
+        // SAFETY: nothing else runs between fork and exec, and this parent is
+        // single-threaded here, so the child inherits no lock held by another
+        // thread. Note setrlimit is NOT in POSIX.1-2024's async-signal-safe
+        // table nor in signal-safety(7); getrlimit(2) documents only MT-Safe.
+        // On Linux/glibc it is a thin syscall wrapper, which is why this is
+        // sound in practice, but that is a platform fact and not a standards
+        // guarantee, and the comment here used to claim the latter (#363).
         unsafe {
             cmd.pre_exec(|| {
                 let zero = libc::rlimit {

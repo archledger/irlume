@@ -351,14 +351,6 @@ const RETRY_SEAM_ALLOWANCE_MS: u64 = 10_000;
 /// kind is presence-retryable, so the grace window just captures again.
 const MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// True for the sudo/su family of PAM services, which take the shorter window.
-fn is_sudo_like(service: &str) -> bool {
-    matches!(
-        service,
-        "sudo" | "sudo-i" | "su" | "su-l" | "runuser" | "runuser-l"
-    )
-}
-
 /// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
 /// (testing); otherwise sudo/su and polkit get the short window (the user is
 /// already at the machine, and the KDE polkit agent re-runs the stack up to 3
@@ -372,8 +364,11 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
     {
         return v;
     }
-    match service {
-        Some(s) if is_sudo_like(s) || s == "polkit-1" || s == "polkit" => SUDO_GRACE_WINDOW_MS,
+    // From the shared table, not a local list. The list this replaced was
+    // missing `doas`, which is Elevation for the policy, so a doas prompt held
+    // the camera for the 15s login window instead of the 5s one (#362).
+    match service.and_then(irlume_common::pam_service::classify) {
+        Some(kind) if kind.wants_short_grace() => SUDO_GRACE_WINDOW_MS,
         _ => GRACE_WINDOW_MS,
     }
 }
@@ -4225,6 +4220,44 @@ mod tests {
         assert_eq!(grace_window_ms(Some("kde")), GRACE_WINDOW_MS);
         assert_eq!(grace_window_ms(Some("gdm-password")), GRACE_WINDOW_MS);
         assert_eq!(grace_window_ms(None), GRACE_WINDOW_MS);
+        assert_eq!(
+            grace_window_ms(Some("service-invented-tomorrow")),
+            GRACE_WINDOW_MS,
+            "an unrecognised service takes the long window, not a shortcut"
+        );
+    }
+
+    /// Every service the policy calls Elevation must also take the SHORT
+    /// window, which is the invariant the two hard-coded lists broke (#362).
+    ///
+    /// `doas` is the instance that was live: Elevation in
+    /// `biopolicy::classify`, absent from the grace list, so it held the camera
+    /// and the worker for 15s instead of 5s on a request this project already
+    /// classifies as terminal elevation. Walking the shared table rather than
+    /// naming doas alone means the next name added cannot reintroduce the split.
+    #[test]
+    fn every_elevation_and_consent_service_takes_the_short_window() {
+        let _g = env_guard();
+        std::env::remove_var("IRLUME_GRACE_MS");
+        use irlume_common::pam_service::{ServiceKind, SERVICES};
+        let mut checked = 0;
+        for (name, kind) in SERVICES {
+            let want = if kind.wants_short_grace() {
+                SUDO_GRACE_WINDOW_MS
+            } else {
+                GRACE_WINDOW_MS
+            };
+            assert_eq!(grace_window_ms(Some(name)), want, "{name} ({kind:?})");
+            checked += 1;
+        }
+        assert!(checked >= 30, "the table shrank to {checked} rows");
+        // The two that motivated this, named so a reader sees them.
+        assert_eq!(grace_window_ms(Some("doas")), SUDO_GRACE_WINDOW_MS);
+        assert_eq!(grace_window_ms(Some("polkit-1")), SUDO_GRACE_WINDOW_MS);
+        assert_eq!(
+            irlume_common::pam_service::classify("doas"),
+            Some(ServiceKind::Elevation)
+        );
     }
 
     #[test]

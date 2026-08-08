@@ -80,30 +80,28 @@ pub enum SessionState {
 }
 
 /// Classify a PAM service name into an [`OperationClass`].
+///
+/// The NAMES live in `irlume_common::pam_service`, shared with the grace-window
+/// and consent-instruction decisions that used to keep their own copies and had
+/// drifted (#362). What stays here is the part only this crate can answer: a
+/// greeter service that drives both a cold login and a live lock screen is
+/// split by session state.
 pub fn classify(service: &str, session: SessionState) -> OperationClass {
-    let s = service.trim().to_ascii_lowercase();
-    match s.as_str() {
-        // Lock screens (live session).
-        "kde" | "kde-fingerprint" | "kscreensaver" | "xscreensaver" | "gnome-screensaver"
-        | "swaylock" | "i3lock" | "hyprlock" => OperationClass::ScreenUnlock,
-        // Display-manager greeters (cold login), incl. GDM's separate
-        // fingerprint login service (`gdm-fingerprint`), same login class.
-        // `cosmic-greeter` (COSMIC / Pop!_OS) uses one service for both the cold
-        // login and the live lock screen, so the session state below is what
-        // separates its login from its screen-unlock.
-        "sddm" | "sddm-greeter" | "plasmalogin" | "gdm-password" | "gdm-fingerprint" | "gdm"
-        | "gdm3" | "lightdm" | "login" | "greetd" | "ly" | "cosmic-greeter" => match session {
+    use irlume_common::pam_service::ServiceKind;
+    match irlume_common::pam_service::classify(service) {
+        Some(ServiceKind::ScreenUnlock) => OperationClass::ScreenUnlock,
+        // `cosmic-greeter` (COSMIC / Pop!_OS) and `gdm-password` use one service
+        // for both the cold login and the live lock screen, so the session state
+        // is what separates them.
+        Some(ServiceKind::Greeter) => match session {
             SessionState::Warm => OperationClass::ScreenUnlock,
             SessionState::Cold => OperationClass::Login,
         },
-        // Elevation.
-        "sudo" | "sudo-i" | "su" | "su-l" | "doas" => OperationClass::Elevation,
-        // polkit's agent helper hardcodes pam_start("polkit-1", ...); "polkit"
-        // is kept for any downstream that renames the service file.
-        "polkit-1" | "polkit" => OperationClass::AppConsent,
-        // Remote / network: never satisfiable by face.
-        "sshd" | "remote" | "cockpit" => OperationClass::Remote,
-        _ => OperationClass::Unknown,
+        Some(ServiceKind::Elevation) => OperationClass::Elevation,
+        Some(ServiceKind::AppConsent) => OperationClass::AppConsent,
+        Some(ServiceKind::Remote) => OperationClass::Remote,
+        // Fails closed: `decide` maps Unknown to Deny.
+        None => OperationClass::Unknown,
     }
 }
 

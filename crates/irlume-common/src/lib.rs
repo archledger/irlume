@@ -15,6 +15,7 @@ pub mod config;
 pub mod dbglog;
 pub mod gkr_wire;
 pub mod memlock;
+pub mod pam_service;
 pub mod platform;
 pub mod secureboot;
 pub mod thirdparty;

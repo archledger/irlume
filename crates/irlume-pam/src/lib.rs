@@ -281,10 +281,17 @@ impl PamServiceModule for IrlumePam {
             // to be a hardcoded string naming both gestures, which told a
             // `closure`-only user to nod at a gate that would not accept a nod: the
             // failure `ConsentGesture` was introduced to prevent.
-            let is_polkit = matches!(
-                pamh.get_service().ok().flatten().and_then(|c| c.to_str().ok().map(str::to_string)),
-                Some(ref s) if s == "polkit-1" || s == "polkit"
-            );
+            // From the shared table, so this cannot drift from the class the
+            // daemon enforces or the window the grace loop uses (#362). Out of
+            // step, this produces the worst version of the bug: a mandatory
+            // gesture the user is never told to make.
+            let is_polkit = pamh
+                .get_service()
+                .ok()
+                .flatten()
+                .and_then(|c| c.to_str().ok().map(str::to_string))
+                .and_then(|s| irlume_common::pam_service::classify(&s))
+                .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
             if is_polkit && !unseal {
                 let how = irlume_common::config::consent_gesture_mode().instruction("approve");
                 let _ = pamh.conv(

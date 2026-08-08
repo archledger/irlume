@@ -2923,11 +2923,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // clears a stale id when the current node has no USB descriptor.
             let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
             let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
-            if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "rgb_id", &rgb_id))
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir_id", &ir_id))
-            {
+            // Publish all four keys in ONE atomic rename. Four separate
+            // `write_kv` calls published the pin four times, so a reader racing
+            // the sequence, or a write failing partway (a full disk after the
+            // RGB write), could leave one camera's RGB path bound to another's
+            // IR path and identities. `write_camera_pin` builds the whole file
+            // once and renames it into place, so the pin lands whole or not at
+            // all.
+            if let Err(e) = irlume_common::config::write_camera_pin(&rgb, &ir, &rgb_id, &ir_id) {
                 msg = format!("{msg} (live only; could not persist: {e})");
             }
             eprintln!("irlumed: {msg}");

@@ -76,6 +76,58 @@ for unit_path in "${units[@]}"; do
   done
 done
 
+# Every model the shipped unit NAMES must actually be INSTALLED by every lane.
+#
+# The units check above greps for a filename anywhere in the manifest, which is
+# not the same question. The Arch PKGBUILD downloaded face_landmarks_detector
+# .tflite, listed it in source=(), staged it in prepare(), installed the TFLite
+# RUNTIME, and never installed the MODEL; the filename was present twice, so a
+# name grep was satisfied while `IRLUME_MESH_MODEL` pointed at a file the
+# package did not ship (#360). Being absent is silent: Engine::with_mesh treats
+# a missing path as a no-op and returns Ok, so the daemon starts and passive
+# liveness, the closure gesture and the BlazeFace rescue just stop working.
+#
+# So this looks for the filename next to the lane's INSTALL DESTINATION, within
+# a two-line window because two lanes wrap the install across a continuation.
+echo "== models named by the unit are installed by every lane =="
+unit=packaging/systemd/irlumed.service
+models=$(sed -n 's/.*IRLUME_[A-Z_]*MODEL=\([^"]*\).*/\1/p' "$unit" | xargs -r -n1 basename | sort -u)
+if [ -z "$models" ]; then
+  echo "  ERROR: no IRLUME_*_MODEL entries found in $unit; has the unit changed shape?"
+  exit 1
+fi
+# Where each lane writes its payload. A filename that never appears beside one
+# of these is named but not shipped.
+dest_for() {
+  case "$1" in
+    packaging/fedora/irlume.spec)  echo '%{buildroot}' ;;
+    packaging/arch/PKGBUILD)       echo '$pkgdir' ;;
+    packaging/debian/nfpm.yaml)    echo 'dst:' ;;
+    packaging/ppa/debian/rules)    echo 'debian/irlume' ;;
+    *)                             echo '' ;;
+  esac
+}
+for model in $models; do
+  for lane in "${LANES[@]}"; do
+    dest="$(dest_for "$lane")"
+    if grep -F -A1 -- "$model" "$lane" | grep -qF -- "$dest"; then
+      printf '  ok    %-34s %s\n' "$model" "$lane"
+    else
+      printf '  MISS  %-34s %s (named but not installed)\n' "$model" "$lane"
+      fail=1
+    fi
+  done
+  # Nix installs models by extension glob rather than by name, so ask the
+  # question its own way: is this file fetched, and is its extension copied?
+  ext="${model##*.}"
+  if grep -qF -- "$model" nix/package.nix && grep -qE "\*\.$ext\"? +\"?\\\$out" nix/package.nix; then
+    printf '  ok    %-34s %s\n' "$model" nix/package.nix
+  else
+    printf '  MISS  %-34s %s (named but not installed)\n' "$model" nix/package.nix
+    fail=1
+  fi
+done
+
 echo
 echo "== version agreement =="
 cargo_v="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"

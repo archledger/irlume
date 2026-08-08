@@ -24,10 +24,14 @@ All notable changes to irlume are documented here. This project adheres to
   exist and marking the railed ones absent separates it rather than erasing it.
   This is the shape #222 named after measuring all three supported modules.
 
-  #237's exposure gate cannot catch it: on those railed records the FACE region
-  clipped 0.42% to 1.57%, far below `IR_SATURATED_FRAC_MAX` (0.10), because a
-  specular blob inside a 17x17 eye window is a rounding error against a whole
-  face. `Signals::ir_eye_glint` is now `Option<f32>`, `None` for a railed peak,
+  #237's exposure gate mostly cannot catch it, because a specular blob inside a
+  17x17 eye window is a rounding error against a whole face region. Of the 24
+  railed records across both corpora, 22 clip 0.42% to 7.70% of the face, under
+  `IR_SATURATED_FRAC_MAX` (0.10), and are judged normally. The other two are
+  `live_close` captures clipping 30.5% and 54.7%, which that gate already
+  refuses as `Uncertain` for whole-face blowout: a different failure from the
+  one #222 names, and the reason this is a distinct defect rather than a
+  duplicate. `Signals::ir_eye_glint` is now `Option<f32>`, `None` for a railed peak,
   a missing IR face, or the RGB-only path; the corpus writes `ir_glint: null`
   and a new `cues.glint_readable` separates "read and dim" from "not readable".
   No threshold moved: `GLINT_MIN` stays 180, and the ceiling comes from

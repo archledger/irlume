@@ -2330,6 +2330,47 @@ mod tests {
     /// `Signals::face_frac`). This test pins the current contract that
     /// `face_frac` remains observational and cannot change a verdict until
     /// a distance-aware rule is separately derived and reviewed.
+    #[test]
+    fn face_frac_changes_no_verdict() {
+        let gate = LivenessGate::new();
+        // Across the framing guide's whole accepted band and past both ends.
+        for frac in [0.0, 0.05, 0.12, 0.3, 0.55, 0.9] {
+            let mut live = live_signals();
+            live.face_frac = frac;
+            assert_eq!(
+                gate.evaluate(&live).0,
+                Verdict::Live,
+                "a live face must stay Live at face_frac {frac}"
+            );
+            // And the same on the spoof side: a flat target does not become
+            // live by sitting closer, nor a live face a spoof by sitting back.
+            let mut flat = live_signals();
+            flat.face_frac = frac;
+            flat.ir_center_edge_ratio = 1.0; // flat
+            assert_ne!(
+                gate.evaluate(&flat).0,
+                Verdict::Live,
+                "a flat target must not pass at face_frac {frac}"
+            );
+        }
+    }
+
+    /// The cue is still supporting-only. Making it honest must not promote it
+    /// into something decisive, on either evaluator.
+    #[test]
+    fn an_unreadable_glint_changes_no_verdict() {
+        let gate = LivenessGate::new();
+        for glint in [None, Some(0.0), Some(126.0), Some(255.0)] {
+            let mut live = live_signals();
+            live.ir_eye_glint = glint;
+            assert_eq!(
+                gate.evaluate(&live).0,
+                Verdict::Live,
+                "a live face must stay Live at glint {glint:?}"
+            );
+        }
+    }
+
     /// A railed eye peak records as ABSENT, and absent is not "present".
     ///
     /// The corpus this cue feeds is what any future re-derivation of
@@ -2364,47 +2405,6 @@ mod tests {
         let (_, cues, _) = gate.evaluate_ir_only(&dark);
         assert!(!cues.glint_present, "an absent glint is not a present one");
         assert!(!cues.glint_readable);
-    }
-
-    /// The cue is still supporting-only. Making it honest must not promote it
-    /// into something decisive, on either evaluator.
-    #[test]
-    fn an_unreadable_glint_changes_no_verdict() {
-        let gate = LivenessGate::new();
-        for glint in [None, Some(0.0), Some(126.0), Some(255.0)] {
-            let mut live = live_signals();
-            live.ir_eye_glint = glint;
-            assert_eq!(
-                gate.evaluate(&live).0,
-                Verdict::Live,
-                "a live face must stay Live at glint {glint:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn face_frac_changes_no_verdict() {
-        let gate = LivenessGate::new();
-        // Across the framing guide's whole accepted band and past both ends.
-        for frac in [0.0, 0.05, 0.12, 0.3, 0.55, 0.9] {
-            let mut live = live_signals();
-            live.face_frac = frac;
-            assert_eq!(
-                gate.evaluate(&live).0,
-                Verdict::Live,
-                "a live face must stay Live at face_frac {frac}"
-            );
-            // And the same on the spoof side: a flat target does not become
-            // live by sitting closer, nor a live face a spoof by sitting back.
-            let mut flat = live_signals();
-            flat.face_frac = frac;
-            flat.ir_center_edge_ratio = 1.0; // flat
-            assert_ne!(
-                gate.evaluate(&flat).0,
-                Verdict::Live,
-                "a flat target must not pass at face_frac {frac}"
-            );
-        }
     }
 
     #[test]

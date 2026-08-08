@@ -219,6 +219,15 @@ fn presentation_record(
         },
     );
     rec.insert("ir_exposure_ok".into(), cues.ir_exposure_ok.into());
+    // Recorded beside it so a row the gate never read is distinguishable from a
+    // row it read and found clean. Without this the corpus said "clean" for
+    // every frame on a camera whose format defines no ceiling, which is exactly
+    // the population any retune of IR_SATURATED_FRAC_MAX would be fitted on
+    // (#358).
+    rec.insert(
+        "ir_exposure_measured".into(),
+        cues.ir_exposure_measured.into(),
+    );
     rec.insert(
         "ir_center_edge_ratio".into(),
         crate::json_f32(s.ir_center_edge_ratio),

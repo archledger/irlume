@@ -508,12 +508,27 @@ pub fn presence_retryable(o: &Outcome) -> bool {
     )
 }
 
+/// Start of the reason irlume-liveness produces when the IR format defines no
+/// sensor ceiling. Pinned against that text by
+/// `an_unmeasurable_exposure_is_not_retryable`, the same way the `no face in IR`
+/// prefix below is pinned.
+const EXPOSURE_UNMEASURABLE_PREFIX: &str = "IR exposure unmeasurable";
+
 /// Kind of a non-Live cross-spectrum gate verdict on the RGB primary path.
 /// The `no face in IR` reason is singled out because it is the retryable
 /// RGB-yes/IR-no transient; the prefix is pinned against the string
 /// irlume-liveness produces by `grace_retries_only_presence_failures`.
 fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
     match verdict {
+        // Uncertain normally means framing or quality, which the grace window
+        // retries. An unmeasurable IR format is neither: it is a property of
+        // the camera that will hold for every frame, so retrying spends the
+        // whole window to reach the same answer while telling the user to
+        // adjust something that cannot help (#358). OtherDeny is the
+        // non-retryable class for a state refusal like this.
+        Verdict::Uncertain if reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX) => {
+            OutcomeKind::OtherDeny
+        }
         Verdict::Uncertain => OutcomeKind::Uncertain,
         Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
         Verdict::Spoof => OutcomeKind::Spoof,
@@ -1299,6 +1314,7 @@ impl Engine {
             face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
             // RGB-only path: no IR frame exists to clip.
             ir_saturated_frac: None,
+            ir_ceiling_known: false,
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
@@ -1707,6 +1723,10 @@ impl Engine {
                 ir_top.as_ref().map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
+            // Whether the FORMAT could be measured, which is not the same
+            // question as whether this capture produced a number: the call
+            // above also yields None when no face was found (#358).
+            ir_ceiling_known: ir_stats.white_level.is_some(),
             rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -4258,6 +4278,65 @@ mod tests {
             irlume_common::pam_service::classify("doas"),
             Some(ServiceKind::Elevation)
         );
+    }
+
+    /// An unmeasurable IR exposure must NOT be retried (#358).
+    ///
+    /// It arrives as `Verdict::Uncertain`, which is the retryable class, and
+    /// that is the trap: the condition is a property of the camera's negotiated
+    /// format, identical on every frame. Retrying spends the entire grace
+    /// window to reach the same answer and then falls back to the password
+    /// anyway, while the user is told to adjust something that cannot help.
+    #[test]
+    fn an_unmeasurable_exposure_is_not_retryable() {
+        use irlume_liveness::Verdict;
+        // Built from the real producer's wording, not a literal, so a reword in
+        // irlume-liveness that drops the prefix fails here instead of silently
+        // making the refusal retryable again.
+        let mut sig = irlume_liveness::Signals {
+            rgb_face: Some(irlume_liveness::FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face: Some(irlume_liveness::FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face_brightness: 90.0,
+            ir_center_edge_ratio: 1.2,
+            ir_eye_glint: 220.0,
+            ..Default::default()
+        };
+        sig.ir_ceiling_known = false;
+        let (verdict, _, reason) = irlume_liveness::LivenessGate::new().evaluate(&sig);
+        assert_eq!(verdict, Verdict::Uncertain, "precondition for this test");
+        assert!(
+            reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
+            "the prefix this routing keys on moved: {reason}"
+        );
+
+        let kind = liveness_deny_kind(verdict, &reason);
+        assert_eq!(
+            kind,
+            OutcomeKind::OtherDeny,
+            "must leave the retryable class"
+        );
+        assert!(
+            !presence_retryable(&denied(kind, &reason, false)),
+            "retrying an unmeasurable format burns the grace window for nothing"
+        );
+
+        // A blown-out frame IS still retryable: moving back really can fix it,
+        // so this change must not have swept the ordinary case out with it.
+        let mut blown = sig.clone();
+        blown.ir_ceiling_known = true;
+        blown.ir_saturated_frac = Some(0.9);
+        let (bv, _, br) = irlume_liveness::LivenessGate::new().evaluate(&blown);
+        let bk = liveness_deny_kind(bv, &br);
+        assert_eq!(bk, OutcomeKind::Uncertain, "{br}");
+        assert!(presence_retryable(&denied(bk, &br, false)), "{br}");
     }
 
     #[test]

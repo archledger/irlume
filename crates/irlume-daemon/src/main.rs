@@ -4072,6 +4072,9 @@ mod tests {
 
     #[test]
     fn root_and_self_authorized_others_denied() {
+        // `authorized_for` resolves a username, which reads the environment
+        // inside glibc; see `env_lock`.
+        let _g = env_lock();
         let root = Peer {
             uid: 0,
             gid: 0,
@@ -4087,6 +4090,9 @@ mod tests {
     // account; a peer with no local account gets no search at all.
     #[test]
     fn identify_scope_confines_non_root_peers_to_their_own_account() {
+        // `name_for_uid` is a passwd lookup, which reads the environment
+        // inside glibc; see `env_lock`.
+        let _g = env_lock();
         let peer = |uid| Peer {
             uid,
             gid: uid,
@@ -4501,9 +4507,135 @@ mod tests {
         WORKER_CLOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Serializes every test that touches the process environment.
+    ///
+    /// Taken by the tests that WRITE it, and equally by the tests that only
+    /// READ it, including the ones that never mention an environment variable
+    /// at all. `getpwnam_r` reads the environment inside glibc: on a systemd
+    /// host the lookup goes through `libnss_systemd`, whose `getenv` walks the
+    /// same `environ` array `setenv` reallocates. So a test resolving a
+    /// username races every test setting a variable, and it is the READER that
+    /// dies.
+    ///
+    /// Measured, not theorised: the ASAN lane caught it as a SEGV on a READ of
+    /// 0xffffffff00000000 inside `getenv`, under
+    /// `getpwnam_r` <- `users::uid_for_name` <- `uid_of` <- `authorized_for`
+    /// <- `pregate`, on a test thread while 40-odd `set_var`/`remove_var` calls
+    /// ran on other threads. It reproduces only under load, which is why it
+    /// arrived as an intermittently red pipeline rather than a failing test.
+    ///
+    /// The rule this encodes: a lock that only its writers take is no
+    /// exclusion at all. Any test that reaches a username lookup takes this
+    /// too, whatever it thinks it is testing.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Every test that reaches a passwd lookup holds [`env_lock`].
+    ///
+    /// Pins the RULE, not one instance of it, because the failure mode is a
+    /// NEW test added later that resolves a username and takes no lock. No
+    /// behavioural test can catch that: the race needs a concurrent writer and
+    /// enough load to lose, so it surfaces as an unrelated pipeline going red
+    /// once in a while, which is how it reached us.
+    #[test]
+    fn every_test_that_resolves_a_user_holds_the_env_lock() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("read the daemon source");
+        // The calls that end in glibc's getpwnam_r/getpwuid_r.
+        let readers = [
+            "pregate(",
+            "authorized_for(",
+            "uid_of(",
+            "uid_for_name(",
+            "name_for_uid(",
+            "identify_scope(",
+        ];
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offenders = Vec::new();
+        let mut recursive = Vec::new();
+        let mut scanned = 0usize;
+        // Anchor on the attribute, then take the next `fn` line: attributes
+        // between the two (`#[ignore]`, `#[expect]`) are common here, so
+        // looking only at the line above would miss those tests silently.
+        for (n, _) in lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == "#[test]")
+        {
+            let Some(sig) = (n + 1..(n + 10).min(lines.len()))
+                .find(|&k| lines[k].trim_start().starts_with("fn "))
+            else {
+                continue;
+            };
+            let name = lines[sig]
+                .trim_start()
+                .trim_start_matches("fn ")
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let (mut depth, mut started, mut end) = (0i32, false, sig);
+            while end < lines.len() {
+                depth += lines[end].matches('{').count() as i32;
+                depth -= lines[end].matches('}').count() as i32;
+                if lines[end].contains('{') {
+                    started = true;
+                }
+                if started && depth <= 0 {
+                    break;
+                }
+                end += 1;
+            }
+            // Comment lines dropped first: these guards are explained in prose
+            // right where they are taken, so a body scanned raw reports the
+            // explanation as if it were the call.
+            let body = lines[sig..=end.min(lines.len() - 1)]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            scanned += 1;
+            // `enrollment_summary_test_lock()` RETURNS `env_lock()`, so a test
+            // holding it is already covered — and must not take it again, which
+            // would deadlock a non-reentrant mutex.
+            let takes_env = body.contains("env_lock()");
+            let takes_summary = body.contains("enrollment_summary_test_lock()");
+            if name != "every_test_that_resolves_a_user_holds_the_env_lock"
+                && takes_env
+                && takes_summary
+            {
+                recursive.push(format!("{name} (line {})", sig + 1));
+            }
+            let holds_the_lock = takes_env || takes_summary;
+            // This test names the readers in order to look for them.
+            if name != "every_test_that_resolves_a_user_holds_the_env_lock"
+                && readers.iter().any(|r| body.contains(r))
+                && !holds_the_lock
+            {
+                offenders.push(format!("{name} (line {})", sig + 1));
+            }
+        }
+        assert!(
+            scanned > 50,
+            "expected to walk the daemon's tests, walked {scanned}"
+        );
+        assert!(
+            recursive.is_empty(),
+            "these tests take BOTH `env_lock()` and `enrollment_summary_test_lock()`. The second \
+             one RETURNS the first, and a std Mutex is not reentrant, so this deadlocks the whole \
+             suite the moment it runs. Keep one:\n{}",
+            recursive.join("\n")
+        );
+        assert!(
+            offenders.is_empty(),
+            "these tests resolve a username without holding env_lock(). A passwd lookup reads \
+             the environment inside glibc, so it races the tests that write it and dies in \
+             getenv. Add `let _g = env_lock();`:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]
@@ -4793,6 +4925,9 @@ mod tests {
 
     #[test]
     fn pregate_screens_the_username_of_every_user_bearing_variant() {
+        // `pregate` resolves a username, which reads the environment inside
+        // glibc; see `env_lock`.
+        let _g = env_lock();
         // Root, so authorization can never be what refuses: whatever comes
         // back is the traversal screen or nothing at all.
         let root = peer(0);
@@ -4813,6 +4948,9 @@ mod tests {
 
     #[test]
     fn pregate_enforces_the_privilege_every_variant_declares() {
+        // `pregate` resolves a username, which reads the environment inside
+        // glibc; see `env_lock`.
+        let _g = env_lock();
         // NOBODY owns no account, so it is neither root nor SAMPLE_USER.
         let stranger = peer(NOBODY);
         for req in request_samples() {
@@ -4858,6 +4996,9 @@ mod tests {
     /// no other test pins them.
     #[test]
     fn root_only_refusals_name_the_command_an_operator_would_recognize() {
+        // `pregate` resolves a username, which reads the environment inside
+        // glibc; see `env_lock`.
+        let _g = env_lock();
         let stranger = peer(NOBODY);
         for (req, command) in [
             (Request::TuneCaptureMode { rounds: None }, "camera-tune"),
@@ -4888,6 +5029,9 @@ mod tests {
     /// response variant it does not know (#93).
     #[test]
     fn a_listing_refusal_is_typed_only_when_the_client_asked() {
+        // `pregate` resolves a username, which reads the environment inside
+        // glibc; see `env_lock`.
+        let _g = env_lock();
         let stranger = peer(NOBODY);
         let typed = pregate(
             &Request::ListProfiles {
@@ -5021,6 +5165,9 @@ mod tests {
     /// asserting their type: both were the same error.
     #[test]
     fn an_unpublished_listing_reaches_the_worker_instead_of_erroring() {
+        // Covers the `name_for_uid` passwd lookup below too: this helper IS
+        // `env_lock()`, so taking it again here would deadlock on a
+        // non-reentrant mutex. See `env_lock`.
         let _summary_guard = enrollment_summary_test_lock();
         #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
@@ -5157,12 +5304,16 @@ mod tests {
             ),
             (
                 // Own-uid query: authorized, answered from files, no engine.
-                format!(
-                    "{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n",
+                format!("{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n", {
+                    // Held for the passwd lookup ALONE, not for the rest of
+                    // this test: the socket work below waits on timeouts,
+                    // and holding a suite-wide lock across that stalls every
+                    // other test that touches the environment. See `env_lock`.
+                    let _g = env_lock();
                     // SAFETY: getuid takes no arguments, reads only this process's own real
                     // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
-                ),
+                }),
                 Box::new(|r: &Response| matches!(r, Response::HasPassword(_))),
             ),
         ] {
@@ -5226,6 +5377,9 @@ mod tests {
 
     #[test]
     fn a_listing_serves_the_published_summary_and_misses_queue_to_the_worker() {
+        // Covers the `name_for_uid` passwd lookup below too: this helper IS
+        // `env_lock()`, so taking it again here would deadlock on a
+        // non-reentrant mutex. See `env_lock`.
         let _summary_guard = enrollment_summary_test_lock();
         #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let me = users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());

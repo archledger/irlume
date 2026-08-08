@@ -39,12 +39,16 @@ WatchdogSec=90s
 # claimed. Stated explicitly so nobody has to re-derive who may ping us.
 NotifyAccess=main
 # Cap the stop wait so a package-upgrade restart can never stall on the default
-# 90s if a request is mid-flight. There is NO SIGTERM handler: the daemon
-# installs no sigaction and the default disposition kills it, so this bounds how
-# long systemd waits before SIGKILL rather than describing a graceful drain. An
-# accepted-but-unanswered request is lost and its client falls back to the
-# password; one still in the socket backlog survives, because irlumed.socket
-# owns the listening fd across the restart.
+# 90s if a request is mid-flight. This bounds how long systemd waits before
+# SIGKILL; it does not describe a graceful drain, because the socket loop has no
+# signal handling and does not stop accepting on SIGTERM. An accepted but
+# unanswered request is lost, and its client falls back to the password.
+#
+# One handler DOES exist and is easy to mistake for a shutdown path: irlume-camera
+# installs SIGINT/SIGTERM/SIGHUP handlers around IR EMITTER DISCOVERY, scoped to
+# that operation and restored after it, so a stop landing mid-`ir-setup` puts the
+# camera control back instead of leaving it changed until the next capture. It
+# aborts that one operation; it drains nothing.
 TimeoutStopSec=10s
 
 # Sandboxing, layered UNDER the SELinux/AppArmor policies (defense in depth).

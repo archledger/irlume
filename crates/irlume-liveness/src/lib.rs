@@ -1200,9 +1200,12 @@ pub fn contrast_signature(samples: &[EarSample]) -> (f32, f32) {
 /// length and has near-open samples just before and after it. A static print's
 /// jitter is neither deep nor a coherent drop-and-recover; slow drifts (AE
 /// settling, squints) fail the pre/post near-open check or the run-length cap.
-/// Outcome of the shared blink analysis over a sample window. Both
-/// [`detect_blink`] (any blink → live) and [`detect_deliberate_closure`] (the
-/// held-closure consent gesture) derive from this, so the anti-spoof gates and dip
+/// Outcome of the blink analysis over a sample window, consumed by
+/// [`detect_blink`] and nothing else. The consent gesture that shipped is a
+/// HELD CLOSURE, and [`detect_deliberate_closure`] does not come through here:
+/// it walks the EAR samples against per-user calibrated thresholds directly.
+/// The comment this replaces named a `detect_double_blink` that has never
+/// existed, so it described a second consumer as well as a different gesture, so the anti-spoof gates and dip
 /// detection live in exactly one place.
 enum BlinkScan {
     /// No plausibly-open eye anywhere in the window (mesh failed / print / dark).

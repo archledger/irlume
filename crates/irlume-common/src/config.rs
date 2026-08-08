@@ -12,6 +12,12 @@ use std::path::PathBuf;
 /// Default config root.
 pub const CONFIG_ROOT: &str = "/etc/irlume";
 
+/// The config file that pins the camera pair (`rgb`, `ir`, `rgb_id`, `ir_id`)
+/// plus the per-camera capture mode. Named in one place so the reader
+/// ([`read_camera_pin`]) and the writer ([`write_camera_pin`]) cannot disagree
+/// on which file holds the pin.
+pub const CAMERAS_CONF: &str = "cameras.conf";
+
 fn config_root() -> PathBuf {
     std::env::var_os("IRLUME_CONFIG_DIR")
         .map(PathBuf::from)
@@ -112,65 +118,151 @@ pub fn read_kv(file: &str, key: &str) -> Option<String> {
     match observe_kv(file, key) {
         KvObservation::Value(v) => Some(v),
         KvObservation::Absent => None,
-        // A present-but-unreadable config (classically a wrong SELinux label)
-        // must NOT be ignored silently for the *daemon*: that sends it to
-        // auto-detect and it can bind the wrong device. Make it loud (daemon
-        // stderr ⇒ journald). But these files are deliberately root-only (0600),
-        // so an *unprivileged* CLI caller hitting Permission denied is expected,
-        // not a fault; the root daemon reads them fine. Warning there just
-        // alarms new users into needlessly loosening permissions. So: stay loud
-        // for root and for non-permission errors; stay quiet for the expected
-        // EACCES an ordinary user gets.
         KvObservation::Unknown(e) => {
-            // SAFETY: `geteuid` takes no arguments, reads only the calling
-            // process's own credentials, and is specified as always succeeding,
-            // so it has no preconditions for the caller to uphold.
-            let unprivileged_eacces =
-                e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0;
-            if !unprivileged_eacces {
-                let p = config_path(file);
-                eprintln!(
-                    "irlume: WARNING: config {p} exists but is unreadable ({e}); key '{key}' \
-                     ignored; check permissions / SELinux label (try: restorecon -v {p})",
-                    p = p.display(),
-                );
-            }
+            warn_unreadable(file, &format!("key '{key}'"), &e);
             None
         }
     }
+}
+
+/// Warn (or stay quiet) when a config file exists but could not be read.
+///
+/// A present-but-unreadable config (classically a wrong SELinux label) must NOT
+/// be ignored silently for the *daemon*: that sends it to auto-detect and it
+/// can bind the wrong device. Make it loud (daemon stderr ⇒ journald). But these
+/// files are deliberately root-only (0600), so an *unprivileged* CLI caller
+/// hitting Permission denied is expected, not a fault; the root daemon reads
+/// them fine. Warning there just alarms new users into needlessly loosening
+/// permissions. So: stay loud for root and for non-permission errors; stay quiet
+/// for the expected EACCES an ordinary user gets. `ignored` names what the caller
+/// gave up on, e.g. `key 'rgb'` or `keys rgb, ir`. Factored out of [`read_kv`] so
+/// the single-key and multi-key readers cannot drift on that policy.
+fn warn_unreadable(file: &str, ignored: &str, e: &std::io::Error) {
+    // SAFETY: `geteuid` takes no arguments, reads only the calling process's own
+    // credentials, and is specified as always succeeding, so it has no
+    // preconditions for the caller to uphold.
+    let unprivileged_eacces =
+        e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0;
+    if unprivileged_eacces {
+        return;
+    }
+    let p = config_path(file);
+    eprintln!(
+        "irlume: WARNING: config {p} exists but is unreadable ({e}); {ignored} ignored; \
+         check permissions / SELinux label (try: restorecon -v {p})",
+        p = p.display(),
+    );
+}
+
+/// Read several keys from a `key=value` file in ONE read, returning one slot per
+/// requested key in order (each `Some(trimmed)` for a present non-empty value,
+/// `None` for absent/empty), matching [`observe_kv`]'s per-key rules.
+///
+/// The point is the single read. A caller that wants a group of keys as one
+/// value must NOT open the file once per key: a writer that replaces the file
+/// (an atomic rename) between two of those opens hands the caller a value from
+/// the old version and a value from the new one, a pair that was never written
+/// as a unit. `rename(2)` guarantees each *open* sees a whole file, not that N
+/// separate opens see the same one. Reading every key from a single snapshot is
+/// what makes the group whole. See [`read_camera_pin`].
+pub fn read_kvs(file: &str, keys: &[&str]) -> Vec<Option<String>> {
+    let mut out = vec![None; keys.len()];
+    let text = match std::fs::read_to_string(config_path(file)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            warn_unreadable(file, &format!("keys {}", keys.join(", ")), &e);
+            return out;
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        // First non-empty occurrence wins, like `observe_kv`; a later duplicate
+        // of the same key does not override it.
+        if let Some(idx) = keys.iter().position(|want| *want == k.trim()) {
+            if out[idx].is_none() {
+                out[idx] = Some(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Apply `updates` (`(key, value)` pairs) to the lines of `existing`: replace
+/// the first line for each key in place, drop any later duplicates of those
+/// keys, keep every other line and comment untouched, and append any key not
+/// already present, in the order given. Pure (no I/O), so [`write_kv`] and
+/// [`write_kvs`] share exactly one parse and cannot drift on it.
+fn apply_kv_updates(existing: &str, updates: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut written = vec![false; updates.len()];
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        // A comment is never a target. Otherwise, if this line sets one of the
+        // keys we are updating, `target` is which one.
+        let target = if trimmed.starts_with('#') {
+            None
+        } else if let Some((k, _)) = trimmed.split_once('=') {
+            updates.iter().position(|(uk, _)| *uk == k.trim())
+        } else {
+            None
+        };
+        if let Some(idx) = target {
+            if !written[idx] {
+                out.push_str(&format!("{}={}\n", updates[idx].0, updates[idx].1));
+                written[idx] = true;
+            }
+            continue; // drop duplicates and superseded lines
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for (idx, (k, v)) in updates.iter().enumerate() {
+        if !written[idx] {
+            out.push_str(&format!("{k}={v}\n"));
+        }
+    }
+    out
 }
 
 /// Insert or update `key=value`, preserving every other line (including
 /// comments) and dropping duplicate keys. Creates the file at 0600 if absent.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
+    write_kvs(file, &[(key, val)])
+}
+
+/// Insert or update several keys in ONE atomic publish, preserving every other
+/// line (including comments) and dropping duplicate keys. Creates the file at
+/// 0600 if absent.
+///
+/// The whole point over calling [`write_kv`] in a loop is that the group lands
+/// as a unit. Each `write_kv` reads the file, rewrites it, and renames a new
+/// version over the old, so four `write_kv` calls publish four times: a reader
+/// (or a partial failure, say a full disk on the third call) can land between
+/// them and leave keys that belong together split across two versions of the
+/// file. Building the whole updated text once and publishing it in a single
+/// [`crate::write_0600_atomic`] rename means a reader sees either the complete
+/// old file or the complete new one, and a failure rolls the whole group back
+/// because nothing was renamed. See [`write_camera_pin`].
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn write_kvs(file: &str, updates: &[(&str, &str)]) -> std::io::Result<()> {
     let path = config_path(file);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-
-    let mut out = String::new();
-    let mut replaced = false;
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        let is_target = !trimmed.starts_with('#')
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(k, _)| k.trim() == key);
-        if is_target {
-            if !replaced {
-                out.push_str(&format!("{key}={val}\n"));
-                replaced = true;
-            }
-            continue; // drop duplicates
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !replaced {
-        out.push_str(&format!("{key}={val}\n"));
-    }
+    let out = apply_kv_updates(&existing, updates);
 
     // Published atomically, not truncated in place. Truncate-then-write means a
     // full disk or a power loss mid-write leaves a partial file, and these hold
@@ -180,6 +272,64 @@ pub fn write_kv(file: &str, key: &str, val: &str) -> std::io::Result<()> {
     // directory, so a reader sees either the whole old file or the whole new
     // one, and the same helper already protects the envelopes and template keys.
     crate::write_0600_atomic(&path, out.as_bytes())
+}
+
+/// The camera pin read as one value: the RGB and IR node paths and their
+/// optional device identities (`vid:pid:serial`). Each field is `Some(trimmed)`
+/// for a present non-empty key and `None` otherwise, matching [`read_kv`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CameraPin {
+    /// The pinned RGB node path.
+    pub rgb: Option<String>,
+    /// The pinned IR node path.
+    pub ir: Option<String>,
+    /// The RGB node's stable device identity, when it was recorded.
+    pub rgb_id: Option<String>,
+    /// The IR node's stable device identity, when it was recorded.
+    pub ir_id: Option<String>,
+}
+
+/// Read the camera pin from a SINGLE snapshot of `cameras.conf`.
+///
+/// The four keys are the anti-injection binding: the point of pinning
+/// `vid:pid:serial` next to each path is that the RGB and IR nodes are known to
+/// belong to one physical camera. Reading them with four separate opens lets a
+/// repin landing between two of the opens combine an RGB path from the old pin
+/// with an IR path or identity from the new one, so a caller would evaluate a
+/// pair that was never written. `flock` does not help: it is advisory, so it
+/// only constrains other lock takers, and the readers do not (and should not
+/// have to) take it. One read of the whole file is what keeps the pin whole.
+pub fn read_camera_pin() -> CameraPin {
+    // One read of the file. `read_kvs` returns one slot per key, in the order
+    // asked for, so the four values come back rgb, ir, rgb_id, ir_id.
+    let mut vals = read_kvs(CAMERAS_CONF, &["rgb", "ir", "rgb_id", "ir_id"]).into_iter();
+    CameraPin {
+        rgb: vals.next().flatten(),
+        ir: vals.next().flatten(),
+        rgb_id: vals.next().flatten(),
+        ir_id: vals.next().flatten(),
+    }
+}
+
+/// Publish the camera pin (all four keys) in ONE atomic rename.
+///
+/// Replaces four chained [`write_kv`] calls, which published the pin four times
+/// and could leave `cameras.conf` holding one camera's RGB path with another's
+/// IR path if a reader raced the sequence or a later write failed. An empty
+/// `rgb_id`/`ir_id` clears a stale identity, exactly as the per-key writes did.
+/// The `capture_mode` keys in the same file are untouched: the write rewrites
+/// only the keys it is given.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn write_camera_pin(rgb: &str, ir: &str, rgb_id: &str, ir_id: &str) -> std::io::Result<()> {
+    write_kvs(
+        CAMERAS_CONF,
+        &[
+            ("rgb", rgb),
+            ("ir", ir),
+            ("rgb_id", rgb_id),
+            ("ir_id", ir_id),
+        ],
+    )
 }
 
 /// The settings.conf key for the credential-release temporal-liveness gate.
@@ -517,6 +667,182 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_camera_pin_publishes_four_keys_and_leaves_other_lines_alone() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        // A pre-existing comment, a capture-mode key the pin writer must not
+        // touch, and stale rgb/ir lines to be replaced in place.
+        std::fs::write(
+            config_path("cameras.conf"),
+            "# operator notes\ncapture_mode=sequential\nrgb=/dev/videoOLD\nir=/dev/videoOLDIR\n",
+        )
+        .unwrap();
+
+        write_camera_pin("/dev/video0", "/dev/video2", "1d6b:0002:S1", "1d6b:0003:S1").unwrap();
+
+        let pin = read_camera_pin();
+        assert_eq!(pin.rgb.as_deref(), Some("/dev/video0"));
+        assert_eq!(pin.ir.as_deref(), Some("/dev/video2"));
+        assert_eq!(pin.rgb_id.as_deref(), Some("1d6b:0002:S1"));
+        assert_eq!(pin.ir_id.as_deref(), Some("1d6b:0003:S1"));
+
+        let text = std::fs::read_to_string(config_path("cameras.conf")).unwrap();
+        assert!(text.contains("# operator notes"), "comment preserved");
+        assert_eq!(
+            read_kv("cameras.conf", "capture_mode").as_deref(),
+            Some("sequential"),
+            "an unrelated key in the same file is not disturbed"
+        );
+        // Exactly one line per pin key: the stale rgb/ir were replaced, not
+        // appended alongside.
+        for k in ["rgb", "ir", "rgb_id", "ir_id"] {
+            assert_eq!(
+                text.matches(&format!("{k}=")).count(),
+                1,
+                "key {k} must appear once"
+            );
+        }
+        assert!(!text.contains("/dev/videoOLD"), "old paths are gone");
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_camera_pin_with_empty_identity_clears_a_stale_one() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-pinclr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        write_camera_pin("/dev/video0", "/dev/video2", "1d6b:0002:S1", "1d6b:0003:S1").unwrap();
+        // Repin to nodes with no USB descriptor: empty ids must clear, not keep,
+        // the old identity, so a reader does not re-anchor to the wrong sensor.
+        write_camera_pin("/dev/video4", "/dev/video6", "", "").unwrap();
+
+        let pin = read_camera_pin();
+        assert_eq!(pin.rgb.as_deref(), Some("/dev/video4"));
+        assert_eq!(pin.ir.as_deref(), Some("/dev/video6"));
+        assert_eq!(pin.rgb_id, None, "empty id reads back as absent");
+        assert_eq!(pin.ir_id, None, "empty id reads back as absent");
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_camera_pin_of_a_missing_file_is_all_absent() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-pinabs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        assert_eq!(read_camera_pin(), CameraPin::default());
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The property that makes the pin an anti-injection binding: a reader
+    /// racing a repin sees the complete old tuple or the complete new one, never
+    /// a mix. `read_camera_pin` reads the whole file once, so a rename between
+    /// what used to be four separate opens can no longer split the pin. The
+    /// harness the issue (#374) asked for: a reader thread in a tight loop while
+    /// the writer alternates between two full tuples. The `saw_a && saw_b`
+    /// assertion proves the writer actually raced the reader rather than the
+    /// reader finishing first and reading one static value. The two atomic
+    /// fsyncs inside each publish yield the CPU, so the reader interleaves even
+    /// on a single core. This test would trip on the old four-open reader.
+    #[test]
+    fn read_camera_pin_never_observes_a_torn_pair_under_concurrent_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-pinrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let pin_a = CameraPin {
+            rgb: Some("/dev/videoA0".into()),
+            ir: Some("/dev/videoA2".into()),
+            rgb_id: Some("aaaa:0001:AA".into()),
+            ir_id: Some("aaaa:0002:AA".into()),
+        };
+        let pin_b = CameraPin {
+            rgb: Some("/dev/videoB0".into()),
+            ir: Some("/dev/videoB2".into()),
+            rgb_id: Some("bbbb:0001:BB".into()),
+            ir_id: Some("bbbb:0002:BB".into()),
+        };
+        // Start on A so a reader that beats the writer still sees a valid tuple.
+        write_camera_pin(
+            "/dev/videoA0",
+            "/dev/videoA2",
+            "aaaa:0001:AA",
+            "aaaa:0002:AA",
+        )
+        .unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_r = Arc::clone(&done);
+        let (a, b) = (pin_a.clone(), pin_b.clone());
+        let reader = std::thread::spawn(move || {
+            let (mut saw_a, mut saw_b, mut reads) = (false, false, 0u64);
+            while !done_r.load(Ordering::Relaxed) {
+                let p = read_camera_pin();
+                reads += 1;
+                if p == a {
+                    saw_a = true;
+                } else if p == b {
+                    saw_b = true;
+                } else {
+                    panic!("torn camera pin observed after {reads} reads: {p:?}");
+                }
+            }
+            (saw_a, saw_b, reads)
+        });
+
+        for i in 0..400 {
+            if i % 2 == 0 {
+                write_camera_pin(
+                    "/dev/videoB0",
+                    "/dev/videoB2",
+                    "bbbb:0001:BB",
+                    "bbbb:0002:BB",
+                )
+                .unwrap();
+            } else {
+                write_camera_pin(
+                    "/dev/videoA0",
+                    "/dev/videoA2",
+                    "aaaa:0001:AA",
+                    "aaaa:0002:AA",
+                )
+                .unwrap();
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+
+        let (saw_a, saw_b, reads) = reader.join().expect("reader must not observe a torn pin");
+        assert!(reads > 0, "the reader loop must have run");
+        assert!(
+            saw_a && saw_b,
+            "the writer must have raced the reader (saw_a={saw_a}, saw_b={saw_b}, reads={reads})"
+        );
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

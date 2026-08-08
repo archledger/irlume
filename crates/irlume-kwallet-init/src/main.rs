@@ -108,7 +108,8 @@ fn run(user: &str) -> Result<PathBuf, String> {
     let (status_read, status_write) = make_status_pipe()?;
 
     // Resolved HERE, in the parent, so the child between fork() and execve()
-    // does nothing but dup2/close/execve on buffers that already exist (#363).
+    // does nothing but open/dup2/close/fcntl/execve on buffers that already
+    // exist (#363).
     // It used to call getpwuid, format! and CString::new down there. This
     // process is single-threaded at the fork, which is why that never
     // deadlocked, but getpwuid goes through NSS (dlopen, allocation, locks) and
@@ -385,10 +386,6 @@ fn make_pipe() -> Result<(libc::c_int, libc::c_int), String> {
     Ok((fds[0], fds[1]))
 }
 
-/// Drop to the target user and become the wallet daemon.
-///
-/// # Safety
-/// Must only be called in the child of a `fork()`, before any other work.
 /// Everything `execve` needs, built in the PARENT before `fork`.
 ///
 /// The child of a fork may call only async-signal-safe functions when the
@@ -462,8 +459,9 @@ impl LaunchPlan {
     }
 }
 
-/// The post-fork child: only `dup2`, `close`, `fcntl` and `execve`, all of them
-/// on the async-signal-safe list, all on buffers [`LaunchPlan`] already built.
+/// The post-fork child: only `open`, `dup2`, `close`, `fcntl` and `execve`,
+/// every one of them on the POSIX async-signal-safe list, all operating on
+/// buffers [`LaunchPlan`] already built.
 ///
 /// # Safety
 ///
@@ -606,24 +604,37 @@ mod tests {
         }
     }
 
-    /// The struct is self-referential: `argv`/`envp` point into the `CString`s
-    /// held beside them. That is only sound because a `CString`'s bytes live on
-    /// the heap, so moving the struct moves the `Vec` headers and not the
-    /// buffers. The child dereferences these pointers after a fork, so if a
-    /// move ever invalidated them the failure would be a corrupt exec in a
-    /// process that cannot report anything.
+    /// `argv`/`envp` must point at the `CString`s the plan OWNS, not at
+    /// anything temporary.
+    ///
+    /// The first version of this test moved the plan into a `Box` and compared
+    /// the strings read back before and after. That could not fail: if the
+    /// pointers ever did dangle it would be reading freed memory, which
+    /// typically still shows the old bytes, so it would have "proved"
+    /// soundness by committing the undefined behaviour it was checking for
+    /// (#363 review).
+    ///
+    /// Pointer IDENTITY is checkable without dereferencing anything. It catches
+    /// the mistake that would actually be made here: building the arrays from a
+    /// temporary rather than from the owned vectors. That a `CString`'s heap
+    /// buffer does not move when the struct moves is a language guarantee, not
+    /// something a test can establish.
     #[test]
-    fn the_plans_pointers_survive_being_moved() {
+    fn the_plans_pointers_name_the_strings_it_owns() {
         let exe = CString::new("/usr/bin/kwalletd6").unwrap();
         let plan = LaunchPlan::build(&exe, 3, 4, std::path::Path::new("/run/user/0/s.socket"))
             .expect("plan builds");
-        // SAFETY: valid until `moved` is dropped.
-        let before = unsafe { read_back(&plan.argv) };
 
-        let moved = Box::new(plan);
-        // SAFETY: the heap buffers the pointers name did not move with the struct.
-        let after = unsafe { read_back(&moved.argv) };
-
-        assert_eq!(before, after, "moving the plan must not invalidate argv");
+        assert_eq!(
+            plan.argv.len(),
+            plan._argv_owned.len() + 1,
+            "one pointer per owned string, plus the NULL"
+        );
+        for (i, owned) in plan._argv_owned.iter().enumerate() {
+            assert_eq!(plan.argv[i], owned.as_ptr(), "argv[{i}] left its owner");
+        }
+        for (i, owned) in plan._envp_owned.iter().enumerate() {
+            assert_eq!(plan.envp[i], owned.as_ptr(), "envp[{i}] left its owner");
+        }
     }
 }

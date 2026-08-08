@@ -70,6 +70,26 @@ mod tests {
     #[test]
     fn mlock_refusal_warns_and_continues() {
         if std::env::var("IRLUME_TEST_MEMLOCK_CHILD").is_ok() {
+            // Drop the limit HERE, after exec, rather than in a pre_exec hook.
+            // libtest runs every test on its own thread, so the parent is
+            // multi-threaded at the fork and a post-fork child may use only
+            // async-signal-safe calls; setrlimit is in neither POSIX's table nor
+            // signal-safety(7). Lowering our own limit in an ordinary process is
+            // plain libc usage with no such constraint (#363 review).
+            let zero = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `zero` is a fully initialised rlimit and the pointer is
+            // valid for the call; lowering one's own soft and hard
+            // RLIMIT_MEMLOCK is always permitted.
+            let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &zero) };
+            assert_eq!(
+                rc,
+                0,
+                "could not drop RLIMIT_MEMLOCK in the child: {}",
+                std::io::Error::last_os_error()
+            );
             let secret = vec![0x5a_u8; 4096];
             lock_slice(&secret);
             println!("survived-without-mlock");
@@ -90,7 +110,6 @@ mod tests {
             }
             return;
         }
-        use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe().unwrap();
         let mut cmd = std::process::Command::new(exe);
         cmd.args([
@@ -100,25 +119,6 @@ mod tests {
             "--test-threads=1",
         ])
         .env("IRLUME_TEST_MEMLOCK_CHILD", "1");
-        // SAFETY: nothing else runs between fork and exec, and this parent is
-        // single-threaded here, so the child inherits no lock held by another
-        // thread. Note setrlimit is NOT in POSIX.1-2024's async-signal-safe
-        // table nor in signal-safety(7); getrlimit(2) documents only MT-Safe.
-        // On Linux/glibc it is a thin syscall wrapper, which is why this is
-        // sound in practice, but that is a platform fact and not a standards
-        // guarantee, and the comment here used to claim the latter (#363).
-        unsafe {
-            cmd.pre_exec(|| {
-                let zero = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::setrlimit(libc::RLIMIT_MEMLOCK, &zero) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
         let out = cmd.output().unwrap();
         assert!(
             out.status.success(),

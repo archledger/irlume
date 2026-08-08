@@ -733,7 +733,35 @@ const CALIBRATION_ROUNDS_DEFAULT: usize = 3;
 /// glasses-on calibration classified both states, so a user who sometimes wears
 /// glasses should calibrate with them on. This is the interim guidance the
 /// measurement called for; holding more than one calibration per user is the
-/// robust fix and is still open.
+/// full fix and is still open.
+///
+/// # The direction this loosens, taken deliberately
+///
+/// This advice is a tradeoff, not a free win, and the cost lands on the user
+/// who calibrates with glasses and then authenticates without them.
+/// `closed_threshold` is `ear_closed + CLOSURE_DEEP_FRACTION * gap`, so the
+/// glasses-on pair (0.271 / 0.113) puts it at 0.160, while the bare-eyed pair
+/// (0.253 / 0.018) puts it at 0.088. Measured against the BARE-EYED range,
+/// 0.160 sits at openness fraction 0.61: about twice the 0.30 that
+/// [`irlume_liveness::CLOSURE_DEEP_FRACTION`] was validated at, whose own doc
+/// says the point of that number is to separate a held closure from a squint.
+///
+/// The same #173 session recorded an intermediate state that lands in the gap.
+/// The operator's excluded run, watching the terminal instead of the camera,
+/// read 0.07 to 0.16 "because looking down closes the measured eye shape".
+/// Every value in that band is under the glasses-on 0.160; only 0.07 to 0.088
+/// is under the bare-eyed 0.088. So a glance down at the keyboard held for the
+/// 11 to 25 face frames `detect_deliberate_closure` wants, followed by looking
+/// back up (bare-eyed open 0.246-0.254 clears the 0.208 reopen bar), can form a
+/// qualifying run under the glasses-on calibration and mostly cannot under the
+/// bare-eyed one. That path has no motion, glint, brightness or head-pose test.
+///
+/// It is still the right default, because the alternative is measured at 0 of 5
+/// genuine closures registering, which stops the gesture firing at all for a
+/// glasses wearer; that failure is fail-closed to the password, this one
+/// loosens a consent gate. The issue's own analysis compared only the two
+/// extremes and did not look at intermediate states, which is why this is
+/// written down here rather than left implied.
 fn closure_calibration_intro(rounds: usize) -> String {
     format!(
         "[calibrate] this teaches irlume your open/closed eye shape for the polkit\n            \

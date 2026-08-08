@@ -24,6 +24,41 @@ const MODEL_MANIFEST: &str = include_str!("../../../models/SHA256SUMS");
 
 /// Hash each configured model file and compare against the release manifest.
 /// Matching by digest (not filename) so packaging renames stay irrelevant.
+/// Whether `IRLUME_MODELS_STRICT` asks for the startup refusal.
+///
+/// Case-folded, and an unrecognised spelling is REPORTED rather than read as
+/// "off" (#365). This is an operator-facing tamper gate: `=True`, `=Yes` or
+/// `=enabled` used to disable it silently, so the daemon started with a missing
+/// or altered model instead of refusing, which is the outcome the strict branch
+/// exists to prevent. Unset stays off, because that is the documented default
+/// rather than a typo.
+///
+/// The stream is injected so a test can read what an operator would see instead
+/// of trusting that something was written.
+fn strict_requested(raw: Option<&str>, mut out: impl std::io::Write) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" | "" => false,
+        // An unreadable value means ON, not off (#365). The operator SET this
+        // variable, so the one thing we know is that they wanted the gate; the
+        // old answer disabled a tamper check because of a typo, which is the
+        // permissive direction on the security question. Refusing to start is
+        // loud and immediately fixable; starting with an unverified model is
+        // neither.
+        other => {
+            let _ = writeln!(
+                out,
+                "irlume: IRLUME_MODELS_STRICT={other:?} is not a boolean (expected \
+                 1/true/yes/on or 0/false/no/off); treating it as ON, because it was set"
+            );
+            true
+        }
+    }
+}
+
 /// Unknown weights WARN by default: operators legitimately deploy self-trained
 /// adapters, and refusing to start would turn a model swap into a lockout.
 /// `IRLUME_MODELS_STRICT=1` upgrades the warning to a startup refusal.
@@ -41,8 +76,15 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
         .lines()
         .filter_map(|l| l.split_whitespace().next())
         .collect();
-    let strict = std::env::var("IRLUME_MODELS_STRICT")
-        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
+    // Case-folded, and an unrecognised spelling is reported rather than read as
+    // "off" (#365). This is an operator-facing TAMPER gate: `=True`, `=Yes` or
+    // `=enabled` used to disable it silently, so the daemon started with a
+    // missing or altered model instead of refusing, which is the exact outcome
+    // the strict branch below exists to prevent.
+    let strict = strict_requested(
+        std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+        std::io::stderr(),
+    );
     let mut kept = None;
     for path in paths {
         let bytes = match std::fs::read(path) {
@@ -2923,11 +2965,11 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // clears a stale id when the current node has no USB descriptor.
             let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
             let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
-            if let Err(e) = irlume_common::config::write_kv("cameras.conf", "rgb", &rgb)
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir", &ir))
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "rgb_id", &rgb_id))
-                .and_then(|_| irlume_common::config::write_kv("cameras.conf", "ir_id", &ir_id))
-            {
+            // One operation under the file's own lock: the four writes were
+            // individually atomic and collectively not, so a reader could see a
+            // half-updated pair, and an unlocked rewrite could erase a locked
+            // writer's keys (#365).
+            if let Err(e) = irlume_common::config::write_camera_pin(&rgb, &ir, &rgb_id, &ir_id) {
                 msg = format!("{msg} (live only; could not persist: {e})");
             }
             eprintln!("irlumed: {msg}");
@@ -5602,6 +5644,47 @@ mod tests {
         note_worker_idle();
         std::thread::sleep(std::time::Duration::from_millis(70));
         assert!(!worker_wedged(short), "idle after a job is still healthy");
+    }
+
+    /// A tamper gate must not be switched off by a capitalisation (#365).
+    ///
+    /// `IRLUME_MODELS_STRICT` used to be matched case-sensitively against a
+    /// literal list, so `=True` read as "off" and the daemon started with a
+    /// missing or altered model instead of refusing.
+    #[test]
+    fn models_strict_accepts_any_casing_and_reports_what_it_cannot_read() {
+        for raw in ["1", "true", "TRUE", "True", " yes ", "on", "ON"] {
+            let mut out = Vec::new();
+            assert!(strict_requested(Some(raw), &mut out), "{raw} means on");
+            assert!(
+                out.is_empty(),
+                "{raw} should not warn: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+        for raw in ["0", "false", "FALSE", "no", "off", ""] {
+            let mut out = Vec::new();
+            assert!(!strict_requested(Some(raw), &mut out), "{raw} means off");
+            assert!(out.is_empty(), "{raw} should not warn");
+        }
+        // Unset is the documented default, not a typo, so it stays silent.
+        let mut out = Vec::new();
+        assert!(!strict_requested(None, &mut out));
+        assert!(out.is_empty());
+
+        // An unreadable value means ON, and says so. The operator SET the
+        // variable, so the permissive reading disabled a tamper gate over a
+        // typo, which is the wrong direction on a security question (#365).
+        for raw in ["enabled", "y", "strict", "2"] {
+            let mut out = Vec::new();
+            assert!(
+                strict_requested(Some(raw), &mut out),
+                "{raw} was set, so the gate stays on rather than silently off"
+            );
+            let warned = String::from_utf8_lossy(&out);
+            assert!(warned.contains("IRLUME_MODELS_STRICT"), "{raw}: {warned}");
+            assert!(warned.contains(raw), "must name the value: {warned}");
+        }
     }
 
     /// The #336 arithmetic gate: the longest stretch a defined capture failure

@@ -2060,18 +2060,23 @@ impl Engine {
         enr: &irlume_core::storage::Enrollment,
     ) -> (bool, Option<irlume_liveness::ClosureCalibration>) {
         let mode = consent_gesture_mode();
-        let allow_nod = mode != ConsentGesture::Closure;
-        let closure_cal = (mode != ConsentGesture::Nod && self.mesh.is_some())
-            .then(|| {
-                enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
-                    let cal = irlume_liveness::ClosureCalibration {
-                        ear_open,
-                        ear_closed,
-                    };
-                    cal.is_usable().then_some(cal)
-                })
+        // Positive membership, not `!= Closure` / `!= Nod`. Those read as YES
+        // for any state that is neither, so `Misconfigured` would have enabled
+        // BOTH gestures, which is the failure this state exists to prevent
+        // (#365).
+        let allow_nod = matches!(mode, ConsentGesture::Nod | ConsentGesture::Either);
+        let closure_cal = (matches!(mode, ConsentGesture::Closure | ConsentGesture::Either)
+            && self.mesh.is_some())
+        .then(|| {
+            enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
+                let cal = irlume_liveness::ClosureCalibration {
+                    ear_open,
+                    ear_closed,
+                };
+                cal.is_usable().then_some(cal)
             })
-            .flatten();
+        })
+        .flatten();
         (allow_nod, closure_cal)
     }
 
@@ -2365,6 +2370,12 @@ impl Engine {
                 // `ConsentGesture::instruction`: a denial is the worst possible
                 // moment to offer the gesture that needs a calibration to work.
                 ConsentGesture::Either => "keep nodding your head to approve",
+                // No gesture is enabled, so no gesture could have been seen and
+                // none is worth suggesting. Name the setting: the person who can
+                // clear this is whoever typed it (#365).
+                ConsentGesture::Misconfigured => {
+                    "consent_gesture is set to a value irlume does not recognise                      (expected nod or closure); use your password"
+                }
             }))
         }
     }

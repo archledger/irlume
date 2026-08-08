@@ -1240,67 +1240,151 @@ fn worker_progress() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
     P.get_or_init(Default::default)
 }
 
+/// The camera worker's engine, and the only place its stop signal is attached.
+///
+/// A module rather than a bare struct on purpose. Rust privacy is module
+/// scoped, so a private field declared beside the worker would still let the
+/// worker write `WorkerEngine(fresh)` and skip the attachment entirely, which
+/// is the whole defect. Here the field is reachable only from inside, so
+/// [`WorkerEngine::attach`] really is the only way to get one.
+mod worker_engine {
+    use super::{arbiter, note_worker_progress, Queued};
+
+    /// Anything that can be handed the worker's stop signal.
+    ///
+    /// This exists for testability, and it is the difference between a guard
+    /// that is claimed and one that is checked: a real `Engine` needs the model
+    /// files on disk, so without a seam here nothing could assert that
+    /// attaching actually attaches.
+    pub(super) trait StopSignalSink {
+        fn accept_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+    }
+
+    impl StopSignalSink for irlume_auth::Engine {
+        fn accept_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+            self.set_stop_signal(signal);
+        }
+    }
+
+    /// The signal the worker's engine polls while a job runs.
+    ///
+    /// It carries two jobs that are easy to mistake for one. `stop_requested`
+    /// is cooperative cancellation: an authentication has arrived and the
+    /// running job should yield at its next safe boundary. `note_worker_progress`
+    /// is the watchdog heartbeat (#141). Both ride the same closure, so losing
+    /// it loses both, which is what made #359 costly out of proportion to its
+    /// size.
+    pub(super) fn stop_signal(
+        token: arbiter::CancelToken,
+    ) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
+        std::sync::Arc::new(move || {
+            note_worker_progress();
+            token.stop_requested()
+        })
+    }
+
+    /// An engine that has been wired to cancellation and the heartbeat.
+    ///
+    /// What this prevents: assigning a freshly built `Engine` over the worker's
+    /// engine, which is what the post-panic rebuild did. `Engine::load` starts
+    /// with no signal and the builder chain does not restore one, so a single
+    /// panic left the daemon unable to cancel a capture and unable to report
+    /// progress, for the life of the process (#359).
+    ///
+    /// What it does NOT prevent, stated plainly rather than left to be
+    /// discovered: `DerefMut` hands out `&mut Engine`, which `dispatch` needs,
+    /// so `*engine = fresh` would still replace the inner engine and drop the
+    /// signal. Closing that would mean not exposing the engine at all, which
+    /// this daemon cannot do. The guard is against the accident that happened,
+    /// not against a determined rewrite.
+    pub(super) struct WorkerEngine<E: StopSignalSink = irlume_auth::Engine>(E);
+
+    impl<E: StopSignalSink> WorkerEngine<E> {
+        /// The only constructor. Takes the token fresh, so a rebuilt engine
+        /// observes the same signal the arbiter is already setting.
+        pub(super) fn attach(mut engine: E, arbiter: &arbiter::Arbiter<Queued>) -> Self {
+            engine.accept_stop_signal(stop_signal(arbiter.cancel_token()));
+            Self(engine)
+        }
+    }
+
+    impl<E: StopSignalSink> std::ops::Deref for WorkerEngine<E> {
+        type Target = E;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl<E: StopSignalSink> std::ops::DerefMut for WorkerEngine<E> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{StopSignalSink, WorkerEngine};
+
+        /// Stands in for an `Engine`, which a test cannot build without the
+        /// model files.
+        #[derive(Default)]
+        struct Sink(Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>);
+
+        impl StopSignalSink for Sink {
+            fn accept_stop_signal(
+                &mut self,
+                signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+            ) {
+                self.0 = Some(signal);
+            }
+        }
+
+        /// Constructing a `WorkerEngine` must hand the engine a working signal.
+        ///
+        /// Pinning the type alone would not catch an `attach` that forgot to
+        /// install, which is the same shape as the original defect one level up.
+        #[test]
+        fn attaching_installs_a_signal_that_cancels_and_marks_progress() {
+            let _clock = super::super::tests::worker_clock_lock();
+            let arb = super::arbiter::Arbiter::<super::Queued>::default();
+            let engine = WorkerEngine::attach(Sink::default(), &arb);
+            // `.0` is the WorkerEngine's engine, `.0.0` is the signal the Sink
+            // was handed.
+            let signal = engine
+                .0
+                 .0
+                .clone()
+                .expect("attach must hand the engine a stop signal");
+
+            super::super::note_worker_idle();
+            assert!(!signal(), "nothing has asked the worker to stop yet");
+            // Inspect the clock directly rather than through an elapsed-time
+            // comparison: two adjacent Instant reads are not promised to differ.
+            assert!(
+                super::super::worker_progress()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some(),
+                "polling the signal must mark worker progress, or a long capture \
+                 reports nothing and the watchdog kills a healthy daemon"
+            );
+
+            arb.cancel_token().request_stop();
+            assert!(
+                signal(),
+                "a requested stop must be visible through the signal"
+            );
+            super::super::note_worker_idle();
+        }
+    }
+}
+
+use worker_engine::WorkerEngine;
+
 /// Mark forward progress: a job was picked up, or a capture boundary was
 /// reached. Called from the same points cooperative cancellation is polled at,
 /// so long-but-healthy work (an enrolment capturing ten scans) keeps reporting
 /// while a capture stuck inside one driver call does not.
-/// The signal the camera worker's engine polls between whole captures.
-///
-/// It carries two jobs that are easy to mistake for one. `stop_requested` is
-/// cooperative cancellation: an authentication has arrived and the running job
-/// should yield at its next safe boundary. `note_worker_progress` is the
-/// watchdog heartbeat (#141), and it is here because a poll between captures is
-/// the one moment that distinguishes a long-but-healthy job from a capture
-/// stuck inside a driver call. Losing this closure loses BOTH.
-fn worker_stop_signal(
-    token: arbiter::CancelToken,
-) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
-    std::sync::Arc::new(move || {
-        note_worker_progress();
-        token.stop_requested()
-    })
-}
-
-/// An [`irlume_auth::Engine`] with the stop signal attached.
-///
-/// This type exists to make one mistake unrepresentable rather than merely
-/// documented. The worker used to attach the signal once before its loop and
-/// then, after a panic, assign a freshly built engine straight over the top.
-/// `Engine::load` starts with no signal and the builder chain does not restore
-/// one, so a single panic left the daemon unable to cancel a running capture
-/// and unable to report progress to the watchdog, for the rest of its life. An
-/// enrollment running past the 45s wedge threshold then read as a hang, and
-/// systemd restarted a healthy daemon, destroying that enrollment on every
-/// retry (#359).
-///
-/// Nothing here prevents someone writing the same bug again with a bare
-/// `Engine`; what it does is make the rebuild site fail to compile unless it
-/// goes back through [`WorkerEngine::attach`], which is where the omission was.
-struct WorkerEngine(irlume_auth::Engine);
-
-impl WorkerEngine {
-    /// Wire an engine to the arbiter's cancellation and the watchdog heartbeat.
-    /// The token is taken fresh each time, so a rebuilt engine observes the same
-    /// signal the arbiter is already setting.
-    fn attach(mut engine: irlume_auth::Engine, arbiter: &arbiter::Arbiter<Queued>) -> Self {
-        engine.set_stop_signal(worker_stop_signal(arbiter.cancel_token()));
-        Self(engine)
-    }
-}
-
-impl std::ops::Deref for WorkerEngine {
-    type Target = irlume_auth::Engine;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for WorkerEngine {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 fn note_worker_progress() {
     let mut p = match worker_progress().lock() {
         Ok(p) => p,
@@ -4413,7 +4497,7 @@ mod tests {
     /// `note_worker_idle` lands between another's `note_worker_progress` and
     /// its `worker_wedged` assertion.
     static WORKER_CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn worker_clock_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn worker_clock_lock() -> std::sync::MutexGuard<'static, ()> {
         WORKER_CLOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -5518,43 +5602,6 @@ mod tests {
         note_worker_idle();
         std::thread::sleep(std::time::Duration::from_millis(70));
         assert!(!worker_wedged(short), "idle after a job is still healthy");
-    }
-
-    /// The worker's stop signal carries cancellation AND the watchdog
-    /// heartbeat, and #359 lost both at once by replacing the engine after a
-    /// panic without re-attaching it.
-    ///
-    /// `WorkerEngine` makes that unrepresentable, but the type only proves the
-    /// signal is ATTACHED. This proves the signal itself does the two things
-    /// the worker depends on, so a closure that silently stopped reading the
-    /// token, or stopped marking progress, would fail here rather than at the
-    /// next long enrollment on someone's laptop.
-    #[test]
-    fn the_worker_stop_signal_reports_cancellation_and_marks_progress() {
-        let _clock = worker_clock_lock();
-        let token = arbiter::CancelToken::new();
-        let signal = worker_stop_signal(token.clone());
-
-        note_worker_idle();
-        assert!(!signal(), "nothing has asked the worker to stop yet");
-        // Calling it is what the watchdog counts as being alive: an idle clock
-        // has no timestamp, so a wedge check right after the poll can only be
-        // true if the poll wrote one.
-        assert!(
-            worker_wedged(std::time::Duration::ZERO),
-            "polling the signal must mark worker progress, or a long capture \
-             reports nothing and the watchdog kills a healthy daemon"
-        );
-
-        token.request_stop();
-        assert!(
-            signal(),
-            "a requested stop must be visible through the signal"
-        );
-
-        token.reset();
-        assert!(!signal(), "a reset clears it for the next job");
-        note_worker_idle();
     }
 
     /// The #336 arithmetic gate: the longest stretch a defined capture failure

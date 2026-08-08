@@ -1047,7 +1047,7 @@ fn marshal_pcr_selection(pcrs: &[u32]) -> Vec<u8> {
 /// Part 3 §23.7 eq. 20: `policyDigest_new := H(policyDigest_old ||
 /// TPM_CC_PolicyPCR || pcrs || pcrDigest)`. In a trial session the TPM uses the
 /// supplied `pcrDigest` rather than reading PCRs, which is exactly the case
-/// this replaces, so the two must agree; `super_pcr_matches_a_trial_session`
+/// this replaces, so the two must agree; `software_digests_match_a_trial_session`
 /// asserts that against real hardware.
 fn policy_pcr_digest(old: &Digest, pcrs: &[u32], pcr_digest: &Digest) -> Result<Digest> {
     let mut h = Sha256::new();

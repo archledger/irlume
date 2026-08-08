@@ -77,7 +77,8 @@ gnome-keyring or ksecretd so the wallet opens without a prompt.
 **irlume-cli** is the same socket client grown a full CLI and TUI: setup,
 enrollment, diagnostics, model management, uninstall. For development and
 benchmarks it can also drive the Engine directly, bypassing the daemon
-(the dashed arrow). **irlume-fingerprint** wraps fprintd so a fingerprint
+(the solid `cli --> auth` edge; the dotted one is the socket path it
+bypasses). **irlume-fingerprint** wraps fprintd so a fingerprint
 can stand beside face auth where hardware exists.
 
 ## What the graph does and does not promise

@@ -96,8 +96,12 @@ const fn fourcc(c: &[u8; 4]) -> u32 {
 struct V4l2Format {
     kind: u32,
     _pad: u32,
-    /// `struct v4l2_meta_format { __u32 dataformat; __u32 buffersize; }`,
-    /// followed by the rest of the 200-byte union.
+    /// `struct v4l2_meta_format { __u32 dataformat; __u32 buffersize; __u32
+    /// width; __u32 height; __u32 bytesperline; }` packed, followed by the rest
+    /// of the 200-byte union. Only the first two are set: the three line-based
+    /// fields do not apply to UVC metadata. The union is 200 bytes whichever
+    /// fields the kernel adds, so the layout below is unaffected by the three
+    /// that arrived after this comment was first written.
     dataformat: u32,
     buffersize: u32,
     _rest: [u8; 192],

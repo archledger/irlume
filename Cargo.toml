@@ -50,8 +50,9 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 undocumented_unsafe_blocks = "warn"
 
-# Shared dependency versions. Heavy/native deps are listed but commented so the
-# scaffold compiles offline as pure stubs; uncomment per crate as you implement.
+# Shared dependency versions, inherited by member crates with
+# `dep = { workspace = true }`. Every entry below is live; the scaffold-era note
+# that used to sit here described stubs that no longer exist.
 [workspace.dependencies]
 irlume-common   = { path = "crates/irlume-common" }
 irlume-camera   = { path = "crates/irlume-camera" }
@@ -82,11 +83,16 @@ ort     = { version = "=2.0.0-rc.12", default-features = false, features = ["loa
 
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
 
-# --- native deps (enable as you build each crate) -----------------------------
-# nokhwa    = { version = "0.10", features = ["input-native"] }   # V4L2 capture
-# tss-esapi = "7"                                                 # TPM 2.0
-# pamsm     = "0.5"                                               # PAM service module
-# secrecy   = "0.10"
+# --- considered and not used -------------------------------------------------
+# nokhwa  = { version = "0.10", features = ["input-native"] }  # rejected: it
+#           wraps the `v4l` crate this workspace uses directly. See the note in
+#           crates/irlume-camera/Cargo.toml.
+# secrecy = "0.10"                                             # never adopted;
+#           secrets use irlume-common's SecretBytes and zeroize::Zeroizing.
+#
+# tss-esapi and pamsm used to sit in this block as "enable as you build". Both
+# have been live for a long time: tss-esapi above, pamsm in
+# crates/irlume-pam/Cargo.toml.
 
 [profile.release]
 lto = true

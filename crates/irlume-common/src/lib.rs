@@ -128,12 +128,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// value removes the second pass, and it removes the failure mode that would
 /// have come with passing a loose digest alongside loose bytes: the constructor
 /// is the only way in and it takes the digest from the buffer it stores, so the
-/// two cannot be from different artifacts.
-///
-/// ```
-/// let m = irlume_common::HashedModel::new(b"weights".to_vec());
-/// assert_eq!(m.sha256(), irlume_common::sha256_hex(m.bytes()));
-/// ```
+/// two cannot be from different artifacts. The invariant is pinned by
+/// `the_digest_always_belongs_to_the_bytes_it_was_built_from` rather than by a
+/// doctest: the sanitizer lane builds with an explicit target and no
+/// instrumented std, so a doctest there fails to link while a unit test runs
+/// in every lane.
 pub struct HashedModel {
     bytes: Vec<u8>,
     sha256: String,
@@ -1024,6 +1023,19 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+
+    /// The digest a `HashedModel` reports must be the digest of the bytes it
+    /// carries, because callers skip their own hashing on the strength of it
+    /// (#346). Fails if the constructor ever stores a digest from anywhere
+    /// but its own buffer.
+    #[test]
+    fn the_digest_always_belongs_to_the_bytes_it_was_built_from() {
+        for payload in [b"weights".to_vec(), Vec::new(), vec![0u8; 4096]] {
+            let m = super::HashedModel::new(payload.clone());
+            assert_eq!(m.bytes(), &payload[..]);
+            assert_eq!(m.sha256(), super::sha256_hex(&payload));
+        }
+    }
     use std::path::{Path, PathBuf};
 
     /// The upgrade window: a 0.9.1 client reading an Enrolled reply from a

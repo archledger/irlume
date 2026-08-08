@@ -728,6 +728,19 @@ fn sequential_capture_selected(rgb_dev: &str, ir_dev: &str) -> (bool, &'static s
 /// (ASUS) to 1.3 s (NexiGo) of capture latency, and only until a measured
 /// verdict is stored; enrollment now probes an unmeasured pair, so most
 /// installs leave this arm at their first enrollment (#340).
+fn capture_mode_decision(
+    env: Option<&str>,
+    stored: Option<irlume_camera::CaptureMode>,
+) -> (bool, &'static str) {
+    match env {
+        Some(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
+        None => match stored {
+            Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
+            None => (true, "default"),
+        },
+    }
+}
+
 /// May the cross-spectrum self-heal recapture RGB on its own?
 ///
 /// Pure over its five observations, so the one clause that keeps costing
@@ -759,19 +772,6 @@ fn self_heal_may_recapture(
     held_sessions: bool,
 ) -> bool {
     rgb_lost_the_face && ir_kept_the_face && !sequential && !rgb_hard_retried && !held_sessions
-}
-
-fn capture_mode_decision(
-    env: Option<&str>,
-    stored: Option<irlume_camera::CaptureMode>,
-) -> (bool, &'static str) {
-    match env {
-        Some(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
-        None => match stored {
-            Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
-            None => (true, "default"),
-        },
-    }
 }
 
 #[cfg(test)]

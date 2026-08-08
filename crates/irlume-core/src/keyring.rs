@@ -644,9 +644,14 @@ mod tests {
     /// downgrades the envelope to `LoginPassword` and the next login hands 56
     /// bytes of raw key to `pam_gnome_keyring` as an `AUTHTOK`.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: measured failing against a bare swtpm, the tier climb reports Unchanged (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn resealing_preserves_the_secret_kind() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        // Same missing precondition as the climb test below (#361): without a
+        // stronger tier available, the rewrite this test inspects never runs and
+        // `reseal_password` answers Unchanged. A distinct NV index from the
+        // other fixtures, so a leftover from one cannot mask another.
+        let _pcrlock = tpm::tests::PcrlockFixture::provision(0x0181_C222);
         let dir = crate::test_tmp_dir("kr-kind");
         std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
@@ -862,12 +867,22 @@ mod tests {
     /// token into `PAM_AUTHTOK` on the next login. This is #253's
     /// `resealing_preserves_the_secret_kind` trap, one field wider.
     #[test]
-    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI. NOT run by CI: measured failing against a bare swtpm, the tier climb reports Unchanged (#361)"]
+    #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap() {
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         let dir = crate::test_tmp_dir("kr-token-climb");
         std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
+
+        // The precondition this test never established (#361): a climb needs a
+        // stronger tier to exist, and `stronger_tier_available_than(PcrLiteral)`
+        // is `signed_policy_available() || pcrlock_provisioned().is_some()`. On
+        // a bare swtpm neither holds, so `reseal_password` correctly answered
+        // Unchanged and the assertion below could never pass. Provisioning a
+        // synthetic Tier 2 makes the climb real: a genuine PolicyAuthorizeNV
+        // session and TPM round trip, which is the boundary the credential-leak
+        // regression lives behind.
+        let _pcrlock = tpm::tests::PcrlockFixture::provision(0x0181_C111);
 
         let pw = b"climb-password";
         let token = mint_gnome_token();

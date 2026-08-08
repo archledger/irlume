@@ -1383,7 +1383,7 @@ pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1678,6 +1678,138 @@ mod tests {
     /// Real Tier-2 pcrlock seal→unseal on the host TPM. Ignored by default: needs
     /// /dev/tpmrm0, root, and a provisioned pcrlock policy
     /// (`systemd-pcrlock make-policy`, NV index in /var/lib/systemd/pcrlock.json).
+    /// A synthetic systemd-pcrlock policy, provisioned for the guard's lifetime.
+    ///
+    /// Extracted from `seal_unseal_pcrlock_roundtrip_provisioned_nv`, which built
+    /// this inline, so the tier-climb tests can establish the precondition they
+    /// were missing: `stronger_tier_available_than(PcrLiteral)` is
+    /// `signed_policy_available() || pcrlock_provisioned().is_some()`, and on a
+    /// bare swtpm neither holds, so those tests asserted a climb that could not
+    /// happen (#361).
+    ///
+    /// What this IS: a real owner-hierarchy NV space holding the alg-tagged
+    /// policy digest of the live PCR state, laid out the way
+    /// `systemd-pcrlock make-policy` writes it, plus a matching prediction JSON.
+    /// A seal against it runs a genuine `PolicyAuthorizeNV` session and a real
+    /// TPM round trip.
+    ///
+    /// What it is NOT: real systemd provisioning. It does not exercise
+    /// `make-policy`, protected NV updates, event-log prediction, real firmware
+    /// PCR movement, or Tier-1 signed-PCR behaviour. Those stay hardware work.
+    ///
+    /// Drop undefines the NV space and clears the override, so an assertion
+    /// failure mid-test does not leave the index or the env var behind for the
+    /// next one.
+    pub(crate) struct PcrlockFixture {
+        nv_index: u32,
+        dir: std::path::PathBuf,
+    }
+
+    impl PcrlockFixture {
+        /// Provision `nv_index` against the live PCR 7. The caller must hold
+        /// `ENV_LOCK`: this sets a process-global override.
+        pub(crate) fn provision(nv_index: u32) -> Self {
+            use tss_esapi::attributes::NvIndexAttributes;
+            use tss_esapi::structures::{MaxNvBuffer, NvPublic};
+
+            let mut ctx = open_context().expect("tpm context");
+            let pcr7 = read_pcr_values(&mut ctx, &[7])
+                .expect("read pcr7")
+                .remove(0);
+            assert_eq!(pcr7.value.len(), 32, "sha256 bank expected");
+            let hex: String = pcr7.value.iter().map(|b| format!("{b:02x}")).collect();
+
+            let dir = std::env::temp_dir().join(format!(
+                "irlume-pcrlock-{}-{nv_index:08x}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let json_path = dir.join("pcrlock.json");
+            std::fs::write(
+                &json_path,
+                format!(
+                    r#"{{"pcrBank":"sha256","pcrValues":[{{"pcr":7,"values":["{hex}"]}}],"nvIndex":{nv_index}}}"#
+                ),
+            )
+            .unwrap();
+            std::env::set_var("IRLUME_PCRLOCK_JSON", &json_path);
+
+            // A leftover index from an aborted run has a different name lineage;
+            // drop it before defining ours.
+            let nv_handle_t = NvIndexTpmHandle::new(nv_index).unwrap();
+            if let Ok(obj) = ctx.tr_from_tpm_public(TpmHandle::NvIndex(nv_handle_t)) {
+                let _ = ctx.execute_with_nullauth_session(|ctx| {
+                    ctx.nv_undefine_space(Provision::Owner, NvIndexHandle::from(obj))
+                });
+            }
+
+            // Owner-hierarchy NV space, owner read/write, 34 bytes: a 2-byte
+            // hash alg id plus the sha256 policy digest, systemd-pcrlock's
+            // layout.
+            let attrs = NvIndexAttributes::builder()
+                .with_owner_write(true)
+                .with_owner_read(true)
+                .build()
+                .unwrap();
+            let public = NvPublic::builder()
+                .with_nv_index(nv_handle_t)
+                .with_index_name_algorithm(HashingAlgorithm::Sha256)
+                .with_index_attributes(attrs)
+                .with_data_area_size(34)
+                .build()
+                .unwrap();
+            let nv = ctx
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.nv_define_space(Provision::Owner, None, public)
+                })
+                .expect("nv define");
+
+            // The digest a session holds after PolicyPCR(sel=[7], composite):
+            // what the live unseal session presents when PolicyAuthorizeNV
+            // compares it against the NV content.
+            let composite: [u8; 32] = Sha256::digest(&pcr7.value).into();
+            let policy_digest = with_session(&mut ctx, SessionType::Trial, |ctx, session| {
+                let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+                ctx.policy_pcr(
+                    policy,
+                    Digest::try_from(composite.to_vec()).map_err(tpm_err)?,
+                    pcr_selection(&[7])?,
+                )
+                .map_err(tpm_err)?;
+                ctx.policy_get_digest(policy).map_err(tpm_err)
+            })
+            .expect("trial policy digest");
+
+            let mut content = vec![0x00u8, 0x0B]; // TPM2_ALG_SHA256, big-endian
+            content.extend_from_slice(policy_digest.value());
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.nv_write(
+                    NvAuth::Owner,
+                    nv,
+                    MaxNvBuffer::try_from(content).unwrap(),
+                    0,
+                )
+            })
+            .expect("nv write");
+
+            Self { nv_index, dir }
+        }
+    }
+
+    impl Drop for PcrlockFixture {
+        fn drop(&mut self) {
+            if let Ok(mut ctx) = open_context() {
+                if let Ok(nv) = nv_index_handle(&mut ctx, self.nv_index) {
+                    let _ = ctx.execute_with_nullauth_session(|ctx| {
+                        ctx.nv_undefine_space(Provision::Owner, nv)
+                    });
+                }
+            }
+            std::env::remove_var("IRLUME_PCRLOCK_JSON");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// Tier-2 pcrlock seal/unseal without systemd-pcrlock: the test provisions
     /// the NV index the way `systemd-pcrlock make-policy` does (owner-hierarchy
     /// NV space holding the alg-tagged policy digest of the predicted PCR
@@ -1687,90 +1819,14 @@ mod tests {
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
     fn seal_unseal_pcrlock_roundtrip_provisioned_nv() {
-        use tss_esapi::attributes::NvIndexAttributes;
-        use tss_esapi::structures::{MaxNvBuffer, NvPublic};
-
         let _g = crate::testenv::ENV_LOCK.lock().unwrap();
         const NV_INDEX: u32 = 0x0181_C0DE;
         let secret = b"irlume-pcrlock-roundtrip-secret!";
 
-        let mut ctx = open_context().expect("tpm context");
-        // Current PCR 7 feeds both the prediction JSON and the policy digest.
-        let pcr7 = read_pcr_values(&mut ctx, &[7])
-            .expect("read pcr7")
-            .remove(0);
-        assert_eq!(pcr7.value.len(), 32, "sha256 bank expected");
-        let hex: String = pcr7.value.iter().map(|b| format!("{b:02x}")).collect();
-
-        let dir = std::env::temp_dir().join(format!("irlume-pcrlock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let json_path = dir.join("pcrlock.json");
-        std::fs::write(
-            &json_path,
-            format!(
-                r#"{{"pcrBank":"sha256","pcrValues":[{{"pcr":7,"values":["{hex}"]}}],"nvIndex":{NV_INDEX}}}"#
-            ),
-        )
-        .unwrap();
-        std::env::set_var("IRLUME_PCRLOCK_JSON", &json_path);
-
-        // A leftover index from an aborted run has a different name lineage;
-        // drop it before defining ours.
-        let nv_handle_t = NvIndexTpmHandle::new(NV_INDEX).unwrap();
-        if let Ok(obj) = ctx.tr_from_tpm_public(TpmHandle::NvIndex(nv_handle_t)) {
-            let _ = ctx.execute_with_nullauth_session(|ctx| {
-                ctx.nv_undefine_space(Provision::Owner, NvIndexHandle::from(obj))
-            });
-        }
-
-        // Owner-hierarchy NV space, owner read/write, 34 bytes: a 2-byte hash
-        // alg id plus the sha256 policy digest, systemd-pcrlock's layout.
-        let attrs = NvIndexAttributes::builder()
-            .with_owner_write(true)
-            .with_owner_read(true)
-            .build()
-            .unwrap();
-        let public = NvPublic::builder()
-            .with_nv_index(nv_handle_t)
-            .with_index_name_algorithm(HashingAlgorithm::Sha256)
-            .with_index_attributes(attrs)
-            .with_data_area_size(34)
-            .build()
-            .unwrap();
-        let nv = ctx
-            .execute_with_nullauth_session(|ctx| {
-                ctx.nv_define_space(Provision::Owner, None, public)
-            })
-            .expect("nv define");
-
-        // The digest a session holds after PolicyPCR(sel=[7], composite): what
-        // the live unseal session presents when PolicyAuthorizeNV compares it
-        // against the NV content.
-        let composite: [u8; 32] = Sha256::digest(&pcr7.value).into();
-        let policy_digest = with_session(&mut ctx, SessionType::Trial, |ctx, session| {
-            let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-            ctx.policy_pcr(
-                policy,
-                Digest::try_from(composite.to_vec()).map_err(tpm_err)?,
-                pcr_selection(&[7])?,
-            )
-            .map_err(tpm_err)?;
-            ctx.policy_get_digest(policy).map_err(tpm_err)
-        })
-        .expect("trial policy digest");
-
-        let mut content = vec![0x00u8, 0x0B]; // TPM2_ALG_SHA256, big-endian
-        content.extend_from_slice(policy_digest.value());
-        ctx.execute_with_nullauth_session(|ctx| {
-            ctx.nv_write(
-                NvAuth::Owner,
-                nv,
-                MaxNvBuffer::try_from(content).unwrap(),
-                0,
-            )
-        })
-        .expect("nv write");
-        drop(ctx);
+        // Provisioning moved into PcrlockFixture so the tier-climb tests can
+        // establish the same precondition; using it here is what keeps the two
+        // honest, since a fixture only this test's twin exercised would drift.
+        let fixture = PcrlockFixture::provision(NV_INDEX);
 
         // Round trip through the public Tier-2 entry points.
         let env = seal_with_pcrlock(secret, NV_INDEX).expect("pcrlock seal");
@@ -1780,6 +1836,7 @@ mod tests {
 
         // Drift: rewrite the NV policy to one the live PCRs cannot satisfy
         // (what a firmware change looks like) and the unseal must refuse.
+        use tss_esapi::structures::MaxNvBuffer;
         let mut ctx = open_context().unwrap();
         let nv = nv_index_handle(&mut ctx, NV_INDEX).unwrap();
         let mut bogus = vec![0x00u8, 0x0B];
@@ -1791,13 +1848,9 @@ mod tests {
         drop(ctx);
         assert!(unseal(&env).is_err(), "stale policy must not unseal");
 
-        // Cleanup: the NV space, the override, the fixture.
-        let mut ctx = open_context().unwrap();
-        let nv = nv_index_handle(&mut ctx, NV_INDEX).unwrap();
-        let _ =
-            ctx.execute_with_nullauth_session(|ctx| ctx.nv_undefine_space(Provision::Owner, nv));
-        std::env::remove_var("IRLUME_PCRLOCK_JSON");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Cleanup is the fixture's Drop, which also runs if an assertion above
+        // fails; the hand-rolled version here did not.
+        drop(fixture);
     }
 
     /// The software digests must equal what a trial session produces.

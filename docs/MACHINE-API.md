@@ -213,6 +213,7 @@ reused for a different meaning. The registry as of this contract:
 | `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
 | `boot-mode` | the boot chain, which decides which PCR policy tier applies |
 | `emitter-undo-pending` | camera controls an interrupted `ir-setup` left changed and has not put back. `unknown` when the root-only record store cannot be read, which is any run that is not root |
+| `capture-mode` | which capture strategy the active camera pair uses (concurrent or sequential) and whether it was measured for that pair or is the unmeasured sequential default. `info` in every measured, default, or no-pinned-pair case, since a capture mode is a strategy and not a fault; `unknown` when the root-only `cameras.conf` cannot be read, which is any run that is not root |
 | `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
 | `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths |

@@ -2589,9 +2589,11 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_center_edge_ratio = ir_top_face
             .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        let ir_eye_glint = ir_top_face
-            .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-            .unwrap_or(0.0);
+        // Single frame, no burst stats, so no white level is known: the
+        // `white: None` arm passes the peak through exactly as before, the same
+        // honesty this probe already applies to ir_saturated_frac below (#222).
+        let ir_eye_glint =
+            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks));
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
@@ -2615,19 +2617,25 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             rgb_moire_score: 0.0,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}  face_frac {:.3}  clipped {}", signals.face_frac,
+        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {}  face_frac {:.3}  clipped {}",
+            signals
+                .ir_eye_glint
+                .map(|g| format!("{g:.0}"))
+                .unwrap_or_else(|| "n/a".into()),
+            signals.face_frac,
             signals
                 .ir_saturated_frac
                 .map(|f| format!("{:.1}%", f * 100.0))
                 .unwrap_or_else(|| "n/a".into()));
         println!(
-            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
+            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={} glint_readable={}",
             cues.face_in_rgb,
             cues.face_in_ir,
             cues.cross_spectrum_aligned,
             cues.ir_reflectance_ok,
             cues.center_edge_ratio_ok,
-            cues.glint_present
+            cues.glint_present,
+            cues.glint_readable
         );
         println!("[GATE] {verdict:?}: {reason}");
         Ok(())

@@ -55,7 +55,8 @@ Attack Instrument categories, ISO term). Constants are the current values in
 | `ir_reflectance_ok` | active-emitter skin remission floor (melanin-independent > 1.2 µm → skin-tone fair) | dark / low-reflectance flat media | IR face mean ≥ `IR_FACE_MIN_BRIGHTNESS` (35) |
 | `center_edge_ratio_ok` | shape-from-shading: a lit 3D face is brighter center→edge under a near-coaxial emitter; flat matte media are uniform. A brightness ratio, not a range measurement, and a glossy print clears it (see the 2026-06-30 result below). Raising the floor has been measured twice and does not work: the same banner reaches 1.51 to 1.58 when it is ANGLED, above the genuine range, so no value separates them (2026-06-30, and again 2026-08-02) | **printed photo** (matte), flat screen, paper **cutout** | center/edge ratio ≥ `MIN_CENTER_EDGE_RATIO` (1.03) |
 | `frontal_ok` | Windows-Hello-style ±15° pose gate (quality, not spoof → `Uncertain`) | off-angle / partial captures | yaw ≤ 0.40, pitch ∈ [0.20, 0.80] |
-| `glint_present` | corneal retro-reflection of the emitter | *supporting only*, never decisive (standalone-glint liveness is refuted) | eye peak ≥ `GLINT_MIN` (180) |
+| `glint_present` | corneal retro-reflection of the emitter | *supporting only*, never decisive (standalone-glint liveness is refuted) | eye peak ≥ `GLINT_MIN` (180) **and** the peak did not reach the format's ceiling |
+| `glint_readable` | whether the eye peak was in band at all | recorded only | peak below the negotiated format's ceiling. A railed peak records `ir_glint: null` and both flags false: a clipped sample says the value was AT LEAST the ceiling, never what it was (#222) |
 
 The **per-user calibrated IR floor** (a center/edge-ratio floor stored at
 enrollment by `irlume-core`, enforced in `Engine::authenticate`) tightens that

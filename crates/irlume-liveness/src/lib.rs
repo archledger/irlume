@@ -42,7 +42,24 @@ pub struct Signals {
     pub ir_center_edge_ratio: f32,
     /// Peak IR brightness (0..255) at the eyes: the emitter's specular corneal
     /// glint. Supporting cue only (glint alone is not decisive).
-    pub ir_eye_glint: f32,
+    ///
+    /// `None` = the reading established nothing, and it is NOT a dark eye. Three
+    /// ways to get there: no IR face was found, the RGB-only path ran (no IR
+    /// frame at all), or the peak reached the negotiated format's ceiling, where
+    /// a clipped sample says the value was AT LEAST that and never what it was.
+    ///
+    /// The railed case is #222, and it is the common one rather than a corner:
+    /// with glasses on the peak pinned at 255 in all 30 frames measured
+    /// 2026-08-04, reading the lens specular rather than the cornea, and in
+    /// `docs/pad-results/2026-08-04-occluder-gate.jsonl` all 8 records that
+    /// recorded a glint are railed at exactly 255, so "glint present" and "the
+    /// peak railed" name the same set. A cue recorded that way cannot separate
+    /// two populations, which is what re-deriving [`GLINT_MIN`] would need.
+    ///
+    /// `None` is NOT zero: the same distinction [`Signals::ir_saturated_frac`]
+    /// draws, and it exists so a maximum nobody could measure is never recorded
+    /// as one that was.
+    pub ir_eye_glint: Option<f32>,
     /// Head-orientation yaw asymmetry from the RGB face landmarks (0 frontal,
     /// →1 turned). Defaults to 0 (frontal) when not computed.
     pub head_yaw_asym: f32,
@@ -121,7 +138,7 @@ impl Default for Signals {
             ir_face: None,
             ir_face_brightness: 0.0,
             ir_center_edge_ratio: 0.0,
-            ir_eye_glint: 0.0,
+            ir_eye_glint: None,
             head_yaw_asym: 0.0,   // frontal
             head_pitch_frac: 0.5, // frontal
             face_frac: 0.0,
@@ -313,7 +330,18 @@ pub struct Cues {
     /// passes it (see docs/PAD_SELFTEST.md).
     pub center_edge_ratio_ok: bool,
     /// Corneal glint present (supporting; logged, not decisive).
+    ///
+    /// FALSE when the peak could not be read at all, not only when it was dim.
+    /// [`Cues::glint_readable`] separates those two, because merging them is the
+    /// same conflation this field used to carry from the other direction.
     pub glint_present: bool,
+    /// The eye peak was IN BAND rather than at the sensor's ceiling (#222).
+    ///
+    /// Without this, `glint_present: false` would merge "the eye was dim" with
+    /// "the reading railed and says nothing", and the corpus would trade one
+    /// conflation for another. False also on the early-refusal paths where the
+    /// cue is never reached, exactly like `glint_present`.
+    pub glint_readable: bool,
     /// Face is frontal enough (≈±15°) to make a decision; Windows-Hello-style
     /// head-orientation gate.
     pub frontal_ok: bool,
@@ -526,7 +554,8 @@ impl LivenessGate {
         }
 
         // Corneal glint: supporting only; logged, never decisive on its own.
-        cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
+        cues.glint_readable = s.ir_eye_glint.is_some();
+        cues.glint_present = s.ir_eye_glint.is_some_and(|g| g >= GLINT_MIN);
 
         (
             Verdict::Live,
@@ -626,7 +655,8 @@ impl LivenessGate {
             };
             return (Verdict::Spoof, cues, reason);
         }
-        cues.glint_present = s.ir_eye_glint >= GLINT_MIN;
+        cues.glint_readable = s.ir_eye_glint.is_some();
+        cues.glint_present = s.ir_eye_glint.is_some_and(|g| g >= GLINT_MIN);
         (
             Verdict::Live,
             cues,
@@ -2217,7 +2247,7 @@ mod tests {
             ir_face: Some(fb(0.52, 0.49)),
             ir_face_brightness: 90.0,
             ir_center_edge_ratio: 1.2,
-            ir_eye_glint: 220.0,
+            ir_eye_glint: Some(220.0),
             ..Default::default() // frontal pose
         }
     }
@@ -2300,6 +2330,58 @@ mod tests {
     /// `Signals::face_frac`). This test pins the current contract that
     /// `face_frac` remains observational and cannot change a verdict until
     /// a distance-aware rule is separately derived and reviewed.
+    /// A railed eye peak records as ABSENT, and absent is not "present".
+    ///
+    /// The corpus this cue feeds is what any future re-derivation of
+    /// [`GLINT_MIN`] would be fitted to, and you cannot observe two populations
+    /// in a variable that is pinned at the sensor's ceiling. In
+    /// `docs/pad-results/2026-08-04-occluder-gate.jsonl` all 8 records carrying
+    /// a glint are railed at exactly 255, so before this change "glint present"
+    /// and "the peak railed" named the same 8 records (#222).
+    #[test]
+    fn a_railed_glint_records_as_absent_not_as_the_strongest_reading() {
+        let gate = LivenessGate::new();
+        for signals in [live_signals()] {
+            // Three-way separation, which is the whole point: unreadable, read
+            // and dim, read and strong. Before this, the first and third were
+            // the same value.
+            for (glint, want_readable, want_present) in [
+                (None, false, false),
+                (Some(126.0), true, false), // the highest unpegged reading in that corpus
+                (Some(220.0), true, true),
+            ] {
+                let mut s = signals.clone();
+                s.ir_eye_glint = glint;
+                let (_, cues, _) = gate.evaluate(&s);
+                assert_eq!(cues.glint_readable, want_readable, "readable for {glint:?}");
+                assert_eq!(cues.glint_present, want_present, "present for {glint:?}");
+            }
+        }
+        // BOTH evaluators. #237's first version gated one path and left the
+        // dark-room path accepting what the other refused.
+        let mut dark = live_signals();
+        dark.ir_eye_glint = None;
+        let (_, cues, _) = gate.evaluate_ir_only(&dark);
+        assert!(!cues.glint_present, "an absent glint is not a present one");
+        assert!(!cues.glint_readable);
+    }
+
+    /// The cue is still supporting-only. Making it honest must not promote it
+    /// into something decisive, on either evaluator.
+    #[test]
+    fn an_unreadable_glint_changes_no_verdict() {
+        let gate = LivenessGate::new();
+        for glint in [None, Some(0.0), Some(126.0), Some(255.0)] {
+            let mut live = live_signals();
+            live.ir_eye_glint = glint;
+            assert_eq!(
+                gate.evaluate(&live).0,
+                Verdict::Live,
+                "a live face must stay Live at glint {glint:?}"
+            );
+        }
+    }
+
     #[test]
     fn face_frac_changes_no_verdict() {
         let gate = LivenessGate::new();

@@ -127,10 +127,16 @@ fn capture_once(
         .as_ref()
         .map(|f| crate::center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
         .unwrap_or(0.0);
-    let ir_eye_glint = ir_top
-        .as_ref()
-        .map(|f| crate::eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-        .unwrap_or(0.0);
+    // Ceiling-aware, and on the RAW frame for the same reason the saturation
+    // fraction below uses it: a railed peak measured nothing, and subtraction
+    // would move it off the ceiling and hide that (#222).
+    let ir_eye_glint = irlume_auth::eye_glint_of(
+        ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+        ir.width,
+        ir.height,
+        ir_top.as_ref().map(|f| &f.landmarks),
+        ir_stats.white_level,
+    );
 
     let signals = Signals {
         rgb_face,
@@ -223,7 +229,13 @@ fn presentation_record(
         "ir_center_edge_ratio".into(),
         crate::json_f32(s.ir_center_edge_ratio),
     );
-    rec.insert("ir_glint".into(), crate::json_f32(s.ir_eye_glint));
+    rec.insert(
+        "ir_glint".into(),
+        match s.ir_eye_glint {
+            Some(g) => crate::json_f32(g),
+            None => serde_json::Value::Null,
+        },
+    );
     let cross = match (s.rgb_face, s.ir_face) {
         (Some(r), Some(i)) => ((r.cx - i.cx).powi(2) + (r.cy - i.cy).powi(2)).sqrt(),
         _ => f32::NAN,
@@ -249,6 +261,7 @@ fn presentation_record(
         "ir_reflectance_ok": cues.ir_reflectance_ok,
         "center_edge_ratio_ok": cues.center_edge_ratio_ok,
         "glint_present": cues.glint_present,
+        "glint_readable": cues.glint_readable,
         "frontal_ok": cues.frontal_ok,
     });
     rec.insert("cues".into(), cues_json);
@@ -353,12 +366,14 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 ""
             };
             println!(
-                "      -> {} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>3.0} | {}{}",
+                "      -> {} | ir {} bri {:>5.1} c/e {:>5.2} glint {} | {}{}",
                 verdict_str(verdict),
                 if s.ir_face.is_some() { "✓" } else { "·" },
                 s.ir_face_brightness,
                 s.ir_center_edge_ratio,
-                s.ir_eye_glint,
+                s.ir_eye_glint
+                    .map(|g| format!("{g:>3.0}"))
+                    .unwrap_or_else(|| "n/a".into()),
                 reason,
                 flag,
             );

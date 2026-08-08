@@ -256,20 +256,144 @@ impl ConsentGesture {
 }
 
 /// The configured consent-gesture mode: `consent_gesture=nod|closure` in
-/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset or any other
-/// value accepts EITHER.
+/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset accepts
+/// EITHER.
+///
+/// An unrecognised spelling is REPORTED and then falls back to `Either` (#365).
+/// It used to fall back silently, which is the wrong direction twice over:
+/// `Either` is the widest of the three, so an operator writing
+/// `consent_gesture=blink` to tighten the gate got a looser one, and
+/// `Either::instruction` then told them to nod, so the misconfiguration had no
+/// visible symptom at all. Compare `credential_release_challenge` twenty lines
+/// up, which documents the opposite choice for its own key.
+///
+/// Adding a `ConsentGesture` variant breaks `instruction`, which is exhaustive,
+/// but would NOT break this parser, so a new mode would be unreachable while
+/// appearing configured. The warning is what surfaces that.
 pub fn consent_gesture_mode() -> ConsentGesture {
-    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+    consent_gesture_mode_reporting(std::io::stderr())
+}
+
+/// [`consent_gesture_mode`] with the warning stream injected, so a test can
+/// read what an operator would see rather than trusting that it was written.
+fn consent_gesture_mode_reporting(mut out: impl std::io::Write) -> ConsentGesture {
+    let mut parse = |v: &str, source: &str| match v.trim().to_ascii_lowercase().as_str() {
         "nod" => ConsentGesture::Nod,
         "closure" => ConsentGesture::Closure,
-        _ => ConsentGesture::Either,
+        other => {
+            let _ = writeln!(
+                out,
+                "irlume: ignoring {source}={other:?} (expected nod or closure);                  accepting either gesture"
+            );
+            ConsentGesture::Either
+        }
     };
     if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
-        return parse(&v);
+        return parse(&v, "IRLUME_CONSENT_GESTURE");
     }
     read_kv("settings.conf", "consent_gesture")
-        .map(|v| parse(&v))
+        .map(|v| parse(&v, "consent_gesture"))
         .unwrap_or(ConsentGesture::Either)
+}
+
+#[cfg(test)]
+mod camera_pin_tests {
+    use super::{read_kv, write_camera_pin};
+
+    /// The pin is written as one unit, under the lock the file already has.
+    ///
+    /// Four bare `write_kv` calls left the pair readable half-updated, and an
+    /// unlocked rewrite could erase the keys a locked writer had just made
+    /// (#365). The lock sidecar existing is what distinguishes this from four
+    /// loose writes: `store_capture_mode_if_absent` takes the same lock, and
+    /// exclusion needs BOTH sides to take it.
+    #[test]
+    fn the_camera_pin_lands_whole_and_takes_the_lock() {
+        let _g = crate::testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        write_camera_pin("/dev/video0", "/dev/video2", "rgbid", "irid").expect("pin writes");
+
+        let got = |k: &str| read_kv("cameras.conf", k);
+        assert_eq!(got("rgb").as_deref(), Some("/dev/video0"));
+        assert_eq!(got("ir").as_deref(), Some("/dev/video2"));
+        assert_eq!(got("rgb_id").as_deref(), Some("rgbid"));
+        assert_eq!(got("ir_id").as_deref(), Some("irid"));
+        assert!(
+            dir.join("cameras.conf.lock").exists(),
+            "the write must go through the same lock store_capture_mode_if_absent takes"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod consent_gesture_tests {
+    use super::{consent_gesture_mode_reporting, ConsentGesture};
+
+    /// An unrecognised spelling must SAY so. Silence is what made this a bug
+    /// worth filing: the operator asked for a narrower gate, got the widest
+    /// one, and `Either::instruction` then told them to nod, so nothing about
+    /// the running system looked wrong (#365).
+    #[test]
+    fn an_unrecognised_gesture_is_reported_and_falls_back_to_either() {
+        let _g = crate::testenv::lock();
+        std::env::set_var("IRLUME_CONSENT_GESTURE", "blink");
+        let mut out = Vec::new();
+        let mode = consent_gesture_mode_reporting(&mut out);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        assert_eq!(mode, ConsentGesture::Either, "the documented fallback");
+        let warned = String::from_utf8_lossy(&out);
+        assert!(warned.contains("IRLUME_CONSENT_GESTURE"), "{warned}");
+        assert!(warned.contains("blink"), "must name the value: {warned}");
+    }
+
+    /// A recognised spelling is honoured in either case and says nothing.
+    #[test]
+    fn a_recognised_gesture_is_silent() {
+        let _g = crate::testenv::lock();
+        for (raw, want) in [
+            ("nod", ConsentGesture::Nod),
+            ("NOD", ConsentGesture::Nod),
+            (" closure ", ConsentGesture::Closure),
+        ] {
+            std::env::set_var("IRLUME_CONSENT_GESTURE", raw);
+            let mut out = Vec::new();
+            let mode = consent_gesture_mode_reporting(&mut out);
+            std::env::remove_var("IRLUME_CONSENT_GESTURE");
+            assert_eq!(mode, want, "{raw}");
+            assert!(
+                out.is_empty(),
+                "{raw} warned: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+}
+
+/// Write the camera pin as ONE operation, under the lock that guards the file.
+///
+/// The four keys used to be four bare `write_kv` calls (#365). Each is atomic
+/// on its own; the SEQUENCE was not, so a reader between the first and the last
+/// saw an RGB node from one physical camera and an IR node from another, and
+/// that pair is the anti-injection binding. Worse, `write_kv` rewrites the
+/// whole file from a snapshot it read, so a locked writer racing the unlocked
+/// ones lost every key it had just written; `store_capture_mode_if_absent` took
+/// this lock and these did not, which is no exclusion at all.
+///
+/// # Errors
+/// Propagates the first failed write, and a failure to take the lock.
+pub fn write_camera_pin(rgb: &str, ir: &str, rgb_id: &str, ir_id: &str) -> std::io::Result<()> {
+    let _guard = lock_exclusive("cameras.conf")?;
+    write_kv("cameras.conf", "rgb", rgb)?;
+    write_kv("cameras.conf", "ir", ir)?;
+    write_kv("cameras.conf", "rgb_id", rgb_id)?;
+    write_kv("cameras.conf", "ir_id", ir_id)
 }
 
 /// The spellings that turn a boolean settings.conf key off.
